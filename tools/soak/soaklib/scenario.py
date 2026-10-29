@@ -204,7 +204,16 @@ RANGE_KEYS = {"min", "max"}
 # name, and each further SUT service's under its service name.
 SUT_CONFIG_KEY = "sut"
 LEDGER_KEYS = {"sut_aggregate", "sink", "source", "wire_loss_outside_faults"}
-OPTIONAL_LEDGER_KEYS = {"vm_every_window", "sut_script", "split", "hop", "sut_router"}
+OPTIONAL_LEDGER_KEYS = {"vm_every_window", "sut_script", "split", "hop", "sut_router",
+                        "sut_delta"}
+# `[ledger] sut_delta` names, in place of `sut_aggregate`, a `cumulative_to_delta` feeding the
+# one sink with no `aggregate` after it. Each event it sends carries one delta point, so the
+# count rows judge in points, and `ledger.value` judges the deltas' sum against the generator's
+# increments (checks.py's `check_ledger_value`). The sum needs every stored point's value, which
+# only a `datadog` stand-in's record keeps.
+DELTA_KIND = "cumulative_to_delta"
+# The `[ledger]` keys whose rows read one `aggregate`, refused beside `sut_delta`.
+DELTA_REFUSED_KEYS = ("sut_aggregate", "sut_script", "hop", "split", "vm_every_window")
 # A `[[ledger.hop]]`: the native hop between two SUT services, `from`'s `logit_out` component
 # `sink` and `to`'s `logit_in` component `listener`. A scenario has at most one.
 HOP_KEYS = {"from", "sink", "to", "listener"}
@@ -213,17 +222,22 @@ SOURCE_LEDGER_KEYS = ("generator_input", "generator_sink", "sut_listener")
 # A `[[ledger.source]]`: the generator service, its `generate_in` and sink, the SUT listener its
 # lines reach, and, optionally, the wire they cross and the transforms between that listener
 # and `aggregate`, each of which must send every event it receives or count it discarded, unless
-# `fan_out` gives the events it emits per event.
+# `fan_out` gives the events it emits per event. `merge` lists the nodes whose discards are
+# merges, each merged record credited back as delivered (checks.py's `Ledger.merged`).
 # `generator_input` and `generator_sink` may both list components, as many of each, whose counts
 # sum (`source_ids()`), each input feeding the sink at its position (`source_pairs()`): a
 # generator that sends several UDP flows has one input and one sink per flow.
 SOURCE_KEYS = {"service", "generator_input", "generator_sink", "sut_listener"}
 LISTED_SOURCE_KEYS = ("generator_input", "generator_sink")
-OPTIONAL_SOURCE_KEYS = {"sut_transforms", "wire", "fan_out"}
+OPTIONAL_SOURCE_KEYS = {"sut_transforms", "wire", "fan_out", "merge"}
 # The one transform kind `fan_out` may name: it emits one event per point of a parent's message
 # and counts the lines it loses in `logit.transform.lines.dropped` (checks.py's
 # `Ledger.through`).
 FAN_OUT_KIND = "line_protocol"
+# The one transform kind `merge` may name: it folds a series' records of one timestamp bucket
+# into one, counting each folded record in `logit.transform.metrics.merged` and an event it
+# leaves with nothing in `events.discarded` (checks.py's `Ledger.merged`).
+MERGE_KIND = "dedup_timestamps"
 # The wires a source's lines can cross into the SUT, each with its own ledger symbols
 # (checks.py's `WIRES`): datagrams, a TCP stream of LF-terminated lines, a file the SUT tails,
 # or HTTP requests a listener answers.
@@ -300,8 +314,10 @@ ROUTER_KINDS = ("route", "route_signals")
 # A `[[ledger.sink]]`: the sink's component id, the backend service it delivers to and the
 # selector V is read with (both local only), under `split = "route"` or `"target"` the `target`
 # feeding it, and under `"target"` its own `aggregate` and the `transforms` between the target
-# and that `aggregate`, in order.
-SINK_KEYS = {"id", "backend", "vm_selector", "target", "aggregate", "transforms"}
+# and that `aggregate`, in order. A local sink may add `vm_absent_selector`, a selector its
+# backend must hold no series for at the end (checks.py's `check_ledger_absent`).
+SINK_KEYS = {"id", "backend", "vm_selector", "target", "aggregate", "transforms",
+             "vm_absent_selector"}
 _COMPONENT_ID = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
 THRESHOLD_KEYS = {"progress_window", "rss_growth_mib_per_hour", "fd_growth"}
 EXPECT_KEYS = {"name", "service", "metric", "component", "attrs", "step", "window", "reduce",
@@ -834,6 +850,10 @@ def from_dict(raw, path):
     if isinstance(ledger, dict) and ledger.get("split") == TARGET_SPLIT:
         ledger_keys = ledger_keys - {"sut_aggregate"}
         ledger_optional = ledger_optional | {"sut_aggregate"}
+    # `sut_delta` takes `sut_aggregate`'s place, and `_delta_problems()` refuses both together.
+    if isinstance(ledger, dict) and "sut_delta" in ledger:
+        ledger_keys = ledger_keys - {"sut_aggregate"}
+        ledger_optional = ledger_optional | {"sut_aggregate"}
     if no_vm and isinstance(ledger, dict):
         for key in sorted(VM_LEDGER_KEYS & set(ledger)):
             problems.append(f"ledger.{key} names a VictoriaMetrics query, and the "
@@ -889,6 +909,7 @@ def from_dict(raw, path):
             problems += _wire_problems(ledger, sut_text)
             problems += _route_problems(ledger, sut_text)
             problems += _transform_problems(ledger, sut_text)
+            problems += _delta_problems(ledger, sut_text, target, "overlap" in raw)
             if target["kind"] == KAFKA_TARGET:
                 target["format"] = kafka_format(ledger, sut_text, target["topic"], problems)
         problems += _writer_problems(ledger, configs, path.parent)
@@ -1096,7 +1117,7 @@ def _sink_problems(ledger, kind):
         else:
             ids.append(sink_id)
         if no_backend:
-            for key in sorted({"backend", "vm_selector"} & set(sink)):
+            for key in sorted({"backend", "vm_selector", "vm_absent_selector"} & set(sink)):
                 problems.append(f"{where}: `{key}` names a backend query, and the {kind} "
                                 "target has no backend")
         else:
@@ -1104,6 +1125,11 @@ def _sink_problems(ledger, kind):
                 if not isinstance(sink.get(key), str) or not sink.get(key):
                     problems.append(f"{where}: missing `{key}`; a local sink names the backend "
                                     "service it delivers to and the selector its V is read with")
+            absent = sink.get("vm_absent_selector")
+            if "vm_absent_selector" in sink and (not isinstance(absent, str) or not absent
+                                                 or absent == sink.get("vm_selector")):
+                problems.append(f"{where}: `vm_absent_selector` must be a selector other than "
+                                "`vm_selector`, for series the backend must never hold")
         target = sink.get("target")
         if split in ("route", TARGET_SPLIT):
             if not isinstance(target, str) or not _COMPONENT_ID.match(target):
@@ -1614,6 +1640,33 @@ def _source_problems(ledger):
                             "combined; the script's hop is judged from every listener's E")
     for index, source in enumerate(sources):
         problems += _fan_out_problems(source, f"ledger.source {index + 1}")
+        problems += _merge_problems(ledger, source, f"ledger.source {index + 1}")
+    return problems
+
+
+def _merge_problems(ledger, source, where):
+    """What a source's `merge` breaks: a list of distinct nodes of the source's
+    `sut_transforms`, on a source with no `fan_out`, under a split other than `target`, since
+    the credit is written for one chain into the one `aggregate` the rows share. The kind each
+    node must be needs the SUT config: `_transform_problems()`."""
+    if "merge" not in source:
+        return []
+    merge = source.get("merge")
+    if (not isinstance(merge, list) or not merge
+            or not all(isinstance(node, str) for node in merge)
+            or len(set(merge)) != len(merge)):
+        return [f"{where}: `merge` must list distinct `sut_transforms` nodes, such as "
+                "[\"dedup\"]"]
+    chain = source.get("sut_transforms")
+    chain = chain if isinstance(chain, list) else []
+    problems = [f"{where}: `merge` names {node!r}, which isn't in the source's "
+                "`sut_transforms`" for node in merge if node not in chain]
+    if "fan_out" in source:
+        problems.append(f"{where}: `merge` and `fan_out` can't be combined: W′ takes the "
+                        "chain's discards out, and a merge loses nothing")
+    if ledger.get("split") == TARGET_SPLIT:
+        problems.append(f"{where}: `merge` can't be combined with split = \"target\", whose "
+                        "rows judge one aggregate per sink")
     return problems
 
 
@@ -1642,12 +1695,19 @@ def _fan_out_problems(source, where):
 
 def _transform_problems(ledger, sut_text):
     """Each source's `fan_out` node must be a `FAN_OUT_KIND` component of the SUT config
-    `sut_text`."""
+    `sut_text`, and each `merge` node a `MERGE_KIND` one."""
     sources = ledger.get("source")
     if not isinstance(sources, list):
         return []
     problems = []
     for index, source in enumerate(sources):
+        merge = source.get("merge") if isinstance(source, dict) else None
+        for node in merge if isinstance(merge, list) else ():
+            kind = listener_wire(sut_text, node)[1] if _COMPONENT_ID.match(str(node)) else None
+            if kind != MERGE_KIND:
+                problems.append(f"ledger.source {index + 1}: `merge` names {node!r}, "
+                                + (f"a {kind}" if kind else "no component of the SUT config")
+                                + f"; only a {MERGE_KIND} merges records")
         fan_out = source.get("fan_out") if isinstance(source, dict) else None
         for node in fan_out if isinstance(fan_out, dict) else ():
             kind = listener_wire(sut_text, node)[1] if _COMPONENT_ID.match(str(node)) else None
@@ -1655,6 +1715,45 @@ def _transform_problems(ledger, sut_text):
                 problems.append(f"ledger.source {index + 1}: `fan_out` names {node!r}, "
                                 + (f"a {kind}" if kind else "no component of the SUT config")
                                 + f"; only a {FAN_OUT_KIND} emits several events per event")
+    return problems
+
+
+def _delta_problems(ledger, sut_text, target, overlap):
+    """What `[ledger] sut_delta` breaks: it names a `DELTA_KIND` component of the SUT config
+    `sut_text`, off every source's `sut_transforms`, under a `datadog` stand-in target with one
+    source; and `DELTA_REFUSED_KEYS`, a `fan_out`, and `[overlap]` are refused beside it."""
+    if "sut_delta" not in ledger:
+        return []
+    node = ledger.get("sut_delta")
+    problems = []
+    kind = (listener_wire(sut_text, node)[1]
+            if isinstance(node, str) and _COMPONENT_ID.match(node) else None)
+    if kind != DELTA_KIND:
+        problems.append(f"ledger.sut_delta names {node!r}, "
+                        + (f"a {kind}" if kind else "no component of the SUT config")
+                        + f"; it must name the {DELTA_KIND} that feeds the sink")
+    if target.get("kind") != STANDIN_TARGET or target.get("shape") != standin_mod.DATADOG:
+        problems.append("ledger.sut_delta needs a standin target with shape = \"datadog\", "
+                        "whose record keeps every stored delta's value")
+    for key in DELTA_REFUSED_KEYS:
+        if key in ledger:
+            problems.append(f"ledger.{key} can't be combined with ledger.sut_delta, whose rows "
+                            "read no aggregate")
+    if overlap:
+        problems.append("[overlap] can't be combined with ledger.sut_delta")
+    sources = ledger.get("source") if isinstance(ledger.get("source"), list) else []
+    if len(sources) != 1:
+        problems.append("ledger.sut_delta needs one [[ledger.source]], whose generator's "
+                        "increments ledger.value judges")
+    for index, source in enumerate(sources):
+        if not isinstance(source, dict):
+            continue
+        if "fan_out" in source:
+            problems.append(f"ledger.source {index + 1}: `fan_out` can't be combined with "
+                            "ledger.sut_delta")
+        if node in (source.get("sut_transforms") or []):
+            problems.append(f"ledger.source {index + 1}: `sut_transforms` lists {node!r}, the "
+                            "sut_delta node, which feeds the sink")
     return problems
 
 

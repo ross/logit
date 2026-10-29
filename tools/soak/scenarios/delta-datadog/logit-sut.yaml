@@ -1,0 +1,31 @@
+# The system under test in `script/soak`'s delta-datadog scenario: OTLP cumulative sums over
+# HTTP, turned into deltas by `cumulative_to_delta`, and posted by `datadog_out` as `count` series
+# to the scripted stand-in, a delta-only destination that drops a cumulative kind. Its
+# `internal` telemetry goes to stdout as NDJSON for the harness to read; `script/soak` runs it
+# with `--log-format json`.
+admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
+components:
+  otlp:
+    type: otlp_in                   # a slow downstream holds the request; never 503 busy
+    bind: 0.0.0.0:4318
+    protocol: http
+  delta:
+    type: cumulative_to_delta
+    sources: [otlp]
+    # The default: a series that began before this process started records its first point
+    # as a baseline, so each SUT start loses the counts up to that point, which ledger.value
+    # reports.
+    initial_value: auto
+    # Above the longest stall a cued step causes (a 20 s hold backs up into the listener), and
+    # below the scenario's 100 s generator pause, which evicts every series.
+    max_staleness: 60s
+  datadog:
+    type: datadog_out
+    sources: [delta]
+    api_key: soak-standin           # the stand-in checks no key
+    # Series go to the stand-in's /api/v2/series over plain HTTP.
+    endpoints: { api: http://standin:8080 }
+    compression: gzip               # the default, written out: the checks decode it with zlib
+    # buffer: defaults (block, at_least_once, retry_max_delay 10s)
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }

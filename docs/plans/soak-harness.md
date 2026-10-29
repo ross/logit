@@ -586,6 +586,10 @@ sut_transforms = ["parse", "labels", "count", "metrics_only"]   # optional, in o
   points and carry no other payload; a message whose points merge, that has none, or whose
   parent carries metrics or a span and goes on beside its children reads as a `ledger.edge`
   FAIL, since no counter counts such a message.
+- `merge`, optional (W22), lists `dedup_timestamps` nodes of the source's `sut_transforms`
+  whose discards are merges, each merged record credited back as delivered (§6, M).
+  `load()` checks each node's kind against the SUT config, and refuses `merge` beside a
+  `fan_out` and under `split = "target"`, whose rows read one `aggregate` per sink.
 - With the role map: every source's `service` is a `generator`, and every `generator` in the
   stack has a source, because a generator with none would put lines into a listener with no
   G behind them.
@@ -1025,6 +1029,7 @@ and takes the worst status; `report.py` is unchanged.
 | X | per listener, SUT `logit.component.events.dropped{component=<sut_listener>}` under every reason (W7a): events the listener counted as sent and then dropped, such as a batch sent into the inbox of a node that has failed (`closed_consumer`) |
 | T_in[node], T_out[node] | with a source's `sut_transforms` (W8b), each node's `logit.component.events.received` and `logit.component.events.sent` |
 | T_disc[node] | each such node's `logit.component.events.discarded` (W13a), the events it received and sent no part of, which the runtime counts for every Transform node, only when nonzero, so an absent count is 0; ΣT_disc sums every node of every source |
+| M[node], T_ab[node] | at each `merge` node (W22), its `logit.transform.metrics.merged` and `logit.transform.metrics.absorbed`; M sums every `merge` node. Each merged record's increment reaches V inside its survivor, so every row after the node reads Ab + M where it reads Ab and ΣT_disc − M where it subtracts the discards. With one record per event, as a statsd line has, each merge empties its event, so T_disc[node] == M[node] |
 | T_lines[node] | each such node's `logit.transform.lines.dropped` under every reason (W13b); only `line_protocol` counts it, under `malformed`, for a bad line in a message whose log doesn't go on |
 | W′ | with a source's `fan_out` (W13b), each listener's W − D − B − X carried through its chain (`Ledger.through`): a `fan_out` node of k turns x events into k × x − T_lines + (T_in − T_disc), its children and the parents it sent on; any other node into x − T_disc. Summed over the listeners, it takes W − D − B − X − ΣT_disc's place in the residual, a stopped life's egress gap, and the end-to-end bound; R and a killed life's ingest rate grow by each chain's product of k. A fan-out node's own T_disc counts its parents, which went on as children, so it is never loss |
 | A | aggregate `logit.component.events.received` |
@@ -1284,7 +1289,8 @@ The rows:
   judged hop by hop: its listener's E == T_in[first node], T_in − T_disc == T_out at every node
   (from W13a; each sends every event it receives that it doesn't discard), T_out[node] ==
   T_in[next node], and the last node's T_out takes that listener's E's place in the sum. The
-  detail shows each node's T_disc. From W13b a `fan_out` node of k is held instead to
+  detail shows each node's T_disc. From W22 a `merge` node is also held to T_disc == M, and
+  to T_ab == 0 in every life a kill didn't end. From W13b a `fan_out` node of k is held instead to
   children == k × T_in − T_lines, with no tolerance, its children being T_out − (T_in − T_disc),
   the count [ADR `transform-fan-out`](../adr/transform-fan-out.md)'s "Telemetry stays as it
   is" gives; with one, `ledger.summary`'s path term becomes the sum of these chain terms and
@@ -1376,6 +1382,11 @@ The rows:
   while others flush FAILs; set `vm_every_window` only where every series is written in every
   window. The detail names each excused gap with its offsets, its series count, and the
   batches and drains counted.
+- `ledger.absent` (W22), only for a sink with a `vm_absent_selector`, else SKIP: the driver
+  exports what the selector matches at the end into `vm-export/<sink>.absent.jsonl` and
+  records `vm_absent_exported`, and the row FAILs any series there, naming the SUT lives its
+  samples fall in, and an export that failed or never ran. A count balances whichever keys a
+  `sample` keeps; only absence shows that every life kept the same ones.
 - `ledger.replay`, for each killed life followed by another and each sink, else SKIP: the next
   life's
   first-drain `buffer.disk.replayed` equals the killed life's `buffer.batches` at its last
@@ -1407,7 +1418,8 @@ The rows:
   With `sut_script` (W7a), E − A becomes (E − L_in) + (L_in − L_emit − L_drop − L_err) +
   (L_emit + L_flush − L_sent) + (L_sent − A), the egress term is Ab − L_flush − V, and the
   script's L_drop and L_err are shown beside them as counted. With `sut_transforms` (W13a),
-  E − A becomes E − ΣT_disc − A, and ΣT_disc is shown beside it as counted. With a `fan_out`
+  E − A becomes E − ΣT_disc − A, and ΣT_disc is shown beside it as counted; with a `merge`
+  node (W22) the egress term is Ab + M − V, and ΣT_disc is shown with its M credited. With a `fan_out`
   (W13b), which doesn't telescope, E − A becomes `ledger.edge`'s chain terms summed plus
   Σ(sent into aggregate) − A, and ΣT_disc isn't shown, since W′ carries it. From W7b there is
   one egress term per egress group, each of which must be 0 or counted on its own, so a surplus
@@ -2488,8 +2500,9 @@ where it needs them, and a small check extension.
     `logit.input.batches.deferred` are a retry the producer makes, not loss, and a client's
     resend of a request the SUT took before the answer was lost is a surplus, allowed one
     batch per transport-error attempt, as a TCP window's is per ambiguous drop. `otlp_in` has
-    rows of its own in `checks.HTTP_LISTENERS`, with W per log record (one `Event` per
-    `LogRecord`) and no request identity, for W13b's generator, which `otlp-fan-out` runs.
+    rows of its own in `checks.HTTP_LISTENERS`, with W per log record and per metric data
+    point (one `Event` each) and no request identity, for W13b's generator, which
+    `otlp-fan-out` runs, and W23's, which `delta-datadog` runs.
     Built as `http-ingress`: each point carries a string field alone, so the SUT decodes no
     gauge, which V can't count, and `kv_metrics` counts one per point. Faults: netem delaying
     the SUT's egress past `influxdb_out`'s 10 s timeout, which carries the answers, and
@@ -2589,7 +2602,7 @@ eviction under `cumulative_to_delta` are reported, not judged (item 20); AGENTS.
 names `otlp_out` and `splunk_hec_out` once their stand-ins land (item 26); and the follow-ups
 under "Deferred to a later round" wait.
 
-19. **Discarding and merging transforms (W22).** `sut_transforms` today holds nodes that send
+19. **Discarding and merging transforms (built in W22).** `sut_transforms` today holds nodes that send
     an event or count it `events.discarded`, judged T_in − T_disc == T_out with ΣT_disc taken
     out downstream (item 13), and `fan_out` is for `line_protocol` alone. No `sut_transforms`
     node sits between `aggregate` and the sink, whose only identity there is
@@ -2624,7 +2637,10 @@ under "Deferred to a later round" wait.
       at 0.
 
     `aggregate`'s `max_series` admission drops, `metrics.dropped{reason="series_limit"}`, are
-    loss, so a fourth scenario driving them is optional and lands only if it's cheap.
+    loss, so a fourth scenario driving them is optional and lands only if it's cheap. W22 left
+    it out: a refused record is received and never absorbed, so `ledger.aggregate`'s A == Ab
+    FAILs it, and `drop_credit` counts a gap only from a dropped batch. Scoring it needs a
+    per-record credit at `aggregate`, a ledger term of its own, not a scenario.
 20. **`cumulative_to_delta` (W23).** Generator `generate_in → aggregate (temporality:
     cumulative) → otlp_out`, emitting a fixed N series; SUT `otlp_in → cumulative_to_delta
     (initial_value: auto) → datadog_out` into the Datadog-shaped stand-in (§8c). Datadog is the
@@ -2636,11 +2652,13 @@ under "Deferred to a later round" wait.
       `"decrease"`, the point emitted whole), netem, the stand-in's `Clean`, `Ambiguous`, and
       `Refused` cues, and resends, which
       `logit.transform.metrics.skipped{reason="duplicate"|"out_of_order"}` makes idempotent.
-    - Reported, not judged: a cued step that loses value on the SUT, which is a `Rejected`
-      status, a `202` whose `series_errors` body names series, and stale points
-      (`records.dropped{reason="stale"}`). The SUT counts those drops in records, not value, and
-      `cumulative_to_delta` has already moved its baseline past the dropped delta, so no later
-      point restores it.
+    - Judged exactly through U: a cued step that loses value on the SUT, which is a `Rejected`
+      status or a `202` whose `series_errors` body names series. The SUT counts those drops in
+      records, not value, and `cumulative_to_delta` has already moved its baseline past the
+      dropped delta, so no later point restores it, but the stand-in's record holds each lost
+      point's value, so the row takes U from the record and judges I − V − U.
+    - Bounded, not judged exactly: stale points (`records.dropped{reason="stale"}`), which never
+      reach the record, enter the band as drops the record can't see.
     - Reported, not judged (decided with Ross): the first SUT life's start, a SUT restart, and
       a staleness eviction, each inside its window. The transform's state is in memory, and
       `auto` skips a point whose start precedes the component's own, so no counter gives the
@@ -2651,6 +2669,53 @@ under "Deferred to a later round" wait.
     - A delta resent downstream counts twice: `datadog_out` isn't duplicate-safe, and the
       stand-in's `datadog` shape already counts each distinct copy once and reports duplicates
       per life.
+
+    As built (W23), as `delta-datadog`:
+    - `[ledger] sut_delta` names the `cumulative_to_delta` node in place of `sut_aggregate`.
+      The scenario loader refuses it beside `sut_aggregate`, `sut_script`, a hop, a `split`,
+      `vm_every_window`, or `[overlap]`, refuses it with more than one source, a `fan_out`, the
+      node in `sut_transforms`, or any target but a `datadog` stand-in, and refuses a node of
+      another kind.
+    - The count rows judge points with the node in `aggregate`'s place:
+      - Ab is the node's `events.sent`, and Δ_disc its `events.discarded`, the points it skipped.
+        Δ_disc leaves every row after the edge as ΣT_disc does (item 13), and `ledger.aggregate`
+        judges Ab == A − Δ_disc in the final life.
+      - V is the stand-in's distinct stored points, each credited to the life its request
+        reached the stand-in in. A point's timestamp is the generator's window, which can fall
+        in the life before the one that sent it.
+      - The kill band's interval is the generator's `aggregate` interval, the most a killed life
+        held before sending.
+    - `ledger.value`'s symbols:
+
+      | Symbol | Meaning |
+      |---|---|
+      | I | The generator's `generate_in` `events.sent`, less its counted drops ahead of its sink. |
+      | V | The sum of the stand-in's distinct stored delta values. |
+      | U | Each point the stand-in never stored whose last request fell in a `rejected` step or drew a `202` naming `series_errors`, read from the record's bodies. |
+
+      The rest of a cued loss, the gap I − V − U, is judged rather than reported, because the
+      record holds the lost values.
+    - With no reported window and no drop the record can't see, the row is exact:
+      I − V − U == 0. Below 0 it FAILs as a surplus.
+    - A reported window opens at each drain that counts `skipped{reason="initial"}` or
+      `series.evicted` on the node. It runs back to the node's last receiving drain before it
+      in that life, or the previous life's last drain, widened by one generator window and one
+      drain interval. A generator sink's `shutdown` drop adds a window too.
+    - Each window is bounded alone by what it can lose: its skipped (or evicted) series times
+      one generator window of one series' increments, the median stored delta, plus one window
+      of every series as slack for a window boundary. It widens to the generator's increments
+      over its whole span only when the generator's sink counted a dropped batch or event in it,
+      which moves the first point the SUT sees further on, when the life before it ended in a
+      kill, which loses the deltas the SUT's sink still held, or for a shutdown drop's window.
+    - With windows, the gap is reported if it's no more than the sum of the windows' bounds,
+      plus each drop the stand-in can't see (`events.dropped` other than `rejected`,
+      `records.dropped` other than `rejected` and `oversize`, stale points included) times the
+      largest stored delta. Past that it FAILs: value was lost outside the windows. A first
+      version bounded the windows by the increments over their whole spans, which on the first
+      run's re-score was 195,000 against a gap of 14,800, so a loss of 13% of I outside every
+      window would have passed.
+    - Stale points can't be cued in a run of 30 minutes or less, because `datadog_out`'s window
+      reaches an hour back, so they enter only the unseen drops' bound.
 21. **More HTTP listeners (W24).** Item 14's `http` wire for three more listeners, each a
     scenario:
     - `splunk-hec-ingress`: generator `splunk_hec_out` with `ack: true` → SUT `splunk_hec_in`.
@@ -2970,9 +3035,9 @@ that items 3, 7, and 11 need.
   `dedup_timestamps` node, an amendment to ADR `soak-harness` for the merge term, self-test
   fixtures for each rule, and the `sample-path`, `dedup-merge`, and `cardinality-capped`
   scenarios, each run recorded under "Findings".
-- **W23**: item 20: the value ledger row against the Datadog-shaped stand-in, the reported
-  windows (value-losing cues, the first SUT life's start, SUT restarts, and staleness
-  evictions), an amendment to ADR `soak-harness` for the value ledger, self-test fixtures for
+- **W23**: item 20: the value ledger row against the Datadog-shaped stand-in, the
+  value-losing cues judged through U, the reported windows (the first SUT life's start, SUT
+  restarts, staleness evictions, and a generator shutdown drop), each bounded alone, an amendment to ADR `soak-harness` for the value ledger, self-test fixtures for
   each rule, and a `cumulative_to_delta` scenario, with a run recorded under "Findings".
 - **W24**: item 21: `LISTENER_WIRES` and `HTTP_LISTENERS` entries for `splunk_hec_in`,
   `datadog_in`, and `prometheus_in`'s remote-write receiver, the mode-keyed wire lookup for
@@ -5883,3 +5948,125 @@ development host. Overall PASS, with only inapplicable SKIPs. It confirms the 20
   which the 180 s consumer bound should still cover, but no run has measured it.
 - **RSS and descriptors were flat.** `rss_slope` read +1.7 MiB/h on the SUT and −0.0 on the
   generator, and both kept their descriptor count.
+
+### W22: `sample`, `dedup_timestamps`, and a capped `aggregate` in the path (2026-10-29)
+
+Each scenario ran once on the development host (`sailfish`, 32 cores, Linux 7.2.13), against
+`logit:soak` built with `--no-cache` at 2026-10-29 10:00 PDT from `soak/w22`, whose diff touches
+no product code, over `origin/main` at `5d8fd053`. Other agents' soak runs shared the daemon
+during the last two. Every row of every run was PASS or SKIP:
+
+| Run | Scenario | Duration | Verdict |
+|---|---|---|---|
+| `20261029T170202Z` | `sample-path` | 15m30s, its default | PASS |
+| `20261029T171839Z` | `dedup-merge` | 15m30s, its default | PASS |
+| `20261029T173550Z` | `cardinality-capped` | 25m (`--duration`; its default is 75m) | PASS |
+
+What the runs showed:
+
+- **`sample` kept the same shards in every life.** The backend held 70 series, the 7 kept
+  shards' 10 each, and `ledger.absent` found no series of shards 1, 4, or 8 across 4 SUT lives
+  (a stop, a kill, and a restart). `sample` discarded 30% of each life's lines, 147,600 of
+  492,000 in life 0 and 270,030 of 900,100 in the final life, as 3 of 10 equally loaded shards
+  give, and no verdict was `by="missing"`. `ledger.edge` balanced the node's discards in every
+  life, and the killed life's Ab − V of 7,140 sat inside its band.
+- **Receive-time collisions merge most of a statsd stream at 1 ms.** `dedup` merged 783,792 of
+  the final life's 900,100 lines, 87%: the generator writes 100 lines at a time over 10 series,
+  and a burst's datagrams mostly land in one millisecond. Every merged record emptied its event,
+  so T_disc == M held in the final life, `metrics.absorbed` and `metrics.passed_through` stayed
+  0, and V equaled Ab + M: 900,100 with Ab 116,308. Without the merge term,
+  `ledger.egress` would FAIL the final life on an Ab − V of −783,792.
+- **A capped name's churn costs nothing that grows, over 23 minutes.** After warmup every one
+  of the 200 churn lines a second folded into its name's overflow series, 276,000 of them; 10
+  names were overflowing in every window, `series.active` peaked at 110, no record dropped for
+  `series_limit`, and the backend held 210 series: 100 fixed names, 10 admitted values per churn
+  name, and 10 overflow series. The SUT's interner grew 10.5 strings an hour, so a tag value
+  isn't interned, and `rss_slope` read +4.3 MiB/h on the SUT and +1.2 on the generator against
+  48. A 25-minute run reports growth as WARN at most, so the expected PASS is still owed a run of
+  an hour or more at the scenario's default 75 minutes.
+
+`aggregate`'s `max_series` admission drops got no scenario: see item 19.
+
+### W23: a `cumulative_to_delta` value ledger (2026-10-29)
+
+`delta-datadog` ran for 22 minutes 30 seconds on the development host, against `logit:soak`
+(`sha256:4f9075e1…`) built on 2026-10-29 by a concurrent soak session; no soak branch changes
+Rust. The run is `perf/results/soak/20261029T175130Z`. It first scored one FAIL
+(`ledger.standin`) and one WARN (`recovery`), both harness misreadings fixed on the branch, as
+below. The table is its re-score with `script/soak check`, overall WARN.
+
+| Check | Status | Detail |
+|---|---|---|
+| `run` | PASS | ran from start through end_end |
+| `timeline` | PASS | 22 apply/revert action(s) returned 0; 4 start(s) or unpause(s) each probed; no fail fast |
+| `exit` | PASS | 3 exit(s) of the logit services, each a scheduled stop with code 0 or a scheduled kill with code 137 (1 kill(s)) |
+| `restarts` | PASS | 4 start(s), each a scheduled start or restart |
+| `self_log` | PASS | 9 sink fault line(s) inside fault windows, 0 outside, 0 expected-exit line(s), 0 other ERROR, 0 non-JSON |
+| `ready` | PASS | 96 readiness sample(s) read ok outside fault windows; 4 start(s) or unpause(s) ready in time, slowest ready 0.1s |
+| `progress` | PASS | 10 30s window(s) outside fault windows, judged per sink (standin target: no VictoriaMetrics): datadog: deliveries in 10 of 10, no freshness samples; 270s of 1290s after warmup judged (21%; WARN under 5%) |
+| `rss_slope` | PASS | generator PASS: MiB/h life 0 -0.2, life 1 +41.0 (limit 64); 375s of 1290s after warmup judged (29%; WARN under 5%) \| logit PASS: MiB/h life 0 +8.4, life 1 +30.1, life 2 +11.1 (limit 64); 370s of 1290s after warmup judged (29%; WARN under 5%) |
+| `fd_slope` | PASS | generator PASS: warmup median 15 -> end 15 (limit +8) \| logit PASS: warmup median 17 -> end 17 (limit +8) |
+| `ledger.wire` | PASS | G 5,060 (acknowledged of 5,060 attempted) = W 5,060 − X 0 + gap 0 (19 in reported windows, 0 in judged HTTP-affecting windows, -20 steady, 0 at the end; loss judged 20, each run at 0 or more, against limit 260); the generator's requests: 0 transport-error attempt(s), 7 connect failure(s), 0 answered 5xx and retried; its counted loss, not in G: 0 event(s) in 0 batch(es) |
+| `ledger.intake` | PASS | final life 2: W − D 800 vs E + B 800; final life 2: otlp_in counts no requests: W − D == E + B alone; life 0: W − D − B − X − Δ_disc − Ab 0 within [0, R]; life 1: W − D − B − X − Δ_disc − Ab 0 within [0, R] (R 67,000 = 0 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.edge` | PASS | final life 2: E 800 == A 800 (listener to aggregate); A_sent 780 == S_in[datadog] 780 (aggregate to datadog) |
+| `ledger.script` | SKIP | no [ledger] sut_script |
+| `ledger.aggregate` | PASS | final life 2: Ab 780 == Ad 780 (every point delta didn't skip sent on: Ab its events sent, Ad its events received less Δ_disc) |
+| `ledger.egress` | PASS | datadog: life 0: W − D − B − X − Δ_disc − V 88 = residual 0 + Ab − V 88, counted (batches dropped: rejected 4; records dropped: rejected 88); rejected 4 cued by c0s2, counted; life 1 (killed): Ab 600 − V[datadog] 600 = 0, ok (band [-20, 40]: ingest 4/s over the last drain interval; below, the residual 0 plus one 5.00002s drain interval of ingest, absorbed after the last drain and flushed before the kill; above, one 5s generator window of points sent past delta and not yet stored at the kill plus one drain interval of queue growth after the last drain); residual W − D − B − X − Δ_disc − Ab 0 at its last drain, what the kill lost from the receive queue and inbox, by design, not judged here; D has no shutdown part: a SIGKILL counts no shutdown drops; life 2 (final): Ab 780 − V[datadog] 780 = 0, ok (split copy; R 67,000 = 0 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.windows` | SKIP | not enabled ([ledger] vm_every_window) |
+| `ledger.replay` | PASS | datadog: life 2's first drain replayed 0 vs killed life 1's last-drain buffer.batches 0 (one batch in flight allowed) |
+| `ledger.summary` | PASS | final life 2: uncounted 0 = W − D − E − B 0 + E − A 0 + A − Δ_disc − Ab 0 + Ab − V[datadog] 0; delta's skipped points Δ_disc 20, counted; wire G − (W + K + F) 0 over the run, F 0 counted; ledger.wire judges the rest; end to end over the run, G 5,060 less counted loss 60 plus a resend allowance 0: datadog: V 4,912 <= G − counted + resent 5,000 |
+| `ledger.value` | PASS | I 1,355,500 (generate_in sent 1,355,500 − lost 0) − V 1,318,700 − U 22,000 = 14,800, reported: within the 75,000 that the 3 reported window(s) can lose, each bounded alone; U 2,000 cued by c0s1, 20,000 cued by c0s2 |
+| `ledger.sent` | PASS | to standin: every batch received ended in an accepted response; datadog: requests 2xx 246, 4xx 11, 5xx 7, connect_error 3, network_error 7; records accepted 4,912; cued, excused: request_refused line(s) 3 by c0s3; batch(es) dropped rejected 4 by c0s2; record(s) dropped rejected 8 by c0s1, 80 by c0s2; datadog life 0 at +900s: received 181 vs delivered 177 + dropped 4 + buffer.batches 0, gap 0; datadog life 1 at +1150s: received 30 vs delivered 30 + dropped 0 + buffer.batches 0, gap 0; datadog life 2 at +1375s: received 39 vs delivered 39 + dropped 0 + buffer.batches 0, gap 0 (one batch in flight allowed); ledger.egress and ledger.standin read the stand-in's record |
+| `ledger.topic` | SKIP | standin target: no topic |
+| `ledger.standin` | WARN | 20 pair(s) of points of one series in one second from two requests, first logit.soak.requests_0 at +795s stored 250, then 25: Datadog keeps the later and loses the other uncounted, which datadog_out collapses only within one batch (docs/known-gaps/datadog.md); 271 request(s) recorded, 253 stored, 10 cue(s); 140 duplicate copies of stored points (life 0 140), 35,000 counted twice by the destination, reported; 8 series named by series_errors; 5 classed step(s) (at_least_once) |
+| `identity.sink` | PASS | final life 2 at +1375s: datadog: received 39 vs delivered 39 + dropped 0 + buffer.batches 0, gap 0 (one batch in flight allowed) |
+| `drops` | PASS | no *.dropped count outside the ledger and the sink rows |
+| `recovery` | PASS | 11 of 11 fault(s) judged at 1 sink(s), each recovered within recovery_bound 45s of its end; warmup rate 4/s |
+| `file.reopen` | SKIP | the scenario has no rename step |
+| `tls.served` | SKIP | the scenario has no probe step |
+| `expect.generator-restart-resets` | PASS | delta of logit.transform.series.reset{component=delta} on logit, through c0s8: c0s8 (+795s, +870s]: 20 (over 15 drain(s)), want >= 20 and <= 20 |
+| `expect.restart-skips-initial` | PASS | delta of logit.transform.metrics.skipped{component=delta, reason=initial} on logit, through c0s9: c0s9 (+900s, +975s]: 20 (over 15 drain(s)), want >= 20 and <= 20 |
+| `expect.pause-evicts-idle` | PASS | delta of logit.transform.series.evicted{component=delta, reason=idle} on logit, through c0s10: c0s10 (+1005s, +1150s]: 20 (over 29 drain(s)), want >= 20 and <= 20 |
+| `expect.kill-skips-initial` | PASS | delta of logit.transform.metrics.skipped{component=delta, reason=initial} on logit, through c0s11: c0s11 (+1155s, +1230s]: 20 (over 9 drain(s)), want >= 20 and <= 20 |
+| `expect.netem-skips-no-initial` | PASS | delta of logit.transform.metrics.skipped{component=delta, reason=initial} on logit, through c0s7: c0s7 (+690s, +795s]: 0 (over 21 drain(s)), want <= 0 |
+| `expect.series-errors-drop-records` | PASS | delta of logit.output.records.dropped{component=datadog, reason=rejected} on logit, through c0s1: c0s1 (+60s, +125s]: 8 (over 13 drain(s)), want >= 2 |
+| `expect.rejected-drops` | PASS | delta of logit.component.batches.dropped{component=datadog, reason=rejected} on logit, through c0s2: c0s2 (+165s, +230s]: 4 (over 13 drain(s)), want >= 1 |
+| `expect.refused-holds` | PASS | max of logit.component.retrying{component=datadog} on logit, during c0s3: c0s3 (+270s, +290s]: 1 (1 sample(s)), want >= 1 |
+| `expect.clean-holds` | PASS | max of logit.component.retrying{component=datadog} on logit, during c0s6: c0s6 (+585s, +605s]: 1 (1 sample(s) and the value in force at its start), want >= 1 |
+
+- **The value balanced inside its reported windows.** I was 1,355,500, V 1,318,700, and U
+  22,000: 2,000 from the two series c0s1's `202`s named, four times over, and 20,000 from
+  c0s2's four rejected batches. The gap, 14,800, is about three windows of 20 series × 250:
+  the first point after the SUT restart, after the idle eviction, and after the kill, each
+  skipped and counted 20 times. No window opened at life 0's start: the SUT was up before the
+  generator's first point, so `auto` emitted it whole. Each window is bounded alone: the SUT
+  restart's and the eviction's at 10,000 each (20 skips × 250, plus 5,000 of slack), and the
+  kill's at 55,000, its span's increments, since a kill loses the sink's queued deltas. The
+  three sum to 75,000. Before review the row pooled the windows' whole spans into a band of
+  195,000, inflated by the 100 s pause and `generate_in`'s catch-up after it, which would have
+  passed a loss of about 13% of I outside every window.
+- **Netem, the generator restart, and the cues that lose nothing lost no value.** The 20% loss
+  caused no initial skip (`netem-skips-no-initial` read 0), so each `otlp_out` resend was
+  skipped as a duplicate or emitted once. The generator restart reset all 20 series, each
+  first point emitted whole. The `503` after storing left 140 duplicate copies, 35,000 that
+  Datadog would count twice, which `ledger.standin` reports and V counts once.
+- **The generator restart sent two points of each series in one second.** On shutdown the
+  generator's `aggregate` flushed a 0.5 s partial window, 25 per series, at +795.0, half a
+  second after its last full 5 s window, 250, at +794.5. Both truncate to one epoch second,
+  1793297098, which `datadog_out` sends in two requests, and Datadog keeps the later, so it would lose 250 of each series
+  uncounted. That's the documented gap that `datadog_out` collapses same-second points only
+  within a batch (`docs/known-gaps/datadog.md`), but its workaround, an `aggregate` upstream,
+  doesn't cover that `aggregate`'s own shutdown flush. `ledger.standin` read the pair as a
+  resend that changed a sample and FAILed. `datadog_out` re-encodes a resend's points
+  unchanged, so under the `datadog` shape the row now WARNs on such a pair, naming the gap.
+- **`recovery`'s baseline was the input's rate, not the wire's.** It compared the SUT's
+  ingest, 4 points a second behind the generator's `aggregate`, with `generate_in`'s 1,000
+  events a second, so every fault read as unrecovered at 0%. On an HTTP wire the baseline is
+  now the writer's events received, the same rate wherever `generate_in` feeds the writer.
+- **Every expectation held.** 20 resets for the generator restart, 20 initial skips each for
+  the SUT restart and the kill, 20 idle evictions for the pause, 8 records dropped `rejected`
+  for c0s1's named series, 4 batches dropped `rejected` for c0s2, and `retrying` at 1 under
+  the `401` and the stand-in stop.
+- **`otlp_in`'s W fits metrics.** It counts one event per data point, as G does while each
+  event carries one, so `ledger.wire` balanced at 5,060. Its resend allowance had used the
+  input's batch, 100 events, as the unit; the writer's own batch, 20 points, replaces it.

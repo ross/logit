@@ -1,0 +1,224 @@
+# OTLP cumulative sums through cumulative_to_delta into datadog_out, against the Datadog-shaped
+# stand-in, with the value each delta carries judged beside the point counts. The generator
+# sums 1,000 increments a second into 20 running totals and sends them every 5 s; the SUT
+# differences each against its last point and posts the deltas. `ledger.value` holds the
+# stand-in's stored deltas, plus what a cued step lost, to the generator's increments. An SUT
+# start, an SUT restart, and the idle eviction a long generator pause causes each skip a
+# series' first point, whose value no counter gives, so each opens a reported window bounded
+# alone by the points it skipped (the kill's widened to its span, since a kill loses queued
+# deltas). Netem, a generator restart (a reset, its point emitted whole), and every cued class
+# lose nothing the record doesn't give, so any loss there must fit inside the windows' bounds.
+# Each `respond` step's `class` names the fault class datadog_out must read
+# (crates/logit-outputs/src/datadog.rs, "Faults, retries, and duplicate safety"). The schema is
+# docs/plans/soak-harness.md's "The scenario schema".
+
+name = "delta-datadog"
+description = "generator aggregate (cumulative) -> otlp_out -> otlp_in -> cumulative_to_delta -> datadog_out (series, gzip) against a stand-in, with a value ledger"
+duration = "22m30s"       # warmup + one cycle + cooldown
+warmup = "60s"
+cooldown = "60s"          # >= recovery_bound
+recovery_bound = "45s"    # the sink's retry_max_delay 10s + two generator windows + a drain
+cycle = "20m30s"          # the last step, its recovery, and two progress windows
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"
+
+[target]
+kind = "standin"
+shape = "datadog"
+
+[ledger]
+sut_delta = "delta"       # in place of sut_aggregate: the count rows judge points
+wire_loss_outside_faults = 0.0
+
+[[ledger.source]]
+service = "generator"
+generator_input = "load"
+generator_sink = "otlp"
+sut_listener = "otlp"
+wire = "http"             # G events.delivered, W the listener's events.sent: one per data point
+
+[[ledger.sink]]           # the one sink, whose writes the stand-in records
+id = "datadog"
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64
+fd_growth = 8
+
+[[step]]                  # c0s1: a 202 naming 2 series dropped: their deltas are lost, cued
+at = "0s"
+action = "respond"
+on = "standin"
+status = 202
+series_errors = 2
+for = "20s"
+
+[[step]]                  # c0s2: 400, a bad payload: dropped, its deltas lost, cued
+at = "1m45s"
+action = "respond"
+on = "standin"
+status = 400
+class = "rejected"
+for = "20s"
+
+[[step]]                  # c0s3: 401, a missing key: held, nothing lost
+at = "3m30s"
+action = "respond"
+on = "standin"
+status = 401
+class = "refused"
+for = "20s"
+
+[[step]]                  # c0s4: 503 after storing: a duplicate the stand-in counts once
+at = "5m15s"
+action = "respond"
+on = "standin"
+status = 503
+apply = true
+class = "ambiguous"
+for = "20s"
+
+[[step]]                  # c0s5: a transport error after the request was sent: retried
+at = "7m"
+action = "respond"
+on = "standin"
+answer = "reset"
+class = "ambiguous"
+for = "20s"
+
+[[step]]                  # c0s6: a connect failure: held
+at = "8m45s"
+action = "stop"
+on = "standin"
+class = "clean"
+for = "20s"
+
+[[step]]                  # c0s7: loss on the generator's requests: resends the SUT skips
+at = "10m30s"
+action = "netem"
+on = "generator"
+args = "loss 20%"
+for = "60s"
+
+[[step]]                  # c0s8: a generator restart: new totals, each point a reset
+at = "12m15s"
+action = "restart"
+on = "generator"
+for = "30s"
+
+[[step]]                  # c0s9: an SUT restart: each series' first point skipped, reported
+at = "14m"
+action = "restart"
+on = "logit"
+for = "30s"
+
+[[step]]                  # c0s10: a generator pause past max_staleness: every series evicted
+at = "15m45s"
+action = "pause"
+on = "generator"
+for = "100s"
+
+[[step]]                  # c0s11: an SUT kill: each series' first point skipped, reported
+at = "18m15s"
+action = "kill"
+on = "logit"
+for = "30s"
+
+# The transform's own counts, one series each per event, 20 series.
+[[expect]]
+name = "generator-restart-resets"
+service = "logit"
+metric = "logit.transform.series.reset"
+component = "delta"
+step = "c0s8"
+window = "through"
+reduce = "delta"
+min = 20
+max = 20
+
+[[expect]]
+name = "restart-skips-initial"
+service = "logit"
+metric = "logit.transform.metrics.skipped"
+attrs = { component = "delta", reason = "initial" }
+step = "c0s9"
+window = "through"
+reduce = "delta"
+min = 20
+max = 20
+
+[[expect]]
+name = "pause-evicts-idle"
+service = "logit"
+metric = "logit.transform.series.evicted"
+attrs = { component = "delta", reason = "idle" }
+step = "c0s10"
+window = "through"
+reduce = "delta"
+min = 20
+max = 20
+
+[[expect]]
+name = "kill-skips-initial"
+service = "logit"
+metric = "logit.transform.metrics.skipped"
+attrs = { component = "delta", reason = "initial" }
+step = "c0s11"
+window = "through"
+reduce = "delta"
+min = 20
+max = 20
+
+[[expect]]
+name = "netem-skips-no-initial"
+service = "logit"
+metric = "logit.transform.metrics.skipped"
+attrs = { component = "delta", reason = "initial" }
+step = "c0s7"
+window = "through"
+reduce = "delta"
+max = 0
+
+# The sink's classes, beside ledger.standin's check of every step.
+[[expect]]
+name = "series-errors-drop-records"
+service = "logit"
+metric = "logit.output.records.dropped"
+attrs = { component = "datadog", reason = "rejected" }
+step = "c0s1"
+window = "through"
+reduce = "delta"
+min = 2
+
+[[expect]]
+name = "rejected-drops"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "datadog"
+attrs = { reason = "rejected" }
+step = "c0s2"
+window = "through"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "refused-holds"
+service = "logit"
+metric = "logit.component.retrying"
+component = "datadog"
+step = "c0s3"
+window = "during"
+reduce = "max"
+min = 1
+
+[[expect]]
+name = "clean-holds"
+service = "logit"
+metric = "logit.component.retrying"
+component = "datadog"
+step = "c0s6"
+window = "during"
+reduce = "max"
+min = 1

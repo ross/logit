@@ -26,16 +26,17 @@ accepted, and its duplicate copies and repeated data points per life against
 `EPOCH_BUMP_REASONS`; it SKIPs for every other target.
 
 The ledger follows each `[[ledger.sink]]`. A row about a sink (`progress`, `identity.sink`,
-`recovery`, `ledger.egress`, `ledger.windows`, `ledger.replay`, `ledger.sent`) keeps its id,
-reports one line per sink, and takes the worst status. Under `split = "copy"` each sink holds a
-full copy of `aggregate`'s output, so each sink's V is judged alone; under `split = "route"` the
-sinks' V add up to it, so the egress gap is judged on their sum. That holds because `load()`
-refuses `split = "route"` over a `route` that can send one event to several targets (a
-list-valued `routes:` value) and over any `route_signals`, so each event reaches
-one sink. Those routers run under `split = "target"`: each sink sits behind its own target and
-`aggregate`, the listeners' rows end at the router (`[ledger] sut_router`), the router balances
-as received + copied − discarded == its forward edge's sends + its targets' (`router_balance`),
-and each sink's rows start at its own target (`branch_fed`), so each sink's V is judged alone.
+`recovery`, `ledger.edge`, `ledger.egress`, `ledger.windows`, `ledger.absent`, `ledger.replay`,
+`ledger.sent`)
+keeps its id, reports one line per sink, and takes the worst status. Under `split = "copy"` each
+sink holds a full copy of `aggregate`'s output, so each sink's V is judged alone; under `split =
+"route"` the sinks' V add up to it, so the egress gap is judged on their sum. That holds because
+`load()` refuses `split = "route"` over a `route` that can send one event to several targets (a
+list-valued `routes:` value) and over any `route_signals`, so each event reaches one sink. Those
+routers run under `split = "target"`: each sink sits behind its own target and `aggregate`, the
+listeners' rows end at the router (`[ledger] sut_router`), the router balances as received + copied
+− discarded == its forward edge's sends + its targets' (`router_balance`), and each sink's rows
+start at its own target (`branch_fed`), so each sink's V is judged alone.
 
 The ledger also follows each `[[ledger.source]]`, a generator and the SUT listener it reaches
 over the source's `wire` (`WIRES`), which names the counters each symbol reads.
@@ -50,7 +51,10 @@ source's `sut_transforms` are judged hop by hop in `ledger.edge`, each node's di
 egress gap, `ledger.summary`'s path term, and the end-to-end bound as a script's discards do
 (`Ledger.discarded`). A source's `fan_out` node emits k events per event, so with one the rows
 that compare the listeners' symbols with `aggregate`'s or V read them carried through the chain,
-W′ (`Ledger.through`), which takes the discards in. `recovery` judges the
+W′ (`Ledger.through`), which takes the discards in. A source's `merge` node discards the events
+its merges emptied, and every row after it credits the merged records back as delivered
+(`Ledger.merged`). A sink's `vm_absent_selector` must match no series at the end
+(`check_ledger_absent`). `recovery` judges the
 listeners' summed ingest against the generators' summed warmup rate.
 
 A run against a stand-in target (`[target] kind = "standin"`) has no VictoriaMetrics either: V
@@ -109,6 +113,8 @@ from .scenario import (DEFAULT_RSS_SETTLE_S, DEFAULT_WIRE, EXPECT_REDUCERS, FILE
                        stdio_shared_targets, tls_reload_polls)
 
 PASS, WARN, FAIL, SKIP = "PASS", "WARN", "FAIL", "SKIP"
+# The suffix of a sink's `vm_absent_selector` export beside its `vm-export/<sink>.jsonl`.
+ABSENT_SUFFIX = ".absent.jsonl"
 _ORDER = {PASS: 0, SKIP: 0, WARN: 1, FAIL: 2}
 # The self-log keys of a TLS reload that kept the previous files, and of one that loaded
 # (crates/logit-pipeline/src/tls.rs, `Watched::check`).
@@ -1363,6 +1369,22 @@ def component_duration(text, component, key):
 
 # The aggregate window assumed when the SUT config names none.
 DEFAULT_AGGREGATE_INTERVAL_S = 10.0
+
+
+def config_components(text, kind):
+    """The ids of the components of `kind` in a config's `components:` map, in file order."""
+    ids = re.findall(r"^  ([A-Za-z0-9_][A-Za-z0-9_.-]*)\s*:", text, re.M)
+    return [one for one in ids if listener_wire(text, one)[1] == kind]
+
+
+def delta_window(data, source):
+    """The longest `aggregate` window in `source`'s generator config, in seconds, or None: under
+    `[ledger] sut_delta` the generator's `aggregate` runs the cumulative windows, and a window is
+    how long one series' point can stand for."""
+    text = _service_config_text(data, source.get("service"))
+    windows = [component_duration(text, one, "interval")
+               for one in config_components(text, "aggregate")]
+    return max([one for one in windows if one] or [None], key=lambda one: one or 0)
 # `logit_out`'s `concurrency` and a disk spool's `checkpoint_interval` when the config names none
 # (crates/logit-config, `LogitOut` and `DiskBufferConfig`).
 DEFAULT_HOP_WINDOW = 32
@@ -1396,7 +1418,10 @@ class Wire:
 # `file_out`, which counts no `output.messages`. An HTTP wire's G is the writer's points in the
 # batches its listener answered with a success, and W the listener's `events.sent`, since
 # neither listener counts points before it sends them (`HTTP_LISTENERS`); a request the
-# listener refuses decodes to nothing W counts, so the wire has no F and no B.
+# listener refuses decodes to nothing W counts, so the wire has no F and no B. `otlp_in` decodes
+# one event per log record and one per metric data point, and `otlp_out` writes each of an
+# event's metric records as one data point, so the two count in one unit while each generator
+# event carries one record, as `generate_in`'s and `aggregate`'s do.
 WIRES = {
     "udp": Wire("UDP", "logit.output.messages", "logit.input.datagrams",
                 "logit.input.kernel.dropped", (), ("undecodable", "oversize")),
@@ -1592,7 +1617,11 @@ class Ledger:
         self.wires = {source.get("sut_listener"): WIRES[source_wire(source)]
                       for source in self.sources}
         self.streams = any(source_wire(source) != DEFAULT_WIRE for source in self.sources)
-        self.aggregate = cfg.get("sut_aggregate")
+        # Under `[ledger] sut_delta`, the `cumulative_to_delta` feeding the sink takes
+        # `aggregate`'s place: A is its events received, Ab its events sent, each one delta
+        # point, and Δ_disc the events a skipped point left with nothing, counted (`discarded`).
+        self.delta = cfg.get("sut_delta")
+        self.aggregate = cfg.get("sut_aggregate") or self.delta
         self.sinks = list(data.sinks)
         self.split = data.split
         # Under `route` and `target`, the `target` feeding each sink.
@@ -1621,15 +1650,26 @@ class Ledger:
         for source in self.sources:
             self.fan_out.update(source.get("fan_out") or {})
         self.reshaped = bool(self.fan_out)
+        # Each source's `merge` nodes, a `dedup_timestamps` each. Every record one folds into
+        # another counts `metrics.merged`, M, and keeps its increment in the survivor, so M of
+        # the node's discards are no loss: the rows after it credit M back as delivered, in Ab
+        # + M (`absorbed`) and ΣT_disc − M (`discarded`).
+        self.merges = [node for source in self.sources for node in source.get("merge") or []]
+        if self.merges:
+            self.ab_text = "Ab + M"
         self.discarded_text = ("(L_drop + L_err) − " if self.script
                                else "" if self.reshaped
+                               else "(ΣT_disc − M) − " if self.merges
                                else "ΣT_disc − " if chained else "")
+        if self.delta:
+            self.discarded_text += "Δ_disc − "
         self.residual_text = ("E_B − X_B − Ab" if cfg.get("hop")
                               else "W′ − R_in" if self.reshaped and self.targeted
                               else f"W − D − B − X − {self.discarded_text}R_in" if self.targeted
                               else "W′ − Ab" if self.reshaped
                               else f"W − D − B − X − {self.discarded_text}"
-                              + ("(Ab − L_flush)" if self.script else "Ab"))
+                              + ("(Ab − L_flush)" if self.script
+                                 else "(Ab + M)" if self.merges else "Ab"))
         # `{service: SutLives}` for each SUT service, the one holding the listeners, and the one
         # holding `aggregate` and the sinks.
         self.views = {service: SutLives(data, service) for service in data.suts}
@@ -1739,6 +1779,12 @@ class Ledger:
                                      component=self.aggregate)
         self.Ab = sut.counter_by_life("logit.transform.metrics.absorbed",
                                       component=self.aggregate)
+        if self.delta:
+            self.Ab = sut.counter_by_life("logit.component.events.sent", component=self.delta)
+            self.Delta_disc = sut.counter_by_life("logit.component.events.discarded",
+                                                  component=self.delta)
+            self.Ad = {life: self.A.get(life, 0) - self.Delta_disc.get(life, 0)
+                       for life in set(self.A) | set(self.Delta_disc)}
         if self.targeted:
             # The router's own counts: what it took, the deliveries past each event's first
             # (`copied`), the events no target took (`discarded`, only `route_signals` counts
@@ -1845,6 +1891,12 @@ class Ledger:
             sink = self.counts_sink
             self.V[sink], self.V_total[sink] = topic.totals_by_life(
                 data.standin_counts.points, self.life_starts)
+            if self.delta:
+                # The count rows judge in points: each distinct point stored is one, credited
+                # to the life that sent it by its request's time, since the point's own
+                # timestamp is the generator's. `ledger.value` judges the values.
+                self.V[sink], self.V_total[sink] = topic.totals_by_life(
+                    [(t, 1) for t, _ in data.standin_counts.arrivals], self.life_starts)
             self.resets[sink], self.mismatched[sink] = {}, []
         # Per sink, what `edge` judges: the events it received, and under `route` the events
         # its target sent; and the events `aggregate` sent, once per send whatever its fan-out.
@@ -1876,6 +1928,12 @@ class Ledger:
                 # counts it, under `malformed`.
                 self.T_lines[component] = sut.counter_by_life(
                     "logit.transform.lines.dropped", component=component)
+        # At each `merge` node, the records it merged (M) and superseded (T_ab), each counted
+        # only when nonzero. A superseded record's value is gone, so T_ab must stay 0.
+        self.T_merged = {node: sut.counter_by_life("logit.transform.metrics.merged",
+                                                   component=node) for node in self.merges}
+        self.T_ab = {node: sut.counter_by_life("logit.transform.metrics.absorbed",
+                                               component=node) for node in self.merges}
 
         # Per source, from its generator's telemetry: G and its wire's precondition, the sink's
         # counted loss (`drop_newest`, and on a stream `ambiguous_at_most_once`) by reason, and
@@ -1907,6 +1965,18 @@ class Ledger:
                 batches = total("logit.component.batches.sent", [load])
                 input_batch[load] = sent / batches if batches else 0.0
             batch = sum(input_batch.values())
+            sink_batch = {sink: input_batch.get(load, 0.0)
+                          for load, sink in source_pairs(source)}
+            if source_wire(source) == HTTP_WIRE:
+                # An HTTP writer sends its own batches, one per request, which an `aggregate`
+                # ahead of it sizes: one window's points, not the input's batch. A writer that
+                # counted no batch received keeps the input's.
+                for sink in sinks:
+                    batches = total("logit.component.batches.received", [sink])
+                    if batches:
+                        sink_batch[sink] = (total("logit.component.events.received", [sink])
+                                            / batches)
+                batch = sum(sink_batch.values())
             # On an HTTP wire, the batches each edge of a judged run may hold in W and not yet
             # in G: every request in flight, the writers' `concurrency:` summed
             # (`HTTP_DEFAULT_CONCURRENCY` when unset), since the listener counts a batch before
@@ -1924,8 +1994,7 @@ class Ledger:
                 "dropped_events": total("logit.component.events.dropped", sinks),
                 "dropped_batches": total("logit.component.batches.dropped", sinks),
                 "batch": batch,
-                "sink_batch": {sink: input_batch.get(load, 0.0)
-                               for load, sink in source_pairs(source)},
+                "sink_batch": sink_batch,
                 # An HTTP writer's events received, and its requests answered `5xx`, which it
                 # retries.
                 "attempted": total("logit.component.events.received", sinks),
@@ -1976,6 +2045,12 @@ class Ledger:
         # under `target` each sink's own (`intervals`), and the longest of them.
         config = self._sut_config_text(self.service)
         self.interval = component_duration(config, self.aggregate or "", "interval")
+        # Under `sut_delta` the window a kill can catch past the node is one of the generator
+        # `aggregate`'s, the points one generator flush sends (`delta_window`).
+        self.gen_window = None
+        if self.delta:
+            self.gen_window = delta_window(data, self.sources[0] if self.sources else {})
+            self.interval = self.gen_window or 0.0
         self.intervals = {sink: component_duration(config, aggregate or "", "interval")
                           for sink, aggregate in self.aggregates.items()}
         if self.targeted:
@@ -2202,6 +2277,8 @@ class Ledger:
                 "L_in", "L_emit", "L_drop", "L_err", "L_flush", "L_sent"))
         elif self.T_disc:
             script = f"ΣT_disc {_n(self.t_disc(life))}, "
+            if self.merges:
+                script += f"M {_n(self.merged(life))}, "
         text = (f"W {_n(self.get('W', life))}, K {_n(self.get('K', life))}, {self._f_text(life)}"
                 f"D {_n(self.D(life))} "
                 f"({_n(self.get('D_shutdown', life))} at shutdown; stderr says "
@@ -2248,7 +2325,14 @@ class Ledger:
         `target`, the sum of the `aggregate`s of `sinks`, every sink when None."""
         if self.targeted:
             return sum(self.Ab_k[sink].get(life, 0) for sink in sinks or self.sinks)
-        return self.get("Ab", life) - (self.get("L_flush", life) if self.script else 0)
+        return (self.get("Ab", life) - (self.get("L_flush", life) if self.script else 0)
+                + self.merged(life))
+
+    def merged(self, life):
+        """M: the records every `merge` node folded into a survivor in `life`, each an
+        increment that reaches V inside the survivor's value. Every soaked event carries one
+        record, so each is also one of the node's discards (`ledger.edge` holds T_disc to it)."""
+        return sum(counts.get(life, 0) for counts in getattr(self, "T_merged", {}).values())
 
     def t_disc(self, life):
         """ΣT_disc: the events every `sut_transforms` node discarded in `life`, a sink's branch
@@ -2309,18 +2393,22 @@ class Ledger:
 
     def discarded(self, life):
         """The events the path to `aggregate` removed, counted, in `life`: a script's discards
-        and errors (L_drop + L_err), or the `sut_transforms` nodes' discards (ΣT_disc). A scenario
-        has one or the other, so neither counts twice."""
+        and errors (L_drop + L_err), or the `sut_transforms` nodes' discards less the records
+        the `merge` nodes merged (ΣT_disc − M). A scenario has one or the other, so neither
+        counts twice."""
         script = self.get("L_drop", life) + self.get("L_err", life) if self.script else 0
+        # A `sut_delta` node's own discards, Δ_disc, are skipped points; it takes no fan_out.
+        script += self.get("Delta_disc", life) if self.delta else 0
         # With a `fan_out`, W′ has taken the chain's discards in already (`through`), and a
-        # fan-out node's discarded parents went on as its children.
-        return script + (0 if self.reshaped else self.t_disc(life))
+        # fan-out node's discarded parents went on as its children. A merge node's merged
+        # records went on inside their survivors (`merged`).
+        return script + (0 if self.reshaped else self.t_disc(life) - self.merged(life))
 
     def residual(self, life, sinks=None):
         """What a life read but neither absorbed nor removed, counted, by its last drain:
         W − D − B − X − Ab, with a script W − D − B − X − (L_drop + L_err) − (Ab − L_flush), with
-        `sut_transforms` W − D − B − X − ΣT_disc − Ab, with a `fan_out` W′ − Ab, and across a hop
-        E_B − X_B − Ab.
+        `sut_transforms` W − D − B − X − ΣT_disc − Ab (M cancels where a `merge` node credits
+        it), with a `fan_out` W′ − Ab, and across a hop E_B − X_B − Ab.
 
         Under `target` the path splits at the router, so the residual has two kinds. With no
         `sinks`, the listeners' side: what reached the router's side short of the router,
@@ -2374,11 +2462,14 @@ class Ledger:
         residual = max(0, self.residual(life, sinks))
         low = -(residual + round(rate * interval))
         high = round(rate * window) + round(rate * interval)
+        caught = (f"one {window:g}s generator window of points sent past {self.delta} and "
+                  "not yet stored" if self.delta
+                  else f"one {window:g}s aggregate window ({source}) unflushed")
         text = (f"band [{_n(low)}, {_n(high)}]: ingest {rate:,.0f}/s over the last drain "
                 f"interval; below, the residual {_n(residual)} plus one {interval:g}s drain "
                 f"interval of ingest, absorbed after the last drain and flushed before the "
-                f"kill; above, one {window:g}s aggregate window ({source}) unflushed at the "
-                f"kill plus one drain interval of queue growth after the last drain")
+                f"kill; above, {caught} at the kill plus one drain interval of queue growth "
+                "after the last drain")
         return low, high, text
 
     def replay_band(self, listeners):
@@ -3289,7 +3380,7 @@ def _wire_one(data, led, source, instances=None):
 def _end_allowance(led, source):
     """How far a source's G may fall short of W + K at the end: a send each generator sink
     cancels at shutdown loses its counts, up to that sink's last `buffer.batches` plus one, each
-    a batch of the input that feeds it."""
+    a batch of the input that feeds it, or on an HTTP wire of the sink's own."""
     gen = led.gens[source.get("service")]
     sizes = led.gen_stats[source.get("service")]["sink_batch"]
     allowed = 0.0
@@ -3625,7 +3716,9 @@ def check_ledger_edge(data):
     judges the listeners'; with a source's `sut_transforms`, each hop from its listener through
     them, every transform sending each event it received that it didn't discard
     (received − discarded == sent), or for a `fan_out` node of k its children against
-    k × received less the lines it dropped (`_node_edge`), and the last transform's sent in place
+    k × received less the lines it dropped (`_node_edge`), a `merge` node's discards also
+    against its merged records and its superseded ones against 0 (`_merge_edges`), and the
+    last transform's sent in place
     of that listener's E in the sum; and out to each sink, under `copy` `aggregate`'s
     events.sent == the sink's events.received (a fan-out counts one send per batch, however
     many consumers it reaches), and under `route` the sink's target's events.sent == the
@@ -3724,8 +3817,23 @@ def _chain_edges(led, view):
             edges.append((left, f"T_in[{component}]", lhs, led.T_in[component],
                           f"into {component}", view))
             edges.append(_node_edge(led, component, view))
+            if component in led.merges:
+                edges += _merge_edges(led, component, view)
             left, lhs = f"T_out[{component}]", led.T_out[component]
     return edges
+
+
+def _merge_edges(led, component, view):
+    """A `merge` node's two terms for `ledger.edge`, past its own: T_disc == M, every event it
+    discarded emptied by a merge, which holds while each event carries one record (a statsd
+    line does), so the credit the later rows give is the node's discards and no more; and
+    T_ab == 0 in every life a kill didn't end, since a superseded reading's value is gone, not
+    carried in a survivor."""
+    zero = {}
+    return [(f"T_disc[{component}]", f"M[{component}]", led.T_disc[component],
+             led.T_merged[component], f"{component} discards only what it merged", view),
+            (f"T_ab[{component}]", "expected", led.T_ab[component], zero,
+             f"{component} supersedes no reading", view, True)]
 
 
 def _target_edges(led, view):
@@ -3849,6 +3957,10 @@ def check_ledger_aggregate(data):
     if _overlapped(data):
         return _per_instance(data, check_ledger_aggregate)
     led = _ledger(data)
+    if led.delta and not led.problems:
+        return _final_equality(data, "ledger.aggregate", "Ab", "Ad",
+                               f"every point {led.delta} didn't skip sent on: Ab its events "
+                               "sent, Ad its events received less Δ_disc")
     if not led.targeted or _skip_without_sut("ledger.aggregate", led):
         return _final_equality(data, "ledger.aggregate", "Ab", "A", "every event absorbed")
     status, parts, lines = PASS, [], []
@@ -3994,6 +4106,15 @@ def check_ledger_egress(data):
                          f"{_n(led.V_total[sink])} (the sum of the stored points' values, one "
                          "per series and timestamp)")
             continue
+        if sink == led.counts_sink and led.delta:
+            counts = data.standin_counts
+            lines.append(f"{sink}: {_n(len(counts.points) + len(counts.duplicates))} stored "
+                         f"point(s), {_n(len(counts.points))} distinct, "
+                         f"{_n(len(counts.duplicates))} duplicate copies; V "
+                         f"{_n(led.V_total[sink])} (the distinct points, each credited to "
+                         "the life its request reached the stand-in in; ledger.value judges "
+                         "their values)")
+            continue
         if sink == led.counts_sink:
             counts = data.standin_counts
             lines.append(f"{sink}: {_n(len(counts.points) + len(counts.duplicates))} stored "
@@ -4074,7 +4195,10 @@ def check_ledger_summary(data):
         terms.append(("E − ΣT_disc − A", g("E", life) - led.t_disc(life) - g("A", life)))
     else:
         terms.append(("E − A", g("E", life) - g("A", life)))
-    terms.append(("A − Ab", g("A", life) - g("Ab", life)))
+    if led.delta:
+        terms.append(("A − Δ_disc − Ab", g("Ad", life) - g("Ab", life)))
+    else:
+        terms.append(("A − Ab", g("A", life) - g("Ab", life)))
     shown = [f"{name} {_n(value)}" for name, value in terms]
     uncounted_egress = False
     faults = []
@@ -4100,8 +4224,15 @@ def check_ledger_summary(data):
     if led.script:
         counted_script = (f"; the script's L_drop {_n(g('L_drop', life))} and L_err "
                           f"{_n(g('L_err', life))}, counted")
+    elif led.T_disc and not led.reshaped and led.merges:
+        counted_script = (f"; the transforms' ΣT_disc {_n(led.t_disc(life))}, of which M "
+                          f"{_n(led.merged(life))} merged and credited in Ab + M, counted "
+                          f"{_n(led.discarded(life))}")
     elif led.T_disc and not led.reshaped:
         counted_script = f"; the transforms' ΣT_disc {_n(led.t_disc(life))}, counted"
+    if led.delta:
+        counted_script += (f"; {led.delta}'s skipped points Δ_disc "
+                           f"{_n(g('Delta_disc', life))}, counted")
     wire = ""
     # An overlap instance reads part of the generators' lines; `_summary_overlap` adds the wire.
     whole = data.overlap_instance is None and led.gens
@@ -4134,6 +4265,222 @@ def check_ledger_summary(data):
             and not uncounted_egress and not faults):
         detail = f"{bound_text}; {detail}"
     return Result("ledger.summary", status, detail, lines)
+
+
+# ---- the value ledger ----------------------------------------------------------------------------
+#
+# Under `[ledger] sut_delta` the count rows judge points, and `ledger.value` judges what they
+# carry: the generator's increments against the deltas the stand-in stored. `cumulative_to_delta`
+# moves its baseline past every point it accepts, so a delta lost downstream is never restored,
+# and a first point it skips (`skipped{reason="initial"}`) loses the counts since the series'
+# previous point, a value no counter gives (docs/adr/cumulative-to-delta-transform.md, "State is
+# in memory").
+
+# The generator counters that lose an increment before its cumulative state holds it, summed
+# over every generator component but its sink: a cumulative point the sink drops is carried by
+# the next one.
+VALUE_LOSS_COUNTERS = ("logit.component.events.dropped", "logit.transform.metrics.dropped")
+# The SUT sink's record drops whose points reach the stand-in, in the request a cued step
+# answered; a record dropped for any other reason, such as `stale` or `duplicate_timestamp`, is
+# a delta lost short of it.
+VALUE_SEEN_RECORD_REASONS = ("rejected", "oversize")
+
+
+def _generator_increments(led, source):
+    """`(increments, lost)`: what `source`'s `generate_in`s sent over the run, and what the
+    generator's components other than its sink dropped of it (`VALUE_LOSS_COUNTERS`)."""
+    gen = led.gens[source.get("service")]
+    sent = sum(sum(gen.counter_by_life("logit.component.events.sent", component=one).values())
+               for one in source_ids(source, "generator_input"))
+    sinks = set(source_ids(source, "generator_sink"))
+    lost = sum(point.value for name in VALUE_LOSS_COUNTERS for point in gen.matching(name)
+               if point.attributes.get("component") not in sinks
+               and isinstance(point.value, (int, float)))
+    return sent, lost
+
+
+def _value_windows(data, led, source):
+    """`[(start, end, label, skips, widened)]`: each span in which the SUT can lose a delta's
+    value with no counter giving it, ending at the drain that counted it, with the series whose
+    first point it skipped (or evicted) and why, if at all, it can lose the whole span's
+    increments.
+
+    - A drain in which the `sut_delta` node counted `skipped{reason="initial"}` or
+      `series.evicted`: the skipped first point lost the counts since its series' previous
+      point, so the span starts at the node's last drain before it that received a point, or
+      with none in the life, the previous life's last drain (the run's start for the first).
+      It widens when the generator's sink counted a dropped batch or event in it, which leaves
+      the first point the SUT sees further on, or when the life before it ended in a kill,
+      which loses the deltas the SUT's sink still held.
+    - A generator life whose sink counted a `shutdown` drop: its last cumulative point, and the
+      counts since the one before, never reached the SUT; the span is that life's last two
+      windows, always widened.
+
+    Each span opens one generator window and one drain interval early, since a point carries
+    up to a window of counts and a drain's deltas cover the interval before it."""
+    sut, node = led.sut, led.delta
+    window = led.gen_window or DEFAULT_AGGREGATE_INTERVAL_S
+    drains = sorted(sut.drains)
+    gaps = [b - a for a, b in zip(drains, drains[1:])]
+    drain = statistics.median(gaps) if gaps else 0.0
+    received = sorted(ts for ts, v, _ in sut.counter_points(
+        "logit.component.events.received", component=node) if v)
+    initial = {ts: (v, life) for ts, v, life in sut.counter_points(
+        "logit.transform.metrics.skipped", component=node, reason="initial") if v}
+    evicted = {ts: (v, life) for ts, v, life in sut.counter_points(
+        "logit.transform.series.evicted", component=node) if v}
+    gen = led.gens[source.get("service")]
+    gen_sinks = source_ids(source, "generator_sink")
+    gen_drops = sorted(ts for sink in gen_sinks
+                       for name in ("logit.component.batches.dropped",
+                                    "logit.component.events.dropped")
+                       for ts, v, _ in gen.counter_points(name, component=sink) if v)
+    windows = []
+    for ts in sorted(set(initial) | set(evicted)):
+        life = (initial.get(ts) or evicted.get(ts))[1]
+        own = set(sut.life_drains(life))
+        before = [t for t in received if t < ts and t in own]
+        killed = False
+        if before:
+            start = before[-1]
+            label = "idle eviction" if ts in evicted else "initial skip"
+        else:
+            earlier = sut.life_drains(life - 1) if life > 0 else []
+            start = earlier[-1] if earlier else (data.t0 or ts)
+            label = f"life {life} start"
+            killed = life > 0 and life - 1 in led.killed
+        counts = []
+        if ts in initial:
+            counts.append(f"{_n(initial[ts][0])} skipped initial")
+        if ts in evicted:
+            counts.append(f"{_n(evicted[ts][0])} evicted")
+        skips = max(initial.get(ts, (0,))[0], evicted.get(ts, (0,))[0])
+        opened = start - window - drain
+        widened = ("the life before it was killed" if killed else
+                   "the generator dropped in it" if any(opened < t <= ts for t in gen_drops)
+                   else None)
+        windows.append((opened, ts, f"{label} ({', '.join(counts)})", skips, widened))
+    for sink in gen_sinks:
+        for ts, v, life in gen.counter_points("logit.component.batches.dropped",
+                                              component=sink, reason="shutdown"):
+            if v:
+                windows.append((ts - 2 * window - drain, ts,
+                                f"generator life {life} shutdown drop ({_n(v)} batch(es))", 0,
+                                "a shutdown drop"))
+    return sorted(windows)
+
+
+def _increments_in(led, source, spans):
+    """The generator's increments over the union of `spans` (`[(start, end)]`): each drain's
+    delta counted once when its drain falls in one, widened by one drain interval at the end,
+    since a drain covers the interval before it."""
+    gen = led.gens[source.get("service")]
+    gaps = [b - a for a, b in zip(gen.drains, gen.drains[1:])]
+    drain = statistics.median(gaps) if gaps else 0.0
+    total = 0
+    for one in source_ids(source, "generator_input"):
+        for ts, v, _ in gen.counter_points("logit.component.events.sent", component=one):
+            if any(start < ts <= end + drain for start, end in spans):
+                total += v
+    return total
+
+
+def check_ledger_value(data):
+    """Under `[ledger] sut_delta`, the generator's increments I (its `generate_in`s' events
+    sent, less what its components before the sink dropped) against V, the sum of the distinct
+    deltas the `datadog` stand-in stored, and U, the deltas a cued step lost: the points of a
+    request answered under a step classed `rejected`, and the series a `series_errors` answer
+    named, each a point the stand-in never stored (`standin.unstored_points`), whose value the
+    record gives. Below 0 the gap I − V − U FAILs as a surplus. It's judged exact when the run
+    has no reported window (`_value_windows`) and no delta the SUT sink dropped short of the
+    stand-in; otherwise it must fit the sum of what each can lose, and FAILs past it:
+
+    - A window loses at most its skipped series' first points, each one generator window of
+      one series' increments (the median stored delta), plus one window of every series as
+      slack for a window boundary; a widened window, the increments over its whole span.
+    - A delta the sink dropped short of the stand-in (an event dropped other than `rejected`,
+      or a record other than `VALUE_SEEN_RECORD_REASONS`) loses at most the largest stored.
+
+    So the windows bound the loss they explain and excuse none outside them."""
+    if not data.ledger.get("sut_delta"):
+        return Result("ledger.value", SKIP, "no [ledger] sut_delta, so V counts increments and "
+                      "ledger.egress judges them")
+    led = _ledger(data)
+    skipped = _skip_without_sut("ledger.value", led)
+    if skipped:
+        return skipped
+    counts = data.standin_counts
+    if counts is None or not led.sources:
+        return Result("ledger.value", FAIL, "no datadog stand-in record to read V from")
+    source = led.sources[0]
+    if source.get("service") not in led.gens:
+        return Result("ledger.value", FAIL, f"no telemetry from generator "
+                      f"{source.get('service')}, so its increments are unknown")
+    sent, lost = _generator_increments(led, source)
+    increments = sent - lost
+    v = sum(value for _, value in counts.points)
+    requests = data.standin_requests
+    rejected = {f.step for f in data.faults
+                if f.action == "respond" and f.fault_class == "rejected"}
+    cued, other = {}, 0
+    for _, _, value, index in standin.unstored_points(requests, counts.series):
+        request = requests[index]
+        step = request.get("cue")
+        # A `series_errors` answer stored every series of its request but the ones it named.
+        if step in rejected or request.get("series_errors"):
+            cued[step] = cued.get(step, 0) + value
+        else:
+            other += value
+    u = sum(cued.values())
+    gap = increments - v - u
+    windows = _value_windows(data, led, source)
+    values = sorted(value for _, value in counts.points)
+    per_series = statistics.median(values) if values else 0
+    slack = per_series * len(counts.series)
+    bounds = []
+    lines = []
+    for start, end, label, skips, widened in windows:
+        if widened:
+            bound = _increments_in(led, source, [(start, end)]) + slack
+            how = f"widened, {widened}: its span's increments + slack"
+        else:
+            bound = skips * per_series + slack
+            how = f"{_n(skips)} x {_n(per_series)} + slack"
+        bounds.append(bound)
+        lines.append(f"[{data.offset(start)}, {data.offset(end)}] {label}: at most "
+                     f"{_n(bound)} ({how} {_n(slack)})")
+    sink = led.counts_sink
+    unseen = sum(point.value for point in led.sut.matching("logit.component.events.dropped",
+                                                           component=sink)
+                 if point.attributes.get("reason") != "rejected"
+                 and isinstance(point.value, (int, float)))
+    unseen += sum(point.value for point in led.sut.matching("logit.output.records.dropped",
+                                                            component=sink)
+                  if point.attributes.get("reason") not in VALUE_SEEN_RECORD_REASONS
+                  and isinstance(point.value, (int, float)))
+    largest = values[-1] if values else 0
+    band = sum(bounds) + unseen * largest
+    head = (f"I {_n(increments)} (generate_in sent {_n(sent)} − lost {_n(lost)}) − V {_n(v)} "
+            f"− U {_n(u)} = {_n(gap)}")
+    cued_text = ", ".join(f"{_n(value)} cued by {step}" for step, value in sorted(cued.items()))
+    tail = (f"; U {cued_text}" if cued_text else "") + (
+        f"; {_n(other)} in points never stored outside a cue, in the gap" if other else "")
+    if unseen:
+        tail += (f"; {_n(unseen)} delta(s) the sink dropped short of the stand-in, each up to "
+                 f"the largest stored, {_n(largest)}")
+    if gap < 0:
+        return Result("ledger.value", FAIL, f"{head}: a surplus, deltas stored beyond the "
+                      f"increments sent{tail}", lines)
+    if not windows and not unseen:
+        verdict = "exact" if gap == 0 else "uncounted loss, with no reported window"
+        return Result("ledger.value", PASS if gap == 0 else FAIL, f"{head}, {verdict}{tail}",
+                      lines)
+    within = gap <= band
+    verdict = (f"reported: within the {_n(band)} that the {len(windows)} reported window(s) "
+               "can lose, each bounded alone" if within else
+               f"over the {_n(band)} that the {len(windows)} reported window(s) can lose, "
+               "each bounded alone, so value was lost outside them")
+    return Result("ledger.value", PASS if within else FAIL, f"{head}, {verdict}{tail}", lines)
 
 
 def _summary_targeted(data, led):
@@ -5183,6 +5530,8 @@ def check_ledger_standin(data):
     requests under such a step; and each duplicate copy of a stored point is reported: permitted
     under `at_least_once` after an answer the sink didn't see accepted, and a FAIL under
     `at_most_once`, or as a resend within one life of a point the stand-in answered `2xx`.
+    Two values of one series in one second WARN rather than FAIL as a changed resend: they're
+    two points the sink sent in two requests, of which Datadog keeps the later.
 
     Under the `influxdb` shape (`_standin_influxdb`), also: per SUT life, no point of a request
     answered under the cue of a step classed `rejected` is stored, and the egress gap, Ab − V
@@ -5226,6 +5575,18 @@ def check_ledger_standin(data):
         flag(FAIL, f"{len(undecodable)} request body(ies) don't decode as "
                    f"{standin.BODY_NAMES[shape]}: "
                    f"{'; '.join(undecodable[:3])}")
+    if shape == standin.DATADOG and conflicts:
+        # `datadog_out` re-encodes a resend's points unchanged, so two values of one series in
+        # one second are two points its whole-second timestamps merged, sent in two requests.
+        # Datadog keeps the later and loses the other uncounted, a known gap the sink can't
+        # close across batches (docs/known-gaps/datadog.md).
+        key, stamp, first, last = conflicts[0]
+        flag(WARN, f"{_n(len(conflicts))} pair(s) of points of one series in one second from "
+                   f"two requests, first {dict(key).get('__name__', key)} at "
+                   f"{data.offset(stamp / 1000)} stored {first:g}, then {last:g}: Datadog keeps "
+                   "the later and loses the other uncounted, which datadog_out collapses only "
+                   "within one batch (docs/known-gaps/datadog.md)")
+        conflicts = []
     for key, stamp, first, last in conflicts[:5]:
         flag(FAIL, f"{dict(key).get('__name__', key)} at {stamp} ms stored {first:g}, then "
                    f"{last:g}: a resend changed a sample")
@@ -5542,7 +5903,8 @@ def check_recovery(data):
     its end, that sink's `retrying` is 0, its `buffer.utilization` is under 0.05 or its
     `buffer.batches` at most 1, every UDP listener's `receive.utilization` is under 0.05, and the
     ingest rate summed over the listeners over the drain interval ending there is at least 95%
-    of the generators' summed warmup rate. A drain interval another fault overlaps, or that
+    of the generators' summed warmup rate, on an HTTP wire their writers' events received. A
+    drain interval another fault overlaps, or that
     spans two SUT lives, isn't eligible; a fault with no eligible interval is skipped and
     listed. A `rate_behind` diagnostic from any generator turns a throughput shortfall into a
     WARN. Across a hop each SUT's sinks are judged on its own drains: the hop sink against the
@@ -5572,14 +5934,21 @@ def check_recovery(data):
     behind = 0
     for source in led.sources:
         gen = led.gens[source.get("service")]
-        for load in source_ids(source, "generator_input"):
-            warm = [(ts, v) for ts, v, _ in gen.counter_points("logit.component.events.sent",
-                                                               component=load)
+        # An HTTP writer's events are what the wire carries, and an `aggregate` ahead of it
+        # sends one point per series per window, not the input's events.
+        rated = ([(sink, "logit.component.events.received")
+                  for sink in source_ids(source, "generator_sink")]
+                 if source_wire(source) == HTTP_WIRE else
+                 [(load, "logit.component.events.sent")
+                  for load in source_ids(source, "generator_input")])
+        for component, counter in rated:
+            warm = [(ts, v) for ts, v, _ in gen.counter_points(counter, component=component)
                     if data.t0 <= ts <= data.t0 + data.warmup]
             if len(warm) < 2 or warm[-1][0] <= warm[0][0]:
                 return Result("recovery", SKIP, f"too few {source.get('service')} drains in "
                               "warmup for a baseline")
             baseline += sum(v for _, v in warm[1:]) / (warm[-1][0] - warm[0][0])
+        for load in source_ids(source, "generator_input"):
             behind += sum(v for _, v, _ in gen.counter_points(
                 "logit.component.diagnostics", component=load, key="rate_behind"))
     # Only a UDP listener has a receive queue to drain.
@@ -6262,11 +6631,64 @@ def check_drops(data):
                   + "; ".join(lines), lines)
 
 
+def check_ledger_absent(data):
+    """Each sink's `vm_absent_selector` against its backend at the end: the export
+    (`vm-export/<sink>.absent.jsonl`) must hold no series, so nothing it matches was stored in
+    any SUT life. A series FAILs the row, named with the lives its samples fall in; so does an
+    export that failed or never ran, which the driver's `vm_absent_exported` phase tells from an
+    empty one. `sample-path` names its discarded shards here: a keyed verdict that changed
+    across a restart would store one."""
+    sinks =[sink for sink in data.ledger.get("sink") or [] if sink.get("vm_absent_selector")]
+    if not sinks:
+        return Result("ledger.absent", SKIP, "no [[ledger.sink]] sets vm_absent_selector")
+    if not data.has_vm:
+        return Result("ledger.absent", SKIP, no_vm_reason(data))
+    led = _ledger(data)
+    life_starts = getattr(led, "life_starts", None) or []
+    status, parts, lines = PASS, [], []
+    exported = {}
+    for record in data.timeline:
+        if record.get("event") == "phase" and record.get("phase") in (
+                "vm_absent_exported", "vm_absent_export_failed"):
+            exported[record.get("sink")] = record
+    for sink in sinks:
+        sink_id, selector = sink["id"], sink["vm_absent_selector"]
+        record = exported.get(sink_id)
+        if record is None or record.get("phase") != "vm_absent_exported":
+            status = FAIL
+            why = (f"the export failed: {record.get('error')}" if record is not None
+                   else "no vm_absent_exported phase in the timeline")
+            parts.append(f"{sink_id}: {selector} wasn't read, so absence is unknown ({why})")
+            continue
+        try:
+            series = vm.parse_export((data.run_dir / "vm-export"
+                                      / f"{sink_id}{ABSENT_SUFFIX}").read_text())
+        except OSError as err:
+            status = FAIL
+            parts.append(f"{sink_id}: vm-export/{sink_id}{ABSENT_SUFFIX} unreadable: {err}")
+            continue
+        if not series:
+            lives = f" in any of {len(life_starts)} SUT life/lives" if life_starts else ""
+            parts.append(f"{sink_id}: no series match {selector}{lives}")
+            continue
+        status = FAIL
+        for one in series:
+            held = sorted({vm.life_at(life_starts, stamp / 1000)
+                           for stamp in one.get("timestamps") or []})
+            lines.append(f"{sink_id}: {vm.series_name(one)}, {len(one.get('values') or [])} "
+                         f"sample(s) in SUT life/lives {', '.join(map(str, held)) or '?'}")
+        names = ", ".join(vm.series_name(one) for one in series[:3])
+        parts.append(f"{sink_id}: {_n(len(series))} series match {selector}, which must "
+                     f"match none: {names}" + (", ..." if len(series) > 3 else ""))
+    return Result("ledger.absent", status, "; ".join(parts), lines)
+
+
 CHECKS = (
     check_run, check_timeline, check_exit, check_restarts, check_self_log, check_ready,
     check_progress, check_rss_slope, check_fd_slope, check_ledger_wire, check_ledger_overlap,
     check_ledger_intake, check_ledger_edge, check_ledger_hop, check_ledger_script, check_ledger_aggregate,
-    check_ledger_egress, check_ledger_windows, check_ledger_replay, check_ledger_summary,
+    check_ledger_egress, check_ledger_windows, check_ledger_absent, check_ledger_replay,
+    check_ledger_summary, check_ledger_value,
     check_ledger_sent, check_ledger_topic, check_ledger_standin, check_identity_sink, check_drops, check_recovery,
     check_file_reopen, check_tls_served, check_expect,
 )
