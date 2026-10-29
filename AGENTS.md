@@ -938,7 +938,7 @@ the operator-facing account of all of this.
   a generator's cumulative totals: the count rows judge points, and `ledger.value` holds the
   stored deltas' sum, plus the values the record shows a cued step lost, to the generator's
   increments, exact unless the transform skipped a first point (an SUT start or restart, an
-  idle eviction), where the gap is reported within the increments those windows hold.
+  idle eviction), where the gap is reported within the sum of each window's own bound.
   `standin-concurrency` points `prometheus_out` at `concurrency: 8` and `at_most_once` at the
   remote-write stand-in with several batches in flight, and its `respond` steps' `count = 1`
   lands a `401`, a `400`, and a reset on one write each: a held head, a batch dropped alone,

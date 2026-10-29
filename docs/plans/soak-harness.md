@@ -2670,11 +2670,19 @@ under "Deferred to a later round" wait.
       `series.evicted` on the node. It runs back to the node's last receiving drain before it
       in that life, or the previous life's last drain, widened by one generator window and one
       drain interval. A generator sink's `shutdown` drop adds a window too.
-    - With windows, the gap is reported if it's no more than the band: the generator's
-      increments inside the windows, plus each drop the stand-in can't see (`events.dropped`
-      other than `rejected`, `records.dropped` other than `rejected` and `oversize`, stale
-      points included) times the largest stored delta. Past the band it FAILs, since a judged
-      window lost value.
+    - Each window is bounded alone by what it can lose: its skipped (or evicted) series times
+      one generator window of one series' increments, the median stored delta, plus one window
+      of every series as slack for a window boundary. It widens to the generator's increments
+      over its whole span only when the generator's sink counted a dropped batch or event in it,
+      which moves the first point the SUT sees further on, when the life before it ended in a
+      kill, which loses the deltas the SUT's sink still held, or for a shutdown drop's window.
+    - With windows, the gap is reported if it's no more than the sum of the windows' bounds,
+      plus each drop the stand-in can't see (`events.dropped` other than `rejected`,
+      `records.dropped` other than `rejected` and `oversize`, stale points included) times the
+      largest stored delta. Past that it FAILs: value was lost outside the windows. A first
+      version bounded the windows by the increments over their whole spans, which on the first
+      run's re-score was 195,000 against a gap of 14,800, so a loss of 13% of I outside every
+      window would have passed.
     - Stale points can't be cued in a run of 30 minutes or less, because `datadog_out`'s window
       reaches an hour back, so they enter only the unseen drops' bound.
 21. **More HTTP listeners (W24).** Item 14's `http` wire for three more listeners, each a
@@ -2996,9 +3004,9 @@ that items 3, 7, and 11 need.
   `dedup_timestamps` node, an amendment to ADR `soak-harness` for the merge term, self-test
   fixtures for each rule, and the `sample-path`, `dedup-merge`, and `cardinality-capped`
   scenarios, each run recorded under "Findings".
-- **W23**: item 20: the value ledger row against the Datadog-shaped stand-in, the reported
-  windows (value-losing cues, the first SUT life's start, SUT restarts, and staleness
-  evictions), an amendment to ADR `soak-harness` for the value ledger, self-test fixtures for
+- **W23**: item 20: the value ledger row against the Datadog-shaped stand-in, the
+  value-losing cues judged through U, the reported windows (the first SUT life's start, SUT
+  restarts, staleness evictions, and a generator shutdown drop), each bounded alone, an amendment to ADR `soak-harness` for the value ledger, self-test fixtures for
   each rule, and a `cumulative_to_delta` scenario, with a run recorded under "Findings".
 - **W24**: item 21: `LISTENER_WIRES` and `HTTP_LISTENERS` entries for `splunk_hec_in`,
   `datadog_in`, and `prometheus_in`'s remote-write receiver, the mode-keyed wire lookup for
@@ -5976,7 +5984,7 @@ below. The table is its re-score with `script/soak check`, overall WARN.
 | `ledger.windows` | SKIP | not enabled ([ledger] vm_every_window) |
 | `ledger.replay` | PASS | datadog: life 2's first drain replayed 0 vs killed life 1's last-drain buffer.batches 0 (one batch in flight allowed) |
 | `ledger.summary` | PASS | final life 2: uncounted 0 = W − D − E − B 0 + E − A 0 + A − Δ_disc − Ab 0 + Ab − V[datadog] 0; delta's skipped points Δ_disc 20, counted; wire G − (W + K + F) 0 over the run, F 0 counted; ledger.wire judges the rest; end to end over the run, G 5,060 less counted loss 60 plus a resend allowance 0: datadog: V 4,912 <= G − counted + resent 5,000 |
-| `ledger.value` | PASS | I 1,355,500 (generate_in sent 1,355,500 − lost 0) − V 1,318,700 − U 22,000 = 14,800, reported: within the band 195,000 that the 3 reported window(s) could lose; U 2,000 cued by c0s1, 20,000 cued by c0s2 |
+| `ledger.value` | PASS | I 1,355,500 (generate_in sent 1,355,500 − lost 0) − V 1,318,700 − U 22,000 = 14,800, reported: within the 75,000 that the 3 reported window(s) can lose, each bounded alone; U 2,000 cued by c0s1, 20,000 cued by c0s2 |
 | `ledger.sent` | PASS | to standin: every batch received ended in an accepted response; datadog: requests 2xx 246, 4xx 11, 5xx 7, connect_error 3, network_error 7; records accepted 4,912; cued, excused: request_refused line(s) 3 by c0s3; batch(es) dropped rejected 4 by c0s2; record(s) dropped rejected 8 by c0s1, 80 by c0s2; datadog life 0 at +900s: received 181 vs delivered 177 + dropped 4 + buffer.batches 0, gap 0; datadog life 1 at +1150s: received 30 vs delivered 30 + dropped 0 + buffer.batches 0, gap 0; datadog life 2 at +1375s: received 39 vs delivered 39 + dropped 0 + buffer.batches 0, gap 0 (one batch in flight allowed); ledger.egress and ledger.standin read the stand-in's record |
 | `ledger.topic` | SKIP | standin target: no topic |
 | `ledger.standin` | WARN | 20 pair(s) of points of one series in one second from two requests, first logit.soak.requests_0 at +795s stored 250, then 25: Datadog keeps the later and loses the other uncounted, which datadog_out collapses only within one batch (docs/known-gaps/datadog.md); 271 request(s) recorded, 253 stored, 10 cue(s); 140 duplicate copies of stored points (life 0 140), 35,000 counted twice by the destination, reported; 8 series named by series_errors; 5 classed step(s) (at_least_once) |
@@ -6000,18 +6008,21 @@ below. The table is its re-score with `script/soak check`, overall WARN.
   c0s2's four rejected batches. The gap, 14,800, is about three windows of 20 series × 250:
   the first point after the SUT restart, after the idle eviction, and after the kill, each
   skipped and counted 20 times. No window opened at life 0's start: the SUT was up before the
-  generator's first point, so `auto` emitted it whole. The band, 195,000, is wide because the
-  eviction's window spans the 100 s pause, after which `generate_in` caught up its backlog.
-  The row pools its windows, so it can't say which window lost what.
-- **Netem, the generator restart, and every cue that loses no value were exact.** The 20% loss
+  generator's first point, so `auto` emitted it whole. Each window is bounded alone: the SUT
+  restart's and the eviction's at 10,000 each (20 skips × 250, plus 5,000 of slack), and the
+  kill's at 55,000, its span's increments, since a kill loses the sink's queued deltas. The
+  three sum to 75,000. Before review the row pooled the windows' whole spans into a band of
+  195,000, inflated by the 100 s pause and `generate_in`'s catch-up after it, which would have
+  passed a loss of about 13% of I outside every window.
+- **Netem, the generator restart, and the cues that lose nothing lost no value.** The 20% loss
   caused no initial skip (`netem-skips-no-initial` read 0), so each `otlp_out` resend was
   skipped as a duplicate or emitted once. The generator restart reset all 20 series, each
   first point emitted whole. The `503` after storing left 140 duplicate copies, 35,000 that
   Datadog would count twice, which `ledger.standin` reports and V counts once.
 - **The generator restart sent two points of each series in one second.** On shutdown the
-  generator's `aggregate` flushed a half window, 25 per series, at +795.0, half a second after
-  its last full window, 250, at +794.5. `datadog_out`'s whole-second timestamps put both on one
-  second, in two requests, and Datadog keeps the later, so it would lose 250 of each series
+  generator's `aggregate` flushed a 0.5 s partial window, 25 per series, at +795.0, half a
+  second after its last full 5 s window, 250, at +794.5. Both truncate to one epoch second,
+  1793297098, which `datadog_out` sends in two requests, and Datadog keeps the later, so it would lose 250 of each series
   uncounted. That's the documented gap that `datadog_out` collapses same-second points only
   within a batch (`docs/known-gaps/datadog.md`), but its workaround, an `aggregate` upstream,
   doesn't cover that `aggregate`'s own shutdown flush. `ledger.standin` read the pair as a

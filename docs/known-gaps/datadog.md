@@ -142,8 +142,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
     restart flush: it emits a partial window, which can fall in the same whole second as the
     last full one and leaves in a separate request, so Datadog keeps one of the two, uncounted.
     The soak scenario `delta-datadog` hit it on a generator restart: all 20 series sent a full
-    window (250) stamped +794.5 s and a half window (25) at +795.0 s, one second each, in two
-    requests (`tools/soak/README.md`'s "A delta transform's value"; its `ledger.standin` row
+    5 s window (250) stamped +794.5 s from the run's start and a 0.5 s partial window (25) at
+    +795.0 s, both truncating to one epoch second, 1793297098, in two requests (`tools/soak/README.md`'s "A delta transform's value"; its `ledger.standin` row
     WARNs on such a pair). No configuration avoids it, since the flush's offset into a second
     depends on when the process stops.
 - **`datadog_out` sends a container id unresolved.** `container.id` leaves as a bare

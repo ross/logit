@@ -4231,16 +4231,21 @@ def _generator_increments(led, source):
 
 
 def _value_windows(data, led, source):
-    """`[(start, end, label)]`: each span in which the SUT can lose a delta's value with no
-    counter giving it, ending at the drain that counted it.
+    """`[(start, end, label, skips, widened)]`: each span in which the SUT can lose a delta's
+    value with no counter giving it, ending at the drain that counted it, with the series whose
+    first point it skipped (or evicted) and why, if at all, it can lose the whole span's
+    increments.
 
     - A drain in which the `sut_delta` node counted `skipped{reason="initial"}` or
       `series.evicted`: the skipped first point lost the counts since its series' previous
       point, so the span starts at the node's last drain before it that received a point, or
       with none in the life, the previous life's last drain (the run's start for the first).
+      It widens when the generator's sink counted a dropped batch or event in it, which leaves
+      the first point the SUT sees further on, or when the life before it ended in a kill,
+      which loses the deltas the SUT's sink still held.
     - A generator life whose sink counted a `shutdown` drop: its last cumulative point, and the
       counts since the one before, never reached the SUT; the span is that life's last two
-      windows.
+      windows, always widened.
 
     Each span opens one generator window and one drain interval early, since a point carries
     up to a window of counts and a drain's deltas cover the interval before it."""
@@ -4255,11 +4260,18 @@ def _value_windows(data, led, source):
         "logit.transform.metrics.skipped", component=node, reason="initial") if v}
     evicted = {ts: (v, life) for ts, v, life in sut.counter_points(
         "logit.transform.series.evicted", component=node) if v}
+    gen = led.gens[source.get("service")]
+    gen_sinks = source_ids(source, "generator_sink")
+    gen_drops = sorted(ts for sink in gen_sinks
+                       for name in ("logit.component.batches.dropped",
+                                    "logit.component.events.dropped")
+                       for ts, v, _ in gen.counter_points(name, component=sink) if v)
     windows = []
     for ts in sorted(set(initial) | set(evicted)):
         life = (initial.get(ts) or evicted.get(ts))[1]
         own = set(sut.life_drains(life))
         before = [t for t in received if t < ts and t in own]
+        killed = False
         if before:
             start = before[-1]
             label = "idle eviction" if ts in evicted else "initial skip"
@@ -4267,19 +4279,25 @@ def _value_windows(data, led, source):
             earlier = sut.life_drains(life - 1) if life > 0 else []
             start = earlier[-1] if earlier else (data.t0 or ts)
             label = f"life {life} start"
+            killed = life > 0 and life - 1 in led.killed
         counts = []
         if ts in initial:
             counts.append(f"{_n(initial[ts][0])} skipped initial")
         if ts in evicted:
             counts.append(f"{_n(evicted[ts][0])} evicted")
-        windows.append((start - window - drain, ts, f"{label} ({', '.join(counts)})"))
-    gen = led.gens[source.get("service")]
-    for sink in source_ids(source, "generator_sink"):
+        skips = max(initial.get(ts, (0,))[0], evicted.get(ts, (0,))[0])
+        opened = start - window - drain
+        widened = ("the life before it was killed" if killed else
+                   "the generator dropped in it" if any(opened < t <= ts for t in gen_drops)
+                   else None)
+        windows.append((opened, ts, f"{label} ({', '.join(counts)})", skips, widened))
+    for sink in gen_sinks:
         for ts, v, life in gen.counter_points("logit.component.batches.dropped",
                                               component=sink, reason="shutdown"):
             if v:
                 windows.append((ts - 2 * window - drain, ts,
-                                f"generator life {life} shutdown drop ({_n(v)} batch(es))"))
+                                f"generator life {life} shutdown drop ({_n(v)} batch(es))", 0,
+                                "a shutdown drop"))
     return sorted(windows)
 
 
@@ -4304,13 +4322,17 @@ def check_ledger_value(data):
     deltas the `datadog` stand-in stored, and U, the deltas a cued step lost: the points of a
     request answered under a step classed `rejected`, and the series a `series_errors` answer
     named, each a point the stand-in never stored (`standin.unstored_points`), whose value the
-    record gives. The gap I − V − U is judged exact when the run has no reported window
-    (`_value_windows`): an SUT life's start, an idle eviction, or any other first point the
-    node skipped, and a generator shutdown drop. With one, the gap is reported, and FAILs only
-    below 0, a surplus, or above the band: the increments the generator sent over the reported
-    windows, plus, for each delta the SUT sink dropped short of the stand-in (an event dropped
-    other than `rejected`, or a record other than `VALUE_SEEN_RECORD_REASONS`), the largest
-    delta stored."""
+    record gives. Below 0 the gap I − V − U FAILs as a surplus. It's judged exact when the run
+    has no reported window (`_value_windows`) and no delta the SUT sink dropped short of the
+    stand-in; otherwise it must fit the sum of what each can lose, and FAILs past it:
+
+    - A window loses at most its skipped series' first points, each one generator window of
+      one series' increments (the median stored delta), plus one window of every series as
+      slack for a window boundary; a widened window, the increments over its whole span.
+    - A delta the sink dropped short of the stand-in (an event dropped other than `rejected`,
+      or a record other than `VALUE_SEEN_RECORD_REASONS`) loses at most the largest stored.
+
+    So the windows bound the loss they explain and excuse none outside them."""
     if not data.ledger.get("sut_delta"):
         return Result("ledger.value", SKIP, "no [ledger] sut_delta, so V counts increments and "
                       "ledger.egress judges them")
@@ -4343,8 +4365,21 @@ def check_ledger_value(data):
     u = sum(cued.values())
     gap = increments - v - u
     windows = _value_windows(data, led, source)
-    lines = [f"[{data.offset(start)}, {data.offset(end)}] {label}"
-             for start, end, label in windows]
+    values = sorted(value for _, value in counts.points)
+    per_series = statistics.median(values) if values else 0
+    slack = per_series * len(counts.series)
+    bounds = []
+    lines = []
+    for start, end, label, skips, widened in windows:
+        if widened:
+            bound = _increments_in(led, source, [(start, end)]) + slack
+            how = f"widened, {widened}: its span's increments + slack"
+        else:
+            bound = skips * per_series + slack
+            how = f"{_n(skips)} x {_n(per_series)} + slack"
+        bounds.append(bound)
+        lines.append(f"[{data.offset(start)}, {data.offset(end)}] {label}: at most "
+                     f"{_n(bound)} ({how} {_n(slack)})")
     sink = led.counts_sink
     unseen = sum(point.value for point in led.sut.matching("logit.component.events.dropped",
                                                            component=sink)
@@ -4354,9 +4389,8 @@ def check_ledger_value(data):
                                                             component=sink)
                   if point.attributes.get("reason") not in VALUE_SEEN_RECORD_REASONS
                   and isinstance(point.value, (int, float)))
-    largest = max([value for _, value in counts.points] or [0])
-    band = _increments_in(led, source, [(start, end) for start, end, _ in windows])
-    band += unseen * largest
+    largest = values[-1] if values else 0
+    band = sum(bounds) + unseen * largest
     head = (f"I {_n(increments)} (generate_in sent {_n(sent)} − lost {_n(lost)}) − V {_n(v)} "
             f"− U {_n(u)} = {_n(gap)}")
     cued_text = ", ".join(f"{_n(value)} cued by {step}" for step, value in sorted(cued.items()))
@@ -4373,10 +4407,10 @@ def check_ledger_value(data):
         return Result("ledger.value", PASS if gap == 0 else FAIL, f"{head}, {verdict}{tail}",
                       lines)
     within = gap <= band
-    verdict = (f"reported: within the band {_n(band)} that the {len(windows)} reported "
-               "window(s) could lose" if within else
-               f"over the band {_n(band)} that the {len(windows)} reported window(s) could "
-               "lose, so a judged window lost value")
+    verdict = (f"reported: within the {_n(band)} that the {len(windows)} reported window(s) "
+               "can lose, each bounded alone" if within else
+               f"over the {_n(band)} that the {len(windows)} reported window(s) can lose, "
+               "each bounded alone, so value was lost outside them")
     return Result("ledger.value", PASS if within else FAIL, f"{head}, {verdict}{tail}", lines)
 
 
