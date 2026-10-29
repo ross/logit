@@ -978,10 +978,18 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         }
     }
 
-    /// Stops tracking a file `read_one` found compressed, closing its descriptor. Nothing of it
-    /// was emitted, so there's nothing to flush.
-    fn untrack_compressed(&mut self, id: FileId, format: &str) {
-        let Some(tracked) = self.files.remove(&id) else { return };
+    /// Stops tracking a file `read_one` found compressed, closing its descriptor. Nothing of the
+    /// compressed content was read, but a file rewritten in place after a truncation can still
+    /// hold the old content's lines in its accumulator: they're emitted first
+    /// (`FlushReason::Closed`), as `Tailer::reap_drained` does. A refused emit sets
+    /// [`Tailer::untaken`].
+    async fn untrack_compressed(&mut self, id: FileId, format: &str, sink: &Fanout) {
+        let Some(mut tracked) = self.files.remove(&id) else { return };
+        if let Some(batch) = tracked.accumulator.take() {
+            if !emit(sink, &self.telemetry, batch, FlushReason::Closed).await {
+                self.untaken = true;
+            }
+        }
         if self.by_path.get(&tracked.path) == Some(&id) {
             self.by_path.remove(&tracked.path);
         }
@@ -1551,7 +1559,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                     return false;
                 }
                 Sniff::Compressed(format) => {
-                    self.untrack_compressed(id, format);
+                    self.untrack_compressed(id, format, sink).await;
                     return false;
                 }
             }
@@ -6868,6 +6876,28 @@ mod tests {
         assert_eq!(probe.sum("logit.input.bytes.dropped", &[("reason", "truncated")]), 10.0);
         assert_eq!(tailer.files.values().next().map(|f| f.offset), Some(2), "the refill is read");
         assert_eq!(tick(&mut tailer, false).await, vec!["x"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A tailed file rewritten in place with a compressed file (`cp app.log.1.gz app.log`) is
+    /// untracked, but the lines it read before the truncation, still in its accumulator, are
+    /// emitted first.
+    #[tokio::test(start_paused = true)]
+    async fn a_file_rewritten_compressed_emits_its_held_lines_before_it_is_skipped() {
+        let dir = scratch_dir("compressed-after-truncation");
+        let path = dir.join("app.log");
+        let line = "a".repeat(40);
+        std::fs::write(&path, format!("{line}\n{line}\n")).unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(vec![PathPattern::new(&path)], ReadFrom::Beginning, &probe);
+        tailer.scan(true, &mut crate::tail::watch::Watcher::Poll).await;
+        assert!(drain_by_hand(&mut tailer).await.is_empty(), "held in the accumulator");
+
+        copytruncate_and_refill(&path, &compressed_bytes(&[0x1f, 0x8b]));
+        assert_eq!(tick(&mut tailer, false).await, vec![line.clone(), line]);
+        assert_eq!(tailer.tracked_len(), 0);
+        assert_eq!(skipped_compressed(&mut probe), 1.0);
+        assert_eq!(closed_flushes(&mut probe), 1.0);
         std::fs::remove_dir_all(&dir).ok();
     }
 
