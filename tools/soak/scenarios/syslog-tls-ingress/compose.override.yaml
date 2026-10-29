@@ -1,0 +1,14 @@
+# Caps the socket buffers on each end of the TCP connection, as syslog-tcp-ingress's override
+# does, and mounts the run's TLS directory, `<run>/tls`, which the driver fills from a private CA
+# and names in SOAK_TLS_DIR, read-only at /tls in the SUT and the generator. A whole directory,
+# not single files, so a `rotate` step's repointed `live` symlink reaches the SUT. `:z` relabels
+# it for SELinux.
+services:
+  logit:
+    sysctls:
+      net.ipv4.tcp_rmem: "4096 65536 262144"
+    volumes: ["${SOAK_TLS_DIR:?set by script/soak}:/tls:ro,z"]
+  generator:
+    sysctls:
+      net.ipv4.tcp_wmem: "4096 16384 262144"
+    volumes: ["${SOAK_TLS_DIR:?set by script/soak}:/tls:ro,z"]

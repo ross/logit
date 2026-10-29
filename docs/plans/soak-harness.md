@@ -1030,6 +1030,9 @@ sends one message per datagram, with no packing to bound, and counts both (W8b).
 `statsd_out`'s per-batch name resolution fails `Clean` and nothing is sent. Over TCP (W11a)
 `statsd_out` writes each batch as one frame and counts its lines in `output.messages` only once
 the write completes, so a batch dropped `ambiguous_at_most_once` is counted there and never in G.
+`syslog_out` over TCP (W27) writes each batch as one octet-counted frame and counts it the same
+way; under its default `at_least_once` it resends a batch after an ambiguous attempt, so G counts
+that batch once and W can hold the attempt's lines as well.
 
 **Which life a hop is judged in.** Every SUT config gives `internal` a dedicated pipeline, so
 its final drain runs after every data node has exited
@@ -1157,10 +1160,11 @@ The rows:
   `partition` whose record shows the container's address changed or doesn't show the address
   after it (`checks.wire_judgment`). Every other TCP-affecting window is **judged**: its loss
   counts with steady state's, against the same limit and edge tolerance, and its surplus, W + F
-  above G, may not exceed one generator batch per `ambiguous_at_most_once` drop the generator
-  counted inside it, plus one per edge. A write that failed partway leaves whole lines the SUT
-  reads, and under `statsd_out`'s `at_most_once` posture the generator drops that batch and
-  never counts it in G. A partition's label carries the address before and after it. The detail
+  above G, may not exceed one generator batch per ambiguous attempt the generator's stream sink
+  counted inside it, `logit.output.requests{class="ambiguous"}`, plus one per edge. A write
+  that failed partway, or a TLS first write that failed, leaves whole lines the SUT reads that G
+  never counts: under `at_least_once` the generator resends the batch, and under `statsd_out`'s
+  `at_most_once` posture it drops the batch `ambiguous_at_most_once`. A partition's label carries the address before and after it. The detail
   names the generator's counted loss by reason (`overflow_newest`, `ambiguous_at_most_once`)
   beside the gap; none of it is in G.
 
@@ -2001,8 +2005,8 @@ the other.
   each egress term in `collector`'s, with `ledger.hop` left to judge the hop. Beside them, one
   bound end to end, which no kill or restart can loosen: each egress group's V over the whole
   run is at most G less every counted loss (K, D, B, X, the hop's drops, and X_B, and on a TCP
-  wire F), plus one generator batch per `ambiguous_at_most_once` drop of a TCP source, the
-  partial-frame surplus `ledger.wire` allows. A duplicate
+  wire F), plus one generator batch per ambiguous attempt of a TCP source, the partial-frame
+  surplus `ledger.wire` allows. A duplicate
   forwarded across the hop adds the same increments to E_B, A, Ab, and V, so every per-life term
   balances around it; this bound and `ledger.hop` are what see it, the bound only once the
   surplus exceeds the run's uncounted loss, the wire loss among it.

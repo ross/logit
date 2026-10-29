@@ -1,0 +1,245 @@
+# syslog-tcp-ingress over TLS (RFC 5425) from the run's private CA: generated log lines as RFC
+# 5424 syslog into `logit`'s `syslog_in`, octet-counted, and out to VictoriaMetrics, under the
+# same faults on the SUT and one rotation of its server certificate, reloaded on a SIGHUP with
+# the poll off. The generator's `syslog_out` runs `at_least_once`. A TLS first write that fails
+# is ambiguous, not clean as over plaintext (crates/logit-outputs/src/stream.rs's module table),
+# so it adds to the ambiguous attempts that allow a judged window one batch of surplus each. A
+# stop or kill of the SUT can lose the lines in either side's socket buffers, so `ledger.wire`
+# reports those windows (docs/known-gaps/sinks.md, "A stream sink counts a frame delivered once
+# the kernel takes it"). The schema is docs/plans/soak-harness.md's "The scenario schema".
+
+name = "syslog-tls-ingress"
+description = "generator syslog_out (TLS, at_least_once) -> syslog_in -> kv -> kv_metrics -> aggregate 10s cumulative -> prometheus_out RW1 zstd -> VictoriaMetrics, with a certificate rotation"
+duration = "14m"          # warmup + one cycle + cooldown; --duration overrides
+# A second cycle's rotation would name the same day, and a certificate's notAfter must rise.
+max_duration = "14m"
+warmup = "60s"            # no faults: baseline rate, RSS, fds
+cooldown = "120s"         # no faults at the end; >= recovery_bound
+recovery_bound = "45s"    # retry_max_delay 10s + two aggregate windows + a drain
+rss_settle = "60s"        # the generator or SUT releases partition-time memory over about 100 s
+cycle = "11m"             # >= last recovery (10m0s) + 2 x progress_window
+compose = "compose.override.yaml"   # caps both ends' TCP socket buffers, mounts <run>/tls
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"
+
+[ledger]                  # component ids the checker reads; no rates here
+sut_aggregate = "window"
+wire_loss_outside_faults = 0.0
+
+[[ledger.source]]
+service = "generator"
+generator_input = "load"
+generator_sink = "syslog"
+sut_listener = "syslog"
+sut_transforms = ["parse", "labels", "count", "metrics_only"]   # messages to aggregate, in order
+wire = "tcp"              # G output.messages, W input.frames, F the framer's counted drops
+
+[[ledger.sink]]
+id = "victoria_metrics"
+backend = "victoria-metrics"
+vm_selector = '{__name__="soak_lines_total"}'
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64   # WARN under 1h, FAIL above
+fd_growth = 8
+
+# The SUT's server certificate, first valid for 30 days, serving `logit`, the name the generator
+# dials.
+[tls.cert.syslog]
+san = ["logit"]
+usage = "server"
+
+# Step 1: netem on the SUT drops its ACKs: judged, with a surplus allowed per ambiguous attempt.
+[[step]]
+at = "0s"
+action = "netem"
+on = "logit"
+args = "loss 30%"
+for = "90s"
+
+# Steps 2 to 4: a rotation, its SIGHUP, and a probe of what the listener then serves. The open
+# connection keeps the session it handshook; the stop at step 6 makes the generator handshake
+# again with the rotated certificate.
+[[step]]
+at = "1m40s"
+action = "rotate"
+on = "logit"
+cert = "syslog"
+days = 31
+for = "40s"
+
+[[step]]
+at = "1m50s"
+action = "signal"
+on = "logit"
+signal = "HUP"
+for = "10s"
+
+[[step]]
+at = "2m5s"
+action = "probe"
+on = "logit"
+cert = "syslog"
+port = 6514
+for = "5s"
+
+# Step 5: the SUT's kernel keeps ACKing until its receive buffer fills, then the generator's
+# write stalls past connect_timeout: judged. A stalled write fails ambiguous and is resent. The
+# generator's queue overflows, counted.
+[[step]]
+at = "2m30s"
+action = "pause"
+on = "logit"
+for = "30s"
+
+# Steps 6 and 7: a stop or kill can end the connection with lines in its buffers: reported.
+[[step]]
+at = "4m"
+action = "stop"
+on = "logit"
+for = "30s"
+
+[[step]]
+at = "5m30s"
+action = "kill"
+on = "logit"
+for = "30s"
+
+# Step 8: no RST in 45 s: judged when the SUT keeps its address, and reported when the
+# reconnect moves it.
+[[step]]
+at = "7m"
+action = "partition"
+on = "logit"
+for = "45s"
+
+# A graceful stop of the generator ends its connection from the sending side: reported, since
+# the generator's queue is lost at the stop.
+[[step]]
+at = "8m45s"
+action = "stop"
+on = "generator"
+for = "30s"
+
+# The SIGHUP after the rotation reloads the listener once, and its notAfter rises by the extra
+# day at least.
+[[expect]]
+name = "server-reload"
+service = "logit"
+metric = "logit.tls.reloads"
+component = "syslog"
+attrs = { outcome = "reloaded" }
+step = "c0s3"
+window = "through"
+reduce = "delta"
+min = 1
+max = 1
+
+[[expect]]
+name = "server-expiry-rises"
+service = "logit"
+metric = "logit.tls.certificate.not_after"
+component = "syslog"
+attrs = { side = "server" }
+step = "c0s3"
+window = "through"
+reduce = "rise"
+min = 86400
+
+# After the stop the generator handshakes again against the rotated certificate, and every drain
+# reads lines; a refused handshake would show as a drain with none.
+[[expect]]
+name = "lines-after-stop"
+service = "logit"
+metric = "logit.input.frames"
+component = "syslog"
+step = "c0s6"
+window = "after"
+reduce = "min_delta"
+min = 1
+
+# The SUT's pause stalls the generator's write: its queue overflows, counted, and an attempt that
+# failed partway is ambiguous and resent, which the wire's allowance covers.
+[[expect]]
+name = "generator-overflows"
+service = "generator"
+metric = "logit.component.batches.dropped"
+component = "syslog"
+attrs = { reason = "overflow_newest" }
+step = "c0s5"
+window = "through"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "generator-ambiguous"
+service = "generator"
+metric = "logit.output.requests"
+component = "syslog"
+attrs = { class = "ambiguous" }
+step = "c0s5"
+window = "through"
+reduce = "delta"
+min = 1
+
+# Under at_least_once the generator resends an ambiguous batch and never drops one.
+[[expect]]
+name = "no-ambiguous-drop"
+service = "generator"
+metric = "logit.component.batches.dropped"
+component = "syslog"
+attrs = { reason = "ambiguous_at_most_once" }
+window = "run"
+reduce = "delta"
+max = 0
+
+# A reset after a connection's first byte. Session tickets the generator never read could
+# turn its close into a reset, but in the recorded runs none of these faults did: a stalled
+# write's dropped connection, the end of a partition, and the generator's stop each closed
+# with a FIN, and a stop or kill of the SUT ends the connection on its own side
+# (docs/plans/soak-harness.md's "W27" findings).
+[[expect]]
+name = "no-reset-pause"
+service = "logit"
+metric = "logit.input.connections.closed"
+component = "syslog"
+attrs = { reason = "reset" }
+step = "c0s5"
+window = "through"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "no-reset-partition"
+service = "logit"
+metric = "logit.input.connections.closed"
+component = "syslog"
+attrs = { reason = "reset" }
+step = "c0s8"
+window = "through"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "no-reset-generator-stop"
+service = "logit"
+metric = "logit.input.connections.closed"
+component = "syslog"
+attrs = { reason = "reset" }
+step = "c0s9"
+window = "through"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "no-resets"
+service = "logit"
+metric = "logit.input.connections.closed"
+component = "syslog"
+attrs = { reason = "reset" }
+window = "run"
+reduce = "delta"
+max = 0

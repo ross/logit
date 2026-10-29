@@ -1,0 +1,27 @@
+# The load source in `script/soak`'s syslog-tls-ingress scenario: syslog-tcp-ingress's stream,
+# 2,000 RFC 5424 messages a second, octet-counted, each batch of 100 one write, over one TLS
+# connection (RFC 5425) that trusts the run's private CA. `syslog_out` runs its default posture,
+# `at_least_once`. Its `internal` telemetry goes to stdout as NDJSON, so the harness reads what
+# it sent.
+admin: { bind: 127.0.0.1:9600 }
+components:
+  load:
+    type: generate_in               # unbounded
+    rate: 2000
+    batch: 100
+    event:
+      log: "id={seq%50}"            # the SUT's `kv` reads `id`, one series per value
+  syslog:
+    type: syslog_out
+    sources: [load]
+    endpoint: logit:6514            # the server certificate's DNS name
+    transport: tcp                  # output.messages counts a batch once its write completes
+    hostname: soak
+    app_name: soak-syslog
+    tls:
+      ca_file: /tls/ca.pem          # the override mounts <run>/tls here
+    # 50 batches is 2.5 s of load, so a write stalled for connect_timeout (5 s) overflows it and
+    # the loss is counted here; never stall generate_in.
+    buffer: { max_batches: 50, overflow: drop_newest, retry_max_delay: 1s }
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }

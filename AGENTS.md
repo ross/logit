@@ -857,7 +857,12 @@ the operator-facing account of all of this.
   against the listener's `transport:`: W is `input.frames`, the framer's drops are counted wire
   loss, and the generator's netem is judged at 0 because TCP retransmits. A process-ending
   fault, or a partition that moved or didn't record the SUT's address, is reported; every other
-  TCP window is judged with a surplus allowance (the plan's `ledger.wire` row).
+  TCP window is judged with a surplus allowance (the plan's `ledger.wire` row) of one batch per
+  ambiguous attempt the generator's sink counted, under either posture.
+  `syslog-tcp-ingress` and `syslog-tls-ingress` send RFC 5424 from `syslog_out` at its default
+  `at_least_once`, octet-counted, into `syslog_in` over TCP and over TLS from the run's private
+  CA, through a certificate rotation in the second, with `[[expect]]` rows on the listener's
+  `logit.input.connections.closed{reason="reset"}`.
   `http-ingress` sends InfluxDB points from `influxdb_out` into `influxdb_in`, its source
   declared `wire = "http"`: G is the points the listener answered `204` for and W its
   `events.sent`, a busy `503` and `logit.input.batches.deferred` are a retry, not loss, and only

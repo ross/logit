@@ -101,6 +101,33 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **To close:** a dead-letter sink for rejected batches and a split-on-`413` retry step in the
     shared HTTP driver, each with its own ADR.
 
+- **A stream sink counts a frame delivered once the kernel takes it.** `syslog_out`,
+  `statsd_out`, and `graphite_out` over TCP, TLS, or a Unix stream count a batch's messages in
+  `logit.output.messages` once the frame's write and flush return
+  (`crates/logit-outputs/src/stream.rs`). A line protocol has no acknowledgment, so at that point
+  the bytes may still be in the sender's send buffer, on the wire, or in the receiver's receive
+  buffer, unread. When the receiving process ends with bytes in either buffer (a kill, a crash, a
+  stop that closes the connection before its reader drains it), those bytes are lost, and
+  neither side counts them: the sink counted them sent, and the listener never read them. The
+  next write meets the reset and fails `Ambiguous` or is retried, but only for the frame it
+  carries, never for the frames already counted.
+  - **Consequence:** the loss per abrupt end is bounded by the two buffers, and Linux autotunes
+    each up to several MiB by default (`net.ipv4.tcp_wmem` and `tcp_rmem`), many seconds of a
+    busy stream. `logit` itself as the receiver loses the same way on a kill, which the
+    `logit_in` native hop avoids by acknowledging each frame after it reaches every downstream
+    inbox.
+  - **Measured:** not separately. In the soak harness's `tcp-ingress`, `syslog-tcp-ingress`, and
+    `syslog-tls-ingress`, the loss sits inside a kill's wire gap, which is made mostly of the
+    counts the killed process read and never exported, so `ledger.wire` reports those windows
+    rather than judging them.
+  - **Workaround:** where a lost tail matters, use a protocol with an acknowledgment: the native
+    hop, or an HTTP sink whose destination answers after it holds the batch. Smaller socket
+    buffers on both ends narrow the window at a throughput cost.
+  - **To close:** the sender's part is countable: on a failed connection, `SIOCOUTQ` (or
+    `TCP_INFO`'s unacknowledged bytes) says how much the peer never acknowledged, and the driver
+    could count that as loss. The receiver's part, acknowledged by its kernel and never read,
+    can't be seen from the sender without an application acknowledgment such as RELP's.
+
 - **A kept-alive connection a destination closed first reads as `Ambiguous`.** An HTTP sink
   closes a pooled connection idle past its `idle_timeout:` (30 s by default) before reusing it,
   so a destination that closes idle connections later doesn't race a write
