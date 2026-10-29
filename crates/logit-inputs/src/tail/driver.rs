@@ -326,6 +326,9 @@ struct Candidate<'a> {
     /// grow into a match. A checkpoint entry has only the hash.
     head_bytes: Option<&'a [u8]>,
     marker: u64,
+    /// The length a claimant must reach: the offset, or for a truncated file's state its read
+    /// offset before the truncation, so a copy shorter than what was read claims nothing.
+    min_len: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -359,6 +362,9 @@ struct Truncation {
     /// under [`CLAIM_MIN_HEAD`] or the marker at the line boundary isn't in memory (a
     /// `docker_in` decoder holding lines).
     candidate: Option<(u64, Head, Vec<u8>, u64)>,
+    /// The read offset before the truncation: a copy shorter than it lacks bytes `logit` read,
+    /// so it can't claim the state ([`Candidate::min_len`]).
+    read_offset: u64,
     /// Bytes the last size observation saw past the read offset, for
     /// `logit.input.bytes.dropped{reason="truncated"}`.
     unread: u64,
@@ -1052,8 +1058,8 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     /// its own inode rejected in this scan (`Tailer::rejected`), a truncated file's state from
     /// before the truncation (`Tailer::truncations`), and a tracked file at its line boundary,
     /// each only with a head of at least [`CLAIM_MIN_HEAD`] bytes. An inode claims a candidate
-    /// iff its head and marker match and it's at least the candidate's offset long
-    /// ([`probe`]), and no other inode or candidate matches either. Two of either is ambiguous:
+    /// iff its head and marker match and it's at least the candidate's [`Candidate::min_len`]
+    /// long ([`probe`]), and no other inode or candidate matches either. Two of either is ambiguous:
     /// nothing is claimed, diagnosed `claim_ambiguous`, so the inode starts where it would have,
     /// which favors duplicates over loss.
     ///
@@ -1182,6 +1188,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                     head: r.head,
                     head_bytes: None,
                     marker: r.marker,
+                    min_len: r.offset,
                 });
             }
         }
@@ -1193,6 +1200,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                     head: r.head,
                     head_bytes: None,
                     marker: r.marker,
+                    min_len: r.offset,
                 });
             }
         }
@@ -1204,6 +1212,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                     head: *head,
                     head_bytes: Some(bytes),
                     marker: *marker,
+                    min_len: t.read_offset,
                 });
             }
         }
@@ -1218,6 +1227,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                     head: Head::of(&f.head),
                     head_bytes: Some(&f.head),
                     marker,
+                    min_len: f.boundary_at,
                 });
             }
         }
@@ -1694,6 +1704,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         self.telemetry.count("logit.input.files.truncated", 1.0, &[]);
         let truncation = Truncation {
             candidate,
+            read_offset: prev_offset,
             unread,
             partial: discarded_partial,
             offered: false,
@@ -2582,7 +2593,8 @@ fn push_tail(tail: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 /// Compares the file at `path`, `len` bytes long, with each candidate for a content claim
-/// (`Tailer::claim_unmatched`): at most two reads of up to [`HEAD_BYTES`] each, the head and the
+/// (`Tailer::claim_unmatched`), which it matches only once it's [`Candidate::min_len`] long: at
+/// most two reads of up to [`HEAD_BYTES`] each, the head and the
 /// bytes ending at a candidate's offset, plus one per further distinct offset whose head matches.
 /// Blocking, like `Tailer::list`.
 fn probe(path: &Path, len: u64, candidates: &[Candidate<'_>]) -> std::io::Result<Vec<Verdict>> {
@@ -2620,7 +2632,7 @@ fn probe(path: &Path, len: u64, candidates: &[Candidate<'_>]) -> std::io::Result
             }
         } else if !c.head.matches(&head) {
             Verdict::No
-        } else if len < c.offset {
+        } else if len < c.min_len {
             if c.head_bytes.is_some() {
                 Verdict::Maybe
             } else {
@@ -7002,6 +7014,36 @@ mod tests {
             assert_eq!(truncated_drops(&mut probe), (0.0, 0.0), "and nothing is left to count");
             std::fs::remove_dir_all(&dir).ok();
         }
+    }
+
+    /// A copy cut inside the line pending at the truncation lacks bytes `logit` read from the
+    /// original, so it can't claim the state from before the truncation: it waits as a copy
+    /// still being written, then replays, and the discarded line is counted. Lines over
+    /// `HEAD_BYTES`, so the candidate's head ends before the pending line.
+    #[tokio::test]
+    async fn a_copy_shorter_than_the_read_offset_claims_nothing() {
+        let dir = scratch_dir("claim-short-copy");
+        let (path, copy) = (dir.join("app.log"), dir.join("app.log.1"));
+        let (one, two) = (format!("one-{}", "x".repeat(300)), format!("two-{}", "y".repeat(300)));
+        std::fs::write(&path, format!("{one}\n{two}\na")).unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(
+            vec![PathPattern::new(dir.join("app.log*"))],
+            ReadFrom::Beginning,
+            &probe,
+        );
+        assert_eq!(tick(&mut tailer, true).await, vec![one.clone(), two.clone()]);
+        std::fs::copy(&path, &copy).unwrap();
+        append(&path, b"bc");
+        assert!(drain_by_hand(&mut tailer).await.is_empty());
+        truncate(&path);
+        for _ in 0..=CLAIM_DEFER_SCANS {
+            scan_in_order(&mut tailer, &[path.clone(), copy.clone()]).await;
+        }
+        assert_eq!(probe.sum("logit.input.files.claimed", &[]), 0.0);
+        assert_eq!(read_out(&mut tailer).await, vec![one, two], "the copy replays");
+        assert_eq!(truncated_drops(&mut probe), (0.0, 1.0), "the discarded line is counted");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Under an exact pattern nothing can claim a truncation, and its counts wait only for the

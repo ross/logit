@@ -145,7 +145,11 @@ reviewer can check.
    A rejected entry is a candidate only in the scan that rejected it.
 
    It claims a candidate iff the candidate's head covers at least 64 bytes, the file's length is
-   at least the candidate's offset, and both the head hash and the marker match. It resumes at the
+   at least the candidate's offset, and both the head hash and the marker match. A truncated
+   file's candidate also needs the file to reach the original's read offset before the
+   truncation, so a copy cut inside the pending line, which lacks bytes the tailer read, can't
+   claim it: it waits as a copy still being written, then starts where it would have, and the
+   truncation's counts stand. It resumes at the
    candidate's offset, overriding `read_from` as a resume does, counted
    `logit.input.files.claimed`. If more than one file matches one candidate, or one file matches
    more than one candidate, nothing is claimed and a `claim_ambiguous` diagnostic says so: the

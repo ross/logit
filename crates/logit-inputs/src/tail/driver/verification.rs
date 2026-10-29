@@ -221,6 +221,8 @@ struct Cand {
     /// written.
     head_known: bool,
     marker: Vec<u8>,
+    /// The length a claimant must reach: the offset, or a truncated state's read offset.
+    min_len: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -508,6 +510,7 @@ impl Model {
             head: t.head.clone(),
             head_known: true,
             marker: tail_at(&t.seen, boundary),
+            min_len: t.offset,
         });
         t.last_len = len;
         t.offset = 0;
@@ -745,6 +748,7 @@ impl Model {
                     head: e.head.clone(),
                     head_known: false,
                     marker: e.marker.clone(),
+                    min_len: e.offset,
                 });
             }
         }
@@ -756,6 +760,7 @@ impl Model {
                     head: e.head.clone(),
                     head_known: false,
                     marker: e.marker.clone(),
+                    min_len: e.offset,
                 });
             }
         }
@@ -773,6 +778,7 @@ impl Model {
                     head: t.head.clone(),
                     head_known: true,
                     marker: tail_at(&t.seen, boundary),
+                    min_len: boundary,
                 });
             }
         }
@@ -796,7 +802,7 @@ impl Model {
         if head[..c.head.len()] != c.head[..] {
             return Verdict::No;
         }
-        if len < c.offset {
+        if len < c.min_len {
             return if c.head_known { Verdict::Maybe } else { Verdict::No };
         }
         if tail_at(content, c.offset) == c.marker {
