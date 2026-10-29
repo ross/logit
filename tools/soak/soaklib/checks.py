@@ -26,7 +26,8 @@ accepted, and its duplicate copies and repeated data points per life against
 `EPOCH_BUMP_REASONS`; it SKIPs for every other target.
 
 The ledger follows each `[[ledger.sink]]`. A row about a sink (`progress`, `identity.sink`,
-`recovery`, `ledger.egress`, `ledger.windows`, `ledger.absent`, `ledger.replay`, `ledger.sent`)
+`recovery`, `ledger.edge`, `ledger.egress`, `ledger.windows`, `ledger.absent`, `ledger.replay`,
+`ledger.sent`)
 keeps its id, reports one line per sink, and takes the worst status. Under `split = "copy"` each
 sink holds a full copy of `aggregate`'s output, so each sink's V is judged alone; under `split =
 "route"` the sinks' V add up to it, so the egress gap is judged on their sum. That holds because

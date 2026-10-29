@@ -2621,11 +2621,13 @@ under "Deferred to a later round" wait.
       `"decrease"`, the point emitted whole), netem, the stand-in's `Clean`, `Ambiguous`, and
       `Refused` cues, and resends, which
       `logit.transform.metrics.skipped{reason="duplicate"|"out_of_order"}` makes idempotent.
-    - Reported, not judged: a cued step that loses value on the SUT, which is a `Rejected`
-      status, a `202` whose `series_errors` body names series, and stale points
-      (`records.dropped{reason="stale"}`). The SUT counts those drops in records, not value, and
-      `cumulative_to_delta` has already moved its baseline past the dropped delta, so no later
-      point restores it.
+    - Judged exactly through U: a cued step that loses value on the SUT, which is a `Rejected`
+      status or a `202` whose `series_errors` body names series. The SUT counts those drops in
+      records, not value, and `cumulative_to_delta` has already moved its baseline past the
+      dropped delta, so no later point restores it, but the stand-in's record holds each lost
+      point's value, so the row takes U from the record and judges I − V − U.
+    - Bounded, not judged exactly: stale points (`records.dropped{reason="stale"}`), which never
+      reach the record, enter the band as drops the record can't see.
     - Reported, not judged (decided with Ross): the first SUT life's start, a SUT restart, and
       a staleness eviction, each inside its window. The transform's state is in memory, and
       `auto` skips a point whose start precedes the component's own, so no counter gives the
