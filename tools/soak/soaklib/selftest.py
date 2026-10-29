@@ -100,9 +100,9 @@ fake Docker and the checks reading them, the driver recording every wire's flag,
 run: W from `input.frames`, the reversed datagram precondition, R with no receive queue, a
 framer's counted drop as wire loss kept out of `drops`, the same lines uncounted FAILing, a
 generator netem judged on TCP but not on UDP, a SUT netem judged, a judged window's surplus
-against its ambiguous drops, a partition judged or reported by its address, `recovery` and a
-killed life's band reading the frames, and a source naming `wire = "udp"` scoring as one
-naming none. On an HTTP wire it covers the generator sink's kind checked at load either way,
+against its ambiguous attempts under either posture and not a drop alone, a partition judged
+or reported by its address, `recovery` and a killed life's band reading the frames, and a
+source naming `wire = "udp"` scoring as one naming none. On an HTTP wire it covers the generator sink's kind checked at load either way,
 the fault predicates and judgments, and runs into `influxdb_in` and `otlp_in`: G from the
 writer's acknowledged events, a stop judged and a kill reported, a judged window's surplus
 against its transport-error attempts and not its `5xx` answers, a `closed_consumer` refusal
@@ -3439,7 +3439,8 @@ def _rss_settle_rules(root):
         _refused(path, with_settle(value), "scenario.rss_settle: not a duration",
                  f"rss_settle = {value!r}")
     # Only these schedules opt in; every other shipped scenario keeps recovery_bound alone.
-    opted_in = {"fanin": 60.0, "tcp-ingress": 60.0, "partition-rss": 120.0}
+    opted_in = {"fanin": 60.0, "tcp-ingress": 60.0, "partition-rss": 120.0,
+                "syslog-tcp-ingress": 60.0, "syslog-tls-ingress": 60.0}
     for path_one in sorted((root / "scenarios").glob("*/scenario.toml")):
         name = path_one.parent.name
         want = opted_in.get(name, 0.0)
@@ -6079,18 +6080,28 @@ def _tcp_ledger():
     """The ledger on a TCP source: W from `input.frames`, F from the framer's counted drops,
     the `output.datagrams` precondition reversed, R with no receive queue, the wire judged
     through netem on the generator and reported through a stop, a judged window's surplus
-    against its ambiguous drops, a partition judged or reported by its address, and `recovery`
+    against its ambiguous attempts, a partition judged or reported by its address, and `recovery`
     reading the frames; and a source naming `wire = "udp"` scored as one naming none."""
 
-    def ambiguous(offset, batches):
+    def ambiguous(offset, batches, requests=True, drops=True):
+        """A `gen_edit` counting `batches` ambiguous attempts on the generator's sink at
+        `offset`: `requests{class="ambiguous"}` when `requests`, and the
+        `ambiguous_at_most_once` drop an `at_most_once` sink adds per attempt when `drops`."""
         stamp = _stamp(T0 + offset)
 
         def edit(record):
             if (record["metrics"][0]["name"] == "logit.component.events.sent"
                     and record["timestamp"] == stamp):
-                return [record, json.loads(_line(
-                    stamp, "logit.component.batches.dropped", "sum", batches, component="out",
-                    attrs={"reason": "ambiguous_at_most_once"}))]
+                extra = []
+                if requests:
+                    extra.append(json.loads(_line(
+                        stamp, "logit.output.requests", "sum", batches, component="out",
+                        attrs={"class": "ambiguous"})))
+                if drops:
+                    extra.append(json.loads(_line(
+                        stamp, "logit.component.batches.dropped", "sum", batches,
+                        component="out", attrs={"reason": "ambiguous_at_most_once"})))
+                return [record, *extra]
             return record
         return edit
 
@@ -6187,16 +6198,35 @@ def _tcp_ledger():
         late = _fault_pair("x1", "netem", "logit", 200, 210, tcp=True)
         over = results("tcp-surplus", steady_surplus=350, timeline_extra=late)
         expect(over["ledger.wire"].status == checks.FAIL
-               and "W + counted exceeds G by 350, over the 200 its 0 ambiguous drop(s) and 2 "
+               and "W + counted exceeds G by 350, over the 200 its 0 ambiguous attempt(s) and 2 "
                "edge(s) allow" in over["ledger.wire"].detail,
                f"a surplus past a judged window's edges FAILs, got {over['ledger.wire']}")
         allowed = results("tcp-surplus-ambiguous", steady_surplus=350, timeline_extra=late,
                           gen_edit=ambiguous(230, 2))
         expect(allowed["ledger.wire"].status == checks.PASS
-               and "surplus allowed 400 (2 ambiguous drop(s) + 2 edge(s), x one 100-line "
+               and "surplus allowed 400 (2 ambiguous attempt(s) + 2 edge(s), x one 100-line "
                "batch)" in "\n".join(allowed["ledger.wire"].lines)
-               and "ambiguous_at_most_once 2" in allowed["ledger.wire"].detail,
-               f"two ambiguous drops allow two batches of surplus, got {allowed['ledger.wire']}")
+               and "ambiguous_at_most_once 2" in allowed["ledger.wire"].detail
+               and "the generator's requests: 2 ambiguous attempt(s)"
+               in allowed["ledger.wire"].detail,
+               f"two ambiguous at_most_once attempts allow two batches of surplus, got "
+               f"{allowed['ledger.wire']}")
+        # Under at_least_once the sink resends the batch and drops nothing: the attempts
+        # alone allow the surplus, and a drop with no ambiguous attempt beside it allows none.
+        resent = results("tcp-surplus-resent", steady_surplus=350, timeline_extra=late,
+                         gen_edit=ambiguous(230, 2, drops=False))
+        expect(resent["ledger.wire"].status == checks.PASS
+               and "surplus allowed 400 (2 ambiguous attempt(s) + 2 edge(s), x one 100-line "
+               "batch)" in "\n".join(resent["ledger.wire"].lines),
+               f"two ambiguous at_least_once attempts allow two batches of surplus, got "
+               f"{resent['ledger.wire']}")
+        dropped = results("tcp-surplus-drop-only", steady_surplus=350, timeline_extra=late,
+                          gen_edit=ambiguous(230, 2, requests=False))
+        expect(dropped["ledger.wire"].status == checks.FAIL
+               and "over the 200 its 0 ambiguous attempt(s) and 2 edge(s) allow"
+               in dropped["ledger.wire"].detail,
+               f"an ambiguous drop with no ambiguous attempt allows nothing, got "
+               f"{dropped['ledger.wire']}")
 
         # A partition: judged when the SUT kept its address, reported when the reconnect moved
         # it, and reported when no address was recorded after it.
@@ -7753,8 +7783,9 @@ def _two_sut_run(tmp, name, kill_on="collector", collector_lives=2, extra=0, sho
 def _tcp_hop_run(tmp, name, extra, ambiguous_at=None):
     """`_two_sut_run`'s unkilled one-life hop run with its one source on a TCP wire: `logit`
     counts `input.frames` in place of datagrams, the generator counts no `output.datagrams`,
-    `extra` lines reach V as surplus, and one `ambiguous_at_most_once` batch drop is counted on
-    the generator's sink at that offset when `ambiguous_at` is set."""
+    `extra` lines reach V as surplus, and one ambiguous attempt,
+    `requests{class="ambiguous"}`, is counted on the generator's sink at that offset when
+    `ambiguous_at` is set."""
     run_dir = _two_sut_run(tmp, name, kill_on=None, collector_lives=1, extra=extra)
 
     def rewrite(path, edit):
@@ -7777,8 +7808,8 @@ def _tcp_hop_run(tmp, name, extra, ambiguous_at=None):
         if (name == "logit.component.events.sent" and ambiguous_at is not None
                 and record["timestamp"] == _stamp(T0 + ambiguous_at)):
             return [record, json.loads(_line(
-                record["timestamp"], "logit.component.batches.dropped", "sum", 1,
-                component="out", attrs={"reason": "ambiguous_at_most_once"}))]
+                record["timestamp"], "logit.output.requests", "sum", 1,
+                component="out", attrs={"class": "ambiguous"}))]
         return [record]
 
     rewrite(run_dir / "logs" / "logit.stdout", sut)
@@ -7892,7 +7923,7 @@ def _two_sut_checks():
                f"ledger.summary FAILs a surplus end to end that every per-life term balances, "
                f"got {exact['ledger.summary']}")
         # A write that failed partway leaves whole lines in V that G doesn't count: one
-        # generator batch per ambiguous drop on a TCP wire, none on UDP.
+        # generator batch per ambiguous attempt on a TCP wire, none on UDP.
         def tcp_hop(name, extra, ambiguous_at=None):
             return {r.id: r for r in checks.run_all(
                 _tcp_hop_run(tmp, name, extra, ambiguous_at))}
@@ -7902,7 +7933,7 @@ def _two_sut_checks():
                and "end to end over the run, G 60,000 less counted loss 0 and a partial-frame "
                "allowance 100: sink: V 60,100 <= G − counted + partial 60,100"
                in partial["ledger.summary"].detail,
-               f"one ambiguous drop on a TCP source allows one batch of surplus end to end, "
+               f"one ambiguous attempt on a TCP source allows one batch of surplus end to end, "
                f"got {partial['ledger.summary']}")
         beyond_partial = tcp_hop("two-tcp-partial-beyond", 101, ambiguous_at=150)
         expect(beyond_partial["ledger.summary"].status == checks.FAIL

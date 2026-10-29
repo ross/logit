@@ -1457,10 +1457,14 @@ _SIZE_UNITS = {"B": 1, "KB": 1000, "MB": 1000 ** 2, "GB": 1000 ** 3,
 # address, can lose lines the generator counted as sent: what sat in either side's socket buffers
 # when the connection reset. Their windows are reported, not judged. Every other TCP-affecting
 # window is judged as steady state is, with a surplus allowed of one generator batch per
-# `ambiguous_at_most_once` drop in it: a write that failed partway left whole lines the SUT read
-# and the generator never counted.
+# attempt its stream sink counted `logit.output.requests{class="ambiguous"}` in it: a write that
+# failed partway, or a TLS first write that failed, left whole lines the SUT read and the
+# generator never counted. Under `at_least_once` the sink then resends the whole batch, and under
+# `at_most_once` it drops the batch `ambiguous_at_most_once`, one drop per such attempt; either
+# way the attempt leaves at most one batch of surplus (crates/logit-outputs/src/stream.rs's module
+# table).
 TCP_REPORTED_ACTIONS = ("stop", "kill", "restart", "exit")
-AMBIGUOUS_DROP = "ambiguous_at_most_once"
+TCP_AMBIGUOUS_CLASS = "ambiguous"
 # On an HTTP wire G counts only points the listener answered with a success, which it does once
 # their batch is in every inbox, after W counted it, so no window can lose a point G counted. A
 # SIGKILL or an exit loses up to one `internal` interval of the SUT's unexported W, so those
@@ -2940,7 +2944,7 @@ def check_ledger_wire(data):
     reported windows of faults that can affect that source's wire and at the end. On UDP that
     loss is by design and every affecting window is reported; on TCP F is the listener's counted
     framer drops, only a process end or a partition that moved an address is reported, and
-    every other affecting window is judged with a surplus allowed for its ambiguous drops
+    every other affecting window is judged with a surplus allowed for its ambiguous attempts
     (`wire_judgment`); on HTTP G counts acknowledged points against W − X, only a kill or an
     exit is reported, and every other affecting window is judged with a surplus allowed for its
     transport-error attempts (`HTTP_REPORTED_ACTIONS`). See `_wire_buckets` for the tolerance.
@@ -3022,14 +3026,14 @@ def _boundary_nets(runs, anchors):
 def _ambiguous_drops(led, source):
     """`[(timestamp, count)]` of what can leave one generator batch in W that G doesn't count,
     so `ledger.wire` and `_end_to_end` allow that much surplus per count: on a TCP wire the
-    generator sink's `ambiguous_at_most_once` batch drops, each a write that failed partway, and
+    generator sink's ambiguous attempts under either posture (`TCP_AMBIGUOUS_CLASS`), and
     on an HTTP wire its attempts that ended in an ambiguous transport error
     (`HTTP_AMBIGUOUS_CLASS`), each a request the listener may have taken before the answer was
     lost; a connect failure (`HTTP_CONNECT_CLASS`) sent nothing and isn't one. Empty on any
     other wire."""
     wire = source_wire(source)
     if wire == "tcp":
-        name, attrs = "logit.component.batches.dropped", {"reason": AMBIGUOUS_DROP}
+        name, attrs = "logit.output.requests", {"class": TCP_AMBIGUOUS_CLASS}
     elif wire == HTTP_WIRE:
         name, attrs = "logit.output.requests", {"class": HTTP_AMBIGUOUS_CLASS}
     else:
@@ -3136,7 +3140,7 @@ def _wire_one(data, led, source, instances=None):
             drops = sum(v for ts, v in ambiguous if start < ts <= end)
             sides = sum(1 for other in (index - 1, index + 1) if 0 <= other < len(runs))
             allowed = allowances[index]
-            what = "transport-error attempt(s)" if http else "ambiguous drop(s)"
+            what = "transport-error attempt(s)" if http else "ambiguous attempt(s)"
             dials = sum(v for ts, v in connects if start < ts <= end)
             lines[-1] += (f", surplus allowed {_n(allowed)} ({_n(drops)} {what} + "
                           f"{sides} edge(s), x one {_n(batch)}-line batch"
@@ -3210,7 +3214,9 @@ def _wire_one(data, led, source, instances=None):
                   f"{_n(round(sums['judged']))} in judged {wire.label}-affecting windows, "
                   f"{_n(round(sums['steady']))} steady, {_n(round(sums['end']))} at the end; "
                   f"loss judged {_n(round(steady_lost))}, each run at 0 or more, against limit "
-                  f"{_n(round(allowed))}); the generator's counted loss, not in G: "
+                  f"{_n(round(allowed))}); the generator's requests: "
+                  f"{_n(sum(v for _, v in ambiguous))} ambiguous attempt(s); its counted loss, "
+                  f"not in G: "
                   f"{_n(stats['dropped_events'])} event(s) in {_n(stats['dropped_batches'])} "
                   f"batch(es)" + (f" ({_reasons(stats['dropped_by'])})"
                                   if stats["dropped_by"] else ""))
@@ -4178,7 +4184,7 @@ def _end_to_end(data, led):
     """`(status, text)`: across a hop or from a file or HTTP wire, each egress group's V over
     the whole run against what the generators sent less every counted loss on the way (K, D, B,
     X, the hop sink's drops, X_B, and the path's counted discards; on a TCP or file wire F too;
-    on an HTTP wire no X, which the client resends), plus one generator batch per ambiguous drop
+    on an HTTP wire no X, which the client resends), plus one generator batch per ambiguous attempt
     on a TCP wire and per transport-error attempt on an HTTP wire, as `ledger.wire` allows, and
     on a file wire the replay band's upper edge. With a `fan_out`, each source's share is
     carried through its chain instead (`Ledger.through`). A kill on either side shifts lives but

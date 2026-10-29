@@ -1,6 +1,6 @@
 ---
 created: 2026-10-08
-updated: 2026-10-25
+updated: 2026-10-29
 ---
 
 # A soak harness: real containers over ordinary config, one-shot netem, and a reset-aware ledger as the loss oracle
@@ -577,3 +577,19 @@ Re-scored, the failed run PASSes with 90 of loss judged against 650, and the pas
 96 as before. A backend stop still opens no judged HTTP window: whether it reaches the wire
 depends on the listener (`otlp_in` holds a request past the writer's timeout, `influxdb_in`
 answers a busy `503`), so its resends' surplus counts 0 as steady state's does.
+
+## Amendment: a TCP window's resend allowance counts ambiguous attempts (2026-10-29)
+
+A TCP source's judged window allowed one generator batch of surplus per
+`ambiguous_at_most_once` drop, which only a sink under `at_most_once` counts. `statsd_out`
+defaults to that posture, but `syslog_out` and `graphite_out` default to `at_least_once`, which
+resends the batch after an ambiguous attempt and drops nothing, so a `syslog_out` generator at
+its default would have no allowance for the lines its failed attempts left at the SUT.
+
+The allowance now counts the generator sink's ambiguous attempts,
+`logit.output.requests{class="ambiguous"}`, which the stream driver counts once per attempt
+under either posture (`crates/logit-outputs/src/stream.rs`). Under `at_most_once` each such
+attempt is one `ambiguous_at_most_once` drop, so `statsd_out`'s allowance is unchanged; under
+`at_least_once` each leaves at most one batch the SUT read beside the resend G counts. A TLS
+first write that fails is ambiguous, where a plaintext one is clean, and adds to the count the
+same way. A drop counted with no ambiguous attempt beside it allows nothing.
