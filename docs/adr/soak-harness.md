@@ -624,9 +624,17 @@ of the deltas a Datadog-shaped stand-in stored, V, to the increments the generat
 - **A first point the transform skips is reported inside a bound.** Under `initial_value: auto`
   the transform skips a series' first point after its start, a restart, or an idle eviction,
   and no counter gives that point's value. Each drain that counts `skipped{reason="initial"}`
-  or `series.evicted` opens a window back to the node's previous receiving drain, and the gap is
-  reported if the generator's increments in those windows cover it. A gap past them FAILs: the
-  windows bound the loss they explain, and don't excuse loss elsewhere.
+  or `series.evicted` opens a window back to the node's previous receiving drain. Each window
+  is bounded alone by what it can lose: its skipped series times one generator window of one
+  series' increments, plus one window of every series as slack. It widens to its span's
+  increments only when the generator's sink counted a drop in it, which moves the first point
+  the SUT sees further on. After a kill, which loses the deltas the SUT's sink still held, the
+  window adds the points that killed life lost, its Ab − V, each up to the largest stored delta,
+  rather than widening: a kill's span holds its whole outage, which would excuse a loss
+  anywhere in it. The gap is reported if it fits the sum of the windows' bounds, and FAILs past
+  it. Bounding the windows' whole spans instead, a first version did, let a loss of 13% of the
+  run's increments outside every window pass on the first run: the windows bound the loss they
+  explain, and excuse none elsewhere.
 - **The count rows judge points with the node in `aggregate`'s place.** Ab is its
   `events.sent`, its skipped points leave every row as a transform's counted discards do, and V
   is the stand-in's distinct points, each credited to the life its request arrived in, because a

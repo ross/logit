@@ -12150,13 +12150,13 @@ DELTA_GENERATOR = ("components:\n  load: { type: generate_in }\n"
 
 
 def _delta_run(tmp, name, restart=False, evict_at=None, edit=None, timeline_extra=(),
-               sut_extra=(), gen_extra=()):
+               sut_extra=(), gen_extra=(), action="stop"):
     """A `sut_delta` run directory that balances in points and in value. The generator sends
     from +5 to +300; each SUT drain receives one window's points and sends their deltas, each
     stored by a `202` request a second before the drain. With `restart`, the SUT is stopped
-    over `STOP`: the generator's points from it reach life 1 in its first drain, where the
-    transform skips each series' first point, losing one window's increments, and the stand-in
-    stores the rest by one request, their timestamps in life 0. `evict_at` makes the drain at
+    (or killed, by `action`) over `STOP`: the generator's points from it reach life 1 in its
+    first drain, where the transform skips each series' first point, losing one window's
+    increments, and the stand-in stores the rest by one request, their timestamps in life 0. `evict_at` makes the drain at
     that offset an idle eviction: each series evicted and its point skipped, a window's
     increments lost. `edit(requests)` returns the record's request lines, edited."""
     per_point = DELTA_PER_DRAIN / DELTA_SERIES
@@ -12209,9 +12209,9 @@ def _delta_run(tmp, name, restart=False, evict_at=None, edit=None, timeline_extr
             requests.append(_datadog_request(len(requests) + 1, offset - 1, series))
     timeline = [_phase("start", 0, t0=T0)]
     if restart:
-        timeline += [_action("apply", "c0s1", "stop", "logit", STOP[0],
+        timeline += [_action("apply", "c0s1", action, "logit", STOP[0],
                              affects_http_ingress=True),
-                     _action("revert", "c0s1", "stop", "logit", STOP[1] - 1, STOP[1],
+                     _action("revert", "c0s1", action, "logit", STOP[1] - 1, STOP[1],
                              affects_http_ingress=True),
                      _ready("c0s1", "logit", STOP[1] + 1)]
     timeline += [_phase("end_begin", 300), _phase("end_end", 330)] + list(timeline_extra)
@@ -12328,7 +12328,7 @@ def _delta_ledger():
                    f"an SUT restart's skipped points and late-stamped deltas balance {row}, got "
                    f"{restarted[row]}")
         expect(restarted["ledger.value"].status == checks.PASS
-               and "= 100, reported: within the band 1,000" in restarted["ledger.value"].detail
+               and "= 100, reported: within the 200 " in restarted["ledger.value"].detail
                and "life 1 start (2 skipped initial)" in " ".join(restarted["ledger.value"].lines),
                f"an SUT restart's lost window is reported inside its band, got "
                f"{restarted['ledger.value']}")
@@ -12336,12 +12336,46 @@ def _delta_ledger():
                        component="load")]
         past = rows("delta-restart-past", restart=True, gen_extra=extra)
         expect(past["ledger.value"].status == checks.FAIL
-               and "so a judged window lost value" in past["ledger.value"].detail,
+               and "so value was lost outside them" in past["ledger.value"].detail,
                f"a loss past the reported windows' band FAILs, got {past['ledger.value']}")
+        # 300 increments lost at +250, far from the restart's window and under a band pooled
+        # over its whole span (1,000), past what one skip of each series can lose.
+        outside = [_line(_stamp(T0 + 250), "logit.component.events.sent", "sum", 300,
+                         component="load")]
+        hidden = rows("delta-restart-outside", restart=True, gen_extra=outside)
+        expect(hidden["ledger.value"].status == checks.FAIL,
+               f"a loss outside every window, under a pooled band, FAILs, got "
+               f"{hidden['ledger.value']}")
+        # The same loss beside a kill: the kill's window holds the points the killed life
+        # lost, not its whole span.
+        hidden = rows("delta-kill-outside", restart=True, action="kill", gen_extra=outside)
+        expect(hidden["ledger.value"].status == checks.FAIL,
+               f"a loss outside every window, beside a kill, FAILs, got {hidden['ledger.value']}")
+
+        # Life 0's last two requests never stored: deltas a kill loses from the sink's queue.
+        def lost_queue(requests):
+            last = [i for i, r in enumerate(requests) if r["t"] < T0 + STOP[0]][-2:]
+            return [r for i, r in enumerate(requests) if i not in last]
+
+        stopped = rows("delta-stop-queue", restart=True, edit=lost_queue)
+        expect(stopped["ledger.value"].status == checks.FAIL,
+               f"a stop's window doesn't widen past its skips, got {stopped['ledger.value']}")
+        killed = rows("delta-kill-queue", restart=True, action="kill", edit=lost_queue)
+        expect(killed["ledger.value"].status == checks.PASS
+               and "killed life 0's Ab − V 4 x 50" in " ".join(killed["ledger.value"].lines),
+               f"a kill's window holds the points the killed life lost, got "
+               f"{killed['ledger.value']}")
+        dropped = [_line(_stamp(T0 + 110), "logit.component.batches.dropped", "sum", 1,
+                         component="out", attrs={"reason": "overflow_oldest"})]
+        overflowed = rows("delta-drop-queue", restart=True, edit=lost_queue, gen_extra=dropped)
+        expect(overflowed["ledger.value"].status == checks.PASS
+               and "widened, the generator dropped in it"
+               in " ".join(overflowed["ledger.value"].lines),
+               f"a generator drop widens its window, got {overflowed['ledger.value']}")
 
         evicted = rows("delta-evicted", evict_at=200)
         expect(evicted["ledger.value"].status == checks.PASS
-               and "= 100, reported: within the band 400" in evicted["ledger.value"].detail
+               and "= 100, reported: within the 200 " in evicted["ledger.value"].detail
                and "idle eviction (2 skipped initial, 2 evicted)"
                in " ".join(evicted["ledger.value"].lines),
                f"an idle eviction's lost window is reported inside its band, got "
@@ -12396,6 +12430,20 @@ def _delta_rules(root):
              "sut_delta in a source's chain")
     _refused(path, mutate(lambda r: r["ledger"].pop("sut_delta")),
              "ledger: missing `sut_aggregate`", "neither sut_delta nor sut_aggregate")
+    for key, value in (("sut_script", "delta"),
+                       ("hop", [{"from": "logit", "to": "collector", "sink": "hop",
+                                 "listener": "hop"}]),
+                       ("split", "route"), ("vm_every_window", True)):
+        _refused(path, mutate(lambda r, key=key, value=value: r["ledger"].update({key: value})),
+                 f"ledger.{key} can't be combined with ledger.sut_delta",
+                 f"sut_delta beside {key}")
+    _refused(path, mutate(lambda r: r.update(overlap={"instances": ["logit", "logit_b"]})),
+             "[overlap] can't be combined with ledger.sut_delta", "sut_delta under [overlap]")
+    _refused(path, mutate(lambda r: r["ledger"]["source"].append(
+                 dict(r["ledger"]["source"][0]))),
+             "ledger.sut_delta needs one [[ledger.source]]", "sut_delta with two sources")
+    _refused(path, mutate(lambda r: r["ledger"]["source"][0].update(fan_out={"points": 4})),
+             "`fan_out` can't be combined with ledger.sut_delta", "sut_delta with a fan_out")
 
 
 def _sampling_vectors(root):

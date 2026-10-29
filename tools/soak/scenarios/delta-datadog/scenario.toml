@@ -2,10 +2,12 @@
 # stand-in, with the value each delta carries judged beside the point counts. The generator
 # sums 1,000 increments a second into 20 running totals and sends them every 5 s; the SUT
 # differences each against its last point and posts the deltas. `ledger.value` holds the
-# stand-in's stored deltas, plus what a cued step lost, to the generator's increments: exact
-# through netem, a generator restart (a reset, its point emitted whole), and every cued class,
-# and reported through an SUT start, an SUT restart, and the idle eviction a long generator
-# pause causes, where the transform skips a series' first point and no counter gives its value.
+# stand-in's stored deltas, plus what a cued step lost, to the generator's increments. An SUT
+# start, an SUT restart, and the idle eviction a long generator pause causes each skip a
+# series' first point, whose value no counter gives, so each opens a reported window bounded
+# alone by the points it skipped (the kill's also by the points the killed life lost, its
+# Ab − V). Netem, a generator restart (a reset, its point emitted whole), and every cued class
+# lose nothing the record doesn't give, so any loss there must fit inside the windows' bounds.
 # Each `respond` step's `class` names the fault class datadog_out must read
 # (crates/logit-outputs/src/datadog.rs, "Faults, retries, and duplicate safety"). The schema is
 # docs/plans/soak-harness.md's "The scenario schema".

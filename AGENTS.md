@@ -939,7 +939,7 @@ the operator-facing account of all of this.
   a generator's cumulative totals: the count rows judge points, and `ledger.value` holds the
   stored deltas' sum, plus the values the record shows a cued step lost, to the generator's
   increments, exact unless the transform skipped a first point (an SUT start or restart, an
-  idle eviction), where the gap is reported within the increments those windows hold.
+  idle eviction), where the gap is reported within the sum of each window's own bound.
   `standin-otlp` points `otlp_out` at an OTLP/HTTP stand-in on `/v1/metrics`
   (`[target] shape = "otlp"`), cueing the table's rows that are neither gRPC nor dial rows and a
   `partial_success` whose rejected points `ledger.standin` holds to the sink's
