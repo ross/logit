@@ -1111,7 +1111,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     /// a candidate in [`Tailer::claim_snapshot`] (`docs/adr/tail-content-identity.md`, decision
     /// 5). It then seeks back to `0` and is marked `claim_pending`; otherwise it stops being
     /// claimable and the read goes on, so a rename rotation's new file, which matches nothing, is
-    /// read at once. Decided from the read, so a write landing just before it can't slip past.
+    /// read at once. Decided from the read, so a write landing before it can't slip past.
     ///
     /// The snapshot is built here, once per drain, so an empty claimable file costs nothing on a
     /// wake that finds it still empty. `drain` visits claimable files first, so the snapshot
