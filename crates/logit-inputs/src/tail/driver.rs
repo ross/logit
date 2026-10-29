@@ -543,6 +543,9 @@ pub(crate) struct Tailer<D: TailDecoder, F: DecoderFactory<D>> {
     /// File watches `read_one` released with a compressed file, for the next `drain` or `scan`
     /// to remove: `read_one` has no `Watcher`.
     unwatch: Vec<super::watch::WatchId>,
+    /// Inodes nothing names that `DecoderFactory::accept` took in this scan's first pass, so
+    /// `open_tracked` doesn't ask again. Cleared at the end of `reconcile_all`.
+    accepted: HashSet<FileId>,
     /// Where a file found by the first scan with no `resume` entry starts. Set at `bind`:
     /// `Beginning` after [`Loaded::Unusable`], else from `read_from`.
     first_scan_start: StartOffset,
@@ -595,6 +598,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             deferred: HashMap::new(),
             skipped: HashMap::new(),
             unwatch: Vec::new(),
+            accepted: HashSet::new(),
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
             watched_dirs: HashSet::new(),
@@ -1001,9 +1005,12 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 || self.skipped.contains_key(&id)
             {
                 self.reconcile_discovered(path, &meta, first, None, watcher).await;
-            } else {
+            } else if self.factory.accept(&path) {
+                self.accepted.insert(id);
                 unmatched.push((path, meta));
             }
+            // A path the factory rejects (a container `containers:` doesn't select) is neither
+            // probed nor a taker, and isn't opened; the next scan asks again.
         }
         self.recheck_draining().await;
         let claims = self.claim_unmatched(&unmatched, first, listing, discovered_ids);
@@ -1024,6 +1031,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             }
         }
         self.settle_claims(&taken);
+        self.accepted.clear();
         // A file the second pass rotated away started draining after step 3.
         self.recheck_draining().await;
     }
@@ -1899,7 +1907,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             );
             return;
         }
-        if !self.factory.accept(&path) {
+        if !self.accepted.remove(&id) && !self.factory.accept(&path) {
             return;
         }
         let opened = match fault::check(super::pattern::OPEN, &path, 0) {
@@ -2760,6 +2768,8 @@ fn probe_file(
     // Shorter than the scan's `stat` said: it was truncated since, so what's there decides.
     let len = if got < len.min(HEAD_BYTES as u64) as usize { got as u64 } else { len };
     let mut markers: HashMap<u64, Option<u64>> = HashMap::new();
+    // One hash per distinct candidate head length, however many candidates share it.
+    let mut heads: HashMap<u32, Head> = HashMap::new();
     let mut verdicts = Vec::with_capacity(candidates.len());
     for c in candidates {
         let head_len = c.head.len as usize;
@@ -2768,7 +2778,8 @@ fn probe_file(
                 Some(bytes) if bytes.starts_with(&head) => Verdict::Maybe,
                 _ => Verdict::No,
             }
-        } else if !c.head.matches(&head) {
+        } else if *heads.entry(c.head.len).or_insert_with(|| Head::of(&head[..head_len])) != c.head
+        {
             Verdict::No
         } else if len < c.min_len {
             if c.head_bytes.is_some() {
@@ -6666,6 +6677,40 @@ mod tests {
 
     /// `end_scan` evicts what no call touched, so a path missing from one scan's calls loses its
     /// cached state: a rebind and a de-selected file awaiting its reap included.
+    /// A path the factory rejects (`docker_in`'s unselected container) is asked once per scan
+    /// and never probed for a claim, though a tracked file's head offers a candidate every scan.
+    #[tokio::test]
+    async fn a_path_the_factory_rejects_is_never_probed_for_a_claim() {
+        let dir = scratch_dir("factory-rejects-probe");
+        let (kept, other) = (dir.join("app.log"), dir.join("other.log"));
+        let line = long_line("same");
+        std::fs::write(&kept, format!("{line}\n{line}\n")).unwrap();
+        let offered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let deselect = Arc::new(std::sync::Mutex::new(Some(other.clone())));
+        let factory = RecordingFactory { offered: offered.clone(), deselect };
+        let mut hand = Hand::bind(
+            vec![PathPattern::new(dir.join("*.log"))],
+            factory,
+            fast_config(ReadFrom::Beginning),
+        )
+        .await;
+        hand.pump().await;
+        // Its content matches the tracked file's candidate, so a probe would take it.
+        std::fs::write(&other, format!("{line}\n{line}\n")).unwrap();
+        let scope = fault::scope(&other);
+        scope.record();
+        offered.lock().unwrap().clear();
+        for _ in 0..3 {
+            hand.scan().await;
+        }
+        let probes = scope.hits().iter().filter(|h| h.point == crate::tail::pattern::OPEN).count();
+        assert_eq!(probes, 0, "never opened to probe");
+        let asked = offered.lock().unwrap().iter().filter(|p| **p == other).count();
+        assert_eq!(asked, 3, "asked once per scan");
+        assert!(!hand.tailer.files.contains_key(&id_of(&other)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn every_discovered_path_is_offered_to_the_factory_once_per_scan() {
         let dir = scratch_dir("factory-offers");

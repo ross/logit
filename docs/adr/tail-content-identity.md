@@ -177,8 +177,12 @@ reviewer can check.
    it's read from `0` at once, as a rename rotation's new file is.
 
    The first scan never waits, since `read_from` decides only files it opens. The cost falls only
-   on an unmatched inode: a read of at most 256 bytes for the head and one per distinct candidate
-   offset whose head matches, repeated at each scan while it waits. What it recovers:
+   on an unmatched inode the decoder factory accepts (under `docker_in`, a selected container's
+   log; a rejected one is never opened): one open, a read of at most 256 bytes for the head, one
+   hash per distinct candidate head length, and a read of at most 256 bytes per distinct
+   candidate offset whose head matches. An inode that waits pays it again at each scan, and a
+   file opened empty pays it once more when a drain first finds it holding bytes; any other is
+   opened in the scan that probed it and never probed again. What it recovers:
 
    - a `copytruncate` copy under `app.log*` resumes at the original's offset instead of replaying
      from `0`;
