@@ -3178,28 +3178,28 @@ def _ack_timeouts(led, source):
 
 
 def _in_flight_reader(led, source):
-    """`in_flight_at(at)`: the highest `HTTP_IN_FLIGHT` an HTTP source's generator sinks read,
-    summed over the sinks, at the two generator drains straddling `at`, the last at or before it
-    and the first after; None when no sink emitted the gauge. A drain with no point carries the
-    sink's last value, since the gauge exports only on a change."""
+    """`in_flight_at(at)`: the batches an HTTP source's generator sinks held in flight at `at`,
+    the highest at the two generator drains straddling it (the last at or before it and the
+    first after), each sink counting `max(1, its HTTP_IN_FLIGHT reading)` and a sink that emits
+    no gauge, at a `concurrency:` of 1, counting 1; None when no sink emitted the gauge. A drain
+    with no point carries the sink's last value, since the gauge exports only on a change."""
     gen = led.gens[source.get("service")]
     series = [gen.gauge_series(HTTP_IN_FLIGHT, component=sink)
               for sink in source_ids(source, "generator_sink")]
-    series = [one for one in series if one]
-    if not series:
+    if not any(series):
         return lambda at: None
     drains = sorted(gen.drains)
 
     def value_at(one, drain):
         stamps = [ts for ts, _, _ in one]
         index = bisect.bisect_right(stamps, drain) - 1
-        return one[index][1] if index >= 0 else 0.0
+        return max(1, int(one[index][1])) if index >= 0 else 1
 
     def in_flight_at(at):
         index = bisect.bisect_right(drains, at)
         straddling = drains[max(0, index - 1):index + 1]
-        return max((sum(value_at(one, drain) for one in series) for drain in straddling),
-                   default=None)
+        return max((sum(value_at(one, drain) if one else 1 for one in series)
+                    for drain in straddling), default=None)
 
     return in_flight_at
 
@@ -3259,13 +3259,13 @@ def _wire_one(data, led, source, instances=None):
             # A judged run's surplus has no pool to fall into, so every edge it has, a boundary
             # with another judged run included, allows its one batch of interpolation error. On
             # HTTP the listener counts a request's batch in W before the writer counts it in G,
-            # so an edge allows the batches the writer read in flight at the generator drains
-            # straddling it, when more than one: that many sit in W and not yet in G there,
-            # whatever the neighbour, and a pair `_boundary_nets` didn't net can hold them.
-            edges_at = [at for other, at in ((index - 1, start), (index + 1, end))
-                        if 0 <= other < len(runs)]
-            readings = [in_flight_at(at) for at in edges_at]
-            edge_batches[index] = [max(1, int(reading or 0)) for reading in readings]
+            # so the lag at an edge is the batches in flight there, and the surplus lag leaves in
+            # a run is its lag at the end less its lag at the start: only the trailing edge's
+            # reading backs one, whatever the neighbour, so it allows that many batches when
+            # more than one, and the leading edge its one.
+            edge_batches[index] = (
+                [1] * (index > 0)
+                + [max(1, in_flight_at(end) or 1)] * (index + 1 < len(runs)))
             drops = sum(v for ts, v in ambiguous if start < ts <= end)
             allowances[index] = (drops + sum(edge_batches[index])) * batch
     connects = (sorted((ts, v) for sink in source_ids(source, "generator_sink")
