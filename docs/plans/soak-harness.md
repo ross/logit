@@ -6191,3 +6191,49 @@ What the runs showed:
 - All three generators shed load to `overflow: drop_newest` while their writer waited, counted
   and outside G: 23% of `splunk-hec-ingress`'s attempted events, 21% of `datadog-ingress`'s,
   and 24% of `rw-ingress`'s.
+
+### W25: a `prometheus_in` scrape (2026-10-29)
+
+`prometheus-scrape` ran at its default 18 minutes on the development host, with
+`SOAK_SKIP_IMAGE=1` against the `logit:soak` image built at 2026-10-29 10:00 PDT; `soak/w25`
+touches no product code. Other agents' soak runs shared the daemon throughout.
+
+| Run | Verdict |
+|---|---|
+| `20261029T195143Z` | FAIL: `expect.partition-fails` and `expect.kill-fails`, a scenario defect, below |
+| `20261029T201553Z` | WARN: `rss_slope` on the generator, below |
+
+The first run FAILed two rows:
+
+| Check | Status | Detail |
+|---|---|---|
+| `expect.partition-fails` | FAIL | delta of logit.input.scrapes{class=network_error, component=scrape} on logit, through c0s1: c0s1 (+60s, +150s]: 0 (over 18 drain(s)), want >= 1, FAIL |
+| `expect.kill-fails` | FAIL | delta of logit.input.scrapes{class=network_error, component=scrape} on logit, through c0s4: c0s4 (+540s, +600s]: 0 (over 12 drain(s)), want >= 1, FAIL |
+
+The rerun's ledger rows:
+
+| Check | Status | Detail |
+|---|---|---|
+| `rss_slope` | WARN | generator WARN: MiB/h life 0 +103.7, life 1 -4.0 (limit 64); 635s of 1020s after warmup judged (62%; WARN under 5%) \| logit PASS: MiB/h life 0 +2.0 (limit 64); 640s of 1020s after warmup judged (63%; WARN under 5%) |
+| `ledger.wire` | PASS | G 1,055,200 − V 1,053,000 = 2,200 over the run; generator life 0 (killed): G 545,100 − V 544,000 = 1,100 within its end band [-5,000, 11,000]; generator life 1 (stopped): G 510,100 − V 509,000 = 1,100 within its end band [0, 11,000] |
+| `ledger.intake` | PASS | final life 0: W + Y − D 17,457 vs E + B 17,457 (R 67,000 = 0 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.edge` | PASS | final life 0: E − X 17,457 == S_in[victoria_metrics] 17,457 (listener to victoria_metrics) |
+| `ledger.egress` | PASS | victoria_metrics: life 0 (final): W − X 16,800 − V_n 16,800 = 0, exact (V_n the distinct stored samples) |
+| `recovery` | PASS | 4 of 4 fault(s) judged at 1 sink(s), each recovered within recovery_bound 30s of its end; each by a sample scraped |
+
+What the runs showed:
+
+- **A scrape of a partitioned or killed target times out.** Neither resolving the generator's
+  name nor dialing it failed within the scrape's 2 s `timeout`, so every failed scrape in the
+  partition and the kill counted `timeout` (12 and 6), as in the pause (11) and the delay (17),
+  and none counted `network_error`. The scenario now expects `timeout` in all four.
+- **No increment was lost.** Each generator life's G − V was 1,100 in both runs, a fraction of
+  its 11,000 end band, whatever the faults before it: the next scrape after each fault read the
+  total that held every increment generated during it.
+- **The egress was exact.** VictoriaMetrics stored every sample the listener sent once, so
+  W − X equaled the distinct stored samples in both runs.
+- **The generator's RSS steps once after the pause and holds.** In the first run its first
+  life grew from 25 to 33 MiB as it caught up on the minute of generation the pause held back,
+  then stayed flat, and in both runs its second life stayed flat. The generator is the load source, not the system under test,
+  so the scenario leaves the WARN reported rather than listing it under `[expected]`. The SUT's
+  RSS stayed flat (+2.0 MiB/h).
