@@ -21,7 +21,8 @@
 //! content (`docs/adr/tail-content-identity.md`), how a drain splits, drops, batches, and reaps,
 //! and what a checkpoint persists. A truncation's counts wait, as the driver's do, until
 //! `TRUNCATION_OFFERS` scans have offered its state, and up to `CLAIM_DEFER_SCANS` more while an
-//! inode may still claim it, or a stop; a second truncation of the file counts the first. After every op the test checks:
+//! inode may still claim it, or a stop; a second truncation of the file counts the first. After
+//! every op the test checks:
 //!
 //! - the batches received equal the model's, each in file order and in order per inode;
 //! - the tracked set, each file's offset, pending bytes, state, path, head, and `rescanned`,

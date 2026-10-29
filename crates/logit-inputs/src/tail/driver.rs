@@ -351,6 +351,10 @@ enum ClaimFrom {
     Live(FileId),
 }
 
+/// What [`Tailer::claim_unmatched`] decided for one inode: `None` for no claim, else its start
+/// and the candidate it claims (none for [`StartOffset::Defer`]).
+type Claim = Option<(StartOffset, Option<ClaimFrom>)>;
+
 /// How a new inode's content compares with one [`Candidate`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Verdict {
@@ -1156,10 +1160,10 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     ///
     /// The candidates are an unspent checkpoint entry whose inode this scan didn't find, an entry
     /// its own inode rejected in this scan (`Tailer::rejected`), a truncated file's state from
-    /// before the truncation (`Tailer::truncations`), and a tracked file at its line boundary,
-    /// each only with a head of at least [`CLAIM_MIN_HEAD`] bytes. An inode claims a candidate
-    /// iff its head and marker match and it's at least the candidate's [`Candidate::min_len`]
-    /// long ([`probe`]), and no other inode or candidate matches either. Two of either is ambiguous:
+    /// before the truncation (`Tailer::truncations`), and a tracked file at its line boundary, each
+    /// only with a head of at least [`CLAIM_MIN_HEAD`] bytes. An inode claims a candidate iff its
+    /// head and marker match and it's at least the candidate's [`Candidate::min_len`] long
+    /// ([`probe`]), and no other inode or candidate matches either. Two of either is ambiguous:
     /// nothing is claimed, diagnosed `claim_ambiguous`, so the inode starts where it would have,
     /// which favors duplicates over loss.
     ///
@@ -1187,7 +1191,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         first: bool,
         listing: &Listing,
         discovered_ids: &HashSet<FileId>,
-    ) -> (Vec<Option<(StartOffset, Option<ClaimFrom>)>>, HashSet<usize>) {
+    ) -> (Vec<Claim>, HashSet<usize>) {
         for t in &mut self.truncations {
             t.offers += 1;
             t.pinned = false;
@@ -1357,11 +1361,11 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
 
     /// Spends each candidate a new inode claimed in this scan, given with the claimant's length,
     /// then counts each rejected entry no inode matched as gone
-    /// (`docs/adr/tail-content-identity.md`, decision 6): one in `matched` that nothing claimed
-    /// was matched ambiguously, and the file that matched it starts at `0` and delivers it. A claimed checkpoint entry, rejected or
-    /// not, leaves the checkpoint. A claimed truncation's discarded line isn't counted, since the
-    /// copy resumes at its start, but the bytes the original was last seen to hold past the
-    /// copy's end are: they're in neither file.
+    /// (`docs/adr/tail-content-identity.md`, decision 6): one in `matched` that nothing claimed was
+    /// matched ambiguously, and the file that matched it starts at `0` and delivers it. A claimed
+    /// checkpoint entry, rejected or not, leaves the checkpoint. A claimed truncation's discarded
+    /// line isn't counted, since the copy resumes at its start, but the bytes the original was last
+    /// seen to hold past the copy's end are: they're in neither file.
     fn settle_claims(&mut self, taken: &[(ClaimFrom, u64)], matched: &HashSet<usize>) {
         if !taken.is_empty() {
             self.telemetry.count("logit.input.files.claimed", taken.len() as f64, &[]);
@@ -1789,13 +1793,14 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     ///
     /// When a copy could claim it, neither count is emitted here. The file's state from before the
     /// truncation (its head, its line boundary, and the marker there) waits in
-    /// `Tailer::truncations` for a copy to claim ([`Tailer::claim_unmatched`]). A claim resumes
-    /// the copy at that boundary, so the copy delivers the unterminated line whole and whatever
-    /// the copy holds of what the original never read, and only the bytes past the copy's end
-    /// are counted ([`Tailer::settle_claims`]). A scan that finds no claimant
-    /// counts both ([`Tailer::count_truncations`]): a copy made before the truncate is listable by
-    /// any scan after the truncation is seen, and a second scan covers one whose listing failed. A state no copy can claim (a head under
-    /// [`CLAIM_MIN_HEAD`], or no known marker at the boundary) is counted at once.
+    /// `Tailer::truncations` for a copy to claim ([`Tailer::claim_unmatched`]). A claim resumes the
+    /// copy at that boundary, so the copy delivers the unterminated line whole and whatever the
+    /// copy holds of what the original never read, and only the bytes past the copy's end are
+    /// counted ([`Tailer::settle_claims`]). A scan that finds no claimant counts both
+    /// ([`Tailer::count_truncations`]): a copy made before the truncate is listable by any scan
+    /// after the truncation is seen, and a second scan covers one whose listing failed. A state no
+    /// copy can claim (a head under [`CLAIM_MIN_HEAD`], or no known marker at the boundary) is
+    /// counted at once.
     async fn reconcile_truncation(&mut self, id: FileId, len: u64) {
         let max_line_bytes = self.config.max_line_bytes;
         let Some(tracked) = self.files.get_mut(&id) else { return };
@@ -2260,8 +2265,8 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         let bytes = self.read_buf.split().freeze();
 
         let Some(tracked) = self.files.get_mut(&id) else { return false };
-        // Bytes written after `decide_claimable` saw the file empty: read now, so no scan may untrack
-        // it.
+        // Bytes written after `decide_claimable` saw the file empty: read now, so no scan may
+        // untrack it.
         tracked.claimable = false;
         capture_head(&mut tracked.head, tracked.offset, &bytes);
         // Before any line is split, so nothing of a compressed file is emitted.
