@@ -1,0 +1,29 @@
+# The system under test in `script/soak`'s standin-splunk scenario: statsd-vm's SUT with
+# `splunk_hec_out` posting HEC metric events, gzipped and acknowledged, to the scripted
+# stand-in. Its `internal` telemetry goes to stdout as NDJSON for the harness to read;
+# `script/soak` runs it with `--log-format json`.
+admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
+components:
+  statsd: { type: statsd_in, bind: 0.0.0.0:8125 }   # receive: defaults (drop_oldest)
+  window:
+    type: aggregate
+    sources: [statsd]
+    interval: 10s
+    # Cumulative: a resend repeats a running total rather than adding to it, the sink's remedy
+    # for a resent `Sum`, so a lost window is overwritten by the next.
+    temporality: cumulative
+    series_retention: 360           # a fault must never evict a series
+  hec:
+    type: splunk_hec_out
+    sources: [window]
+    endpoint: http://standin:8080/services/collector   # the stand-in checks no token
+    token: soak-standin
+    # Under 5 s, so a step that withholds acks for 20 s reaches the timeout several times.
+    ack: true
+    ack_timeout: 5s
+    # A window's 100 metric objects take several bodies, so a cue can land on a batch's second
+    # body, after its first was accepted.
+    max_body_bytes: 4KiB
+    # compression: gzip, the default; buffer: defaults (block, at_least_once, retry_max_delay 10s)
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }

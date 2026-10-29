@@ -202,6 +202,7 @@ import base64
 import copy
 import gzip
 import json
+import math
 import os
 import re
 import shutil
@@ -1454,8 +1455,9 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
     stored `200` request per sample timestamp a second before it (`_standin_record`), the SUT's
     `logit.output.requests` counts each in the drain after it, and `standin_edit(requests)`
     returns the request lines to write, edited. Under `standin_shape` `"datadog"` the record is
-    `_datadog_record`'s, the export's samples as delta points, and under `"influxdb"`
-    `_influx_record`'s, the same points as line protocol."""
+    `_datadog_record`'s, the export's samples as delta points, under `"influxdb"`
+    `_influx_record`'s, the same points as line protocol, and under `"otlp"` and `"splunk"`
+    `_otlp_standin_record`'s and `_splunk_record`'s, the export's cumulative samples."""
     gen = []
     for offset in range(5, 301, 5):
         stamp = _stamp(T0 + offset)
@@ -1633,6 +1635,8 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
     if standin_edit is not None:
         record = (_datadog_record(export) if standin_shape == standin.DATADOG
                   else _influx_record(export) if standin_shape == standin.INFLUXDB
+                  else _otlp_standin_record(export) if standin_shape == standin.OTLP
+                  else _splunk_record(export) if standin_shape == standin.SPLUNK
                   else _standin_record(export))
         requests = standin_edit(record)
         _write_standin(run_dir, requests, shape=standin_shape)
@@ -1751,6 +1755,84 @@ def _influx_record(export):
             by_stamp.setdefault(stamp, []).append((metric, float(delta), stamp))
     return [_influx_request(seq, stamp / 1000 - T0 - 1, points)
             for seq, (stamp, points) in enumerate(sorted(by_stamp.items()), start=1)]
+
+
+def _otlp_standin_request(seq, offset, points, status=200, stored=True, cue=None,
+                          answer="status", encoding="gzip", path="/v1/metrics",
+                          partial_success=None):
+    """One `otlp` stand-in record line at `T0 + offset` whose body is an
+    `ExportMetricsServiceRequest` of `points`, `[(name, value, timestamp_ms)]`, one `Sum` point
+    each, under `encoding`."""
+    payload = _otlp_request([_otlp_metric(name, [_otlp_point(stamp * 1_000_000, float(value))])
+                             for name, value, stamp in points])
+    body = gzip.compress(payload, mtime=0) if encoding == "gzip" else payload
+    line = {"event": "request", "seq": seq, "t": T0 + offset, "path": path,
+            "content_type": "application/x-protobuf", "content_encoding": encoding,
+            "bytes": len(body), "cue": cue, "answer": answer,
+            "status": None if answer == "reset" else status, "stored": stored,
+            "body_b64": base64.b64encode(body).decode()}
+    if partial_success is not None:
+        line["partial_success"] = partial_success
+    return line
+
+
+def _otlp_standin_record(export):
+    """The requests an `otlp` stand-in would record for `export`: one stored `200` per sample
+    timestamp, a second before it, holding every series' cumulative value at that timestamp."""
+    by_stamp = {}
+    for one in export:
+        for stamp, value in zip(one["timestamps"], one["values"]):
+            by_stamp.setdefault(stamp, []).append((one["metric"]["__name__"], value, stamp))
+    return [_otlp_standin_request(seq, stamp / 1000 - T0 - 1, points)
+            for seq, (stamp, points) in enumerate(sorted(by_stamp.items()), start=1)]
+
+
+def _hec_object(name, value, stamp):
+    """One HEC metric object as `splunk_hec_out` writes it: a cumulative `Sum` on host
+    `logit-soak`."""
+    return json.dumps({"time": stamp / 1000, "host": "logit-soak", "event": "metric",
+                       "fields": {"metric_type": "Sum", f"metric_name:{name}": value}},
+                      separators=(",", ":"))
+
+
+def _splunk_request(seq, offset, points, status=200, stored=True, cue=None, answer="status",
+                    encoding="gzip", path="/services/collector/event", ack_id=None,
+                    invalid_event=None):
+    """One `splunk` stand-in record line at `T0 + offset` whose body is HEC metric objects of
+    `points`, `[(name, value, timestamp_ms)]`, concatenated, under `encoding`; a default `2xx`
+    carries `ack_id`, `seq - 1` unless given."""
+    payload = "".join(_hec_object(*point) for point in points).encode()
+    body = gzip.compress(payload, mtime=0) if encoding == "gzip" else payload
+    line = {"event": "request", "seq": seq, "t": T0 + offset, "path": path,
+            "content_type": "application/json", "content_encoding": encoding,
+            "bytes": len(body), "cue": cue, "answer": answer,
+            "status": None if answer == "reset" else status, "stored": stored,
+            "body_b64": base64.b64encode(body).decode()}
+    if answer == "status" and 200 <= status < 300 and cue is None:
+        line["ack_id"] = seq - 1 if ack_id is None else ack_id
+    if invalid_event is not None:
+        line["invalid_event"] = invalid_event
+    return line
+
+
+def _splunk_record(export):
+    """The requests a `splunk` stand-in would record for `export`, as `_otlp_standin_record`
+    builds them, each with its minted `ackId`."""
+    by_stamp = {}
+    for one in export:
+        for stamp, value in zip(one["timestamps"], one["values"]):
+            by_stamp.setdefault(stamp, []).append((one["metric"]["__name__"], value, stamp))
+    return [_splunk_request(seq, stamp / 1000 - T0 - 1, points)
+            for seq, (stamp, points) in enumerate(sorted(by_stamp.items()), start=1)]
+
+
+def _ack_poll(seq, offset, acks, cue=None):
+    """One `splunk` stand-in `/ack` poll line at `T0 + offset`, answered `acks`."""
+    body = json.dumps({"acks": [int(one) for one in acks]}).encode()
+    return {"event": "request", "seq": seq, "t": T0 + offset, "path": "/services/collector/ack",
+            "content_type": "application/json", "content_encoding": None,
+            "bytes": len(body), "cue": cue, "answer": "status", "status": 200, "stored": False,
+            "acks": acks, "body_b64": base64.b64encode(body).decode()}
 
 
 def _write_standin(run_dir, requests, extra=(), shape="remote_write"):
@@ -9124,7 +9206,7 @@ def _datadog_rules(root):
         return edit
 
     cases = [
-        (base, lambda raw: raw["target"].update(shape="splunk"),
+        (base, lambda raw: raw["target"].update(shape="loki"),
          "target.shape must be one of remote_write, datadog", "an unknown shape"),
         (vm_base, lambda raw: raw.update(target={"kind": "victoria-metrics",
                                                  "shape": "datadog"}),
@@ -9757,6 +9839,458 @@ def _influx_checks():
                and "the writes name 2 destinations, one expected" in rows["ledger.standin"].detail
                and "bucket='other' (1 write(s))" in rows["ledger.standin"].detail,
                f"writes to two buckets FAIL, got {rows['ledger.standin']}")
+
+
+def _otlp_standin_codec(root):
+    """The `otlp` shape's decoder: an `ExportMetricsServiceRequest` under gzip and none read
+    one series per data point, named by metric, resource, and attributes, in ms; a body that
+    isn't one refused; a `partial_success` answer's first N points named and left out of what
+    was stored; and the stand-in's `partial_success` body read as `otlp_out` reads one."""
+    points = [("a", 3, 1000), ("b", 4.5, 2000)]
+    for encoding in ("gzip", None):
+        request = _otlp_standin_request(1, 0, points, encoding=encoding)
+        series = standin.decode_body(request, standin.OTLP)
+        expect([(labels["__name__"], samples) for labels, samples in series]
+               == [("a", [(1000, 3.0)]), ("b", [(2000, 4.5)])]
+               and set(series[0][0]) == {"__name__", "resource", "attributes"}
+               and series[0][0]["resource"] == series[1][0]["resource"] != "",
+               f"an OTLP body under {encoding} reads one series per point, got {series}")
+    for request, needle in (
+            ({**_otlp_standin_request(1, 0, points, encoding=None),
+              "body_b64": base64.b64encode(b"\x0a\x05ab").decode()}, "truncated"),
+            ({**_otlp_standin_request(1, 0, points), "content_encoding": "zstd"}, "zstd")):
+        try:
+            standin.decode_body(request, standin.OTLP)
+            expect(False, f"an OTLP body with {needle} decoded")
+        except standin.DecodeError as err:
+            expect(needle in str(err), f"an OTLP body is refused with {needle!r}, got {err}")
+    partial = _otlp_standin_request(1, 0, points, partial_success=1)
+    kept = standin.stored_part(partial, standin.OTLP)
+    expect([labels["__name__"] for labels, _ in kept] == ["b"]
+           and standin.named_series(partial, standin.decode_body(partial, standin.OTLP)) == 1,
+           f"a partial_success of 1 names the request's first point and stores the rest, got "
+           f"{kept}")
+    stored, _, _, _ = standin.stored_series([partial], standin.OTLP)
+    lost = standin.acknowledged_unstored([partial], stored, standin.OTLP)
+    expect(lost == [], f"the point a partial_success named isn't an acknowledged loss, got {lost}")
+    server = _load_standin_server(root)
+    body = server.partial_success_body(7)
+    inner = [value for number, _, value in otlp.fields(body) if number == 1]
+    parts = {number: value for number, _, value in otlp.fields(inner[0])} if inner else {}
+    expect(parts.get(1) == 7 and b"rejected" in parts.get(2, b""),
+           f"the partial_success body is field 1 holding rejected_data_points 7 and a message, "
+           f"got {parts}")
+
+
+def _splunk_codec(root):
+    """The `splunk` shape's decoder: concatenated HEC objects with and without whitespace, under
+    gzip and none, one series per measurement named by its dimensions and envelope, the
+    single-metric form, a log object with none, and malformed bodies refused; an `invalid_event`
+    answer storing the objects before the one it names; an `/ack` poll no write; and the
+    stand-in's HEC answers byte for byte as `crates/logit-proto/src/splunk/response.rs` pins
+    Splunk's."""
+    objects = standin.splunk_objects('{"a":1}{"b":2}\n {"c":3}\n')
+    expect(objects == [{"a": 1}, {"b": 2}, {"c": 3}],
+           f"HEC objects split with or without whitespace, got {objects}")
+    for text, needle in (('{"a":1}[1]', "is a list"), ('{"a":1}{"b"', "object 1")):
+        try:
+            standin.splunk_objects(text)
+            expect(False, f"{text!r} split")
+        except standin.DecodeError as err:
+            expect(needle in str(err), f"{text!r} is refused with {needle!r}, got {err}")
+    metric = {"time": 1.5, "host": "h", "index": "m", "event": "metric",
+              "fields": {"env": "soak", "metric_type": "Sum", "metric_name:x": 3,
+                         "metric_name:y": "NaN"}}
+    samples = standin.splunk_samples(metric)
+    expect(samples[0] == ({"env": "soak", "metric_type": "Sum", "host": "h", "index": "m",
+                           "__name__": "x"}, [(1500, 3.0)])
+           and samples[1][0]["__name__"] == "y" and math.isnan(samples[1][1][0][1])
+           and standin.splunk_object_records(metric) == 2,
+           f"a multi-metric object is a sample per measurement, got {samples}")
+    single = {"time": 2, "fields": {"metric_name": "z", "_value": 4}}
+    log = {"time": 2, "event": "a log line", "fields": {"k": "v"}}
+    expect(standin.splunk_samples(single) == [({"__name__": "z"}, [(2000, 4.0)])]
+           and standin.splunk_samples(log) == [] and standin.splunk_object_records(log) == 1,
+           "the single-metric form is one sample, and a log object none and one record")
+    for bad, needle in (({"time": "x", "fields": {"metric_name:x": 1}}, "isn't a number"),
+                        ({"time": 1, "fields": {"metric_name:x": True}}, "no number")):
+        try:
+            standin.splunk_samples(bad)
+            expect(False, f"{bad} decoded")
+        except standin.DecodeError as err:
+            expect(needle in str(err), f"{bad} is refused with {needle!r}, got {err}")
+    points = [("a", 1, 1000), ("b", 2, 1000), ("c", 3, 1000)]
+    for encoding in ("gzip", None):
+        series = standin.decode_body(_splunk_request(1, 0, points, encoding=encoding),
+                                     standin.SPLUNK)
+        expect([labels["__name__"] for labels, _ in series] == ["a", "b", "c"],
+               f"a HEC body under {encoding} reads every object's measurement, got {series}")
+    rejected = _splunk_request(1, 0, points, status=400, stored=False, cue="c0s1",
+                               invalid_event=2)
+    kept = standin.stored_part(rejected, standin.SPLUNK)
+    expect([labels["__name__"] for labels, _ in kept] == ["a", "b"],
+           f"a code 6 naming object 2 stored the two objects before it, got {kept}")
+    plain = _splunk_request(1, 0, points, status=400, stored=False, cue="c0s1")
+    expect(standin.stored_part(plain, standin.SPLUNK) == [],
+           "a 400 with no invalid_event stored nothing")
+    poll = _ack_poll(2, 1, {"0": True})
+    expect(not standin.is_write(poll, standin.SPLUNK) and standin.is_write(plain, standin.SPLUNK)
+           and standin.is_write(poll, standin.REMOTE_WRITE),
+           "an /ack poll is no write under the splunk shape alone")
+    server = _load_standin_server(root)
+    got = (server.hec_body(text="Success", code=0, ackId=7),
+           server.hec_body(**{"text": "Invalid data format", "code": 6,
+                              "invalid-event-number": 2}))
+    expect(got == (b'{"text":"Success","code":0,"ackId":7}',
+                   b'{"text":"Invalid data format","code":6,"invalid-event-number":2}'),
+           f"the stand-in's HEC answers are Splunk's bytes, got {got}")
+
+
+def _standin_on_loopback(root, shape, path, exchange):
+    """Runs the stand-in's handlers for `shape` on loopback ports and `exchange(request, cue)`,
+    where `request(method, path, body, headers)` returns `(status, headers, body)` and
+    `cue(obj)` posts a cue; returns the record lines it printed."""
+    import http.client
+    import http.server
+    import io
+    import threading
+    server = _load_standin_server(root)
+    state = server.State(shape, path)
+    data = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.data_handler(state))
+    control = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.control_handler(state))
+    for one in (data, control):
+        threading.Thread(target=one.serve_forever, daemon=True).start()
+    printed = io.StringIO()
+    real_stdout = server.sys.stdout
+    server.sys.stdout = printed
+    control_base = f"http://127.0.0.1:{control.server_address[1]}"
+    sent = [0]
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", data.server_address[1], timeout=5)
+
+        def request(path, body, headers=None):
+            conn.request("POST", path, body=body, headers=headers or {})
+            response = conn.getresponse()
+            sent[0] += 1
+            return response.status, dict(response.getheaders()), response.read()
+
+        try:
+            exchange(request, lambda obj: faults.post_cue(control_base, obj))
+        finally:
+            conn.close()
+        deadline = time.monotonic() + 5
+        while (printed.getvalue().count('"event": "request"') < sent[0]
+               and time.monotonic() < deadline):
+            time.sleep(0.01)
+    finally:
+        server.sys.stdout = real_stdout
+        for one in (data, control):
+            one.shutdown()
+            one.server_close()
+    return [json.loads(line) for line in printed.getvalue().splitlines()
+            if '"event": "request"' in line]
+
+
+def _otlp_standin_server(root):
+    """The stand-in's `otlp` shape on loopback ports: the default `200` with an empty protobuf
+    body on `/v1/metrics`, a `partial_success` cue's body and record, its cue rules, and `404`
+    on `/v1/logs`."""
+    answers = []
+
+    def exchange(request, cue):
+        answers.append(request("/v1/metrics", b"x"))
+        cue({"step": "c0s1", "status": 200, "partial_success": 2})
+        answers.append(request("/v1/metrics", b"x"))
+        cue({})
+        answers.append(request("/v1/logs", b"x"))
+
+    lines = _standin_on_loopback(root, "otlp", "/v1/metrics", exchange)
+    expect(answers[0][0] == 200 and answers[0][2] == b""
+           and answers[0][1].get("Content-Type") == "application/x-protobuf",
+           f"the otlp shape answers 200 with an empty protobuf body, got {answers[:1]}")
+    server = _load_standin_server(root)
+    expect(answers[1][0] == 200 and answers[1][2] == server.partial_success_body(2)
+           and answers[2][0] == 404,
+           f"a partial_success cue answers its body, and /v1/logs 404, got {answers[1:]}")
+    got = [(r["path"], r["status"], r["stored"], r.get("partial_success"), r["cue"])
+           for r in lines]
+    expect(got == [("/v1/metrics", 200, True, None, None),
+                   ("/v1/metrics", 200, True, 2, "c0s1"), ("/v1/logs", 404, False, None, None)],
+           f"each line records the answer and the partial_success, got {got}")
+    for cue, shape, needle in (
+            ({"step": "s", "status": 200, "partial_success": 1}, "splunk",
+             "`partial_success` is for the otlp shape"),
+            ({"step": "s", "status": 503, "partial_success": 1}, "otlp",
+             "`partial_success` goes with a 2xx `status`"),
+            ({"step": "s", "status": 200, "partial_success": 0}, "otlp",
+             "`partial_success` must be a positive integer"),
+            ({"step": "s", "status": 200, "after": 0}, "otlp",
+             "`after` must be a positive integer")):
+        problems = server.cue_problems(cue, shape)
+        expect(any(needle in one for one in problems),
+               f"the stand-in refuses {cue} under {shape} with {needle!r}, got {problems}")
+
+
+def _splunk_server(root):
+    """The stand-in's `splunk` shape on loopback ports: the default `200` minting an `ackId` per
+    channel from 0; a poll answering `true` for each minted id and `false` for another; a cue
+    with `after` letting the next write through with no cue, then answering its status; a poll
+    spending none of a cue's `count`; `withhold_acks` answering every poll `false` under its
+    cue; an `invalid_event` cue's code 6 body and record; and its cue rules."""
+    event, ack = "/services/collector/event", "/services/collector/ack"
+    answers = []
+
+    def channel(name):
+        return {"X-Splunk-Request-Channel": name}
+
+    def exchange(request, cue):
+        for name in ("a", "a", "b"):
+            answers.append(request(event, b"{}", channel(name)))
+        answers.append(request(ack, b'{"acks":[0,1,5]}', channel("a")))
+        cue({"step": "c0s2", "status": 503, "body": '{"text":"Server is busy","code":9}',
+             "after": 1, "count": 1})
+        answers.append(request(ack, b'{"acks":[0]}', channel("a")))
+        for _ in range(3):
+            answers.append(request(event, b"{}", channel("a")))
+        cue({"step": "c0s3", "status": 200, "withhold_acks": True})
+        answers.append(request(event, b"{}", channel("a")))
+        answers.append(request(ack, b'{"acks":[0,4]}', channel("a")))
+        cue({"step": "c0s4", "status": 400, "invalid_event": 3})
+        answers.append(request(event, b"{}", channel("a")))
+
+    lines = _standin_on_loopback(root, "splunk", event, exchange)
+    bodies = [body for _, _, body in answers]
+    expect(bodies[:3] == [b'{"text":"Success","code":0,"ackId":0}',
+                          b'{"text":"Success","code":0,"ackId":1}',
+                          b'{"text":"Success","code":0,"ackId":0}'],
+           f"a default answer mints an ackId per channel from 0, got {bodies[:3]}")
+    expect(json.loads(bodies[3]) == {"acks": {"0": True, "1": True, "5": False}},
+           f"a poll answers each minted id true and another false, got {bodies[3]}")
+    statuses = [status for status, _, _ in answers[4:8]]
+    expect(statuses == [200, 200, 503, 200] and b'"ackId":3' in bodies[7],
+           f"a poll spends no count, `after` lets one write through, then the cue answers one "
+           f"and is spent, got {statuses} {bodies[5:8]}")
+    expect(answers[8][0] == 200 and json.loads(bodies[9]) == {"acks": {"0": False, "4": False}},
+           f"under withhold_acks a write is accepted and every id answered false, got "
+           f"{bodies[8:10]}")
+    expect(answers[10][0] == 400
+           and bodies[10] == b'{"text":"Invalid data format","code":6,"invalid-event-number":3}',
+           f"an invalid_event cue answers code 6 naming its object, got {answers[10]}")
+    got = [(r["path"].rsplit("/", 1)[1], r["status"], r["cue"], r.get("ack_id"),
+            r.get("acks"), r.get("invalid_event")) for r in lines]
+    expect(got == [("event", 200, None, 0, None, None), ("event", 200, None, 1, None, None),
+                   ("event", 200, None, 0, None, None),
+                   ("ack", 200, None, None, {"0": True, "1": True, "5": False}, None),
+                   ("ack", 200, None, None, {"0": True}, None),
+                   ("event", 200, None, 2, None, None), ("event", 503, "c0s2", None, None, None),
+                   ("event", 200, None, 3, None, None), ("event", 200, "c0s3", 4, None, None),
+                   ("ack", 200, "c0s3", None, {"0": False, "4": False}, None),
+                   ("event", 400, "c0s4", None, None, 3)],
+           f"each line records its cue, ackId, poll answer, and invalid_event, got {got}")
+    server = _load_standin_server(root)
+    for cue, shape, needle in (
+            ({"step": "s", "status": 400, "invalid_event": 1}, "otlp",
+             "`invalid_event` is for the splunk shape"),
+            ({"step": "s", "status": 503, "invalid_event": 1}, "splunk",
+             "`invalid_event` goes with `status` 400"),
+            ({"step": "s", "status": 400, "invalid_event": 1, "body": "x"}, "splunk",
+             "`invalid_event` writes the body"),
+            ({"step": "s", "status": 503, "withhold_acks": True}, "splunk",
+             "`withhold_acks` goes with a 2xx `status`"),
+            ({"step": "s", "status": 200, "withhold_acks": True}, "datadog",
+             "`withhold_acks` is for the splunk shape")):
+        problems = server.cue_problems(cue, shape)
+        expect(any(needle in one for one in problems),
+               f"the stand-in refuses {cue} under {shape} with {needle!r}, got {problems}")
+
+
+def _new_shape_rules(root):
+    """`[target] shape = "otlp"` and `"splunk"` and their step rules: each shipped scenario
+    loading with its shape, every respond classed but its 2xx `partial_success` or its
+    `invalid_event`; a class required on a non-2xx and refused on a 2xx, an `invalid_event`
+    refusing one, `withhold_acks` needing `ambiguous`; and each key refused under another
+    shape, with the wrong status, or with a bad value."""
+    for name, shape, steps, unclassed in (("standin-otlp", "otlp", 13, [200]),
+                                          ("standin-splunk", "splunk", 14, [400])):
+        loaded = scenario.load(root / "scenarios" / name / "scenario.toml")
+        got = [s.status for s in loaded.steps if s.fault_class is None]
+        expect(loaded.standin_shape == shape and got == unclassed and len(loaded.steps) == steps,
+               f"{name} loads as a {shape} stand-in with {steps} steps, all classed but "
+               f"{unclassed}, got {loaded.target} {got}")
+    for name, cases in (
+            ("standin-otlp", (
+                (1, {"class": None}, "under the otlp shape a respond other than a 2xx needs "
+                 "`class`", "an unclassed 429"),
+                (0, {"class": "ambiguous"}, "a 2xx isn't a fault, so it takes no `class`",
+                 "a classed 200"),
+                (0, {"invalid_event": 1, "partial_success": None},
+                 "`invalid_event` is for a standin target with shape 'splunk'", "invalid_event"),
+                (0, {"partial_success": 0}, "`partial_success` must be a positive integer",
+                 "a partial_success of 0"),
+                (1, {"partial_success": 1}, "`partial_success` goes with a 2xx `status`",
+                 "a partial_success on a 429"),
+                (1, {"after": 0}, "`after` must be a positive integer", "an after of 0"),
+                (0, {"withhold_acks": True, "class": "ambiguous"},
+                 "`withhold_acks` is for a standin target with shape 'splunk'",
+                 "withhold_acks"))),
+            ("standin-splunk", (
+                (0, {"class": "rejected"}, "an `invalid_event` answer drops one object and the "
+                 "sink resends the rest, so it takes no `class`", "a classed invalid_event"),
+                (0, {"status": 503}, "`invalid_event` goes with `status` 400",
+                 "an invalid_event on a 503"),
+                (0, {"invalid_event": -1}, "`invalid_event` must be an integer of 0 or more",
+                 "a negative invalid_event"),
+                (12, {"class": None}, "`withhold_acks` needs `class = \"ambiguous\"`",
+                 "an unclassed withhold_acks"),
+                (12, {"class": "clean"}, "`withhold_acks` needs `class = \"ambiguous\"`",
+                 "withhold_acks classed clean"),
+                (12, {"status": 503}, "`withhold_acks` goes with a 2xx `status`",
+                 "withhold_acks on a 503"),
+                (12, {"withhold_acks": False}, "`withhold_acks` must be true",
+                 "withhold_acks false"),
+                (1, {"class": None}, "under the splunk shape a respond other than a 2xx needs "
+                 "`class`", "an unclassed 401"),
+                (1, {"partial_success": 1}, "`partial_success` is for a standin target with "
+                 "shape 'otlp'", "partial_success")))):
+        path = root / "scenarios" / name / "scenario.toml"
+        base = tomllib.loads(path.read_text())
+        for index, changes, needle, what in cases:
+            raw = copy.deepcopy(base)
+            for key in [k for k, v in changes.items() if v is None]:
+                raw["step"][index].pop(key, None)
+            raw["step"][index].update({k: v for k, v in changes.items() if v is not None})
+            _refused(path, raw, needle, f"{name}: {what}")
+
+
+def _shape_results(tmp, shape):
+    """`results(name, edit, **kwargs)` for a two-life `shape` stand-in run: every row by id."""
+    def results(name, edit=lambda requests: requests, **kwargs):
+        run_dir = _ledger_run(tmp, name, standin_edit=edit, standin_shape=shape, **kwargs)
+        return {r.id: r for r in checks.run_all(run_dir)}
+    return results
+
+
+def _dropped_line(offset, n, reason):
+    return _line(_stamp(T0 + offset), "logit.output.records.dropped", "sum", n,
+                 component="sink", attrs={"reason": reason})
+
+
+def _otlp_standin_checks():
+    """The checks over an `otlp` stand-in two-life run: V the stored cumulative points, a
+    `partial_success` answer's points held to the sink's `records.dropped{reason="rejected"}`
+    and left out of `drops`, a rejected step's request points held to it too, and either
+    count short FAILing."""
+    with tempfile.TemporaryDirectory() as tmp:
+        results = _shape_results(tmp, "otlp")
+        rows = results("otlp-clean")
+        for row in ("ledger.egress", "ledger.summary", "ledger.standin", "drops"):
+            expect(rows[row].status == checks.PASS,
+                   f"an otlp stand-in run that balances PASSes {row}, got {rows[row]}")
+        expect(rows["ledger.sent"].status == checks.SKIP
+               and "shape otlp" in rows["ledger.sent"].detail,
+               f"ledger.sent SKIPs under the otlp shape, got {rows['ledger.sent']}")
+
+        # A partial success at +199 rejecting the first point of the request it answers.
+        def partial(requests):
+            requests[2].update(partial_success=1, cue="c0s2")
+            return requests
+
+        cued = _respond_fault("c0s2", 195, 205, status=200)
+        rows = results("otlp-partial", partial, timeline_extra=cued,
+                       sut_extra=[_dropped_line(200, 1, "rejected")])
+        for row in ("ledger.standin", "ledger.egress", "drops"):
+            expect(rows[row].status == checks.PASS,
+                   f"a partial success the sink counted PASSes {row}, got {rows[row]}")
+        expect("life 1: records dropped rejected 1 by the record, 1 by sink"
+               in rows["ledger.standin"].lines,
+               f"the row reports the partial success's point, got {rows['ledger.standin'].lines}")
+        rows = results("otlp-partial-uncounted", partial, timeline_extra=cued)
+        expect(rows["ledger.standin"].status == checks.FAIL
+               and "sink counted 0 record(s) dropped rejected, the record holds 1"
+               in rows["ledger.standin"].detail,
+               f"a partial success the sink didn't count FAILs, got {rows['ledger.standin']}")
+
+        # The last request answered 400 under a step classed rejected: its 2 points dropped.
+        def rejected(requests):
+            requests[-1].update(status=400, stored=False, cue="c0s2")
+            return requests
+
+        cued = _respond_fault("c0s2", 290, 305, status=400, cls="rejected")
+        drop = [_line(_stamp(T0 + 300), "logit.component.batches.dropped", "sum", 1,
+                      component="sink", attrs={"reason": "rejected"}),
+                _dropped_line(300, 2, "rejected")]
+        rows = results("otlp-rejected", rejected, timeline_extra=cued, sut_extra=drop)
+        expect(rows["ledger.standin"].status == checks.PASS and rows["drops"].status == checks.PASS,
+               f"a rejected request whose points the sink counted PASSes, got "
+               f"{rows['ledger.standin']} {rows['drops']}")
+        rows = results("otlp-rejected-short", rejected, timeline_extra=cued,
+                       sut_extra=drop[:1] + [_dropped_line(300, 1, "rejected")])
+        expect(rows["ledger.standin"].status == checks.FAIL
+               and "sink counted 1 record(s) dropped rejected, the record holds 2"
+               in rows["ledger.standin"].detail,
+               f"a rejected request's points counted short FAILs, got {rows['ledger.standin']}")
+
+
+def _splunk_checks():
+    """The checks over a `splunk` stand-in two-life run: V the stored cumulative measurements;
+    `/ack` polls neither writes to a wrong path nor undecodable, and counted with the requests;
+    a default 2xx with no `ackId` FAILing; an `invalid_event` answer storing the objects before
+    the one it names, which V needs, and its object's records held to the sink's
+    `records.dropped{reason="invalid_event"}`, left out of `drops`."""
+    with tempfile.TemporaryDirectory() as tmp:
+        results = _shape_results(tmp, "splunk")
+
+        def polled(requests):
+            out = []
+            for request in requests:
+                out.append(request)
+                out.append(_ack_poll(99, request["t"] - T0 + 0.5,
+                                     {str(request["ack_id"]): True}))
+            return out
+
+        rows = results("splunk-clean", polled)
+        for row in ("ledger.egress", "ledger.summary", "ledger.standin", "drops"):
+            expect(rows[row].status == checks.PASS,
+                   f"a splunk stand-in run that balances PASSes {row}, got {rows[row]}")
+        expect(any(line.startswith("4 /ack poll(s): 4 id(s) answered true")
+                   for line in rows["ledger.standin"].lines),
+               f"the row reports the polls, got {rows['ledger.standin'].lines}")
+
+        def unminted(requests):
+            requests[1].pop("ack_id")
+            return requests
+
+        rows = results("splunk-no-ack-id", unminted)
+        expect(rows["ledger.standin"].status == checks.FAIL
+               and "1 default 2xx answer(s) carried no ackId" in rows["ledger.standin"].detail,
+               f"a default 2xx with no ackId FAILs, got {rows['ledger.standin']}")
+
+        # A code 6 at +299 naming object 1, x_9, of [x_0, x_9, x_1], and the resend of x_1.
+        def invalid(requests):
+            last = requests[-1]
+            stamp = int((T0 + 300) * 1000)
+            values = dict((name, value) for name, value in (
+                (labels["__name__"], samples[0][1]) for labels, samples
+                in standin.decode_body(last, standin.SPLUNK)))
+            body = [("x_0_total", values["x_0_total"], stamp), ("x_9_total", 5, stamp),
+                    ("x_1_total", values["x_1_total"], stamp)]
+            offset = last["t"] - T0
+            requests[-1] = _splunk_request(last["seq"], offset, body, status=400, stored=False,
+                                           cue="c0s2", invalid_event=1)
+            requests.append(_splunk_request(last["seq"] + 1, offset + 0.1, body[2:]))
+            return requests
+
+        cued = _respond_fault("c0s2", 295, 305, status=400)
+        rows = results("splunk-invalid", invalid, timeline_extra=cued,
+                       sut_extra=[_dropped_line(300, 1, "invalid_event")])
+        for row in ("ledger.standin", "ledger.egress", "drops"):
+            expect(rows[row].status == checks.PASS,
+                   f"a code 6 the sink counted, its prefix stored, PASSes {row}, got {rows[row]}")
+        rows = results("splunk-invalid-uncounted", invalid, timeline_extra=cued)
+        expect(rows["ledger.standin"].status == checks.FAIL
+               and "sink counted 0 record(s) dropped invalid_event, the record holds 1"
+               in rows["ledger.standin"].detail,
+               f"a code 6 the sink didn't count FAILs, got {rows['ledger.standin']}")
 
 
 # A rolling overlap: two instances, `logit` and `logit-b`, in `sut-net`'s namespace.
@@ -12169,7 +12703,9 @@ def run(root, quiet=False):
                      _standin_checks, _class_signatures, _written_counts, _datadog_codec,
                      _datadog_counts, _datadog_server,
                      _datadog_rules, _datadog_checks, _influx_codec, _influx_points,
-                     _influx_server, _influx_rules, _influx_checks, _overlap_rules,
+                     _influx_server, _influx_rules, _influx_checks, _otlp_standin_codec,
+                     _splunk_codec, _otlp_standin_server, _splunk_server, _new_shape_rules,
+                     _otlp_standin_checks, _splunk_checks, _overlap_rules,
                      _overlap_driver, _overlap_checks, _idp_rules, _refresh_checks,
                      _signal_rules, _signal_actions, _sighup_driver,
                      _reopen_checks, _tls_rules, _tls_actions, _tls_driver, _tls_checks,
@@ -12189,6 +12725,8 @@ def run(root, quiet=False):
                               _standin_driver, _written_counts, _datadog_codec,
                               _datadog_server,
                               _datadog_rules, _influx_codec, _influx_server, _influx_rules,
+                              _otlp_standin_codec, _splunk_codec, _otlp_standin_server,
+                              _splunk_server, _new_shape_rules,
                               _overlap_rules, _overlap_driver, _idp_rules, _signal_rules,
                               _sighup_driver,
                               _tls_rules, _tls_driver, _fan_out_rules, _sampling_vectors,

@@ -6,7 +6,7 @@ it answered (with the raw body, base64), `cue` for each cue it took, and `ready`
 around a life. Decoding happens here, on the host, so `check` re-scores a run from the record
 alone.
 
-Three shapes, each the stand-in's `--shape` and a scenario's `[target] shape`:
+Five shapes, each the stand-in's `--shape` and a scenario's `[target] shape`:
 
 - `remote_write`: a body is a Snappy **block** (never framed) holding a `prometheus.WriteRequest`
   (1.0): `timeseries` is field 1; a `TimeSeries` has `labels` (1) and `samples` (2); a `Label`
@@ -38,6 +38,22 @@ Three shapes, each the stand-in's `--shape` and a scenario's `[target] shape`:
   `influxdb_out` re-encodes a retried batch byte for byte, so a resend is a rewrite: V is the
   sum over distinct `(series, timestamp)` of the stored value, and a resend that stored another
   value is a conflict (`stored_points`).
+- `otlp`: a body is an OTLP/HTTP `ExportMetricsServiceRequest`, under `Content-Encoding` `gzip`
+  or none, read by `otlp.py`: each `Sum` and `Gauge` data point is a sample of the series
+  `{__name__: metric name, resource, attributes}`, the last two the hex of their encoded
+  `KeyValue`s, in wire order. A `2xx` with `partial_success` N stored every point of its request
+  but the first N (`stored_part`).
+- `splunk`: a body is HEC `/event` JSON objects concatenated with no separator, under
+  `Content-Encoding` `gzip` or none, as `splunk_hec_out` writes them
+  (`crates/logit-proto/src/splunk/metrics.rs`, "Encode"). Each `metric_name:<n>` field of an
+  object, or its `metric_name` and `_value` pair, is a sample of the series `{__name__: n, host,
+  index, source, sourcetype, **dimensions}` at the object's `time` in milliseconds; a log or
+  span object carries none. A `400` with `invalid_event` N stored the objects before object N,
+  as Splunk indexes them (`stored_part`). A `/services/collector/ack` poll is no write and holds
+  no samples.
+
+The `otlp` and `splunk` shapes are for cumulative sinks, whose V is `remote_write`'s: one sample
+per `(label set, timestamp)`, a later write replacing an earlier one (`stored_series`).
 
 Every other protobuf field, `metadata` included, is skipped by wire type. V has `/api/v1/export`'s shape,
 timestamps in milliseconds, so `ledger.windows` reads it as it reads VictoriaMetrics.
@@ -53,19 +69,31 @@ import urllib.parse
 import zlib
 from dataclasses import dataclass, field
 
+from . import otlp
+
 REMOTE_WRITE, DATADOG, INFLUXDB = "remote_write", "datadog", "influxdb"
-SHAPES = (REMOTE_WRITE, DATADOG, INFLUXDB)
+OTLP, SPLUNK = "otlp", "splunk"
+SHAPES = (REMOTE_WRITE, DATADOG, INFLUXDB, OTLP, SPLUNK)
 REMOTE_WRITE_PATH = "/api/v1/write"
 DATADOG_SERIES_PATH = "/api/v2/series"
 INFLUXDB_WRITE_PATH = "/api/v2/write"
+OTLP_METRICS_PATH = "/v1/metrics"
+SPLUNK_EVENT_PATH = "/services/collector/event"
+SPLUNK_ACK_PATH = "/services/collector/ack"
 # Each shape's write path and the status it answers with no cue; standin/standin.py's
 # DEFAULT_PATH and DEFAULT_STATUS.
 PATHS = {REMOTE_WRITE: REMOTE_WRITE_PATH, DATADOG: DATADOG_SERIES_PATH,
-         INFLUXDB: INFLUXDB_WRITE_PATH}
-DEFAULT_STATUS = {REMOTE_WRITE: 200, DATADOG: 202, INFLUXDB: 204}
+         INFLUXDB: INFLUXDB_WRITE_PATH, OTLP: OTLP_METRICS_PATH, SPLUNK: SPLUNK_EVENT_PATH}
+# A shape's paths that take requests but no writes.
+OTHER_PATHS = {SPLUNK: (SPLUNK_ACK_PATH,)}
+DEFAULT_STATUS = {REMOTE_WRITE: 200, DATADOG: 202, INFLUXDB: 204, OTLP: 200, SPLUNK: 200}
 # What a body of each shape is, for a check's message about one that doesn't decode.
 BODY_NAMES = {REMOTE_WRITE: "a Snappy WriteRequest", DATADOG: "a MetricPayload",
-              INFLUXDB: "InfluxDB line protocol"}
+              INFLUXDB: "InfluxDB line protocol", OTLP: "an ExportMetricsServiceRequest",
+              SPLUNK: "HEC event JSON"}
+# The object keys a HEC metric's series is named by besides its dimensions.
+SPLUNK_ENVELOPE = ("host", "index", "source", "sourcetype")
+SPLUNK_METRIC_PREFIX = "metric_name:"
 # Nanoseconds per unit of each `precision` the v2 write API takes.
 INFLUXDB_PRECISION_NS = {"ns": 1, "us": 1_000, "ms": 1_000_000, "s": 1_000_000_000}
 # The labels a line-protocol sample is named by besides its tags; a tag key equal to one would
@@ -572,6 +600,100 @@ def _influxdb_series(raw, request):
     return series
 
 
+def _otlp_series(raw, request):
+    try:
+        points = otlp.metric_points(decompress(raw, request.get("content_encoding")))
+    except otlp.ProtoError as err:
+        raise DecodeError(str(err)) from None
+    series = []
+    for point in points:
+        resource, name, attributes = point.series
+        labels = {"__name__": name, "resource": resource.hex(),
+                  "attributes": ",".join(one.hex() for one in attributes)}
+        series.append((labels, [(point.time_unix_nano // 1_000_000, float(point.value))]))
+    return series
+
+
+def splunk_objects(text):
+    """The JSON objects of a HEC `/event` body, concatenated with or without whitespace between
+    them. Raises `DecodeError` for anything else."""
+    decoder = json.JSONDecoder()
+    objects = []
+    pos = 0
+    while True:
+        while pos < len(text) and text[pos] in " \t\r\n":
+            pos += 1
+        if pos >= len(text):
+            return objects
+        try:
+            one, pos = decoder.raw_decode(text, pos)
+        except ValueError as err:
+            raise DecodeError(f"object {len(objects)}: {err}") from None
+        if not isinstance(one, dict):
+            raise DecodeError(f"object {len(objects)} is a {type(one).__name__}, not an object")
+        objects.append(one)
+
+
+def _splunk_value(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise DecodeError(f"metric {name!r} has value {value!r}, no number")
+    try:
+        return float(value)
+    except ValueError:
+        raise DecodeError(f"metric {name!r} has value {value!r}, no number") from None
+
+
+def splunk_metrics(one):
+    """`[(name, value)]` for each measurement of a HEC object: each `metric_name:<n>` field, then
+    a `metric_name` and `_value` pair. Empty for a log or span object."""
+    fields = one.get("fields")
+    if not isinstance(fields, dict):
+        return []
+    named = [(key[len(SPLUNK_METRIC_PREFIX):], value) for key, value in fields.items()
+             if key.startswith(SPLUNK_METRIC_PREFIX)]
+    if isinstance(fields.get("metric_name"), str) and "_value" in fields:
+        named.append((fields["metric_name"], fields["_value"]))
+    return [(name, _splunk_value(value, name)) for name, value in named]
+
+
+def splunk_object_records(one):
+    """The records `splunk_hec_out` counts for one object: its measurements, or 1 for a log or
+    span (`ObjectMeta::records`)."""
+    return len(splunk_metrics(one)) or 1
+
+
+def splunk_samples(one):
+    """A HEC object's measurements as `[(labels, [(timestamp_ms, value)])]`."""
+    metrics = splunk_metrics(one)
+    if not metrics:
+        return []
+    stamp = one.get("time")
+    if isinstance(stamp, bool) or not isinstance(stamp, (int, float, str)):
+        raise DecodeError(f"a metric object's time {stamp!r} isn't a number")
+    try:
+        stamp_ms = round(float(stamp) * 1000)
+    except ValueError:
+        raise DecodeError(f"a metric object's time {stamp!r} isn't a number") from None
+    fields = one["fields"]
+    dimensions = {key: str(value) for key, value in fields.items()
+                  if not key.startswith(SPLUNK_METRIC_PREFIX)
+                  and key not in ("metric_name", "_value")}
+    envelope = {key: str(one[key]) for key in SPLUNK_ENVELOPE if key in one}
+    return [({**dimensions, **envelope, "__name__": name}, [(stamp_ms, value)])
+            for name, value in metrics]
+
+
+def splunk_request_objects(request):
+    """The HEC objects of one request line's body, raising `DecodeError` for a body that isn't
+    them."""
+    raw = decompress(_raw_body(request), request.get("content_encoding"))
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as err:
+        raise DecodeError(f"not UTF-8: {err}") from None
+    return splunk_objects(text)
+
+
 def _raw_body(request):
     try:
         return base64.b64decode(request.get("body_b64") or "", validate=True)
@@ -584,9 +706,16 @@ def decode_body(request, shape=REMOTE_WRITE):
     `DecodeError` for a body that isn't the shape's: a Snappy-compressed `WriteRequest` for
     `remote_write`, a `MetricPayload` under gzip, deflate, or no compression for `datadog`, and
     uncompressed line protocol for `influxdb`, one series per numeric or boolean field, a
-    boolean as 1 or 0. Under `influxdb` a timestamp is floored to the millisecond, so two
-    points of one series within a millisecond read as one rewritten sample."""
+    boolean as 1 or 0, an `ExportMetricsServiceRequest` under gzip or none for `otlp`, one series
+    per data point, and HEC objects under gzip or none for `splunk`, one series per measurement.
+    Under `influxdb` a timestamp is floored to the millisecond, so two points of one series
+    within a millisecond read as one rewritten sample."""
+    if shape == SPLUNK:
+        return [sample for one in splunk_request_objects(request)
+                for sample in splunk_samples(one)]
     raw = _raw_body(request)
+    if shape == OTLP:
+        return _otlp_series(raw, request)
     if shape == INFLUXDB:
         return _influxdb_series(raw, request)
     if shape == DATADOG:
@@ -615,12 +744,34 @@ def unwritten_samples(request, decoded):
 
 
 def named_series(request, decoded):
-    """How many series of a request's decoded body a `series_errors` answer named: its first N,
-    or all of them when the body holds fewer. 0 for any other answer."""
-    count = request.get("series_errors")
+    """How many series of a request's decoded body a `series_errors` or a `partial_success`
+    answer named: its first N, or all of them when the body holds fewer. 0 for any other
+    answer."""
+    count = request.get("series_errors", request.get("partial_success"))
     if status_class(request) != "2xx" or not isinstance(count, int) or count < 1:
         return 0
     return min(count, len(decoded))
+
+
+def is_write(request, shape):
+    """Whether a request line went to one of the shape's paths that take no writes: a
+    `splunk` `/ack` poll."""
+    return request.get("path") not in OTHER_PATHS.get(shape, ())
+
+
+def stored_part(request, shape):
+    """The series of one request line the destination kept, as `decode_body` reads them: every
+    one of a stored request but those a `series_errors` or `partial_success` answer named, the
+    objects before the one a `splunk` `invalid_event` answer named, and none otherwise. Raises
+    `DecodeError` as `decode_body` does."""
+    if (shape == SPLUNK and request.get("status") == 400
+            and isinstance(request.get("invalid_event"), int)):
+        return [sample for one in splunk_request_objects(request)[:request["invalid_event"]]
+                for sample in splunk_samples(one)]
+    if not request.get("stored") or not is_write(request, shape):
+        return []
+    decoded = decode_body(request, shape)
+    return decoded[named_series(request, decoded):]
 
 
 def series_key(labels):
@@ -641,10 +792,8 @@ def stored_series(requests, shape=REMOTE_WRITE):
     conflicts = []
     undecodable = []
     for request in requests:
-        if not request.get("stored"):
-            continue
         try:
-            decoded = decode_body(request, shape)
+            decoded = stored_part(request, shape)
         except DecodeError as err:
             undecodable.append((request.get("seq"), str(err)))
             continue
@@ -794,15 +943,15 @@ def unstored_points(requests, series):
 def acknowledged_unstored(requests, series, shape=REMOTE_WRITE):
     """`(series key, timestamp)` for each sample of a request the stand-in answered `2xx` that
     `series` (from `stored_series`, `stored_counts`, or `stored_points`) doesn't hold: a write the sink saw
-    accepted that the destination never kept. The series a `series_errors` answer named are
-    left out, since the sink saw them dropped, as is every sample of a request a short
+    accepted that the destination never kept. The series a `series_errors` or
+    `partial_success` answer named are left out, as is a `splunk` `/ack` poll, since the sink saw them dropped, as is every sample of a request a short
     `Samples-Written` answered (`unwritten_samples`), since the answer doesn't say which samples
     the destination kept, and a body that doesn't decode, which the caller judges."""
     stored = {(series_key(one["metric"]), stamp) for one in series
               for stamp in one["timestamps"]}
     missing = []
     for request in requests:
-        if status_class(request) != "2xx":
+        if status_class(request) != "2xx" or not is_write(request, shape):
             continue
         try:
             decoded = decode_body(request, shape)

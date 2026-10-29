@@ -149,8 +149,12 @@ READY_WORDS = ("starting", "stalled", "draining", "degraded")
 # spends the cue on the next N writes, after which the stand-in answers its default again, so a
 # cue can land on one request among several in flight. `headers` replaces the response headers
 # the stand-in adds itself (a 2.0 receiver's written counts under the `remote_write` shape), so
-# `headers = {}` sends none.
-RESPOND_KEYS = ("status", "body", "apply", "answer", "series_errors", "count", "headers")
+# `headers = {}` sends none. `after` lets the next K writes through with the default answer
+# before the cue answers any. Under the `otlp` shape a 2xx can carry `partial_success`, the data
+# points its body rejects; under the `splunk` shape a `400` can carry `invalid_event`, the object
+# its code 6 names, and a 2xx `withhold_acks`, answering every `/ack` poll `false`.
+RESPOND_KEYS = ("status", "body", "apply", "answer", "series_errors", "count", "headers",
+                "after", "partial_success", "invalid_event", "withhold_acks")
 RESPOND_ANSWERS = ("reset",)
 # The sink fault classes a step's `class` may name (docs/adr/sink-fault-classes.md), which the
 # checks read the SUT's telemetry and self-log against. `class` is for a `respond`, and for a
@@ -180,9 +184,14 @@ TARGET_KEYS = {"kind", "name", "env", "topic", "shape"}
 STANDIN_SHAPES = standin_mod.SHAPES
 STANDIN_DEFAULT_SHAPE = standin_mod.REMOTE_WRITE
 DATADOG_SHAPE = standin_mod.DATADOG
+OTLP_SHAPE = standin_mod.OTLP
+SPLUNK_SHAPE = standin_mod.SPLUNK
 # The shapes whose `ledger.standin` reads a request's loss from its step's `class` alone, so a
-# respond other than a 2xx must carry one.
-CLASS_REQUIRED_SHAPES = (standin_mod.DATADOG, standin_mod.INFLUXDB)
+# respond other than a 2xx must carry one: but a `splunk` `invalid_event` answer, whose loss is
+# the one object it names, and a `splunk` `withhold_acks` 2xx, which the sink must read as
+# `ambiguous`, take the opposite rule.
+CLASS_REQUIRED_SHAPES = (standin_mod.DATADOG, standin_mod.INFLUXDB, standin_mod.OTLP,
+                         standin_mod.SPLUNK)
 # Kafka's legal topic names (`Topic.validate`): ASCII letters, digits, `.`, `_`, and `-`, up to
 # 249 characters.
 _TOPIC_NAME = re.compile(r"^[A-Za-z0-9._-]{1,249}$")
@@ -449,6 +458,10 @@ class StepSpec:
     series_errors: object = None
     count: object = None
     headers: object = None
+    after: object = None
+    partial_success: object = None
+    invalid_event: object = None
+    withhold_acks: object = None
     fault_class: object = None
     # A `signal`'s signal, and a `rename`'s file and new name in the shared directory.
     signal: object = None
@@ -467,6 +480,8 @@ class StepSpec:
 STEP_FIELDS = (("ready", "ready"), ("code", "code"), ("key", "key"), ("status", "status"),
                ("body", "body"), ("apply", "apply"), ("answer", "answer"),
                ("series_errors", "series_errors"), ("count", "count"), ("headers", "headers"),
+               ("after", "after"), ("partial_success", "partial_success"),
+               ("invalid_event", "invalid_event"), ("withhold_acks", "withhold_acks"),
                ("fault_class", "class"),
                ("signal", "signal"), ("path", "path"), ("to", "to"), ("cert", "cert"),
                ("days", "days"), ("broken", "broken"), ("port", "port"))
@@ -528,6 +543,10 @@ class Step:
     series_errors: object = None
     count: object = None
     headers: object = None
+    after: object = None
+    partial_success: object = None
+    invalid_event: object = None
+    withhold_acks: object = None
     fault_class: object = None
     signal: object = None
     path: object = None
@@ -929,6 +948,9 @@ def from_dict(raw, path):
             apply=raw_step.get("apply"), answer=raw_step.get("answer"),
             series_errors=raw_step.get("series_errors"), count=raw_step.get("count"),
             headers=raw_step.get("headers"), fault_class=raw_step.get("class"),
+            after=raw_step.get("after"), partial_success=raw_step.get("partial_success"),
+            invalid_event=raw_step.get("invalid_event"),
+            withhold_acks=raw_step.get("withhold_acks"),
             signal=raw_step.get("signal"), path=raw_step.get("path"), to=raw_step.get("to"),
             cert=raw_step.get("cert"), days=raw_step.get("days"), broken=raw_step.get("broken"),
             port=raw_step.get("port"),
@@ -2434,10 +2456,14 @@ def _respond_problems(spec, where, shape=None):
     """What a step breaks of the `respond` rules: one of `status` (an integer from 100 to 599) and
     `answer` (one of `RESPOND_ANSWERS`), `body` a string with `status` only, `apply` true or false,
     `count` a positive integer, `headers` a table of strings with `status` only,
-    `series_errors` a positive integer with a 2xx `status` and no `body` under the `datadog` shape
-    only, none of them on another action; and `class` one of `FAULT_CLASSES`, on a `respond` or a
-    `stop` only, and under the `datadog` and `influxdb` shapes required on a `respond` other than a
-    2xx and refused on a 2xx. Whether a `respond`'s or a classed `stop`'s `on` is a stand-in needs the role map:
+    `after` a positive integer, `series_errors` a positive integer with a 2xx `status` and no
+    `body` under the `datadog` shape only, `partial_success` the same under the `otlp` shape only,
+    `invalid_event` an integer of 0 or more with `status` 400 and no `body` and `withhold_acks`
+    true with a 2xx `status`, each under the `splunk` shape only, none of them on another action;
+    and `class` one of `FAULT_CLASSES`, on a `respond` or a `stop` only, and under the
+    `CLASS_REQUIRED_SHAPES` required on a `respond` other than a 2xx and refused on a 2xx, except
+    that an `invalid_event` refuses one and a `withhold_acks` needs `ambiguous`. Whether a
+    `respond`'s or a classed `stop`'s `on` is a stand-in needs the role map:
     `service_problems()`."""
     problems = []
     if spec.action == "respond":
@@ -2464,23 +2490,47 @@ def _respond_problems(spec, where, shape=None):
         if spec.count is not None and (not isinstance(spec.count, int)
                                        or isinstance(spec.count, bool) or spec.count < 1):
             problems.append(f"{where}: `count` must be a positive integer, got {spec.count!r}")
-        if spec.series_errors is not None:
-            count = spec.series_errors
-            if shape != DATADOG_SHAPE:
-                problems.append(f"{where}: `series_errors` is for a standin target with shape "
-                                f"{DATADOG_SHAPE!r}")
-            if not isinstance(count, int) or isinstance(count, bool) or count < 1:
-                problems.append(f"{where}: `series_errors` must be a positive integer, got "
-                                f"{count!r}")
+        if spec.after is not None and (not isinstance(spec.after, int)
+                                       or isinstance(spec.after, bool) or spec.after < 1):
+            problems.append(f"{where}: `after` must be a positive integer, got {spec.after!r}")
+        success = (isinstance(spec.status, int) and not isinstance(spec.status, bool)
+                   and 200 <= spec.status < 300)
+        # Each key that writes the answer's body: its shape, its least value, and its status.
+        for name, own_shape, least, fits, wanted in (
+                ("series_errors", DATADOG_SHAPE, 1, success, "a 2xx `status`"),
+                ("partial_success", OTLP_SHAPE, 1, success, "a 2xx `status`"),
+                ("invalid_event", SPLUNK_SHAPE, 0, spec.status == 400, "`status` 400")):
+            count = getattr(spec, name)
+            if count is None:
+                continue
+            if shape != own_shape:
+                problems.append(f"{where}: `{name}` is for a standin target with shape "
+                                f"{own_shape!r}")
+            if not isinstance(count, int) or isinstance(count, bool) or count < least:
+                what = "a positive integer" if least else "an integer of 0 or more"
+                problems.append(f"{where}: `{name}` must be {what}, got {count!r}")
             if spec.body is not None:
-                problems.append(f"{where}: `series_errors` writes the body, so it takes no "
-                                "`body`")
-            if not (isinstance(spec.status, int) and not isinstance(spec.status, bool)
-                    and 200 <= spec.status < 300):
-                problems.append(f"{where}: `series_errors` goes with a 2xx `status`")
-        if shape in CLASS_REQUIRED_SHAPES:
-            success = (isinstance(spec.status, int) and not isinstance(spec.status, bool)
-                       and 200 <= spec.status < 300)
+                problems.append(f"{where}: `{name}` writes the body, so it takes no `body`")
+            if not fits:
+                problems.append(f"{where}: `{name}` goes with {wanted}")
+        if spec.withhold_acks is not None:
+            if shape != SPLUNK_SHAPE:
+                problems.append(f"{where}: `withhold_acks` is for a standin target with shape "
+                                f"{SPLUNK_SHAPE!r}")
+            if spec.withhold_acks is not True:
+                problems.append(f"{where}: `withhold_acks` must be true, got "
+                                f"{spec.withhold_acks!r}")
+            if not success:
+                problems.append(f"{where}: `withhold_acks` goes with a 2xx `status`")
+        if spec.invalid_event is not None:
+            if spec.fault_class is not None:
+                problems.append(f"{where}: an `invalid_event` answer drops one object and the "
+                                "sink resends the rest, so it takes no `class`")
+        elif spec.withhold_acks is not None:
+            if spec.fault_class != "ambiguous":
+                # The sink reads an ack it never gets, past its `ack_timeout`, as `Ambiguous`.
+                problems.append(f"{where}: `withhold_acks` needs `class = \"ambiguous\"`")
+        elif shape in CLASS_REQUIRED_SHAPES:
             if success and spec.fault_class is not None:
                 problems.append(f"{where}: a 2xx isn't a fault, so it takes no `class`")
             elif not success and spec.fault_class is None:
@@ -3141,6 +3191,8 @@ def expand(scenario, duration=None, seed=None):
                     body=spec.body, apply=spec.apply, answer=spec.answer,
                     series_errors=spec.series_errors, count=spec.count,
                     headers=spec.headers, fault_class=spec.fault_class,
+                    after=spec.after, partial_success=spec.partial_success,
+                    invalid_event=spec.invalid_event, withhold_acks=spec.withhold_acks,
                     signal=spec.signal, path=spec.path, to=spec.to, cert=spec.cert,
                     days=spec.days, broken=spec.broken, port=spec.port,
                 ))

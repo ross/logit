@@ -1,0 +1,279 @@
+# The rows of splunk_hec_out's response-class table a stand-in can answer, against a scripted
+# HEC stand-in under load, with `ack: true`. Each step tells the stand-in what to answer for
+# 20 s, 105 s apart, so a 30 s progress window fits between one step's recovery and the next,
+# and its `class` names the fault class the sink must read (crates/logit-outputs/src/splunk.rs,
+# "Faults, retries, and duplicate safety", and "Acknowledgment" for the withheld acks). The cued
+# rows: a code 6 naming one object, which the sink drops and resends the rest after; `401` and
+# `403` with a token code; `400` code 10; `429` and a `503` code 9 before any body of the batch
+# was accepted, and a `503` code 9 after one was, landed on a batch's second body; `500` code 8;
+# `400` with a code no row names; `404`; a `3xx`; a reset after the request left; and acks
+# withheld past `ack_timeout`. A stop of the stand-in is the connect-failure row before a body
+# was accepted. Not cued: Splunk Cloud's code 6 at object 0 of a body over 5 MiB, which
+# `max_body_bytes` keeps the sink from sending; a connect failure after a body was accepted,
+# which the stand-in can't time between two bodies; and the two `connect_timeout:` rows.
+# `ledger.standin` checks each step's effect at the sink, that the sink's
+# `records.dropped{reason="invalid_event"}` is the records of the objects the code 6 answers
+# named, and that every default answer carried an `ackId`. A lost window is overwritten by the
+# next window's cumulative totals, so the ledger's gap stays 0. The run takes about 27 minutes.
+# The schema is docs/plans/soak-harness.md's "The scenario schema".
+
+name = "standin-splunk"
+description = "statsd into splunk_hec_out (ack: true, cumulative) against a HEC stand-in answering each row of the sink's response-class table it can produce in turn"
+duration = "26m55s"       # warmup + one cycle + cooldown
+warmup = "60s"
+cooldown = "60s"          # >= recovery_bound
+recovery_bound = "45s"    # retry_max_delay 10s + two aggregate windows + a drain
+cycle = "24m55s"          # the last step, its recovery, and two progress windows
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"
+
+[target]
+kind = "standin"
+shape = "splunk"
+
+[ledger]
+sut_aggregate = "window"
+wire_loss_outside_faults = 0.0
+
+[[ledger.source]]
+service = "generator"
+generator_input = "load"
+generator_sink = "statsd"
+sut_listener = "statsd"
+
+[[ledger.sink]]           # the one sink, whose writes the stand-in records
+id = "hec"
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64
+fd_growth = 8
+
+[[step]]                  # c0s1: code 6 naming object 3 of one body: that object dropped, the rest resent
+at = "0s"
+action = "respond"
+on = "standin"
+status = 400
+invalid_event = 3
+count = 1
+for = "20s"
+
+[[step]]                  # c0s2: 401 code 3, the token: held
+at = "1m45s"
+action = "respond"
+on = "standin"
+status = 401
+body = "{\"text\":\"Invalid authorization\",\"code\":3}"
+class = "refused"
+for = "20s"
+
+[[step]]                  # c0s3: 403 code 4, the token: held
+at = "3m30s"
+action = "respond"
+on = "standin"
+status = 403
+body = "{\"text\":\"Invalid token\",\"code\":4}"
+class = "refused"
+for = "20s"
+
+[[step]]                  # c0s4: 400 code 10, the channel stripped on the way: held
+at = "5m15s"
+action = "respond"
+on = "standin"
+status = 400
+body = "{\"text\":\"Data channel is missing\",\"code\":10}"
+class = "refused"
+for = "20s"
+
+[[step]]                  # c0s5: 429 code 26 before any body was accepted: held
+at = "7m"
+action = "respond"
+on = "standin"
+status = 429
+body = "{\"text\":\"Queue at capacity\",\"code\":26}"
+class = "clean"
+for = "20s"
+
+[[step]]                  # c0s6: 503 code 9 before any body was accepted: held
+at = "8m45s"
+action = "respond"
+on = "standin"
+status = 503
+body = "{\"text\":\"Server is busy\",\"code\":9}"
+class = "clean"
+for = "20s"
+
+[[step]]                  # c0s7: 503 code 9 on a batch's second body, after its first was accepted: retried
+at = "10m30s"
+action = "respond"
+on = "standin"
+status = 503
+body = "{\"text\":\"Server is busy\",\"code\":9}"
+after = 1
+count = 1
+class = "ambiguous"
+for = "20s"
+
+[[step]]                  # c0s8: 500 code 8, which may have indexed: retried
+at = "12m15s"
+action = "respond"
+on = "standin"
+status = 500
+body = "{\"text\":\"Internal server error\",\"code\":8}"
+class = "ambiguous"
+for = "20s"
+
+[[step]]                  # c0s9: 400 code 5, a code about this request: dropped
+at = "14m"
+action = "respond"
+on = "standin"
+status = 400
+body = "{\"text\":\"No data\",\"code\":5}"
+class = "rejected"
+for = "20s"
+
+[[step]]                  # c0s10: 404, no HEC collector there: held
+at = "15m45s"
+action = "respond"
+on = "standin"
+status = 404
+class = "refused"
+for = "20s"
+
+[[step]]                  # c0s11: a redirect, never followed: dropped
+at = "17m30s"
+action = "respond"
+on = "standin"
+status = 302
+class = "rejected"
+for = "20s"
+
+[[step]]                  # c0s12: a reset after the request left: retried
+at = "19m15s"
+action = "respond"
+on = "standin"
+answer = "reset"
+class = "ambiguous"
+for = "20s"
+
+[[step]]                  # c0s13: every /event accepted and every ack withheld past ack_timeout: resent
+at = "21m"
+action = "respond"
+on = "standin"
+status = 200
+withhold_acks = true
+class = "ambiguous"
+for = "20s"
+
+[[step]]                  # c0s14: a connect failure before any body was accepted: held
+at = "22m45s"
+action = "stop"
+on = "standin"
+class = "clean"
+for = "20s"
+
+# One expectation per class, beside ledger.standin's check of every step.
+[[expect]]
+name = "invalid-event-counts"
+service = "logit"
+metric = "logit.output.records.dropped"
+component = "hec"
+attrs = { reason = "invalid_event" }
+step = "c0s1"
+window = "through"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "invalid-event-drops-no-batch"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "hec"
+step = "c0s1"
+window = "through"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "refused-holds"
+service = "logit"
+metric = "logit.component.retrying"
+component = "hec"
+step = "c0s2"
+window = "during"
+reduce = "max"
+min = 1
+
+[[expect]]
+name = "refused-drops-nothing"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "hec"
+step = "c0s2"
+window = "through"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "busy-holds"
+service = "logit"
+metric = "logit.component.retrying"
+component = "hec"
+step = "c0s6"
+window = "during"
+reduce = "max"
+min = 1
+
+[[expect]]
+name = "busy-after-delivery-retries"
+service = "logit"
+metric = "logit.component.retries"
+component = "hec"
+step = "c0s7"
+window = "during"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "rejected-drops"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "hec"
+attrs = { reason = "rejected" }
+step = "c0s9"
+window = "through"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "ack-timeout-counted"
+service = "logit"
+metric = "logit.output.acks"
+component = "hec"
+attrs = { result = "timeout" }
+step = "c0s13"
+window = "during"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "clean-holds"
+service = "logit"
+metric = "logit.component.retrying"
+component = "hec"
+step = "c0s14"
+window = "during"
+reduce = "max"
+min = 1
+
+[[expect]]
+name = "retrying-clears"
+service = "logit"
+metric = "logit.component.retrying"
+component = "hec"
+step = "c0s14"
+window = "after"
+reduce = "last"
+max = 0

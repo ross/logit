@@ -1,0 +1,237 @@
+# The rows of otlp_out's response-class table a stand-in can answer over OTLP/HTTP, against a
+# scripted stand-in on /v1/metrics under load. Each step tells the stand-in what to answer for
+# 20 s, 105 s apart, so a 30 s progress window fits between one step's recovery and the next,
+# and its `class` names the fault class the sink must read (crates/logit-outputs/src/otlp.rs,
+# "Response classes"). The cued rows: a 2xx with a `partial_success`; 429 and the other
+# retryable 5xx; 408; 400; 401, which stands for 403, 404, and 501; 405 and 407; any other 5xx;
+# any other 4xx; a 3xx; and a reset after the request left. A stop of the stand-in is the
+# connect-refused row. Not cued: a DNS failure, a failed TLS handshake, a dial past
+# `connect_timeout:`, the request timeout (fixed at 10 s, which a held answer would turn into
+# a stall), and the four gRPC rows. With one signal, the run says nothing about settlement per
+# signal. `ledger.standin` checks each step's effect at the sink, and that the sink's
+# `records.dropped{reason="rejected"}` is the points the partial successes and the rejected
+# steps' requests carried. A rejected window is lost, but the next window's cumulative totals
+# overwrite it, so the ledger's gap stays 0. The run takes about 25 minutes. The schema is
+# docs/plans/soak-harness.md's "The scenario schema".
+
+name = "standin-otlp"
+description = "statsd into otlp_out (OTLP/HTTP metrics, cumulative) against a stand-in answering each HTTP row of the sink's response-class table in turn"
+duration = "25m10s"       # warmup + one cycle + cooldown
+warmup = "60s"
+cooldown = "60s"          # >= recovery_bound
+recovery_bound = "45s"    # retry_max_delay 10s + two aggregate windows + a drain
+cycle = "23m10s"          # the last step, its recovery, and two progress windows
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"
+
+[target]
+kind = "standin"
+shape = "otlp"
+
+[ledger]
+sut_aggregate = "window"
+wire_loss_outside_faults = 0.0
+
+[[ledger.source]]
+service = "generator"
+generator_input = "load"
+generator_sink = "statsd"
+sut_listener = "statsd"
+
+[[ledger.sink]]           # the one sink, whose writes the stand-in records
+id = "otlp"
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64
+fd_growth = 8
+
+[[step]]                  # c0s1: a 2xx whose partial_success rejects two points: counted, not retried
+at = "0s"
+action = "respond"
+on = "standin"
+status = 200
+partial_success = 2
+for = "20s"
+
+[[step]]                  # c0s2: 429, the retryable set: retried
+at = "1m45s"
+action = "respond"
+on = "standin"
+status = 429
+class = "ambiguous"
+for = "20s"
+
+[[step]]                  # c0s3: 503 after storing, the retryable set: the resend stores the same points again
+at = "3m30s"
+action = "respond"
+on = "standin"
+status = 503
+apply = true
+class = "ambiguous"
+for = "20s"
+
+[[step]]                  # c0s4: 408, a proxy gave up on the request's arrival: retried
+at = "5m15s"
+action = "respond"
+on = "standin"
+status = 408
+class = "ambiguous"
+for = "20s"
+
+[[step]]                  # c0s5: 400, bad data: dropped
+at = "7m"
+action = "respond"
+on = "standin"
+status = 400
+body = "invalid metric data"
+class = "rejected"
+for = "20s"
+
+[[step]]                  # c0s6: 401, a credential scoped to other signals: dropped
+at = "8m45s"
+action = "respond"
+on = "standin"
+status = 401
+class = "rejected"
+for = "20s"
+
+[[step]]                  # c0s7: 405, the path to the receiver: held
+at = "10m30s"
+action = "respond"
+on = "standin"
+status = 405
+class = "refused"
+for = "20s"
+
+[[step]]                  # c0s8: 407, a proxy credential: held
+at = "12m15s"
+action = "respond"
+on = "standin"
+status = 407
+class = "refused"
+for = "20s"
+
+[[step]]                  # c0s9: 500, any other 5xx: retried
+at = "14m"
+action = "respond"
+on = "standin"
+status = 500
+class = "ambiguous"
+for = "20s"
+
+[[step]]                  # c0s10: 422, any other 4xx: dropped
+at = "15m45s"
+action = "respond"
+on = "standin"
+status = 422
+class = "rejected"
+for = "20s"
+
+[[step]]                  # c0s11: a redirect, never followed: dropped
+at = "17m30s"
+action = "respond"
+on = "standin"
+status = 302
+class = "rejected"
+for = "20s"
+
+[[step]]                  # c0s12: a reset after the request left: retried
+at = "19m15s"
+action = "respond"
+on = "standin"
+answer = "reset"
+class = "ambiguous"
+for = "20s"
+
+[[step]]                  # c0s13: a connect failure: held
+at = "21m"
+action = "stop"
+on = "standin"
+class = "clean"
+for = "20s"
+
+# One expectation per class, beside ledger.standin's check of every step.
+[[expect]]
+name = "partial-success-counts"
+service = "logit"
+metric = "logit.output.records.dropped"
+component = "otlp"
+attrs = { reason = "rejected" }
+step = "c0s1"
+window = "through"
+reduce = "delta"
+min = 2
+
+[[expect]]
+name = "partial-success-drops-no-batch"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "otlp"
+step = "c0s1"
+window = "through"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "ambiguous-retries"
+service = "logit"
+metric = "logit.component.retries"
+component = "otlp"
+step = "c0s2"
+window = "during"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "rejected-drops"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "otlp"
+attrs = { reason = "rejected" }
+step = "c0s5"
+window = "through"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "refused-holds"
+service = "logit"
+metric = "logit.component.retrying"
+component = "otlp"
+step = "c0s7"
+window = "during"
+reduce = "max"
+min = 1
+
+[[expect]]
+name = "refused-drops-nothing"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "otlp"
+step = "c0s7"
+window = "through"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "clean-holds"
+service = "logit"
+metric = "logit.component.retrying"
+component = "otlp"
+step = "c0s13"
+window = "during"
+reduce = "max"
+min = 1
+
+[[expect]]
+name = "retrying-clears"
+service = "logit"
+metric = "logit.component.retrying"
+component = "otlp"
+step = "c0s13"
+window = "after"
+reduce = "last"
+max = 0

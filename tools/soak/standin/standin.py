@@ -5,10 +5,14 @@ Stdlib only; compose runs it in a stock Python image. It serves two ports:
 
 - The data port (`--data-port`) takes the sink's writes on `--path`. With no cue it answers the
   shape's default with an empty body: `200` on `/api/v1/write` for `remote_write`, `202` on
-  `/api/v2/series` for `datadog`, and `204` on `/api/v2/write` for `influxdb`, with no
-  `Content-Length`, which a `204` mustn't carry. The path is compared without its query string,
-  which `influxdb_out` always sends (`org`, `orgID`, `bucket`, `precision`). A request to any
-  other path answers `404`, so a misconfigured endpoint can't pass for a stored write.
+  `/api/v2/series` for `datadog`, `204` on `/api/v2/write` for `influxdb`, with no
+  `Content-Length`, which a `204` mustn't carry, and `200` on `/v1/metrics` for `otlp`, an empty
+  `ExportMetricsServiceResponse`. Under `splunk` it answers `200` on `/services/collector/event`
+  with HEC's success body and an `ackId`, minted per `X-Splunk-Request-Channel` from 0, and takes
+  `/services/collector/ack` polls too: each id is answered `true` once minted on the poll's
+  channel, `false` otherwise. The path is compared without its query string, which
+  `influxdb_out` always sends (`org`, `orgID`, `bucket`, `precision`). A request to any other
+  path answers `404`, so a misconfigured endpoint can't pass for a stored write.
 - The control port (`--control-port`) takes `POST /cue` from the driver: a JSON object with
   `step`, and either `status` (with an optional `body`) or `answer: "reset"`, and an optional
   `apply` and `count`. With `count`, N, the cue answers the next N writes on `--path` and is then
@@ -17,7 +21,14 @@ Stdlib only; compose runs it in a stock Python image. It serves two ports:
   body is then the series route's `errors` list, protobuf field 1 (`repeated string`), with N
   entries, which `datadog_out` counts as N series the intake dropped. The stand-in doesn't
   decode the request, so the entries name series by their place in it; the checks take them to
-  be its first N series. A cue's `headers`, an object of header names to string values, replaces
+  be its first N series. Under the `otlp` shape a `2xx` can carry `partial_success`, N: the body
+  is an `ExportMetricsServiceResponse` whose `partial_success` rejects N data points, which the
+  checks take to be the request's first N. Under the `splunk` shape a `400` can carry
+  `invalid_event`, N: the body is HEC's code 6 naming object N, and the record counts the
+  objects before it stored, as Splunk indexes them; and a `2xx` can carry `withhold_acks`, which
+  answers `false` to every poll while the cue is in force. With `after`, K, the next K writes
+  get the default answer, recorded with no cue, before the cue answers any, so a cue can land on
+  the second body of a batch. A cue's `headers`, an object of header names to string values, replaces
   the response headers the stand-in would add itself (below), so `{}` sends none. An empty cue
   restores the default. `GET /health` answers `OK`.
 
@@ -29,7 +40,9 @@ histograms. A body that doesn't decode gets no headers.
 
 Each request line records the path and the query string apart (`path`, `query`), the raw body
 (`body_b64`), the response headers it added (`headers`), and whether the write counts as stored:
-`apply` when the cue sets it, else whether the answer is `2xx`. A `reset` reads the whole
+`apply` when the cue sets it, else whether the answer is `2xx`. A cued `series_errors`,
+`partial_success`, or `invalid_event` is recorded under its own name, a minted `ackId` as
+`ack_id`, and a poll's answer as `acks`, each id's string to its boolean. A `reset` reads the whole
 request, then closes the connection with an RST and no response. The line is printed after the
 answer is written, so a request the sink saw answered is in the record unless the process died
 between the two. The checks decode the bodies on the host (`soaklib/standin.py`).
@@ -51,14 +64,20 @@ import threading
 import time
 import urllib.parse
 
-DEFAULT_STATUS = {"remote_write": 200, "datadog": 202, "influxdb": 204}
+DEFAULT_STATUS = {"remote_write": 200, "datadog": 202, "influxdb": 204, "otlp": 200,
+                  "splunk": 200}
 DEFAULT_PATH = {"remote_write": "/api/v1/write", "datadog": "/api/v2/series",
-                "influxdb": "/api/v2/write"}
+                "influxdb": "/api/v2/write", "otlp": "/v1/metrics",
+                "splunk": "/services/collector/event"}
 # Statuses whose answer has no body and no `Content-Length` (RFC 9110, section 8.6).
 NO_BODY_STATUSES = (204, 304)
 # The cue key only the `datadog` shape takes.
 DATADOG_SHAPE = "datadog"
 REMOTE_WRITE_SHAPE = "remote_write"
+OTLP_SHAPE = "otlp"
+SPLUNK_SHAPE = "splunk"
+SPLUNK_ACK_PATH = "/services/collector/ack"
+SPLUNK_CHANNEL_HEADER = "X-Splunk-Request-Channel"
 # A remote-write 2.0 request's `Content-Type` names this message.
 REMOTE_WRITE_V2_PROTO = "io.prometheus.write.v2.Request"
 WRITTEN_HEADERS = ("X-Prometheus-Remote-Write-Samples-Written",
@@ -85,25 +104,50 @@ class State:
         self.cue = {}
         # The writes a cue with `count` has left to answer; None for a cue without one.
         self.left = None
+        # The writes a cue with `after` lets through with the default answer first.
+        self.skip = 0
         self.seq = 0
         self.stopping = False
+        # Under `splunk`, the next `ackId` per channel, and the ids each channel was given.
+        self.next_ack = {}
+        self.minted = {}
 
     def set_cue(self, cue):
         with self.lock:
             self.cue = dict(cue)
             self.left = cue.get("count")
+            self.skip = cue.get("after", 0)
 
     def take(self, write):
-        """The cue in force and the next request number. A `write` to the stand-in's path spends
-        one of a counted cue's answers, and the last one clears the cue."""
+        """The cue in force and the next request number. A `write` to the stand-in's path first
+        spends a cue's `after`, getting no cue, then one of a counted cue's answers, and the last
+        one clears the cue."""
         with self.lock:
             self.seq += 1
+            if write and self.skip > 0:
+                self.skip -= 1
+                return {}, self.seq
             cue = dict(self.cue)
             if write and self.left is not None:
                 self.left -= 1
                 if self.left <= 0:
                     self.cue, self.left = {}, None
             return cue, self.seq
+
+    def mint_ack(self, channel):
+        with self.lock:
+            ack_id = self.next_ack.get(channel, 0)
+            self.next_ack[channel] = ack_id + 1
+            self.minted.setdefault(channel, set()).add(ack_id)
+            return ack_id
+
+    def acked(self, channel, ack_id):
+        with self.lock:
+            return ack_id in self.minted.get(channel, ())
+
+
+def _positive(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
 
 
 def cue_problems(cue, shape="remote_write"):
@@ -113,7 +157,8 @@ def cue_problems(cue, shape="remote_write"):
         return []
     problems = []
     unknown = set(cue) - {"step", "status", "body", "answer", "apply", "series_errors", "count",
-                          "headers"}
+                          "headers", "after", "partial_success", "invalid_event",
+                          "withhold_acks"}
     if unknown:
         problems.append(f"unknown keys {sorted(unknown)}")
     if not isinstance(cue.get("step"), str) or not cue.get("step"):
@@ -121,8 +166,10 @@ def cue_problems(cue, shape="remote_write"):
     has_status, has_answer = "status" in cue, "answer" in cue
     if has_status == has_answer:
         problems.append("a cue sets one of `status` and `answer`")
-    if has_status and (not isinstance(cue["status"], int) or isinstance(cue["status"], bool)
-                       or not 100 <= cue["status"] <= 599):
+    status = cue.get("status")
+    valid_status = isinstance(status, int) and not isinstance(status, bool)
+    success = valid_status and 200 <= status < 300
+    if has_status and (not valid_status or not 100 <= status <= 599):
         problems.append("`status` must be an integer from 100 to 599")
     if has_answer and cue["answer"] != "reset":
         problems.append("`answer` must be \"reset\"")
@@ -134,21 +181,36 @@ def cue_problems(cue, shape="remote_write"):
         problems.append("`headers` maps header names to strings, with `status` only")
     if "apply" in cue and not isinstance(cue["apply"], bool):
         problems.append("`apply` must be true or false")
-    if "count" in cue and (not isinstance(cue["count"], int) or isinstance(cue["count"], bool)
-                           or cue["count"] < 1):
+    if "count" in cue and not _positive(cue["count"]):
         problems.append("`count` must be a positive integer")
-    if "series_errors" in cue:
-        count = cue["series_errors"]
-        if shape != DATADOG_SHAPE:
-            problems.append(f"`series_errors` is for the {DATADOG_SHAPE} shape")
-        if not isinstance(count, int) or isinstance(count, bool) or count < 1:
-            problems.append("`series_errors` must be a positive integer")
+    if "after" in cue and not _positive(cue["after"]):
+        problems.append("`after` must be a positive integer")
+    # Each body-writing key: its shape, and the status it goes with.
+    for key, own_shape, fits, wanted in (
+            ("series_errors", DATADOG_SHAPE, success, "a 2xx `status`"),
+            ("partial_success", OTLP_SHAPE, success, "a 2xx `status`"),
+            ("invalid_event", SPLUNK_SHAPE, status == 400, "`status` 400")):
+        if key not in cue:
+            continue
+        if shape != own_shape:
+            problems.append(f"`{key}` is for the {own_shape} shape")
+        if key == "invalid_event":
+            if not (isinstance(cue[key], int) and not isinstance(cue[key], bool)
+                    and cue[key] >= 0):
+                problems.append(f"`{key}` must be an integer of 0 or more")
+        elif not _positive(cue[key]):
+            problems.append(f"`{key}` must be a positive integer")
         if "body" in cue:
-            problems.append("`series_errors` writes the body, so it takes no `body`")
-        status = cue.get("status")
-        if not (isinstance(status, int) and not isinstance(status, bool)
-                and 200 <= status < 300):
-            problems.append("`series_errors` goes with a 2xx `status`")
+            problems.append(f"`{key}` writes the body, so it takes no `body`")
+        if not fits:
+            problems.append(f"`{key}` goes with {wanted}")
+    if "withhold_acks" in cue:
+        if shape != SPLUNK_SHAPE:
+            problems.append(f"`withhold_acks` is for the {SPLUNK_SHAPE} shape")
+        if cue["withhold_acks"] is not True:
+            problems.append("`withhold_acks` must be true")
+        if not success:
+            problems.append("`withhold_acks` goes with a 2xx `status`")
     return problems
 
 
@@ -170,6 +232,37 @@ def series_errors_body(count):
                  "the soak stand-in (series_errors)").encode()
         out += _varint(1 << 3 | 2) + _varint(len(entry)) + entry
     return bytes(out)
+
+
+def partial_success_body(count):
+    """An `ExportMetricsServiceResponse` whose `partial_success` (field 1) rejects `count` data
+    points (`rejected_data_points`, field 1) with an `error_message` (field 2)."""
+    message = (f"{count} data point(s) rejected by the soak stand-in "
+               "(partial_success)").encode()
+    inner = (_varint(1 << 3 | 0) + _varint(count)
+             + _varint(2 << 3 | 2) + _varint(len(message)) + message)
+    return _varint(1 << 3 | 2) + _varint(len(inner)) + inner
+
+
+def hec_body(**fields):
+    """A HEC answer, `{"text","code"}` and then `fields`, in Splunk's key order and with no
+    whitespace, as `crates/logit-proto/src/splunk/response.rs` writes one."""
+    return json.dumps(fields, separators=(",", ":")).encode()
+
+
+def ack_reply(state, channel, body, withhold):
+    """`(ids, reply)` for a `/services/collector/ack` poll: each id `true` once minted on
+    `channel` and not withheld, else `false`; `ids` is None for a body that isn't
+    `{"acks":[<id>,...]}`."""
+    try:
+        ids = json.loads(body or b"null")["acks"]
+    except (ValueError, TypeError, KeyError):
+        return None, None
+    if not isinstance(ids, list) or not all(
+            isinstance(one, int) and not isinstance(one, bool) for one in ids):
+        return None, None
+    acks = {str(one): (not withhold and state.acked(channel, one)) for one in ids}
+    return ids, {"acks": acks}
 
 
 def _read_varint(data, pos):
@@ -289,7 +382,10 @@ def data_handler(state, idle_timeout=IDLE_TIMEOUT_S):
                 "bytes": len(body), "cue": cue.get("step"),
                 "body_b64": base64.b64encode(body).decode(),
             }
-            if split.path != state.path:
+            channel = self.headers.get(SPLUNK_CHANNEL_HEADER) or ""
+            if state.shape == SPLUNK_SHAPE and split.path == SPLUNK_ACK_PATH:
+                self._ack(record, channel, body, cue)
+            elif split.path != state.path:
                 record.update(answer="status", status=404, stored=False)
                 self._answer(404, f"no write path {split.path}; this stand-in takes {state.path}")
             elif cue.get("answer") == "reset":
@@ -297,7 +393,8 @@ def data_handler(state, idle_timeout=IDLE_TIMEOUT_S):
                 self._reset()
             else:
                 status = cue.get("status", DEFAULT_STATUS[state.shape])
-                stored = cue.get("apply", 200 <= status < 300)
+                success = 200 <= status < 300
+                stored = cue.get("apply", success)
                 headers = cue.get("headers")
                 if headers is None:
                     headers = default_headers(state.shape, record["content_type"], status, body)
@@ -307,11 +404,44 @@ def data_handler(state, idle_timeout=IDLE_TIMEOUT_S):
                     record["series_errors"] = cue["series_errors"]
                     self._answer(status, series_errors_body(cue["series_errors"]),
                                  "application/x-protobuf", headers)
+                elif "partial_success" in cue:
+                    record["partial_success"] = cue["partial_success"]
+                    self._answer(status, partial_success_body(cue["partial_success"]),
+                                 "application/x-protobuf", headers)
+                elif "invalid_event" in cue:
+                    record["invalid_event"] = cue["invalid_event"]
+                    self._answer(status, hec_body(**{
+                        "text": "Invalid data format", "code": 6,
+                        "invalid-event-number": cue["invalid_event"]}),
+                        "application/json", headers)
+                elif "body" in cue:
+                    self._answer(status, cue["body"].encode(), headers=headers)
+                elif state.shape == SPLUNK_SHAPE and success:
+                    record["ack_id"] = state.mint_ack(channel)
+                    self._answer(status, hec_body(text="Success", code=0,
+                                                  ackId=record["ack_id"]),
+                                 "application/json", headers)
+                elif state.shape == OTLP_SHAPE and success:
+                    self._answer(status, b"", "application/x-protobuf", headers)
                 else:
-                    self._answer(status, cue.get("body", "").encode(), headers=headers)
+                    self._answer(status, b"", headers=headers)
             if state.stopping:
                 self.close_connection = True
             emit(record)
+
+        def _ack(self, record, channel, body, cue):
+            # A poll is no write: it spends no cue, and records the cue only when it withholds.
+            withhold = bool(cue.get("withhold_acks"))
+            record["cue"] = cue.get("step") if withhold else None
+            ids, reply = ack_reply(state, channel, body, withhold)
+            if reply is None:
+                record.update(answer="status", status=400, stored=False)
+                self._answer(400, hec_body(text="Invalid data format", code=6),
+                             "application/json")
+                return
+            record.update(answer="status", status=200, stored=False, acks=reply["acks"])
+            self._answer(200, json.dumps(reply, separators=(",", ":")).encode(),
+                         "application/json")
 
         def _answer(self, status, payload, content_type="text/plain; charset=utf-8",
                     headers=None):

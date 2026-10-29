@@ -411,7 +411,8 @@ class RunData:
                 self.standin_store = (counts.series, len(counts.rewrites), counts.conflicts,
                                       counts.undecodable)
             else:
-                self.standin_store = standin.stored_series(self.standin_requests)
+                self.standin_store = standin.stored_series(self.standin_requests,
+                                                           self.standin_shape)
             for sink in self.sinks:
                 self.vm_series[sink] = self.standin_store[0]
 
@@ -5435,7 +5436,18 @@ def check_ledger_standin(data):
     sum, credited to lives by timestamp; a killed life's is reported. The record's writes name
     one `(org, orgID, bucket)`, which the row reports. A point stored again with the same value
     is a rewrite InfluxDB absorbs, reported, and FAILs only under `at_most_once`, or as a
-    resend within one life of a point the stand-in answered `2xx`."""
+    resend within one life of a point the stand-in answered `2xx`.
+
+    Under the `otlp` shape (`_standin_otlp`), also: per SUT life, the sink's
+    `records.dropped{reason="rejected"}` equals the data points the `partial_success` answers
+    rejected plus the points of the requests answered under the cue of a step classed
+    `rejected`. A `partial_success` answer stores every point but the first N.
+
+    Under the `splunk` shape (`_standin_splunk`), also: per SUT life, the sink's
+    `records.dropped{reason="invalid_event"}` equals the records of the objects the
+    `invalid_event` answers named, an answer that stores the objects before the one it names;
+    every default `2xx` carried an `ackId`, since the sink reads one without it as a token that
+    doesn't acknowledge; and the row reports the `/ack` polls' answers. A poll is no write."""
     if not data.standin:
         return Result("ledger.standin", SKIP, f"{data.target.get('kind')} target: no stand-in")
     if data.standin_text is None:
@@ -5463,6 +5475,8 @@ def check_ledger_standin(data):
     _, rewrites, conflicts, _ = data.standin_store
     undecodable = []
     for request in requests:
+        if not standin.is_write(request, shape):
+            continue
         try:
             standin.decode_body(request, shape)
         except standin.DecodeError as err:
@@ -5494,7 +5508,8 @@ def check_ledger_standin(data):
         flag(FAIL, f"{_n(len(lost))} sample(s) the stand-in answered 2xx were never stored, "
                    f"first {dict(key).get('__name__', key)} at {data.offset(stamp / 1000)}: a "
                    "write the sink saw accepted and the destination lost")
-    wrong_path = [r for r in requests if r.get("path") != path]
+    paths = (path,) + standin.OTHER_PATHS.get(shape, ())
+    wrong_path = [r for r in requests if r.get("path") not in paths]
     if wrong_path:
         flag(FAIL, f"{len(wrong_path)} write(s) to a path other than {path}, first "
                    f"{wrong_path[0].get('path')!r}")
@@ -5533,6 +5548,8 @@ def check_ledger_standin(data):
     seen_cues = {}
     for request in requests:
         cue = request.get("cue")
+        if not standin.is_write(request, shape) and cue is None:
+            continue  # a poll with no cue; `_standin_splunk` reads its answer
         default = (request.get("answer") == "status"
                    and request.get("status") == standin.DEFAULT_STATUS[shape]
                    and request.get("stored") is True)
@@ -5580,7 +5597,12 @@ def check_ledger_standin(data):
     elif data.standin_influxdb:
         resent = _standin_influxdb(data, led, sink, at_most_once, flag, lines)
     else:
-        _standin_not_written(data, led, sink, flag, lines)
+        if shape == standin.REMOTE_WRITE:
+            _standin_not_written(data, led, sink, flag, lines)
+        elif shape == standin.OTLP:
+            _standin_otlp(data, led, sink, flag, lines)
+        else:
+            _standin_splunk(data, led, sink, flag, lines)
         resent = f"{_n(rewrites)} resent sample(s) stored again with the same value"
     summary = (f"{_n(len(requests))} request(s) recorded, {_n(stored)} stored, "
                f"{_n(len(data.standin_cues))} cue(s); {resent}; {len(classed)} classed step(s) "
@@ -5620,6 +5642,96 @@ def _standin_not_written(data, led, sink, flag, lines):
                           f"{_n(counted.get(life, 0))} samples.dropped{{reason=\"not_written\"}}")
         lines.append(f"life {life}: {_n(told.get(life, 0))} sample(s) answered not written; "
                      f"{sink} counted {_n(counted.get(life, 0))} not_written")
+
+
+def _records_dropped_by_life(led, sink, reason):
+    """The sink's `logit.output.records.dropped{reason}` per SUT life."""
+    counted = {}
+    for _, value, life in led.sut.counter_points("logit.output.records.dropped",
+                                                 component=sink, reason=reason):
+        counted[life] = counted.get(life, 0) + value
+    return counted
+
+
+def _judge_records_dropped(led, sink, reason, expected, what, flag, lines):
+    """Per SUT life, the sink's `records.dropped{reason}` against `expected`, `{life:
+    records}` from the record; a killed life's mismatch WARNs."""
+    counted = _records_dropped_by_life(led, sink, reason)
+    for life in led.lives:
+        verdict = WARN if life in led.killed and life != led.final else FAIL
+        want, got = expected.get(life, 0), counted.get(life, 0)
+        if got != want:
+            flag(verdict, f"life {life}: {sink} counted {_n(got)} record(s) dropped {reason}, "
+                          f"the record holds {_n(want)}: {what}")
+        lines.append(f"life {life}: records dropped {reason} {_n(want)} by the record, "
+                     f"{_n(got)} by {sink}")
+
+
+def _standin_otlp(data, led, sink, flag, lines):
+    """`ledger.standin`'s rule for an `otlp` stand-in: per SUT life, the sink's
+    `records.dropped{reason="rejected"}` equals the data points the `partial_success` answers
+    rejected, as each answer states them, plus the points of the requests answered under the cue
+    of a step classed `rejected`, since a request `otlp_out` reads as `Rejected` counts its
+    records. A data point is a record: `otlp_out` writes one per metric record."""
+    classed = {f.step: f for f in data.faults if f.action == "respond" and f.fault_class}
+    expected = {}
+    for request in data.standin_requests:
+        life = vm.life_at(led.life_starts, request.get("t") or 0)
+        fault = classed.get(request.get("cue"))
+        if standin.status_class(request) == "2xx" and request.get("partial_success"):
+            expected[life] = expected.get(life, 0) + request["partial_success"]
+        elif fault is not None and fault.fault_class == "rejected":
+            expected[life] = expected.get(life, 0) + standin.points_in(request, standin.OTLP)
+    _judge_records_dropped(led, sink, "rejected", expected,
+                           "the points partial_success answers rejected plus the points of "
+                           "requests answered under a rejected step", flag, lines)
+
+
+def _standin_splunk(data, led, sink, flag, lines):
+    """`ledger.standin`'s rules for a `splunk` stand-in: per SUT life, the sink's
+    `records.dropped{reason="invalid_event"}` equals the records of the objects the
+    `invalid_event` answers named; and every `/event` answered the default `2xx` carried an
+    `ackId`, without which `splunk_hec_out` reads the token as not acknowledging. The polls are
+    reported: the ids answered `true`, those withheld under a `withhold_acks` cue, and those the
+    stand-in never minted on the poll's channel, as after a stand-in restart."""
+    expected = {}
+    for request in data.standin_requests:
+        named = request.get("invalid_event")
+        if request.get("status") != 400 or not isinstance(named, int):
+            continue
+        life = vm.life_at(led.life_starts, request.get("t") or 0)
+        try:
+            objects = standin.splunk_request_objects(request)
+        except standin.DecodeError:
+            continue
+        if named < len(objects):
+            expected[life] = expected.get(life, 0) + standin.splunk_object_records(
+                objects[named])
+    _judge_records_dropped(led, sink, "invalid_event", expected,
+                           "the records of the objects invalid_event answers named", flag, lines)
+
+    writes = [r for r in data.standin_requests if standin.is_write(r, standin.SPLUNK)]
+    unminted = [r for r in writes if standin.status_class(r) == "2xx" and r.get("cue") is None
+                and r.get("ack_id") is None]
+    if unminted:
+        flag(FAIL, f"{_n(len(unminted))} default 2xx answer(s) carried no ackId, first "
+                   f"#{unminted[0].get('seq')}: the sink would read the token as not "
+                   "acknowledging")
+    polls = [r for r in data.standin_requests if not standin.is_write(r, standin.SPLUNK)]
+    answered = {"true": 0, "withheld": 0, "unminted": 0}
+    for poll in polls:
+        acks = poll.get("acks") or {}
+        for value in acks.values():
+            if value is True:
+                answered["true"] += 1
+            elif poll.get("cue") is not None:
+                answered["withheld"] += 1
+            else:
+                answered["unminted"] += 1
+    lines.append(f"{_n(len(polls))} /ack poll(s): {_n(answered['true'])} id(s) answered true, "
+                 f"{_n(answered['withheld'])} withheld under a cue, "
+                 f"{_n(answered['unminted'])} never minted on the poll's channel; "
+                 f"{_n(sum(1 for r in writes if r.get('ack_id') is not None))} ackId(s) minted")
 
 
 def _standin_datadog(data, led, sink, at_most_once, flag, lines):
@@ -6426,6 +6538,15 @@ def check_expect(data):
     return [_expect_one(data, exp) for exp in expectations]
 
 
+# The sink drops `ledger.standin` holds to the stand-in's answers, per shape: `(shape, name,
+# reason)`.
+STANDIN_JUDGED_DROPS = {
+    (standin.REMOTE_WRITE, "logit.output.samples.dropped", "not_written"),
+    (standin.OTLP, "logit.output.records.dropped", "rejected"),
+    (standin.SPLUNK, "logit.output.records.dropped", "invalid_event"),
+}
+
+
 def _balanced_drop(led, service, name, component, reason, batch_drops):
     """Whether a row that runs already judges this `*.dropped` term of SUT `service`'s
     `component`, so `drops` leaves it out. Each term is judged only in the SUT it belongs to:
@@ -6479,8 +6600,7 @@ def _balanced_drop(led, service, name, component, reason, batch_drops):
             "logit.output.records.dropped", "logit.output.metrics.dropped"):
         return True  # `ledger.sent` judges these on an external, Kafka, or datadog stand-in target
     if (sinks_side and component in led.sinks and led.data.standin
-            and led.data.standin_shape == standin.REMOTE_WRITE
-            and name == "logit.output.samples.dropped" and reason == "not_written"):
+            and (led.data.standin_shape, name, reason) in STANDIN_JUDGED_DROPS):
         return True  # `ledger.standin` judges these against the stand-in's answers
     return False
 
