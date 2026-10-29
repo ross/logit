@@ -670,13 +670,17 @@ so its wire is keyed on the mode its config sets: `bind:` is the receiver, and
   `logit.output.acks{result="timeout"}` allows one batch, an upper bound because one batch can
   hold several ids. A poll the writer counts under `route="ack"` sends no data, so a poll that
   fails in transport allows none.
-- **A judged run's trailing edge before a reported run allows one batch per request in
-  flight.** The listener counts a batch in W before the writer reads its answer, and under
-  `ack: true` before its acknowledgment arrives, half a second or more later. So a writer at
-  `concurrency: 8` can leave eight batches in W and not in G at a judged run's trailing edge,
-  and the same deficit after it. Against a judged or steady run the boundary pair nets, but
-  against a reported run or the run's end nothing does: `splunk-hec-ingress`'s first run FAILed
-  a SUT restart's window, beside a reported kill, by 930 points against 700 allowed with
-  nothing lost. That trailing edge now allows the writer's `concurrency:` in batches, 1 when
-  unset, and every other edge keeps its one batch, so an edge a neighbour nets isn't widened
-  and a surplus there can't mask a loss eight batches wide.
+- **A judged edge allows the batches the writer read in flight there.** The listener counts a
+  batch in W before the writer reads its answer, and under `ack: true` before its
+  acknowledgment arrives, half a second or more later. So a writer at `concurrency: 8` holds
+  batches in W and not in G at any edge, and the lag drifts by up to that many between drains.
+  `splunk-hec-ingress`'s first run FAILed a SUT restart's window, beside a reported kill, by
+  930 points against 700 allowed with nothing lost. Each edge of a judged run now allows
+  `max(1, in_flight)` batches, `in_flight` being the higher of the writer's
+  `logit.output.in_flight` readings at the two generator drains straddling the edge, on either
+  edge and whatever the neighbour. Two narrower forms were rejected. The writer's
+  `concurrency:` on every edge passes a loss of 300 beside 1,000 duplicates in one judged run
+  where nothing was in flight. `concurrency:` only at a trailing edge beside a reported run
+  FAILed the rerun's generator-netem window on lag alone: a steady neighbour's own drift hid
+  the opposite sign `_boundary_nets` nets. The gauge measures the batches at the edge, so it
+  covers the drift and widens nothing it didn't see.
