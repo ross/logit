@@ -172,8 +172,9 @@ reviewer can check.
    logrotate's `copytruncate` creates its copy empty and then fills it, so a scan can open the copy
    empty. A file opened empty, not from a resume or a claim, stays claimable until its first
    non-empty read, since it has emitted nothing. That read decides, before anything is decoded: the
-   file is probed against the truncated and tracked files' candidates as they stood when the drain
-   began, and if its bytes match one or may grow into one, the drain seeks it back to `0`, emits
+   file is probed against the truncated and tracked files' candidates as they stood when the first
+   pass of the drain that reads a claimable file's bytes began (each pass reads claimable files
+   first), and if its bytes match one or may grow into one, the drain seeks it back to `0`, emits
    nothing, and leaves it to the next scan's claim pass, which decides it as it does a new inode;
    otherwise the read goes on, so a rename rotation's new file is read at once.
 
@@ -299,10 +300,11 @@ reviewer can check.
     `poll_interval` later, and up to `CLAIM_DEFER_SCANS` (2) more scans when that pass defers
     it, for a match that may still grow or a tracked file's match found before a truncation.
     One that matches nothing is read at once.
-  - A file opened empty is decided against the candidates as they stood when its drain began. A
-    tracked file that offered no candidate then (a head under 64 bytes, or a held reassembly)
-    and that a later pass of the same drain reads past that point isn't among them, so a copy of
-    it whose first bytes that drain reads is read from `0`, duplicating its lines.
+  - A file opened empty is decided against the candidates as they stood when the first pass of
+    its drain that reads a claimable file's bytes began. A tracked file that offered no candidate
+    then (a head under 64 bytes, or a held reassembly) and that the drain reads past that point
+    afterwards isn't among them, so a copy of it whose first bytes that drain reads is read from
+    `0`, duplicating its lines.
   - A restored file that first appears empty and then fills is read from `0`, not claimed, and
     its entry's unread bytes are also counted `bytes.dropped{reason="gone"}`: the scan that
     opened the file empty pruned the entry, since no inode it found matched it, and the check a

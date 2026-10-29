@@ -1114,9 +1114,10 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     /// read at once. Decided from the read, so a write landing before it can't slip past.
     ///
     /// The snapshot is built here, once per drain, so an empty claimable file costs nothing on a
-    /// wake that finds it still empty. `drain` visits claimable files first, so the snapshot
-    /// holds what the other files offered when the drain began, whatever order a pass visits
-    /// them in; what another file's read adds later in the drain isn't seen.
+    /// wake that finds it still empty. Each pass of `drain` visits claimable files first, so the
+    /// snapshot holds the candidates as they stood when the first pass that reads a claimable
+    /// file's bytes began, whatever order that pass visits the other files in; what a read adds
+    /// after that isn't seen.
     async fn claim_waits(&mut self, id: FileId, n: usize) -> bool {
         let Some(tracked) = self.files.get_mut(&id) else { return false };
         if !tracked.claimable {
