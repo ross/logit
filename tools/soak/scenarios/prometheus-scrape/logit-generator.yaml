@@ -1,0 +1,29 @@
+# The scrape target in `script/soak`'s prometheus-scrape scenario: 1,000 increments a second over
+# 100 series, summed into running totals every second and exposed on `/metrics` for the system
+# under test to scrape. Its `internal` telemetry goes to stdout as NDJSON, so the harness reads
+# what it generated: `generate_in`'s events are the increments the scrape wire judges.
+admin: { bind: 127.0.0.1:9600 }
+components:
+  load:
+    type: generate_in               # unbounded
+    rate: 1000
+    batch: 100
+    event:
+      metric: { name: soak_gen, kind: sum, value: 1 }
+      attributes:
+        series: "{seq%100}"
+  totals:
+    type: aggregate
+    sources: [load]
+    interval: 1s
+    # A scrape reads running totals, so a scrape that fails loses only the values between two
+    # that succeed.
+    temporality: cumulative
+    series_retention: 3600          # an hour of windows: a pause must never evict a series
+  exposition:
+    # The default `expire_after: 5m`: a pause longer than that forgets every series.
+    type: prometheus_out
+    sources: [totals]
+    bind: 0.0.0.0:9464
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }

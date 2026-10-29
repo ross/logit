@@ -2127,7 +2127,9 @@ components:
   the receive-queue gauges above. Under `transport: tcp`: `logit.input.connections` (a gauge that
   should match the number of connected senders),
   `logit.input.connections.rejected{reason="limit"}` (nonzero means the `max_connections` cap is
-  binding), `logit.input.frames`/`.frame.bytes` (one frame is one statsd line), and
+  binding), `logit.input.connections.closed{reason="reset"}` (a peer that reset its connection
+  after sending data; a partial frame it cut off is also counted `truncated`),
+  `logit.input.frames`/`.frame.bytes` (one frame is one statsd line), and
   `logit.input.frames.dropped{reason="oversize"|"drained"|"truncated"}`. On either transport, a malformed
   *line* is the decoder's `logit.input.messages.dropped{reason="malformed"}` (diagnostic `bad_line`),
   not a framing error, and a datagram or frame that isn't UTF-8 is

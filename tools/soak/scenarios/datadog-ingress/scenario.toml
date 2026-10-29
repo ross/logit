@@ -1,0 +1,146 @@
+# Generated Datadog `count` points from `datadog_out` into `logit`'s `datadog_in` and out to
+# VictoriaMetrics, under network and lifecycle faults on both ends and a backend stop that backs
+# up into busy `503`s. G counts only the points the SUT answered `202` for, after they were in its
+# pipeline, so every window but a kill's is judged; a request the SUT took whose answer was lost
+# is resent, a surplus allowed one batch per transport-error attempt. A busy `503` takes nothing,
+# and `datadog_out` reads it as ambiguous and resends: a retry, not loss. The schema is
+# docs/plans/soak-harness.md's "The scenario schema".
+
+name = "datadog-ingress"
+description = "generator datadog_out (series) -> datadog_in (HTTP) -> aggregate 500ms cumulative -> prometheus_out RW1 zstd -> VictoriaMetrics"
+duration = "18m"          # warmup + one cycle + cooldown; --duration overrides
+warmup = "60s"            # no faults: baseline rate, RSS, fds
+cooldown = "120s"         # no faults at the end; >= recovery_bound
+recovery_bound = "45s"    # the generator's retry_max_delay 1s, the sink's 10s, and a drain
+cycle = "15m"             # >= last recovery (13m45s) + 2 x progress_window
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"
+
+[ledger]                  # component ids the checker reads; no rates here
+sut_aggregate = "window"
+wire_loss_outside_faults = 0.0
+
+[[ledger.source]]
+service = "generator"
+generator_input = "load"
+generator_sink = "datadog"
+sut_listener = "datadog"
+wire = "http"             # G events.delivered, W the listener's events.sent
+
+[[ledger.sink]]
+id = "victoria_metrics"
+backend = "victoria-metrics"
+vm_selector = '{__name__="soak_requests_total"}'
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64   # WARN under 1h, FAIL above
+fd_growth = 8
+
+# The SUT's egress carries its answers. Delayed 11 s, past datadog_out's 10 s timeout, the
+# answer to a request the SUT took arrives after the generator gave up on it, and the generator
+# resends a batch the SUT holds: a surplus judged against its transport errors.
+[[step]]
+at = "0s"
+action = "netem"
+on = "logit"
+args = "delay 11s"
+for = "60s"
+
+[[step]]
+at = "2m30s"
+action = "netem"
+on = "logit"
+args = "loss 30%"
+for = "90s"
+
+# Netem on the generator delays its requests: judged as well.
+[[step]]
+at = "5m"
+action = "netem"
+on = "generator"
+args = "loss 10%"
+for = "60s"
+
+# The sink's two-batch queue, its inbox, and `aggregate`'s fill, and then the listener answers
+# `503` after 5 s busy, deferring the batch to the client.
+[[step]]
+at = "7m"
+action = "stop"
+on = "victoria-metrics"
+for = "90s"
+
+# The SUT's graceful ends: each answers what it took before it exits, so they're judged.
+[[step]]
+at = "10m"
+action = "stop"
+on = "logit"
+for = "30s"
+
+[[step]]
+at = "11m30s"
+action = "restart"
+on = "logit"
+for = "30s"
+
+# A SIGKILL loses up to one `internal` interval of the SUT's counts: reported.
+[[step]]
+at = "12m30s"
+action = "kill"
+on = "logit"
+for = "30s"
+
+[[expect]]
+name = "listener-defers"
+service = "logit"
+metric = "logit.input.batches.deferred"
+component = "datadog"
+step = "c0s4"
+window = "through"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "generator-retries-503s"
+service = "generator"
+metric = "logit.output.requests"
+component = "datadog"
+attrs = { class = "5xx" }
+step = "c0s4"
+window = "through"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "generator-resends"
+service = "generator"
+metric = "logit.output.requests"
+component = "datadog"
+attrs = { class = "network_error" }
+step = "c0s1"
+window = "through"
+reduce = "delta"
+min = 1
+
+# Every point is a distinct series and second in its batch, so the generator collapses none.
+[[expect]]
+name = "generator-collapses-none"
+service = "generator"
+metric = "logit.output.metrics.dropped"
+component = "datadog"
+window = "run"
+reduce = "delta"
+max = 0
+
+# Backpressure never reaches the sink as a drop: `block` holds every batch.
+[[expect]]
+name = "sink-never-drops"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "victoria_metrics"
+step = "c0s4"
+window = "through"
+reduce = "delta"
+max = 0

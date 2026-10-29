@@ -1,0 +1,27 @@
+# The load source in `script/soak`'s datadog-ingress scenario: 2,000 Datadog `count` points a
+# second to the system under test over `/api/v2/series`, each batch of 100 one request. Its
+# `internal` telemetry goes to stdout as NDJSON, so the harness reads what it sent.
+admin: { bind: 127.0.0.1:9600 }
+components:
+  load:
+    type: generate_in               # unbounded
+    rate: 2000
+    batch: 100
+    event:
+      # A delta sum of 1, a `count` on the wire, one series point per event. A batch shares one
+      # timestamp and holds each `series` tag once, so no two points in one body share a series
+      # and second, which datadog_out would collapse into one.
+      metric: { name: soak_requests, kind: sum, value: 1 }
+      attributes:
+        series: "{seq%100}"
+  datadog:
+    type: datadog_out
+    sources: [load]
+    api_key: soak                   # the SUT checks no key
+    endpoints: { api: http://logit:8080 }
+    # 50 batches is 2.5 s of load, so a SUT that answers nothing for longer overflows it and
+    # the loss is counted here; never stall generate_in. The default posture, at_least_once,
+    # resends a batch whose answer was lost, and a 503, which this sink reads as ambiguous.
+    buffer: { max_batches: 50, overflow: drop_newest, retry_max_delay: 1s }
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }

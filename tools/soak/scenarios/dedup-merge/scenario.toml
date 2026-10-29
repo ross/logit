@@ -1,0 +1,95 @@
+# statsd-vm over 10 series with a `dedup_timestamps` between the listener and `aggregate`, under
+# stops, a kill, and a restart of the SUT. statsd_in stamps receive time, so the lines of one
+# series that one read takes collide in a 1 ms bucket, and `dedup` merges each set into one
+# record carrying their sum. A merged record's event is left with nothing and counted
+# `events.discarded`, which `ledger.edge` judges at the node as for any discard, and holds to
+# the node's `metrics.merged`, M. Every row after the node credits M back as delivered (Ab + M),
+# since the increments reach V inside the survivors, and the node's `metrics.absorbed`, a
+# superseded reading, must stay 0. The schema is docs/plans/soak-harness.md's "The scenario
+# schema".
+
+name = "dedup-merge"
+description = "statsd-vm over 10 series through dedup_timestamps (1ms): receive-time collisions merge, and the ledger credits each merged record as delivered"
+duration = "15m30s"       # warmup + one cycle + cooldown; --duration overrides
+warmup = "60s"            # no faults: baseline rate, RSS, fds
+cooldown = "120s"         # no faults at the end; >= recovery_bound
+recovery_bound = "45s"    # retry_max_delay 10s + two aggregate windows + a drain
+cycle = "12m30s"          # >= last recovery (11m15s) + 2 x progress_window
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"
+
+[ledger]
+sut_aggregate = "window"
+wire_loss_outside_faults = 0.0
+
+[[ledger.source]]
+service = "generator"
+generator_input = "load"
+generator_sink = "statsd"
+sut_listener = "statsd"
+sut_transforms = ["dedup"]
+merge = ["dedup"]         # its discards are merges: M is credited back after it
+
+[[ledger.sink]]
+id = "victoria_metrics"
+backend = "victoria-metrics"
+vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64   # WARN under 1h, FAIL above
+fd_growth = 8
+
+[[step]]
+at = "0s"
+action = "netem"
+on = "logit"
+args = "delay 200ms 50ms"
+for = "120s"
+
+[[step]]
+at = "3m"
+action = "stop"
+on = "logit"
+for = "30s"
+
+[[step]]
+at = "5m"
+action = "kill"
+on = "logit"
+for = "30s"
+
+[[step]]
+at = "7m"
+action = "restart"
+on = "logit"
+for = "30s"
+
+[[step]]
+at = "9m"
+action = "stop"
+on = "victoria-metrics"
+for = "90s"
+
+# The collisions happen: one read takes several lines of a series. A run with none would leave
+# the merge term untested.
+[[expect]]
+name = "records-merge"
+service = "logit"
+metric = "logit.transform.metrics.merged"
+component = "dedup"
+window = "run"
+reduce = "delta"
+min = 1
+
+# A statsd counter is a delta Sum of one value type, so every collision merges.
+[[expect]]
+name = "nothing-passes-through"
+service = "logit"
+metric = "logit.transform.metrics.passed_through"
+component = "dedup"
+window = "run"
+reduce = "delta"
+max = 0

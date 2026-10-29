@@ -1,0 +1,33 @@
+# The system under test in `script/soak`'s rw-ingress scenario: remote-write over HTTP into
+# `prometheus_in`'s receiver, a counter per sample, a 500 ms cumulative aggregate, and
+# remote-write 1.0 (zstd) to VictoriaMetrics behind a two-batch blocking queue. Its `internal`
+# telemetry goes to stdout as NDJSON for the harness to read; `script/soak` runs it with
+# `--log-format json`.
+admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
+components:
+  remote_write:
+    # One batch per request, one event per sample. It never answers busy: backpressure holds
+    # the `204` until the pipeline takes the batch.
+    type: prometheus_in
+    bind: 0.0.0.0:9090
+  count:
+    # Each sample is a cumulative counter, which `aggregate` passes through and V can't count,
+    # so each gets a counter of 1.
+    type: kv_metrics
+    sources: [remote_write]
+    counters: [{ name: soak_requests }]
+  window:
+    type: aggregate
+    sources: [count]
+    interval: 500ms                 # one batch per window, so a backend stop backs up in seconds
+    temporality: cumulative
+    series_retention: 7200          # an hour of windows: a fault must never evict a series
+  victoria_metrics:
+    type: prometheus_out
+    sources: [window]
+    endpoint: http://victoria-metrics:8428/api/v1/write
+    version: 1
+    compression: zstd
+    buffer: { max_batches: 2 }      # overflow: block, the default
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }

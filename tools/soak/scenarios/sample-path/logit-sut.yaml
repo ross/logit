@@ -1,0 +1,27 @@
+# The system under test in `script/soak`'s sample-path scenario: DogStatsD over UDP, a `sample`
+# keyed on the `shard` tag, a 10 s cumulative aggregate, and remote-write 1.0 (zstd) to
+# VictoriaMetrics. `sample` keeps shards 0, 2, 3, 5, 6, 7, and 9 and discards 1, 4, and 8, the
+# same shards in every life (scenario.toml shows the hashes). Its `internal` telemetry goes to
+# stdout as NDJSON for the harness to read.
+admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
+components:
+  statsd: { type: statsd_in, bind: 0.0.0.0:8125 }   # DogStatsD tags become attributes
+  keyed:
+    type: sample
+    sources: [statsd]
+    key: { attribute: shard }
+    rate: 0.5
+  window:
+    type: aggregate
+    sources: [keyed]
+    interval: 10s
+    temporality: cumulative
+    series_retention: 360           # a fault must never evict a series
+  victoria_metrics:
+    type: prometheus_out
+    sources: [window]
+    endpoint: http://victoria-metrics:8428/api/v1/write
+    version: 1
+    compression: zstd               # buffer: defaults (block, at_least_once, retry_max_delay 10s)
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }
