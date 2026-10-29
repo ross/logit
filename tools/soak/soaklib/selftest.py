@@ -1417,7 +1417,7 @@ PER_DRAIN = 1000
 def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_short=0,
                 life0_dropped=0, life1_dropped=0, steady_loss=0, fault_loss=0, end_extra=0,
                 e1_short=0, a1_short=0, ab1_short=0, late_series=False, receive_util=0.0, slow_after_stop=False, rate_behind=0,
-                undelivered=0, empty_export=False, ab0_short=0, merged_lives=False,
+                undelivered=0, late_loss=0, empty_export=False, ab0_short=0, merged_lives=False,
                 empty_sut=False, buffer_batches=0, buffer_util=0.0, steady_surplus=0,
                 external=False, sut_extra=(), stderr_extra=(), timeline_extra=(),
                 script=None, l_in_short=0, l_err_unreported=0, l_sent_short=0,
@@ -1485,6 +1485,8 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
             w = PER_DRAIN  # the generator's lines from the stop never arrive: fault-window loss
         if slow_after_stop and life == 1 and offset <= 180:
             w //= 2
+        if offset == 290:
+            w -= late_loss
         if offset == 60:
             w -= steady_loss
         if offset == 250:
@@ -2971,6 +2973,11 @@ def _ledger_checks():
         expect(within_end["ledger.wire"].status == checks.PASS,
                f"wire allows W + K past G by up to one batch at the end, got "
                f"{within_end['ledger.wire']}")
+        # A drain's lines counted on either side of the steady-to-end boundary.
+        netted_end = results("wire-end-netted", late_loss=30, end_extra=130)
+        expect(netted_end["ledger.wire"].status == checks.PASS,
+               f"wire nets the end run against the steady run before it, got "
+               f"{netted_end['ledger.wire']}")
 
         unbalanced = results("identity", undelivered=1)
         expect(unbalanced["identity.sink"].status == checks.FAIL,
@@ -7591,6 +7598,142 @@ def _two_sut_driver(root):
                f"own stdout, got {order} {drained}")
 
 
+def _relay_base(root):
+    path = root / "scenarios" / "otlp-grpc-egress" / "scenario.toml"
+    return path, tomllib.loads(path.read_text())
+
+
+def _relay_rules(root):
+    """A `[[ledger.sink]]`'s `relay`: a further SUT service that passes the sinks' writes on to
+    their backend, so `logit` stays the SUT holding `aggregate` and the sinks and no hop is
+    needed; and every rule `load()` holds a relay to."""
+    path, raw = _relay_base(root)
+
+    def mutate(edit):
+        changed = copy.deepcopy(raw)
+        edit(changed)
+        return changed
+
+    loaded = scenario.from_dict(copy.deepcopy(raw), path)
+    expect(loaded.suts == ["logit", "collector"] and loaded.relays == ["collector"]
+           and loaded.sink_sut == "logit" and loaded.to_json()["sink_sut"] == "logit",
+           f"a relay is a SUT after logit, and logit holds the sinks, got {loaded.suts} "
+           f"{loaded.relays} {loaded.sink_sut}")
+    expect(scenario.service_problems(loaded, TWO_SUT_ROLES) == [],
+           f"a stack running the relay as a sut holds, got "
+           f"{scenario.service_problems(loaded, TWO_SUT_ROLES)}")
+    _refused(path, mutate(lambda r: r["ledger"]["sink"][0].pop("relay")),
+             "configs: SUT services logit and collector need a [[ledger.hop]]",
+             "a second SUT that is neither a hop's far side nor a relay")
+    _refused(path, mutate(lambda r: r["ledger"]["sink"][0].update(relay="generator")),
+             "ledger.sink: `relay` must be the one further SUT service [configs] names, "
+             "collector", "a relay that isn't the further SUT")
+    _refused(path, mutate(lambda r: r["configs"].pop("collector")),
+             "`relay` must be the one further SUT service [configs] names; it names none",
+             "a relay with one SUT")
+    _refused(path, mutate(lambda r: r["ledger"]["sink"].append(
+        {"id": "other", "backend": "victoria-metrics", "vm_selector": "{x=\"1\"}"})),
+             "ledger.sink: every sink names the same `relay`, or none does",
+             "a relay on one sink of two")
+    _refused(path, mutate(lambda r: r["ledger"].update(hop=[dict(TWO_SUT_HOP)])),
+             "ledger.hop and a sink's `relay` can't be combined", "a relay beside a hop")
+    ext_path, ext = _external_base(root)
+    ext["configs"]["collector"] = "logit-sut.yaml"
+    ext["ledger"]["sink"][0]["relay"] = "collector"
+    _refused(ext_path, ext, "`relay` carries a sink's writes to a backend, and the external "
+             "target has none", "a relay to an external target")
+
+
+def _relay_driver(root):
+    """The end sequence with a relay: the generators stop, then `logit` once the sinks it holds
+    are drained, then the relay once the backends' stored totals hold."""
+    path, _ = _relay_base(root)
+    loaded = scenario.load(path)
+    with tempfile.TemporaryDirectory() as tmp:
+        clock = [1000.0]
+        events = []
+
+        def lines(now):
+            out = []
+            for t in range(int(now) - 30, int(now) + 1, 5):
+                stamp = _stamp(t)
+                out.append(_line(stamp, "logit.process.uptime", "gauge", float(t - 900)))
+                out.append(_line(stamp, "logit.component.buffer.batches", "gauge",
+                                 2 if t < 1040 else 0, component="collector"))
+            return out
+
+        seq = driver.Run(root, loaded, loaded.duration, None, False, Path(tmp), [],
+                         "logit:soak", roles=TWO_SUT_ROLES)
+        seq.run_dir = driver.claim_run_dir(seq.out_dir)
+        seq.refresh_vm_base = lambda backend: None
+        seq.docker = _ChainDocker(clock, events, lines)
+        seq.ids = {name: f"id-{name}" for name in TWO_SUT_ROLES}
+        seq.timeline = _Records()
+        seq.t0 = 900.0
+        seq.has_vm = True
+        seq.inspect_all = lambda: None
+        seq.wait_quiet = lambda: events.append(("quiet",))
+        reals = (driver._now, driver.time.sleep, driver._print, vm.force_flush, vm.export_raw)
+        driver._now = lambda: clock[0]
+        driver.time.sleep = lambda s: clock.__setitem__(0, clock[0] + s)
+        driver._print = lambda text, stream=None: None
+        vm.force_flush = lambda base: None
+        vm.export_raw = lambda base, selector, start, timeout=None: ""
+        try:
+            seq.end_sequence()
+        finally:
+            (driver._now, driver.time.sleep, driver._print, vm.force_flush,
+             vm.export_raw) = reals
+        order = [e for e in events if e[0] in ("stop", "quiet")]
+        drained = [r for r in seq.timeline if r.get("phase") == "sink_drained"]
+        expect(order == [("stop", "id-generator"), ("stop", "id-logit"), ("quiet",),
+                         ("stop", "id-collector")],
+               f"generators, then logit, then the relay once the backends are quiet, got {order}")
+        expect(len(drained) == 1 and drained[0]["service"] == "logit" and drained[0]["held"]
+               and drained[0]["waited_s"] >= 40
+               and sorted(drained[0]["sinks"]) == ["collector"],
+               f"logit stops once the sink the relay carries on is drained, got {drained}")
+
+
+def _relay_checks():
+    """A run whose sink's writes a relay carries on: every ledger row reads `logit`, which holds
+    the listener, `aggregate`, and the sink, and V splits on `logit`'s lives, while a kill of the
+    relay gives it two lives of its own that no row reads."""
+    with tempfile.TemporaryDirectory() as tmp:
+        kill = (203, 213)
+        relay_timeline = [_action("apply", "c0s2", "kill", "collector", kill[0]),
+                          _action("revert", "c0s2", "kill", "collector", kill[1] - 1, kill[1]),
+                          _ready("c0s2", "collector", kill[1] + 1)]
+        run_dir = _ledger_run(tmp, "relay", timeline_extra=relay_timeline)
+        resolved_path = run_dir / "scenario.resolved.json"
+        resolved = json.loads(resolved_path.read_text())
+        resolved["suts"] = ["logit", "collector"]
+        resolved["sink_sut"] = "logit"
+        resolved["services"] = dict(TWO_SUT_ROLES)
+        resolved["ledger"]["sink"][0]["relay"] = "collector"
+        resolved_path.write_text(json.dumps(resolved))
+        relay = []
+        for offset in range(5, 321, 5):
+            if kill[0] <= offset < kill[1]:
+                continue
+            start = kill[1] if offset >= kill[1] else -1
+            relay.append(_line(_stamp(T0 + offset), "logit.process.uptime", "gauge",
+                               float(offset - start)))
+        (run_dir / "logs" / "collector.stdout").write_text("\n".join(relay) + "\n")
+        data = checks.RunData(run_dir)
+        led = checks.Ledger(data)
+        expect(data.sut_out == "logit" and led.problems == [] and not led.across
+               and led.service == "logit" and led.lives == [0, 1]
+               and led.views["collector"].lives == [0, 1],
+               f"with a relay logit holds the sinks and the relay keeps its own lives, got "
+               f"{data.sut_out} {led.problems} {led.service} {led.lives}")
+        rows = {r.id: r for r in checks.run_all(run_dir)}
+        for row in ("ledger.intake", "ledger.edge", "ledger.egress"):
+            expect(rows[row].status == checks.PASS,
+                   f"{row} reads logit's lives across a relay, got {rows[row].status}: "
+                   f"{rows[row].detail}")
+
+
 # Two SUT services: `logit` holds the listener `in` and a `hop` sink, `collector` holds
 # `window` and `sink`. A kill on collector over +203..+213 ends its life 0.
 TWO_SUT_KILL = (203, 213)
@@ -11536,8 +11679,9 @@ def _boundary_skew():
     capped, _ = checks._boundary_nets(runs, [(660.0, 0.0), (667.0, 1000.0)])
     expect([round(net) for net in capped] == [-1154, 1159],
            f"the transfer stops at the straddling G, got {capped}")
-    # A steady run beside a judged one nets; a reported or end run never does.
-    for kind, want in (("steady", [0, 5]), ("fault", [-2154, 2159]), ("end", [-2154, 2159])):
+    # A steady run beside a judged one nets, as does the end run after one; a reported one never
+    # does.
+    for kind, want in (("steady", [0, 5]), ("fault", [-2154, 2159]), ("end", [0, 5])):
         mixed = [runs[0], [*runs[1][:2], kind, *runs[1][3:]]]
         got, _ = checks._boundary_nets(mixed, anchors)
         expect([round(net) for net in got] == want,
@@ -11881,7 +12025,8 @@ def run(root, quiet=False):
                      _sources_ledger, _source_rules, _fanin_driver, _tcp_ledger, _tcp_rules,
                      _http_ledger, _http_rules, _file_ledger, _file_rules,
                      _two_sut_rules,
-                     _two_sut_driver, _two_sut_checks, _per_service, _slope_edges,
+                     _two_sut_driver, _two_sut_checks, _relay_rules, _relay_driver,
+                     _relay_checks, _per_service, _slope_edges,
                      _rss_settle_rules, _rss_settle_checks,
                      _expected_rules, _slope_reducer, _standin_codec, _standin_record_parts,
                      _standin_server, _respond_rules, _standin_count, _standin_idle_timeout,
@@ -11903,7 +12048,7 @@ def run(root, quiet=False):
                               _expected_event_rules,
                               _shipped, _roles, _sink_rules, _driver_roles, _source_rules,
                               _fanin_driver, _tcp_rules, _http_rules, _file_rules, _two_sut_rules,
-                              _two_sut_driver,
+                              _two_sut_driver, _relay_rules, _relay_driver,
                               _rss_settle_rules, _expected_rules, _standin_codec, _standin_server,
                               _respond_rules, _standin_count, _standin_idle_timeout,
                               _standin_driver, _written_counts, _datadog_codec,

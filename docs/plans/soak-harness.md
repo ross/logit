@@ -619,7 +619,12 @@ services:
 
 - The SUT services form a chain: `logit`, then each further one in the order `[configs]` lists
   it (`Scenario.suts`, recorded in `scenario.resolved.json` as `suts`). The chain's last service
-  holds `sut_aggregate` and every `[[ledger.sink]]`.
+  holds `sut_aggregate` and every `[[ledger.sink]]`, unless the sinks name it as their relay.
+- From W28 a second SUT service can instead be the sinks' relay: each `[[ledger.sink]]` names it
+  in `relay`, there is no hop, and `logit` holds `sut_aggregate` and the sinks
+  (`Scenario.sink_sut`, recorded as `sink_sut`), so every ledger row reads `logit`'s lives
+  and V splits on them. The relay passes the sinks' writes on to their backend with `logit`'s
+  timestamps (item 25's `otlp-grpc-egress`).
 - From W10b a second SUT service needs a `[[ledger.hop]]` naming the native hop that joins it to
   `logit`, and a scenario has at most one hop, so at most two SUT services ("The native hop
   (W10b)" in §8d). From W12b an `[overlap]` table instead runs two or more instances of one
@@ -1134,8 +1139,10 @@ The rows:
   shows as an opposite-signed pair in the two runs that touch. The pair nets in full, up to that
   G, before the surplus run's allowance (below) applies to what's left, and the detail line
   shows each transfer. The cap keeps a resend's surplus, or a steady run's, from hiding more
-  loss next door than interpolation explains; runs that don't touch, and a reported or end run,
-  never net. `checks._boundary_nets`' doc is the full rule. A judged run's surplus allowance
+  loss next door than interpolation explains; runs that don't touch, and a reported run, never
+  net. On every wire the boundary from a judged or steady run into the end run nets the same
+  way (W28), since the end allowance covers only the sends the generator cancels at shutdown.
+  `checks._boundary_nets`' doc is the full rule. A judged run's surplus allowance
   counts every edge it has, a boundary with another judged run included. Apart from that
   netting, each steady run's gap counts at 0 when W + K exceeds G in it, so a surplus in one run
   can't net out loss in another. The

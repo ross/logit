@@ -39,7 +39,9 @@ needs at the code:
   does every SUT service after `logit` (`Scenario.suts`). The end sequence stops every generator
   before it waits on the sinks, then each SUT service in chain order: an earlier one once its
   `[[ledger.hop]]` sink's queue is empty and nothing is in flight, the last, which holds the
-  `[[ledger.sink]]` sinks, once their stored totals hold or their queues are empty.
+  `[[ledger.sink]]` sinks, once their stored totals hold or their queues are empty. When the
+  sinks name a `relay`, `logit` holds them and is stopped once they're drained, and the relay,
+  last, once the stored totals hold.
 - Every `backend` service has its own published port, re-read after any revert of a fault on
   it. Freshness is sampled per `[[ledger.sink]]`, the end sequence waits until every sink's stored
   total holds, and each sink's export lands in `vm-export/<sink>.jsonl`, and what its
@@ -738,12 +740,16 @@ class Run:
         self.finish_end_sequence()
 
     def stop_chain(self, suts):
-        """Stops each SUT service in chain order: an earlier one once its `[[ledger.hop]]` sink
-        is drained, the last once its sinks' stored totals hold or their queues are empty."""
+        """Stops each SUT service in chain order: an earlier one once its `[[ledger.hop]]` sink,
+        or the `[[ledger.sink]]` sinks a relay carries on, is drained, the last once its sinks'
+        stored totals hold or their queues are empty. A relay is last, so the stored totals
+        holding covers what it passes on."""
         for service in suts:
             if service != suts[-1]:
-                self.wait_sink_drained(service, sinks=[hop["sink"] for hop in self.scenario.hops
-                                                       if hop.get("from") == service])
+                sinks = [hop["sink"] for hop in self.scenario.hops if hop.get("from") == service]
+                if service == self.scenario.sink_sut:
+                    sinks += [sink["id"] for sink in self.scenario.sinks]
+                self.wait_sink_drained(service, sinks=sinks)
             elif self.has_vm:
                 self.wait_quiet()
             else:

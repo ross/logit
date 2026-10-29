@@ -606,3 +606,30 @@ Two transforms in the path need rules a counted discard doesn't give.
 
 [`docs/plans/soak-harness.md`](../plans/soak-harness.md), item 19 of "10. Next scenarios", has
 the scenarios that use them.
+
+## Amendment: a relay keeps `aggregate` in `logit`, and V splits on its lives (2026-10-29)
+
+A sink whose destination is another `logit` (`otlp_out` over gRPC to `otlp_in`, passed on by
+`prometheus_out` to VictoriaMetrics, whose OTLP route is HTTP only) needs a second SUT that
+isn't the far side of a hop: it has no `aggregate`, and the running totals and their timestamps
+are `logit`'s. Each `[[ledger.sink]]` names that service in `relay`. `logit` then holds the
+listeners, `sut_aggregate`, and every sink, and the resolved scenario records it as `sink_sut`,
+so every ledger row reads `logit`'s lives and V splits on them. The relay is still a SUT: it is
+scored on its own lives by the watchdog rows, and a fault may name it.
+
+The relay's losses are judged only through V. Under `temporality: cumulative` a write it loses
+in the middle of a `logit` life, such as the queue of its own sink at a kill, changes no
+stored total, so the egress rows see it only when it holds a life's last value. That's the
+property the scenario soaks: a cumulative relay through a stateless hop. A relay can't be
+combined with a hop, every sink names the same one, and the target is local.
+
+## Amendment: the end run nets with the run before it (2026-10-29)
+
+A `graphite-egress` run FAILed `ledger.wire` with G − W exactly 0 over the run: the end run read
+G 102 short of W + K, past its allowance of 100, and the steady run before it read 102 of loss.
+G's interpolation at the boundary between them put one drain's lines on the wrong side. Every
+wire now nets that boundary, from a judged or a steady run into the end run, as the 2026-10-25
+amendment nets a boundary that touches a judged run: an opposite-signed pair nets up to the G
+that moved over the straddling generator interval. The end allowance covers only the sends the
+generator cancels at shutdown, and it then applies to the end run's net. A reported run still
+never nets. Re-scored, the run PASSes with 0 of steady loss judged.

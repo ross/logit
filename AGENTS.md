@@ -890,7 +890,12 @@ the operator-facing account of all of this.
   discarded key's series reaches the backend in any SUT life. `dedup-merge` puts a
   `dedup_timestamps` there instead, and its source's `merge` credits each merged record back as
   delivered. `cardinality-capped` churns tag values under fixed names into `aggregate`'s
-  `max_series_per_metric`, expecting `rss_slope` to PASS over an hour.
+  `max_series_per_metric`, expecting `rss_slope` to PASS over an hour. `graphite-egress` and
+  `otlp-egress` send a cumulative `aggregate` through `graphite_out` and `otlp_out` over HTTP
+  into VictoriaMetrics' own Graphite and OTLP listeners, under `vm_every_window`;
+  `otlp-grpc-egress` sends it over gRPC to a second `logit`, `collector`, which passes it on
+  through `prometheus_out`. `collector` is the sink's `relay`, so `logit` keeps `aggregate`
+  and the sink, and V splits on `logit`'s lives.
   `tail-rotate-delete` runs that path for hours against a writer keeping eight files and
   deleting the oldest at each rotation, with `[[expect]]` maxima on `logit.input.files.open`
   and `logit.process.fds`: G bounds the end count, which must find the eight files, and
