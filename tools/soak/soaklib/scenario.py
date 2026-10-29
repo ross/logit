@@ -99,6 +99,9 @@ SUT_ONLY_ACTIONS = {
              "with no G behind them, so ledger.wire would net them against real loss"),
     "exit": "an expected exit is one the SUT's own config causes",
 }
+# The `SUT_ONLY_ACTIONS` allowed on a scrape wire's generator: it sends nothing, so a kill
+# loses only the increments after the SUT's last scrape, which `ledger.wire` bounds per life.
+SCRAPED_GENERATOR_ACTIONS = ("kill",)
 # Actions that name an expected event rather than cause one: their apply and revert make no
 # Docker call (an `exit`'s revert starts the container the event ended), so a `[random]`
 # schedule, which draws faults, can't hold them.
@@ -240,8 +243,8 @@ FAN_OUT_KIND = "line_protocol"
 MERGE_KIND = "dedup_timestamps"
 # The wires a source's lines can cross into the SUT, each with its own ledger symbols
 # (checks.py's `WIRES`): datagrams, a TCP stream of LF-terminated lines, a file the SUT tails,
-# or HTTP requests a listener answers.
-WIRES = ("udp", "tcp", "file", "http")
+# HTTP requests a listener answers, or an exposition a listener scrapes.
+WIRES = ("udp", "tcp", "file", "http", "scrape")
 DEFAULT_WIRE = "udp"
 # `rss_settle` when a scenario doesn't set it, and for a run directory recorded before the key:
 # how long past `recovery_bound` `rss_slope` keeps excusing a fault, while the allocator returns
@@ -250,6 +253,7 @@ DEFAULT_WIRE = "udp"
 DEFAULT_RSS_SETTLE_S = 0.0
 FILE_WIRE = "file"
 HTTP_WIRE = "http"
+SCRAPE_WIRE = "scrape"
 # A file wire's writer: a generator sink whose G is `events.delivered` (checks.py's `WIRES`),
 # since it counts no `output.messages`.
 FILE_WRITER_KIND = "file_out"
@@ -257,6 +261,13 @@ FILE_WRITER_KIND = "file_out"
 # listener answered with a success.
 HTTP_WRITER_KINDS = ("influxdb_out", "otlp_out", "splunk_hec_out", "datadog_out",
                      "prometheus_out")
+# A scrape wire's writer: an exposition on `bind:`, whose G is its generator's increments, since
+# a scrape reads running totals (checks.py's `check_ledger_wire`).
+SCRAPE_WRITER_KIND = "prometheus_out"
+# The `[ledger]` keys refused beside a scrape wire, whose rows judge the generator's increments
+# against V and read no `aggregate` in the SUT.
+SCRAPE_REFUSED_KEYS = ("sut_aggregate", "sut_delta", "sut_script", "hop", "split",
+                       "vm_every_window")
 # Each listener kind the ledger can follow: the wire it takes with no `transport:`, and the
 # wire each `transport:` value it accepts gives. A kind or transport missing here has no wire.
 LISTENER_WIRES = {
@@ -273,10 +284,10 @@ LISTENER_WIRES = {
     "datadog_in": ("http", {}),
 }
 # Each listener kind with no `transport:` that runs in one of several modes, each chosen by the
-# config key it sets: that key and its mode's wire, None for a mode the ledger has no wire for.
+# config key it sets: that key and its mode's wire.
 # `prometheus_in` receives remote-write on `bind:` and scrapes `scrape_targets:`.
 LISTENER_MODES = {
-    "prometheus_in": (("bind", "http"), ("scrape_targets", None)),
+    "prometheus_in": (("bind", "http"), ("scrape_targets", "scrape")),
 }
 # `[overlap]`: two or more SUT services, `instances`, each running the whole pipeline on one
 # shared UDP port under `reuse_port`, in the network namespace of the `holder` service, each
@@ -851,7 +862,8 @@ def from_dict(raw, path):
         ledger_keys = ledger_keys - {"sut_aggregate"}
         ledger_optional = ledger_optional | {"sut_aggregate"}
     # `sut_delta` takes `sut_aggregate`'s place, and `_delta_problems()` refuses both together.
-    if isinstance(ledger, dict) and "sut_delta" in ledger:
+    # A scrape wire's rows read no `aggregate`, and `_scrape_problems()` refuses one.
+    if isinstance(ledger, dict) and ("sut_delta" in ledger or _scraped(ledger)):
         ledger_keys = ledger_keys - {"sut_aggregate"}
         ledger_optional = ledger_optional | {"sut_aggregate"}
     if no_vm and isinstance(ledger, dict):
@@ -910,6 +922,7 @@ def from_dict(raw, path):
             problems += _route_problems(ledger, sut_text)
             problems += _transform_problems(ledger, sut_text)
             problems += _delta_problems(ledger, sut_text, target, "overlap" in raw)
+            problems += _scrape_problems(ledger, target, "overlap" in raw, extra_suts)
             if target["kind"] == KAFKA_TARGET:
                 target["format"] = kafka_format(ledger, sut_text, target["topic"], problems)
         problems += _writer_problems(ledger, configs, path.parent)
@@ -1506,8 +1519,9 @@ def source_pairs(source):
 
 def _writer_problems(ledger, configs, directory):
     """What a source's `generator_sink` breaks against its generator's config: on a `file`
-    wire it must be a `file_out` and on an `http` wire one of `HTTP_WRITER_KINDS`, and on any
-    other wire it must be neither, because each reads G from its own counter."""
+    wire it must be a `file_out`, on an `http` wire one of `HTTP_WRITER_KINDS`, and on a
+    `scrape` wire a `SCRAPE_WRITER_KIND` exposing on `bind:`; on any other wire it must be
+    neither a `file_out` nor an HTTP writer, because each reads G from its own counter."""
     sources = ledger.get("source")
     if not isinstance(sources, list) or not isinstance(configs, dict):
         return []
@@ -1539,6 +1553,15 @@ def _writer_problems(ledger, configs, directory):
             elif wire != FILE_WIRE and kind == FILE_WRITER_KIND:
                 problems.append(f"{where}: `generator_sink` {sink!r} is a {FILE_WRITER_KIND}, "
                                 "which only a file wire reads")
+            elif wire == SCRAPE_WIRE:
+                if kind != SCRAPE_WRITER_KIND or not any(
+                        re.search(r"(?<![\w.])bind\s*:", _uncommented(block))
+                        for block in component_blocks(text, sink)):
+                    problems.append(f"{where}: a scrape wire's `generator_sink` must be a "
+                                    f"{SCRAPE_WRITER_KIND} exposing on `bind:`, and {sink!r} "
+                                    "is " + (f"a {kind}" + ("" if kind != SCRAPE_WRITER_KIND
+                                                            else " with no `bind:`")
+                                             if kind else "no component of its config"))
             elif wire == HTTP_WIRE and kind not in HTTP_WRITER_KINDS:
                 problems.append(f"{where}: an http wire's `generator_sink` must be one of "
                                 f"{', '.join(HTTP_WRITER_KINDS)}, and {sink!r} is "
@@ -1754,6 +1777,50 @@ def _delta_problems(ledger, sut_text, target, overlap):
         if node in (source.get("sut_transforms") or []):
             problems.append(f"ledger.source {index + 1}: `sut_transforms` lists {node!r}, the "
                             "sut_delta node, which feeds the sink")
+    return problems
+
+
+def _scraped(ledger):
+    """Whether any `[[ledger.source]]` of `ledger` crosses the scrape wire."""
+    sources = ledger.get("source") if isinstance(ledger.get("source"), list) else []
+    return any(isinstance(source, dict) and source.get("wire") == SCRAPE_WIRE
+               for source in sources)
+
+
+def _scrape_problems(ledger, target, overlap, extra_suts):
+    """What a scrape wire breaks: it is the one `[[ledger.source]]`, with no `sut_transforms`,
+    `fan_out`, or `merge`, into one SUT service with one `[[ledger.sink]]` on the local target,
+    whose V the wire reads; and `SCRAPE_REFUSED_KEYS` and `[overlap]` are refused beside it.
+    The wire judges the generator's increments against V, so nothing between the listener and
+    the sink may change a sample's value."""
+    if not _scraped(ledger):
+        return []
+    problems = []
+    sources = ledger.get("source") if isinstance(ledger.get("source"), list) else []
+    if len(sources) != 1:
+        problems.append("a scrape wire needs one [[ledger.source]], since its V is the one "
+                        "sink's stored counters")
+    for index, source in enumerate(sources):
+        if not isinstance(source, dict):
+            continue
+        for key in ("sut_transforms", "fan_out", "merge"):
+            if key in source:
+                problems.append(f"ledger.source {index + 1}: `{key}` can't be combined with a "
+                                "scrape wire, which relays each sample's value unchanged")
+    sinks = ledger.get("sink") if isinstance(ledger.get("sink"), list) else []
+    if len(sinks) != 1:
+        problems.append("a scrape wire needs one [[ledger.sink]], whose stored counters are V")
+    if target.get("kind") != LOCAL_TARGET:
+        problems.append("a scrape wire needs the local target, whose VictoriaMetrics holds the "
+                        "counters' values")
+    for key in SCRAPE_REFUSED_KEYS:
+        if key in ledger:
+            problems.append(f"ledger.{key} can't be combined with a scrape wire, whose rows "
+                            "read no aggregate")
+    if overlap:
+        problems.append("[overlap] can't be combined with a scrape wire")
+    if extra_suts:
+        problems.append("a scrape wire needs one SUT service")
     return problems
 
 
@@ -3043,7 +3110,8 @@ def role_problems(roles, suts=(SUT_SERVICE,), holder=None):
 def service_problems(scenario, roles, modes=None):
     """Every rule that needs the stack's services, against `roles` (`{service: role}`): the
     role map's own rules; each step's and random fault's `on` a service of the stack, with a
-    `kill` or an `exit` on a SUT service only, and a `respond`, or a `stop` with a `class`, on a
+    `kill` or an `exit` on a SUT service only, or a `kill` on a scrape wire's generator, and a
+    `respond`, or a `stop` with a `class`, on a
     stand-in only; each `[[expect]]` service one that runs `logit`; for a Kafka target, the
     broker `kafka`; for a stand-in target, the stand-in `standin`; each `[[ledger.source]]`
     service a generator, and every generator a source's; and each local sink's `backend` a
@@ -3065,13 +3133,17 @@ def service_problems(scenario, roles, modes=None):
                   else "; a standin target's stack runs the stand-in and no backend"
                   if scenario.standin else "")
 
+    scraped = {source.get("service") for source in scenario.sources
+               if source.get("wire") == SCRAPE_WIRE}
+
     def on_problems(on, action, where, reason=True, classed=False):
         if on not in roles:
             return [f"{where}: unknown service `{on}`{no_backend}"]
         if action in NO_WINDOW_ACTIONS and roles[on] not in LOGIT_ROLES:
             return [f"{where}: {action} is for a service that runs logit; the stack's are "
                     f"{', '.join(logit_services(roles))}"]
-        if action in SUT_ONLY_ACTIONS and roles[on] != SUT_ROLE:
+        if action in SUT_ONLY_ACTIONS and roles[on] != SUT_ROLE and not (
+                action in SCRAPED_GENERATOR_ACTIONS and on in scraped):
             why = f": {SUT_ONLY_ACTIONS[action]}" if reason else ""
             return [f"{where}: {action} is for {' or '.join(scenario.suts)} only{why}"]
         if (action == "respond" or classed) and roles[on] != STANDIN_ROLE:

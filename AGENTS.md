@@ -867,6 +867,11 @@ the operator-facing account of all of this.
   remote-write receiver, its wire keyed on its `bind:` mode, which `splunk-hec-ingress`,
   `datadog-ingress`, and `rw-ingress` run from `splunk_hec_out` under `ack: true`,
   `datadog_out`, and `prometheus_out`; an ack timeout allows a resend as a transport error does.
+  `prometheus-scrape` has `prometheus_in` scrape a generator's `prometheus_out` exposition, on
+  the `scrape` wire its `scrape_targets:` mode keys: G is each generator life's increments and
+  V the stored counters' reset-aware total in that life, a failed scrape loses only intermediate
+  values, and each life's G − V must fall in an end band of one scrape interval, one generator
+  window, and one drain; a kill on that generator is allowed.
   `otlp-fan-out` sends OTLP log records over it whose bodies each
   hold four line-protocol points into `otlp_in -> line_protocol`, its source declaring
   `fan_out = { points = 4 }`: `ledger.edge` judges the node's children,

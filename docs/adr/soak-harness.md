@@ -660,7 +660,7 @@ receiver, from `splunk_hec_out`, `datadog_out`, and `prometheus_out`. `splunk_he
 to its two identities on their write routes. `prometheus_in` counts `logit.input.writes{class}`,
 with no `route` tag, and never answers busy, so it holds only the first. It has no `transport:`,
 so its wire is keyed on the mode its config sets: `bind:` is the receiver, and
-`scrape_targets:`, a pull, has no wire yet.
+`scrape_targets:` the scrape wire, the next amendment.
 
 - **An acknowledgment timeout allows one batch of surplus, as a transport error does.**
   `splunk_hec_out` under `ack: true` counts a batch delivered only once `/ack` answers every id
@@ -677,3 +677,44 @@ so its wire is keyed on the mode its config sets: `bind:` is the receiver, and
   window by 930 points against 700 allowed with nothing lost. Each edge of a judged run now
   allows the writer's `concurrency:` in batches, 1 when unset, which leaves every writer at the
   default where it was.
+
+## Amendment: a scrape wire judges increments per generator life (2026-10-29)
+
+`prometheus_in` scraping a generator's `prometheus_out` exposition is a fifth wire, `scrape`,
+judged in value: per generator life, G, the increments its `generate_in` sent less what its
+components before the sink dropped, against V, the stored counters' reset-aware total in that
+life.
+
+A pull carries running totals, not lines. A sample is a series' total at the scrape, so there
+is no count of lines on either side to compare, and the generator's `aggregate` exports no
+per-series total to read G from. The increments are the one quantity both ends hold: the
+generator counts them as it generates, and the backend's reset-aware total sums them back. A
+failed, timed-out, or skipped scrape loses no increment, since the next one reads the total
+that includes it, so the only loss is intermediate values, and no fault window excuses
+anything.
+
+- **V splits at the generator's lives, not the SUT's.** A generator restart resets its totals,
+  which the backend records as a counter reset, and a SUT restart doesn't reset them. So each
+  sample is credited by its scrape time to the generator life in force, and a SUT restart
+  splits nothing.
+- **Each generator life has an end band.** The increments after a life's last scrape never
+  reach a scrape: up to one scrape `interval`, plus one generator `aggregate` window, since the
+  scraped totals lag the generation by up to a window, plus one generator drain interval as
+  slack. A life the end sequence stops exports all its counts, so its G − V can't go below 0;
+  a killed life's last drain interval of counts is never exported, so G can fall short of the
+  increments V holds by one drain interval of them. A life outside its band FAILs, a surplus
+  below it and lost increments above it.
+- **A kill on the generator is allowed on this wire alone.** Elsewhere a generator killed
+  after its last drain has sent lines with no G behind them. A scrape target sends nothing; a
+  kill only ends a life early, which its end band covers.
+- **The count rows judge samples.** W is the listener's `logit.input.samples`, which leaves out
+  the three synthetic samples each scrape appends, `up`, `scrape_duration_seconds`, and
+  `scrape_samples_scraped`, failures included. They are Y, three per scrape, so the listener
+  balances W + Y − D == E + B, and the sink's `vm_selector` leaves them out too, so the
+  distinct stored samples per SUT life are judged against W − X. The rows that read an
+  `aggregate` SKIP: the SUT relays samples and has none, and a node between the listener and
+  the sink could change the values the wire judges, so `load()` refuses `sut_transforms` and
+  every `[ledger]` key that names such a node.
+
+[`docs/plans/soak-harness.md`](../plans/soak-harness.md), "10. Next scenarios", item 22, has the
+scenario.

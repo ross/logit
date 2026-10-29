@@ -1,0 +1,140 @@
+# A generator's running totals scraped by `logit`'s `prometheus_in` from the generator's
+# `prometheus_out` exposition and relayed to VictoriaMetrics, under faults on the generator. The
+# scrape wire is a pull: G is the increments each generator life generated, V the stored
+# counters' reset-aware total in that life, and a scrape that fails loses only the values
+# between two that succeed. Each generator life's end loses the increments after its last
+# scrape, judged against a band. The schema is docs/plans/soak-harness.md's "The scenario
+# schema".
+
+name = "prometheus-scrape"
+description = "generator generate_in -> aggregate 1s cumulative -> prometheus_out bind <- prometheus_in scrape 5s -> prometheus_out RW1 zstd -> VictoriaMetrics"
+duration = "18m"          # warmup + one cycle + cooldown; --duration overrides
+warmup = "60s"            # no faults: baseline rate, RSS, fds
+cooldown = "120s"         # no faults at the end; >= recovery_bound
+recovery_bound = "30s"    # a scrape interval, the sink's 10 s timeout, and a drain
+cycle = "15m"             # >= last recovery (8m30s + 30s) + 2 x progress_window
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"
+
+[ledger]                  # component ids the checker reads; no rates here
+wire_loss_outside_faults = 0.0
+
+[[ledger.source]]
+service = "generator"
+generator_input = "load"
+generator_sink = "exposition"
+sut_listener = "scrape"
+wire = "scrape"           # G the generator's increments, V the stored counters' total
+
+[[ledger.sink]]
+id = "victoria_metrics"
+backend = "victoria-metrics"
+# The relayed counters alone: `up`, `scrape_duration_seconds`, and `scrape_samples_scraped`
+# aren't the generator's.
+vm_selector = '{__name__="soak_gen_total"}'
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64   # WARN under 1h, FAIL above
+fd_growth = 8
+
+# Each scrape fails while the generator is off the network. Resolving its name and dialing it
+# don't fail within the 2 s timeout, so each one counts `timeout`, not `network_error`.
+[[step]]
+at = "0s"
+action = "partition"
+on = "generator"
+for = "60s"
+
+# Kept under the exposition's 5-minute `expire_after`, past which it forgets its series. The
+# paused process can't answer, so each scrape times out.
+[[step]]
+at = "2m30s"
+action = "pause"
+on = "generator"
+for = "60s"
+
+# The generator's answers arrive past the scrape's 2 s timeout.
+[[step]]
+at = "5m"
+action = "netem"
+on = "generator"
+args = "delay 3s"
+for = "90s"
+
+# The totals restart from 0, a counter reset VictoriaMetrics' totals absorb. The increments
+# after the last scrape are lost: the life's end band. Each scrape in between times out, as in
+# the partition.
+[[step]]
+at = "8m"
+action = "kill"
+on = "generator"
+for = "30s"
+
+[[expect]]
+name = "partition-times-out"
+service = "logit"
+metric = "logit.input.scrapes"
+component = "scrape"
+attrs = { class = "timeout" }
+step = "c0s1"
+window = "through"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "pause-times-out"
+service = "logit"
+metric = "logit.input.scrapes"
+component = "scrape"
+attrs = { class = "timeout" }
+step = "c0s2"
+window = "through"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "delay-times-out"
+service = "logit"
+metric = "logit.input.scrapes"
+component = "scrape"
+attrs = { class = "timeout" }
+step = "c0s3"
+window = "through"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "kill-times-out"
+service = "logit"
+metric = "logit.input.scrapes"
+component = "scrape"
+attrs = { class = "timeout" }
+step = "c0s4"
+window = "through"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "scrapes-succeed"
+service = "logit"
+metric = "logit.input.scrapes"
+component = "scrape"
+attrs = { class = "2xx" }
+window = "run"
+reduce = "delta"
+min = 1
+
+# A body the scrape couldn't parse, or one over its size cap, would lose its values with no
+# window to excuse it.
+[[expect]]
+name = "no-parse-errors"
+service = "logit"
+metric = "logit.input.scrapes"
+component = "scrape"
+attrs = { class = "parse_error" }
+window = "run"
+reduce = "delta"
+max = 0

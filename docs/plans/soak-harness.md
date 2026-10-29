@@ -565,12 +565,17 @@ sut_transforms = ["parse", "labels", "count", "metrics_only"]   # optional, in o
   `syslog_in` UDP unless `transport: tcp`, `lines_in` and `graphite_in` TCP unless
   `transport: udp`, `collectd_in` UDP, `tail_in` and `docker_in` file, `influxdb_in`,
   `otlp_in`, `splunk_hec_in`, and `datadog_in` HTTP), or of a kind and mode
-  (`scenario.LISTENER_MODES`: `prometheus_in` HTTP on `bind:`, and no wire on
+  (`scenario.LISTENER_MODES`: `prometheus_in` HTTP on `bind:`, and scrape on
   `scrape_targets:`), whose wire is the source's. A listener the config lacks, a kind,
   transport, or mode with no wire (a Unix socket), and a mismatch are refused. It also reads
   the generator's config: a file wire's `generator_sink` must be a `file_out`, an HTTP wire's
   one of `scenario.HTTP_WRITER_KINDS` (`influxdb_out`, `otlp_out`, `splunk_hec_out`,
-  `datadog_out`, or `prometheus_out`), and any other wire's neither.
+  `datadog_out`, or `prometheus_out`), a scrape wire's a `prometheus_out` with `bind:`, and any
+  other wire's neither. A scrape wire (W25) is the one source, into one SUT service with one
+  sink on the local target and no `sut_transforms`, and `load()` refuses `sut_aggregate`,
+  `sut_delta`, `sut_script`, `split`, `hop`, `vm_every_window`, and `[overlap]` beside it
+  (`scenario._scrape_problems`). A `kill` on its generator is allowed, the one generator
+  `kill`: a scrape target sends nothing, so a kill only ends a life, which its end band covers.
 - `sut_transforms`, optional, lists the nodes between the listener and `aggregate`, distinct, none
   of them a listener, and none on another source's list. Each must send every event it
   receives or count it in `logit.component.events.discarded`, which `ledger.edge` judges hop by
@@ -1009,7 +1014,29 @@ pipeline takes the batch, past a writer's timeout, which resends while the held 
 delivers. So it holds the first identity alone, `ok` and `closed_consumer` writes summing to
 `batches.sent`, while no write decodes to nothing (a `204` with no batch). Its wire is keyed on
 its mode, since it has no `transport:` (`scenario.LISTENER_MODES`): `bind:` is the receiver, an
-HTTP wire, and `scrape_targets:` has no wire until W25 adds one. The writer's `logit.component.events.received` is reported beside G as the points attempted,
+HTTP wire, and `scrape_targets:` the scrape wire.
+
+The scrape wire (W25) is a pull of running totals, judged in value per generator life, not in
+lines per drain interval (`checks._scrape_wire_one`). G is the increments a generator life's
+`generate_in`s sent less what its components before the sink dropped
+(`logit.component.events.dropped` and `logit.transform.metrics.dropped`), and V the sink's
+stored counters' reset-aware total in that life, each sample credited to the generator life
+its timestamp, the SUT's scrape time, falls in; a SUT life splits nothing, since a SUT restart
+doesn't reset the generator's totals. A failed, timed-out, or skipped scrape loses only the
+values between two that succeed, so no fault window excuses anything: each life's G − V must
+fall in its end band (`checks.scrape_band`), the increments after its last scrape, at the life's
+median rate per drain interval: up to one scrape `interval` plus one generator `aggregate`
+window plus one generator drain interval, and below 0 by one drain interval for a killed life,
+whose last drain's counts go unexported. Past the band it FAILs. The count rows judge samples
+instead: W is the listener's `logit.input.samples`, the target's samples, and Y the three
+synthetic samples each scrape appends (`up`, `scrape_duration_seconds`,
+`scrape_samples_scraped`), three per `logit.input.scrapes`, so `ledger.intake` holds
+W + Y − D == E + B and an earlier life's residual W + Y − D − B − X − S_in in [0, R];
+`ledger.edge` holds E − X == S_in; `ledger.egress` holds W − X to V_n, the distinct stored
+samples the sink's `vm_selector` matches, per SUT life, a killed life reported and a stopped
+one's gap allowed up to the sink's counted event drops; `ledger.aggregate` and
+`ledger.summary` SKIP; and `recovery` reads any sample scraped as ingest recovered, since the
+generator counts increments and a scrape lands in a drain interval or doesn't. The writer's `logit.component.events.received` is reported beside G as the points attempted,
 and its `logit.output.requests{class="5xx"}` as the answers it retried.
 
 From W7b the ledger follows each `[[ledger.sink]]`. A row about a sink (`progress`,
@@ -1027,6 +1054,7 @@ and takes the worst status; `report.py` is unchanged.
 | B | per listener, SUT `logit.input.messages.dropped{reason=malformed}` plus `logit.input.frames.dropped{reason=undecodable}` plus `logit.input.frames.dropped{reason=oversize}` (W8b): a line the decoder refused, a datagram it refused whole, and a line over `lines_in`'s `max_line_bytes`, which its decoder drops with a throttled diagnostic and no decoder error. Each is 0 on a listener with no such rule |
 | E | per listener, SUT `logit.component.events.sent{component=<sut_listener>}` |
 | X | per listener, SUT `logit.component.events.dropped{component=<sut_listener>}` under every reason (W7a): events the listener counted as sent and then dropped, such as a batch sent into the inbox of a node that has failed (`closed_consumer`) |
+| Y | on a scrape wire (W25), per listener, 3 × SUT `logit.input.scrapes{component=<sut_listener>}` under every class: the synthetic samples E counts and W leaves out; else 0 |
 | T_in[node], T_out[node] | with a source's `sut_transforms` (W8b), each node's `logit.component.events.received` and `logit.component.events.sent` |
 | T_disc[node] | each such node's `logit.component.events.discarded` (W13a), the events it received and sent no part of, which the runtime counts for every Transform node, only when nonzero, so an absent count is 0; ΣT_disc sums every node of every source |
 | M[node], T_ab[node] | at each `merge` node (W22), its `logit.transform.metrics.merged` and `logit.transform.metrics.absorbed`; M sums every `merge` node. Each merged record's increment reaches V inside its survivor, so every row after the node reads Ab + M where it reads Ab and ΣT_disc − M where it subtracts the discards. With one record per event, as a statsd line has, each merge empties its event, so T_disc[node] == M[node] |
