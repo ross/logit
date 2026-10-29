@@ -420,6 +420,9 @@ struct TrackedFile<D> {
     boundary_tail: Vec<u8>,
     /// The last marker [`Tailer::marker_of`] read back from the descriptor, with its offset.
     read_marker: Option<(u64, u64)>,
+    /// The last `(offset, marker)` a checkpoint persisted whose marker was taken, for a write
+    /// whose read-back fails ([`TrackedFile::checkpoint_position`]). Cleared on a truncation.
+    last_good: Option<(u64, u64)>,
     /// Whether [`sniff`] has found `head` to be text. Until it does, `read_one` emits nothing
     /// from the file. Cleared with `head` on a truncation, since the new content starts over.
     sniffed: bool,
@@ -472,6 +475,18 @@ impl<D> TrackedFile<D> {
             Some(marker(&self.boundary_tail))
         } else {
             self.read_marker.filter(|(cached, _)| *cached == at).map(|(_, hash)| hash)
+        }
+    }
+
+    /// The `(offset, marker)` a checkpoint persists: the persisted offset with its marker when
+    /// that's known, else the last position persisted with a known marker, else `0`, whose
+    /// marker is the empty one. Never an offset whose marker couldn't be taken: a restart would
+    /// reject it, replay the file, and count its unread bytes gone besides.
+    fn checkpoint_position(&self) -> (u64, u64) {
+        let offset = self.persisted_offset();
+        match self.known_marker(offset) {
+            Some(marker) => (offset, marker),
+            None => self.last_good.unwrap_or((0, marker(&[]))),
         }
     }
 }
@@ -1664,6 +1679,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         tracked.boundary_at = 0;
         tracked.boundary_tail.clear();
         tracked.read_marker = None;
+        tracked.last_good = None;
         // Discard, not emit, the held partial (or a stale `dropping`): it belongs to content
         // that's gone, and would otherwise be spliced onto, or swallow, the new first line. The
         // decoder gets the same reset for its own cross-line state (`docker_in`'s partial-entry
@@ -1913,6 +1929,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             window,
             boundary_at: offset,
             read_marker: None,
+            last_good: None,
             sniffed,
             draining_since: None,
             draining_scan: 0,
@@ -2298,11 +2315,11 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 // earlier of the two, so a rename back drops that line whole again. The head is
                 // checked again on re-selection, with the marker, since the file may be
                 // rewritten meanwhile.
-                let offset = tracked.persisted_offset();
-                let marker = match tracked.known_marker(offset) {
-                    Some(marker) => marker,
-                    None => read_marker(&mut tracked, offset, &mut self.diag).await,
-                };
+                let at = tracked.persisted_offset();
+                if tracked.known_marker(at).is_none() {
+                    read_marker(&mut tracked, at, &mut self.diag).await;
+                }
+                let (offset, marker) = tracked.checkpoint_position();
                 let retained = Retained {
                     path: tracked.path.clone(),
                     offset,
@@ -2401,9 +2418,15 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 }
             }
         }
+        for f in self.files.values_mut() {
+            let offset = f.persisted_offset();
+            if let Some(marker) = f.known_marker(offset) {
+                f.last_good = Some((offset, marker));
+            }
+        }
         let Some(checkpoint) = &mut self.checkpoint else { return };
         let tracked = self.files.values().map(|f| {
-            let offset = f.persisted_offset();
+            let (offset, marker) = f.checkpoint_position();
             // `offset` is a size observation too: the file held every byte read.
             let len = f.last_len.max(f.offset);
             Persisted {
@@ -2412,8 +2435,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 offset,
                 len,
                 head: Head::of(&f.head),
-                // Missing only after a failed read-back: the empty marker replays at a restart.
-                marker: f.known_marker(offset).unwrap_or_else(|| marker(&[])),
+                marker,
             }
         });
         // An entry not yet spent persists until `scan` prunes it: dropping it here would lose
@@ -2633,29 +2655,25 @@ fn probe(path: &Path, len: u64, candidates: &[Candidate<'_>]) -> std::io::Result
 
 /// Reads back the marker at `at` from `tracked`'s descriptor, for an offset
 /// [`TrackedFile::known_marker`] doesn't cover: the start of a line a `docker_in` decoder holds.
-/// Cached, so a file whose persisted offset stays put is read once. On an error, diagnosed
-/// `read_error`, it returns the empty marker, which a restart's check rejects, a replay rather
-/// than a skip.
-async fn read_marker<D>(tracked: &mut TrackedFile<D>, at: u64, diag: &mut Diagnostics) -> u64 {
+/// Cached in `TrackedFile::read_marker`, so a file whose persisted offset stays put is read
+/// once. An error is diagnosed `read_error` and caches nothing, so
+/// [`TrackedFile::checkpoint_position`] falls back to a position whose marker it has.
+async fn read_marker<D>(tracked: &mut TrackedFile<D>, at: u64, diag: &mut Diagnostics) {
     let n = at.min(HEAD_BYTES as u64);
     let mut buf = vec![0u8; n as usize];
+    let path = tracked.path.clone();
     let file = &mut tracked.file;
     let read = async {
         file.seek(std::io::SeekFrom::Start(at - n)).await?;
-        file.read_exact(&mut buf).await
+        logit_pipeline::fault_io!(READ, &path, 0, file.read_exact(&mut buf).await)
     }
     .await;
     // `read_one` reads from the cursor, so it goes back to the read offset whatever happened.
     let back = file.seek(std::io::SeekFrom::Start(tracked.offset)).await;
     match read.and(back.map(|_| ())) {
-        Ok(()) => {
-            let hash = marker(&buf);
-            tracked.read_marker = Some((at, hash));
-            hash
-        }
+        Ok(()) => tracked.read_marker = Some((at, marker(&buf))),
         Err(err) => {
             diag.warn_throttled("read_error", format!("{}: {err}", tracked.path.display()));
-            marker(&[])
         }
     }
 }
@@ -7332,6 +7350,48 @@ mod tests {
         assert_eq!(hand.pump().await.len(), 5, "read from 0");
         assert_eq!(hand.rejected(), 1.0);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A persisted offset whose marker can't be read back (`docker_in`'s held line, on a read
+    /// error) falls back to the last position persisted with a known marker, else to `0`, so the
+    /// restart replays from there with no rejected resume and no `gone` count.
+    #[tokio::test]
+    async fn a_failed_marker_read_back_persists_a_position_whose_marker_is_known() {
+        for checkpointed_first in [false, true] {
+            let dir = scratch_dir("marker-read-back");
+            let path = dir.join("app.log");
+            std::fs::write(&path, b"one\ntwo\n").unwrap();
+            let patterns = vec![PathPattern::new(&path)];
+            let config = checkpointed(&dir, ReadFrom::Beginning);
+            let mut hand = Hand::bind(patterns.clone(), LineFactory, config.clone()).await;
+            assert_eq!(hand.pump().await, vec!["one", "two"]);
+            if checkpointed_first {
+                hand.checkpoint().await;
+            }
+            // A held line from offset 4, as `docker_in` leaves one, whose bytes aren't in memory.
+            let id = id_of(&path);
+            hand.tailer.files.get_mut(&id).unwrap().held_from = Some(4);
+            let scope = fault::scope(&path);
+            scope.fail(READ, errno::EIO);
+            hand.checkpoint().await;
+            drop(scope);
+            let want = if checkpointed_first { 8 } else { 0 };
+            assert_eq!(
+                checkpointed_entry(&dir).0,
+                want,
+                "checkpointed first: {checkpointed_first}"
+            );
+            drop(hand);
+
+            let mut hand = Hand::bind(patterns, LineFactory, config).await;
+            let replay: Vec<String> =
+                if checkpointed_first { Vec::new() } else { vec!["one".into(), "two".into()] };
+            assert_eq!(hand.pump().await, replay);
+            assert_eq!(hand.rejected(), 0.0);
+            hand.checkpoint().await;
+            assert_eq!(gone_bytes(&mut hand.probe), 0.0);
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 
     /// A checkpoint taken with a line pending persists the line's start and the marker of the

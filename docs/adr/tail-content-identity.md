@@ -121,8 +121,9 @@ reviewer can check.
    file. Under `docker_in`, a held reassembly pins the persisted offset at the start of its oldest
    held line, which neither buffer covers, so a checkpoint write reads the 256 bytes there back
    from the open descriptor, once per distinct offset, and seeks back. A failed read-back is
-   diagnosed `read_error` and persists the empty marker, which a restart rejects: a replay, not a
-   skip. A resume by inode accepts iff the head
+   diagnosed `read_error`, and the checkpoint persists that file's last position whose marker it
+   took, else offset `0` with the empty marker, never an offset whose marker it couldn't take: a
+   restart resumes from there, a replay with no `resume_rejected` and no `gone` count. A resume by inode accepts iff the head
    matches, the marker matches, and the offset is at most the file's length; anything else is a
    `resume_rejected` and a start at `0`, as today. That closes the 256-byte residual: a recycled
    inode that shares the first 256 bytes now also has to share the 256 bytes before the offset. It
