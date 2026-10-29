@@ -38,7 +38,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
     names it.
   - A file whose inode a new file reused while `tail_in` was down is counted the same way: the
     new file's content rejects the entry, counted `logit.input.files.resume_rejected`, and if no
-    new file claims the entry by content, its unread bytes are counted gone ([ADR
+    new file matches the entry by content, its unread bytes are counted gone ([ADR
     `tail-content-identity`](../adr/tail-content-identity.md), decision 6).
 
   A pattern that also matches the rotated name (`app.log*`) avoids the loss for a rename, but not

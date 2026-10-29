@@ -195,11 +195,11 @@ reviewer can check.
    The 64-byte floor is Filebeat's minimum fingerprint size. A shorter head is too likely to be a
    timestamp prefix or header that unrelated files share.
 
-6. **A rejected entry nothing claims is counted as gone.** A checkpoint entry its inode's content
-   rejected, and that no new file matches by content by the end of that scan, counts its recorded
-   unread bytes as `logit.input.bytes.dropped{reason="gone"}` with a `file_gone` diagnostic. It goes
-   through the path a pruned entry already takes, counted only once a checkpoint write without the
-   entry lands ([ADR
+6. **A rejected entry no new file matches is counted as gone.** A checkpoint entry its inode's
+   content rejected, and that no new file matches by content by the end of that scan, counts its
+   recorded unread bytes as `logit.input.bytes.dropped{reason="gone"}` with a `file_gone`
+   diagnostic. It goes through the path a pruned entry already takes, counted only once a checkpoint
+   write without the entry lands ([ADR
    `tail-discovery-failure-and-resume-identity`](tail-discovery-failure-and-resume-identity.md)'s
    2026-10-18 amendment). An entry a new file matched without claiming it (an ambiguous match,
    decision 5) isn't counted: the code starts every file that matched a rejected entry ambiguously
@@ -293,12 +293,17 @@ reviewer can check.
     have without a claim; one that matched a rejected entry ambiguously starts at `0` whatever
     `read_from` says (decision 6).
   - A file opened empty whose bytes, once written, match or may grow into a truncated or tracked
-    file's candidate is read only after the next scan's claim pass decides it, up to one
-    `poll_interval` later. One that matches nothing is read at once.
-  - A restored file that first appears empty and then fills is read from `0`, not claimed: the
-    check a drain makes before its first read sees only truncated and tracked files' candidates,
-    not an unspent checkpoint entry whose inode is gone, and the scan that later finds the file
-    holding bytes has already pruned that entry.
+    file's candidate is read only after a scan's claim pass decides it: up to one
+    `poll_interval` later, and up to `CLAIM_DEFER_SCANS` (2) more scans when that pass defers
+    it, for a match that may still grow or a tracked file's match found before a truncation.
+    One that matches nothing is read at once.
+  - A restored file that first appears empty and then fills is read from `0`, not claimed, and
+    its entry's unread bytes are also counted `bytes.dropped{reason="gone"}`: the scan that
+    opened the file empty pruned the entry, since no inode it found matched it, and the check a
+    drain makes before its first read sees only truncated and tracked files' candidates. So the
+    bytes are both replayed and counted gone. Keeping the entry while a file at its path is open
+    and empty would need the drain-time check to carry checkpoint entries and pruning to depend
+    on another inode's read state, mirrored in the model, so it stays a counted residual.
   - A rejected entry whose head is under 64 bytes is no candidate, so a copy that delivers its
     bytes from `0` can't be told from a file that's gone, and the entry is still counted
     `bytes.dropped{reason="gone"}` (decision 6).
@@ -318,7 +323,7 @@ reviewer can check.
   and `docs/known-gaps/tailing.md` no longer lists the wildcard `copytruncate` replay, the
   256-byte residual, or the `(dev, ino)` migration.
 - **`tailid/w1`** implements decisions 2 and 7: the compressed skip and the truncation count.
-- **`tailid/w2`** implements decisions 4, 5, and 6: the format 4 offset marker, the content
-  claim, and gone counting for a rejected entry nothing claims, and narrows decision 7's counts on
-  a claim to what the copy lacks. `crates/logit-inputs/src/tail/driver.rs`'s `Tailer::claim_unmatched` and
-  `crates/logit-inputs/src/tail/checkpoint.rs`'s module doc are the code's statement of both.
+- **`tailid/w2`** implements decisions 4, 5, and 6: the format 4 offset marker, the content claim,
+  and gone counting for a rejected entry no new file matches, and narrows decision 7's counts on a
+  claim to what the copy lacks. `crates/logit-inputs/src/tail/driver.rs`'s `Tailer::claim_unmatched`
+  and `crates/logit-inputs/src/tail/checkpoint.rs`'s module doc are the code's statement of both.

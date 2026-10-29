@@ -7763,8 +7763,8 @@ mod tests {
         }
     }
 
-    /// An entry its own inode rejects and nothing claims is a file that's gone: its unread bytes
-    /// are counted once a checkpoint write without it lands.
+    /// An entry its own inode rejects and no new file matches is a file that's gone: its unread
+    /// bytes are counted once a checkpoint write without it lands.
     #[tokio::test]
     async fn a_rejected_entry_nothing_claims_counts_its_unread_bytes_gone() {
         let dir = scratch_dir("claim-rejected-gone");

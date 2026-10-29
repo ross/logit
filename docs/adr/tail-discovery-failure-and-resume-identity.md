@@ -386,7 +386,7 @@ lost lines that no telemetry showed. That breaks the loss vocabulary's rule that
 at its offset, in checkpoint format 4, and a resume by inode needs it to match as well as the
 head. That closes the 256-byte residual. A newly discovered inode no entry matches may claim an
 unclaimed entry, or a file tracked in this process, by head and marker. An entry its inode's
-content rejected and nothing claims counts its unread bytes as `bytes.dropped{reason="gone"}`,
+content rejected and no new file matches counts its unread bytes as `bytes.dropped{reason="gone"}`,
 which changes the table's reused-inode row from "nothing" to a count. `tailid/w2` implements
 these.
 
