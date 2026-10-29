@@ -200,9 +200,12 @@ reviewer can check.
    the operator needs is to know it happened, not the exact count. The tailer doesn't search for
    the copy outside its patterns. `docs/deploying.md` steers to rename rotation, and, under
    `copytruncate`, to a pattern that matches the rotated names. A claim of the truncated file's
-   pre-truncation state (decision 5) cancels this count and the discarded line's
+   pre-truncation state (decision 5) cancels the discarded line's
    `logit.input.frames.dropped{reason="truncated"}`, because the copy then resumes where the
-   original stopped. So that neither is counted and then retracted, both wait: they're recorded at
+   original stopped and holds the line whole. Of the bytes count it keeps only what the copy
+   lacks: the last size the tailer saw less the larger of the copy's length and the
+   pre-truncation read offset, when that's positive, since those bytes are in neither file. So
+   that neither is counted and then retracted, both wait: they're recorded at
    the end of the first scan after the truncation whose listing failed nowhere and no waiting
    inode could still claim the state, or at a stop. A truncated file whose head is under 64 bytes
    can't be claimed, so its counts are recorded at once. `logit.input.files.truncated` and the
@@ -261,8 +264,10 @@ reviewer can check.
   decision 2).
 - **What a claim still duplicates or loses.** Each is a decided limit:
   - Under `copytruncate`, the bytes the writer appends after the copy and before the truncate are
-    in neither file. The original reads them only if a read lands in that window; otherwise the
-    claim cancels the count that would have reported them, so they're lost uncounted.
+    in neither file. The original reads them only if a read lands in that window. Those a size
+    observation saw are counted `bytes.dropped{reason="truncated"}` when the copy claims
+    (decision 7); those written after the last observation are lost uncounted, the same floor as
+    an exact pattern's.
   - A copy shorter than what the tailer read from the original (the original read appends the
     copy missed) can't claim, and once its wait runs out it's read from `0`, duplicating the
     original's lines.
@@ -284,6 +289,6 @@ reviewer can check.
   256-byte residual, or the `(dev, ino)` migration.
 - **`tailid/w1`** implements decisions 2 and 7: the compressed skip and the truncation count.
 - **`tailid/w2`** implements decisions 4, 5, and 6: the format 4 offset marker, the content
-  claim, and gone counting for a rejected entry nothing claims, and cancels decision 7's count on
-  a claim. `crates/logit-inputs/src/tail/driver.rs`'s `Tailer::claim_unmatched` and
+  claim, and gone counting for a rejected entry nothing claims, and narrows decision 7's counts on
+  a claim to what the copy lacks. `crates/logit-inputs/src/tail/driver.rs`'s `Tailer::claim_unmatched` and
   `crates/logit-inputs/src/tail/checkpoint.rs`'s module doc are the code's statement of both.

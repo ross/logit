@@ -252,6 +252,8 @@ enum Start {
 #[derive(Debug)]
 struct MTruncation {
     candidate: Option<Cand>,
+    /// The read offset before the truncation.
+    read_offset: u64,
     unread: u64,
     offered: bool,
     pinned: bool,
@@ -512,6 +514,7 @@ impl Model {
             marker: tail_at(&t.seen, boundary),
             min_len: t.offset,
         });
+        let read_offset = t.offset;
         t.last_len = len;
         t.offset = 0;
         t.line.clear();
@@ -521,7 +524,13 @@ impl Model {
         t.seen.clear();
         self.counts.truncated += 1;
         if candidate.is_some() {
-            self.truncations.push(MTruncation { candidate, unread, offered: false, pinned: false });
+            self.truncations.push(MTruncation {
+                candidate,
+                read_offset,
+                unread,
+                offered: false,
+                pinned: false,
+            });
         } else {
             self.counts.truncated_bytes += unread;
         }
@@ -699,7 +708,7 @@ impl Model {
                 Start::Plain => self.open(path, inode, None),
                 Start::Claim(offset, from) => {
                     self.open(path, inode, Some(offset));
-                    taken.push(from);
+                    taken.push((from, self.inodes[inode].content.len() as u64));
                 }
             }
         }
@@ -876,15 +885,22 @@ impl Model {
     }
 
     /// Spends what this scan's claims took.
-    fn settle(&mut self, taken: &[From]) {
+    /// A claimed truncation counts what the copy lacks of what the original was last seen to
+    /// hold.
+    fn settle(&mut self, taken: &[(From, u64)]) {
         self.counts.claimed += taken.len() as u64;
         let mut truncated = Vec::new();
-        for from in taken {
-            match *from {
+        for &(from, len) in taken {
+            match from {
                 From::Orphan(id) => {
                     self.resume.remove(&id);
                 }
-                From::Truncated(ix) => truncated.push(ix),
+                From::Truncated(ix) => {
+                    let t = &self.truncations[ix];
+                    self.counts.truncated_bytes +=
+                        (t.read_offset + t.unread).saturating_sub(len.max(t.read_offset));
+                    truncated.push(ix);
+                }
                 From::Rejected(_) | From::Live => {}
             }
         }

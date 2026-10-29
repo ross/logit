@@ -1001,8 +1001,8 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             if let (Some(StartOffset::Claim(offset, ..)), Some(from)) = (start, from) {
                 // The open re-reads what the probe read; a file that changed in between starts
                 // at `0` instead, and claims nothing.
-                if self.files.get(&id).is_some_and(|f| f.offset == offset) {
-                    taken.push(from);
+                if let Some(f) = self.files.get(&id).filter(|f| f.offset == offset) {
+                    taken.push((from, f.last_len.max(meta.len())));
                 }
             }
         }
@@ -1234,25 +1234,39 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         out
     }
 
-    /// Spends each candidate a new inode claimed in this scan, then counts each rejected entry
-    /// nothing claimed as gone (`docs/adr/tail-content-identity.md`, decision 6). A claimed
-    /// checkpoint entry, rejected or not, leaves the checkpoint, and a claimed truncation's
-    /// counts are never emitted: the copy resumes where the original stopped.
-    fn settle_claims(&mut self, taken: &[ClaimFrom]) {
+    /// Spends each candidate a new inode claimed in this scan, given with the claimant's length,
+    /// then counts each rejected entry nothing claimed as gone
+    /// (`docs/adr/tail-content-identity.md`, decision 6). A claimed checkpoint entry, rejected or
+    /// not, leaves the checkpoint. A claimed truncation's discarded line isn't counted, since the
+    /// copy resumes at its start, but the bytes the original was last seen to hold past the
+    /// copy's end are: they're in neither file.
+    fn settle_claims(&mut self, taken: &[(ClaimFrom, u64)]) {
         if !taken.is_empty() {
             self.telemetry.count("logit.input.files.claimed", taken.len() as f64, &[]);
         }
         let mut truncated = Vec::new();
         let mut rejected_taken = HashSet::new();
-        for from in taken {
-            match *from {
+        for &(from, len) in taken {
+            match from {
                 ClaimFrom::Orphan(id) => {
                     self.resume.remove(&id);
                 }
                 ClaimFrom::Rejected(ix) => {
                     rejected_taken.insert(ix);
                 }
-                ClaimFrom::Truncated(ix) => truncated.push(ix),
+                ClaimFrom::Truncated(ix) => {
+                    let t = &self.truncations[ix];
+                    // A claim needs `len >= read_offset`, so this is what the copy lacks.
+                    let lost = (t.read_offset + t.unread).saturating_sub(len.max(t.read_offset));
+                    if lost > 0 {
+                        self.telemetry.count(
+                            "logit.input.bytes.dropped",
+                            lost as f64,
+                            &[("reason", "truncated")],
+                        );
+                    }
+                    truncated.push(ix);
+                }
                 ClaimFrom::Live(_) => {}
             }
         }
@@ -1651,7 +1665,8 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     /// truncation (its head, its line boundary, and the marker there) waits in
     /// `Tailer::truncations` for a copy to claim ([`Tailer::claim_unmatched`]). A claim resumes
     /// the copy at that boundary, so the copy delivers the unterminated line whole and whatever
-    /// the original never read, and neither count is emitted. A scan that finds no claimant
+    /// the copy holds of what the original never read, and only the bytes past the copy's end
+    /// are counted ([`Tailer::settle_claims`]). A scan that finds no claimant
     /// counts both ([`Tailer::count_truncations`]): a copy made before the truncate is listable by
     /// any scan after the truncation is seen. A state no copy can claim (a head under
     /// [`CLAIM_MIN_HEAD`], or no known marker at the boundary) is counted at once.
@@ -7043,6 +7058,34 @@ mod tests {
         assert_eq!(probe.sum("logit.input.files.claimed", &[]), 0.0);
         assert_eq!(read_out(&mut tailer).await, vec![one, two], "the copy replays");
         assert_eq!(truncated_drops(&mut probe), (0.0, 1.0), "the discarded line is counted");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Bytes a scan saw appended after the copy and before the truncate are in neither file: a
+    /// copy that claims the truncated state counts them, though its claim cancels the discarded
+    /// line's count.
+    #[tokio::test]
+    async fn a_claimed_truncation_counts_the_bytes_the_copy_lacks() {
+        let dir = scratch_dir("claim-lost");
+        let (path, copy) = (dir.join("app.log"), dir.join("app.log.1"));
+        let (one, two, three) = (long_line("one"), long_line("two"), long_line("three"));
+        std::fs::write(&path, format!("{one}\n{two}\n")).unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(
+            vec![PathPattern::new(dir.join("app.log*"))],
+            ReadFrom::Beginning,
+            &probe,
+        );
+        assert_eq!(tick(&mut tailer, true).await, vec![one, two]);
+        std::fs::copy(&path, &copy).unwrap();
+        append(&path, format!("{three}\n").as_bytes());
+        // Sees the appended bytes and defers the copy, which matches the live original.
+        scan_in_order(&mut tailer, &[path.clone(), copy.clone()]).await;
+        truncate(&path);
+        scan_in_order(&mut tailer, &[path.clone(), copy.clone()]).await;
+        assert_eq!(probe.sum("logit.input.files.claimed", &[]), 1.0);
+        assert!(read_out(&mut tailer).await.is_empty(), "nothing replays");
+        assert_eq!(truncated_drops(&mut probe), (three.len() as f64 + 1.0, 0.0));
         std::fs::remove_dir_all(&dir).ok();
     }
 
