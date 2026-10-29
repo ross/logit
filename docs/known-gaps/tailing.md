@@ -15,13 +15,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
   a volume moved to different storage, or a bind mount re-created from a snapshot resumes from the
   beginning instead of the checkpointed offset. That's safe (at-least-once still holds), but not
   the seamless resume of the common case.
-- **The tail checkpoint is at-least-once only up to the downstream in-memory queues.** Shutdown
-  flushes every file's accumulator, then force-writes the checkpoint, so the offset covers every
-  line flushed into a sink's inbox. A sink that then drops that batch when its own grace runs out
-  (`logit.component.batches.dropped{reason="shutdown"}`) loses it for good, because the restart
-  resumes past it. A `buffer.disk:` sink spools the batch instead. See [ADR
-  `file-tailing-and-docker-json-logs`](../adr/file-tailing-and-docker-json-logs.md)'s 2026-09-26
-  amendment.
 - **The tail driver notices shutdown only between two files' reads.** One read is at most 64 KiB
   (`READ_CHUNK_BYTES`), but the driver emits its lines before the next check, and each `emit`
   waits on the downstream. Against a slow or stalled downstream, `run_input`'s grace backstop can

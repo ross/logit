@@ -289,7 +289,9 @@ rule no longer applies to them, and a failed request's own class is the batch's.
 
 `tail_in` and `docker_in` checkpoint an offset once its lines are acknowledged as item 3
 defines it. A crash replays the lines since the last checkpoint and loses the checkpointed
-lines that were still in memory. Two records decide the details:
+lines that were still in memory, as does a sink that drops a batch at its shutdown grace; a
+`buffer.disk:` sink spools them ([ADR `tail-content-identity`](tail-content-identity.md),
+decision 1). Two records decide the details:
 [ADR `file-tailing-and-docker-json-logs`](file-tailing-and-docker-json-logs.md) and
 [ADR `tail-discovery-failure-and-resume-identity`](tail-discovery-failure-and-resume-identity.md).
 

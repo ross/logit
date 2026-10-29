@@ -1,6 +1,6 @@
 ---
 created: 2026-09-28
-updated: 2026-10-18
+updated: 2026-10-29
 ---
 
 # Tail discovery failure and resume identity: a failed listing is no information, and a resume verifies the file's head
@@ -103,9 +103,12 @@ the fault seam extended to reads. Each numbered item is one decision a reviewer 
    other pattern, and a removed file under a healthy pattern would stay open for as long as
    the other directory failed.
 
-2. **Resume identity is `(dev, ino)` plus a head fingerprint.** `TrackedFile` holds the file's
-   first `min(256, offset)` bytes and clears them on a truncation. A checkpoint entry and a
-   de-selection retention carry `head_len` (at most 256) and `head_hash`, XXH64 with seed 0
+2. **Resume identity is `(dev, ino)` plus a head fingerprint.** [Amended by [ADR
+   `tail-content-identity`](tail-content-identity.md), decisions 4 and 5, which `tailid/w2`
+   implements: a resume also checks an offset marker, and an inode no entry matches may claim one
+   by content.] `TrackedFile` holds
+   the file's first `min(256, offset)` bytes and clears them on a truncation. A checkpoint entry
+   and a de-selection retention carry `head_len` (at most 256) and `head_hash`, XXH64 with seed 0
    (`twox-hash`, already pinned in the workspace) over those bytes.
 
    - **Where the head comes from.** A file opened at `0` captures its head as the tailer reads
@@ -140,15 +143,18 @@ the fault seam extended to reads. Each numbered item is one decision a reviewer 
      `file-tailing-and-docker-json-logs`](file-tailing-and-docker-json-logs.md)'s "Rotation and
      truncation" section). A path-must-match rule would replay it.
 
-3. **Checkpoint format version 2, with no version 1 reader.** An entry's fields are `dev`, `ino`,
-   `path`, `offset`, `head_len`, and `head_hash`, and `CHECKPOINT_VERSION` becomes `2`. The hash
-   and `HEAD_BYTES` (256) are part of the format: changing either is a version bump. The loader
-   probes the version before the full parse, so a version 1 file reads as "unsupported version
-   1", not "malformed"; a `head_len` over 256 is malformed. Either is `Loaded::Unusable`: every
-   file present at the first scan replays from `0`, the path the 2026-09-24 amendment defines,
-   counted `logit.input.checkpoint.errors{op="load"}`. Logit is pre-release, so no version 1
-   reader is kept, and upgrading replays every file once. The in-memory `resume` becomes a map
-   from `FileId` to `Retained { path, offset, head, source }`, where `source` is `Checkpoint` or
+3. **Checkpoint format version 2, with no version 1 reader.** [Superseded by format 3 in the
+   2026-10-18 amendment below, and by format 4 in [ADR
+   `tail-content-identity`](tail-content-identity.md), decision 4, once `tailid/w2` lands.] An
+   entry's fields are `dev`, `ino`, `path`, `offset`, `head_len`, and `head_hash`, and
+   `CHECKPOINT_VERSION` becomes `2`. The hash and `HEAD_BYTES` (256) are part of the format:
+   changing either is a version bump. The loader probes the version before the full parse, so a
+   version 1 file reads as "unsupported version 1", not "malformed"; a `head_len` over 256 is
+   malformed. Either is `Loaded::Unusable`: every file present at the first scan replays from
+   `0`, the path the 2026-09-24 amendment defines, counted
+   `logit.input.checkpoint.errors{op="load"}`. Logit is pre-release, so no version 1 reader is
+   kept, and upgrading replays every file once. The in-memory `resume` becomes a map from
+   `FileId` to `Retained { path, offset, head, source }`, where `source` is `Checkpoint` or
    `Deselected`.
 
 4. **Eviction is per entry.** A retained entry lives only as long as something can still
@@ -368,6 +374,17 @@ lost lines that no telemetry showed. That breaks the loss vocabulary's rule that
   last write, so the count would still miss what came after it. A format 2 reader that read a missing
   `len` as the offset would count nothing for those entries, which is today's behavior, at the
   cost of a second decode path pre-release.
+
+## Amendment (2026-10-29): an offset marker, a content claim, and counting a rejected entry
+
+[ADR `tail-content-identity`](tail-content-identity.md) amends decisions 2 and 3 and the
+2026-10-18 amendment. A checkpoint entry gains a marker, the XXH64 of the up to 256 bytes ending
+at its offset, in checkpoint format 4, and a resume by inode needs it to match as well as the
+head. That closes the 256-byte residual. A newly discovered inode no entry matches may claim an
+unclaimed entry, or a file tracked in this process, by head and marker. An entry its inode's
+content rejected and nothing claims counts its unread bytes as `bytes.dropped{reason="gone"}`,
+which changes the table's reused-inode row from "nothing" to a count. `tailid/w2` implements
+these; until it lands, this record describes the code.
 
 ## Running it
 

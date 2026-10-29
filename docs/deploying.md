@@ -1127,7 +1127,10 @@ An in-memory queue is lost on a restart, a `SIGKILL`, or a shutdown grace that e
 To keep it, add a `buffer.disk:` block, which replaces that sink's queue with a crash-recoverable
 spool on disk ([ADR `disk-backed-sink-buffer`](adr/disk-backed-sink-buffer.md)). A restart resumes
 delivery from the last persisted read cursor and replays at most the batches committed since the
-last checkpoint: at-least-once, the same trade `tail_in`'s checkpoint makes.
+last checkpoint: at-least-once, the same trade `tail_in`'s checkpoint makes. A `tail_in` or
+`docker_in` upstream needs one on each of its sinks to survive a restart without loss, because its
+checkpoint covers only what reached a sink's inbox (see
+[Tailing files and Docker logs](#tailing-files-and-docker-logs)).
 
 **A crash replays a window, under either posture.** After a crash, the spool replays the batches
 that were in flight and every batch committed since the last cursor write. The cursor is written
@@ -2537,6 +2540,16 @@ tracked files, and a pass reads at most 64 KiB per file, so a crash then replays
 `checkpoint_interval` or one 64 KiB chunk per file, whichever is more. This is a deliberate
 at-least-once boundary, the same trade `buffer:`'s sink-side retry makes: it bounds how much a
 crash can replay, and replay is always safe.
+
+**A tail source whose restart must not lose lines needs a `buffer.disk:` sink.** The checkpoint
+covers the lines handed to a sink's inbox, not the lines a sink delivered. A sink with an
+in-memory queue that's still holding them when its `buffer.shutdown_grace` runs out drops them,
+counted `logit.component.batches.dropped{reason="shutdown"}`, and the restart resumes past
+them. A crash loses the queue too, with every line in it that the last checkpoint covers. Give
+every sink downstream of the tail source a `buffer.disk:` block (see
+[Durable buffering](#durable-buffering)): its spool keeps the batches across the restart. `logit` doesn't hold the checkpoint back until a
+sink delivers, because a stage such as `aggregate` emits batches that match no input batch
+([ADR `tail-content-identity`](adr/tail-content-identity.md), decision 1).
 
 **A file gone at a restart is counted as far as the checkpoint knew.** Each checkpoint entry
 records the file's length as `tail_in` last saw it. If a restart finds an entry's file under no
