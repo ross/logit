@@ -1,6 +1,6 @@
 ---
 created: 2026-10-08
-updated: 2026-10-25
+updated: 2026-10-29
 ---
 
 # Enabling plan: a soak harness — faults on a timeline, a watchdog, and a loss ledger
@@ -36,7 +36,8 @@ Non-goals:
 Stream key **`soak`**: branches `soak/w0`, `soak/w1a`, `soak/w1b`, then `soak/w2` through
 `soak/w12d`, a linear stack. After it come `soak/w13a`, `soak/w16`, and `soak/w17`, which each
 branch off `main`, `soak/w14`, `soak/w13b`, and `soak/w15`, stacked in that order, and
-`soak/w18`, which branches off `main` after W14 merged. PR stack only: nothing is
+`soak/w18`, which branches off `main` after W14 merged. A third round, `soak/w21` through
+`soak/w29`, is a linear stack off `main` (§10's items 19 to 26). PR stack only: nothing is
 merged by this workstream; Ross directs merging.
 
 Settled with Ross (2026-10-08): faults are an iproute2 image with `NET_ADMIN` applying `tc netem`
@@ -2293,7 +2294,7 @@ where it needs them, and a small check extension.
    `logit.internal.spans.dropped{reason="buffer_full"}` and a killed life's last drain interval
    of spans.
 8. **TCP ingress (built in W11a).** `statsd_in` with `transport: tcp` from the generator's
-   `statsd_out` over TCP; a `syslog_in` TCP source and a TCP reset counter are deferred. A
+   `statsd_out` over TCP; a `syslog_in` TCP source is item 24, and a TCP reset counter item 23. A
    stalled SUT backs up into the sender
    ([ADR `syslog-tcp-ingress-and-tls`](../adr/syslog-tcp-ingress-and-tls.md), "No receive queue on
    TCP -- the connection itself is the backpressure"): the SUT's kernel keeps ACKing until its
@@ -2466,8 +2467,8 @@ where it needs them, and a small check extension.
     Rows: `ledger.wire` with the surplus allowance, `ledger.intake` with `influxdb_in`'s request
     identities, `ledger.summary`'s end-to-end bound, and `[[expect]]` on deferred batches and
     the generator's `5xx` answers during the backend stop and its transport errors under the
-    delay. `datadog_in`, `splunk_hec_in`, and `prometheus_in`'s remote-write receiver come
-    later.
+    delay. `datadog_in`, `splunk_hec_in`, and `prometheus_in`'s remote-write receiver are item
+    21, and `prometheus_in`'s scrape is item 22.
 15. **Multi-destination `route` and `route_signals` (81b0befa, 4b86ccc7), built in W15.**
     `scenario.py`'s `_route_problems` refuses a list-valued `routes:` and any `route_signals`
     under `split = "route"`, because one event can reach several sinks and their V no longer
@@ -2549,11 +2550,174 @@ where it needs them, and a small check extension.
       and the restart then counts `resume_rejected` correctly, so the scenario drops
       `tail-rotate`'s expectation of none.
 
+**Round three.** Items 19 to 26, planned in W21 (2026-10-29), cover the transforms the ledger
+doesn't follow yet, SUT sinks that haven't run into a real receiver or a stand-in, and SUT inputs
+the ledger has no wire for. Ross decided four calls: the TCP reset counter is a product
+change ahead of the syslog scenario (item 23); a SUT restart and a staleness eviction under
+`cumulative_to_delta` are reported, not judged (item 20); AGENTS.md's response-class invariant
+names `otlp_out` and `splunk_hec_out` once their stand-ins land (item 26); and the follow-ups
+under "Deferred to a later round" wait.
+
+19. **Discarding and merging transforms (W22).** `sut_transforms` today holds nodes that send
+    an event or count it `events.discarded`, judged T_in − T_disc == T_out with ΣT_disc taken
+    out downstream (item 13); `fan_out` is for `line_protocol` alone, and no tracked node sits
+    between `aggregate` and the sink, whose only identity there is `A_sent == S_in[sink]`. Three
+    scenarios:
+    - `sample-path`: `statsd_in → sample (key: {attribute: shard}, rate: 0.5) → aggregate →
+      prometheus_out`. Its discards fit item 13's rule with no harness change. Rows:
+      `[[expect]]` that `logit.transform.sample.decisions`, kept plus discarded, equals the
+      node's `events.received`, and that the keyed verdict holds across SUT restarts: each life
+      keeps the same shards, and a per-shard VictoriaMetrics selector shows the discarded shards
+      never appear.
+    - `dedup-merge`: a generator whose `{seq%N}`, N below the batch size, makes delta sums
+      collide within a batch, since `generate_in` stamps every event of a batch with one `now`.
+      Open: whether `statsd_in`'s decode keeps a timestamp the collision needs; if it doesn't,
+      the scenario feeds the SUT another way. The harness gains a **merge term**: at a
+      `dedup_timestamps` node, `events.discarded` equal to `logit.transform.metrics.merged` is
+      value-preserving for delta sums, so the rows after it don't subtract it, and
+      `logit.transform.metrics.absorbed` (a superseded gauge or cumulative reading) must stay
+      at 0. The node goes before `aggregate`, though a real config puts it before a sink, because
+      the ledger tracks no node after `aggregate`.
+    - `cardinality-capped`: tag values churning under a fixed set of names, with
+      `max_series_per_metric` set. New names would escape the cap, which bounds series per
+      name. An overflow series absorbs what passes the limit (`metrics.overflowed`, never
+      dropped), and `vm_selector` still matches it, so the ledger stays exact. The claim under
+      test is `[expected] rss_slope` PASS on the SUT, the positive control to item 6's
+      `cardinality`; if interning attribute values grows RSS anyway, that's the finding. Rows:
+      `[[expect]]` on `logit.transform.metrics.overflowed` above 0, the
+      `logit.transform.metrics.overflowing` gauge, a bounded maximum of
+      `logit.transform.series.active`, and `logit.transform.metrics.dropped{reason="series_limit"}`
+      at 0.
+
+    `aggregate`'s `max_series` admission drops, `metrics.dropped{reason="series_limit"}`, are
+    loss, so a fourth scenario driving them is optional and lands only if it's cheap.
+20. **`cumulative_to_delta` (W23).** Generator `generate_in → aggregate (temporality:
+    cumulative) → otlp_out`; SUT `otlp_in → cumulative_to_delta (initial_value: auto) →
+    datadog_out` into the Datadog-shaped stand-in (§8c). Datadog is the transform's motivating
+    destination: `datadog_out` drops a cumulative kind. The harness gains a **value ledger** row:
+    V, the sum of the delta points the stand-in stored, against the generator's increments,
+    `generate_in`'s events sent less the generator's counted drops. The point-count rows judge
+    in points as today.
+    - Judged exact: a generator restart (`logit.transform.series.reset{cause="restarted"}` or
+      `"decrease"`, the point emitted whole), netem, the stand-in's cued faults, and resends,
+      which `logit.transform.metrics.skipped{reason="duplicate"|"out_of_order"}` makes
+      idempotent.
+    - Reported, not judged (decided with Ross): a SUT restart and a staleness eviction, each
+      inside its window. The transform's state is in memory, and `auto` skips a point whose
+      start precedes the component's own, so no counter gives the skipped first point's value.
+      `[[expect]]` rows assert that `skipped{reason="initial"}` after a SUT restart equals the
+      series the transform tracked (`logit.transform.series.tracked`), and that
+      `logit.transform.series.evicted{reason="idle"}` counts after a generator pause longer than
+      a short `max_staleness`; the row reports the value gap.
+    - A delta resent downstream counts twice: `datadog_out` isn't duplicate-safe, and the
+      stand-in's `datadog` shape already counts each distinct copy once and reports duplicates
+      per life.
+21. **More HTTP listeners (W24).** Item 14's `http` wire for three more listeners, each a
+    scenario:
+    - `splunk-hec-ingress`: generator `splunk_hec_out` with `ack: true` → SUT `splunk_hec_in`.
+      Busy is a `503` code 9, each batch of the body counted `deferred`; once the first batch
+      delivers, the rest wait with no deadline. A SUT restart loses the in-memory ack ledger, so
+      the sink polls `false` until its 30 s `ack_timeout` and then resends the body whole; that's
+      inferred from the code, untested, and the scenario verifies it. Surplus allowance: one
+      batch per `logit.output.acks{result="timeout"}`. Listener rows on
+      `logit.input.acks.issued`, `logit.input.acks.polled{result}`, and
+      `logit.input.acks.evicted{reason}`.
+    - `datadog-ingress`: generator `datadog_out` sending series → SUT `datadog_in`. A series
+      request is one batch, answered `503` after the listener's 5 s `BUSY_AFTER`, which
+      `datadog_out` reads as `Ambiguous`. A `503` partway through a multi-batch body happens on
+      traces and stats only, out of scope here.
+    - `rw-ingress`: generator `prometheus_out` sending remote-write → SUT `prometheus_in` on
+      `bind:`. The receiver never answers busy: backpressure delays the `204`, and the sender's
+      10 s timeout is `Ambiguous` and resends. Rows on `logit.input.writes{class}` and
+      `logit.input.samples`. A 1.0 sender sends metadata in separate requests, so the SUT sets
+      `metadata_cache:` or the generator sends `version: 2`.
+
+    Harness: `LISTENER_WIRES` entries, an `HTTP_LISTENERS` row per listener with its busy and
+    closed-consumer identity, and `splunk_hec_out`, `datadog_out`, and `prometheus_out` in
+    `HTTP_WRITER_KINDS`.
+22. **`prometheus_in`'s scrape (W25).** Generator `generate_in → aggregate (temporality:
+    cumulative) → prometheus_out` exposing on `bind:`; SUT `prometheus_in` with
+    `scrape_targets:` → `prometheus_out` remote-write → VictoriaMetrics. The harness gains a
+    pull **`scrape` wire**: G is the generator's final cumulative total per series per generator
+    life, read from its `aggregate`, not a message count, and the only loss is intermediate
+    values, since a failed or timed-out scrape loses nothing from a cumulative series. W and
+    `vm_selector` leave out the three series each scrape adds, `up`,
+    `scrape_duration_seconds`, and `scrape_samples_scraped`. A generator kill loses the
+    increments after its last scrape, a band of one scrape `interval` of increments per kill.
+    Faults: a generator partition, kept shorter than the exposition's 5-minute `expire_after`;
+    a generator kill, whose counter reset `prometheus_in` passes on and VictoriaMetrics' totals
+    absorb; and a generator slowed past the scrape `timeout`. Rows: `[[expect]]` on
+    `logit.input.scrapes{class}`.
+23. **A TCP reset counter (W26, product, decided with Ross).** A reset after a stream
+    connection's first byte is only a throttled `connection_error` diagnostic today, and one
+    before it is silent (`docs/design/internal-telemetry.md`'s `connection_error` key). W26 adds
+    a counter on the shared TCP driver, `crates/logit-inputs/src/tcp.rs`, such as a
+    `reason="reset"` on `logit.input.connections.closed`, named against
+    [internal-telemetry.md](../design/internal-telemetry.md)'s loss vocabulary. It isn't
+    `*.dropped`: a partial frame lost to a reset is already
+    `logit.input.frames.dropped{reason="truncated"}`. Its own PR, ahead of item 24, which
+    asserts on it; it updates `internal-telemetry.md` and item 8.
+24. **`syslog_in` over TCP and TLS (W27).** Generator `syslog_out` over TCP, then over TLS from
+    the run's private CA (item 12's `[tls]` table and `rotate` action) → SUT `syslog_in`
+    (`transport: tcp`) → `kv` → `kv_metrics` → `aggregate`, on the `tcp` wire, framed by octet
+    counting, `syslog_out`'s TCP form. Faults: SUT stop, kill, and partition, and a certificate
+    rotation. Rows: item 8's, and `[[expect]]` on item 23's reset counter. W27 also writes a
+    `docs/known-gaps/sinks.md` entry, after checking no other gap file has one: a TCP stream sink
+    counts a frame delivered once the kernel accepts it, so the bytes in the sender's send
+    buffer or the receiver's receive buffer when the receiver is killed are lost uncounted;
+    `tcp-ingress` reported about 9.8k lines on one kill.
+25. **SUT sinks into real receivers (W28).** Three scenarios, each with an `aggregate` under
+    `temporality: cumulative` so VictoriaMetrics' reset-aware V applies:
+    - `graphite-egress`: SUT `graphite_out`, TCP plaintext, → VictoriaMetrics' Graphite
+      listener, which a compose override turns on with `-graphiteListenAddr`. `vm_selector`
+      must match the names after Graphite's mangling. Faults: a VictoriaMetrics stop and restart
+      (the stream driver's probe redial, `logit.output.reconnects`), netem, and a partition,
+      with `vm_every_window` to show holes. `graphite_out` has no `tls:`.
+    - `otlp-egress`: SUT `otlp_out` over HTTP → VictoriaMetrics' `/opentelemetry` route,
+      metrics as cumulative sums.
+    - `otlp-grpc-egress`: SUT `otlp_out` over gRPC → a second `logit`, `collector` (item 7's
+      several-SUT setup), `otlp_in → prometheus_out` → VictoriaMetrics, whose OTLP route is HTTP
+      only.
+
+    `otlp_out` retries per signal, remembering which were accepted or rejected for a batch in
+    process only; its request timeout is a fixed 10 s; and a kept-alive connection's close race
+    reads `Ambiguous`, a known gap.
+26. **Stand-ins for `otlp_out` and `splunk_hec_out` (W29).** Two more stand-in shapes on
+    item 10's design (§8c), each cueing every row of its sink's response-class table:
+    - `otlp`: HTTP only, since the stand-in speaks HTTP/1.1, with protobuf read by W20's
+      `soaklib/otlp.py`. Cues for each of `otlp_out`'s 16 rows, among them `408` `Ambiguous`,
+      `405` and `407` `Refused`, and a `3xx` `Rejected`, plus a `partial_success` cue: `Ok`, with
+      the rejected records counted `logit.output.records.dropped{reason="rejected"}`. Settlement
+      per signal needs a mixed-signal batch; without one, the scenario states that it covers
+      metrics alone.
+    - `splunk`: `/services/collector/event` and `/services/collector/ack`. Cues for each of
+      `splunk_hec_out`'s 16 rows: a code 6 naming object N (drop and resend), a `503` code 9
+      before a body was accepted (`Clean`) and after (`Ambiguous`, `after_delivery`), `429`,
+      `401` and `403` `Refused`, and withheld acks (`ack_timeout`, then `Ambiguous`).
+
+    Each shape touches the places W9b's and W16's shapes did: `standin/standin.py`'s
+    `DEFAULT_STATUS`, `DEFAULT_PATH`, and `cue_problems`; `soaklib/standin.py`'s `SHAPES`,
+    `PATHS`, `decode_body`, and points function; `scenario.py`'s `CLASS_REQUIRED_SHAPES`; and
+    `checks.py`'s V assembly, `check_ledger_standin`, and `_balanced_drop`. The handler matches
+    one path per shape today, and `splunk` needs two. W29 also extends AGENTS.md's
+    response-class invariant to name `otlp_out` and `splunk_hec_out` beside `prometheus_out`,
+    `datadog_out`, and `influxdb_out` (decided with Ross).
+
 Two follow-ups have no item yet. An overlap of TCP listeners, item 11 over `transport: tcp`,
 will need `net.ipv4.tcp_migrate_req`, without which the connections still in the old socket's
 accept queue at its close are reset rather than moved to the new one. A CA rotation, item 12's
 TLS half carried further, will rotate to a bundle of the old and new CAs, then to a leaf the new
 CA signed.
+
+Deferred to a later round (decided with Ross, 2026-10-29):
+
+- The `datadog_trace_in → datadog_trace_out` pair. The ledger has no span unit, and the harness
+  has no stdlib msgpack reader.
+- Resource faults: a cgroup memory limit, a CPU quota, a file-descriptor limit, a slow disk, and
+  clock steps.
+- Connection adversity: slowloris senders and half-open peers.
+- Native-hop variants: a TLS hop, a window under high RTT, and more senders than the identity
+  table holds.
 
 **Items 1 and 2 land first, as two stacked PRs, W7a and W7b.** Both touch code the harness has
 never driven, and item 2 forces the compose override, the service list, and the per-sink ledger
@@ -2595,6 +2759,15 @@ that items 3, 7, and 11 need.
 | W18 | `soak/w18` | `soak/w18: a tail_in descriptor soak under a deleting rotation` | M | W14 |
 | W19 | `soak/w19` | `soak/w19: a Kafka OAUTHBEARER soak with short-lived tokens` | M | W17 |
 | W20 | `soak/w20` | `soak/w20: an otlp_proto Kafka topic in the soak ledger` | M | W17 |
+| W21 | `soak/w21` | `soak/w21: plan transforms, new SUT sinks, and new SUT inputs` | S | W20 |
+| W22 | `soak/w22` | `soak/w22: sample, dedup_timestamps, and capped-aggregate soaks, with a merge term` | M | W21 |
+| W23 | `soak/w23` | `soak/w23: a cumulative_to_delta soak into a Datadog stand-in, with a value ledger` | M | W22 |
+| W24 | `soak/w24` | `soak/w24: HTTP-ingress soaks into splunk_hec_in, datadog_in, and prometheus_in's remote-write receiver` | M | W23 |
+| W25 | `soak/w25` | `soak/w25: a prometheus_in scrape soak, with a pull scrape wire` | M | W24 |
+| W26 | `soak/w26` | `soak/w26: count resets on the TCP stream listeners` | S | W25 |
+| W27 | `soak/w27` | `soak/w27: a syslog_in TCP and TLS soak, and the stream-sink buffer-loss gap` | M | W26 |
+| W28 | `soak/w28` | `soak/w28: graphite_out and otlp_out soaks into real receivers` | M | W27 |
+| W29 | `soak/w29` | `soak/w29: OTLP- and HEC-shaped stand-ins for otlp_out and splunk_hec_out` | M | W28 |
 
 - **W0**: [ADR `soak-harness`](../adr/soak-harness.md), this plan, and a row in each README.
 - **W1a**: `script/soak`, `compose.yaml`, the netem image, `scenario.py`, `docker.py`,
@@ -2738,10 +2911,36 @@ that items 3, 7, and 11 need.
   the Rust encoder pins, V per data point and the repeated points `ledger.topic` judges,
   self-test fixtures for each rule, and the `kafka-otlp-broker-restart` scenario, a 20-minute
   and a 1-hour run recorded under "Findings".
+- **W21**: §10's items 19 to 26, their deferred follow-ups, and these rows. Documentation only.
+- **W22**: item 19: the merge term at a `dedup_timestamps` node, self-test fixtures for it, and
+  the `sample-path`, `dedup-merge`, and `cardinality-capped` scenarios, each run recorded under
+  "Findings".
+- **W23**: item 20: the value ledger row against the Datadog-shaped stand-in, the reported SUT
+  restart and staleness windows, self-test fixtures for each rule, and a `cumulative_to_delta`
+  scenario, with a run recorded under "Findings".
+- **W24**: item 21: `LISTENER_WIRES` and `HTTP_LISTENERS` entries for `splunk_hec_in`,
+  `datadog_in`, and `prometheus_in`'s remote-write receiver, three more `HTTP_WRITER_KINDS`, the
+  ack-timeout surplus allowance, self-test fixtures for each rule, and the `splunk-hec-ingress`,
+  `datadog-ingress`, and `rw-ingress` scenarios, each run recorded under "Findings".
+- **W25**: item 22: the `scrape` wire, its G per series per generator life, the synthetic
+  series left out of W and `vm_selector`, the kill band, self-test fixtures for each rule, and
+  a scrape scenario, with a run recorded under "Findings".
+- **W26**: item 23, a product change: the reset counter on the shared TCP driver, its tests, and
+  its row in `docs/design/internal-telemetry.md`.
+- **W27**: item 24: the `syslog_in` TCP and TLS scenarios with `[[expect]]` rows on W26's
+  counter, each run recorded under "Findings", and the `docs/known-gaps/sinks.md` entry for a
+  TCP stream sink's kernel-buffer loss.
+- **W28**: item 25: the compose overrides for VictoriaMetrics' Graphite listener and the
+  `collector` service, and the `graphite-egress`, `otlp-egress`, and `otlp-grpc-egress`
+  scenarios, each run recorded under "Findings".
+- **W29**: item 26: the stand-in's `otlp` and `splunk` shapes, a path per route, their V and
+  `ledger.standin` rules, self-test fixtures for each, a scenario per shape with a run recorded
+  under "Findings", and AGENTS.md's response-class invariant extended to both sinks.
 
-§10's follow-ups to items 11 and 12 have no workstream yet.
+§10's follow-ups to items 11 and 12, and its list deferred to a later round, have no workstream
+yet.
 
-Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9a → W9b → W10a → W10b → W11a → W11b → W12a → W12b → W12c → W12d → W14 → W13b → W15, linear; W13a, W16, and W17 land off `main` beside W14, and W18, W19, and W20 off `main` after it. Each PR is based on and targets its
+Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9a → W9b → W10a → W10b → W11a → W11b → W12a → W12b → W12c → W12d → W14 → W13b → W15, linear; W13a, W16, and W17 land off `main` beside W14, and W18, W19, and W20 off `main` after it. W21 → W22 → W23 → W24 → W25 → W26 → W27 → W28 → W29 land after them, a linear stack off `main`. Each PR is based on and targets its
 parent's branch and is brought up to date with `git merge origin/main`, never a rebase.
 
 ## Findings
