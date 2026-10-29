@@ -9277,11 +9277,15 @@ def _datadog_checks():
             return requests + [again]
 
         rows = results("dd-changed", changed)
+        # datadog_out re-encodes a resend unchanged, so a new value at a stored second reads as
+        # a second point of that second, the known gap, and is still summed.
         expect(rows["ledger.standin"].status == checks.FAIL
-               and "a resend changed a sample" in rows["ledger.standin"].detail
+               and "Datadog keeps the later" in " ".join(rows["ledger.standin"].lines)
+               and "a resend changed a sample" not in rows["ledger.standin"].detail
                and rows["ledger.egress"].status == checks.FAIL
                and "surplus" in rows["ledger.egress"].detail,
-               f"a changed resend is summed, no last write winning: a surplus, got "
+               f"a changed value at a stored second is summed, no last write winning: a "
+               f"surplus, got "
                f"{rows['ledger.standin']} {rows['ledger.egress']}")
 
         # A 202 naming the request's first series, at +299 under its cue.
@@ -11773,6 +11777,10 @@ def _delta_ledger():
                f"the series a series_errors answer named are U, got {rows_named['ledger.value']}")
 
         restarted = rows("delta-restart", restart=True)
+        # The baseline is the wire's rate, one point per series per window, not the input's.
+        expect(restarted["recovery"].status == checks.PASS,
+               f"recovery's baseline behind a generator aggregate is its writer's events, got "
+               f"{restarted['recovery']}")
         for row in ("ledger.egress", "ledger.aggregate", "ledger.summary", "ledger.edge"):
             expect(restarted[row].status == checks.PASS,
                    f"an SUT restart's skipped points and late-stamped deltas balance {row}, got "
@@ -11796,6 +11804,20 @@ def _delta_ledger():
                in " ".join(evicted["ledger.value"].lines),
                f"an idle eviction's lost window is reported inside its band, got "
                f"{evicted['ledger.value']}")
+
+        # A second point of one series in one second, as an upstream aggregate's shutdown flush
+        # sends after its last window: two requests, two values, no resend.
+        def same_second(requests):
+            stamp = int(T0) + 99
+            extra = _datadog_request(len(requests) + 1, 100.5, [("x_0", [(stamp, 5.0)])])
+            return requests + [extra]
+
+        pair = rows("delta-same-second", edit=same_second)
+        expect(pair["ledger.standin"].status == checks.WARN
+               and "Datadog keeps the later" in pair["ledger.standin"].detail
+               and "a resend changed a sample" not in pair["ledger.standin"].detail,
+               f"two points of one series in one second from two requests WARN as the known "
+               f"gap, got {pair['ledger.standin']}")
 
         # Points skipped in a life the restart ended: its residual takes Δ_disc out.
         early = rows("delta-restart-evicted", restart=True, evict_at=50)

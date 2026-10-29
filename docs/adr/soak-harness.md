@@ -603,6 +603,14 @@ of the deltas a Datadog-shaped stand-in stored, V, to the increments the generat
   is the stand-in's distinct points, each credited to the life its request arrived in, because a
   point's timestamp is the generator's window and can precede the SUT life that sent it.
 
+- **Two values at one second under the `datadog` shape are a WARN, not a changed resend.**
+  `datadog_out` re-encodes a resend's points unchanged, so a second value of one series in one
+  second is a second point its whole-second timestamps merged, sent in another request. The
+  first run met one when the generator's `aggregate` flushed a partial window on shutdown.
+  Datadog keeps the later, an uncounted loss
+  [`docs/known-gaps/datadog.md`](../known-gaps/datadog.md) lists, so `ledger.standin` reports it
+  rather than failing every run whose generator restarts at the wrong phase.
+
 The node replaces `sut_aggregate` rather than sitting beside one, since an `aggregate` after it
 would resum the deltas the row judges. [`docs/plans/soak-harness.md`](../plans/soak-harness.md),
 "10. Next scenarios", item 20, has the rules.

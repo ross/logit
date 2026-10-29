@@ -5373,6 +5373,8 @@ def check_ledger_standin(data):
     requests under such a step; and each duplicate copy of a stored point is reported: permitted
     under `at_least_once` after an answer the sink didn't see accepted, and a FAIL under
     `at_most_once`, or as a resend within one life of a point the stand-in answered `2xx`.
+    Two values of one series in one second WARN rather than FAIL as a changed resend: they're
+    two points the sink sent in two requests, of which Datadog keeps the later.
 
     Under the `influxdb` shape (`_standin_influxdb`), also: per SUT life, no point of a request
     answered under the cue of a step classed `rejected` is stored, and the egress gap, Ab − V
@@ -5416,6 +5418,18 @@ def check_ledger_standin(data):
         flag(FAIL, f"{len(undecodable)} request body(ies) don't decode as "
                    f"{standin.BODY_NAMES[shape]}: "
                    f"{'; '.join(undecodable[:3])}")
+    if shape == standin.DATADOG and conflicts:
+        # `datadog_out` re-encodes a resend's points unchanged, so two values of one series in
+        # one second are two points its whole-second timestamps merged, sent in two requests.
+        # Datadog keeps the later and loses the other uncounted, a known gap the sink can't
+        # close across batches (docs/known-gaps/datadog.md).
+        key, stamp, first, last = conflicts[0]
+        flag(WARN, f"{_n(len(conflicts))} pair(s) of points of one series in one second from "
+                   f"two requests, first {dict(key).get('__name__', key)} at "
+                   f"{data.offset(stamp / 1000)} stored {first:g}, then {last:g}: Datadog keeps "
+                   "the later and loses the other uncounted, which datadog_out collapses only "
+                   "within one batch (docs/known-gaps/datadog.md)")
+        conflicts = []
     for key, stamp, first, last in conflicts[:5]:
         flag(FAIL, f"{dict(key).get('__name__', key)} at {stamp} ms stored {first:g}, then "
                    f"{last:g}: a resend changed a sample")
@@ -5732,7 +5746,8 @@ def check_recovery(data):
     its end, that sink's `retrying` is 0, its `buffer.utilization` is under 0.05 or its
     `buffer.batches` at most 1, every UDP listener's `receive.utilization` is under 0.05, and the
     ingest rate summed over the listeners over the drain interval ending there is at least 95%
-    of the generators' summed warmup rate. A drain interval another fault overlaps, or that
+    of the generators' summed warmup rate, on an HTTP wire their writers' events received. A
+    drain interval another fault overlaps, or that
     spans two SUT lives, isn't eligible; a fault with no eligible interval is skipped and
     listed. A `rate_behind` diagnostic from any generator turns a throughput shortfall into a
     WARN. Across a hop each SUT's sinks are judged on its own drains: the hop sink against the
@@ -5762,14 +5777,21 @@ def check_recovery(data):
     behind = 0
     for source in led.sources:
         gen = led.gens[source.get("service")]
-        for load in source_ids(source, "generator_input"):
-            warm = [(ts, v) for ts, v, _ in gen.counter_points("logit.component.events.sent",
-                                                               component=load)
+        # An HTTP writer's events are what the wire carries, and an `aggregate` ahead of it
+        # sends one point per series per window, not the input's events.
+        rated = ([(sink, "logit.component.events.received")
+                  for sink in source_ids(source, "generator_sink")]
+                 if source_wire(source) == HTTP_WIRE else
+                 [(load, "logit.component.events.sent")
+                  for load in source_ids(source, "generator_input")])
+        for component, counter in rated:
+            warm = [(ts, v) for ts, v, _ in gen.counter_points(counter, component=component)
                     if data.t0 <= ts <= data.t0 + data.warmup]
             if len(warm) < 2 or warm[-1][0] <= warm[0][0]:
                 return Result("recovery", SKIP, f"too few {source.get('service')} drains in "
                               "warmup for a baseline")
             baseline += sum(v for _, v in warm[1:]) / (warm[-1][0] - warm[0][0])
+        for load in source_ids(source, "generator_input"):
             behind += sum(v for _, v, _ in gen.counter_points(
                 "logit.component.diagnostics", component=load, key="rate_behind"))
     # Only a UDP listener has a receive queue to drain.
