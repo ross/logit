@@ -13,7 +13,7 @@
 //! first, renames the live file to `.1`, and creates a new one, with a `Scan` free to land between
 //! any two steps; `AppendToRenamed` is a writer still appending to the renamed inode before it
 //! reopens; `CopyTruncate` copies the live file to a new `.1` and truncates it in place, then
-//! scans. A listing or `stat` failure comes through the fault seam.
+//! scans, optionally after a drain that reaches the truncation first. A listing or `stat` failure comes through the fault seam.
 //!
 //! [`Model`] restates the driver's rules over the model filesystem: which inode each path names,
 //! what a scan retires, rebinds, opens, resumes, or finds truncated, how a drain splits, drops,
@@ -109,7 +109,10 @@ enum Op {
         lens: Vec<usize>,
     },
     /// logrotate's `copytruncate`: shift, copy `f.log` to a new `f.log.1`, truncate `f.log` in
-    /// place, then scan (failing the listing if `scan_fails`). The scan checks every tracked copy
+    /// place, then scan (failing the listing if `scan_fails`). Under `drain_first`, a drain runs
+    /// between the truncate and the scan, so a zero read at the old offset can find the
+    /// truncation before any size check. The scan always follows: a refill past the offset with
+    /// no check between is the undetected case, which the model doesn't follow. The scan checks every tracked copy
     /// of the truncated inode, bound or draining. An unspent resume entry is a position no scan
     /// checks, so a refill under a failed listing after a failed first scan is resumed through
     /// the head fingerprint, which at an offset of at most `HEAD_BYTES` matches by construction
@@ -117,6 +120,7 @@ enum Op {
     CopyTruncate {
         f: usize,
         scan_fails: bool,
+        drain_first: bool,
     },
     Delete {
         f: usize,
@@ -165,7 +169,9 @@ fn op() -> impl Strategy<Value = Op> {
             .prop_map(|(f, scan_between)| Op::RenameRotate { f, scan_between }),
         4 => (slot(), (10usize..=60).prop_flat_map(|len| (Just(len), 1..len)))
             .prop_map(|(f, (len, k))| Op::AppendTorn { f, len, k }),
-        4 => (slot(), any::<bool>()).prop_map(|(f, scan_fails)| Op::CopyTruncate { f, scan_fails }),
+        4 => (slot(), any::<bool>(), any::<bool>()).prop_map(|(f, scan_fails, drain_first)| {
+            Op::CopyTruncate { f, scan_fails, drain_first }
+        }),
         4 => rare().prop_map(|first_scan_fails| Op::Restart { first_scan_fails }),
         4 => rare().prop_map(|first_scan_fails| Op::Crash { first_scan_fails }),
         3 => slot().prop_map(|f| Op::Create { f }),
@@ -941,6 +947,18 @@ impl World {
         self.check_scan(fail);
     }
 
+    /// A drain to idle on both sides.
+    async fn drain(&mut self) {
+        let real = &mut self.real;
+        let end = timed(
+            "drain",
+            real.tailer.drain(&real.fanout, &real.shutdown, &mut real.watcher, no_timer_due()),
+        )
+        .await;
+        assert_eq!(end, DrainEnd::Idle, "{}", self.ctx);
+        self.model.drain();
+    }
+
     async fn apply(&mut self, op: &Op) {
         let slots = self.model.slots;
         match op.clone() {
@@ -985,7 +1003,7 @@ impl World {
                     self.append_lines(f, inode, &lens);
                 }
             }
-            Op::CopyTruncate { f, scan_fails } => {
+            Op::CopyTruncate { f, scan_fails, drain_first } => {
                 let f = f % slots;
                 self.complete_torn(f);
                 if let Some(live) = self.model.chains[f].first().copied().flatten() {
@@ -1003,6 +1021,9 @@ impl World {
                     let inode = &mut self.model.inodes[live];
                     inode.content.clear();
                     inode.splits.clear();
+                }
+                if drain_first {
+                    self.drain().await;
                 }
                 self.scan(if scan_fails { ScanFail::ReadDir } else { ScanFail::None }).await;
             }
@@ -1031,21 +1052,7 @@ impl World {
                 };
                 self.scan(fail).await;
             }
-            Op::Drain => {
-                let real = &mut self.real;
-                let end = timed(
-                    "drain",
-                    real.tailer.drain(
-                        &real.fanout,
-                        &real.shutdown,
-                        &mut real.watcher,
-                        no_timer_due(),
-                    ),
-                )
-                .await;
-                assert_eq!(end, DrainEnd::Idle, "{}", self.ctx);
-                self.model.drain();
-            }
+            Op::Drain => self.drain().await,
             Op::Flush => {
                 timed(
                     "flush",
@@ -1436,7 +1443,7 @@ fn truncated_while_draining(scan_fails: bool) {
             Scan(ScanFail::None),
             Drain,
             Scan(ScanFail::StatGone(0)),
-            CopyTruncate { f: 0, scan_fails },
+            CopyTruncate { f: 0, scan_fails, drain_first: false },
             Append { f: 0, lens: vec![30, 30] },
             Drain,
         ],
