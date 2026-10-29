@@ -2515,8 +2515,8 @@ file it names, provided the file still holds the bytes `logit` read from it. A r
 the file's first 256 bytes, the 256 bytes before the offset (fewer of each for a smaller offset),
 and its length. A file that changed, because a new file reused the inode or the file was
 rewritten while `logit` was down, starts at offset 0 instead; `logit.input.files.resume_rejected`
-and a `resume_rejected` diagnostic say so. If nothing claims that entry (below), its unread bytes
-are counted `logit.input.bytes.dropped{reason="gone"}` with a `file_gone` diagnostic.
+and a `resume_rejected` diagnostic say so. If no other file matches that entry by content (below), its
+unread bytes are counted `logit.input.bytes.dropped{reason="gone"}` with a `file_gone` diagnostic.
 
 **A file no entry names can claim one by its content.** A file whose inode no checkpoint entry
 names, but whose first bytes and the bytes before an entry's offset match that entry, resumes

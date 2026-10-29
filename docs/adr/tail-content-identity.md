@@ -194,13 +194,15 @@ reviewer can check.
    timestamp prefix or header that unrelated files share.
 
 6. **A rejected entry nothing claims is counted as gone.** A checkpoint entry its inode's content
-   rejected, and that no content claim takes by the end of that scan, counts its recorded unread
-   bytes as `logit.input.bytes.dropped{reason="gone"}` with a `file_gone` diagnostic. It goes
+   rejected, and that no new file matches by content by the end of that scan, counts its recorded
+   unread bytes as `logit.input.bytes.dropped{reason="gone"}` with a `file_gone` diagnostic. It goes
    through the path a pruned entry already takes, counted only once a checkpoint write without
    the entry lands ([ADR
    `tail-discovery-failure-and-resume-identity`](tail-discovery-failure-and-resume-identity.md)'s
-   2026-10-18 amendment). A file created and removed wholly while `tail_in` was down can't be
-   counted, because no checkpoint recorded it. That's a decided limit.
+   2026-10-18 amendment). An entry a new file matched without claiming it (an ambiguous match,
+   decision 5) isn't counted: that file is read from `0`, so it delivers the entry's bytes. A file
+   created and removed wholly while `tail_in` was down can't be counted, because no checkpoint
+   recorded it. That's a decided limit.
 
 7. **An exact-pattern `copytruncate` is counted, not recovered.** At a truncation, the tailer counts
    the bytes it knew existed past its read offset, the last size it saw before the truncation less
@@ -285,6 +287,9 @@ reviewer can check.
     copy missed) can't claim, and once its wait runs out it's read from `0`, duplicating the
     original's lines.
   - A copy whose head is under 64 bytes, or that matches ambiguously, is read from `0`.
+  - A rejected entry whose head is under 64 bytes is no candidate, so a copy that delivers its
+    bytes from `0` can't be told from a file that's gone, and the entry is still counted
+    `bytes.dropped{reason="gone"}` (decision 6).
   - A plain `cp` of a live file claims the original as it stands once its wait runs out, so the
     lines the original reads after that are read again from the copy.
   - A truncation held at a stop is counted, though a copy the restart claims by the original's

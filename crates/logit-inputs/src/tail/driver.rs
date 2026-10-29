@@ -1018,7 +1018,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             // probed nor a taker, and isn't opened; the next scan asks again.
         }
         self.recheck_draining().await;
-        let claims = self.claim_unmatched(&unmatched, first, listing, discovered_ids);
+        let (claims, matched) = self.claim_unmatched(&unmatched, first, listing, discovered_ids);
         let mut taken = Vec::new();
         for ((path, meta), claim) in unmatched.into_iter().zip(claims) {
             let id = FileId::from_metadata(&meta);
@@ -1035,7 +1035,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 }
             }
         }
-        self.settle_claims(&taken);
+        self.settle_claims(&taken, &matched);
         self.accepted.clear();
         // A file the second pass rotated away started draining after step 3.
         self.recheck_draining().await;
@@ -1178,13 +1178,16 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     ///   bytes.
     ///
     /// The first scan defers nothing: `read_from` decides only files it opens.
+    ///
+    /// Also returns each `Tailer::rejected` index some inode matched, claimed or not: a file
+    /// that matched it ambiguously starts at `0`, so it delivers what the entry described.
     fn claim_unmatched(
         &mut self,
         unmatched: &[(PathBuf, std::fs::Metadata)],
         first: bool,
         listing: &Listing,
         discovered_ids: &HashSet<FileId>,
-    ) -> Vec<Option<(StartOffset, Option<ClaimFrom>)>> {
+    ) -> (Vec<Option<(StartOffset, Option<ClaimFrom>)>>, HashSet<usize>) {
         for t in &mut self.truncations {
             t.offers += 1;
             t.pinned = false;
@@ -1224,6 +1227,14 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 takers[c] += usize::from(*verdict == Verdict::Match);
             }
         }
+        let matched = candidates
+            .iter()
+            .zip(&takers)
+            .filter_map(|((from, ..), &n)| match from {
+                ClaimFrom::Rejected(ix) if n > 0 => Some(*ix),
+                _ => None,
+            })
+            .collect();
         for (i, v) in verdicts.iter().enumerate() {
             if out[i].is_some() {
                 continue;
@@ -1267,7 +1278,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             }
         }
         self.deferred = deferred;
-        out
+        (out, matched)
     }
 
     /// Every [`Candidate`] [`Tailer::claim_unmatched`] offers this scan.
@@ -1345,12 +1356,13 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     }
 
     /// Spends each candidate a new inode claimed in this scan, given with the claimant's length,
-    /// then counts each rejected entry nothing claimed as gone
-    /// (`docs/adr/tail-content-identity.md`, decision 6). A claimed checkpoint entry, rejected or
+    /// then counts each rejected entry no inode matched as gone
+    /// (`docs/adr/tail-content-identity.md`, decision 6): one in `matched` that nothing claimed
+    /// was matched ambiguously, and the file that matched it starts at `0` and delivers it. A claimed checkpoint entry, rejected or
     /// not, leaves the checkpoint. A claimed truncation's discarded line isn't counted, since the
     /// copy resumes at its start, but the bytes the original was last seen to hold past the
     /// copy's end are: they're in neither file.
-    fn settle_claims(&mut self, taken: &[(ClaimFrom, u64)]) {
+    fn settle_claims(&mut self, taken: &[(ClaimFrom, u64)], matched: &HashSet<usize>) {
         if !taken.is_empty() {
             self.telemetry.count("logit.input.files.claimed", taken.len() as f64, &[]);
         }
@@ -1387,6 +1399,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         for (ix, (id, r)) in std::mem::take(&mut self.rejected).into_iter().enumerate() {
             let unread = r.len.saturating_sub(r.offset);
             if !rejected_taken.contains(&ix)
+                && !matched.contains(&ix)
                 && unread > 0
                 && self.patterns.iter().any(|p| p.covers(&r.path))
             {
@@ -7637,6 +7650,43 @@ mod tests {
             assert_eq!(hand.diag.occurrences("file_gone"), 0);
             std::fs::remove_dir_all(&dir).ok();
         }
+    }
+
+    /// `copytruncate` while `logit` was down, with two copies of the original: both match its
+    /// rejected entry, so neither claims it and each is read from `0`, and the entry isn't
+    /// counted gone, since the copies deliver its bytes.
+    #[tokio::test]
+    async fn a_rejected_entry_matched_ambiguously_is_not_counted_gone() {
+        let dir = scratch_dir("claim-rejected-ambiguous");
+        let path = dir.join("app.log");
+        let (one, two) = (long_line("one"), long_line("two"));
+        std::fs::write(&path, format!("{one}\n{two}\n")).unwrap();
+        let patterns = vec![PathPattern::new(dir.join("app.log*"))];
+        let config = checkpointed(&dir, ReadFrom::Beginning);
+        let mut hand = Hand::bind(vec![PathPattern::new(&path)], LineFactory, config.clone()).await;
+        assert_eq!(hand.pump().await.len(), 2);
+        hand.checkpoint().await;
+        drop(hand);
+        // Leave the entry `two` unread: rewind it to the end of `one`.
+        let head = std::fs::read(&path).unwrap();
+        let offset = one.len() as u64 + 1;
+        write_checkpoint_for(&dir, &path, offset, Head::of(&head[..offset as usize]));
+
+        std::fs::copy(&path, dir.join("app.log.1")).unwrap();
+        std::fs::copy(&path, dir.join("app.log.2")).unwrap();
+        copytruncate_and_refill(&path, b"new\n");
+        let mut hand = Hand::bind(patterns, LineFactory, config).await;
+        let mut lines = hand.pump().await;
+        lines.sort();
+        let mut want = vec![one.clone(), one, two.clone(), two, "new".to_string()];
+        want.sort();
+        assert_eq!(lines, want);
+        assert_eq!(hand.rejected(), 1.0);
+        assert_eq!(hand.diag.occurrences("claim_ambiguous"), 2, "one per copy");
+        hand.checkpoint().await;
+        assert_eq!(gone_bytes(&mut hand.probe), 0.0, "the copies deliver it");
+        assert_eq!(hand.diag.occurrences("file_gone"), 0);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// An entry its own inode rejects and nothing claims is a file that's gone: its unread bytes
