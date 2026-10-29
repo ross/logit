@@ -2653,7 +2653,8 @@ under "Deferred to a later round" wait.
     values. W and `vm_selector` leave out the three series each scrape adds, `up`,
     `scrape_duration_seconds`, and `scrape_samples_scraped`. A generator kill loses the
     increments after its last scrape, a band of one scrape `interval` plus one generator
-    `aggregate` window of increments per kill. Faults: a generator partition; a generator
+    `aggregate` window of increments per kill, widened by the generator's `internal` export
+    interval, since a killed life's last `generate_in` count may go unexported. Faults: a generator partition; a generator
     pause, kept under the exposition's 5-minute `expire_after`, past which the exposition
     forgets its series; a generator kill, whose counter reset `prometheus_in` passes on and
     VictoriaMetrics' totals absorb; and a generator slowed past the scrape `timeout`. Rows:
@@ -2702,8 +2703,8 @@ under "Deferred to a later round" wait.
 26. **Stand-ins for `otlp_out` and `splunk_hec_out` (W29).** Two more stand-in shapes on
     item 10's design (§8c):
     - `otlp`: metrics only, on one path, `/v1/metrics`, over HTTP, since the stand-in speaks
-      HTTP/1.1, with protobuf read by W20's `soaklib/otlp.py`, unchanged. It covers the 12 HTTP
-      rows of `otlp_out`'s 16, among them `408` `Ambiguous`, `405` and `407` `Refused`, and a
+      HTTP/1.1, with protobuf read by W20's `soaklib/otlp.py`, unchanged. It cues the 10 response
+      rows of `otlp_out`'s 16 that are neither gRPC nor dial rows, among them `408` `Ambiguous`, `405` and `407` `Refused`, and a
       `3xx` `Rejected`, plus a `partial_success` cue: `Ok`, with the rejected records counted
       `logit.output.records.dropped{reason="rejected"}`. A stand-in `stop` step covers connect
       refused, as in `standin-remote-write`. Out of scope: DNS failure, a failed TLS handshake,
