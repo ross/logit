@@ -1419,7 +1419,7 @@ PER_DRAIN = 1000
 
 def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_short=0,
                 life0_dropped=0, life1_dropped=0, steady_loss=0, fault_loss=0, end_extra=0,
-                e1_short=0, a1_short=0, ab1_short=0, late_series=False, receive_util=0.0, slow_after_stop=False, rate_behind=0,
+                end_moved=0, e1_short=0, a1_short=0, ab1_short=0, late_series=False, receive_util=0.0, slow_after_stop=False, rate_behind=0,
                 undelivered=0, empty_export=False, ab0_short=0, merged_lives=False,
                 empty_sut=False, buffer_batches=0, buffer_util=0.0, steady_surplus=0,
                 external=False, sut_extra=(), stderr_extra=(), timeline_extra=(),
@@ -1430,7 +1430,8 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
                 standin_edit=None, standin_shape="remote_write", **resolved):
     """A two-life run directory for the ledger checks. The generator sends `PER_DRAIN` lines
     per 5 s drain from +0 to +300; the SUT is stopped over `STOP`; each keyword breaks one
-    rule. By default life 0 ends with `life0_extra` read but not absorbed, `shutdown_drops` of
+    rule. `end_moved` lines the listener reads in the drain at +300, the end run's boundary,
+    arrive in the drain after it instead. By default life 0 ends with `life0_extra` read but not absorbed, `shutdown_drops` of
     them dropped at shutdown, and `v0_extra` reaching VictoriaMetrics after its last drain, and
     life 1 balances. `shutdown_in` names where the shutdown drops, of datagrams and of
     `life0_dropped`/`life1_dropped` batches, are written: telemetry, as a dedicated `internal`
@@ -1496,6 +1497,10 @@ def _ledger_run(tmp, name, life0_extra=50, shutdown_drops=20, v0_extra=30, v1_sh
             w -= fault_loss
         if offset == 320:
             w += end_extra
+        if offset == 300:
+            w -= end_moved
+        if offset == 305:
+            w += end_moved
         e = w
         if offset == last0:
             w += life0_extra
@@ -2970,6 +2975,12 @@ def _ledger_checks():
                and "end allowance" in over_end["ledger.wire"].detail,
                f"wire FAILs W + K past G by more than the end allowance, got "
                f"{over_end['ledger.wire']}")
+        moved_end = results("wire-end-moved", end_moved=160)
+        moved_lines = "\n".join(moved_end["ledger.wire"].lines)
+        expect(moved_end["ledger.wire"].status == checks.PASS
+               and "160 netted across the boundary at +300s" in moved_lines,
+               f"wire nets a batch read across the end run's boundary before the end allowance "
+               f"applies, got {moved_end['ledger.wire']}")
         within_end = results("wire-end-ok", end_extra=60)
         expect(within_end["ledger.wire"].status == checks.PASS,
                f"wire allows W + K past G by up to one batch at the end, got "
@@ -11763,8 +11774,8 @@ def _boundary_skew():
     capped, _ = checks._boundary_nets(runs, [(660.0, 0.0), (667.0, 1000.0)])
     expect([round(net) for net in capped] == [-1154, 1159],
            f"the transfer stops at the straddling G, got {capped}")
-    # A steady run beside a judged one nets; a reported or end run never does.
-    for kind, want in (("steady", [0, 5]), ("fault", [-2154, 2159]), ("end", [-2154, 2159])):
+    # A steady or end run beside a judged one nets; a reported run never does.
+    for kind, want in (("steady", [0, 5]), ("fault", [-2154, 2159]), ("end", [0, 5])):
         mixed = [runs[0], [*runs[1][:2], kind, *runs[1][3:]]]
         got, _ = checks._boundary_nets(mixed, anchors)
         expect([round(net) for net in got] == want,

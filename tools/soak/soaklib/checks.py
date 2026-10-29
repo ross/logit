@@ -3223,8 +3223,9 @@ def _scrape_wire_one(data, led, source):
 
 def _boundary_nets(runs, anchors):
     """`(nets, netted)`: each run's gap, G − (W + K + F), after netting across every boundary
-    that touches a judged run, judged or steady on its other side, where the two gaps have
-    opposite signs, and `{index: [(moved, at, straddled)]}` for each run a transfer touched.
+    that touches a judged run, judged or steady on its other side, or the end run, where the two
+    gaps have opposite signs, and `{index: [(moved, at, straddled)]}` for each run a transfer
+    touched.
 
     G is interpolated between generator drains, so at a SUT drain inside a generator interval
     its error is up to the G that moved in that interval: one batch while acknowledgments arrive
@@ -3237,14 +3238,16 @@ def _boundary_nets(runs, anchors):
     at the G that moved over the generator anchor pair straddling the boundary (`straddled`),
     the most interpolation can move, and at either gap, so neither run changes sign. That cap is
     what keeps a surplus from hiding a loss next door: a resend's surplus or a steady run's,
-    which otherwise counts at 0, nets a loss only as far as interpolation could explain it.
-    Runs that don't touch, and a reported or end run, never net."""
+    which otherwise counts at 0, nets a loss only as far as interpolation could explain it. The
+    end run's boundary is a SUT drain like any other, so a batch the generator counted before
+    it and the listener read after it leaves the same pair, and the end allowance
+    applies to what's left. Runs that don't touch, and a reported run, never net."""
     nets = [g - wk for _, _, _, _, g, wk, _ in runs]
     netted = {}
     stamps = [t for t, _ in anchors]
     for index in range(len(runs) - 1):
         kinds = {runs[index][2], runs[index + 1][2]}
-        if ("judged" not in kinds or not kinds <= {"judged", "steady"}
+        if (not kinds & {"judged", "end"} or not kinds <= {"judged", "steady", "end"}
                 or nets[index] * nets[index + 1] >= 0):
             continue
         at = runs[index][1]
@@ -3467,7 +3470,8 @@ def _wire_one(data, led, source, instances=None):
 
     limit = float(data.ledger.get("wire_loss_outside_faults", 0.0))
     tolerance = batch * edges
-    judged = steady_lost + max(0.0, sums["end"])
+    end_net = sum(net for net, run in zip(nets, runs) if run[2] == "end")
+    judged = steady_lost + max(0.0, end_net)
     allowed = limit * g_steady + tolerance
     if judged > allowed:
         status = FAIL
@@ -3476,9 +3480,9 @@ def _wire_one(data, led, source, instances=None):
                         f"{limit:g} x {_n(round(g_steady))} + {edges} edge(s) x one "
                         f"{_n(batch)}-line batch")
     end_allow = _end_allowance(led, source)
-    if sums["end"] < -end_allow:
+    if end_net < -end_allow:
         status = FAIL
-        lines.insert(0, f"G falls {_n(round(-sums['end']))} short of W + K at the end, over "
+        lines.insert(0, f"G falls {_n(round(-end_net))} short of W + K at the end, over "
                         f"the end allowance "
                         f"{_n(end_allow)} (the generator sink's last buffer.batches + 1 batch)")
     if udp:

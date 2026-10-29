@@ -743,3 +743,17 @@ attempt is one `ambiguous_at_most_once` drop, so `statsd_out`'s allowance is unc
 `at_least_once` each leaves at most one batch the SUT read beside the resend G counts. A TLS
 first write that fails is ambiguous, where a plaintext one is clean, and adds to the count the
 same way. A drop counted with no ambiguous attempt beside it allows nothing.
+
+## Amendment: the end run nets at its boundary (2026-10-29)
+
+A `syslog-tls-ingress` run FAILed `ledger.wire` with nothing lost: G fell 100.1 short of W at
+the end, against an end allowance of 100, while the steady run before the end read 98 of loss.
+The generator counted a batch in the drain interval before the end run's boundary and the
+listener read it in the one after, the opposite-signed pair "a boundary pair nets in full" describes. That rule netted only
+at a boundary touching a judged run, so the end run's shortfall met its allowance whole.
+
+The end run now nets with the run before it, steady or judged, on every wire, under the same
+cap: up to the G that moved over the generator interval straddling the boundary, and never past
+either gap. The end allowance then applies to what's left, and the end run's netted gap is what
+the loss outside the reported windows counts. A reported run still never nets. Re-scored, the
+run PASSes with 98 netted across the boundary and 2 left at the end.
