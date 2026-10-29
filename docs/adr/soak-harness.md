@@ -578,6 +578,35 @@ Re-scored, the failed run PASSes with 90 of loss judged against 650, and the pas
 depends on the listener (`otlp_in` holds a request past the writer's timeout, `influxdb_in`
 answers a busy `503`), so its resends' surplus counts 0 as steady state's does.
 
+## Amendment: a merge is credited back as delivered, and a keyed discard is judged by absence (2026-10-29)
+
+Two transforms in the path need rules a counted discard doesn't give.
+
+- **A merge is no loss.** `dedup_timestamps` folds a series' records of one timestamp bucket
+  into one record carrying their sum, counts each folded record in
+  `logit.transform.metrics.merged` (M), and counts an event it leaves with nothing in
+  `events.discarded`. Under the discard amendment above, the ledger would read each merge as
+  counted loss and V, which holds the folded increments, as a surplus of M. A source now names
+  such a node in `merge`. `ledger.edge` still judges its discards as for any node, and holds
+  them to M, which is exact while each event carries one record, as a statsd line does. Every
+  later row credits M back: Ab + M wherever it reads `aggregate`'s Ab, and ΣT_disc − M wherever
+  it subtracts the discards. The node's `logit.transform.metrics.absorbed`, a superseded gauge
+  or cumulative reading, loses that reading's value, so `ledger.edge` requires it to stay 0 in
+  every life a kill didn't end. The declaration is per node, and `load()` takes only a
+  `dedup_timestamps` there, so the credit applies only where a merge is known to carry its
+  value.
+- **A keyed discard is judged by what never arrives.** `sample`'s discards balance under the
+  discard amendment, but a balanced count can't tell a stable verdict from one that changed
+  across a restart: a life that kept the wrong half would still balance. A sink may name a
+  `vm_absent_selector`, exported beside its `vm_selector` at the end, and `ledger.absent` FAILs
+  any series it matches, from any SUT life, and an export that failed or never ran. The kept set
+  is computed before the run from the frozen hash (`soaklib/sampling.py`, an XXH64 checked
+  against xxHash's published vectors and `logit_core::sampling`'s pinned ones), so a scenario
+  states it in its selectors rather than learning it from the run.
+
+[`docs/plans/soak-harness.md`](../plans/soak-harness.md), item 19 of "10. Next scenarios", has
+the scenarios that use them.
+
 ## Amendment: a delta transform's value is judged beside its points (2026-10-29)
 
 A `cumulative_to_delta` node's point counts can balance while its values don't: a delta that

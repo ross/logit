@@ -583,6 +583,10 @@ sut_transforms = ["parse", "labels", "count", "metrics_only"]   # optional, in o
   points and carry no other payload; a message whose points merge, that has none, or whose
   parent carries metrics or a span and goes on beside its children reads as a `ledger.edge`
   FAIL, since no counter counts such a message.
+- `merge`, optional (W22), lists `dedup_timestamps` nodes of the source's `sut_transforms`
+  whose discards are merges, each merged record credited back as delivered (§6, M).
+  `load()` checks each node's kind against the SUT config, and refuses `merge` beside a
+  `fan_out` and under `split = "target"`, whose rows read one `aggregate` per sink.
 - With the role map: every source's `service` is a `generator`, and every `generator` in the
   stack has a source, because a generator with none would put lines into a listener with no
   G behind them.
@@ -1012,6 +1016,7 @@ and takes the worst status; `report.py` is unchanged.
 | X | per listener, SUT `logit.component.events.dropped{component=<sut_listener>}` under every reason (W7a): events the listener counted as sent and then dropped, such as a batch sent into the inbox of a node that has failed (`closed_consumer`) |
 | T_in[node], T_out[node] | with a source's `sut_transforms` (W8b), each node's `logit.component.events.received` and `logit.component.events.sent` |
 | T_disc[node] | each such node's `logit.component.events.discarded` (W13a), the events it received and sent no part of, which the runtime counts for every Transform node, only when nonzero, so an absent count is 0; ΣT_disc sums every node of every source |
+| M[node], T_ab[node] | at each `merge` node (W22), its `logit.transform.metrics.merged` and `logit.transform.metrics.absorbed`; M sums every `merge` node. Each merged record's increment reaches V inside its survivor, so every row after the node reads Ab + M where it reads Ab and ΣT_disc − M where it subtracts the discards. With one record per event, as a statsd line has, each merge empties its event, so T_disc[node] == M[node] |
 | T_lines[node] | each such node's `logit.transform.lines.dropped` under every reason (W13b); only `line_protocol` counts it, under `malformed`, for a bad line in a message whose log doesn't go on |
 | W′ | with a source's `fan_out` (W13b), each listener's W − D − B − X carried through its chain (`Ledger.through`): a `fan_out` node of k turns x events into k × x − T_lines + (T_in − T_disc), its children and the parents it sent on; any other node into x − T_disc. Summed over the listeners, it takes W − D − B − X − ΣT_disc's place in the residual, a stopped life's egress gap, and the end-to-end bound; R and a killed life's ingest rate grow by each chain's product of k. A fan-out node's own T_disc counts its parents, which went on as children, so it is never loss |
 | A | aggregate `logit.component.events.received` |
@@ -1253,7 +1258,8 @@ The rows:
   judged hop by hop: its listener's E == T_in[first node], T_in − T_disc == T_out at every node
   (from W13a; each sends every event it receives that it doesn't discard), T_out[node] ==
   T_in[next node], and the last node's T_out takes that listener's E's place in the sum. The
-  detail shows each node's T_disc. From W13b a `fan_out` node of k is held instead to
+  detail shows each node's T_disc. From W22 a `merge` node is also held to T_disc == M, and
+  to T_ab == 0 in every life a kill didn't end. From W13b a `fan_out` node of k is held instead to
   children == k × T_in − T_lines, with no tolerance, its children being T_out − (T_in − T_disc),
   the count [ADR `transform-fan-out`](../adr/transform-fan-out.md)'s "Telemetry stays as it
   is" gives; with one, `ledger.summary`'s path term becomes the sum of these chain terms and
@@ -1345,6 +1351,11 @@ The rows:
   while others flush FAILs; set `vm_every_window` only where every series is written in every
   window. The detail names each excused gap with its offsets, its series count, and the
   batches and drains counted.
+- `ledger.absent` (W22), only for a sink with a `vm_absent_selector`, else SKIP: the driver
+  exports what the selector matches at the end into `vm-export/<sink>.absent.jsonl` and
+  records `vm_absent_exported`, and the row FAILs any series there, naming the SUT lives its
+  samples fall in, and an export that failed or never ran. A count balances whichever keys a
+  `sample` keeps; only absence shows that every life kept the same ones.
 - `ledger.replay`, for each killed life followed by another and each sink, else SKIP: the next
   life's
   first-drain `buffer.disk.replayed` equals the killed life's `buffer.batches` at its last
@@ -1376,7 +1387,8 @@ The rows:
   With `sut_script` (W7a), E − A becomes (E − L_in) + (L_in − L_emit − L_drop − L_err) +
   (L_emit + L_flush − L_sent) + (L_sent − A), the egress term is Ab − L_flush − V, and the
   script's L_drop and L_err are shown beside them as counted. With `sut_transforms` (W13a),
-  E − A becomes E − ΣT_disc − A, and ΣT_disc is shown beside it as counted. With a `fan_out`
+  E − A becomes E − ΣT_disc − A, and ΣT_disc is shown beside it as counted; with a `merge`
+  node (W22) the egress term is Ab + M − V, and ΣT_disc is shown with its M credited. With a `fan_out`
   (W13b), which doesn't telescope, E − A becomes `ledger.edge`'s chain terms summed plus
   Σ(sent into aggregate) − A, and ΣT_disc isn't shown, since W′ carries it. From W7b there is
   one egress term per egress group, each of which must be 0 or counted on its own, so a surplus
@@ -2559,7 +2571,7 @@ eviction under `cumulative_to_delta` are reported, not judged (item 20); AGENTS.
 names `otlp_out` and `splunk_hec_out` once their stand-ins land (item 26); and the follow-ups
 under "Deferred to a later round" wait.
 
-19. **Discarding and merging transforms (W22).** `sut_transforms` today holds nodes that send
+19. **Discarding and merging transforms (built in W22).** `sut_transforms` today holds nodes that send
     an event or count it `events.discarded`, judged T_in − T_disc == T_out with ΣT_disc taken
     out downstream (item 13), and `fan_out` is for `line_protocol` alone. No `sut_transforms`
     node sits between `aggregate` and the sink, whose only identity there is
@@ -2594,7 +2606,10 @@ under "Deferred to a later round" wait.
       at 0.
 
     `aggregate`'s `max_series` admission drops, `metrics.dropped{reason="series_limit"}`, are
-    loss, so a fourth scenario driving them is optional and lands only if it's cheap.
+    loss, so a fourth scenario driving them is optional and lands only if it's cheap. W22 left
+    it out: a refused record is received and never absorbed, so `ledger.aggregate`'s A == Ab
+    FAILs it, and `drop_credit` counts a gap only from a dropped batch. Scoring it needs a
+    per-record credit at `aggregate`, a ledger term of its own, not a scenario.
 20. **`cumulative_to_delta` (W23).** Generator `generate_in → aggregate (temporality:
     cumulative) → otlp_out`, emitting a fixed N series; SUT `otlp_in → cumulative_to_delta
     (initial_value: auto) → datadog_out` into the Datadog-shaped stand-in (§8c). Datadog is the
@@ -5892,6 +5907,44 @@ development host. Overall PASS, with only inapplicable SKIPs. It confirms the 20
   which the 180 s consumer bound should still cover, but no run has measured it.
 - **RSS and descriptors were flat.** `rss_slope` read +1.7 MiB/h on the SUT and −0.0 on the
   generator, and both kept their descriptor count.
+
+### W22: `sample`, `dedup_timestamps`, and a capped `aggregate` in the path (2026-10-29)
+
+Each scenario ran once on the development host (`sailfish`, 32 cores, Linux 7.2.13), against
+`logit:soak` built with `--no-cache` at 2026-10-29 10:00 PDT from `soak/w22`, whose diff touches
+no product code, over `origin/main` at `5d8fd053`. Other agents' soak runs shared the daemon
+during the last two. Every row of every run was PASS or SKIP:
+
+| Run | Scenario | Duration | Verdict |
+|---|---|---|---|
+| `20261029T170202Z` | `sample-path` | 15m30s, its default | PASS |
+| `20261029T171839Z` | `dedup-merge` | 15m30s, its default | PASS |
+| `20261029T173550Z` | `cardinality-capped` | 25m (`--duration`; its default is 75m) | PASS |
+
+What the runs showed:
+
+- **`sample` kept the same shards in every life.** The backend held 70 series, the 7 kept
+  shards' 10 each, and `ledger.absent` found no series of shards 1, 4, or 8 across 4 SUT lives
+  (a stop, a kill, and a restart). `sample` discarded 30% of each life's lines, 147,600 of
+  492,000 in life 0 and 270,030 of 900,100 in the final life, as 3 of 10 equally loaded shards
+  give, and no verdict was `by="missing"`. `ledger.edge` balanced the node's discards in every
+  life, and the killed life's Ab − V of 7,140 sat inside its band.
+- **Receive-time collisions merge most of a statsd stream at 1 ms.** `dedup` merged 783,792 of
+  the final life's 900,100 lines, 87%: the generator writes 100 lines at a time over 10 series,
+  and a burst's datagrams mostly land in one millisecond. Every merged record emptied its event,
+  so T_disc == M held in the final life, `metrics.absorbed` and `metrics.passed_through` stayed
+  0, and V equaled Ab + M: 900,100 with Ab 116,308. Without the merge term,
+  `ledger.egress` would FAIL the final life on an Ab − V of −783,792.
+- **A capped name's churn costs nothing that grows, over 23 minutes.** After warmup every one
+  of the 200 churn lines a second folded into its name's overflow series, 276,000 of them; 10
+  names were overflowing in every window, `series.active` peaked at 110, no record dropped for
+  `series_limit`, and the backend held 210 series: 100 fixed names, 10 admitted values per churn
+  name, and 10 overflow series. The SUT's interner grew 10.5 strings an hour, so a tag value
+  isn't interned, and `rss_slope` read +4.3 MiB/h on the SUT and +1.2 on the generator against
+  48. A 25-minute run reports growth as WARN at most, so the expected PASS is still owed a run of
+  an hour or more at the scenario's default 75 minutes.
+
+`aggregate`'s `max_series` admission drops got no scenario: see item 19.
 
 ### W23: a `cumulative_to_delta` value ledger (2026-10-29)
 

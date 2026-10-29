@@ -184,6 +184,14 @@ polling service when a reload follows it there, a torn read, but not with no lat
 service that doesn't poll; a rotation a later probe reads loaded by a SIGHUP or a start on a SUT
 that doesn't poll; the TLS directory's mode under a narrow umask; and the `rise` reducer.
 
+For `sample` and `dedup_timestamps` in the path, it covers sampling.py's XXH64 against xxHash's
+published vectors and `logit_core::sampling`'s pinned ones, and the shipped sample-path
+scenario's selectors against its verdicts; every `vm_absent_selector` and `merge` rule; and over
+synthetic runs, `ledger.absent` passing an empty export and FAILing a stored series, a failed
+export, and one that never ran, and the merge term crediting M back in the final and a stopped
+life, with discards past M, a superseded reading in either life, and an undeclared merge each
+FAILing.
+
 No part can reach a daemon. `run` sets `$DOCKER` to a path that doesn't exist for the whole
 suite and restores the caller's value after it, so a `Docker()` built without `prefix=`, through
 a slip in a part's own stand-ins included, gets rc 127 from `Docker.run`'s `OSError` instead of
@@ -208,7 +216,7 @@ import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import (checks, collect, docker, driver, faults, otlp, report, scenario, standin,
+from . import (checks, collect, docker, driver, faults, otlp, report, sampling, scenario, standin,
                telemetry,
                topic, vm)
 
@@ -11856,6 +11864,267 @@ def _delta_rules(root):
              "ledger: missing `sut_aggregate`", "neither sut_delta nor sut_aggregate")
 
 
+def _sampling_vectors(root):
+    """sampling.py against xxHash's published seed-0 vectors and `logit_core::sampling`'s
+    pinned ones, `keep`'s rate-0.5 edge, and the shipped sample-path scenario: its
+    `vm_selector` names the shards its SUT's `sample` keeps and its `vm_absent_selector` the
+    ones it discards, every shard the generator writes on one of the two."""
+    for data, want in sampling.VECTORS:
+        got = sampling.xxh64(data)
+        expect(got == want, f"XXH64({data!r}) is {want:#018x}, got {got:#018x}")
+    expect(sampling.keep(0x7FFF_FFFF_FFFF_FFFF, 0.5) and not sampling.keep(1 << 63, 0.5),
+           "at rate 0.5 the threshold is 2^63")
+    expect(sampling.keep(0, 1.0) and not sampling.keep(0, 0.0),
+           "rate 1 keeps everything and rate 0 nothing")
+
+    directory = root / "scenarios" / "sample-path"
+    sut = (directory / "logit-sut.yaml").read_text()
+    gen = (directory / "logit-generator.yaml").read_text()
+    rate = float(re.search(r"^\s*rate:\s*([0-9.]+)", sut, re.M).group(1))
+    shards = int(re.search(r"shard:\s*\"\{seq%([0-9]+)\}\"", gen).group(1))
+    verdicts = sampling.verdicts(range(shards), rate)
+    kept = {key for key, (_, keep) in verdicts.items() if keep}
+    loaded = scenario.load(directory / "scenario.toml")
+    sink = loaded.sinks[0]
+
+    def named(selector):
+        match = re.search(r'shard=~"([0-9|]+)"', selector or "")
+        return set(match.group(1).split("|")) if match else None
+
+    expect(named(sink.get("vm_selector")) == kept,
+           f"sample-path's vm_selector names the kept shards {sorted(kept)}, got "
+           f"{sink.get('vm_selector')}")
+    expect(named(sink.get("vm_absent_selector")) == set(verdicts) - kept,
+           f"sample-path's vm_absent_selector names the discarded shards "
+           f"{sorted(set(verdicts) - kept)}, got {sink.get('vm_absent_selector')}")
+
+    # A misspelled name or label in the absent selector matches nothing, and ledger.absent
+    # would PASS on it, so the two selectors may differ only in their shard sets.
+    def frame(selector):
+        return re.sub(r'shard=~"[0-9|]+"', 'shard=~"*"', selector or "")
+
+    expect(frame(sink.get("vm_absent_selector")) == frame(sink.get("vm_selector")),
+           f"sample-path's vm_absent_selector is its vm_selector with only the shard set "
+           f"swapped, got {sink.get('vm_absent_selector')} against {sink.get('vm_selector')}")
+    expect(0 < len(kept) < shards, f"sample-path keeps some shards and discards some, got "
+           f"{sorted(kept)} of {shards}")
+
+
+def _absent_rules(root):
+    """`load()`'s rules for a sink's `vm_absent_selector`."""
+    path, raw = _base(root)
+
+    def problems(target=None, **sink):
+        changed = copy.deepcopy(raw)
+        changed["ledger"]["sink"][0].update(sink)
+        if target is not None:
+            changed["target"] = target
+            for key in ("backend", "vm_selector"):
+                changed["ledger"]["sink"][0].pop(key, None)
+        try:
+            scenario.from_dict(changed, path)
+            return []
+        except scenario.ScenarioError as err:
+            return err.problems
+
+    good = problems(vm_absent_selector='{__name__="other_total"}')
+    expect(good == [], f"a vm_absent_selector on a local sink loads, got {good}")
+    selector = raw["ledger"]["sink"][0]["vm_selector"]
+    for value in ("", 5, selector):
+        found = problems(vm_absent_selector=value)
+        expect(any("`vm_absent_selector` must be a selector other than `vm_selector`" in p
+                   for p in found), f"vm_absent_selector {value!r} is refused, got {found}")
+    found = problems(target={"kind": "external", "name": "datadog", "env": ["DD_API_KEY"]},
+                     vm_absent_selector='{__name__="other_total"}')
+    expect(any("`vm_absent_selector` names a backend query" in p for p in found),
+           f"vm_absent_selector on an external target is refused, got {found}")
+
+
+def _absent_run(tmp, name, series=(), phase="vm_absent_exported", error=None):
+    """`_ledger_run`'s two-life run with `vm_absent_selector` on its sink: the absent export
+    holds `series`, and the timeline records `phase` for it, none when None."""
+    extra = []
+    if phase == "vm_absent_exported":
+        extra.append(_phase(phase, 329, sink="sink", series=len(series)))
+    elif phase is not None:
+        extra.append(_phase(phase, 329, sink="sink", error=error))
+    run_dir = _ledger_run(tmp, name, timeline_extra=extra)
+    resolved_path = run_dir / "scenario.resolved.json"
+    resolved = json.loads(resolved_path.read_text())
+    resolved["ledger"]["sink"][0]["vm_absent_selector"] = '{__name__="x_9_total"}'
+    resolved_path.write_text(json.dumps(resolved))
+    (run_dir / "vm-export" / f"sink{checks.ABSENT_SUFFIX}").write_text(
+        "".join(json.dumps(one) + "\n" for one in series))
+    return {r.id: r for r in checks.run_all(run_dir)}
+
+
+def _absent_checks():
+    """`ledger.absent`: an empty export PASSes, a series FAILs naming the lives its samples fall
+    in, and an export that failed or never ran FAILs; a run with no selector SKIPs."""
+    with tempfile.TemporaryDirectory() as tmp:
+        plain = {r.id: r for r in checks.run_all(_ledger_run(tmp, "absent-none"))}
+        expect(plain["ledger.absent"].status == checks.SKIP,
+               f"a run with no vm_absent_selector SKIPs, got {plain['ledger.absent']}")
+        clean = _absent_run(tmp, "absent-clean")["ledger.absent"]
+        expect(clean.status == checks.PASS
+               and clean.detail == 'sink: no series match {__name__="x_9_total"} in any of 2 '
+               "SUT life/lives",
+               f"an empty absent export PASSes, got {clean}")
+        stored = {"metric": {"__name__": "x_9_total", "shard": "1"}, "values": [3, 4],
+                  "timestamps": [int((T0 + 200) * 1000), int((T0 + 210) * 1000)]}
+        held = _absent_run(tmp, "absent-held", series=[stored])["ledger.absent"]
+        expect(held.status == checks.FAIL
+               and "1 series match" in held.detail and "x_9_total{shard=1}" in held.detail
+               and any("2 sample(s) in SUT life/lives 1" in line for line in held.lines),
+               f"a stored series FAILs naming its life, got {held} {held.lines}")
+        failed = _absent_run(tmp, "absent-failed", phase="vm_absent_export_failed",
+                             error="timed out")["ledger.absent"]
+        expect(failed.status == checks.FAIL and "the export failed: timed out" in failed.detail,
+               f"a failed absent export FAILs, got {failed}")
+        missing = _absent_run(tmp, "absent-missing", phase=None)["ledger.absent"]
+        expect(missing.status == checks.FAIL
+               and "no vm_absent_exported phase in the timeline" in missing.detail,
+               f"an absent export that never ran FAILs, got {missing}")
+
+
+def _merge_run(tmp, name, offset=200, n=7, merged=None, absorbed=0, declared=True):
+    """`_ledger_run`'s two-life run with a `dedup_timestamps` node, `dedup`, between `in` and
+    `window`: in the SUT drain at `offset` it merges `merged` records (default `n`) and
+    discards the `n` events they emptied, counted, with V unchanged, since a merged increment
+    reaches V in its survivor. `absorbed` records it superseded are counted beside them. With
+    `declared` the source names the node in `merge`."""
+    run_dir = _ledger_run(tmp, name)
+    _discard(_with_chain(run_dir, ("dedup",)), ("dedup",), "dedup", offset, n)
+    path = run_dir / "vm-export" / "sink.jsonl"
+    series = vm.parse_export(path.read_text())
+    same_life = (lambda s: s < STOP[1]) if offset < STOP[1] else (lambda s: s >= STOP[1])
+    for one in series:
+        if one["metric"]["__name__"] == "x_0_total":
+            one["values"] = [value + n if offset <= ms / 1000 - T0 and same_life(ms / 1000 - T0)
+                             else value for value, ms in zip(one["values"], one["timestamps"])]
+    _write_export(run_dir, "sink", series)
+    stdout = run_dir / "logs" / "logit.stdout"
+    lines = [_line(_stamp(T0 + offset), "logit.transform.metrics.merged", "sum",
+                   n if merged is None else merged, component="dedup")]
+    if absorbed:
+        lines.append(_line(_stamp(T0 + offset), "logit.transform.metrics.absorbed", "sum",
+                           absorbed, component="dedup"))
+    stdout.write_text(stdout.read_text() + "\n".join(lines) + "\n")
+    if declared:
+        resolved_path = run_dir / "scenario.resolved.json"
+        resolved = json.loads(resolved_path.read_text())
+        resolved["ledger"]["source"][0]["merge"] = ["dedup"]
+        resolved_path.write_text(json.dumps(resolved))
+    return {r.id: r for r in checks.run_all(run_dir)}
+
+
+def _merge_ledger():
+    """The merge term: a `merge` node's discards are its merged records, which `ledger.edge`
+    holds them to, and every later row credits back as delivered (Ab + M), in the final life
+    and in a stopped earlier one; a superseded record at the node FAILs the edge, and the same
+    merges with no `merge` declared read as a surplus."""
+    with tempfile.TemporaryDirectory() as tmp:
+        final = _merge_run(tmp, "merge-final")
+        for row in ("ledger.intake", "ledger.edge", "ledger.aggregate", "ledger.egress",
+                    "ledger.summary", "drops"):
+            expect(final[row].status == checks.PASS,
+                   f"{row} PASSes merges credited in the final life, got {final[row]}")
+        edge = final["ledger.edge"].detail
+        expect("T_in[dedup] 34,000 − T_disc[dedup] 7 = 33,993 == T_out[dedup] 33,993" in edge
+               and "T_disc[dedup] 7 == M[dedup] 7 (dedup discards only what it merged)" in edge
+               and "T_ab[dedup] 0 == expected 0 (dedup supersedes no reading)" in edge,
+               f"ledger.edge judges the merge node's discards and holds them to M, got {edge}")
+        egress = final["ledger.egress"].detail
+        expect("life 1 (final): Ab + M 33,993 + 7 = 34,000" not in egress
+               and "life 1 (final): Ab + M 34,000 − V[sink] 34,000 = 0, ok" in egress,
+               f"ledger.egress credits M back in the final life, got {egress}")
+        summary = final["ledger.summary"].detail
+        expect("Ab + M − V[sink] 0" in summary
+               and "the transforms' ΣT_disc 7, of which M 7 merged and credited in Ab + M, "
+               "counted 0" in summary,
+               f"ledger.summary credits M back, got {summary}")
+
+        stopped = _merge_run(tmp, "merge-stopped", offset=50)
+        egress = stopped["ledger.egress"].detail
+        expect(stopped["ledger.egress"].status == checks.PASS
+               and "life 0: W − D − B − X − (ΣT_disc − M) − V 0 = residual 30" in egress,
+               f"a stopped life's egress gap credits M back, got {egress}")
+        intake = stopped["ledger.intake"].detail
+        expect(stopped["ledger.intake"].status == checks.PASS
+               and "life 0: W − D − B − X − (ΣT_disc − M) − (Ab + M) 30 within [0, R]" in intake,
+               f"a stopped life's residual credits M back, got {intake}")
+
+        undeclared = _merge_run(tmp, "merge-undeclared", declared=False)
+        expect(undeclared["ledger.egress"].status == checks.FAIL
+               and "Ab 33,993 − V[sink] 34,000 = -7, uncounted"
+               in undeclared["ledger.egress"].detail,
+               f"merges with no `merge` declared leave V above Ab, got "
+               f"{undeclared['ledger.egress']}")
+
+        short = _merge_run(tmp, "merge-short", merged=5)
+        edge = short["ledger.edge"].detail
+        expect(short["ledger.edge"].status == checks.FAIL
+               and "T_disc[dedup] 7 != M[dedup] 5, off by 2" in edge,
+               f"discards past the merged count FAIL the edge, got {edge}")
+        superseded = _merge_run(tmp, "merge-absorbed", absorbed=2)
+        edge = superseded["ledger.edge"].detail
+        expect(superseded["ledger.edge"].status == checks.FAIL
+               and "T_ab[dedup] 2 != expected 0, off by 2" in edge,
+               f"a superseded reading at the merge node FAILs the edge, got {edge}")
+        earlier = _merge_run(tmp, "merge-absorbed-earlier", offset=50, absorbed=2)
+        edge = earlier["ledger.edge"].detail
+        expect(earlier["ledger.edge"].status == checks.FAIL
+               and "life 0: T_ab[dedup] 2 != expected 0, off by 2" in edge,
+               f"a superseded reading in an earlier life FAILs the edge too, got {edge}")
+
+
+def _merge_rules(root):
+    """`load()`'s rules for a source's `merge`, and the shipped dedup-merge scenario."""
+    path, raw = _base(root)
+    sut = ("components:\n  statsd: { type: statsd_in, bind: 0.0.0.0:8125 }\n"
+           "  dedup: { type: dedup_timestamps, sources: [statsd], precision: 1ms }\n"
+           "  stale: { type: drop_stale, sources: [dedup], max_age: 30s }\n"
+           "  points: { type: line_protocol, sources: [stale] }\n")
+
+    def problems(chain=("dedup", "stale"), **source):
+        with tempfile.TemporaryDirectory() as tmp:
+            changed = copy.deepcopy(raw)
+            for key, name in changed["configs"].items():
+                text = sut if key == "sut" else (path.parent / name).read_text()
+                (Path(tmp) / name).write_text(text)
+            changed["ledger"]["source"][0].update(sut_transforms=list(chain), **source)
+            try:
+                scenario.from_dict(changed, Path(tmp) / "scenario.toml")
+                return []
+            except scenario.ScenarioError as err:
+                return err.problems
+
+    good = problems(merge=["dedup"])
+    expect(good == [], f"a merge on a dedup_timestamps node loads, got {good}")
+    for source, needle in (
+            ({"merge": "dedup"}, "`merge` must list distinct `sut_transforms` nodes"),
+            ({"merge": []}, "`merge` must list distinct `sut_transforms` nodes"),
+            ({"merge": ["dedup", "dedup"]}, "`merge` must list distinct `sut_transforms` nodes"),
+            ({"merge": ["other"]}, "`merge` names 'other', which isn't in"),
+            ({"merge": ["stale"]}, "`merge` names 'stale', a drop_stale; only a "
+                                   "dedup_timestamps merges records")):
+        found = problems(**source)
+        expect(any(needle in problem for problem in found),
+               f"{source} is refused with {needle!r}, got {found}")
+    found = problems(chain=("dedup", "points"), merge=["dedup"], fan_out={"points": 4})
+    expect(any("`merge` and `fan_out` can't be combined" in problem for problem in found),
+           f"merge beside fan_out is refused, got {found}")
+    found = scenario._merge_problems({"split": "target"},
+                                     {"sut_transforms": ["dedup"], "merge": ["dedup"]}, "here")
+    expect(any("can't be combined with split = \"target\"" in problem for problem in found),
+           f"merge under split = \"target\" is refused, got {found}")
+
+    merged = scenario.load(root / "scenarios" / "dedup-merge" / "scenario.toml")
+    expect(merged.sources[0].get("merge") == ["dedup"]
+           and merged.sources[0].get("sut_transforms") == ["dedup"],
+           f"dedup-merge declares its merge node, got {merged.sources}")
+
+
 def _shipped(root):
     paths = scenario.shipped(root)
     expect(bool(paths), "at least one shipped scenario")
@@ -11904,8 +12173,9 @@ def run(root, quiet=False):
                      _overlap_driver, _overlap_checks, _idp_rules, _refresh_checks,
                      _signal_rules, _signal_actions, _sighup_driver,
                      _reopen_checks, _tls_rules, _tls_actions, _tls_driver, _tls_checks,
-                     _fan_out_ledger, _idle_writer, _boundary_skew, _fan_out_rules, _delta_ledger,
-                     _delta_rules, _shipped):
+                     _fan_out_ledger, _idle_writer, _boundary_skew, _fan_out_rules,
+                     _sampling_vectors, _absent_rules, _absent_checks, _merge_ledger,
+                     _merge_rules, _delta_ledger, _delta_rules, _shipped):
             try:
                 takes_root = (_rules, _expect_rules, _expand, _random, _signals, _hung_inspect,
                               _stalled, _stall_abort,
@@ -11921,7 +12191,8 @@ def run(root, quiet=False):
                               _datadog_rules, _influx_codec, _influx_server, _influx_rules,
                               _overlap_rules, _overlap_driver, _idp_rules, _signal_rules,
                               _sighup_driver,
-                              _tls_rules, _tls_driver, _fan_out_rules, _delta_rules)
+                              _tls_rules, _tls_driver, _fan_out_rules, _sampling_vectors,
+                              _absent_rules, _merge_rules, _delta_rules)
                 part(root) if part in takes_root else part()
             except Exception as err:  # report the part that broke, then keep going
                 _FAILURES.append(f"{part.__name__}: {type(err).__name__}: {err}")
