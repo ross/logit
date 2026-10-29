@@ -2552,7 +2552,7 @@ where it needs them, and a small check extension.
     open, taken off W, since the client resends it. A `503` and
     `logit.input.batches.deferred` are a retry the producer makes, not loss, and a client's
     resend of a request the SUT took before the answer was lost is a surplus, allowed one
-    batch per transport-error attempt, as a TCP window's is per ambiguous drop. `otlp_in` has
+    batch per transport-error attempt, as a TCP window's is per ambiguous attempt. `otlp_in` has
     rows of its own in `checks.HTTP_LISTENERS`, with W per log record and per metric data
     point (one `Event` each) and no request identity, for W13b's generator, which
     `otlp-fan-out` runs, and W23's, which `delta-datadog` runs.
@@ -2832,11 +2832,13 @@ under "Deferred to a later round" wait.
     `logit.output.requests{class="ambiguous"}`. A failed first write over TLS is `Ambiguous`,
     not `Clean` as over plaintext (`crates/logit-outputs/src/stream.rs`'s module table), so the
     same allowance covers the TLS phase. Rows: `ledger.wire` with that allowance, and
-    `[[expect]]` on item 23's reset counter. W27 also writes a `docs/known-gaps/sinks.md` entry,
-    after checking no other gap file has one: a TCP stream sink counts a frame delivered once the
-    kernel accepts it, so the bytes in the sender's send buffer or the receiver's receive buffer
-    when the receiver is killed are lost uncounted. That loss is unmeasured: in `tcp-ingress` it
-    sits inside a kill's gap made mostly of counters the killed process never exported.
+    `[[expect]]` on item 23's reset counter. A TCP stream hop is best-effort by decision
+    ([ADR `delivery-semantics`](../adr/delivery-semantics.md), item 6): the bytes in the
+    sender's send buffer or the receiver's receive buffer when the receiver is killed are lost.
+    W27 writes a `docs/known-gaps/sinks.md` entry for the open part, after checking no other gap
+    file has one: the sink doesn't count the bytes its peer never acknowledged, and the loss is
+    unmeasured, since in `tcp-ingress` it sits inside a kill's gap made mostly of counters the
+    killed process never exported. The operator's workaround goes in `docs/deploying.md`.
 25. **SUT sinks into real receivers (W28).** Three scenarios, each with an `aggregate` under
     `temporality: cumulative` so VictoriaMetrics' reset-aware V applies:
     - `graphite-egress`: SUT `graphite_out`, TCP plaintext, → VictoriaMetrics' Graphite
@@ -3109,8 +3111,8 @@ that items 3, 7, and 11 need.
   row in `docs/design/internal-telemetry.md`, and item 8's text updated to name it.
 - **W27**: item 24: the `at_least_once` resend allowance on the `tcp` wire, self-test fixtures
   for it, the `syslog_in` TCP and TLS scenarios with `[[expect]]` rows on W26's counter, each
-  run recorded under "Findings", and the `docs/known-gaps/sinks.md` entry for a TCP stream
-  sink's kernel-buffer loss.
+  run recorded under "Findings", the `docs/known-gaps/sinks.md` entry for a stream sink's
+  uncounted unacknowledged bytes, and the operator's workaround in `docs/deploying.md`.
 - **W28**: item 25: the compose overrides for VictoriaMetrics' Graphite listener and the
   `collector` service, and the `graphite-egress`, `otlp-egress`, and `otlp-grpc-egress`
   scenarios, each run recorded under "Findings".
@@ -6320,8 +6322,10 @@ What the runs showed:
   the four kills' gaps were 9,916, 9,812, 9,800, and 9,814 lines, while the killed life's last
   drain came 5.0 s before each kill, about 10,000 lines at 2,000 a second that it read and never
   exported. Each gap fell within about 400 lines of that, the estimate's error, so the buffers
-  held little at the kill. The loss they can hold is a [known gap](../known-gaps/sinks.md), and
-  no scenario stalls the receiver behind a full buffer before killing it.
+  held little at the kill. That loss is the best-effort hop
+  [ADR `delivery-semantics`](../adr/delivery-semantics.md) item 6 decides; counting it, and a
+  receiver stalled behind a full buffer before the kill, which no scenario measures, are a
+  [known gap](../known-gaps/sinks.md).
 - **A stop or kill cuts a plaintext frame.** The plaintext runs counted 6 and 8
   `logit.input.frames.dropped{reason="truncated"}`, octet-counted frames a closing connection
   ended mid-frame, which `ledger.wire` counts in F. The TLS runs counted none.

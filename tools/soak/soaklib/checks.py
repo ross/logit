@@ -3415,10 +3415,10 @@ def _wire_one(data, led, source, instances=None):
                            **{"class": HTTP_CONNECT_CLASS}))
                 if http else [])
     # Each steady or judged run counts at 0 when W + K + F exceeds G in it, so a surplus in one
-    # run can't net out loss in another. The one exception is a boundary that touches a judged
-    # run, where an opposite-signed pair nets in full, up to the G that moved over the generator
-    # interval straddling it, before the surplus run's allowance applies to what's left
-    # (`_boundary_nets` says why).
+    # run can't net out loss in another. The exceptions are a boundary that touches a judged run
+    # and the end run's boundary, where an opposite-signed pair nets in full, up to the G that
+    # moved over the generator interval straddling it, before the surplus run's allowance or the
+    # end allowance applies to what's left (`_boundary_nets` says why).
     nets, netted = _boundary_nets(runs, anchors)
     steady_lost = 0.0
     g_steady = 0.0

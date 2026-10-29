@@ -11747,6 +11747,30 @@ def _idle_writer():
                    for line in steady.lines)
            and steady.detail.startswith("600 lost outside reported HTTP windows"),
            f"a steady surplus nets a judged loss only up to the straddling G, got {steady}")
+
+    # 3,000 duplicates in the steady run's last drain, at +300, beside 3,000 the generator
+    # counted in the end run at +305 that the listener never read: the pair nets only the
+    # 1,000 of G that moved over the generator interval straddling +300, so 2,000 of loss
+    # stands at the end.
+    def late_delivery(record):
+        metric = record["metrics"][0]
+        if (record["timestamp"] != _stamp(T0 + 300) or metric["name"]
+                != "logit.component.events.delivered"
+                or record["attributes"].get("component") != "out"):
+            return record
+        late = copy.deepcopy(record)
+        late["timestamp"] = _stamp(T0 + 305)
+        late["metrics"][0]["value"] = 3000
+        return [record, late]
+
+    end_loss = wire_with("boundary-end-beyond", {300: 3000}, gen_edit=late_delivery)
+    expect(end_loss.status == checks.FAIL
+           and any(line.startswith("[+300s, ") and "end" in line
+                   and "1,000 netted across the boundary at +300s" in line
+                   and "net gap 2,000" in line for line in end_loss.lines)
+           and end_loss.detail.startswith("2,000 lost outside reported HTTP windows"),
+           f"an end loss past the straddling G beside duplicates before it FAILs, got "
+           f"{end_loss}")
     # A loss in one judged window and a surplus in another that doesn't touch it: nothing
     # nets, so the loss and the surplus each FAIL.
     apart = wire_with("boundary-apart", {150: -800, 220: 800})
@@ -11780,6 +11804,15 @@ def _boundary_skew():
         got, _ = checks._boundary_nets(mixed, anchors)
         expect([round(net) for net in got] == want,
                f"a judged run beside a {kind} run nets to {want}, got {got}")
+    # Duplicates in the steady run before the end net an end loss only as far as the straddling
+    # G of 1,000; the 2,000 past it stays a loss at the end.
+    ending = [[600.0, 665.0, "steady", "no fault", 10_000, 13_000, 0],
+              [665.0, 690.0, "end", "end sequence", 5_000, 2_000, 0]]
+    capped_end, netted_end = checks._boundary_nets(ending, [(660.0, 0.0), (667.0, 1000.0)])
+    expect([round(net) for net in capped_end] == [-2000, 2000]
+           and netted_end.get(1) == [(1000.0, 665.0, 1000.0)],
+           f"an end loss nets the steady duplicates before it only up to the straddling G, got "
+           f"{capped_end} {netted_end}")
 
 
 def _fan_out_rules(root):

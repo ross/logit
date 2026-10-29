@@ -314,8 +314,11 @@ overflow and ambiguous attempts around the pause and no `ambiguous_at_most_once`
 both hold the listener's `logit.input.connections.closed{reason="reset"}` at 0 under the pause,
 the partition, the generator's stop, and the whole run: the listener never writes to a
 plaintext peer, so a closing generator sends a FIN, and over TLS no fault in the recorded runs
-reset a connection either. A stop or kill of the SUT loses what sat in the two socket buffers, which neither side counts
-([known gap](../../docs/known-gaps/sinks.md)), so `ledger.wire` reports those windows.
+reset a connection either. A stop or kill of the SUT loses what sat in the two socket buffers,
+which neither side counts: a stream hop with no acknowledgment is best-effort
+([ADR `delivery-semantics`](../../docs/adr/delivery-semantics.md), item 6), and counting the
+sender's part is a [known gap](../../docs/known-gaps/sinks.md). So `ledger.wire` reports those
+windows.
 
 `http-ingress` (18 minutes) sends 2,000 InfluxDB points a second with `influxdb_out`, 100 to a
 request, into `influxdb_in`, its source declared `wire = "http"`. Each point carries only a
