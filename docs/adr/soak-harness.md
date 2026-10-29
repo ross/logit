@@ -1,6 +1,6 @@
 ---
 created: 2026-10-08
-updated: 2026-10-25
+updated: 2026-10-29
 ---
 
 # A soak harness: real containers over ordinary config, one-shot netem, and a reset-aware ledger as the loss oracle
@@ -577,3 +577,32 @@ Re-scored, the failed run PASSes with 90 of loss judged against 650, and the pas
 96 as before. A backend stop still opens no judged HTTP window: whether it reaches the wire
 depends on the listener (`otlp_in` holds a request past the writer's timeout, `influxdb_in`
 answers a busy `503`), so its resends' surplus counts 0 as steady state's does.
+
+## Amendment: a delta transform's value is judged beside its points (2026-10-29)
+
+A `cumulative_to_delta` node's point counts can balance while its values don't: a delta that
+leaves a series' baseline wrong carries the wrong value in a point the count rows accept. So a
+scenario that names the node in `[ledger] sut_delta` gains `ledger.value`, which holds the sum
+of the deltas a Datadog-shaped stand-in stored, V, to the increments the generator's
+`generate_in` sent less its counted drops, I.
+
+- **The record holds the values a cue loses.** A `rejected` step and a `202` naming
+  `series_errors` lose deltas the sink counts only as records, and the transform has already
+  moved its baseline past them. The stand-in records every request body, so the row reads each
+  never-stored point whose last request drew one of those answers, U, and judges I − V − U
+  exactly. Reporting those cues instead, as first planned, would excuse whatever else their
+  windows lost.
+- **A first point the transform skips is reported inside a bound.** Under `initial_value: auto`
+  the transform skips a series' first point after its start, a restart, or an idle eviction,
+  and no counter gives that point's value. Each drain that counts `skipped{reason="initial"}`
+  or `series.evicted` opens a window back to the node's previous receiving drain, and the gap is
+  reported if the generator's increments in those windows cover it. A gap past them FAILs: the
+  windows bound the loss they explain, and don't excuse loss elsewhere.
+- **The count rows judge points with the node in `aggregate`'s place.** Ab is its
+  `events.sent`, its skipped points leave every row as a transform's counted discards do, and V
+  is the stand-in's distinct points, each credited to the life its request arrived in, because a
+  point's timestamp is the generator's window and can precede the SUT life that sent it.
+
+The node replaces `sut_aggregate` rather than sitting beside one, since an `aggregate` after it
+would resum the deltas the row judges. [`docs/plans/soak-harness.md`](../plans/soak-harness.md),
+"10. Next scenarios", item 20, has the rules.

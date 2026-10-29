@@ -1,0 +1,31 @@
+# The load source in `script/soak`'s delta-datadog scenario: 1,000 counter increments a second
+# over 20 series, summed into running totals every 5 s and sent to the system under test as OTLP
+# cumulative sums over HTTP, as an OTel SDK's default temporality sends them. Its `internal`
+# telemetry goes to stdout as NDJSON, so the harness reads what it sent: `generate_in`'s events
+# are the increments `ledger.value` judges the stored deltas against.
+admin: { bind: 127.0.0.1:9600 }
+components:
+  load:
+    type: generate_in               # unbounded
+    rate: 1000
+    batch: 100
+    event:
+      metric: { name: "logit.soak.requests_{seq%20}", kind: sum, value: 1 }
+  totals:
+    type: aggregate
+    sources: [load]
+    interval: 5s
+    # Each window sends every series' running total, its start the series' first increment.
+    temporality: cumulative
+    series_retention: 720           # an hour of windows: a pause must never evict a series
+  otlp:
+    type: otlp_out
+    sources: [totals]
+    endpoint: http://logit:4318
+    # 200 batches is over 16 minutes of windows, so no SUT fault overflows it. A cumulative
+    # point dropped here would cost no value, since the next one carries the total, but the
+    # wire row counts it. The default posture, at_least_once, resends a batch whose answer was
+    # lost, and the SUT's cumulative_to_delta skips the copy.
+    buffer: { max_batches: 200, overflow: drop_newest, retry_max_delay: 1s }
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }

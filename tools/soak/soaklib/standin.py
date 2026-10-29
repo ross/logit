@@ -681,7 +681,9 @@ class Counts:
     timestamp_ms, first value, later value)` per point stored again with another value;
     `undecodable` one `(seq, reason)` per stored body that doesn't decode; and `named`, under
     `datadog`, one `(seq, count, t)` per `series_errors` answer: the series it named and when it
-    was answered, epoch seconds."""
+    was answered, epoch seconds. `arrivals`, under `datadog`, pairs each of `points`' terms with
+    the time its request was answered, epoch seconds, in place of the point's own timestamp: a
+    point a generator stamped carries the generator's clock, not the life that sent it."""
 
     series: list = field(default_factory=list)
     points: list = field(default_factory=list)
@@ -690,6 +692,7 @@ class Counts:
     conflicts: list = field(default_factory=list)
     undecodable: list = field(default_factory=list)
     named: list = field(default_factory=list)
+    arrivals: list = field(default_factory=list)
 
 
 def stored_points(requests):
@@ -759,11 +762,33 @@ def stored_counts(requests):
                 seen.append((value, index))
                 points[stamp] = points.get(stamp, 0.0) + value
                 counts.points.append((stamp / 1000, value))
+                counts.arrivals.append((request.get("t"), value))
     for key, points in sorted(by_series.items()):
         stamps = sorted(points)
         counts.series.append({"metric": dict(key), "timestamps": stamps,
                               "values": [points[stamp] for stamp in stamps]})
     return counts
+
+
+def unstored_points(requests, series):
+    """`[(series key, timestamp_ms, value, index)]`, one per `(series, timestamp)` a decodable
+    `datadog` request sent that `series` (from `stored_counts`) doesn't hold, with its value and
+    the record index of the last request that sent it: the deltas the destination never kept.
+    A resent point that a later request stored isn't one."""
+    stored = {(series_key(one["metric"]), stamp) for one in series
+              for stamp in one["timestamps"]}
+    unstored = {}
+    for index, request in enumerate(requests):
+        try:
+            decoded = decode_body(request, DATADOG)
+        except DecodeError:
+            continue
+        for labels, samples in decoded:
+            key = series_key(labels)
+            for stamp, value in samples:
+                if (key, stamp) not in stored:
+                    unstored[(key, stamp)] = (key, stamp, value, index)
+    return list(unstored.values())
 
 
 def acknowledged_unstored(requests, series, shape=REMOTE_WRITE):

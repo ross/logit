@@ -11585,6 +11585,255 @@ def _fan_out_rules(root):
            f"otlp-fan-out declares its fan-out over an http wire, got {fan.sources}")
 
 
+# A `sut_delta` fixture: a generator `generate_in -> aggregate (cumulative) -> otlp_out` sending
+# `DELTA_SERIES` points a 5 s drain, each window's `DELTA_PER_DRAIN` increments split evenly
+# between them, into SUT `otlp_in -> cumulative_to_delta -> datadog_out`.
+DELTA_LEDGER = {"source": [{"service": "generator", "generator_input": "load",
+                            "generator_sink": "out", "sut_listener": "in", "wire": "http"}],
+                "sut_delta": "delta", "wire_loss_outside_faults": 0.0, "split": "copy",
+                "sink": [{"id": "sink"}]}
+DELTA_SERIES = 2
+DELTA_PER_DRAIN = 100
+DELTA_SUT = ("components:\n  in: { type: otlp_in, bind: 0.0.0.0:4318, protocol: http }\n"
+             "  delta: { type: cumulative_to_delta, sources: [in] }\n"
+             "  sink: { type: datadog_out, sources: [delta] }\n")
+DELTA_GENERATOR = ("components:\n  load: { type: generate_in }\n"
+                   "  totals: { type: aggregate, sources: [load], interval: 5s,"
+                   " temporality: cumulative }\n"
+                   "  out: { type: otlp_out, sources: [totals] }\n")
+
+
+def _delta_run(tmp, name, restart=False, evict_at=None, edit=None, timeline_extra=(),
+               sut_extra=(), gen_extra=()):
+    """A `sut_delta` run directory that balances in points and in value. The generator sends
+    from +5 to +300; each SUT drain receives one window's points and sends their deltas, each
+    stored by a `202` request a second before the drain. With `restart`, the SUT is stopped
+    over `STOP`: the generator's points from it reach life 1 in its first drain, where the
+    transform skips each series' first point, losing one window's increments, and the stand-in
+    stores the rest by one request, their timestamps in life 0. `evict_at` makes the drain at
+    that offset an idle eviction: each series evicted and its point skipped, a window's
+    increments lost. `edit(requests)` returns the record's request lines, edited."""
+    per_point = DELTA_PER_DRAIN / DELTA_SERIES
+    gen = []
+    for offset in range(5, 301, 5):
+        stamp = _stamp(T0 + offset)
+        for metric, value, component in (
+                ("logit.component.events.sent", DELTA_PER_DRAIN, "load"),
+                ("logit.component.batches.sent", 1, "load"),
+                ("logit.component.events.received", DELTA_SERIES, "out"),
+                ("logit.component.batches.received", 1, "out"),
+                ("logit.component.events.delivered", DELTA_SERIES, "out")):
+            gen.append(_line(stamp, metric, "sum", value, component=component))
+        gen.append(_line(stamp, "logit.process.uptime", "gauge", float(offset)))
+        gen.append(_line(stamp, "logit.component.buffer.batches", "gauge", 0, component="out"))
+    sut, requests = [], []
+    drains = ([(o, 0) for o in range(5, STOP[0], 5)] + [(o, 1) for o in range(135, 321, 5)]
+              if restart else [(o, 0) for o in range(5, 321, 5)])
+    for offset, life in drains:
+        stamp = _stamp(T0 + offset)
+        sut.append(_line(stamp, "logit.process.uptime", "gauge",
+                         float(offset - (STOP[1] if life else -1))))
+        windows = [offset] if offset <= 300 else []
+        if restart and offset == 135:
+            # The windows the stop held back, the first of each series skipped.
+            windows = list(range(105, 136, 5))
+        received = DELTA_SERIES * len(windows)
+        skipped = DELTA_SERIES if (restart and offset == 135) or offset == evict_at else 0
+        sent = received - skipped
+        stored = windows[1:] if skipped else windows
+        for metric, value, component, attrs in (
+                ("logit.component.events.sent", received, "in", None),
+                ("logit.component.events.received", received, "delta", None),
+                ("logit.component.events.sent", sent, "delta", None),
+                ("logit.component.events.discarded", skipped, "delta", None),
+                ("logit.transform.metrics.skipped", skipped, "delta", {"reason": "initial"}),
+                ("logit.component.events.received", sent, "sink", None),
+                ("logit.component.batches.received", 1 if sent else 0, "sink", None),
+                ("logit.component.batches.delivered", 1 if sent else 0, "sink", None)):
+            if value:
+                sut.append(_line(stamp, metric, "sum", value, component=component, attrs=attrs))
+        if offset == evict_at:
+            sut.append(_line(stamp, "logit.transform.series.evicted", "sum", DELTA_SERIES,
+                             component="delta", attrs={"reason": "idle"}))
+        sut.append(_line(stamp, "logit.component.buffer.batches", "gauge", 0, component="sink"))
+        sut.append(_line(stamp, "logit.component.retrying", "gauge", 0, component="sink"))
+        if stored:
+            series = [(f"x_{index}", [(int(T0) + window - 1, per_point) for window in stored])
+                      for index in range(DELTA_SERIES)]
+            requests.append(_datadog_request(len(requests) + 1, offset - 1, series))
+    timeline = [_phase("start", 0, t0=T0)]
+    if restart:
+        timeline += [_action("apply", "c0s1", "stop", "logit", STOP[0],
+                             affects_http_ingress=True),
+                     _action("revert", "c0s1", "stop", "logit", STOP[1] - 1, STOP[1],
+                             affects_http_ingress=True),
+                     _ready("c0s1", "logit", STOP[1] + 1)]
+    timeline += [_phase("end_begin", 300), _phase("end_end", 330)] + list(timeline_extra)
+    run_dir = _run_dir(tmp, name, timeline, sut + list(sut_extra), ledger=DELTA_LEDGER,
+                       target={"kind": "standin", "name": "standin", "env": [],
+                               "shape": standin.DATADOG},
+                       services={"logit": "sut", "generator": "generator", "standin": "standin"},
+                       configs={"sut": "sut.yaml", "generator": "generator.yaml"})
+    (run_dir / "configs").mkdir()
+    (run_dir / "configs" / "sut.yaml").write_text(DELTA_SUT)
+    (run_dir / "configs" / "generator.yaml").write_text(DELTA_GENERATOR)
+    (run_dir / "logs" / "generator.stdout").write_text("\n".join(gen + list(gen_extra)) + "\n")
+    stderr = [json.dumps({"timestamp": _stamp(T0 + offset), "level": "INFO",
+                          "message": "drain complete", "target": "logit", "duration": "1ms"})
+              for offset in ([STOP[0] + 0.6, 321] if restart else [321])]
+    (run_dir / "logs" / "logit.stderr").write_text("\n".join(stderr) + "\n")
+    requests = edit(requests) if edit else requests
+    _write_standin(run_dir, requests, shape=standin.DATADOG)
+    with open(run_dir / "logs" / "logit.stdout", "a") as out:
+        out.write("\n".join(_standin_telemetry(requests)) + "\n")
+    _write_export(run_dir, "sink", [])
+    return run_dir
+
+
+def _delta_ledger():
+    """The `sut_delta` rows over `_delta_run`'s fixtures: the count rows in points, with the
+    transform's skipped points counted and each stored point credited to the life its request
+    reached the stand-in in; `ledger.value` exact with no reported window, a surplus and a loss
+    FAILing it, a cued rejection's and a `series_errors` answer's deltas taken from the record,
+    an SUT restart and an idle eviction reported inside their band, and a loss past the band
+    FAILing; and an HTTP writer's own batch as the wire's unit."""
+    with tempfile.TemporaryDirectory() as tmp:
+        def rows(name, **kwargs):
+            return {r.id: r for r in checks.run_all(_delta_run(tmp, name, **kwargs))}
+
+        clean = rows("delta-clean")
+        for row in ("ledger.value", "ledger.egress", "ledger.aggregate", "ledger.summary",
+                    "ledger.edge", "ledger.standin"):
+            expect(clean[row].status == checks.PASS,
+                   f"a sut_delta run that balances PASSes {row}, got {clean[row]}")
+        expect("I 6,000 (generate_in sent 6,000 − lost 0) − V 6,000 − U 0 = 0, exact"
+               in clean["ledger.value"].detail,
+               f"ledger.value judges the increments exact, got {clean['ledger.value'].detail}")
+        led = checks.Ledger(checks.RunData(Path(tmp) / "delta-clean"))
+        expect(led.interval == 5.0,
+               f"under sut_delta the kill band's window is the generator's, got {led.interval}")
+        expect(led.gen_stats["generator"]["batch"] == DELTA_SERIES,
+               f"an HTTP writer's batch is its own, not its input's, got "
+               f"{led.gen_stats['generator']['batch']}")
+
+        def scaled(by):
+            def edit(requests):
+                request = requests[10]
+                series = [("x_0", [(int(T0) + 54, DELTA_PER_DRAIN / DELTA_SERIES + by)]),
+                          ("x_1", [(int(T0) + 54, DELTA_PER_DRAIN / DELTA_SERIES)])]
+                requests[10] = _datadog_request(request["seq"], request["t"] - T0, series)
+                return requests
+            return edit
+
+        short = rows("delta-short", edit=scaled(-10))
+        expect(short["ledger.value"].status == checks.FAIL
+               and "uncounted loss, with no reported window" in short["ledger.value"].detail
+               and short["ledger.egress"].status == checks.PASS,
+               f"a stored delta short of its increments FAILs ledger.value alone, got "
+               f"{short['ledger.value']}")
+        over = rows("delta-over", edit=scaled(10))
+        expect(over["ledger.value"].status == checks.FAIL
+               and "a surplus" in over["ledger.value"].detail,
+               f"a stored delta past its increments is a surplus, got {over['ledger.value']}")
+
+        # A 400 under a step classed `rejected`: its deltas are lost, and the record gives them.
+        def rejected(cue):
+            def edit(requests):
+                requests[10].update(status=400, stored=False, cue=cue)
+                return requests
+            return edit
+
+        drop = [_line(_stamp(T0 + 55), metric, "sum", value, component="sink",
+                      attrs={"reason": "rejected"})
+                for metric, value in (("logit.component.batches.dropped", 1),
+                                      ("logit.component.events.dropped", DELTA_SERIES),
+                                      ("logit.output.records.dropped", DELTA_SERIES))]
+        cued = rows("delta-rejected", edit=rejected("c0s2"), sut_extra=drop,
+                    timeline_extra=_respond_fault("c0s2", 50, 70, status=400, cls="rejected"))
+        expect(cued["ledger.value"].status == checks.PASS
+               and "U 100 = 0, exact; U 100 cued by c0s2" in cued["ledger.value"].detail,
+               f"a cued rejection's deltas are U, taken from the record, got "
+               f"{cued['ledger.value']}")
+        uncued = rows("delta-uncued", edit=rejected(None), sut_extra=drop)
+        expect(uncued["ledger.value"].status == checks.FAIL
+               and "100 in points never stored outside a cue" in uncued["ledger.value"].detail,
+               f"a delta never stored outside a cue is in the gap, got {uncued['ledger.value']}")
+
+        def named(requests):
+            requests[10]["series_errors"] = 1
+            return requests
+
+        errors = [_line(_stamp(T0 + 55), "logit.output.records.dropped", "sum", 1,
+                        component="sink", attrs={"reason": "rejected"})]
+        rows_named = rows("delta-series-errors", edit=named, sut_extra=errors,
+                          timeline_extra=_respond_fault("c0s1", 50, 70, status=202,
+                                                        series_errors=1))
+        expect(rows_named["ledger.value"].status == checks.PASS
+               and "U 50 = 0, exact" in rows_named["ledger.value"].detail,
+               f"the series a series_errors answer named are U, got {rows_named['ledger.value']}")
+
+        restarted = rows("delta-restart", restart=True)
+        for row in ("ledger.egress", "ledger.aggregate", "ledger.summary", "ledger.edge"):
+            expect(restarted[row].status == checks.PASS,
+                   f"an SUT restart's skipped points and late-stamped deltas balance {row}, got "
+                   f"{restarted[row]}")
+        expect(restarted["ledger.value"].status == checks.PASS
+               and "= 100, reported: within the band 1,000" in restarted["ledger.value"].detail
+               and "life 1 start (2 skipped initial)" in " ".join(restarted["ledger.value"].lines),
+               f"an SUT restart's lost window is reported inside its band, got "
+               f"{restarted['ledger.value']}")
+        extra = [_line(_stamp(T0 + 250), "logit.component.events.sent", "sum", 2000,
+                       component="load")]
+        past = rows("delta-restart-past", restart=True, gen_extra=extra)
+        expect(past["ledger.value"].status == checks.FAIL
+               and "so a judged window lost value" in past["ledger.value"].detail,
+               f"a loss past the reported windows' band FAILs, got {past['ledger.value']}")
+
+        evicted = rows("delta-evicted", evict_at=200)
+        expect(evicted["ledger.value"].status == checks.PASS
+               and "= 100, reported: within the band 400" in evicted["ledger.value"].detail
+               and "idle eviction (2 skipped initial, 2 evicted)"
+               in " ".join(evicted["ledger.value"].lines),
+               f"an idle eviction's lost window is reported inside its band, got "
+               f"{evicted['ledger.value']}")
+
+        # Points skipped in a life the restart ended: its residual takes Δ_disc out.
+        early = rows("delta-restart-evicted", restart=True, evict_at=50)
+        expect(early["ledger.egress"].status == checks.PASS
+               and "life 0: W − D − B − X − Δ_disc − V 0 = residual 0" in
+               early["ledger.egress"].detail,
+               f"a non-final life's skipped points leave no residual, got {early['ledger.egress']}")
+
+
+def _delta_rules(root):
+    """`[ledger] sut_delta`'s load-time rules, against the shipped delta-datadog scenario."""
+    path = root / "scenarios" / "delta-datadog" / "scenario.toml"
+    raw = tomllib.loads(path.read_text())
+    loaded = scenario.load(path)
+    expect(loaded.ledger.get("sut_delta") == "delta",
+           f"delta-datadog loads with its sut_delta, got {loaded.ledger}")
+
+    def mutate(change):
+        changed = copy.deepcopy(raw)
+        change(changed)
+        return changed
+
+    _refused(path, mutate(lambda r: r["ledger"].update(sut_aggregate="delta")),
+             "ledger.sut_aggregate can't be combined with ledger.sut_delta",
+             "sut_delta beside sut_aggregate")
+    _refused(path, mutate(lambda r: r["ledger"].update(sut_delta="datadog")),
+             "ledger.sut_delta names 'datadog', a datadog_out",
+             "sut_delta naming a component of another kind")
+    _refused(path, mutate(lambda r: r["target"].update(shape="influxdb")),
+             "ledger.sut_delta needs a standin target with shape = \"datadog\"",
+             "sut_delta under another stand-in shape")
+    _refused(path, mutate(lambda r: r["ledger"]["source"][0].update(sut_transforms=["delta"])),
+             "`sut_transforms` lists 'delta', the sut_delta node",
+             "sut_delta in a source's chain")
+    _refused(path, mutate(lambda r: r["ledger"].pop("sut_delta")),
+             "ledger: missing `sut_aggregate`", "neither sut_delta nor sut_aggregate")
+
+
 def _shipped(root):
     paths = scenario.shipped(root)
     expect(bool(paths), "at least one shipped scenario")
@@ -11633,7 +11882,8 @@ def run(root, quiet=False):
                      _overlap_driver, _overlap_checks, _idp_rules, _refresh_checks,
                      _signal_rules, _signal_actions, _sighup_driver,
                      _reopen_checks, _tls_rules, _tls_actions, _tls_driver, _tls_checks,
-                     _fan_out_ledger, _idle_writer, _boundary_skew, _fan_out_rules, _shipped):
+                     _fan_out_ledger, _idle_writer, _boundary_skew, _fan_out_rules, _delta_ledger,
+                     _delta_rules, _shipped):
             try:
                 takes_root = (_rules, _expect_rules, _expand, _random, _signals, _hung_inspect,
                               _stalled, _stall_abort,
@@ -11649,7 +11899,7 @@ def run(root, quiet=False):
                               _datadog_rules, _influx_codec, _influx_server, _influx_rules,
                               _overlap_rules, _overlap_driver, _idp_rules, _signal_rules,
                               _sighup_driver,
-                              _tls_rules, _tls_driver, _fan_out_rules)
+                              _tls_rules, _tls_driver, _fan_out_rules, _delta_rules)
                 part(root) if part in takes_root else part()
             except Exception as err:  # report the part that broke, then keep going
                 _FAILURES.append(f"{part.__name__}: {type(err).__name__}: {err}")

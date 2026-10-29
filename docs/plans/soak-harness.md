@@ -2457,8 +2457,9 @@ where it needs them, and a small check extension.
     `logit.input.batches.deferred` are a retry the producer makes, not loss, and a client's
     resend of a request the SUT took before the answer was lost is a surplus, allowed one
     batch per transport-error attempt, as a TCP window's is per ambiguous drop. `otlp_in` has
-    rows of its own in `checks.HTTP_LISTENERS`, with W per log record (one `Event` per
-    `LogRecord`) and no request identity, for W13b's generator, which `otlp-fan-out` runs.
+    rows of its own in `checks.HTTP_LISTENERS`, with W per log record and per metric data
+    point (one `Event` each) and no request identity, for W13b's generator, which
+    `otlp-fan-out` runs, and W23's, which `delta-datadog` runs.
     Built as `http-ingress`: each point carries a string field alone, so the SUT decodes no
     gauge, which V can't count, and `kv_metrics` counts one per point. Faults: netem delaying
     the SUT's egress past `influxdb_out`'s 10 s timeout, which carries the answers, and
@@ -2620,6 +2621,45 @@ under "Deferred to a later round" wait.
     - A delta resent downstream counts twice: `datadog_out` isn't duplicate-safe, and the
       stand-in's `datadog` shape already counts each distinct copy once and reports duplicates
       per life.
+
+    As built (W23), as `delta-datadog`:
+    - `[ledger] sut_delta` names the `cumulative_to_delta` node in place of `sut_aggregate`.
+      The scenario loader refuses it beside `sut_aggregate`, `sut_script`, a hop, a `split`,
+      `vm_every_window`, or `[overlap]`, refuses it with more than one source, a `fan_out`, the
+      node in `sut_transforms`, or any target but a `datadog` stand-in, and refuses a node of
+      another kind.
+    - The count rows judge points with the node in `aggregate`'s place:
+      - Ab is the node's `events.sent`, and Δ_disc its `events.discarded`, the points it skipped.
+        Δ_disc leaves every row after the edge as ΣT_disc does (item 13), and `ledger.aggregate`
+        judges Ab == A − Δ_disc in the final life.
+      - V is the stand-in's distinct stored points, each credited to the life its request
+        reached the stand-in in. A point's timestamp is the generator's window, which can fall
+        in the life before the one that sent it.
+      - The kill band's interval is the generator's `aggregate` interval, the most a killed life
+        held before sending.
+    - `ledger.value`'s symbols:
+
+      | Symbol | Meaning |
+      |---|---|
+      | I | The generator's `generate_in` `events.sent`, less its counted drops ahead of its sink. |
+      | V | The sum of the stand-in's distinct stored delta values. |
+      | U | Each point the stand-in never stored whose last request fell in a `rejected` step or drew a `202` naming `series_errors`, read from the record's bodies. |
+
+      The rest of a cued loss, the gap I − V − U, is judged rather than reported, because the
+      record holds the lost values.
+    - With no reported window and no drop the record can't see, the row is exact:
+      I − V − U == 0. Below 0 it FAILs as a surplus.
+    - A reported window opens at each drain that counts `skipped{reason="initial"}` or
+      `series.evicted` on the node. It runs back to the node's last receiving drain before it
+      in that life, or the previous life's last drain, widened by one generator window and one
+      drain interval. A generator sink's `shutdown` drop adds a window too.
+    - With windows, the gap is reported if it's no more than the band: the generator's
+      increments inside the windows, plus each drop the stand-in can't see (`events.dropped`
+      other than `rejected`, `records.dropped` other than `rejected` and `oversize`, stale
+      points included) times the largest stored delta. Past the band it FAILs, since a judged
+      window lost value.
+    - Stale points can't be cued in a run of 30 minutes or less, because `datadog_out`'s window
+      reaches an hour back, so they enter only the unseen drops' bound.
 21. **More HTTP listeners (W24).** Item 14's `http` wire for three more listeners, each a
     scenario:
     - `splunk-hec-ingress`: generator `splunk_hec_out` with `ack: true` → SUT `splunk_hec_in`.
