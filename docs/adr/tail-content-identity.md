@@ -287,6 +287,13 @@ reviewer can check.
     copy missed) can't claim, and once its wait runs out it's read from `0`, duplicating the
     original's lines.
   - A copy whose head is under 64 bytes, or that matches ambiguously, is read from `0`.
+  - A file opened empty whose bytes, once written, match or may grow into a truncated or tracked
+    file's candidate is read only after the next scan's claim pass decides it, up to one
+    `poll_interval` later. One that matches nothing is read at once.
+  - A restored file that first appears empty and then fills is read from `0`, not claimed: the
+    check a drain makes before its first read sees only truncated and tracked files' candidates,
+    not an unspent checkpoint entry whose inode is gone, and the scan that later finds the file
+    holding bytes has already pruned that entry.
   - A rejected entry whose head is under 64 bytes is no candidate, so a copy that delivers its
     bytes from `0` can't be told from a file that's gone, and the entry is still counted
     `bytes.dropped{reason="gone"}` (decision 6).
