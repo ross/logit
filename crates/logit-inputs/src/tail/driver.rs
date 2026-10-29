@@ -39,13 +39,52 @@ const READ_CHUNK_BYTES: usize = 64 * 1024;
 /// small reads (a wake per short write) share one allocation instead of taking one each.
 const READ_REFILL_BYTES: usize = 16 * 1024;
 
-/// The magic bytes opening each compressed format the driver won't read as text, with the name
-/// the `compressed` diagnostic gives it.
-const COMPRESSED_MAGIC: [(&str, &[u8]); 4] = [
-    ("gzip", &[0x1f, 0x8b]),
-    ("zstd", &[0x28, 0xb5, 0x2f, 0xfd]),
-    ("xz", &[0xfd, b'7', b'z', b'X', b'Z', 0x00]),
-    ("bzip2", b"BZh"),
+/// One byte of a magic: any value in `lo..=hi`.
+type MagicByte = (u8, u8);
+
+/// A magic byte that takes one value.
+const fn is(b: u8) -> MagicByte {
+    (b, b)
+}
+
+/// The header opening each compressed format the driver won't read as text, with the name the
+/// `compressed` diagnostic gives it. Each is long enough that text can't open with it by chance:
+/// gzip's ID bytes take its one defined method, deflate (`08`), and bzip2's printable `BZh` takes
+/// a block-size digit and the magic of a first block or of an empty stream's end.
+const COMPRESSED_MAGIC: [(&str, &[MagicByte]); 5] = [
+    ("gzip", &[is(0x1f), is(0x8b), is(0x08)]),
+    ("zstd", &[is(0x28), is(0xb5), is(0x2f), is(0xfd)]),
+    ("xz", &[is(0xfd), is(b'7'), is(b'z'), is(b'X'), is(b'Z'), is(0x00)]),
+    (
+        "bzip2",
+        &[
+            is(b'B'),
+            is(b'Z'),
+            is(b'h'),
+            (b'1', b'9'),
+            is(0x31),
+            is(0x41),
+            is(0x59),
+            is(0x26),
+            is(0x53),
+            is(0x59),
+        ],
+    ),
+    (
+        "bzip2",
+        &[
+            is(b'B'),
+            is(b'Z'),
+            is(b'h'),
+            (b'1', b'9'),
+            is(0x17),
+            is(0x72),
+            is(0x45),
+            is(0x38),
+            is(0x50),
+            is(0x90),
+        ],
+    ),
 ];
 
 /// What a file's first bytes say about whether to read it as text.
@@ -61,15 +100,19 @@ enum Sniff {
 }
 
 /// Classifies a file by `head`, its first bytes. An undecided file is read no further until more
-/// bytes decide it, so a text file whose whole content is a magic's prefix (a lone `B`, say)
+/// bytes decide it, so a text file whose whole content is a magic's prefix (`BZh`, say)
 /// isn't read until it grows past it, and if it's closed first, never.
 fn sniff(head: &[u8]) -> Sniff {
     let mut undecided = false;
     for (format, magic) in COMPRESSED_MAGIC {
-        if head.starts_with(magic) {
+        let n = head.len().min(magic.len());
+        if !head[..n].iter().zip(magic).all(|(b, (lo, hi))| (lo..=hi).contains(&b)) {
+            continue;
+        }
+        if n == magic.len() {
             return Sniff::Compressed(format);
         }
-        undecided |= magic.starts_with(head);
+        undecided = true;
     }
     if undecided {
         Sniff::Undecided
@@ -6533,7 +6576,16 @@ mod tests {
         probe.sum("logit.component.diagnostics", &[("key", key)])
     }
 
-    /// A format's magic followed by a few bytes and newlines, so a text read would emit lines.
+    /// A real header of each format `sniff` knows, bzip2's both kinds.
+    const HEADERS: [&[u8]; 5] = [
+        b"\x1f\x8b\x08\x00",
+        b"\x28\xb5\x2f\xfd",
+        b"\xfd7zXZ\x00",
+        b"BZh91AY&SY",
+        b"BZh9\x17\x72\x45\x38\x50\x90",
+    ];
+
+    /// A header followed by a few bytes and newlines, so a text read would emit lines.
     fn compressed_bytes(magic: &[u8]) -> Vec<u8> {
         let mut bytes = magic.to_vec();
         bytes.extend_from_slice(b"\x08\x00\xffgarbage\nmore garbage\n");
@@ -6545,12 +6597,35 @@ mod tests {
         assert_eq!(sniff(b"\x1f\x8b\x08\x00"), Sniff::Compressed("gzip"));
         assert_eq!(sniff(b"\x28\xb5\x2f\xfd\x00"), Sniff::Compressed("zstd"));
         assert_eq!(sniff(b"\xfd7zXZ\x00\x00"), Sniff::Compressed("xz"));
-        assert_eq!(sniff(b"BZh91AY"), Sniff::Compressed("bzip2"));
-        assert_eq!(sniff(b"BZh"), Sniff::Compressed("bzip2"), "a whole magic decides");
-        for prefix in [&b""[..], b"\x1f", b"\x28\xb5\x2f", b"\xfd7zXZ", b"B", b"BZ"] {
+        assert_eq!(sniff(b"BZh91AY&SY\x00"), Sniff::Compressed("bzip2"));
+        assert_eq!(sniff(b"BZh1\x17\x72\x45\x38\x50\x90"), Sniff::Compressed("bzip2"), "empty");
+        for header in HEADERS {
+            assert!(matches!(sniff(header), Sniff::Compressed(_)), "a whole header decides");
+        }
+        for prefix in [
+            &b""[..],
+            b"\x1f",
+            b"\x1f\x8b",
+            b"\x28\xb5\x2f",
+            b"\xfd7zXZ",
+            b"B",
+            b"BZh",
+            b"BZh91AY&S",
+        ] {
             assert_eq!(sniff(prefix), Sniff::Undecided, "{prefix:?}");
         }
-        for text in [&b"Bob\n"[..], b"BZx", b"\x1f\x00", b"\xfd7zXY", b"2026-10-29 hello\n", b"a"] {
+        for text in [
+            &b"Bob\n"[..],
+            b"BZx",
+            b"BZh is a line\n",
+            b"BZh91AY&SX",
+            b"BZh0\x17",
+            b"\x1f\x8b\x07",
+            b"\x1f\x00",
+            b"\xfd7zXY",
+            b"2026-10-29 hello\n",
+            b"a",
+        ] {
             assert_eq!(sniff(text), Sniff::Text, "{text:?}");
         }
     }
@@ -6561,8 +6636,8 @@ mod tests {
     async fn a_compressed_file_of_each_format_is_skipped_counted_once_and_closed() {
         let dir = scratch_dir("compressed-skipped");
         std::fs::write(dir.join("app.log"), b"one\n").unwrap();
-        for (i, (_, magic)) in COMPRESSED_MAGIC.iter().enumerate() {
-            std::fs::write(dir.join(format!("app.log.{}.z", i + 1)), compressed_bytes(magic))
+        for (i, header) in HEADERS.iter().enumerate() {
+            std::fs::write(dir.join(format!("app.log.{}.z", i + 1)), compressed_bytes(header))
                 .unwrap();
         }
         let mut probe = TelemetryProbe::new();
@@ -6572,8 +6647,8 @@ mod tests {
             &probe,
         );
         assert_eq!(tick(&mut tailer, true).await, vec!["one"]);
-        assert_eq!(skipped_compressed(&mut probe), 4.0);
-        assert_eq!(diagnostics(&mut probe, "compressed"), 4.0);
+        assert_eq!(skipped_compressed(&mut probe), 5.0);
+        assert_eq!(diagnostics(&mut probe, "compressed"), 5.0);
         assert_eq!(diagnostics(&mut probe, "invalid_utf8"), 0.0);
         assert_eq!(tailer.tracked_len(), 1, "only app.log is still open");
 
@@ -6581,8 +6656,8 @@ mod tests {
         assert_eq!(tailer.tracked_len(), 1, "a scan leaves a skipped file closed");
         append(&dir.join("app.log"), b"two\n");
         assert_eq!(tick(&mut tailer, false).await, vec!["two"]);
-        assert_eq!(skipped_compressed(&mut probe), 4.0, "counted once per inode");
-        assert_eq!(diagnostics(&mut probe, "compressed"), 4.0);
+        assert_eq!(skipped_compressed(&mut probe), 5.0, "counted once per inode");
+        assert_eq!(diagnostics(&mut probe, "compressed"), 5.0);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -6638,6 +6713,20 @@ mod tests {
         assert!(tick(&mut tailer, true).await.is_empty());
         append(&path, b"ob\n");
         assert_eq!(tick(&mut tailer, false).await, vec!["Bob"]);
+        assert_eq!(skipped_compressed(&mut probe), 0.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `BZh` is printable: a text log whose first line starts with it is tailed, since only a
+    /// whole bzip2 stream header is a match.
+    #[tokio::test(start_paused = true)]
+    async fn a_text_file_starting_with_bzh_is_tailed() {
+        let dir = scratch_dir("compressed-bzh-text");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"BZh9 is not a header\n").unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(vec![PathPattern::new(&path)], ReadFrom::Beginning, &probe);
+        assert_eq!(tick(&mut tailer, true).await, vec!["BZh9 is not a header"]);
         assert_eq!(skipped_compressed(&mut probe), 0.0);
         std::fs::remove_dir_all(&dir).ok();
     }
