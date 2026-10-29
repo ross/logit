@@ -1436,15 +1436,16 @@ WIRES = {
     "scrape": Wire("scrape", "logit.component.events.sent", "logit.input.samples", None, (), ()),
 }
 # A scrape wire is a pull of running totals, so its G is the increments the generator's
-# `generate_in`s sent, less what its components before the sink dropped (`_scrape_increments`),
+# `generate_in`s sent, less what they and its `aggregate`s dropped (`_scrape_increments`),
 # and `ledger.wire` judges G against V per generator life (`_scrape_wire_one`). A failed scrape
 # loses only the values between two that succeed. W is the listener's
 # `logit.input.samples`, the target's samples alone: each scrape also appends three synthetic
 # samples, `up`, `scrape_duration_seconds`, and `scrape_samples_scraped`, failures included
 # (crates/logit-inputs/src/prometheus.rs, "Synthetic scrape metrics"), which E counts as Y.
 SCRAPE_SYNTHETIC_SAMPLES = 3
-# `prometheus_in`'s scrape `interval` when the config names none.
+# `prometheus_in`'s scrape `interval` and `timeout` when the config names none.
 DEFAULT_SCRAPE_INTERVAL_S = 15.0
+DEFAULT_SCRAPE_TIMEOUT_S = 10.0
 
 
 @dataclass(frozen=True)
@@ -2008,7 +2009,7 @@ class Ledger:
                 batch = sum(sink_batch.values())
             g = total(self.wires[source.get("sut_listener")].g, sinks)
             if source_wire(source) == SCRAPE_WIRE:
-                sent, lost = _scrape_increments(gen, source)
+                sent, lost = _scrape_increments(data, gen, source)
                 g = sum(sent.values()) - sum(lost.values())
             self.gen_stats[service] = {
                 "G": g,
@@ -3127,37 +3128,41 @@ def check_ledger_wire(data):
     return Result("ledger.wire", worst(statuses), " | ".join(details), lines)
 
 
-def _scrape_increments(gen, source):
+def _scrape_increments(data, gen, source):
     """`({life: sent}, {life: lost})` on a scrape wire's generator `gen`: the events its
-    `generate_in`s sent per life, each one increment, and what its components other than the
-    sink dropped of them (`VALUE_LOSS_COUNTERS`)."""
+    `generate_in`s sent per life, each one increment, and the increments lost before a total
+    held them: the `generate_in`s' `events.dropped` and each generator `aggregate`'s
+    `transform.metrics.dropped`. A drop anywhere else loses no increment: `internal` and its
+    sinks carry telemetry, and a cumulative point an `aggregate` failed to send is carried by
+    its next one."""
+    inputs = source_ids(source, "generator_input")
     sent = {}
-    for one in source_ids(source, "generator_input"):
+    for one in inputs:
         for life, value in gen.counter_by_life("logit.component.events.sent",
                                                component=one).items():
             sent[life] = sent.get(life, 0) + value
-    sinks = set(source_ids(source, "generator_sink"))
+    text = _service_config_text(data, source.get("service"))
+    counted = ([("logit.component.events.dropped", one) for one in inputs]
+               + [("logit.transform.metrics.dropped", one)
+                  for one in config_components(text, "aggregate")])
     lost = {}
-    for name in VALUE_LOSS_COUNTERS:
-        for point in gen.matching(name):
-            if (point.attributes.get("component") not in sinks
-                    and isinstance(point.value, (int, float))):
-                lost[point.life] = lost.get(point.life, 0) + point.value
+    for name, component in counted:
+        for life, value in gen.counter_by_life(name, component=component).items():
+            lost[life] = lost.get(life, 0) + value
     return sent, lost
 
 
-def scrape_band(rate, interval, window, drain, killed):
+def scrape_band(rate, interval, window, timeout, drain, killed):
     """`(low, high)`: the G − V one generator life on a scrape wire may show with nothing lost
     but the increments after its last scrape, at `rate` increments a second.
 
-    Above: the last scrape can come up to one scrape `interval` before the life ends, and the
-    totals it read are up to one generator `aggregate` `window` old, plus one generator `drain`
-    interval as slack for the exposition's update and the scrape's own time. Below: 0 for a
-    life that ended in a stop, whose final drain exports every count; a killed life's last
-    drain interval of counts is never exported, so G can fall short of the increments V holds
-    by one `drain` interval of them."""
+    Above: the last scrape can start up to one scrape `interval` before the life ends, the
+    totals it read are up to one generator `aggregate` `window` old, and it reads them up to
+    its `timeout` after it starts. Below: 0 for a life that ended in a stop, whose final drain
+    exports every count; a killed life's last drain interval of counts is never exported, so G
+    can fall short of the increments V holds by one `drain` interval of them."""
     low = -round(rate * drain) if killed else 0
-    return low, round(rate * (interval + window + drain))
+    return low, round(rate * (interval + window + timeout))
 
 
 def _scrape_wire_one(data, led, source):
@@ -3173,12 +3178,13 @@ def _scrape_wire_one(data, led, source):
     if gen_view.problems:
         return FAIL, "; ".join(gen_view.problems), []
     gen = gen_view.tel
-    sent, lost = _scrape_increments(gen, source)
+    sent, lost = _scrape_increments(data, gen, source)
     sink = led.sinks[0] if led.sinks else None
     by_life, _, resets, mismatched = vm.totals_by_life(led.series.get(sink, []),
                                                        gen_view.life_starts)
     text = led._sut_config_text(led.inn.service) or ""
     interval = component_duration(text, listener, "interval") or DEFAULT_SCRAPE_INTERVAL_S
+    timeout = component_duration(text, listener, "timeout") or DEFAULT_SCRAPE_TIMEOUT_S
     window = delta_window(data, source) or DEFAULT_AGGREGATE_INTERVAL_S
     status, parts, lines = PASS, [], []
     for life in gen_view.lives:
@@ -3197,15 +3203,17 @@ def _scrape_wire_one(data, led, source):
         killed = life in gen_view.killed
         g = sent.get(life, 0) - lost.get(life, 0)
         v = by_life.get(life, 0)
-        low, high = scrape_band(rate, interval, window, drain, killed)
+        low, high = scrape_band(rate, interval, window, timeout, drain, killed)
         ok = low <= g - v <= high
         how = "killed" if killed else "stopped"
         part = (f"generator life {life} ({how}): G {_n(g)} − V {_n(v)} = {_n(g - v)} "
                 f"{'within' if ok else 'outside'} its end band [{_n(low)}, {_n(high)}]")
         lines.append(f"{part}: G is generate_in sent {_n(sent.get(life, 0))} − lost "
                      f"{_n(lost.get(life, 0))}; the band is {rate:,.0f}/s over a {interval:g}s "
-                     f"scrape interval, a {window:g}s generator window, and a {drain:g}s drain"
-                     + (", and below, a drain's unexported counts" if killed else ""))
+                     f"scrape interval, a {window:g}s generator window, and a {timeout:g}s "
+                     "scrape timeout"
+                     + (f", and below, a {drain:g}s drain's unexported counts" if killed
+                        else ""))
         if not ok:
             status = FAIL
             parts.insert(0, part + (", a surplus" if g - v < low else ", increments lost "
@@ -4336,22 +4344,38 @@ def _scrape_egress(led):
     """`ledger.egress` on a scrape wire, in samples: per SUT life, W − X, the target's samples
     the listener sent, against V_n, the distinct samples the sink's `vm_selector` matches whose
     scrape time falls in that life (`stored_samples_by_life`). The selector matches the
-    target's series and leaves out the synthetic ones, so the two count one unit. 0 passes; a
-    stored sample past W − X is a surplus and FAILs; a killed life's gap is reported, since the
-    kill discards the sink's queue and a cumulative series loses only values in between; a
-    stopped life's gap passes up to the events the sink counted dropped in it, and past that
-    it's uncounted loss. `ledger.wire` judges the values themselves."""
+    target's series and leaves out the synthetic ones, so the two count one unit. A dropped
+    batch's events also count its synthetic samples, one scrape's `SCRAPE_SYNTHETIC_SAMPLES`
+    per batch, since `prometheus_in` sends one batch per scrape of a target and the sink queues
+    the batches it receives: so X here is the listener's events dropped less 3 x the batches
+    it dropped (its scrapes less the sink's batches received, at most X / 3), and
+    the sink's drops are its events dropped less 3 x its batches dropped.
+
+    0 passes; a stored sample past W − X is a surplus and FAILs; a killed life's gap is
+    reported, since the kill discards the sink's queue and a cumulative series loses only
+    values in between; a stopped life's gap passes up to the samples the sink counted dropped
+    in it, and past that it's uncounted loss. `ledger.wire` judges the values themselves."""
     status, parts, lines = PASS, [], []
     sink = led.sinks[0]
     stored = stored_samples_by_life(led.series.get(sink, []), led.life_starts)
-    dropped = led.sut.counter_by_life("logit.component.events.dropped", component=sink)
+    sut = led.sut
+    dropped = sut.counter_by_life("logit.component.events.dropped", component=sink)
+    dropped_batches = sut.counter_by_life("logit.component.batches.dropped", component=sink)
+    reached = sut.counter_by_life("logit.component.batches.received", component=sink)
     if not led.series.get(sink):
         return Result("ledger.egress", FAIL, f"{sink}: the export has no series")
     for life in led.lives:
-        sent = led.get("W", life) - led.get("X", life)
+        scrapes = led.get("Y", life) / SCRAPE_SYNTHETIC_SAMPLES
+        # A batch still on its way at the life's end never reached the sink either, and X
+        # didn't count it, so the batches X dropped are at most its events over 3.
+        lost_batches = max(0, min(scrapes - reached.get(life, 0),
+                                  led.get("X", life) // SCRAPE_SYNTHETIC_SAMPLES))
+        sent = (led.get("W", life) - led.get("X", life)
+                + SCRAPE_SYNTHETIC_SAMPLES * lost_batches)
         v = stored.get(life, 0)
         gap = sent - v
-        counted = dropped.get(life, 0)
+        counted = (dropped.get(life, 0)
+                   - SCRAPE_SYNTHETIC_SAMPLES * dropped_batches.get(life, 0))
         killed = life in led.killed and life != led.final
         if gap == 0:
             verdict = "exact"
@@ -4360,9 +4384,9 @@ def _scrape_egress(led):
         elif killed:
             verdict = "reported: a kill discards the sink's queue"
         elif gap <= counted:
-            verdict = f"counted: within the sink's {_n(counted)} events dropped"
+            verdict = f"counted: within the sink's {_n(counted)} samples dropped"
         else:
-            verdict, status = (f"uncounted loss, past the sink's {_n(counted)} events "
+            verdict, status = (f"uncounted loss, past the sink's {_n(counted)} samples "
                                "dropped"), FAIL
         part = (f"life {life}{' (final)' if life == led.final else ''}"
                 f"{' (killed)' if killed else ''}: W − X {_n(sent)} − V_n {_n(v)} = {_n(gap)}, "

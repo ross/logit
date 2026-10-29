@@ -218,7 +218,8 @@ settle window would leave a life no fit. `fanin` and `tcp-ingress` set `60s`, an
   `partition`, on any service of the stack: `logit`, `generator`, `victoria-metrics`, and from
   W7b any service a `compose` override adds. W3 adds `kill`, on the SUT only:
   the lines a killed generator sent after its last telemetry drain reach the SUT with no G
-  behind them, and `ledger.wire` would net them against real loss. W7a adds `mark` and `exit`
+  behind them, and `ledger.wire` would net them against real loss. W25 allows it on a scrape
+  wire's generator too, which sends nothing. W7a adds `mark` and `exit`
   (below). W9a adds `respond`, on a stand-in only (below). W12c adds `signal` and `rename`, on
   a service that runs `logit` (below), and W12d `rotate` and `probe` (below).
 - `[ledger] vm_every_window`, optional, is `true` or `false`; `[ledger] sut_script`, optional,
@@ -574,7 +575,8 @@ sut_transforms = ["parse", "labels", "count", "metrics_only"]   # optional, in o
   other wire's neither. A scrape wire (W25) is the one source, into one SUT service with one
   sink on the local target and no `sut_transforms`, and `load()` refuses `sut_aggregate`,
   `sut_delta`, `sut_script`, `split`, `hop`, `vm_every_window`, and `[overlap]` beside it
-  (`scenario._scrape_problems`). A `kill` on its generator is allowed, the one generator
+  (`scenario._scrape_problems`), and a listener scrape `timeout` not below the generator's
+  `aggregate` window. A `kill` on its generator is allowed, the one generator
   `kill`: a scrape target sends nothing, so a kill only ends a life, which its end band covers.
 - `sut_transforms`, optional, lists the nodes between the listener and `aggregate`, distinct, none
   of them a listener, and none on another source's list. Each must send every event it
@@ -1015,19 +1017,26 @@ pipeline takes the batch, past a writer's timeout, which resends while the held 
 delivers. So it holds the first identity alone, `ok` and `closed_consumer` writes summing to
 `batches.sent`, while no write decodes to nothing (a `204` with no batch). Its wire is keyed on
 its mode, since it has no `transport:` (`scenario.LISTENER_MODES`): `bind:` is the receiver, an
-HTTP wire, and `scrape_targets:` the scrape wire.
+HTTP wire, and `scrape_targets:` the scrape wire. The writer's
+`logit.component.events.received` is reported beside G as the points attempted, and its
+`logit.output.requests{class="5xx"}` as the answers it retried.
 
 The scrape wire (W25) is a pull of running totals, judged in value per generator life, not in
 lines per drain interval (`checks._scrape_wire_one`). G is the increments a generator life's
-`generate_in`s sent less what its components before the sink dropped
-(`logit.component.events.dropped` and `logit.transform.metrics.dropped`), and V the sink's
+`generate_in`s sent less what they counted in `logit.component.events.dropped` and its
+`aggregate`s in `logit.transform.metrics.dropped`, the increments no total holds (a drop at
+`internal`, its sinks, or an `aggregate`'s output loses none, since the next cumulative point
+carries the value), and V the sink's
 stored counters' reset-aware total in that life, each sample credited to the generator life
 its timestamp, the SUT's scrape time, falls in; a SUT life splits nothing, since a SUT restart
-doesn't reset the generator's totals. A failed, timed-out, or skipped scrape loses only the
+doesn't reset the generator's totals. `load()` requires the listener's scrape `timeout`
+below the generator's `aggregate` window: a scrape that starts before a generator restart and
+waits for the new process could otherwise read its totals and credit them to the old life. A
+failed, timed-out, or skipped scrape loses only the
 values between two that succeed, so no fault window excuses anything: each life's G − V must
 fall in its end band (`checks.scrape_band`), the increments after its last scrape, at the life's
 median rate per drain interval: up to one scrape `interval` plus one generator `aggregate`
-window plus one generator drain interval, and below 0 by one drain interval for a killed life,
+window plus the scrape `timeout`, and below 0 by one drain interval for a killed life,
 whose last drain's counts go unexported. Past the band it FAILs. The count rows judge samples
 instead: W is the listener's `logit.input.samples`, the target's samples, and Y the three
 synthetic samples each scrape appends (`up`, `scrape_duration_seconds`,
@@ -1035,10 +1044,10 @@ synthetic samples each scrape appends (`up`, `scrape_duration_seconds`,
 W + Y − D == E + B and an earlier life's residual W + Y − D − B − X − S_in in [0, R];
 `ledger.edge` holds E − X == S_in; `ledger.egress` holds W − X to V_n, the distinct stored
 samples the sink's `vm_selector` matches, per SUT life, a killed life reported and a stopped
-one's gap allowed up to the sink's counted event drops; `ledger.aggregate` and
+one's gap allowed up to the sink's counted drops, X and those drops each less three
+synthetic samples per dropped batch, one batch per scrape; `ledger.aggregate` and
 `ledger.summary` SKIP; and `recovery` reads any sample scraped as ingest recovered, since the
-generator counts increments and a scrape lands in a drain interval or doesn't. The writer's `logit.component.events.received` is reported beside G as the points attempted,
-and its `logit.output.requests{class="5xx"}` as the answers it retried.
+generator counts increments and a scrape lands in a drain interval or doesn't.
 
 From W7b the ledger follows each `[[ledger.sink]]`. A row about a sink (`progress`,
 `identity.sink`, `recovery`, `ledger.edge`'s sink edges, `ledger.egress`, `ledger.windows`,
@@ -6211,6 +6220,7 @@ touches no product code. Other agents' soak runs shared the daemon throughout.
 |---|---|
 | `20261029T195143Z` | FAIL: `expect.partition-fails` and `expect.kill-fails`, a scenario defect, below |
 | `20261029T201553Z` | WARN: `rss_slope` on the generator, below |
+| `20261029T210629Z` | WARN: `rss_slope` on the generator, with the scrape `timeout` at 500 ms |
 
 The first run FAILed two rows:
 
@@ -6219,7 +6229,7 @@ The first run FAILed two rows:
 | `expect.partition-fails` | FAIL | delta of logit.input.scrapes{class=network_error, component=scrape} on logit, through c0s1: c0s1 (+60s, +150s]: 0 (over 18 drain(s)), want >= 1, FAIL |
 | `expect.kill-fails` | FAIL | delta of logit.input.scrapes{class=network_error, component=scrape} on logit, through c0s4: c0s4 (+540s, +600s]: 0 (over 12 drain(s)), want >= 1, FAIL |
 
-The rerun's ledger rows:
+The second run's ledger rows, as it first scored them:
 
 | Check | Status | Detail |
 |---|---|---|
@@ -6236,16 +6246,27 @@ What the runs showed:
   name nor dialing it failed within the scrape's 2 s `timeout`, so every failed scrape in the
   partition and the kill counted `timeout` (12 and 6), as in the pause (11) and the delay (17),
   and none counted `network_error`. The scenario now expects `timeout` in all four.
-- **No increment was lost.** Each generator life's G − V was 1,100 in both runs, a fraction of
-  its 11,000 end band, whatever the faults before it: the next scrape after each fault read the
+- **No increment was lost.** Each generator life's G − V was 1,100 in every run, a fraction of
+  its end band, whatever the faults before it: the next scrape after each fault read the
   total that held every increment generated during it.
+- **The end band's high edge is the scrape `timeout`, not a drain interval.** Review found
+  that a drain interval hid uncounted loss at a life's end, which nothing else judges on this
+  wire, so the band is now one scrape interval, one generator window, and the scrape
+  `timeout`. Re-scored with `script/soak check`, the second run's `ledger.wire` still passes,
+  each life's 1,100 against a band of [-5,000, 8,000] and [0, 8,000]. `load()` now requires the
+  scrape `timeout` below the generator's `aggregate` window, so a scrape that starts before a
+  generator restart can't read the new process's totals; the scenario's timeout went from 2 s
+  to 500 ms, under its 1 s window. The third run, at 500 ms, scored every ledger and
+  `[[expect]]` row PASS, each life's 1,100 against [-5,000, 6,500] and [0, 6,500], with 12, 12,
+  18, and 6 timeouts in the four fault windows and 156 scrapes answered `2xx`, as at 2 s.
 - **The egress was exact.** VictoriaMetrics stored every sample the listener sent once, so
-  W − X equaled the distinct stored samples in both runs.
+  W − X equaled the distinct stored samples in every run.
 - **The generator's RSS steps once after the pause and holds.** In the first run its first
   life grew from 25 to 33 MiB as it caught up on the minute of generation the pause held back,
-  then stayed flat, and in both runs its second life stayed flat. The generator is the load source, not the system under test,
-  so the scenario leaves the WARN reported rather than listing it under `[expected]`. The SUT's
-  RSS stayed flat (+2.0 MiB/h).
+  then stayed flat, and in every run its second life stayed under the limit (+0.7, −4.0, and
+  +8.8 MiB/h). The generator is the load source, not the system under test, so the scenario
+  leaves the WARN reported rather than listing it under `[expected]`. The SUT's RSS stayed
+  flat (+2.0 to +2.9 MiB/h).
 
 ### W27: `syslog_in` over TCP and TLS (2026-10-29)
 

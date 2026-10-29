@@ -10,7 +10,7 @@ components:
     type: prometheus_in
     scrape_targets: ["http://generator:9464/metrics"]
     interval: 5s
-    timeout: 2s                     # under the 3 s delay the scenario puts on the generator
+    timeout: 500ms                  # under the generator's 1 s window and its 3 s netem delay
   victoria_metrics:
     type: prometheus_out
     sources: [scrape]

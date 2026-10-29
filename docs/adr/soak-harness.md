@@ -690,8 +690,9 @@ so its wire is keyed on the mode its config sets: `bind:` is the receiver, and
 ## Amendment: a scrape wire judges increments per generator life (2026-10-29)
 
 `prometheus_in` scraping a generator's `prometheus_out` exposition is a fifth wire, `scrape`,
-judged in value: per generator life, G, the increments its `generate_in` sent less what its
-components before the sink dropped, against V, the stored counters' reset-aware total in that
+judged in value: per generator life, G, the increments its `generate_in` sent less what the
+`generate_in`s dropped and its `aggregate`s counted in `logit.transform.metrics.dropped`,
+against V, the stored counters' reset-aware total in that
 life.
 
 A pull carries running totals, not lines. A sample is a series' total at the scrape, so there
@@ -705,11 +706,20 @@ anything.
 - **V splits at the generator's lives, not the SUT's.** A generator restart resets its totals,
   which the backend records as a counter reset, and a SUT restart doesn't reset them. So each
   sample is credited by its scrape time to the generator life in force, and a SUT restart
-  splits nothing.
+  splits nothing. A scrape that starts before a generator restart and waits for the new
+  process could read its totals and credit them to the old life, so `load()` requires the
+  scrape `timeout` below the generator's `aggregate` window, before which the new process
+  exposes nothing.
+- **Only the drops before a total count against G.** A dropped event at a `generate_in`, or a
+  metric an `aggregate` dropped, is an increment no total holds. A drop anywhere else loses
+  none: `internal` and its sinks carry telemetry, and a cumulative point the `aggregate`
+  failed to send is carried by its next one.
 - **Each generator life has an end band.** The increments after a life's last scrape never
   reach a scrape: up to one scrape `interval`, plus one generator `aggregate` window, since the
-  scraped totals lag the generation by up to a window, plus one generator drain interval as
-  slack. A life the end sequence stops exports all its counts, so its G − V can't go below 0;
+  scraped totals lag the generation by up to a window, plus the scrape `timeout`, since a
+  scrape reads the totals up to that long after it starts. A drain interval more would hide
+  that much uncounted loss, since this band alone judges a life's end values. A life the end
+  sequence stops exports all its counts, so its G − V can't go below 0;
   a killed life's last drain interval of counts is never exported, so G can fall short of the
   increments V holds by one drain interval of them. A life outside its band FAILs, a surplus
   below it and lost increments above it.
@@ -720,7 +730,9 @@ anything.
   the three synthetic samples each scrape appends, `up`, `scrape_duration_seconds`, and
   `scrape_samples_scraped`, failures included. They are Y, three per scrape, so the listener
   balances W + Y − D == E + B, and the sink's `vm_selector` leaves them out too, so the
-  distinct stored samples per SUT life are judged against W − X. The rows that read an
+  distinct stored samples per SUT life are judged against W − X. A dropped batch's events
+  count its three synthetic samples too, one batch per scrape, so `ledger.egress` takes
+  3 per dropped batch out of X, and out of the sink's counted drops. The rows that read an
   `aggregate` SKIP: the SUT relays samples and has none, and a node between the listener and
   the sink could change the values the wire judges, so `load()` refuses `sut_transforms` and
   every `[ledger]` key that names such a node.
