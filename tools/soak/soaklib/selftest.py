@@ -11770,6 +11770,15 @@ def _sampling_vectors(root):
     expect(named(sink.get("vm_absent_selector")) == set(verdicts) - kept,
            f"sample-path's vm_absent_selector names the discarded shards "
            f"{sorted(set(verdicts) - kept)}, got {sink.get('vm_absent_selector')}")
+
+    # A misspelled name or label in the absent selector matches nothing, and ledger.absent
+    # would PASS on it, so the two selectors may differ only in their shard sets.
+    def frame(selector):
+        return re.sub(r'shard=~"[0-9|]+"', 'shard=~"*"', selector or "")
+
+    expect(frame(sink.get("vm_absent_selector")) == frame(sink.get("vm_selector")),
+           f"sample-path's vm_absent_selector is its vm_selector with only the shard set "
+           f"swapped, got {sink.get('vm_absent_selector')} against {sink.get('vm_selector')}")
     expect(0 < len(kept) < shards, f"sample-path keeps some shards and discards some, got "
            f"{sorted(kept)} of {shards}")
 
