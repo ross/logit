@@ -664,7 +664,7 @@ impl Model {
                 self.by_path.remove(path);
             }
         }
-        let (known, unmatched): (Vec<(PathBuf, usize)>, Vec<(PathBuf, usize)>) =
+        let (known, unmatched): (Vec<_>, Vec<_>) =
             discovered.iter().map(|(p, inode)| (p.clone(), *inode)).partition(|(_, inode)| {
                 let id = self.id(*inode);
                 self.tracked.contains_key(&id) || self.resume.contains_key(&id)

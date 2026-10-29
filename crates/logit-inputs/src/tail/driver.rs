@@ -5,9 +5,17 @@
 //! A file's identity is its [`FileId`]. On each `scan`, a discovered path whose inode differs from
 //! the one tracked under it is a rotation: the old inode is read to EOF and closed once it has
 //! stayed there for one `poll_interval` ([`Tailer::reap_drained`]), and the new one opened at the
-//! beginning. A tracked file whose size is below the offset already read was
-//! truncated in place: it's re-read from `0` with its partial-line state discarded, and the bytes
-//! the driver last saw past that offset are counted lost ([`Tailer::reconcile_truncation`]).
+//! beginning. A tracked file whose size is below the offset already read was truncated in place:
+//! it's re-read from `0` with its partial-line state discarded ([`Tailer::reconcile_truncation`]),
+//! and the bytes the driver last saw past that offset, and the discarded line, are counted lost
+//! unless a copy claims the file's state from before the truncation.
+//!
+//! An inode no checkpoint entry or tracked file names may claim an earlier position by content,
+//! its head and the marker of the bytes before the position matching, and resume there
+//! ([`Tailer::claim_unmatched`], `docs/adr/tail-content-identity.md`): a `copytruncate` copy, a
+//! restored backup, a migrated volume. A scan reconciles in two passes
+//! ([`Tailer::reconcile_all`]) so every candidate exists before any new inode is probed, whatever
+//! order the listing yields.
 //!
 //! A file whose first bytes are a gzip, zstd, xz, or bzip2 magic is never read as text: it's
 //! closed before any line of it is emitted and counted
@@ -2104,7 +2112,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 lines.push((line, start));
             });
             tracked.offset += n as u64;
-            // The marker bytes. A boundary moves only to just past a newline in this chunk, so
+            // The marker bytes. A boundary moves only to the byte after a newline in this chunk, so
             // the bytes before it are the window as it stood before the chunk, then the chunk
             // up to it.
             let boundary = tracked.offset - tracked.splitter.pending_bytes();
@@ -6899,7 +6907,8 @@ mod tests {
         let discovered: Vec<(PathBuf, std::fs::Metadata)> =
             order.iter().map(|p| (p.clone(), std::fs::metadata(p).unwrap())).collect();
         tailer.count_rotations(&discovered.iter().cloned().collect());
-        let ids: HashSet<FileId> = discovered.iter().map(|(_, m)| FileId::from_metadata(m)).collect();
+        let ids: HashSet<FileId> =
+            discovered.iter().map(|(_, m)| FileId::from_metadata(m)).collect();
         let mut watcher = crate::tail::watch::Watcher::Poll;
         tailer.reconcile_all(discovered, false, &Listing::default(), &ids, &mut watcher).await;
         tailer.count_truncations(false);
@@ -6963,7 +6972,11 @@ mod tests {
                 order.reverse();
             }
             scan_in_order(&mut tailer, &order).await;
-            assert_eq!(read_out(&mut tailer).await, vec!["partial".to_string(), three], "{order:?}");
+            assert_eq!(
+                read_out(&mut tailer).await,
+                vec!["partial".to_string(), three],
+                "{order:?}"
+            );
             assert_eq!(probe.sum("logit.input.files.claimed", &[]), 1.0);
             assert_eq!(probe.sum("logit.input.files.truncated", &[]), 1.0);
             assert_eq!(truncated_drops(&mut probe), (0.0, 0.0), "the claim cancels both counts");
@@ -7002,8 +7015,7 @@ mod tests {
     async fn a_truncation_held_at_shutdown_is_counted_by_the_stop() {
         let dir = scratch_dir("claim-shutdown");
         let path = dir.join("app.log");
-        std::fs::write(&path, format!("{}\n{}\npar", long_line("one"), long_line("two")))
-            .unwrap();
+        std::fs::write(&path, format!("{}\n{}\npar", long_line("one"), long_line("two"))).unwrap();
         let mut probe = TelemetryProbe::new();
         let mut tailer = probed_tailer(vec![PathPattern::new(&path)], ReadFrom::Beginning, &probe);
         assert_eq!(tick(&mut tailer, true).await.len(), 2);
@@ -7028,8 +7040,7 @@ mod tests {
         for reversed in [false, true] {
             let dir = scratch_dir("claim-copy-first");
             let (path, copy) = (dir.join("app.log"), dir.join("app.log.1"));
-            std::fs::write(&path, format!("{}\n{}\n", long_line("one"), long_line("two")))
-                .unwrap();
+            std::fs::write(&path, format!("{}\n{}\n", long_line("one"), long_line("two"))).unwrap();
             let mut probe = TelemetryProbe::new();
             let mut tailer = probed_tailer(
                 vec![PathPattern::new(dir.join("app.log*"))],
@@ -7267,15 +7278,23 @@ mod tests {
             let content = format!("{one}\n{two}\n");
             std::fs::write(&path, &content).unwrap();
             let offset = content.len() as u64;
-            write_checkpoint_for(&dir, &path, offset, Head::of(&content.as_bytes()[..offset as usize]));
+            write_checkpoint_for(
+                &dir,
+                &path,
+                offset,
+                Head::of(&content.as_bytes()[..offset as usize]),
+            );
             // Restored beside the original first, so the new inode can't reuse its number.
             let restored = dir.join("restored");
             std::fs::write(&restored, format!("{content}{three}\n")).unwrap();
             std::fs::rename(&restored, &path).unwrap();
 
-            let mut hand =
-                Hand::bind(vec![PathPattern::new(&path)], LineFactory, checkpointed(&dir, read_from))
-                    .await;
+            let mut hand = Hand::bind(
+                vec![PathPattern::new(&path)],
+                LineFactory,
+                checkpointed(&dir, read_from),
+            )
+            .await;
             assert_eq!(hand.pump().await, vec![three], "{read_from:?}");
             assert_eq!(hand.probe.sum("logit.input.files.claimed", &[]), 1.0);
             assert!(hand.tailer.resume.is_empty(), "the claim spends the entry");
@@ -7299,9 +7318,10 @@ mod tests {
         let offset = (lines[0].len() + 1) * 4;
         assert!(offset > HEAD_BYTES);
         write_checkpoint_for(&dir, &path, offset as u64, Head::of(&content[..HEAD_BYTES]));
-        // Same length, same head: only the bytes just before the offset change.
+        // Same length, same head: only bytes past the head and before the offset change.
         let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-        file.write_all_at(b"LINE3", (offset - lines[3].len() - 1) as u64).unwrap();
+        file.write_all_at(b"YYYY", (offset - 10) as u64).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap()[..HEAD_BYTES], content[..HEAD_BYTES]);
 
         let mut hand = Hand::bind(
             vec![PathPattern::new(&path)],

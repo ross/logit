@@ -385,7 +385,7 @@ head. That closes the 256-byte residual. A newly discovered inode no entry match
 unclaimed entry, or a file tracked in this process, by head and marker. An entry its inode's
 content rejected and nothing claims counts its unread bytes as `bytes.dropped{reason="gone"}`,
 which changes the table's reused-inode row from "nothing" to a count. `tailid/w2` implements
-these; until it lands, this record describes the code.
+these.
 
 ## Running it
 

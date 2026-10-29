@@ -6,9 +6,10 @@ updated: 2026-10-29
 # Tail content identity: the inode stays primary, content claims an unmatched inode, and what a restart or rotation still loses is decided or counted
 
 ## Status
-Accepted. `tailid/w1` implements decisions 2 and 7, and `tailid/w2` implements decisions 4, 5,
-and 6. Until each lands, the matching entries in `docs/known-gaps/tailing.md` describe what the
-code does.
+Accepted and built: `tailid/w1` implements decisions 2 and 7, and `tailid/w2` implements
+decisions 4, 5, and 6. Decisions 4, 5, and 7 say how the build refined them: where the marker's
+bytes come from, when an inode waits before it claims, and when a truncation's counts are
+recorded.
 
 ## Context
 
@@ -113,8 +114,15 @@ reviewer can check.
 
 4. **An offset marker checks the bytes before the resume point.** A checkpoint entry carries a
    marker beside the head hash: XXH64 with seed 0, as the head hash uses, over the up to 256 bytes
-   that end at the checkpointed offset. The tailer captures those bytes from what it has already
-   read, so steady-state tailing reads nothing extra. A resume by inode accepts iff the head
+   that end at the checkpointed offset. For `tail_in` the tailer captures those bytes from what
+   it has already read: the up to 256 bytes before its read offset, and the same before its last
+   line boundary, which is the offset a checkpoint persists while a line is pending. Each read
+   copies at most 256 bytes into each, and steady-state tailing reads nothing extra from the
+   file. Under `docker_in`, a held reassembly pins the persisted offset at the start of its oldest
+   held line, which neither buffer covers, so a checkpoint write reads the 256 bytes there back
+   from the open descriptor, once per distinct offset, and seeks back. A failed read-back is
+   diagnosed `read_error` and persists the empty marker, which a restart rejects: a replay, not a
+   skip. A resume by inode accepts iff the head
    matches, the marker matches, and the offset is at most the file's length; anything else is a
    `resume_rejected` and a start at `0`, as today. That closes the 256-byte residual: a recycled
    inode that shares the first 256 bytes now also has to share the 256 bytes before the offset. It
@@ -130,13 +138,35 @@ reviewer can check.
    - a file tracked in this process, by its in-memory head and the marker at its emitted offset,
      including a truncated file (its state from before the truncation).
 
+   A tracked file's candidate is its last line boundary, the offset a checkpoint would persist,
+   so a claim resumes at a line start and a line half read at a truncation is read whole from the
+   copy. A truncated file's candidate lasts until a scan offers it with no claimant (decision 7).
+   A rejected entry is a candidate only in the scan that rejected it.
+
    It claims a candidate iff the candidate's head covers at least 64 bytes, the file's length is
    at least the candidate's offset, and both the head hash and the marker match. It resumes at the
-   candidate's offset, overriding `read_from` as a resume does. If more than one file matches one
-   candidate, or one file matches more than one candidate, nothing is claimed and a diagnostic
-   says so: the file starts where it would have without the claim, which favors duplicates over
-   loss. The cost falls only on discovery of an unmatched inode: two reads of at most 256 bytes
-   each. What it recovers:
+   candidate's offset, overriding `read_from` as a resume does, counted
+   `logit.input.files.claimed`. If more than one file matches one candidate, or one file matches
+   more than one candidate, nothing is claimed and a `claim_ambiguous` diagnostic says so: the
+   file starts where it would have without the claim, which favors duplicates over loss. Each scan
+   reconciles every inode with an entry or a tracked file first, so every candidate the scan can
+   see exists before any unmatched inode is probed, whatever order the listing yields.
+
+   A scan after the first leaves an unmatched inode unopened, for at most two scans in a row,
+   when claiming now could duplicate or a later scan could still find a match:
+
+   - It matches a tracked file that hasn't been truncated: `copytruncate`'s copy, found before
+     the truncate. Claimed now, the copy and the original would both read what the original reads
+     before its truncation. Once the truncation is seen, the copy claims the original's state from
+     before it. A copy whose original is never truncated (a plain `cp`) claims the original as it
+     stands once the wait runs out.
+   - It's shorter than a candidate whose head bytes are in memory and agrees with every byte it
+     has: a copy still being written. An empty file never waits, so a rename rotation's new file
+     isn't delayed.
+
+   The first scan never waits, since `read_from` decides only files it opens. The cost falls only
+   on an unmatched inode: a read of at most 256 bytes for the head and one per distinct candidate
+   offset whose head matches, repeated at each scan while it waits. What it recovers:
 
    - a `copytruncate` copy under `app.log*` resumes at the original's offset instead of replaying
      from `0`;
@@ -163,11 +193,15 @@ reviewer can check.
    written before the truncate may be lost unless a pattern also matches the copy. The count is
    an estimate; `logit.input.files.truncated` is the signal that a truncation happened, and what
    the operator needs is to know it happened, not the exact count. The tailer doesn't search for
-   the copy outside its patterns. `docs/deploying.md` steers to rename rotation, and, once
-   decision 5 lands in `tailid/w2`, also to a pattern that matches the rotated names. Once
-   decision 5 lands, a claim of the truncated file's
-   pre-truncation state cancels that count, because the copy then resumes where the original
-   stopped.
+   the copy outside its patterns. `docs/deploying.md` steers to rename rotation, and, under
+   `copytruncate`, to a pattern that matches the rotated names. A claim of the truncated file's
+   pre-truncation state (decision 5) cancels this count and the discarded line's
+   `logit.input.frames.dropped{reason="truncated"}`, because the copy then resumes where the
+   original stopped. So that neither is counted and then retracted, both wait: they're recorded at
+   the end of the first scan after the truncation whose listing failed nowhere and no waiting
+   inode could still claim the state, or at a stop. A truncated file whose head is under 64 bytes
+   can't be claimed, so its counts are recorded at once. `logit.input.files.truncated` and the
+   `truncated` diagnostic are recorded at once either way.
 
 8. **A refill past the old offset while running stays undetected.** A `copytruncate` that the
    writer refills past the tailer's offset before the next size check still looks like an append
@@ -209,22 +243,42 @@ reviewer can check.
 
 - **Operator-visible names.** `logit.input.files.skipped{reason="compressed"}` and the
   `compressed` diagnostic (decision 2), `logit.input.bytes.dropped{reason="truncated"}`
-  (decision 7), a diagnostic for an ambiguous claim (decision 5), and `bytes.dropped{reason="gone"}`
-  for a rejected, unclaimed entry (decision 6). `docs/design/internal-telemetry.md`'s tail table
-  gains each as its workstream lands.
+  (decision 7), `logit.input.files.claimed` and the `claim_ambiguous` diagnostic (decision 5),
+  and `bytes.dropped{reason="gone"}` for a rejected, unclaimed entry (decision 6), each in
+  `docs/design/internal-telemetry.md`'s tail table.
 - **One replay on upgrade.** Checkpoint format 4 makes every format 3 checkpoint unusable, so
   every file present at the first scan after the upgrade replays from `0`.
-- **A tracked file keeps its pre-truncation head and marker** long enough for decision 5 to match
-  a copy against it. Today a truncation clears the head
-  ([ADR `tail-discovery-failure-and-resume-identity`](tail-discovery-failure-and-resume-identity.md),
+- **Each tracked file holds two more buffers of at most 256 bytes**, the bytes before its read
+  offset and before its line boundary, so the marker costs no read in steady state (decision 4).
+- **A truncation keeps the file's pre-truncation head and marker** beside the tailer, not on the
+  file, until a copy claims them or decision 7 counts them; the tracked file's own head still
+  clears ([ADR `tail-discovery-failure-and-resume-identity`](tail-discovery-failure-and-resume-identity.md),
   decision 2).
+- **What a claim still duplicates or loses.** Each is a decided limit:
+  - Under `copytruncate`, the bytes the writer appends after the copy and before the truncate are
+    in neither file. The original reads them only if a read lands in that window; otherwise the
+    claim cancels the count that would have reported them, so they're lost uncounted.
+  - A copy shorter than what the tailer read from the original (the original read appends the
+    copy missed) can't claim, and once its wait runs out it's read from `0`, duplicating the
+    original's lines.
+  - A copy whose head is under 64 bytes, or that matches ambiguously, is read from `0`.
+  - A plain `cp` of a live file claims the original as it stands once its wait runs out, so the
+    lines the original reads after that are read again from the copy.
+  - A truncation held at a stop is counted, though a copy the restart claims by the original's
+    rejected entry may then deliver those bytes. A crash records no held truncation's counts.
+  - Under `docker_in`, a truncated file whose decoder holds a reassembly offers no candidate:
+    its boundary is the held line's start, whose bytes the truncation removed. The copy is read
+    from `0`, and the decoder's reset counts its own drops as before.
+  - A line being dropped for `max_line_bytes` at a truncation leaves the boundary at its start,
+    so a copy that claims there drops it again, counted `oversize` a second time.
 - **Decided limits, not gaps.** The shutdown loss (decision 1), not decompressing (decision 2), a
-  file created and removed while `tail_in` was down (decision 6), and a refill past the offset
-  while running (decision 8) are recorded here. The refill's known-gaps entry moves to
-  `docs/deploying.md`'s "Rotation" paragraph with this record. `docs/known-gaps/tailing.md` keeps
-  the `copytruncate`, `compress`, gone-file, 256-byte residual, and `(dev, ino)` migration entries
-  until `tailid/w1` and `tailid/w2` change the code each describes.
+  file created and removed while `tail_in` was down (decision 6), a refill past the offset while
+  running (decision 8), and what a claim still duplicates or loses (above) are recorded here. The
+  refill's known-gaps entry moved to `docs/deploying.md`'s "Rotation" paragraph with this record,
+  and `docs/known-gaps/tailing.md` no longer lists the wildcard `copytruncate` replay, the
+  256-byte residual, or the `(dev, ino)` migration.
 - **`tailid/w1`** implements decisions 2 and 7: the compressed skip and the truncation count.
 - **`tailid/w2`** implements decisions 4, 5, and 6: the format 4 offset marker, the content
   claim, and gone counting for a rejected entry nothing claims, and cancels decision 7's count on
-  a claim.
+  a claim. `crates/logit-inputs/src/tail/driver.rs`'s `Tailer::claim_unmatched` and
+  `crates/logit-inputs/src/tail/checkpoint.rs`'s module doc are the code's statement of both.

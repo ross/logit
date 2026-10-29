@@ -10,13 +10,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
   replaying, but only within this process. If `logit` restarts between the two renames, the
   container falls back to `read_from` like any file the process has never seen. See [ADR
   `docker-container-identity-and-minimal-watches`](../adr/docker-container-identity-and-minimal-watches.md).
-- **`tail_in`/`docker_in`'s checkpoint identity is `(dev, ino)`, which doesn't survive a bind
-  mount or filesystem migration that preserves content but not inode numbers.** After a restored
-  backup, a volume moved to different storage, or a bind mount re-created from a snapshot, no
-  checkpoint entry matches a file, so each file starts where `read_from` puts it.
-  - Under the default `read_from: end`, each file's unread tail is skipped, and the scan counts
-    it `logit.input.bytes.dropped{reason="gone"}` as it prunes the unmatched entries.
-  - Under `read_from: beginning`, every file replays from `0`.
 - **The tail driver notices shutdown only between two files' reads.** One read is at most 64 KiB
   (`READ_CHUNK_BYTES`), but the driver emits its lines before the next check, and each `emit`
   waits on the downstream. Against a slow or stalled downstream, `run_input`'s grace backstop can
@@ -43,9 +36,10 @@ Entry format and the other areas: [the known-gaps index](README.md).
     after that checkpoint.
   - A file created and removed wholly while `tail_in` was down isn't counted: no checkpoint
     names it.
-  - A file whose inode a new file reused while `tail_in` was down isn't counted. The new file's
-    head doesn't match the entry, so its resume is rejected, counted
-    `logit.input.files.resume_rejected`, and the original's unread tail is lost uncounted.
+  - A file whose inode a new file reused while `tail_in` was down is counted the same way: the
+    new file's content rejects the entry, counted `logit.input.files.resume_rejected`, and if no
+    new file claims the entry by content, its unread bytes are counted gone ([ADR
+    `tail-content-identity`](../adr/tail-content-identity.md), decision 6).
 
   A pattern that also matches the rotated name (`app.log*`) avoids the loss for a rename, but not
   for a removal, such as a rotator's deletion of its oldest file while `tail_in` is down. See
@@ -70,13 +64,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Workaround:** bound the rotator's retention. A pattern that matches only the active name
     (`app.log`) closes each rotated file once it's read, but loses the file's unread tail at a
     stop or a crash, counted only as far as the last checkpoint knew (the entry above).
-- **Under a pattern that matches rotated names, `copytruncate` re-emits the whole file on every
-  rotation.** The copy `copytruncate` writes is a new inode, so `app.log*` reads it from `0`; a
-  recorded run re-emitted about 1,600 to 2,000 lines per three rotations. `docs/deploying.md`'s
-  "What to watch for file tailing" has the guidance. See [ADR
-  `file-tailing-and-docker-json-logs`](../adr/file-tailing-and-docker-json-logs.md)'s "Rotation and
-  truncation" section; the fix is [ADR `tail-content-identity`](../adr/tail-content-identity.md)'s
-  decision 5, not yet built.
 - **`logit.input.files.rotated` misses a rotation when a scan lands in logrotate `create`'s
   rename-to-create gap.** logrotate renames the file away and creates its replacement afterward. A
   scan between the two finds nothing at the path, so it retires the old inode (which drains to its
@@ -91,21 +78,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
   again. See
   [ADR `file-tailing-and-docker-json-logs`](../adr/file-tailing-and-docker-json-logs.md)'s
   "Checkpoints" section.
-- **A resume verifies only the first `min(256, offset)` bytes of a file, so a recycled inode
-  whose new content shares them still resumes at a stale offset.** A checkpoint entry and a
-  de-selection retention carry a hash of the bytes the tailer read from the file's head. A resume
-  starts at `0` if the file is shorter than that head, differs in those bytes, or is shorter than
-  the offset.
-  - For an offset of at most 256, every skipped byte is identical content.
-  - Beyond that, a new file with the same first 256 bytes skips the bytes between there and the
-    stale offset. Files that start with a timestamp or a per-file header make this unlikely.
-  - A clean stop's mid-line offset, resumed this way into a file truncated and refilled while the
-    entry was unspent, splits the new generation's line at the same point it split the old one.
-    The halves concatenate to the new line, and the old line is the copy's loss.
-
-  See [ADR
-  `tail-discovery-failure-and-resume-identity`](../adr/tail-discovery-failure-and-resume-identity.md),
-  decision 2.
 - **A directory unreadable at startup replays its files under `read_from: end` once it becomes
   readable.** `read_from: end` applies only to files the bind-time scan found. A file first listed
   after that listing failed starts at its beginning, which favors duplicates over loss.

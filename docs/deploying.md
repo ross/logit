@@ -2511,11 +2511,21 @@ time to trust; put a `timestamp` stage after the parser to resolve one from a pa
 the first scan with no checkpoint entry naming it. A file discovered later (a new log, a rotated
 one, a newly selected container) always starts at its beginning, since it has nothing "from before
 `logit` started" to skip. A checkpoint entry, when present, always wins over `read_from` for the
-file it names, provided the file still starts with the bytes `logit` read from it. A resume
-re-checks the file's first 256 bytes (fewer for a smaller offset) and its length. A file whose
-head changed, because a new file reused the inode or the file was rewritten while `logit` was
-down, starts at offset 0 instead; `logit.input.files.resume_rejected` and a `resume_rejected`
-diagnostic say so.
+file it names, provided the file still holds the bytes `logit` read from it. A resume re-checks
+the file's first 256 bytes, the 256 bytes before the offset (fewer of each for a smaller offset),
+and its length. A file that changed, because a new file reused the inode or the file was
+rewritten while `logit` was down, starts at offset 0 instead; `logit.input.files.resume_rejected`
+and a `resume_rejected` diagnostic say so. If nothing claims that entry (below), its unread bytes
+are counted `logit.input.bytes.dropped{reason="gone"}` with a `file_gone` diagnostic.
+
+**A file no entry names can claim one by its content.** A file whose inode no checkpoint entry
+names, but whose first bytes and the bytes before an entry's offset match that entry, resumes
+there, counted `logit.input.files.claimed`. That covers a restored backup or a volume moved to
+other storage, where every inode number changed, under either `read_from`, and a `copytruncate`
+copy (see "Rotation" below). A claim needs at least 64 bytes of head to compare, so a file
+shorter than that can't claim. When two files match one entry, or one file matches two, nothing
+is claimed and a `claim_ambiguous` diagnostic says so: each file starts where it would have,
+which duplicates rather than loses.
 
 **A checkpoint that exists but can't be used replays every file from its beginning.** If
 `checkpoint_path` is unreadable, empty, malformed, or from an unsupported version, or is missing
@@ -2668,9 +2678,11 @@ see [ADR
   reassembly is discarded and counted the same way, once with the unterminated line that
   continues it. The bytes the last scan or read saw past the read offset, which no read reached,
   are counted `logit.input.bytes.dropped{reason="truncated"}`. That count is usually `0` and is
-  a floor: under `copytruncate`, what's written after the last look exists only in the copy, and
-  `logit` doesn't look for it. **Treat any nonzero `files.truncated` under `copytruncate` as
-  possible loss**, unless a pattern also matches the copy.
+  a floor: under `copytruncate`, what's written after the last look exists only in the copy.
+  Both drop counts wait for the end of the next scan whose listing succeeded, or a stop: a copy
+  a pattern matches claims the file's state from before the truncation instead, and then neither
+  is counted. **Treat any nonzero `files.truncated` under `copytruncate` as possible loss**,
+  unless a pattern also matches the copy and `files.claimed` rose with it.
 - `logit.input.files.skipped{reason="compressed"}` and
   `logit.component.diagnostics{key="compressed"}` (counts): a matched file that starts with a gzip,
   zstd, xz, or bzip2 header, which `logit` closes without reading a line of it, counted once per
@@ -2691,19 +2703,23 @@ see [ADR
   diagnostics name the container. **A deselection is process-local:** if `logit` restarts before the
   container is renamed back, the retained resume offset is lost.
 
-**Rotation.** Prefer rotating by rename (logrotate's `create` mode) over `copytruncate`. With
-`copytruncate`, don't use a pattern that matches the rotated names: `app.log*` reads every
-`copytruncate` copy from its beginning, re-emitting the whole file each rotation. Under
+**Rotation.** Prefer rotating by rename (logrotate's `create` mode) over `copytruncate`. If you
+must use `copytruncate`, use a pattern that matches the rotated names (`app.log*`): the copy
+claims the original's position by content and resumes where `logit` stopped reading the
+original, so it delivers the lines written after the last read, a half-read line whole, and
+nothing twice ([ADR `tail-content-identity`](adr/tail-content-identity.md), decision 5). A copy
+found before the truncate waits up to two scans for it. The claim needs the file to hold at
+least 64 bytes; a shorter file's copy is read from its beginning. A copy shorter than what
+`logit` read from the original (the writer appended between the copy and the truncate, and
+`logit` read it) can't claim, and is read from its beginning once its wait runs out. Under
 `compress`, a pattern that matches the rotated names is safe: each compressed file is skipped and
-counted `files.skipped{reason="compressed"}`
-([ADR `tail-content-identity`](adr/tail-content-identity.md), decision 2). With an exact pattern
-(`app.log`), the writer must reopen its file on HUP within one `poll_interval` of the rename: the
-renamed file is read until it reaches its end at least one `poll_interval` after `logit` saw the
-rotation, and what the writer appends to it after that is lost. `copytruncate` under an exact
-pattern loses what was written after the last read and before the truncate, a decided limit
-(decision 7 of the same ADR): `logit` counts the truncation in `files.truncated` and the bytes it
-saw unread in `bytes.dropped{reason="truncated"}`, but doesn't follow the copy. To keep those
-lines, rotate by rename.
+counted `files.skipped{reason="compressed"}` (decision 2). With an exact pattern (`app.log`), the
+writer must reopen its file on HUP within one `poll_interval` of the rename: the renamed file is
+read until it reaches its end at least one `poll_interval` after `logit` saw the rotation, and
+what the writer appends to it after that is lost. `copytruncate` under an exact pattern loses
+what was written after the last read and before the truncate, a decided limit (decision 7): no
+pattern reaches the copy, so `logit` counts the truncation in `files.truncated` and the bytes it
+saw unread in `bytes.dropped{reason="truncated"}`.
 
 A `copytruncate` that the writer refills past `logit`'s read offset before the next size check (one
 `poll_interval`, or one wake) isn't detected while `logit` runs: it reads on from the old offset,

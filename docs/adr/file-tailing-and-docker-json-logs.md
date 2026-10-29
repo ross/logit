@@ -665,6 +665,6 @@ semantic-convention key, in place of the string `container.image.tag`
 "Checkpoints". `(dev, ino)` stays the primary identity, and an inode no checkpoint entry matches
 may claim one by content. A compressed file is skipped and counted instead of tailed as text, and
 a truncation counts the bytes the tailer knew it hadn't read. A checkpoint entry gains an offset
-marker. `tailid/w1` and `tailid/w2` implement those decisions; until each lands, this record and
-`docs/known-gaps/tailing.md` describe the code. That ADR's decision 1 also records the shutdown
+marker. `tailid/w1` and `tailid/w2` implement those decisions. That ADR's decision 1 also
+records the shutdown
 loss in the 2026-09-26 amendment as a decided limit.
