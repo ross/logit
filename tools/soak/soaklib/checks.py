@@ -4231,18 +4231,18 @@ def _generator_increments(led, source):
 
 
 def _value_windows(data, led, source):
-    """`[(start, end, label, skips, widened)]`: each span in which the SUT can lose a delta's
-    value with no counter giving it, ending at the drain that counted it, with the series whose
-    first point it skipped (or evicted) and why, if at all, it can lose the whole span's
-    increments.
+    """`[(start, end, label, skips, widened, killed)]`: each span in which the SUT can lose a
+    delta's value with no counter giving it, ending at the drain that counted it, with the
+    series whose first point it skipped (or evicted), why, if at all, it can lose the whole
+    span's increments, and the killed life before it, if any.
 
     - A drain in which the `sut_delta` node counted `skipped{reason="initial"}` or
       `series.evicted`: the skipped first point lost the counts since its series' previous
       point, so the span starts at the node's last drain before it that received a point, or
       with none in the life, the previous life's last drain (the run's start for the first).
       It widens when the generator's sink counted a dropped batch or event in it, which leaves
-      the first point the SUT sees further on, or when the life before it ended in a kill,
-      which loses the deltas the SUT's sink still held.
+      the first point the SUT sees further on. When the life before it ended in a kill, that
+      life's lost deltas are its own term, not a reason to widen.
     - A generator life whose sink counted a `shutdown` drop: its last cumulative point, and the
       counts since the one before, never reached the SUT; the span is that life's last two
       windows, always widened.
@@ -4271,7 +4271,7 @@ def _value_windows(data, led, source):
         life = (initial.get(ts) or evicted.get(ts))[1]
         own = set(sut.life_drains(life))
         before = [t for t in received if t < ts and t in own]
-        killed = False
+        killed = None
         if before:
             start = before[-1]
             label = "idle eviction" if ts in evicted else "initial skip"
@@ -4279,7 +4279,7 @@ def _value_windows(data, led, source):
             earlier = sut.life_drains(life - 1) if life > 0 else []
             start = earlier[-1] if earlier else (data.t0 or ts)
             label = f"life {life} start"
-            killed = life > 0 and life - 1 in led.killed
+            killed = life - 1 if life > 0 and life - 1 in led.killed else None
         counts = []
         if ts in initial:
             counts.append(f"{_n(initial[ts][0])} skipped initial")
@@ -4287,17 +4287,16 @@ def _value_windows(data, led, source):
             counts.append(f"{_n(evicted[ts][0])} evicted")
         skips = max(initial.get(ts, (0,))[0], evicted.get(ts, (0,))[0])
         opened = start - window - drain
-        widened = ("the life before it was killed" if killed else
-                   "the generator dropped in it" if any(opened < t <= ts for t in gen_drops)
+        widened = ("the generator dropped in it" if any(opened < t <= ts for t in gen_drops)
                    else None)
-        windows.append((opened, ts, f"{label} ({', '.join(counts)})", skips, widened))
+        windows.append((opened, ts, f"{label} ({', '.join(counts)})", skips, widened, killed))
     for sink in gen_sinks:
         for ts, v, life in gen.counter_points("logit.component.batches.dropped",
                                               component=sink, reason="shutdown"):
             if v:
                 windows.append((ts - 2 * window - drain, ts,
                                 f"generator life {life} shutdown drop ({_n(v)} batch(es))", 0,
-                                "a shutdown drop"))
+                                "a shutdown drop", None))
     return sorted(windows)
 
 
@@ -4328,7 +4327,9 @@ def check_ledger_value(data):
 
     - A window loses at most its skipped series' first points, each one generator window of
       one series' increments (the median stored delta), plus one window of every series as
-      slack for a window boundary; a widened window, the increments over its whole span.
+      slack for a window boundary; after a kill, also the points the killed life lost, its
+      Ab − V (what `Ledger.kill_band` judges), each up to the largest stored delta; a widened
+      window, the increments over its whole span.
     - A delta the sink dropped short of the stand-in (an event dropped other than `rejected`,
       or a record other than `VALUE_SEEN_RECORD_REASONS`) loses at most the largest stored.
 
@@ -4370,13 +4371,19 @@ def check_ledger_value(data):
     slack = per_series * len(counts.series)
     bounds = []
     lines = []
-    for start, end, label, skips, widened in windows:
+    largest = values[-1] if values else 0
+    for start, end, label, skips, widened, killed in windows:
         if widened:
             bound = _increments_in(led, source, [(start, end)]) + slack
             how = f"widened, {widened}: its span's increments + slack"
         else:
             bound = skips * per_series + slack
             how = f"{_n(skips)} x {_n(per_series)} + slack"
+            if killed is not None:
+                lost_points = max(0, led.absorbed(killed, led.sinks) - led.v(killed, led.sinks))
+                bound += lost_points * largest
+                how = (f"{_n(skips)} x {_n(per_series)} + killed life {killed}'s Ab − V "
+                       f"{_n(lost_points)} x {_n(largest)} + slack")
         bounds.append(bound)
         lines.append(f"[{data.offset(start)}, {data.offset(end)}] {label}: at most "
                      f"{_n(bound)} ({how} {_n(slack)})")
@@ -4389,7 +4396,6 @@ def check_ledger_value(data):
                                                             component=sink)
                   if point.attributes.get("reason") not in VALUE_SEEN_RECORD_REASONS
                   and isinstance(point.value, (int, float)))
-    largest = values[-1] if values else 0
     band = sum(bounds) + unseen * largest
     head = (f"I {_n(increments)} (generate_in sent {_n(sent)} − lost {_n(lost)}) − V {_n(v)} "
             f"− U {_n(u)} = {_n(gap)}")

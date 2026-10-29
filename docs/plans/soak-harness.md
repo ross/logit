@@ -2674,8 +2674,10 @@ under "Deferred to a later round" wait.
       one generator window of one series' increments, the median stored delta, plus one window
       of every series as slack for a window boundary. It widens to the generator's increments
       over its whole span only when the generator's sink counted a dropped batch or event in it,
-      which moves the first point the SUT sees further on, when the life before it ended in a
-      kill, which loses the deltas the SUT's sink still held, or for a shutdown drop's window.
+      which moves the first point the SUT sees further on, or for a shutdown drop's window.
+      After a kill, which loses the deltas the SUT's sink still held, it adds the points that
+      killed life lost, its Ab − V (the quantity `Ledger.kill_band` judges), each up to the
+      largest stored delta. A kill doesn't widen it: a kill's span holds the whole outage.
     - With windows, the gap is reported if it's no more than the sum of the windows' bounds,
       plus each drop the stand-in can't see (`events.dropped` other than `rejected`,
       `records.dropped` other than `rejected` and `oversize`, stale points included) times the
@@ -5984,7 +5986,7 @@ below. The table is its re-score with `script/soak check`, overall WARN.
 | `ledger.windows` | SKIP | not enabled ([ledger] vm_every_window) |
 | `ledger.replay` | PASS | datadog: life 2's first drain replayed 0 vs killed life 1's last-drain buffer.batches 0 (one batch in flight allowed) |
 | `ledger.summary` | PASS | final life 2: uncounted 0 = W − D − E − B 0 + E − A 0 + A − Δ_disc − Ab 0 + Ab − V[datadog] 0; delta's skipped points Δ_disc 20, counted; wire G − (W + K + F) 0 over the run, F 0 counted; ledger.wire judges the rest; end to end over the run, G 5,060 less counted loss 60 plus a resend allowance 0: datadog: V 4,912 <= G − counted + resent 5,000 |
-| `ledger.value` | PASS | I 1,355,500 (generate_in sent 1,355,500 − lost 0) − V 1,318,700 − U 22,000 = 14,800, reported: within the 75,000 that the 3 reported window(s) can lose, each bounded alone; U 2,000 cued by c0s1, 20,000 cued by c0s2 |
+| `ledger.value` | PASS | I 1,355,500 (generate_in sent 1,355,500 − lost 0) − V 1,318,700 − U 22,000 = 14,800, reported: within the 30,000 that the 3 reported window(s) can lose, each bounded alone; U 2,000 cued by c0s1, 20,000 cued by c0s2 |
 | `ledger.sent` | PASS | to standin: every batch received ended in an accepted response; datadog: requests 2xx 246, 4xx 11, 5xx 7, connect_error 3, network_error 7; records accepted 4,912; cued, excused: request_refused line(s) 3 by c0s3; batch(es) dropped rejected 4 by c0s2; record(s) dropped rejected 8 by c0s1, 80 by c0s2; datadog life 0 at +900s: received 181 vs delivered 177 + dropped 4 + buffer.batches 0, gap 0; datadog life 1 at +1150s: received 30 vs delivered 30 + dropped 0 + buffer.batches 0, gap 0; datadog life 2 at +1375s: received 39 vs delivered 39 + dropped 0 + buffer.batches 0, gap 0 (one batch in flight allowed); ledger.egress and ledger.standin read the stand-in's record |
 | `ledger.topic` | SKIP | standin target: no topic |
 | `ledger.standin` | WARN | 20 pair(s) of points of one series in one second from two requests, first logit.soak.requests_0 at +795s stored 250, then 25: Datadog keeps the later and loses the other uncounted, which datadog_out collapses only within one batch (docs/known-gaps/datadog.md); 271 request(s) recorded, 253 stored, 10 cue(s); 140 duplicate copies of stored points (life 0 140), 35,000 counted twice by the destination, reported; 8 series named by series_errors; 5 classed step(s) (at_least_once) |
@@ -6008,12 +6010,12 @@ below. The table is its re-score with `script/soak check`, overall WARN.
   c0s2's four rejected batches. The gap, 14,800, is about three windows of 20 series × 250:
   the first point after the SUT restart, after the idle eviction, and after the kill, each
   skipped and counted 20 times. No window opened at life 0's start: the SUT was up before the
-  generator's first point, so `auto` emitted it whole. Each window is bounded alone: the SUT
-  restart's and the eviction's at 10,000 each (20 skips × 250, plus 5,000 of slack), and the
-  kill's at 55,000, its span's increments, since a kill loses the sink's queued deltas. The
-  three sum to 75,000. Before review the row pooled the windows' whole spans into a band of
-  195,000, inflated by the 100 s pause and `generate_in`'s catch-up after it, which would have
-  passed a loss of about 13% of I outside every window.
+  generator's first point, so `auto` emitted it whole. Each window is bounded alone at 10,000
+  (20 skips × 250, plus 5,000 of slack): the kill's adds its killed life's Ab − V, which was 0,
+  as `ledger.egress` read it. The three sum to 30,000. Before review the row pooled the
+  windows' whole spans into a band of 195,000, inflated by the 100 s pause and
+  `generate_in`'s catch-up after it, which would have passed a loss of about 13% of I outside
+  every window; widening the kill's window to its span gave 75,000.
 - **Netem, the generator restart, and the cues that lose nothing lost no value.** The 20% loss
   caused no initial skip (`netem-skips-no-initial` read 0), so each `otlp_out` resend was
   skipped as a duplicate or emitted once. The generator restart reset all 20 series, each

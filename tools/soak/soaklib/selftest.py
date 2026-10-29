@@ -11812,6 +11812,11 @@ def _delta_ledger():
         expect(hidden["ledger.value"].status == checks.FAIL,
                f"a loss outside every window, under a pooled band, FAILs, got "
                f"{hidden['ledger.value']}")
+        # The same loss beside a kill: the kill's window holds the points the killed life
+        # lost, not its whole span.
+        hidden = rows("delta-kill-outside", restart=True, action="kill", gen_extra=outside)
+        expect(hidden["ledger.value"].status == checks.FAIL,
+               f"a loss outside every window, beside a kill, FAILs, got {hidden['ledger.value']}")
 
         # Life 0's last two requests never stored: deltas a kill loses from the sink's queue.
         def lost_queue(requests):
@@ -11823,9 +11828,9 @@ def _delta_ledger():
                f"a stop's window doesn't widen past its skips, got {stopped['ledger.value']}")
         killed = rows("delta-kill-queue", restart=True, action="kill", edit=lost_queue)
         expect(killed["ledger.value"].status == checks.PASS
-               and "widened, the life before it was killed"
-               in " ".join(killed["ledger.value"].lines),
-               f"a kill's window widens to its span's increments, got {killed['ledger.value']}")
+               and "killed life 0's Ab − V 4 x 50" in " ".join(killed["ledger.value"].lines),
+               f"a kill's window holds the points the killed life lost, got "
+               f"{killed['ledger.value']}")
         dropped = [_line(_stamp(T0 + 110), "logit.component.batches.dropped", "sum", 1,
                          component="out", attrs={"reason": "overflow_oldest"})]
         overflowed = rows("delta-drop-queue", restart=True, edit=lost_queue, gen_extra=dropped)
