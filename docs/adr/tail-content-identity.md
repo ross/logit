@@ -169,20 +169,22 @@ reviewer can check.
      has: a copy still being written. An empty file never waits, so a rename rotation's new file
      isn't delayed.
 
-   logrotate's `copytruncate` creates its copy empty and then fills it, so a scan can open the
-   copy empty. A file opened empty, not from a resume or a claim, stays claimable until its first
-   non-empty read, since it has emitted nothing. Before reading it, a drain probes it against the
-   truncated and tracked files' candidates: if its bytes match one or may grow into one, the drain
-   leaves it unread and the next scan's claim pass decides it as it does a new inode; otherwise
-   it's read from `0` at once, as a rename rotation's new file is.
+   logrotate's `copytruncate` creates its copy empty and then fills it, so a scan can open the copy
+   empty. A file opened empty, not from a resume or a claim, stays claimable until its first
+   non-empty read, since it has emitted nothing. That read decides, before anything is decoded: the
+   file is probed against the truncated and tracked files' candidates as they stood when the drain
+   began, and if its bytes match one or may grow into one, the drain seeks it back to `0`, emits
+   nothing, and leaves it to the next scan's claim pass, which decides it as it does a new inode;
+   otherwise the read goes on, so a rename rotation's new file is read at once.
 
-   The first scan never waits, since `read_from` decides only files it opens. The cost falls only
-   on an unmatched inode the decoder factory accepts (under `docker_in`, a selected container's
-   log; a rejected one is never opened): one open, a read of at most 256 bytes for the head, one
-   hash per distinct candidate head length, and a read of at most 256 bytes per distinct
-   candidate offset whose head matches. An inode that waits pays it again at each scan, and a
-   file opened empty pays it once more when a drain first finds it holding bytes; any other is
-   opened in the scan that probed it and never probed again. What it recovers:
+   The first scan never waits, since `read_from` decides only files it opens. The cost falls only on
+   an unmatched inode the decoder factory accepts (under `docker_in`, a selected container's log; a
+   rejected one is never opened): one open, a read of at most 256 bytes for the head, one hash per
+   distinct candidate head length, and a read of at most 256 bytes per distinct candidate offset
+   whose head matches. An inode that waits pays it again at each scan, and a file opened empty pays
+   it once more, with an `fstat`, when a read first returns its bytes, and nothing beyond its read
+   while it stays empty; any other is opened in the scan that probed it and never probed again. What
+   it recovers:
 
    - a `copytruncate` copy under `app.log*` resumes at the original's offset instead of replaying
      from `0`;

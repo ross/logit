@@ -355,6 +355,42 @@ enum ClaimFrom {
 /// and the candidate it claims (none for [`StartOffset::Defer`]).
 type Claim = Option<(StartOffset, Option<ClaimFrom>)>;
 
+/// A [`Candidate`] that owns its head bytes, for [`Tailer::claim_snapshot`].
+struct OwnedCandidate {
+    from: ClaimFrom,
+    offset: u64,
+    head: Head,
+    head_bytes: Option<Vec<u8>>,
+    marker: u64,
+    min_len: u64,
+}
+
+impl From<&Candidate<'_>> for OwnedCandidate {
+    fn from(c: &Candidate<'_>) -> Self {
+        Self {
+            from: c.from,
+            offset: c.offset,
+            head: c.head,
+            head_bytes: c.head_bytes.map(<[u8]>::to_vec),
+            marker: c.marker,
+            min_len: c.min_len,
+        }
+    }
+}
+
+impl OwnedCandidate {
+    fn borrow(&self) -> Candidate<'_> {
+        Candidate {
+            from: self.from,
+            offset: self.offset,
+            head: self.head,
+            head_bytes: self.head_bytes.as_deref(),
+            marker: self.marker,
+            min_len: self.min_len,
+        }
+    }
+}
+
 /// How a new inode's content compares with one [`Candidate`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Verdict {
@@ -447,9 +483,9 @@ struct TrackedFile<D> {
     /// Opened empty at `0`, not from a resume or a claim, and nothing read since. logrotate's
     /// `copytruncate` creates its copy empty and then fills it, so a scan can open the copy
     /// before it holds anything. Until the file's first non-empty read it may still claim a
-    /// position, since it has emitted nothing ([`Tailer::decide_claimable`]).
+    /// position, since it has emitted nothing ([`Tailer::claim_waits`]).
     claimable: bool,
-    /// Set by [`Tailer::decide_claimable`] when a claimable file's bytes match, or may grow into, a
+    /// Set by [`Tailer::claim_waits`] when a claimable file's bytes match, or may grow into, a
     /// candidate's: nothing is read from it until the next scan's claim pass decides its start.
     claim_pending: bool,
     /// When the file became [`FileState::Draining`], set by [`TrackedFile::start_draining`] and
@@ -556,6 +592,9 @@ pub(crate) struct Tailer<D: TailDecoder, F: DecoderFactory<D>> {
     /// File watches `read_one` released with a compressed file, for the next `drain` or `scan`
     /// to remove: `read_one` has no `Watcher`.
     unwatch: Vec<super::watch::WatchId>,
+    /// The truncated and tracked files' candidates when the current drain began, while any file
+    /// is claimable ([`Tailer::claim_waits`]); empty otherwise.
+    claim_snapshot: Vec<OwnedCandidate>,
     /// Inodes nothing names that `DecoderFactory::accept` took in this scan's first pass, so
     /// `open_tracked` doesn't ask again. Cleared at the end of `reconcile_all`.
     accepted: HashSet<FileId>,
@@ -612,6 +651,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             skipped: HashMap::new(),
             unwatch: Vec::new(),
             accepted: HashSet::new(),
+            claim_snapshot: Vec::new(),
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
             watched_dirs: HashSet::new(),
@@ -1061,58 +1101,57 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         }
     }
 
-    /// Decides, before a drain reads anything, each claimable file `read_one` leaves unread for
-    /// the next scan's claim pass (`TrackedFile::claim_pending`): one that's `Active`, holds
-    /// bytes, and whose bytes match, or may grow into, a truncated or tracked file's candidate
-    /// (`docs/adr/tail-content-identity.md`, decision 5). Every other claimable file that holds
-    /// bytes stops being claimable and is read from `0`, so a rename rotation's new file, which
-    /// matches nothing, is read at once. Decided before the reads, so what one file's read adds
-    /// to the candidates doesn't depend on the order a pass visits files in.
-    async fn decide_claimable(&mut self) {
-        let ids: Vec<FileId> =
-            self.files.iter().filter(|(_, f)| f.claimable).map(|(id, _)| *id).collect();
-        for id in ids {
-            self.decide_claim(id).await;
-        }
+    /// Takes [`Tailer::claim_snapshot`] at the start of a drain, while any file is claimable.
+    /// No syscall: the candidates are in memory.
+    fn snapshot_candidates(&mut self) {
+        self.claim_snapshot = if self.files.values().any(|f| f.claimable) {
+            self.read_candidates().iter().map(OwnedCandidate::from).collect()
+        } else {
+            Vec::new()
+        };
     }
 
-    /// [`Tailer::decide_claimable`] for one file.
-    async fn decide_claim(&mut self, id: FileId) {
-        let Some(tracked) = self.files.get_mut(&id) else { return };
-        if tracked.state != FileState::Active {
-            // Draining: no scan will offer it a claim, so it's read.
-            tracked.claimable = false;
-            tracked.claim_pending = false;
-            return;
+    /// Whether `read_one` leaves claimable file `id` unread for the next scan's claim pass, after
+    /// a read returned its first `n` bytes: it's `Active`, and its bytes match, or may grow into,
+    /// a candidate in [`Tailer::claim_snapshot`] (`docs/adr/tail-content-identity.md`, decision
+    /// 5). It then seeks back to `0` and is marked `claim_pending`; otherwise it stops being
+    /// claimable and the read goes on, so a rename rotation's new file, which matches nothing, is
+    /// read at once. Decided from the read, so a write landing just before it can't slip past,
+    /// and against the drain's snapshot, so what another file's read adds to the candidates
+    /// during the pass doesn't depend on the order the pass visits files in.
+    async fn claim_waits(&mut self, id: FileId, n: usize) -> bool {
+        let Some(tracked) = self.files.get_mut(&id) else { return false };
+        if !tracked.claimable {
+            return false;
         }
-        if tracked.claim_pending {
-            return;
+        tracked.claimable = false;
+        tracked.claim_pending = false;
+        if tracked.state != FileState::Active || self.claim_snapshot.is_empty() {
+            // Draining: no scan will offer it a claim, so it's read.
+            return false;
         }
         let len = match tracked.file.metadata().await {
-            Ok(meta) => meta.len(),
-            Err(_) => 0,
+            Ok(meta) => meta.len().max(n as u64),
+            Err(_) => n as u64,
         };
-        if len == 0 {
-            return;
-        }
         // Probed through the descriptor: the path may name another inode since the last scan.
-        let file = match tracked.file.try_clone().await {
-            Ok(file) => file.into_std().await,
-            Err(_) => {
-                tracked.claimable = false;
-                return;
-            }
-        };
-        let path = tracked.path.clone();
-        let wait = {
-            let candidates = self.read_candidates();
-            !candidates.is_empty()
-                && probe_file(&file, &path, len, &candidates)
-                    .is_ok_and(|verdicts| verdicts.iter().any(|v| *v != Verdict::No))
-        };
-        let Some(tracked) = self.files.get_mut(&id) else { return };
-        tracked.claimable = wait;
-        tracked.claim_pending = wait;
+        let Ok(file) = tracked.file.try_clone().await else { return false };
+        let file = file.into_std().await;
+        let candidates: Vec<Candidate<'_>> =
+            self.claim_snapshot.iter().map(OwnedCandidate::borrow).collect();
+        let wait = probe_file(&file, &tracked.path, len, &candidates)
+            .is_ok_and(|verdicts| verdicts.iter().any(|v| *v != Verdict::No));
+        if !wait {
+            return false;
+        }
+        let offset = tracked.offset;
+        if let Err(err) = tracked.file.seek(std::io::SeekFrom::Start(offset)).await {
+            self.diag.warn_throttled("read_error", format!("{}: {err}", tracked.path.display()));
+            return false;
+        }
+        tracked.claimable = true;
+        tracked.claim_pending = true;
+        true
     }
 
     /// The truncation check of every `Draining` file, bound to no path, so nothing that walks
@@ -1178,7 +1217,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     /// - It's shorter than a candidate whose head bytes are in memory, and every byte agrees: a
     ///   copy still being written. An empty file is never deferred, so a rename rotation's new
     ///   file isn't delayed. One opened empty stays claimable until its first non-empty read
-    ///   ([`Tailer::decide_claimable`]), and `reconcile_all` offers it here again once it holds
+    ///   ([`Tailer::claim_waits`]), and `reconcile_all` offers it here again once it holds
     ///   bytes.
     ///
     /// The first scan defers nothing: `read_from` decides only files it opens.
@@ -1332,7 +1371,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     }
 
     /// The candidates that live outside a scan: each held truncation's state and each tracked
-    /// file at its line boundary. [`Tailer::decide_claimable`] probes against these alone.
+    /// file at its line boundary. [`Tailer::claim_waits`] probes against these alone.
     fn read_candidates(&self) -> Vec<Candidate<'_>> {
         let mut out = Vec::new();
         for (ix, t) in self.truncations.iter().enumerate() {
@@ -2148,7 +2187,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         watcher: &mut super::watch::Watcher,
         due: tokio::time::Instant,
     ) -> DrainEnd {
-        self.decide_claimable().await;
+        self.snapshot_candidates();
         loop {
             if self.untaken {
                 return DrainEnd::Untaken;
@@ -2223,10 +2262,6 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         if self.files.get(&id).is_some_and(|t| t.state == FileState::Deselected) {
             return false;
         }
-        if self.files.get(&id).is_some_and(|t| t.claimable && !t.claim_pending) {
-            // Empty when the drain began: bytes written since are decided before they're read.
-            self.decide_claim(id).await;
-        }
         if self.files.get(&id).is_some_and(|t| t.claim_pending && t.state == FileState::Active) {
             return false;
         }
@@ -2267,13 +2302,14 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             self.recheck_length(id).await;
             return self.files.get(&id).is_some_and(|t| t.offset < before);
         }
+        if self.claim_waits(id, n).await {
+            self.read_buf.clear();
+            return false;
+        }
         let read_at = now_nanos();
         let bytes = self.read_buf.split().freeze();
 
         let Some(tracked) = self.files.get_mut(&id) else { return false };
-        // Bytes written after `decide_claimable` saw the file empty: read now, so no scan may
-        // untrack it.
-        tracked.claimable = false;
         capture_head(&mut tracked.head, tracked.offset, &bytes);
         // Before any line is split, so nothing of a compressed file is emitted.
         if !tracked.sniffed {
@@ -2775,7 +2811,7 @@ fn push_tail(tail: &mut Vec<u8>, bytes: &[u8]) {
 fn probe(path: &Path, len: u64, candidates: &[Candidate<'_>]) -> std::io::Result<Vec<Verdict>> {
     if len == 0 {
         // Never deferred: a rename rotation's new file is empty, and must not wait. A file
-        // opened empty may still claim before its first read (`Tailer::decide_claimable`).
+        // opened empty may still claim before its first read (`Tailer::claim_waits`).
         return Ok(vec![Verdict::No; candidates.len()]);
     }
     fault::check(super::pattern::OPEN, path, 0)?;
@@ -7329,6 +7365,30 @@ mod tests {
             assert_eq!(truncated_drops(&mut probe), (0.0, 0.0));
             std::fs::remove_dir_all(&dir).ok();
         }
+    }
+
+    /// A claimable file a read leaves for the scan goes back to `0`: renamed out of every pattern
+    /// before any scan decides it, it drains, and its lines are all read.
+    #[tokio::test]
+    async fn a_claimable_file_left_unread_is_read_from_zero_once_it_drains() {
+        let dir = scratch_dir("claim-pending-drains");
+        let (path, copy) = (dir.join("app.log"), dir.join("app.log.1"));
+        let (one, two) = (long_line("one"), long_line("two"));
+        std::fs::write(&path, format!("{one}\n{two}\n")).unwrap();
+        let mut tailer = Tailer::new(
+            vec![PathPattern::new(dir.join("app.log*"))],
+            LineFactory,
+            fast_config(ReadFrom::Beginning),
+        );
+        assert_eq!(tick(&mut tailer, true).await.len(), 2);
+        std::fs::File::create_new(&copy).unwrap();
+        assert!(tick(&mut tailer, false).await.is_empty());
+        std::fs::copy(&path, &copy).unwrap();
+        assert!(read_out(&mut tailer).await.is_empty(), "left for the scan");
+        assert!(tailer.files[&id_of(&copy)].claim_pending);
+        std::fs::rename(&copy, dir.join("moved.txt")).unwrap();
+        assert_eq!(tick(&mut tailer, false).await, vec![one, two], "drained from 0");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A rename rotation's new file is created empty too, but matches nothing once written, so

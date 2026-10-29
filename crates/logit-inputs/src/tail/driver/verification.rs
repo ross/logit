@@ -555,25 +555,22 @@ impl Model {
         }
     }
 
-    /// Before a drain reads anything, leaves each claimable file unread for the next scan when
-    /// it isn't draining, holds bytes, and they match, or may grow into, a truncated or tracked
-    /// file's candidate; any other claimable file holding bytes stops being claimable.
+    /// Before a drain reads anything, the driver's read-time decision against its drain-start
+    /// snapshot: each claimable file holding bytes is left unread for the next scan when it isn't
+    /// draining and they match, or may grow into, a truncated or tracked file's candidate; any
+    /// other stops being claimable.
     fn decide_claimable(&mut self) {
         let ids: Vec<FileId> =
             self.tracked.iter().filter(|(_, t)| t.claimable).map(|(id, _)| *id).collect();
         for id in ids {
             let t = &self.tracked[&id];
-            let wait = if t.draining.is_some() {
-                false
-            } else if t.claim_pending {
+            let content = &self.inodes[t.inode].content;
+            // The driver decides from a read, so an empty file, draining or not, stays as it is.
+            if content.len() as u64 <= t.offset || (t.claim_pending && t.draining.is_none()) {
                 continue;
-            } else {
-                let content = &self.inodes[t.inode].content;
-                if content.is_empty() {
-                    continue;
-                }
-                self.read_candidates().iter().any(|c| Self::probe(content, c) != Verdict::No)
-            };
+            }
+            let wait = t.draining.is_none()
+                && self.read_candidates().iter().any(|c| Self::probe(content, c) != Verdict::No);
             let t = self.tracked.get_mut(&id).expect("tracked");
             t.claimable = wait;
             t.claim_pending = wait;
