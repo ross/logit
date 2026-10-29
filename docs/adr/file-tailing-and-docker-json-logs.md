@@ -528,8 +528,9 @@ where a scan or a read sees the length. A `copytruncate` that the writer refills
 offset before that check isn't detected: the tailer keeps its offset and reads from the middle of
 the new content, so the bytes before that offset aren't emitted during the run. A size comparison can't tell
 the two apart, and the inode is unchanged. A restart replays the file through the head fingerprint
-(decision 2), so those bytes arrive late. The window is one `poll_interval` or one wake, and it's a documented gap
-(`docs/known-gaps/tailing.md`); a writer that rotates by rename has no such window.
+(decision 2), so those bytes arrive late. The window is one `poll_interval` or one wake, and it's
+a decided limit ([ADR `tail-content-identity`](tail-content-identity.md), decision 8); a writer
+that rotates by rename has no such window.
 
 **"Checkpoints": unconsumed entries are persisted.** "A checkpoint write only persists the tailer's
 *currently tracked* files, so ... pruning falls out of the write contract" no longer holds. A write

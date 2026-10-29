@@ -11,10 +11,12 @@ Entry format and the other areas: [the known-gaps index](README.md).
   container falls back to `read_from` like any file the process has never seen. See [ADR
   `docker-container-identity-and-minimal-watches`](../adr/docker-container-identity-and-minimal-watches.md).
 - **`tail_in`/`docker_in`'s checkpoint identity is `(dev, ino)`, which doesn't survive a bind
-  mount or filesystem migration that preserves content but not inode numbers.** A restored backup,
-  a volume moved to different storage, or a bind mount re-created from a snapshot resumes from the
-  beginning instead of the checkpointed offset. That's safe (at-least-once still holds), but not
-  the seamless resume of the common case.
+  mount or filesystem migration that preserves content but not inode numbers.** After a restored
+  backup, a volume moved to different storage, or a bind mount re-created from a snapshot, no
+  checkpoint entry matches a file, so each file starts where `read_from` puts it.
+  - Under the default `read_from: end`, each file's unread tail is skipped, and the scan counts
+    it `logit.input.bytes.dropped{reason="gone"}` as it prunes the unmatched entries.
+  - Under `read_from: beginning`, every file replays from `0`.
 - **The tail driver notices shutdown only between two files' reads.** One read is at most 64 KiB
   (`READ_CHUNK_BYTES`), but the driver emits its lines before the next check, and each `emit`
   waits on the downstream. Against a slow or stalled downstream, `run_input`'s grace backstop can
@@ -96,18 +98,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
   again. See
   [ADR `file-tailing-and-docker-json-logs`](../adr/file-tailing-and-docker-json-logs.md)'s
   "Checkpoints" section.
-- **A `copytruncate` that the writer refills past the old offset before the next check goes
-  undetected.** Truncation is `len < offset`, seen at a scan or a read. A file truncated in place
-  and grown beyond the tailer's offset within one `poll_interval` (or one wake) looks like an
-  ordinary append: the tailer reads the new content from the old offset, and the bytes before it
-  aren't emitted during the run. The inode doesn't change under `copytruncate`, so nothing
-  signals it while `logit` runs.
-  - With a checkpoint, a restart replays the file through the head fingerprint, so the bytes are
-    recovered late, not lost.
-  - A writer that rotates by rename has no such window.
-
-  See [ADR `file-tailing-and-docker-json-logs`](../adr/file-tailing-and-docker-json-logs.md)'s
-  2026-09-28 amendment.
 - **A resume verifies only the first `min(256, offset)` bytes of a file, so a recycled inode
   whose new content shares them still resumes at a stale offset.** A checkpoint entry and a
   de-selection retention carry a hash of the bytes the tailer read from the file's head. A resume

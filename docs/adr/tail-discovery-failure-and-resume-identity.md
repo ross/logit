@@ -286,7 +286,8 @@ the fault seam extended to reads. Each numbered item is one decision a reviewer 
   it.
 - **Documented gaps, not fixes.** Eleven entries in `docs/known-gaps/tailing.md` record what this stream leaves open, so a later workstream that closes one can
   see it was expected:
-  - copytruncate fast refill;
+  - copytruncate fast refill (a decided limit since 2026-10-29; see [ADR
+    `tail-content-identity`](tail-content-identity.md), decision 8);
   - the 256-byte fingerprint residual;
   - a `Draining` read error losing the unread tail;
   - a container name of 12 or more hex characters matching as an id prefix;

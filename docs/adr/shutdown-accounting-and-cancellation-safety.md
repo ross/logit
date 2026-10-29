@@ -1,6 +1,6 @@
 ---
 created: 2026-09-26
-updated: 2026-10-13
+updated: 2026-10-29
 ---
 
 # Shutdown accounting and cancellation safety: every shutdown loss counted, and one table of cancellation points

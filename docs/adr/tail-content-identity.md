@@ -29,8 +29,11 @@ lines stayed open, each listed in `docs/known-gaps/tailing.md`:
   before the truncate exist only in the copy, which no pattern matches. Nothing counts them.
 - **The 256-byte residual.** A resume checks only the first `min(256, offset)` bytes, so a
   recycled inode whose new content shares them resumes at a stale offset and skips bytes.
-- **Migration.** Identity is `(dev, ino)`, so a restored backup or a volume moved to other storage
-  replays every file from `0`.
+- **Migration.** Identity is `(dev, ino)`, so after a restored backup or a volume moved to other
+  storage, no checkpoint entry matches a file, and each file starts where `read_from` puts it.
+  Under the default `read_from: end`, that skips each file's unread tail, counted
+  `logit.input.bytes.dropped{reason="gone"}` when the scan prunes the unmatched entries. Under
+  `read_from: beginning`, every file replays from `0`.
 - **A reused inode hides a gone file.** When a new file reuses a checkpointed inode while
   `tail_in` is down, the head check rejects the resume (`logit.input.files.resume_rejected`), and
   the original file's unread tail is lost with no `*.dropped` count, against the rule in [ADR
@@ -75,10 +78,12 @@ reviewer can check.
    acknowledgment means in [ADR `delivery-semantics`](delivery-semantics.md), item 3: the lines
    are in every open downstream inbox. A sink that drops that batch at its shutdown grace, counted
    `logit.component.batches.dropped{reason="shutdown"}`, loses it, because the restart resumes
-   past it. The same holds for a sink's in-memory queue lost to a crash. There is no end-to-end
+   past it. A crash loses every checkpointed line still in memory: in a sink's queue, in a
+   transform's inbox, on an edge, or in an `aggregate` window. There is no end-to-end
    acknowledgment (Alternatives considered). The remedy is a `buffer.disk:` spool on every sink
-   downstream of a tail source whose restart must not lose lines, and `docs/deploying.md`'s
-   tailing section says so.
+   downstream of the tail source. On a clean shutdown it keeps what the grace would drop. On a
+   crash it keeps only what reached the sinks' spools, and lines still upstream of them are lost.
+   `docs/deploying.md`'s tailing section says so.
 
 2. **A compressed file is skipped and counted, never tailed as text.** The tailer detects one by
    the magic number at the file's head:
@@ -108,11 +113,11 @@ reviewer can check.
    read, so steady-state tailing reads nothing extra. A resume by inode accepts iff the head
    matches, the marker matches, and the offset is at most the file's length; anything else is a
    `resume_rejected` and a start at `0`, as today. That closes the 256-byte residual: a recycled
-   inode that shares the first 256 bytes now also has to share the 256 bytes before the offset.
-   It also catches a `copytruncate` refilled past the old offset while `logit` was down. The
-   marker makes this checkpoint format 4. There's no format 3 reader: a format 3 file is
-   unusable, as an unknown version already is, so every file replays once on upgrade (`logit` is
-   pre-release).
+   inode that shares the first 256 bytes now also has to share the 256 bytes before the offset. It
+   also catches a `copytruncate` refilled past the old offset while `logit` was down whose new
+   content shares the old head, which the head check alone accepts. The marker makes this
+   checkpoint format 4. There's no format 3 reader: a format 3 file is unusable, as an unknown
+   version already is, so every file replays once on upgrade (`logit` is pre-release).
 
 5. **A content claim resumes an inode no entry matches.** A newly discovered inode with no
    inode-matched resume entry may claim one candidate:
@@ -131,7 +136,8 @@ reviewer can check.
 
    - a `copytruncate` copy under `app.log*` resumes at the original's offset instead of replaying
      from `0`;
-   - a restored backup or a migrated volume resumes instead of replaying;
+   - a restored backup or a migrated volume resumes, instead of skipping each file's unread tail
+     (under `read_from: end`) or replaying it from `0` (under `read_from: beginning`);
    - a `copytruncate` while `logit` was down is recovered under a pattern that matches the copy.
 
    The 64-byte floor is Filebeat's minimum fingerprint size. A shorter head is too likely to be a
@@ -153,15 +159,21 @@ reviewer can check.
    written before the truncate may be lost unless a pattern also matches the copy. The count is
    an estimate; `logit.input.files.truncated` is the signal that a truncation happened, and what
    the operator needs is to know it happened, not the exact count. The tailer doesn't search for
-   the copy outside its patterns. `docs/deploying.md` steers to a pattern that matches rotated
-   names, or to rename rotation. Once decision 5 lands, a claim of the truncated file's
+   the copy outside its patterns. `docs/deploying.md` steers to rename rotation, and, once
+   decision 5 lands in `tailid/w2`, also to a pattern that matches the rotated names. Once
+   decision 5 lands, a claim of the truncated file's
    pre-truncation state cancels that count, because the copy then resumes where the original
    stopped.
 
 8. **A refill past the old offset while running stays undetected.** A `copytruncate` that the
    writer refills past the tailer's offset before the next size check still looks like an append
-   while `logit` runs. Detecting it would take a head re-read on every read. Decision 4's marker
-   catches it at the next restart.
+   while `logit` runs: the tailer reads on from the old offset, and the refilled bytes before it
+   aren't emitted. Detecting it would take a head re-read on every read. This is a decided limit,
+   and rotation by rename avoids it (`docs/deploying.md`'s "Rotation" paragraph). At the next
+   restart, the head check that exists today rejects the resume and replays the file, because the
+   tailer still holds the old file's head. If the refilled file shares the old head, the resume
+   is accepted, and the skipped bytes are lost. Decision 4's marker doesn't help here: the tailer
+   takes it from the refilled bytes it read, so it matches them.
 
 ## Alternatives considered
 
@@ -182,8 +194,8 @@ reviewer can check.
 - **End-to-end acknowledgment, advancing the checkpoint only once every sink delivered.**
   Rejected. [ADR `delivery-semantics`](delivery-semantics.md) already rejects it (item 3, and
   "An opt-in durable acknowledgment" under its alternatives). A token can't pass through
-  `aggregate`, Lua `flush()`, or `dedup_timestamps`, and most tail pipelines have one: each emits
-  batches that correspond to no input batch. `BatchContext`, which an edge carries, is `Copy` and
+  `aggregate` or a Lua `flush()`, and most tail pipelines have one: each emits batches that
+  correspond to no input batch. `BatchContext`, which an edge carries, is `Copy` and
   pinned at 32 bytes, so it has no room for an acknowledgment handle. `buffer.disk:` closes the
   window on the sink side with what exists.
 - **Fluent Bit's 32-byte marker.** Rejected in favor of 256 bytes, the head's size, so one rule
@@ -202,10 +214,11 @@ reviewer can check.
   a copy against it. Today a truncation clears the head
   ([ADR `tail-discovery-failure-and-resume-identity`](tail-discovery-failure-and-resume-identity.md),
   decision 2).
-- **Decided limits, not gaps.** The shutdown loss (decision 1), not decompressing (decision 2),
-  a file created and removed while `tail_in` was down (decision 6), and a refill past the offset
-  while running (decision 8) are recorded here. `docs/known-gaps/tailing.md` keeps the
-  `copytruncate`, `compress`, gone-file, 256-byte residual, and `(dev, ino)` migration entries
+- **Decided limits, not gaps.** The shutdown loss (decision 1), not decompressing (decision 2), a
+  file created and removed while `tail_in` was down (decision 6), and a refill past the offset
+  while running (decision 8) are recorded here. The refill's known-gaps entry moves to
+  `docs/deploying.md`'s "Rotation" paragraph with this record. `docs/known-gaps/tailing.md` keeps
+  the `copytruncate`, `compress`, gone-file, 256-byte residual, and `(dev, ino)` migration entries
   until `tailid/w1` and `tailid/w2` change the code each describes.
 - **`tailid/w1`** implements decisions 2 and 7: the compressed skip and the truncation count.
 - **`tailid/w2`** implements decisions 4, 5, and 6: the format 4 offset marker, the content

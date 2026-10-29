@@ -1128,8 +1128,9 @@ To keep it, add a `buffer.disk:` block, which replaces that sink's queue with a 
 spool on disk ([ADR `disk-backed-sink-buffer`](adr/disk-backed-sink-buffer.md)). A restart resumes
 delivery from the last persisted read cursor and replays at most the batches committed since the
 last checkpoint: at-least-once, the same trade `tail_in`'s checkpoint makes. A `tail_in` or
-`docker_in` upstream needs one on each of its sinks to survive a restart without loss, because its
-checkpoint covers only what reached a sink's inbox (see
+`docker_in` upstream needs one on each of its sinks to survive a clean restart without loss,
+because its checkpoint covers what reached its downstream inboxes, not what a sink delivered. A
+crash still loses checkpointed lines that hadn't reached a spool (see
 [Tailing files and Docker logs](#tailing-files-and-docker-logs)).
 
 **A crash replays a window, under either posture.** After a crash, the spool replays the batches
@@ -2541,14 +2542,18 @@ tracked files, and a pass reads at most 64 KiB per file, so a crash then replays
 at-least-once boundary, the same trade `buffer:`'s sink-side retry makes: it bounds how much a
 crash can replay, and replay is always safe.
 
-**A tail source whose restart must not lose lines needs a `buffer.disk:` sink.** The checkpoint
-covers the lines handed to a sink's inbox, not the lines a sink delivered. A sink with an
-in-memory queue that's still holding them when its `buffer.shutdown_grace` runs out drops them,
-counted `logit.component.batches.dropped{reason="shutdown"}`, and the restart resumes past
-them. A crash loses the queue too, with every line in it that the last checkpoint covers. Give
+**A tail source whose clean restart must not lose lines needs a `buffer.disk:` sink.** The
+checkpoint covers the lines handed to the tail source's downstream inboxes, not the lines a sink
+delivered. A sink with an in-memory queue that's still holding them when its
+`buffer.shutdown_grace` runs out drops them, counted
+`logit.component.batches.dropped{reason="shutdown"}`, and the restart resumes past them. Give
 every sink downstream of the tail source a `buffer.disk:` block (see
-[Durable buffering](#durable-buffering)): its spool keeps the batches across the restart. `logit` doesn't hold the checkpoint back until a
-sink delivers, because a stage such as `aggregate` emits batches that match no input batch
+[Durable buffering](#durable-buffering)): its spool keeps those batches across the restart.
+
+A spool doesn't make a crash lossless. A crash loses every line the last checkpoint covers that
+hadn't reached a sink's spool: lines in a transform's inbox, on an edge between components, or in
+an `aggregate` window. `logit` doesn't hold the checkpoint back until a sink delivers, because a
+stage such as `aggregate` emits batches that match no input batch
 ([ADR `tail-content-identity`](adr/tail-content-identity.md), decision 1).
 
 **A file gone at a restart is counted as far as the checkpoint knew.** Each checkpoint entry
@@ -2681,8 +2686,15 @@ every `copytruncate` copy from its beginning, re-emitting the whole file each ro
 `.gz` as lines of binary. With an exact pattern (`app.log`), the writer must reopen its file on
 HUP within one `poll_interval` of the rename: the renamed file is read until it reaches its end at
 least one `poll_interval` after `logit` saw the rotation, and what the writer appends to it after
-that is lost. `copytruncate` under an exact
-pattern loses what was written after the last read and before the truncate.
+that is lost. `copytruncate` under an exact pattern loses what was written after the last read
+and before the truncate.
+
+A `copytruncate` that the writer refills past `logit`'s read offset before the next size check (one
+`poll_interval`, or one wake) isn't detected while `logit` runs: it reads on from the old offset,
+and the refilled bytes before that offset aren't emitted. A restart catches it and replays the
+file, unless the refilled file starts with the same bytes `logit` recorded from the old file's head
+(up to 256), in which case those skipped bytes are lost. Rotating by rename has no such window
+([ADR `tail-content-identity`](adr/tail-content-identity.md), decision 8).
 
 ## Named time zones
 
