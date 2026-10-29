@@ -219,7 +219,8 @@ settle window would leave a life no fit. `fanin` and `tcp-ingress` set `60s`, an
   the lines a killed generator sent after its last telemetry drain reach the SUT with no G
   behind them, and `ledger.wire` would net them against real loss. W7a adds `mark` and `exit`
   (below). W9a adds `respond`, on a stand-in only (below). W12c adds `signal` and `rename`, on
-  a service that runs `logit` (below), and W12d `rotate` and `probe` (below).
+  a service that runs `logit` (below), W12d `rotate` and `probe` (below), and `tailid/soak-claim`
+  `copytruncate`, `gzip`, and `replace`, on a file source's writer (below).
 - `[ledger] vm_every_window`, optional, is `true` or `false`; `[ledger] sut_script`, optional,
   is a component id.
 - `[[ledger.source]]` (W8b) has the rules under "Sources" below.
@@ -405,6 +406,37 @@ for = "10s"
   out of the windows that excuse anything (`RunData.events`). `[[expect]]` reads either's
   window, and `file.reopen` (§6) judges each rename.
 - Neither can appear in a `[random]` schedule, whose faults take no `signal`, `path`, or `to`.
+
+**Copytruncate, compression, and restores (`tailid/soak-claim`)** rotate a file wire's files as
+logrotate and a restore do, for [ADR `tail-content-identity`](../adr/tail-content-identity.md)'s
+content claim, gone counting, and compressed skip:
+
+```toml
+[[step]]
+at = "0s"
+action = "copytruncate"   # logrotate's copytruncate; also "gzip", or "replace" with no `to`
+on = "generator"          # a file source's writer
+path = "app.log"          # the file in /shared
+to = "app.log-01"         # the copy, which the tailer's pattern matches
+for = "5s"
+```
+
+- Each runs `soaklib/fileops.py`'s stdlib source in a one-shot container of the stand-in's
+  `python` image, as root with no network and `<run>/shared` at `/shared`, because the writer's
+  files belong to its container's `logit` user, whose files the host user can't truncate. Its
+  record carries the JSON the source prints.
+- A `copytruncate` creates `to` empty, copies `path` into it until a read returns nothing, and
+  truncates `path` in place, so `file_out`, which holds its file `O_APPEND`, writes on at offset
+  0 with no hole. It reads what the writer appended after the copy's last read on its way to the
+  truncate and records those lines as `lost_lines`: they're in neither file. A write between
+  that read and the truncate is lost unrecorded. A `gzip` writes `path` compressed into `to` and
+  removes `path`. A `replace` writes `path`'s bytes to a dot-prefixed temporary name, which an
+  `app.log*` pattern doesn't match, and renames it over `path`.
+- `path` and `to` are bare names, `to` distinct across steps, and a `replace` takes no `to`. The
+  step is on the writer of a `[[ledger.source]]` with `wire = "file"`. A `copytruncate` or a
+  `gzip` runs once per run, so a scenario with one sets `max_duration` to one cycle's run.
+- None opens a fault window, and none can appear in a `[random]` schedule. §6's `ledger.wire`
+  row reads each `copytruncate`'s record.
 
 **Certificates and rotations (W12d)** drive TLS reload
 ([ADR `tls-certificate-reload`](../adr/tls-certificate-reload.md)): a `[tls]` table gives the run
@@ -1211,10 +1243,21 @@ The rows:
     unterminated at a clean stop into two events"); nothing replays, since shutdown writes a
     final checkpoint;
   - the final life adds nothing: the end sequence waits until the tailers have read what the
-    writer wrote (§5).
+    writer wrote (§5);
+  - a `copytruncate` step (`Ledger.copytruncate_band`): below, its `lost_lines`, which a tailer
+    reads only if a read lands between the copy and the truncate, and whatever the shared
+    directory's count shows lost past the records, up to one writer batch a step; above, for a
+    step while the ingress SUT runs, its copy's lines and one: a read in that window leaves the
+    copy shorter than what the tailer read, so it can't claim and is read from 0, and the
+    truncation's discarded line, counted `frames.dropped{reason="truncated"}`, is also whole in
+    the copy ([ADR `tail-content-identity`](../adr/tail-content-identity.md), "What a claim
+    still duplicates or loses"). A step inside a stop, kill, restart, `exit`, or pause adds
+    nothing above: no read lands in its window, so the copy claims the checkpoint's offset.
 
   While the writer deleted no file, G must also equal the lines the driver counted in the
-  shared directory at the end (`shared_counted`), else the row FAILs its precondition. From
+  shared directory at the end (`shared_counted`), else the row FAILs its precondition; with
+  `copytruncate` steps, G less their `lost_lines`, with up to one writer batch a step fewer.
+  The count reads a gzip file decompressed. From
   W18, `file_out` deletes `.{max_files − 1}` at each rotation, so a writer deleted
   max(0, rotations − (max_files − 1)) files, its `logit.output.file.rotations` read against
   its config's `rotate.max_files`. Once it deleted one, G stands alone: the count must not
@@ -2351,7 +2394,13 @@ where it needs them, and a small check extension.
    matches open at its end, so with every file kept its descriptors grow by about one per
    rotation, and the scenario's `fd_growth` allows for it. Built as `tail-rotate`: 1,000 lines a
    second rotating about every 44 s, a 60 s pause, a 30 s stop, a restart, a 30 s kill, and a
-   150 s kill across about three rotations.
+   150 s kill across about three rotations. `tail-copytruncate` (`tailid/soak-claim`) carries
+   the item to the paths [ADR `tail-content-identity`](../adr/tail-content-identity.md) added,
+   which rename rotation never reaches: a writer that never rotates, `copytruncate` steps while
+   the SUT runs, inside a stop, and inside a kill, `gzip` steps on finished copies, and a
+   `replace` inside the kill, with `[[expect]]` on claims, rejected resumes, truncations,
+   compressed skips, and none of a gone entry's bytes, an ambiguous claim, an invalid UTF-8
+   line, or a checkpoint error.
 10. **Deterministic destination errors (built in W9a, for `prometheus_out`, and W9b, for
     `datadog_out`).** A scripted HTTP stand-in answering `429`, `5xx`, `400`,
     and `413` on cue and recording what it accepts, so every row of a sink's response-class table
@@ -5199,6 +5248,31 @@ limits.
   16 to 23 against a limit of +10.
 - **RSS fell.** `rss_slope` read −3.9 MiB/h over the SUT's last life, with 83% of the time after
   warmup judged.
+
+### `tail-copytruncate`: content claims under copytruncate (2026-10-29)
+
+`tail-copytruncate` ran once for its 15 minutes on the development host, against
+`logit:soak-claim` (`sha256:69984dcd`), built from the branch at `f8d3c714`, whose product code
+is `f0d225e8`'s (run `20261029T233857Z`). Every row passed:
+
+- All seven claims happened: the four copytruncates while the SUT ran, the one inside the stop,
+  the one inside the kill, and the replace (`files.claimed` 7, expected 3 or more). So no copy
+  was read from 0, and W − G was −300 against the band [−5,000, 467,188]: the killed life's
+  unexported last drain interval (its run of drain intervals shows a gap of 294), as in
+  `tail-rotate`. The band's upper edge is the six copies' lines, read again only if a copy can't
+  claim; it's that wide by design, and the claim count shows none was.
+- Every copytruncate recorded `lost_lines` 0, and the shared directory held G's 905,700 lines
+  in 7 files, the two `.gz` files read decompressed. The window between the copy's last read and
+  the truncate is a few system calls, and the writer writes a batch every 100 ms, so the run
+  never caught a write in it: the ADR's copy-to-truncate loss residual stayed unexercised, and a
+  run that catches one is judged by the step's record.
+- `resume_rejected` 2 (the stop's and the kill's app.log, refilled under its inode),
+  `files.truncated` 4, and `files.skipped{reason="compressed"}` 3: `app.log-01.gz` once in the
+  life it was made and again in the life after the kill, since decision 2 counts a skip once per
+  process, and `app.log-03.gz` once. No `bytes.dropped` of any reason, no `frames.dropped`, no
+  `claim_ambiguous` or `invalid_utf8` diagnostic, and no checkpoint error.
+- The SUT's descriptors went from a warmup median of 20 to 24 at the end, inside `fd_growth`'s
+  10: the four copies left uncompressed.
 
 ### W15: multi-destination routers under a target split (2026-10-18)
 

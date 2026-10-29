@@ -1,0 +1,21 @@
+# The writer in `script/soak`'s tail-copytruncate scenario: 1,000 log lines a second into one
+# file in the directory it shares with the system under test, one JSON object per line. It
+# never rotates the file itself: the scenario's `copytruncate` steps do, as logrotate's
+# `copytruncate` does, and `file_out` holds the file `O_APPEND`, so it writes on at offset 0
+# after each truncate. Its `internal` telemetry goes to stdout as NDJSON, so the harness reads
+# what it wrote.
+admin: { bind: 127.0.0.1:9600 }
+components:
+  load:
+    type: generate_in               # unbounded
+    rate: 1000
+    batch: 100
+    event:
+      log: "soak line {seq%100}"
+  file:
+    type: file_out                  # no `rotate:`: the file never rotates by rename
+    sources: [load]
+    path: /shared/app.log
+    format: json
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }
