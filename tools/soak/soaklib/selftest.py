@@ -1801,9 +1801,10 @@ def _splunk_request(seq, offset, points, status=200, stored=True, cue=None, answ
                     encoding="gzip", path="/services/collector/event", ack_id=None,
                     invalid_event=None):
     """One `splunk` stand-in record line at `T0 + offset` whose body is HEC metric objects of
-    `points`, `[(name, value, timestamp_ms)]`, concatenated, under `encoding`; a default `2xx`
-    carries `ack_id`, `seq - 1` unless given."""
-    payload = "".join(_hec_object(*point) for point in points).encode()
+    `points`, `[(name, value, timestamp_ms)]` or an object's JSON text, concatenated, under
+    `encoding`; a default `2xx` carries `ack_id`, `seq - 1` unless given."""
+    payload = "".join(point if isinstance(point, str) else _hec_object(*point)
+                      for point in points).encode()
     body = gzip.compress(payload, mtime=0) if encoding == "gzip" else payload
     line = {"event": "request", "seq": seq, "t": T0 + offset, "path": path,
             "content_type": "application/json", "content_encoding": encoding,
@@ -10260,6 +10261,24 @@ def _new_shape_rules(root):
         expect(loaded.standin_shape == shape and got == unclassed and len(loaded.steps) == steps,
                f"{name} loads as a {shape} stand-in with {steps} steps, all classed but "
                f"{unclassed}, got {loaded.target} {got}")
+        cued = {s.id: {key: getattr(s, key) for key in ("after", "partial_success",
+                                                        "invalid_event", "withhold_acks")
+                       if getattr(s, key) is not None}
+                for s in scenario.expand(loaded)}
+        want = ({"c0s1": {"partial_success": 2}} if shape == "otlp" else
+                {"c0s1": {"invalid_event": 3}, "c0s7": {"after": 1},
+                 "c0s13": {"withhold_acks": True}})
+        expect({step: keys for step, keys in cued.items() if keys} == want,
+               f"{name}'s expanded steps carry their cue fields, got "
+               f"{ {step: keys for step, keys in cued.items() if keys} }")
+    server = _load_standin_server(root)
+    for shape in standin.SHAPES:
+        expect(server.DEFAULT_PATH.get(shape) == standin.PATHS[shape]
+               and server.DEFAULT_STATUS.get(shape) == standin.DEFAULT_STATUS[shape],
+               f"the stand-in and soaklib agree on the {shape} shape's path and default status, "
+               f"got {server.DEFAULT_PATH.get(shape)} {server.DEFAULT_STATUS.get(shape)}")
+    expect(server.SPLUNK_ACK_PATH == standin.SPLUNK_ACK_PATH,
+           f"the stand-in and soaklib agree on the /ack path, got {server.SPLUNK_ACK_PATH}")
     for name, cases in (
             ("standin-otlp", (
                 (1, {"class": None}, "under the otlp shape a respond other than a 2xx needs "
@@ -10283,6 +10302,12 @@ def _new_shape_rules(root):
                  "an invalid_event on a 503"),
                 (0, {"invalid_event": -1}, "`invalid_event` must be an integer of 0 or more",
                  "a negative invalid_event"),
+                # A second code 6 under one cue answers the sink's resend, which it reads as
+                # `Rejected` for the batch, counting no record: `ledger.standin` would FAIL it.
+                (0, {"count": None}, "`invalid_event` needs `count = 1`",
+                 "an invalid_event with no count"),
+                (0, {"count": 2}, "`invalid_event` needs `count = 1`",
+                 "an invalid_event with count 2"),
                 (12, {"class": None}, "`withhold_acks` needs `class = \"ambiguous\"`",
                  "an unclassed withhold_acks"),
                 (12, {"class": "clean"}, "`withhold_acks` needs `class = \"ambiguous\"`",
@@ -10373,6 +10398,16 @@ def _otlp_standin_checks():
                in rows["ledger.standin"].detail,
                f"a rejected request's points counted short FAILs, got {rows['ledger.standin']}")
 
+        # Only a `2xx` carries a partial success: one on a `503` after storing counts nothing.
+        def not_2xx(requests):
+            requests[2].update(status=503, partial_success=1, cue="c0s2")
+            return requests
+
+        rows = results("otlp-partial-on-503", not_2xx,
+                       timeline_extra=_respond_fault("c0s2", 195, 205, status=503))
+        expect(rows["ledger.standin"].status == checks.PASS,
+               f"a partial_success on a 503 rejects no point, got {rows['ledger.standin']}")
+
 
 def _splunk_checks():
     """The checks over a `splunk` stand-in two-life run: V the stored cumulative measurements;
@@ -10408,14 +10443,19 @@ def _splunk_checks():
                and "1 default 2xx answer(s) carried no ackId" in rows["ledger.standin"].detail,
                f"a default 2xx with no ackId FAILs, got {rows['ledger.standin']}")
 
-        # A code 6 at +299 naming object 1, x_9, of [x_0, x_9, x_1], and the resend of x_1.
+        # A code 6 at +299 naming object 1, one multi-metric object holding x_8 and x_9, two
+        # records, of [x_0, x_8 and x_9, x_1], and the resend of x_1.
         def invalid(requests):
             last = requests[-1]
             stamp = int((T0 + 300) * 1000)
             values = dict((name, value) for name, value in (
                 (labels["__name__"], samples[0][1]) for labels, samples
                 in standin.decode_body(last, standin.SPLUNK)))
-            body = [("x_0_total", values["x_0_total"], stamp), ("x_9_total", 5, stamp),
+            pair = json.dumps({"time": stamp / 1000, "host": "logit-soak", "event": "metric",
+                               "fields": {"metric_type": "Sum", "metric_name:x_8_total": 4,
+                                          "metric_name:x_9_total": 5}},
+                              separators=(",", ":"))
+            body = [("x_0_total", values["x_0_total"], stamp), pair,
                     ("x_1_total", values["x_1_total"], stamp)]
             offset = last["t"] - T0
             requests[-1] = _splunk_request(last["seq"], offset, body, status=400, stored=False,
@@ -10424,16 +10464,57 @@ def _splunk_checks():
             return requests
 
         cued = _respond_fault("c0s2", 295, 305, status=400)
-        rows = results("splunk-invalid", invalid, timeline_extra=cued,
-                       sut_extra=[_dropped_line(300, 1, "invalid_event")])
+        counted = _dropped_line(300, 2, "invalid_event")
+        rows = results("splunk-invalid", invalid, timeline_extra=cued, sut_extra=[counted])
         for row in ("ledger.standin", "ledger.egress", "drops"):
             expect(rows[row].status == checks.PASS,
                    f"a code 6 the sink counted, its prefix stored, PASSes {row}, got {rows[row]}")
+        expect("life 1: records dropped invalid_event 2 by the record, 2 by sink"
+               in rows["ledger.standin"].lines,
+               f"a code 6 object's records are its measurements, got "
+               f"{rows['ledger.standin'].lines}")
         rows = results("splunk-invalid-uncounted", invalid, timeline_extra=cued)
         expect(rows["ledger.standin"].status == checks.FAIL
-               and "sink counted 0 record(s) dropped invalid_event, the record holds 1"
+               and "sink counted 0 record(s) dropped invalid_event, the record holds 2"
                in rows["ledger.standin"].detail,
                f"a code 6 the sink didn't count FAILs, got {rows['ledger.standin']}")
+        # A drop of another reason is no code 6's: the row reads `invalid_event` alone.
+        rows = results("splunk-invalid-other-reason", invalid, timeline_extra=cued,
+                       sut_extra=[counted, _dropped_line(300, 3, "oversize")])
+        expect(rows["ledger.standin"].status == checks.PASS,
+               f"a records.dropped of another reason leaves the code 6 rule alone, got "
+               f"{rows['ledger.standin']}")
+
+        # A code 6 answering the resend too, under one cue. The sink reads the second as
+        # `Rejected` for the batch and counts no record, so the row expects more records than
+        # the sink counts; that's why `invalid_event` needs `count = 1`.
+        def twice(requests):
+            requests = invalid(requests)
+            requests[-1] = {**requests[-1], "status": 400, "stored": False, "cue": "c0s2",
+                            "invalid_event": 0}
+            requests[-1].pop("ack_id", None)
+            return requests
+
+        rejected = _line(_stamp(T0 + 300), "logit.component.batches.dropped", "sum", 1,
+                         component="sink", attrs={"reason": "rejected"})
+        rows = results("splunk-invalid-twice", twice, timeline_extra=cued,
+                       sut_extra=[counted, rejected])
+        expect(rows["ledger.standin"].status == checks.FAIL
+               and "sink counted 2 record(s) dropped invalid_event, the record holds 3"
+               in rows["ledger.standin"].detail,
+               f"a second code 6 under one cue FAILs a sink that counted the first alone, got "
+               f"{rows['ledger.standin']}")
+
+        # Only a `400` names an object: an `invalid_event` on another answer counts nothing.
+        def not_400(requests):
+            requests[2].update(invalid_event=0, cue="c0s2")
+            requests[2].pop("ack_id", None)
+            return requests
+
+        rows = results("splunk-invalid-on-200", not_400,
+                       timeline_extra=_respond_fault("c0s2", 195, 205, status=200))
+        expect(rows["ledger.standin"].status == checks.PASS,
+               f"an invalid_event on a 200 names no object, got {rows['ledger.standin']}")
 
 
 # A rolling overlap: two instances, `logit` and `logit-b`, in `sut-net`'s namespace.

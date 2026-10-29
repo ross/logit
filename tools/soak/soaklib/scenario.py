@@ -2499,7 +2499,8 @@ def _respond_problems(spec, where, shape=None):
     `count` a positive integer, `headers` a table of strings with `status` only,
     `after` a positive integer, `series_errors` a positive integer with a 2xx `status` and no
     `body` under the `datadog` shape only, `partial_success` the same under the `otlp` shape only,
-    `invalid_event` an integer of 0 or more with `status` 400 and no `body` and `withhold_acks`
+    `invalid_event` an integer of 0 or more with `status` 400, `count = 1`, and no `body`, and
+    `withhold_acks`
     true with a 2xx `status`, each under the `splunk` shape only, none of them on another action;
     and `class` one of `FAULT_CLASSES`, on a `respond` or a `stop` only, and under the
     `CLASS_REQUIRED_SHAPES` required on a `respond` other than a 2xx and refused on a 2xx, except
@@ -2567,6 +2568,11 @@ def _respond_problems(spec, where, shape=None):
             if spec.fault_class is not None:
                 problems.append(f"{where}: an `invalid_event` answer drops one object and the "
                                 "sink resends the rest, so it takes no `class`")
+            if spec.count != 1:
+                # The sink reads a second code 6, on its resend of the rest, as `Rejected` for
+                # the whole batch and counts no record for it.
+                problems.append(f"{where}: `invalid_event` needs `count = 1`, since a second "
+                                "code 6 answers the sink's resend and drops the batch")
         elif spec.withhold_acks is not None:
             if spec.fault_class != "ambiguous":
                 # The sink reads an ack it never gets, past its `ack_timeout`, as `Ambiguous`.

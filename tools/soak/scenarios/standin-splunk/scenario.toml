@@ -6,11 +6,12 @@
 # rows: a code 6 naming one object, which the sink drops and resends the rest after; `401` and
 # `403` with a token code; `400` code 10; `429` and a `503` code 9 before any body of the batch
 # was accepted, and a `503` code 9 after one was, landed on a batch's second body; `500` code 8;
-# `400` with a code no row names; `404`; a `3xx`; a reset after the request left; and acks
+# `400` code 5, a code about this request; `404`; a `3xx`; a reset after the request left; and acks
 # withheld past `ack_timeout`. A stop of the stand-in is the connect-failure row before a body
 # was accepted. Not cued: Splunk Cloud's code 6 at object 0 of a body over 5 MiB, which
 # `max_body_bytes` keeps the sink from sending; a connect failure after a body was accepted,
-# which the stand-in can't time between two bodies; and the two `connect_timeout:` rows.
+# which the stand-in can't time between two bodies; the request timeout, since the stand-in
+# holds no answer; and the two `connect_timeout:` rows.
 # `ledger.standin` checks each step's effect at the sink, that the sink's
 # `records.dropped{reason="invalid_event"}` is the records of the objects the code 6 answers
 # named, and that every default answer carried an `ackId`. A lost window is overwritten by the

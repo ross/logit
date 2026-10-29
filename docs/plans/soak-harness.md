@@ -1805,7 +1805,8 @@ answer carries an `ackId` minted per `X-Splunk-Request-Channel` from 0, since wi
 stand-in also answers `/services/collector/ack`, each id `true` once minted on the poll's
 channel, and `false` under a `withhold_acks` cue or for an id a restarted stand-in hasn't minted
 since. A poll is no write: it spends no `count` and stores nothing. A cue's `invalid_event`
-answers a `400` with code 6 naming object N, and `after = K` lets K writes through with the
+answers a `400` with code 6 naming object N, under `count = 1`, since the sink reads a second
+code 6, on its resend of the rest, as `Rejected` for the batch and counts no record; and `after = K` lets K writes through with the
 default answer before the cue answers, so a busy `503` lands on a batch's second body after its
 first was accepted. Its control port takes the driver's
 cues and answers `/health`. It prints one JSON line per request to stdout: the time, the path and the
@@ -1989,8 +1990,8 @@ to it, as on an external target. Under `remote_write` and `influxdb`, `ledger.se
   code 10, `429` code 26 and `503` code 9 before any body was accepted (`clean`), `503` code 9 on
   a batch's second body (`after = 1`, `ambiguous`), `500` code 8, `400` code 5, `404`, `302`, a
   reset, every ack withheld (`ambiguous`), and a `stop` of the stand-in. Not cued: Splunk Cloud's
-  code 6 at object 0 of a body over 5 MiB, a connect failure after a body was accepted, and the
-  two `connect_timeout:` rows.
+  code 6 at object 0 of a body over 5 MiB, a connect failure after a body was accepted, the
+  request timeout (the stand-in holds no answer), and the two `connect_timeout:` rows.
 
 The black-hole control is a `2xx` the stand-in doesn't store (`status = 200`, `apply = false`).
 `ledger.standin` FAILs it wherever it falls. Under cumulative temporality the next stored totals
@@ -2833,9 +2834,12 @@ under "Deferred to a later round" wait.
       a dial past `connect_timeout:`, and the four gRPC rows. With one signal, the scenario
       makes no claim about settlement per signal.
     - `splunk`: two paths, `/services/collector/event` and `/services/collector/ack`. Cues for
-      each of `splunk_hec_out`'s 16 rows: a code 6 naming object N (drop and resend), a `503`
-      code 9 before a body was accepted (`Clean`) and after (`Ambiguous`, `after_delivery`),
-      `429`, `401` and `403` `Refused`, and withheld acks (`ack_timeout`, then `Ambiguous`).
+      the rows of `splunk_hec_out`'s 16 a stand-in can produce: a code 6 naming object N (drop
+      and resend), a `503` code 9 before a body was accepted (`Clean`) and after (`Ambiguous`,
+      `after_delivery`), `429`, `401` and `403` `Refused`, and withheld acks (`ack_timeout`,
+      then `Ambiguous`). Out of scope: Splunk Cloud's code 6 at object 0 of a body over 5 MiB,
+      a connect failure after a body was accepted, the request timeout (the stand-in holds no
+      answer), and the two `connect_timeout:` rows.
 
     Each shape touches the places W9b's and W16's shapes did: `standin/standin.py`'s
     `DEFAULT_STATUS`, `DEFAULT_PATH`, and `cue_problems`; `soaklib/standin.py`'s `SHAPES`,
