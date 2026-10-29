@@ -11,7 +11,7 @@ duration = "17m"          # warmup + one cycle + cooldown
 warmup = "60s"
 cooldown = "120s"         # >= recovery_bound
 recovery_bound = "60s"    # request timeout 10s + two sinks' retry_max_delay 10s + 2 windows + a drain
-cycle = "14m"             # >= last recovery (12m45s) + 2 x progress_window
+cycle = "14m"             # >= last recovery (13m) + 2 x progress_window
 compose = "compose.override.yaml"   # adds collector, the relay
 
 [configs]
