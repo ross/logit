@@ -1074,8 +1074,8 @@ sut_transforms = ["parse", "labels", "count", "metrics_only"]   # optional: node
 ```
 
 The ledger follows each `[[ledger.sink]]`. A row about a sink (`progress`, `identity.sink`,
-`recovery`, `ledger.edge`, `ledger.egress`, `ledger.windows`, `ledger.replay`, and
-`ledger.sent`) judges each sink, reports a line per sink, and takes the worst status. Under
+`recovery`, `ledger.edge`, `ledger.egress`, `ledger.windows`, `ledger.absent`, `ledger.replay`,
+and `ledger.sent`) judges each sink, reports a line per sink, and takes the worst status. Under
 `split = "copy"`, the default, each sink holds all of `aggregate`'s output, so each sink's V is
 judged against Ab alone; under `split = "route"` each sink holds its target's share, so their
 summed V is. `load()` refuses `split = "route"` when the SUT config has a `route` with a
