@@ -1455,9 +1455,9 @@ class HttpListener:
 # `batches.deferred`. `otlp_in` counts no requests and never answers busy: a slow downstream
 # holds the request, and a client that gives up leaves its batches to be delivered
 # (crates/logit-inputs/src/otlp.rs). `splunk_hec_in` and `datadog_in` answer as `influxdb_in`
-# does on the route each writer posts to, `event` and `series_v2`, under the same 5 s deadline
-# on a request's first batch: a `/event` body decodes to one batch per envelope and a series
-# body to one batch, so the identities hold while each body carries one envelope
+# does on the route each writer posts to, `event` and `series_v2`, under a 5 s deadline
+# (`splunk_hec_in` on a request's first batch, `datadog_in` on every batch): a `/event` body
+# decodes to one batch per envelope and a series body to one batch, so the identities hold while each body carries one envelope
 # (crates/logit-inputs/src/splunk.rs and datadog.rs, "Backpressure"). `prometheus_in`'s
 # remote-write receiver counts each request once in `logit.input.writes{class}`, with no
 # `route` tag, decodes it to one batch, and never answers busy: backpressure delays its `204`
@@ -1977,8 +1977,8 @@ class Ledger:
                         sink_batch[sink] = (total("logit.component.events.received", [sink])
                                             / batches)
                 batch = sum(sink_batch.values())
-            # On an HTTP wire, the batches each edge of a judged run may hold in W and not yet
-            # in G: every request in flight, the writers' `concurrency:` summed
+            # On an HTTP wire, the batches a judged run's trailing edge may hold in W and not
+            # yet in G: every request in flight, the writers' `concurrency:` summed
             # (`HTTP_DEFAULT_CONCURRENCY` when unset), since the listener counts a batch before
             # the writer reads its answer, or under `ack: true` its acknowledgment.
             in_flight = 1
@@ -3233,14 +3233,21 @@ def _wire_one(data, led, source, instances=None):
     acks = _ack_timeouts(led, source) if http else []
     in_flight = stats.get("in_flight", 1)
     allowances = {}
+    trailing = {}
     for index, (start, end, kind, _, _, _, _) in enumerate(runs):
         if kind == "judged":
             # A judged run's surplus has no pool to fall into, so every edge it has, a boundary
-            # with another judged run included, allows its one batch of interpolation error, or
-            # on an HTTP wire one per request in flight, each counted in W before G.
+            # with another judged run included, allows its one batch of interpolation error.
             sides = sum(1 for other in (index - 1, index + 1) if 0 <= other < len(runs))
             drops = sum(v for ts, v in ambiguous if start < ts <= end)
-            allowances[index] = (drops + sides * in_flight) * batch
+            # On HTTP the listener counts a request's batch in W before the writer counts it in
+            # G, so the requests in flight at a run's trailing edge leave a surplus in it and a
+            # deficit after. `_boundary_nets` nets that pair against a judged or steady run;
+            # against a reported run or the run's end nothing nets, so that edge allows the rest
+            # of the writer's `concurrency:`.
+            following = runs[index + 1][2] if index + 1 < len(runs) else "end"
+            trailing[index] = in_flight - 1 if following in ("fault", "end") else 0
+            allowances[index] = (drops + sides + trailing[index]) * batch
     connects = (sorted((ts, v) for sink in source_ids(source, "generator_sink")
                        for ts, v, _ in led.gens[service].counter_points(
                            "logit.output.requests", component=sink,
@@ -3290,9 +3297,11 @@ def _wire_one(data, led, source, instances=None):
                 what = (f"transport-error attempt(s) or ack timeout(s) ({_n(timed_out)} ack "
                         "timeout(s))")
             dials = sum(v for ts, v in connects if start < ts <= end)
+            extra = trailing[index]
+            in_flight_text = (f" + {extra} more in flight at a trailing edge nothing nets"
+                              if extra else "")
             lines[-1] += (f", surplus allowed {_n(allowed)} ({_n(drops)} {what} + "
-                          f"{sides} edge(s)"
-                          + (f" x {in_flight} in flight" if in_flight > 1 else "")
+                          f"{sides} edge(s)" + in_flight_text
                           + f", x one {_n(batch)}-line batch"
                           + (f"; {_n(dials)} connect failure(s) allow none" if dials else "")
                           + ")")
@@ -3300,9 +3309,7 @@ def _wire_one(data, led, source, instances=None):
                 took = "W − X" if http else "W + counted"
                 surplus.append(f"{span}: {took} exceeds G by {_n(round(-net))}, over "
                                f"the {_n(allowed)} its {_n(drops)} {what} and "
-                               f"{sides} edge(s)"
-                               + (f" x {in_flight} in flight" if in_flight > 1 else "")
-                               + " allow")
+                               f"{sides} edge(s)" + in_flight_text + " allow")
     if surplus:
         status = FAIL
         lines[:0] = surplus

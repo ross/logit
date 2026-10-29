@@ -670,10 +670,13 @@ so its wire is keyed on the mode its config sets: `bind:` is the receiver, and
   `logit.output.acks{result="timeout"}` allows one batch, an upper bound because one batch can
   hold several ids. A poll the writer counts under `route="ack"` sends no data, so a poll that
   fails in transport allows none.
-- **A judged edge allows one batch per request in flight.** The listener counts a batch in W
-  before the writer reads its answer, and under `ack: true` before its acknowledgment arrives,
-  half a second or more later. So a writer at `concurrency: 8` can hold eight batches in W and
-  not in G across a run's edge, and `splunk-hec-ingress`'s first run FAILed a SUT restart's
-  window by 930 points against 700 allowed with nothing lost. Each edge of a judged run now
-  allows the writer's `concurrency:` in batches, 1 when unset, which leaves every writer at the
-  default where it was.
+- **A judged run's trailing edge before a reported run allows one batch per request in
+  flight.** The listener counts a batch in W before the writer reads its answer, and under
+  `ack: true` before its acknowledgment arrives, half a second or more later. So a writer at
+  `concurrency: 8` can leave eight batches in W and not in G at a judged run's trailing edge,
+  and the same deficit after it. Against a judged or steady run the boundary pair nets, but
+  against a reported run or the run's end nothing does: `splunk-hec-ingress`'s first run FAILed
+  a SUT restart's window, beside a reported kill, by 930 points against 700 allowed with
+  nothing lost. That trailing edge now allows the writer's `concurrency:` in batches, 1 when
+  unset, and every other edge keeps its one batch, so an edge a neighbour nets isn't widened
+  and a surplus there can't mask a loss eight batches wide.

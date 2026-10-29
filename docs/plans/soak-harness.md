@@ -1000,8 +1000,9 @@ last interval of counts, so that life is reported unjudged. A busy `503` is a re
 counts no requests and never answers busy: a slow downstream holds the request, and a client
 that gives up leaves its batches to be delivered, so it has no identity beyond W − D == E + B.
 From W24 `splunk_hec_in` and `datadog_in` hold the same two identities as `influxdb_in`, on the
-write routes their writers post to, `event` and `series_v2`, under the same 5 s deadline on a
-request's first batch. A `/event` body decodes to one batch per envelope, so the identities
+write routes their writers post to, `event` and `series_v2`, under a 5 s deadline
+(`splunk_hec_in` on a request's first batch, `datadog_in` on every batch; a series body is one
+batch). A `/event` body decodes to one batch per envelope, so the identities
 hold while each body carries one, as a writer with one resource sends. `prometheus_in`'s
 remote-write receiver counts each request in `logit.input.writes{class}`, with no `route` tag,
 decodes it to one batch, and never answers busy: backpressure holds its `204` until the
@@ -1218,12 +1219,14 @@ The rows:
   one batch, an upper bound, since one batch can hold several ids and resends once
   (`checks.HTTP_ACK_TIMEOUT`). The writer counts its polls in `logit.output.requests` too, under
   `route="ack"`, and a poll that fails in transport sends no data, so it allows none
-  (`checks.HTTP_ACK_ROUTE`). The same allowance bounds `ledger.summary`'s end to end. Each edge
-  of a judged run allows one batch per request the writer keeps in flight, its `concurrency:`
-  (1 when unset), not one batch: the listener counts a batch in W before the writer reads its
-  answer, and under `ack: true` its acknowledgment, half a second or more later, so up to that
-  many batches straddle an edge in W and not yet in G. `splunk-hec-ingress`'s first run FAILed
-  without it (see "Findings").
+  (`checks.HTTP_ACK_ROUTE`). The same allowance bounds `ledger.summary`'s end to end. The listener
+  counts a batch in W before the writer reads its answer, and under `ack: true` its
+  acknowledgment, half a second or more later, so the requests in flight at a judged run's
+  trailing edge leave up to the writer's `concurrency:` in batches (1 when unset) in W and not
+  yet in G, and the same deficit in the run after. Against a judged or steady run the boundary
+  pair nets, so that edge keeps its one batch; against a reported run or the run's end nothing
+  nets, so that trailing edge allows `concurrency:` − 1 batches more. `splunk-hec-ingress`'s
+  first run FAILed without it (see "Findings").
 
   On a file wire (W11b) only a lifecycle fault or an `exit` of the ingress SUT affects the wire.
   A tailer reads behind its writer, so a drain interval's gap is lag, not loss: every run of
@@ -6085,7 +6088,7 @@ shared the daemon throughout.
 | `20261029T175150Z` | `splunk-hec-ingress` | FAIL: `ledger.wire` and `expect.generator-resends`, both harness or scenario defects, fixed below |
 | `20261029T181247Z` | `datadog-ingress` | PASS |
 | `20261029T183141Z` | `rw-ingress` | FAIL: `ledger.intake`, a product defect, below |
-| `20261029T185422Z` | `splunk-hec-ingress` | PASS |
+| `20261029T185422Z` | `splunk-hec-ingress` | PASS as run; FAILs `ledger.wire` re-scored under the trailing-edge rule, below |
 
 The first `splunk-hec-ingress` run FAILed two rows:
 
@@ -6108,12 +6111,27 @@ What the runs showed:
   each run: 5 under the delay, the stop, the restart, and the kill. Every timed-out id was a
   whole batch delivered twice: the first run's `ledger.summary` read V 828,900 against
   G − counted + resent 828,900, the resend allowance of 2,000 used in full.
-- **A judged edge holds one batch per request in flight.** At `concurrency: 8` under
-  `ack: true`, up to eight batches sit in W and not yet in G at a run's edge, and the first
-  run's restart window, next to a reported kill window it couldn't net against, read 930 points
-  of surplus against 700 allowed. Each edge now allows the writer's `concurrency:` in batches
-  (see `ledger.wire`'s HTTP paragraph in "6. The checks"); re-scored offline, the run passes
-  with 784 judged against 2,100, and the rerun judged 0.
+- **A judged run's trailing edge holds one batch per request in flight.** At `concurrency: 8`
+  under `ack: true`, up to eight batches sit in W and not yet in G at a run's trailing edge, and
+  the first run's restart window, next to a reported kill window it couldn't net against, read
+  930 points of surplus against 700 allowed. A trailing edge next to a reported run or the
+  run's end now allows the writer's `concurrency:` in batches (see `ledger.wire`'s HTTP
+  paragraph in "6. The checks"). Re-scored offline, the first run passes `ledger.wire` with 784
+  judged against 2,100 and the restart window's 930 against 1,400.
+- **The trailing-edge rule FAILs the passing rerun, on lag.** Re-scored, `20261029T185422Z`
+  reads "[+359s, +469s] judged (c0s3 netem on generator): W − X exceeds G by 298, over the 200
+  its 0 transport-error attempt(s) and 2 edge(s) allow". The window counted no transport error
+  and no ack timeout. The cumulative W − G at each SUT drain wanders between 5,500 and 6,200
+  across it with no trend: 5,500 at +359, 6,200 at +369, 5,800 at +469, 5,500 again at +499.
+  So W led G by three batches more at the window's end than at its start. The steady run after
+  it gapped −199 over its own 190 s, the same sign, so `_boundary_nets` had no pair to net, and
+  the edge kept one batch. `ledger.summary` held end to end, V 836,100 against 836,600, so
+  nothing was duplicated beyond the ack timeouts' resends. At `concurrency: 8` under
+  `ack: true` the lag moves by up to seven batches between drains, which one batch per edge
+  doesn't cover whenever the neighbour's own drift hides the opposite sign. Allowing
+  `concurrency:` at such an edge would also pass a loss of 300 beside 1,000 duplicates in one
+  judged run, the case `http-surplus-in-flight-masks` holds to FAIL, so the rule stays narrow
+  and this run's verdict is open.
 - **Under `ack: true`, an 11 s delay on the SUT's answers ends in ack timeouts, not transport
   errors.** Every request in flight was waiting on its acknowledgment, each poll's answer came
   late (7 `route="ack"` `network_error`s) and each new dial ended at `connect_timeout`, so the
