@@ -6072,3 +6072,69 @@ below. The table is its re-score with `script/soak check`, overall WARN.
 - **`otlp_in`'s W fits metrics.** It counts one event per data point, as G does while each
   event carries one, so `ledger.wire` balanced at 5,060. Its resend allowance had used the
   input's batch, 100 events, as the unit; the writer's own batch, 20 points, replaces it.
+
+### W24: HTTP ingress into `splunk_hec_in`, `datadog_in`, and `prometheus_in` (2026-10-29)
+
+Each scenario ran at its default 18 minutes on the development host (`sailfish`, 32 cores, Linux
+7.2.13), with `SOAK_SKIP_IMAGE=1` against the `logit:soak` image built at 2026-10-29 10:00 PDT,
+newer than `origin/main`'s head; `soak/w24` touches no product code. Other agents' soak runs
+shared the daemon throughout.
+
+| Run | Scenario | Verdict |
+|---|---|---|
+| `20261029T175150Z` | `splunk-hec-ingress` | FAIL: `ledger.wire` and `expect.generator-resends`, both harness or scenario defects, fixed below |
+| `20261029T181247Z` | `datadog-ingress` | PASS |
+| `20261029T183141Z` | `rw-ingress` | FAIL: `ledger.intake`, a product defect, below |
+| `20261029T185422Z` | `splunk-hec-ingress` | PASS |
+
+The first `splunk-hec-ingress` run FAILed two rows:
+
+| Check | Status | Detail |
+|---|---|---|
+| `ledger.wire` | FAIL | [+745s, +805s] judged (c0s6 restart on logit): W − X exceeds G by 930, over the 700 its 5 ack timeout(s) and 2 edge(s) allow |
+| `expect.generator-resends` | FAIL | delta of logit.output.requests{class=network_error, component=hec, route=event} on generator, through c0s1: c0s1 (+60s, +165s]: 0 (over 21 drain(s)), want >= 1, FAIL |
+
+`rw-ingress` FAILed one:
+
+| Check | Status | Detail |
+|---|---|---|
+| `ledger.intake` | FAIL | life 0: logit.input.writes ok 9,359 + closed_consumer 0 != batches.sent 9,367, so a request isn't one batch |
+
+What the runs showed:
+
+- **A restart forgets the acknowledgment ledger, and the writer resends after `ack_timeout`.**
+  In both `splunk-hec-ingress` runs the restarted SUT answered the ids its last life issued as
+  unknown (45 and 35 polls in c0s6), and the generator counted 5 ack timeouts there, 20 over
+  each run: 5 under the delay, the stop, the restart, and the kill. Every timed-out id was a
+  whole batch delivered twice: the first run's `ledger.summary` read V 828,900 against
+  G − counted + resent 828,900, the resend allowance of 2,000 used in full.
+- **A judged edge holds one batch per request in flight.** At `concurrency: 8` under
+  `ack: true`, up to eight batches sit in W and not yet in G at a run's edge, and the first
+  run's restart window, next to a reported kill window it couldn't net against, read 930 points
+  of surplus against 700 allowed. Each edge now allows the writer's `concurrency:` in batches
+  (see `ledger.wire`'s HTTP paragraph in "6. The checks"); re-scored offline, the run passes
+  with 784 judged against 2,100, and the rerun judged 0.
+- **Under `ack: true`, an 11 s delay on the SUT's answers ends in ack timeouts, not transport
+  errors.** Every request in flight was waiting on its acknowledgment, each poll's answer came
+  late (7 `route="ack"` `network_error`s) and each new dial ended at `connect_timeout`, so the
+  generator counted no `route="event"` `network_error`. The scenario now expects
+  `logit.output.acks{result="timeout"}` in c0s1, which the rerun counted 5 times.
+- **`prometheus_in` misses the count of a write whose sender gave up waiting.** It never
+  answers busy: a full pipeline delays its `204`, and in `rw-ingress`'s VictoriaMetrics stop
+  the generator's 10 s timeout ended 8 such waits (`expect.backend-stop-resends` read 8
+  `network_error`s, "operation timed out" in its self-log). `crate::http::deliver_detached`
+  delivered each batch on its own task, so `batches.sent` counted it, but `handle_write`
+  counts `logit.input.writes` and `logit.input.samples` after `write_response` returns, and
+  hyper dropped that future with the connection: life 0 counted 9,359 `ok` writes against
+  9,367 batches sent, and 1,502,500 samples, 100 per counted write. Nothing was lost:
+  `ledger.wire`, `ledger.egress`, and `ledger.summary` passed. The module doc's "one count per
+  request" is the claim the identity checks, so the row stays and FAILs until the listener
+  counts a cancelled write.
+- **`datadog_in` and `splunk_hec_in` held both request identities in every life a kill didn't
+  end**: `ok` requests on `series_v2` and `event` equal to `batches.sent`, and the backend
+  stop's 9 and 18 busy `503`s equal to `batches.deferred`, with no `closed_consumer` answer.
+- **`datadog_out` collapsed nothing.** A distinct `series` tag per event kept every point its
+  own series, so `logit.output.metrics.dropped` stayed 0 and `ledger.aggregate` balanced.
+- All three generators shed load to `overflow: drop_newest` while their writer waited, counted
+  and outside G: 23% of `splunk-hec-ingress`'s attempted events, 21% of `datadog-ingress`'s,
+  and 24% of `rw-ingress`'s.
