@@ -12114,6 +12114,7 @@ SCRAPE_SERIES = 2
 SCRAPE_RATE = 100
 SCRAPE_SUT = ("components:\n  scrape:\n    type: prometheus_in\n"
               "    scrape_targets: [\"http://generator:9464/metrics\"]\n    interval: 5s\n"
+              "    timeout: 500ms\n"
               "  sink: { type: prometheus_out, sources: [scrape], endpoint: http://vm/api/v1/write }\n")
 SCRAPE_GENERATOR = ("components:\n  load: { type: generate_in }\n"
                     "  totals: { type: aggregate, sources: [load], interval: 1s,"
@@ -12124,14 +12125,17 @@ SCRAPE_KILL = (150, 180)
 
 
 def _scrape_run(tmp, name, kill=False, value_at=None, sut_extra=(), gen_extra=(),
-                failing=()):
+                failing=(), dropped=(), sink_dropped=(), sut_restart=None, warmup=60.0):
     """A scrape run directory that balances: the generator generates from +0 to +300, each 5 s
     drain counting `SCRAPE_RATE` x 5 increments, and the SUT scrapes a second before each of its
     drains to +320, storing each series' running total at that time, which `value_at(t,
     start)` gives, by default every increment up to `t`. Each life ends with the increments
     after its last scrape lost, 100 at the end. With `kill`, the generator is killed over
     `SCRAPE_KILL`: its last drain interval's counts go unexported, and the scrapes in between
-    fail. A scrape at an offset in `failing` times out, storing nothing."""
+    fail. A scrape at an offset in `failing` times out, storing nothing. A scrape at an offset
+    in `dropped` sends its batch into a closed consumer, counted `events.dropped` at the
+    listener, and one in `sink_dropped` reaches the sink, which drops it, counted; neither is
+    stored. With `sut_restart`, the SUT restarts at that offset, its uptime starting over."""
     value_at = value_at or (lambda t, start: SCRAPE_RATE / SCRAPE_SERIES * (t - start))
     lives = [(0, 0, SCRAPE_KILL[0]), (1, SCRAPE_KILL[1], 300)] if kill else [(0, 0, 300)]
     gen = []
@@ -12151,23 +12155,34 @@ def _scrape_run(tmp, name, kill=False, value_at=None, sut_extra=(), gen_extra=()
                      None)
         ok = alive is not None and scraped <= 300 and scraped not in failing
         samples = SCRAPE_SERIES if ok else 0
-        sut.append(_line(stamp, "logit.process.uptime", "gauge", float(offset + 1)))
+        uptime = (offset + 1 if sut_restart is None or offset < sut_restart
+                  else offset - sut_restart + 1)
+        sut.append(_line(stamp, "logit.process.uptime", "gauge", float(uptime)))
         cls = "2xx" if ok else "timeout" if scraped in failing else "network_error"
         sent = samples + checks.SCRAPE_SYNTHETIC_SAMPLES
+        lost, refused = scraped in dropped, scraped in sink_dropped
+        reached = 0 if lost else 1
+        delivered = 0 if lost or refused else 1
         for metric, value, component, attrs in (
                 ("logit.input.scrapes", 1, "scrape", {"class": cls}),
                 ("logit.input.samples", samples, "scrape", None),
                 ("logit.component.events.sent", sent, "scrape", None),
                 ("logit.component.batches.sent", 1, "scrape", None),
-                ("logit.component.events.received", sent, "sink", None),
-                ("logit.component.batches.received", 1, "sink", None),
-                ("logit.component.events.delivered", sent, "sink", None),
-                ("logit.component.batches.delivered", 1, "sink", None)):
+                ("logit.component.events.dropped", sent if lost else 0, "scrape",
+                 {"reason": "closed_consumer"}),
+                ("logit.component.events.received", sent * reached, "sink", None),
+                ("logit.component.batches.received", reached, "sink", None),
+                ("logit.component.events.delivered", sent * delivered, "sink", None),
+                ("logit.component.batches.delivered", delivered, "sink", None),
+                ("logit.component.events.dropped", sent if refused else 0, "sink",
+                 {"reason": "rejected"}),
+                ("logit.component.batches.dropped", 1 if refused else 0, "sink",
+                 {"reason": "rejected"})):
             if value:
                 sut.append(_line(stamp, metric, "sum", value, component=component, attrs=attrs))
         sut.append(_line(stamp, "logit.component.buffer.batches", "gauge", 0, component="sink"))
         sut.append(_line(stamp, "logit.component.retrying", "gauge", 0, component="sink"))
-        if ok:
+        if ok and not lost and not refused:
             for one in series.values():
                 one["values"].append(value_at(scraped, alive[1]))
                 one["timestamps"].append(int((T0 + scraped) * 1000))
@@ -12177,9 +12192,14 @@ def _scrape_run(tmp, name, kill=False, value_at=None, sut_extra=(), gen_extra=()
                      _action("revert", "c0s1", "kill", "generator", SCRAPE_KILL[1] - 1,
                              SCRAPE_KILL[1]),
                      _ready("c0s1", "generator", SCRAPE_KILL[1] + 1)]
+    if sut_restart is not None:
+        timeline += [_action("apply", "c0s2", "restart", "logit", sut_restart - 1),
+                     _action("revert", "c0s2", "restart", "logit", sut_restart),
+                     _ready("c0s2", "logit", sut_restart + 1)]
     timeline += [_phase("end_begin", 300), _phase("end_end", 330)]
     run_dir = _run_dir(tmp, name, timeline, sut + list(sut_extra), ledger=SCRAPE_LEDGER,
-                       configs={"sut": "sut.yaml", "generator": "generator.yaml"})
+                       configs={"sut": "sut.yaml", "generator": "generator.yaml"},
+                       warmup=warmup)
     (run_dir / "configs").mkdir()
     (run_dir / "configs" / "sut.yaml").write_text(SCRAPE_SUT)
     (run_dir / "configs" / "generator.yaml").write_text(SCRAPE_GENERATOR)
@@ -12210,7 +12230,7 @@ def _scrape_ledger():
             expect(clean[row].status == checks.SKIP,
                    f"a scrape run has no aggregate, so {row} SKIPs, got {clean[row]}")
         expect("generator life 0 (stopped): G 30,000 − V 29,900 = 100 within its end band "
-               "[0, 1,100]" in clean["ledger.wire"].detail,
+               "[0, 650]" in clean["ledger.wire"].detail,
                f"a stopped life's lost tail is inside its end band, got {clean['ledger.wire']}")
         expect("W + Y − D 312 vs E + B 312" in clean["ledger.intake"].detail,
                f"the synthetic samples are Y beside W, got {clean['ledger.intake']}")
@@ -12220,7 +12240,7 @@ def _scrape_ledger():
         # A stopped life's G can't fall short of V: its final drain exported every count.
         over = rows("scrape-surplus", value_at=lambda t, start: 51 * (t - start))
         expect(over["ledger.wire"].status == checks.FAIL
-               and "outside its end band [0, 1,100], a surplus" in over["ledger.wire"].detail,
+               and "outside its end band [0, 650], a surplus" in over["ledger.wire"].detail,
                f"stored totals past the increments FAIL as a surplus, got {over['ledger.wire']}")
         # Totals short of the increments by more than a life's tail.
         short = rows("scrape-short", value_at=lambda t, start: 40 * (t - start))
@@ -12239,7 +12259,7 @@ def _scrape_ledger():
         killed = rows("scrape-kill", kill=True)
         expect(killed["ledger.wire"].status == checks.PASS
                and "generator life 0 (killed): G 14,500 − V 14,900 = -400 within its end band "
-               "[-500, 1,100]" in killed["ledger.wire"].detail
+               "[-500, 650]" in killed["ledger.wire"].detail
                and "generator life 1 (stopped): G 12,000 − V 11,900 = 100"
                in killed["ledger.wire"].detail,
                f"a killed life's unexported counts are inside its band, and V restarts with "
@@ -12273,6 +12293,71 @@ def _scrape_ledger():
         expect(off["ledger.intake"].status == checks.FAIL,
                f"an E past W + Y FAILs ledger.intake, got {off['ledger.intake']}")
 
+        # Totals frozen for a stopped life's last 10 s: 1,000 increments past its last scrape,
+        # past the band of one interval, one window, and the scrape timeout.
+        frozen = rows("scrape-frozen", value_at=lambda t, start: 50 * (min(t, 290) - start))
+        expect(frozen["ledger.wire"].status == checks.FAIL
+               and "G 30,000 − V 29,000 = 1,000 outside its end band [0, 650], increments "
+               "lost" in frozen["ledger.wire"].detail,
+               f"increments past the band at a life's end FAIL, got {frozen['ledger.wire']}")
+
+        # A batch the listener sent into a closed consumer: X counts its 2 samples and its 3
+        # synthetic ones, and only the 2 are samples W counted.
+        closed = rows("scrape-closed-consumer", dropped=(99,))
+        expect(closed["ledger.egress"].status == checks.PASS
+               and "W − X 118 − V_n 118 = 0, exact" in closed["ledger.egress"].detail,
+               f"a dropped batch's synthetic samples leave X, got {closed['ledger.egress']}")
+        # A batch the sink dropped, counted: its 2 samples, not its 5 events, are the drop.
+        refused = rows("scrape-sink-dropped", sink_dropped=(99,))
+        expect(refused["ledger.egress"].status == checks.PASS
+               and "W − X 120 − V_n 118 = 2, counted: within the sink's 2 samples dropped"
+               in refused["ledger.egress"].detail,
+               f"a sink's dropped batch counts its samples, got {refused['ledger.egress']}")
+        missing = [_line(_stamp(T0 + 100), "logit.input.samples", "sum", 2, component="scrape")]
+        past = rows("scrape-sink-dropped-past", sink_dropped=(99,), sut_extra=missing)
+        expect(past["ledger.egress"].status == checks.FAIL
+               and "uncounted loss, past the sink's 2 samples dropped"
+               in past["ledger.egress"].detail,
+               f"a gap past a dropped batch's samples FAILs, though under its events, got "
+               f"{past['ledger.egress']}")
+
+        # Drops that lose no increment: telemetry's, and a cumulative point `totals` didn't
+        # send, which its next one carries.
+        for component in ("self", "telemetry", "totals"):
+            extra = [_line(_stamp(T0 + 150), "logit.component.events.dropped", "sum", 600,
+                           component=component)]
+            kept = rows(f"scrape-drop-{component}", gen_extra=extra)
+            expect(kept["ledger.wire"].status == checks.PASS,
+                   f"an events.dropped at {component} loses no increment, got "
+                   f"{kept['ledger.wire']}")
+        # A metric `aggregate` dropped is an increment no total holds.
+        merged = [_line(_stamp(T0 + 150), "logit.transform.metrics.dropped", "sum", 600,
+                        component="totals")]
+        lost_metrics = rows("scrape-metrics-dropped", gen_extra=merged)
+        expect(lost_metrics["ledger.wire"].status == checks.FAIL
+               and "G 29,400 − V 29,900 = -500 outside" in lost_metrics["ledger.wire"].detail,
+               f"an aggregate's dropped metrics leave G, got {lost_metrics['ledger.wire']}")
+
+        # An earlier SUT life's residual is W + Y − D − B − X − S_in: a sink that received
+        # more than the listener sent FAILs it.
+        surplus_in = [_line(_stamp(T0 + 100), "logit.component.events.received", "sum", 5,
+                            component="sink")]
+        restarted = rows("scrape-residual", sut_restart=150, sut_extra=surplus_in)
+        expect(restarted["ledger.intake"].status == checks.FAIL
+               and "life 0: W + Y − D − B − X − S_in -5" in restarted["ledger.intake"].detail,
+               f"an earlier life's sink past its listener FAILs, got {restarted['ledger.intake']}")
+        balanced = rows("scrape-residual-clean", sut_restart=150)
+        expect(balanced["ledger.intake"].status == checks.PASS
+               and "life 0: W + Y − D − B − X − S_in 0" in balanced["ledger.intake"].detail,
+               f"an earlier life that relayed every batch PASSes, got "
+               f"{balanced['ledger.intake']}")
+
+        # A scrape wire needs no generator warmup baseline: recovery is a sample scraped.
+        short = rows("scrape-short-warmup", kill=True, warmup=5.0)
+        expect(short["recovery"].status == checks.PASS,
+               f"a scrape wire judges recovery with one generator drain in warmup, got "
+               f"{short['recovery']}")
+
 
 def _scrape_rules(root):
     """The scrape wire's load-time rules, against the shipped prometheus-scrape scenario."""
@@ -12301,6 +12386,35 @@ def _scrape_rules(root):
     _refused(path, mutate(lambda r: r["ledger"]["source"][0].update(
                  sut_transforms=["victoria_metrics"])),
              "`sut_transforms` can't be combined with a scrape wire", "a scrape wire's chain")
+    _refused(path, mutate(lambda r: r["ledger"].update(hop=[{"from": "logit", "to": "far"}])),
+             "ledger.hop can't be combined with a scrape wire", "a scrape wire beside a hop")
+    _refused(path, mutate(lambda r: r.update(overlap={"instances": ["logit", "logit-b"]})),
+             "[overlap] can't be combined with a scrape wire", "a scrape wire under [overlap]")
+    _refused(path, mutate(lambda r: r["configs"].update(collector="logit-sut.yaml")),
+             "a scrape wire needs one SUT service", "a scrape wire with a second SUT")
+    _refused(path, mutate(lambda r: r.update(target={"kind": "external", "name": "datadog",
+                                                     "env": ["DD_API_KEY"]})),
+             "a scrape wire needs the local target", "a scrape wire to an external target")
+    _refused(path, mutate(lambda r: r["ledger"]["source"].append(
+                 dict(r["ledger"]["source"][0], sut_listener="other"))),
+             "a scrape wire needs one [[ledger.source]]", "a scrape wire with two sources")
+    for key, value in (("fan_out", {"points": 4}), ("merge", "victoria_metrics")):
+        _refused(path, mutate(lambda r, key=key, value=value: r["ledger"]["source"][0].update(
+                     {key: value})),
+                 f"`{key}` can't be combined with a scrape wire", f"a scrape wire's {key}")
+    # A scrape timeout at or past the generator's window could credit a restarted
+    # generator's totals to its old life.
+    with tempfile.TemporaryDirectory() as tmp:
+        copied = Path(tmp) / "prometheus-scrape"
+        shutil.copytree(path.parent, copied)
+        sut_file = copied / "logit-sut.yaml"
+        shipped = sut_file.read_text()
+        for line, shown, what in (("    timeout: 1s\n", "1s", "a timeout equal to the window"),
+                                  ("", "10s", "the default 10 s timeout")):
+            sut_file.write_text(re.sub(r"^    timeout: .*\n", line, shipped, flags=re.M))
+            _refused(copied / "scenario.toml", copy.deepcopy(raw),
+                     f"the scrape `timeout` ({shown}) must be below the generator's "
+                     "`aggregate` window (1s)", f"a scrape wire with {what}")
     _refused(path, mutate(lambda r: r["ledger"]["sink"].append(dict(r["ledger"]["sink"][0]))),
              "a scrape wire needs one [[ledger.sink]]", "a scrape wire with two sinks")
     _refused(path, mutate(lambda r: r["ledger"]["source"][0].update(generator_sink="load")),
