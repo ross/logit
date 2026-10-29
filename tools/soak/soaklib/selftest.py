@@ -6900,8 +6900,15 @@ def _http_ledger():
                 return [record, json.loads(_line(record["timestamp"], "logit.output.in_flight",
                                                  "gauge", float(reading(offset)),
                                                  component="out"))]
-            return {r.id: r for r in checks.run_all(_http_run(tmp, name, gen_edit=gauge,
-                                                              **kwargs))}
+            # Each fixture's writer is at `concurrency: 8`, so a rule read from the config
+            # rather than the gauge widens its edges.
+            run_dir = _http_run(tmp, name, gen_edit=gauge, **kwargs)
+            (run_dir / "configs" / "generator.yaml").write_text(
+                "components:\n  out:\n    type: splunk_hec_out\n    concurrency: 8\n")
+            resolved = json.loads((run_dir / "scenario.resolved.json").read_text())
+            resolved["configs"]["generator"] = "generator.yaml"
+            (run_dir / "scenario.resolved.json").write_text(json.dumps(resolved))
+            return {r.id: r for r in checks.run_all(run_dir)}
 
         before_kill = concurrent(
             "http-surplus-in-flight", lambda offset: 8 if 95 <= offset <= 105 else 1,
@@ -6914,7 +6921,7 @@ def _http_ledger():
                f"eight requests in flight at a judged edge allow eight batches, got "
                f"{before_kill['ledger.wire']}")
         # Lag that drifts up by 7 batches across a judged run, its neighbour drifting on so
-        # that no pair nets, is held at each edge by the 7 requests read in flight there.
+        # that no pair nets, is held by the 7 requests read in flight at its trailing edge.
         drifted = concurrent(
             "http-surplus-in-flight-drift",
             lambda offset: 7 if 195 <= offset <= 205 or 250 <= offset <= 260 else 1,
@@ -6924,11 +6931,24 @@ def _http_ledger():
                 _at_offset("logit.component.events.sent", 270, -700, "in", add=True),
                 _at_offset("logit.component.events.sent", 290, 700, "in", add=True)))
         expect(drifted["ledger.wire"].status == checks.PASS
-               and "surplus allowed 1,400 (0 transport-error attempt(s) + 2 edge(s) holding 7 + "
-               "7 batch(es) read in flight, x one 100-line batch)"
+               and "surplus allowed 800 (0 transport-error attempt(s) + 2 edge(s) holding 1 + 7 "
+               "batch(es) read in flight, x one 100-line batch)"
                in "\n".join(drifted["ledger.wire"].lines),
-               f"lag up to the requests read in flight at the edges passes, got "
+               f"lag up to the requests read in flight at the trailing edge passes, got "
                f"{drifted['ledger.wire']}")
+        # A run's lag surplus is its lag at the end less its lag at the start, so the leading
+        # edge's reading backs none: 1,500 unexplained, with 8 read in flight at both edges and
+        # no resend, FAILs against the 900 the trailing edge and the leading edge's batch allow.
+        unexplained = concurrent(
+            "http-surplus-in-flight-unexplained",
+            lambda offset: 8 if 195 <= offset <= 205 or 250 <= offset <= 260 else 1,
+            timeline_extra=late, sut_edit=_at_offset("logit.component.events.sent", 230, 1500,
+                                                     "in", add=True))
+        expect(unexplained["ledger.wire"].status == checks.FAIL
+               and "W − X exceeds G by 1,500, over the 900 its 0 transport-error attempt(s) and "
+               "2 edge(s) holding 1 + 8 batch(es) read in flight allow"
+               in unexplained["ledger.wire"].detail,
+               f"the leading edge's reading allows no surplus, got {unexplained['ledger.wire']}")
         # With none read in flight at its edges, a loss of 300 beside 1,000 duplicates in one
         # judged run FAILs: each edge keeps its one batch.
         masked = concurrent(
