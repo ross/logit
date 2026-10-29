@@ -13,20 +13,24 @@
 //! first, renames the live file to `.1`, and creates a new one, with a `Scan` free to land between
 //! any two steps; `AppendToRenamed` is a writer still appending to the renamed inode before it
 //! reopens; `CopyTruncate` copies the live file to a new `.1` and truncates it in place, then
-//! scans, optionally after a drain that reaches the truncation first. A listing or `stat` failure comes through the fault seam.
+//! scans, optionally after a drain that reaches the truncation first. A listing or `stat` failure
+//! comes through the fault seam.
 //!
 //! [`Model`] restates the driver's rules over the model filesystem: which inode each path names,
-//! what a scan retires, rebinds, opens, resumes, or finds truncated, how a drain splits, drops,
-//! batches, and reaps, and what a checkpoint persists. After every op the test checks:
+//! what a scan retires, rebinds, opens, resumes, finds truncated, or lets a new inode claim by
+//! content (`docs/adr/tail-content-identity.md`), how a drain splits, drops, batches, and reaps,
+//! and what a checkpoint persists. A truncation's counts wait, as the driver's do, until a clean
+//! scan has offered its state to every new inode, or a stop. After every op the test checks:
 //!
 //! - the batches received equal the model's, each in file order and in order per inode;
 //! - the tracked set, each file's offset, pending bytes, state, path, head, and `rescanned`,
-//!   `by_path`, and the retained resume entries equal the model's;
+//!   `by_path`, the retained resume entries with their markers, the inodes a claim pass
+//!   deferred, and the truncations held for a claim equal the model's;
 //! - the checkpoint on disk equals the model's persisted entries, and every persisted offset is a
 //!   line start or the end of a prefix a clean stop emitted;
 //! - every counter and diagnostic the driver keeps: lines, bytes, drops, truncations and the
-//!   bytes each knew were unread, rotations,
-//!   scan errors, rejected resumes, renames, and flushes by reason; `open_error`, `read_error`,
+//!   bytes each knew were unread, rotations, scan errors, rejected resumes, claims and ambiguous
+//!   claims, renames, and flushes by reason; `open_error`, `read_error`,
 //!   and every checkpoint error stay at zero;
 //! - after a scan, the `by_path` invariants the driver relies on (one path per inode, only
 //!   `Active` files bound) and the `files.open` gauge.
@@ -112,8 +116,10 @@ enum Op {
     /// place, then scan (failing the listing if `scan_fails`). Under `drain_first`, a drain runs
     /// between the truncate and the scan, so a zero read at the old offset can find the
     /// truncation before any size check. The scan always follows: a refill past the offset with
-    /// no check between is the undetected case, which the model doesn't follow. The scan checks every tracked copy
-    /// of the truncated inode, bound or draining. An unspent resume entry is a position no scan
+    /// no check between is the undetected case, which the model doesn't follow. The scan checks
+    /// every tracked copy of the truncated inode, bound or draining, and under a wildcard the copy
+    /// claims the truncated inode's state from before the truncation, when its head is at least
+    /// `CLAIM_MIN_HEAD` bytes, so it resumes at that line boundary. An unspent resume entry is a position no scan
     /// checks, so a refill under a failed listing after a failed first scan is resumed through
     /// the head fingerprint, which at an offset of at most `HEAD_BYTES` matches by construction
     /// and inherits the clean stop's split.
@@ -201,6 +207,58 @@ struct Entry {
     offset: u64,
     /// The bytes the fingerprint covers.
     head: Vec<u8>,
+    /// The bytes the marker covers: up to `HEAD_BYTES` ending at `offset`.
+    marker: Vec<u8>,
+}
+
+/// A position a new inode may claim by content: where it came from, and what it holds.
+#[derive(Debug, Clone)]
+struct Cand {
+    from: From,
+    offset: u64,
+    head: Vec<u8>,
+    /// Whether the head bytes are in memory, so a shorter file can be a copy still being
+    /// written.
+    head_known: bool,
+    marker: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum From {
+    Orphan(FileId),
+    Rejected(usize),
+    Truncated(usize),
+    Live,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    Match,
+    Maybe,
+    No,
+}
+
+/// What an inode found under no entry starts from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Start {
+    Plain,
+    Claim(u64, From),
+    Defer,
+}
+
+/// A truncation not yet claimed or counted.
+#[derive(Debug)]
+struct MTruncation {
+    candidate: Option<Cand>,
+    unread: u64,
+    offered: bool,
+    pinned: bool,
+}
+
+/// The up to `HEAD_BYTES` of `bytes` ending at `at`.
+fn tail_at(bytes: &[u8], at: u64) -> Vec<u8> {
+    let at = at as usize;
+    bytes[at - at.min(HEAD_BYTES)..at].to_vec()
 }
 
 #[derive(Debug)]
@@ -239,6 +297,8 @@ struct MTracked {
     /// an `fstat` that found the file unlinked.
     last_len: u64,
     head: Vec<u8>,
+    /// This generation's bytes before `offset`.
+    seen: Vec<u8>,
     draining: Option<Draining>,
     acc: Vec<String>,
 }
@@ -256,6 +316,8 @@ struct Counts {
     stat_errors: u64,
     scan_error: u64,
     resume_rejected: u64,
+    claimed: u64,
+    claim_ambiguous: u64,
     renamed: u64,
     max_events: u64,
     interval: u64,
@@ -277,6 +339,11 @@ struct Model {
     resume: HashMap<FileId, Entry>,
     /// What the checkpoint on disk holds; empty before the first write.
     persisted: HashMap<FileId, Entry>,
+    truncations: Vec<MTruncation>,
+    /// Entries rejected by their own inode in this scan.
+    rejected: Vec<Entry>,
+    /// Inodes the last claim pass left unopened, with how many scans in a row.
+    deferred: HashMap<FileId, u32>,
     waits: u64,
     scans: u64,
     /// This op's expected batches, each with the inode it came from.
@@ -377,6 +444,7 @@ impl Model {
         }
         let chunk = content[t.offset as usize..].to_vec();
         capture_head(&mut t.head, t.offset, &chunk);
+        t.seen.extend_from_slice(&chunk);
         t.offset += chunk.len() as u64;
         t.last_len = t.offset;
         let mut complete = Vec::new();
@@ -431,14 +499,42 @@ impl Model {
             t.last_len = len;
             return;
         }
-        self.counts.truncated_bytes += t.last_len.saturating_sub(t.offset);
+        let unread = t.last_len.saturating_sub(t.offset);
+        // The state from before the truncation, for a copy to claim at the line boundary.
+        let boundary = t.offset - t.line_len;
+        let candidate = (t.head.len() >= CLAIM_MIN_HEAD as usize).then(|| Cand {
+            from: From::Live,
+            offset: boundary,
+            head: t.head.clone(),
+            head_known: true,
+            marker: tail_at(&t.seen, boundary),
+        });
         t.last_len = len;
         t.offset = 0;
         t.line.clear();
         t.line_len = 0;
         t.dropping = false;
         t.head.clear();
+        t.seen.clear();
         self.counts.truncated += 1;
+        if candidate.is_some() {
+            self.truncations.push(MTruncation { candidate, unread, offered: false, pinned: false });
+        } else {
+            self.counts.truncated_bytes += unread;
+        }
+    }
+
+    /// Counts each truncation a scan offered and no deferred inode may claim, or all.
+    fn count_truncations(&mut self, all: bool) {
+        let mut kept = Vec::new();
+        for t in std::mem::take(&mut self.truncations) {
+            if !all && (!t.offered || t.pinned) {
+                kept.push(t);
+            } else {
+                self.counts.truncated_bytes += t.unread;
+            }
+        }
+        self.truncations = kept;
     }
 
     fn start_draining(&mut self, id: FileId) {
@@ -447,24 +543,33 @@ impl Model {
         t.draining.get_or_insert(Draining { waits, scan, rescanned: false });
     }
 
-    /// Tracks `inode`, found at `path`, from its resume entry if one is accepted, else from `0`.
-    fn open(&mut self, path: PathBuf, inode: usize) {
+    /// Tracks `inode`, found at `path`, at `claim` if given, else from its resume entry if one
+    /// is accepted, else from `0`. A rejected entry stays claimable for the rest of the scan.
+    fn open(&mut self, path: PathBuf, inode: usize, claim: Option<u64>) {
         let id = self.id(inode);
         let content = &self.inodes[inode].content;
         let len = content.len() as u64;
-        let offset = match self.resume.remove(&id) {
-            Some(e) => {
+        let offset = match (claim, self.resume.remove(&id)) {
+            (Some(offset), _) => offset,
+            (None, Some(e)) => {
                 let head_len = e.head.len();
-                if e.offset <= len && head_len as u64 <= len && content[..head_len] == e.head[..] {
+                if e.offset <= len
+                    && head_len as u64 <= len
+                    && content[..head_len] == e.head[..]
+                    && tail_at(content, e.offset) == e.marker
+                {
                     e.offset
                 } else {
                     self.counts.resume_rejected += 1;
+                    self.rejected.push(e);
                     0
                 }
             }
-            None => 0,
+            (None, None) => 0,
         };
+        let content = &self.inodes[inode].content;
         let head = content[..offset.min(HEAD_BYTES as u64) as usize].to_vec();
+        let seen = content[..offset as usize].to_vec();
         if offset > 0 && content[offset as usize - 1] != b'\n' {
             self.inodes[inode].splits.push(offset);
             self.resumed_mid_line.push((inode, offset));
@@ -480,6 +585,7 @@ impl Model {
                 dropping: false,
                 last_len: len,
                 head,
+                seen,
                 draining: None,
                 acc: Vec::new(),
             },
@@ -487,7 +593,7 @@ impl Model {
         self.by_path.insert(path, id);
     }
 
-    fn scan(&mut self, fail: ScanFail) {
+    fn scan(&mut self, fail: ScanFail, first: bool) {
         let read_dir_failed = fail == ScanFail::ReadDir;
         let mut discovered: HashMap<PathBuf, usize> = HashMap::new();
         let mut unknown: HashSet<PathBuf> = HashSet::new();
@@ -545,49 +651,64 @@ impl Model {
             .count();
         self.counts.rotated += rotated as u64;
 
-        // Order-free reconciliation. A path still bound to its inode is checked for truncation.
-        // A path bound to another inode releases it, which drains unless it's found elsewhere.
-        // Every inode found is then bound where it was found: rebound (and checked for
-        // truncation) if tracked, else opened from its accepted entry or `0`.
+        // Order-free reconciliation. A path bound to another inode releases it, which drains
+        // unless it's found elsewhere. Every inode tracked or with an entry is then bound where
+        // it was found: checked for truncation if still bound there, rebound (and checked) if
+        // tracked, else opened from its accepted entry or `0`.
         for (path, inode) in &discovered {
             let id = self.id(*inode);
-            match self.by_path.get(path).copied() {
-                Some(old) if old == id => self.truncation_check(id),
-                Some(old) => {
-                    if !found.contains_key(&old) {
-                        self.start_draining(old);
-                    }
-                    self.by_path.remove(path);
+            if let Some(old) = self.by_path.get(path).copied().filter(|old| *old != id) {
+                if !found.contains_key(&old) {
+                    self.start_draining(old);
                 }
-                None => {}
+                self.by_path.remove(path);
             }
         }
-        for (path, inode) in &discovered {
-            let id = self.id(*inode);
-            if self.by_path.get(path) == Some(&id) {
-                continue;
-            }
-            if let Some(t) = self.tracked.get_mut(&id) {
+        let (known, unmatched): (Vec<(PathBuf, usize)>, Vec<(PathBuf, usize)>) =
+            discovered.iter().map(|(p, inode)| (p.clone(), *inode)).partition(|(_, inode)| {
+                let id = self.id(*inode);
+                self.tracked.contains_key(&id) || self.resume.contains_key(&id)
+            });
+        for (path, inode) in known {
+            let id = self.id(inode);
+            if self.by_path.get(&path) == Some(&id) {
+                self.truncation_check(id);
+            } else if let Some(t) = self.tracked.get_mut(&id) {
                 t.path = path.clone();
                 t.draining = None;
                 self.counts.renamed += 1;
                 self.by_path.retain(|_, bound| *bound != id);
-                self.by_path.insert(path.clone(), id);
+                self.by_path.insert(path, id);
                 self.truncation_check(id);
             } else {
-                self.open(path.clone(), *inode);
+                self.open(path, inode, None);
             }
         }
-
         // A draining file is checked through its handle, whatever the listing saw.
-        let draining: Vec<FileId> =
-            self.tracked.iter().filter(|(_, t)| t.draining.is_some()).map(|(id, _)| *id).collect();
-        for id in draining {
-            self.truncation_check(id);
+        self.check_draining();
+
+        // The rest claim a position by content, wait, or start from `0`.
+        let starts = self.claims(&unmatched, first, &|p: &Path| listed(p), &found);
+        let mut taken = Vec::new();
+        for ((path, inode), start) in unmatched.into_iter().zip(starts) {
+            match start {
+                Start::Defer => {}
+                Start::Plain => self.open(path, inode, None),
+                Start::Claim(offset, from) => {
+                    self.open(path, inode, Some(offset));
+                    taken.push(from);
+                }
+            }
         }
+        self.settle(&taken);
+        self.check_draining();
 
         // An unspent entry goes once a listing shows nothing can consume it.
         self.resume.retain(|id, e| !listed(&e.path) || found.contains_key(id));
+        // Only a listing that saw every path counts what no copy claimed.
+        if !read_dir_failed && unknown.is_empty() {
+            self.count_truncations(false);
+        }
 
         let scan = self.scans;
         for t in self.tracked.values_mut() {
@@ -598,6 +719,174 @@ impl Model {
             }
         }
         self.scans += 1;
+    }
+
+    fn check_draining(&mut self) {
+        let draining: Vec<FileId> =
+            self.tracked.iter().filter(|(_, t)| t.draining.is_some()).map(|(id, _)| *id).collect();
+        for id in draining {
+            self.truncation_check(id);
+        }
+    }
+
+    /// Every position a new inode may claim in this scan.
+    fn candidates(
+        &self,
+        listed: &dyn Fn(&Path) -> bool,
+        found: &HashMap<FileId, PathBuf>,
+    ) -> Vec<Cand> {
+        let long = |head: &[u8]| head.len() >= CLAIM_MIN_HEAD as usize;
+        let mut out = Vec::new();
+        for (id, e) in &self.resume {
+            if long(&e.head) && listed(&e.path) && !found.contains_key(id) {
+                out.push(Cand {
+                    from: From::Orphan(*id),
+                    offset: e.offset,
+                    head: e.head.clone(),
+                    head_known: false,
+                    marker: e.marker.clone(),
+                });
+            }
+        }
+        for (ix, e) in self.rejected.iter().enumerate() {
+            if long(&e.head) {
+                out.push(Cand {
+                    from: From::Rejected(ix),
+                    offset: e.offset,
+                    head: e.head.clone(),
+                    head_known: false,
+                    marker: e.marker.clone(),
+                });
+            }
+        }
+        for (ix, t) in self.truncations.iter().enumerate() {
+            if let Some(c) = &t.candidate {
+                out.push(Cand { from: From::Truncated(ix), ..c.clone() });
+            }
+        }
+        for t in self.tracked.values() {
+            if long(&t.head) {
+                let boundary = t.offset - t.line_len;
+                out.push(Cand {
+                    from: From::Live,
+                    offset: boundary,
+                    head: t.head.clone(),
+                    head_known: true,
+                    marker: tail_at(&t.seen, boundary),
+                });
+            }
+        }
+        out
+    }
+
+    /// What `content` says about candidate `c`.
+    fn probe(content: &[u8], c: &Cand) -> Verdict {
+        let len = content.len() as u64;
+        if len == 0 {
+            return Verdict::No;
+        }
+        let head = &content[..content.len().min(HEAD_BYTES)];
+        if head.len() < c.head.len() {
+            return if c.head_known && c.head.starts_with(head) {
+                Verdict::Maybe
+            } else {
+                Verdict::No
+            };
+        }
+        if head[..c.head.len()] != c.head[..] {
+            return Verdict::No;
+        }
+        if len < c.offset {
+            return if c.head_known { Verdict::Maybe } else { Verdict::No };
+        }
+        if tail_at(content, c.offset) == c.marker {
+            Verdict::Match
+        } else {
+            Verdict::No
+        }
+    }
+
+    /// The claim pass over the inodes nothing names: a unique match is claimed, except a live
+    /// file's, which waits for its truncation; a copy still being written waits; two matches
+    /// claim nothing. A wait lasts at most `CLAIM_DEFER_SCANS` scans, and none on the first.
+    fn claims(
+        &mut self,
+        unmatched: &[(PathBuf, usize)],
+        first: bool,
+        listed: &dyn Fn(&Path) -> bool,
+        found: &HashMap<FileId, PathBuf>,
+    ) -> Vec<Start> {
+        for t in &mut self.truncations {
+            t.offered = true;
+            t.pinned = false;
+        }
+        let candidates = self.candidates(listed, found);
+        let verdicts: Vec<Vec<Verdict>> = unmatched
+            .iter()
+            .map(|(_, inode)| {
+                candidates.iter().map(|c| Self::probe(&self.inodes[*inode].content, c)).collect()
+            })
+            .collect();
+        let takers: Vec<usize> = (0..candidates.len())
+            .map(|c| verdicts.iter().filter(|v| v[c] == Verdict::Match).count())
+            .collect();
+        let mut deferred = HashMap::new();
+        let mut out = Vec::new();
+        for ((_, inode), v) in unmatched.iter().zip(&verdicts) {
+            let id = self.id(*inode);
+            let waited = self.deferred.get(&id).copied().unwrap_or(0);
+            let may_defer = !first && waited < CLAIM_DEFER_SCANS;
+            let matched: Vec<usize> = (0..v.len()).filter(|&c| v[c] == Verdict::Match).collect();
+            let start = match matched.as_slice() {
+                [c] if takers[*c] == 1 => {
+                    let c = &candidates[*c];
+                    if may_defer && c.from == From::Live {
+                        Start::Defer
+                    } else {
+                        Start::Claim(c.offset, c.from)
+                    }
+                }
+                [] if may_defer && v.contains(&Verdict::Maybe) => Start::Defer,
+                [] => Start::Plain,
+                _ => {
+                    self.counts.claim_ambiguous += 1;
+                    Start::Plain
+                }
+            };
+            if start == Start::Defer {
+                deferred.insert(id, waited + 1);
+                for (c, verdict) in v.iter().enumerate() {
+                    if let (From::Truncated(ix), Verdict::Match | Verdict::Maybe) =
+                        (candidates[c].from, verdict)
+                    {
+                        self.truncations[ix].pinned = true;
+                    }
+                }
+            }
+            out.push(start);
+        }
+        self.deferred = deferred;
+        out
+    }
+
+    /// Spends what this scan's claims took.
+    fn settle(&mut self, taken: &[From]) {
+        self.counts.claimed += taken.len() as u64;
+        let mut truncated = Vec::new();
+        for from in taken {
+            match *from {
+                From::Orphan(id) => {
+                    self.resume.remove(&id);
+                }
+                From::Truncated(ix) => truncated.push(ix),
+                From::Rejected(_) | From::Live => {}
+            }
+        }
+        truncated.sort_unstable();
+        for ix in truncated.into_iter().rev() {
+            self.truncations.remove(ix);
+        }
+        self.rejected.clear();
     }
 
     /// Reads every file, then reaps each draining one that has been draining a `poll_interval`
@@ -623,8 +912,13 @@ impl Model {
 
     fn checkpoint(&self) -> HashMap<FileId, Entry> {
         let tracked = self.tracked.iter().map(|(id, t)| {
-            let entry =
-                Entry { path: t.path.clone(), offset: t.offset - t.line_len, head: t.head.clone() };
+            let offset = t.offset - t.line_len;
+            let entry = Entry {
+                path: t.path.clone(),
+                offset,
+                head: t.head.clone(),
+                marker: tail_at(&t.seen, offset),
+            };
             (*id, entry)
         });
         tracked.chain(self.resume.iter().map(|(id, e)| (*id, e.clone()))).collect()
@@ -637,6 +931,7 @@ impl Model {
 
     /// `close_all_for_shutdown`, the shutdown flush, and the forced write.
     fn stop(&mut self) {
+        self.count_truncations(true);
         let ids: Vec<FileId> = self.tracked.keys().copied().collect();
         for id in ids {
             self.close(id);
@@ -649,6 +944,9 @@ impl Model {
     fn reload(&mut self) {
         self.tracked.clear();
         self.by_path.clear();
+        self.truncations.clear();
+        self.rejected.clear();
+        self.deferred.clear();
         self.resume = self.persisted.clone();
     }
 }
@@ -728,8 +1026,9 @@ impl Real {
         batches
     }
 
-    /// The checkpoint on disk as `(offset, head_len, head_hash)` per inode; empty if absent.
-    fn on_disk(&self) -> HashMap<FileId, (u64, u32, u64)> {
+    /// The checkpoint on disk as `(offset, head_len, head_hash, marker)` per inode; empty if
+    /// absent.
+    fn on_disk(&self) -> HashMap<FileId, (u64, u32, u64, u64)> {
         let bytes = match std::fs::read(&self.checkpoint) {
             Ok(bytes) => bytes,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
@@ -743,7 +1042,8 @@ impl Real {
             .iter()
             .map(|e| {
                 let id = FileId { dev: field(e, "dev"), ino: field(e, "ino") };
-                (id, (field(e, "offset"), field(e, "head_len") as u32, field(e, "head_hash")))
+                let fp = (field(e, "head_len") as u32, field(e, "head_hash"));
+                (id, (field(e, "offset"), fp.0, fp.1, field(e, "marker")))
             })
             .collect()
     }
@@ -820,13 +1120,16 @@ impl World {
             by_path: HashMap::new(),
             resume: HashMap::new(),
             persisted: HashMap::new(),
+            truncations: Vec::new(),
+            rejected: Vec::new(),
+            deferred: HashMap::new(),
             waits: 0,
             scans: 0,
             out: Vec::new(),
             counts: Counts::default(),
             resumed_mid_line: Vec::new(),
         };
-        model.scan(ScanFail::None);
+        model.scan(ScanFail::None, true);
         Self {
             dir,
             model,
@@ -943,7 +1246,7 @@ impl World {
 
     async fn scan(&mut self, fail: ScanFail) {
         self.real.scan(fail, &self.model).await;
-        self.model.scan(fail);
+        self.model.scan(fail, false);
         self.check_scan(fail);
     }
 
@@ -1078,12 +1381,14 @@ impl World {
                 self.restarts += 1;
                 self.real.rebind(first_scan_fails).await;
                 self.model.reload();
-                self.model.scan(if first_scan_fails { ScanFail::ReadDir } else { ScanFail::None });
+                self.model
+                    .scan(if first_scan_fails { ScanFail::ReadDir } else { ScanFail::None }, true);
             }
             Op::Crash { first_scan_fails } => {
                 self.real.rebind(first_scan_fails).await;
                 self.model.reload();
-                self.model.scan(if first_scan_fails { ScanFail::ReadDir } else { ScanFail::None });
+                self.model
+                    .scan(if first_scan_fails { ScanFail::ReadDir } else { ScanFail::None }, true);
             }
         }
     }
@@ -1148,11 +1453,20 @@ impl World {
             assert_eq!(f.rescanned, rescanned, "{ctx}: inode {} rescanned", m.inode);
         }
         assert_eq!(tailer.by_path, model.by_path, "{ctx}: by_path");
-        let resume: HashMap<FileId, (u64, Head)> =
-            tailer.resume.iter().map(|(id, r)| (*id, (r.offset, r.head))).collect();
-        let want: HashMap<FileId, (u64, Head)> =
-            model.resume.iter().map(|(id, e)| (*id, (e.offset, Head::of(&e.head)))).collect();
+        let resume: HashMap<FileId, (u64, Head, u64)> =
+            tailer.resume.iter().map(|(id, r)| (*id, (r.offset, r.head, r.marker))).collect();
+        let want: HashMap<FileId, (u64, Head, u64)> = model
+            .resume
+            .iter()
+            .map(|(id, e)| (*id, (e.offset, Head::of(&e.head), marker(&e.marker))))
+            .collect();
         assert_eq!(resume, want, "{ctx}: resume entries");
+        assert_eq!(tailer.deferred, model.deferred, "{ctx}: deferred inodes");
+        assert_eq!(
+            tailer.truncations.len(),
+            model.truncations.len(),
+            "{ctx}: truncations held for a claim"
+        );
 
         // Time moves only on `Wait`.
         let elapsed = tokio::time::Instant::now() - self.real.start;
@@ -1215,6 +1529,8 @@ impl World {
             stat_errors: probe.sum("logit.input.scan.errors", &[("op", "stat")]) as u64,
             scan_error: diag.occurrences("scan_error"),
             resume_rejected: probe.sum("logit.input.files.resume_rejected", &[]) as u64,
+            claimed: probe.sum("logit.input.files.claimed", &[]) as u64,
+            claim_ambiguous: diag.occurrences("claim_ambiguous"),
             renamed: diag.occurrences("renamed"),
             max_events: flushed(probe, "max_events"),
             interval: flushed(probe, "interval"),
@@ -1261,7 +1577,10 @@ impl World {
         }
         if fail == ScanFail::None {
             for f in 0..self.model.slots {
-                for (path, _) in self.model.matched(f) {
+                for (path, inode) in self.model.matched(f) {
+                    if self.model.deferred.contains_key(&self.model.id(inode)) {
+                        continue;
+                    }
                     assert!(
                         tailer.by_path.contains_key(&path),
                         "{ctx}: {path:?} matched, not bound"
@@ -1277,13 +1596,13 @@ impl World {
     /// line start, or (after a clean stop) the end of a prefix the stop emitted.
     fn check_checkpoint(&self, stopped: bool) {
         let ctx = &self.ctx;
-        let want: HashMap<FileId, (u64, u32, u64)> = self
+        let want: HashMap<FileId, (u64, u32, u64, u64)> = self
             .model
             .persisted
             .iter()
             .map(|(id, e)| {
                 let head = Head::of(&e.head);
-                (*id, (e.offset, head.len, head.hash))
+                (*id, (e.offset, head.len, head.hash, marker(&e.marker)))
             })
             .collect();
         assert_eq!(self.real.on_disk(), want, "{ctx}: the checkpoint on disk");
@@ -1379,7 +1698,8 @@ impl World {
     }
 }
 
-fn run(case: Case) {
+/// Runs `case` and returns the model's counts at the end, which the driver's matched.
+fn run(case: Case) -> Counts {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .start_paused(true)
@@ -1395,7 +1715,8 @@ fn run(case: Case) {
         }
         world.epilogue().await;
         std::fs::remove_dir_all(&world.dir).ok();
-    });
+        world.model.counts.clone()
+    })
 }
 
 proptest! {
@@ -1448,4 +1769,42 @@ fn truncated_while_draining(scan_fails: bool) {
             Drain,
         ],
     });
+}
+
+/// `copytruncate` under a wildcard, with a line half read at the truncation: the copy claims the
+/// live file's state from before it and resumes at its line boundary, so the half-read line is
+/// delivered whole from the copy and nothing is counted, whether a drain or the scan finds the
+/// truncation (`copytruncate_under_a_wildcard_resumes_the_copy_where_the_original_stopped`).
+#[test]
+fn a_copytruncate_copy_claims_the_truncated_state() {
+    for drain_first in [false, true] {
+        let counts = copytruncate_with_a_line_half_read(drain_first, false);
+        assert_eq!((counts.claimed, counts.truncated_bytes), (1, 0), "drain_first: {drain_first}");
+    }
+}
+
+/// The same with the listing failing and a crash before any clean scan: the truncation's state
+/// dies with the process, the restart rejects the live file's entry, and the copy claims the
+/// rejected entry (`a_copytruncate_while_logit_was_down_resumes_the_copy`).
+#[test]
+fn a_copytruncate_copy_claims_the_entry_its_original_rejects_after_a_crash() {
+    let counts = copytruncate_with_a_line_half_read(false, true);
+    assert_eq!((counts.claimed, counts.resume_rejected), (1, 1));
+}
+
+fn copytruncate_with_a_line_half_read(drain_first: bool, crash: bool) -> Counts {
+    use Op::*;
+    let mut ops = vec![
+        Append { f: 0, lens: vec![50, 50] },
+        AppendTorn { f: 0, len: 40, k: 20 },
+        Scan(ScanFail::None),
+        Drain,
+        CheckpointTick,
+        CopyTruncate { f: 0, scan_fails: crash, drain_first },
+    ];
+    if crash {
+        ops.push(Crash { first_scan_fails: false });
+    }
+    ops.extend([Append { f: 0, lens: vec![30] }, Drain]);
+    run(Case { slots: 1, wildcard: true, max_events: 1, max_line_bytes: 1 << 20, ops })
 }
