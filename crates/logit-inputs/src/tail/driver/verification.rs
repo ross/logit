@@ -127,6 +127,9 @@ enum Op {
         f: usize,
         scan_fails: bool,
         drain_first: bool,
+        /// Creates the copy empty and scans before filling it, as logrotate creates it before
+        /// writing, so a scan can open the copy empty.
+        empty_first: bool,
     },
     Delete {
         f: usize,
@@ -175,9 +178,11 @@ fn op() -> impl Strategy<Value = Op> {
             .prop_map(|(f, scan_between)| Op::RenameRotate { f, scan_between }),
         4 => (slot(), (10usize..=60).prop_flat_map(|len| (Just(len), 1..len)))
             .prop_map(|(f, (len, k))| Op::AppendTorn { f, len, k }),
-        4 => (slot(), any::<bool>(), any::<bool>()).prop_map(|(f, scan_fails, drain_first)| {
-            Op::CopyTruncate { f, scan_fails, drain_first }
-        }),
+        4 => (slot(), any::<bool>(), any::<bool>(), any::<bool>()).prop_map(
+            |(f, scan_fails, drain_first, empty_first)| {
+                Op::CopyTruncate { f, scan_fails, drain_first, empty_first }
+            }
+        ),
         4 => rare().prop_map(|first_scan_fails| Op::Restart { first_scan_fails }),
         4 => rare().prop_map(|first_scan_fails| Op::Crash { first_scan_fails }),
         3 => slot().prop_map(|f| Op::Create { f }),
@@ -305,6 +310,10 @@ struct MTracked {
     seen: Vec<u8>,
     draining: Option<Draining>,
     acc: Vec<String>,
+    /// Opened empty, not from a resume or a claim, and nothing read since: it may still claim.
+    claimable: bool,
+    /// A read found its bytes match, or may grow into, a candidate's: unread until a scan.
+    claim_pending: bool,
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -431,6 +440,9 @@ impl Model {
     /// Reads everything past the offset: a line is dropped, and counted once, when its length
     /// first exceeds the bound; an unterminated one is held.
     fn read(&mut self, id: FileId) {
+        if self.tracked[&id].claim_pending && self.tracked[&id].draining.is_none() {
+            return;
+        }
         let t = self.tracked.get_mut(&id).expect("tracked");
         let content = &self.inodes[t.inode].content;
         if content.len() as u64 <= t.offset {
@@ -536,6 +548,31 @@ impl Model {
         }
     }
 
+    /// Before a drain reads anything, leaves each claimable file unread for the next scan when
+    /// it isn't draining, holds bytes, and they match, or may grow into, a truncated or tracked
+    /// file's candidate; any other claimable file holding bytes stops being claimable.
+    fn decide_claimable(&mut self) {
+        let ids: Vec<FileId> =
+            self.tracked.iter().filter(|(_, t)| t.claimable).map(|(id, _)| *id).collect();
+        for id in ids {
+            let t = &self.tracked[&id];
+            let wait = if t.draining.is_some() {
+                false
+            } else if t.claim_pending {
+                continue;
+            } else {
+                let content = &self.inodes[t.inode].content;
+                if content.is_empty() {
+                    continue;
+                }
+                self.read_candidates().iter().any(|c| Self::probe(content, c) != Verdict::No)
+            };
+            let t = self.tracked.get_mut(&id).expect("tracked");
+            t.claimable = wait;
+            t.claim_pending = wait;
+        }
+    }
+
     /// Counts each truncation a scan offered and no deferred inode may claim, or all.
     fn count_truncations(&mut self, all: bool) {
         let mut kept = Vec::new();
@@ -561,6 +598,7 @@ impl Model {
         let id = self.id(inode);
         let content = &self.inodes[inode].content;
         let len = content.len() as u64;
+        let claimable = len == 0 && claim.is_none() && !self.resume.contains_key(&id);
         let offset = match (claim, self.resume.remove(&id)) {
             (Some(offset), _) => offset,
             (None, Some(e)) => {
@@ -600,6 +638,8 @@ impl Model {
                 seen,
                 draining: None,
                 acc: Vec::new(),
+                claimable,
+                claim_pending: false,
             },
         );
         self.by_path.insert(path, id);
@@ -674,6 +714,17 @@ impl Model {
                     self.start_draining(old);
                 }
                 self.by_path.remove(path);
+            }
+        }
+        // A claimable file that now holds bytes has emitted nothing: the claim pass decides it
+        // as a new inode.
+        for inode in discovered.values() {
+            let id = self.id(*inode);
+            if !self.inodes[*inode].content.is_empty()
+                && self.tracked.get(&id).is_some_and(|t| t.claimable)
+            {
+                self.tracked.remove(&id);
+                self.by_path.retain(|_, bound| *bound != id);
             }
         }
         let (known, unmatched): (Vec<_>, Vec<_>) =
@@ -773,6 +824,14 @@ impl Model {
                 });
             }
         }
+        out.extend(self.read_candidates());
+        out
+    }
+
+    /// The candidates outside a scan: held truncations and tracked files.
+    fn read_candidates(&self) -> Vec<Cand> {
+        let long = |head: &[u8]| head.len() >= CLAIM_MIN_HEAD as usize;
+        let mut out = Vec::new();
         for (ix, t) in self.truncations.iter().enumerate() {
             if let Some(c) = &t.candidate {
                 out.push(Cand { from: From::Truncated(ix), ..c.clone() });
@@ -914,6 +973,7 @@ impl Model {
     /// Reads every file, then reaps each draining one that has been draining a `poll_interval`
     /// and been rescanned since.
     fn drain(&mut self) {
+        self.decide_claimable();
         let ids: Vec<FileId> = self.tracked.keys().copied().collect();
         for id in &ids {
             if self.tracked[id].draining.is_some() {
@@ -1328,15 +1388,20 @@ impl World {
                     self.append_lines(f, inode, &lens);
                 }
             }
-            Op::CopyTruncate { f, scan_fails, drain_first } => {
+            Op::CopyTruncate { f, scan_fails, drain_first, empty_first } => {
                 let f = f % slots;
                 self.complete_torn(f);
                 if let Some(live) = self.model.chains[f].first().copied().flatten() {
                     self.shift(f);
-                    let content = self.model.inodes[live].content.clone();
                     let copy = self.model.path(f, 1);
-                    std::fs::File::create_new(&copy).unwrap().write_all(&content).unwrap();
-                    self.record(f, 1, content);
+                    let mut file = std::fs::File::create_new(&copy).unwrap();
+                    let inode = self.record(f, 1, Vec::new());
+                    if empty_first {
+                        self.scan(ScanFail::None).await;
+                    }
+                    let content = self.model.inodes[live].content.clone();
+                    file.write_all(&content).unwrap();
+                    self.model.inodes[inode].content = content;
                     std::fs::OpenOptions::new()
                         .write(true)
                         .open(self.model.path(f, 0))
@@ -1786,7 +1851,7 @@ fn truncated_while_draining(scan_fails: bool) {
             Scan(ScanFail::None),
             Drain,
             Scan(ScanFail::StatGone(0)),
-            CopyTruncate { f: 0, scan_fails, drain_first: false },
+            CopyTruncate { f: 0, scan_fails, drain_first: false, empty_first: false },
             Append { f: 0, lens: vec![30, 30] },
             Drain,
         ],
@@ -1800,7 +1865,18 @@ fn truncated_while_draining(scan_fails: bool) {
 #[test]
 fn a_copytruncate_copy_claims_the_truncated_state() {
     for drain_first in [false, true] {
-        let counts = copytruncate_with_a_line_half_read(drain_first, false);
+        let counts = copytruncate_with_a_line_half_read(drain_first, false, false);
+        assert_eq!((counts.claimed, counts.truncated_bytes), (1, 0), "drain_first: {drain_first}");
+    }
+}
+
+/// The same with the copy created empty and found by a scan before it's filled, as logrotate
+/// creates it: the copy has read nothing, so it still claims
+/// (`a_copy_opened_empty_claims_once_it_holds_the_original`).
+#[test]
+fn a_copytruncate_copy_opened_empty_claims_the_truncated_state() {
+    for drain_first in [false, true] {
+        let counts = copytruncate_with_a_line_half_read(drain_first, false, true);
         assert_eq!((counts.claimed, counts.truncated_bytes), (1, 0), "drain_first: {drain_first}");
     }
 }
@@ -1810,11 +1886,11 @@ fn a_copytruncate_copy_claims_the_truncated_state() {
 /// rejected entry (`a_copytruncate_while_logit_was_down_resumes_the_copy`).
 #[test]
 fn a_copytruncate_copy_claims_the_entry_its_original_rejects_after_a_crash() {
-    let counts = copytruncate_with_a_line_half_read(false, true);
+    let counts = copytruncate_with_a_line_half_read(false, true, false);
     assert_eq!((counts.claimed, counts.resume_rejected), (1, 1));
 }
 
-fn copytruncate_with_a_line_half_read(drain_first: bool, crash: bool) -> Counts {
+fn copytruncate_with_a_line_half_read(drain_first: bool, crash: bool, empty_first: bool) -> Counts {
     use Op::*;
     let mut ops = vec![
         Append { f: 0, lens: vec![50, 50] },
@@ -1822,7 +1898,7 @@ fn copytruncate_with_a_line_half_read(drain_first: bool, crash: bool) -> Counts 
         Scan(ScanFail::None),
         Drain,
         CheckpointTick,
-        CopyTruncate { f: 0, scan_fails: crash, drain_first },
+        CopyTruncate { f: 0, scan_fails: crash, drain_first, empty_first },
     ];
     if crash {
         ops.push(Crash { first_scan_fails: false });

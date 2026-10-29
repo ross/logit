@@ -2708,7 +2708,8 @@ must use `copytruncate`, use a pattern that matches the rotated names (`app.log*
 claims the original's position by content and resumes where `logit` stopped reading the
 original, so it delivers the lines written after the last read, a half-read line whole, and
 nothing twice ([ADR `tail-content-identity`](adr/tail-content-identity.md), decision 5). A copy
-found before the truncate waits up to two scans for it. The claim needs the file to hold at
+found before the truncate waits up to two scans for it, and one found while still empty, as
+logrotate creates it, is read only once a scan has decided whether it claims. The claim needs the file to hold at
 least 64 bytes; a shorter file's copy is read from its beginning. A copy shorter than what
 `logit` read from the original (the writer appended between the copy and the truncate, and
 `logit` read it) can't claim, and is read from its beginning once its wait runs out. Under

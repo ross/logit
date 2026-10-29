@@ -169,6 +169,13 @@ reviewer can check.
      has: a copy still being written. An empty file never waits, so a rename rotation's new file
      isn't delayed.
 
+   logrotate's `copytruncate` creates its copy empty and then fills it, so a scan can open the
+   copy empty. A file opened empty, not from a resume or a claim, stays claimable until its first
+   non-empty read, since it has emitted nothing. Before reading it, a drain probes it against the
+   truncated and tracked files' candidates: if its bytes match one or may grow into one, the drain
+   leaves it unread and the next scan's claim pass decides it as it does a new inode; otherwise
+   it's read from `0` at once, as a rename rotation's new file is.
+
    The first scan never waits, since `read_from` decides only files it opens. The cost falls only
    on an unmatched inode: a read of at most 256 bytes for the head and one per distinct candidate
    offset whose head matches, repeated at each scan while it waits. What it recovers:
