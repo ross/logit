@@ -299,7 +299,9 @@ struct TrackedFile<D> {
     offset: u64,
     /// The file's size at the latest observation the driver already makes: a scan's `stat`, an
     /// `fstat` of the handle, or a read returning `0` bytes (size equals `offset`). The latest,
-    /// not the largest, so a truncation lowers it. A checkpoint persists the larger of it and
+    /// not the largest, so a truncation lowers it. A zero read when this is past `offset` means
+    /// the file shrank, so `read_one` runs the truncation check instead of overwriting it, which
+    /// would lose the bytes `reconcile_truncation` counts. A checkpoint persists the larger of it and
     /// `offset`, which `Tailer::prune_checkpoint_entries` counts a gone file's unread bytes
     /// against.
     last_len: u64,
@@ -1087,7 +1089,8 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     }
 
     /// The truncation check for a file no path is bound to: an `fstat` of its handle against its
-    /// offset. `scan` runs it for every `Draining` file, and `drain` before each read of one, since
+    /// offset. `read_one` also runs it on a zero read that contradicts the last size seen. `scan`
+    /// runs it for every `Draining` file, and `drain` before each read of one, since
     /// the drain loop runs far more often than `scan` and a refill past the offset before the
     /// first check is the one truncation size-based detection can't see
     /// (`docs/adr/tail-content-identity.md`, decision 8). An `fstat` error says nothing; a later
@@ -1479,7 +1482,8 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
 
     /// Reads one chunk from `id`, decodes its complete lines, and emits any batch that reaches a
     /// bound. Returns `false` (eligible for [`Tailer::reap_drained`]) at EOF, on a read error,
-    /// or for a [`FileState::Deselected`] file. A refused emit sets [`Tailer::untaken`] and
+    /// or for a [`FileState::Deselected`] file, and `true` for a zero read that found the file
+    /// truncated, since the rewound file has more to read. A refused emit sets [`Tailer::untaken`] and
     /// leaves the chunk's remaining lines undecoded.
     async fn read_one(&mut self, id: FileId, sink: &Fanout) -> bool {
         if self.files.get(&id).is_some_and(|t| t.state == FileState::Deselected) {
@@ -1489,6 +1493,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             self.read_buf.reserve(READ_CHUNK_BYTES);
         }
         debug_assert!(self.read_buf.is_empty(), "every read is split off whole");
+        let mut shrank = false;
         let n = match self.files.get_mut(&id) {
             Some(tracked) => match logit_pipeline::fault_io!(
                 READ,
@@ -1497,7 +1502,11 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 tracked.file.read_buf(&mut (&mut self.read_buf).limit(READ_CHUNK_BYTES)).await
             ) {
                 Ok(0) => {
-                    tracked.last_len = tracked.offset;
+                    if tracked.last_len > tracked.offset {
+                        shrank = true;
+                    } else {
+                        tracked.last_len = tracked.offset;
+                    }
                     0
                 }
                 Ok(n) => n,
@@ -1510,7 +1519,12 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             None => return false,
         };
         if n == 0 {
-            return false;
+            if !shrank {
+                return false;
+            }
+            let before = self.files.get(&id).map_or(0, |t| t.offset);
+            self.recheck_length(id).await;
+            return self.files.get(&id).is_some_and(|t| t.offset < before);
         }
         let read_at = now_nanos();
         let bytes = self.read_buf.split().freeze();
@@ -6833,6 +6847,29 @@ mod tests {
     }
 
     // -- a truncation counts what it knew was unread
+
+    /// The same, but a drain reaches the file before any scan checks its size: its zero read at
+    /// the old offset runs the truncation check, so the 10 bytes the scan saw are still counted,
+    /// and the refill is read in the same drain.
+    #[tokio::test(start_paused = true)]
+    async fn a_drain_that_reaches_a_truncation_first_still_counts_the_bytes_seen() {
+        let dir = scratch_dir("truncated-bytes-drain");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\n").unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(vec![PathPattern::new(&path)], ReadFrom::Beginning, &probe);
+        assert_eq!(tick(&mut tailer, true).await, vec!["one"]);
+
+        append(&path, b"two\nthree\n");
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        copytruncate_and_refill(&path, b"x\n");
+        drain_by_hand(&mut tailer).await;
+        assert_eq!(probe.sum("logit.input.files.truncated", &[]), 1.0);
+        assert_eq!(probe.sum("logit.input.bytes.dropped", &[("reason", "truncated")]), 10.0);
+        assert_eq!(tailer.files.values().next().map(|f| f.offset), Some(2), "the refill is read");
+        assert_eq!(tick(&mut tailer, false).await, vec!["x"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// A scan saw the file at 14 bytes with 4 read; a copytruncate then empties it before a read
     /// reaches the other 10, which are counted lost.

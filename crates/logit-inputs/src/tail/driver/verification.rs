@@ -357,7 +357,16 @@ impl Model {
         let t = self.tracked.get_mut(&id).expect("tracked");
         let content = &self.inodes[t.inode].content;
         if content.len() as u64 <= t.offset {
-            t.last_len = t.offset;
+            // The driver's zero read: past a larger size seen, it's a truncation check.
+            if t.last_len <= t.offset {
+                t.last_len = t.offset;
+                return;
+            }
+            let before = t.offset;
+            self.truncation_check(id);
+            if self.tracked[&id].offset < before {
+                self.read(id);
+            }
             return;
         }
         let chunk = content[t.offset as usize..].to_vec();
