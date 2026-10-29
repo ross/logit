@@ -1,6 +1,6 @@
 ---
 created: 2026-10-08
-updated: 2026-10-25
+updated: 2026-10-29
 ---
 
 # A soak harness: real containers over ordinary config, one-shot netem, and a reset-aware ledger as the loss oracle
@@ -577,3 +577,29 @@ Re-scored, the failed run PASSes with 90 of loss judged against 650, and the pas
 96 as before. A backend stop still opens no judged HTTP window: whether it reaches the wire
 depends on the listener (`otlp_in` holds a request past the writer's timeout, `influxdb_in`
 answers a busy `503`), so its resends' surplus counts 0 as steady state's does.
+
+## Amendment: three more HTTP listeners, and an acknowledgment timeout allows a resend (2026-10-29)
+
+The HTTP wire follows `splunk_hec_in`, `datadog_in`, and `prometheus_in`'s remote-write
+receiver, from `splunk_hec_out`, `datadog_out`, and `prometheus_out`. `splunk_hec_in` and
+`datadog_in` count requests and answer busy as `influxdb_in` does, so `ledger.intake` holds them
+to its two identities on their write routes. `prometheus_in` counts `logit.input.writes{class}`,
+with no `route` tag, and never answers busy, so it holds only the first. It has no `transport:`,
+so its wire is keyed on the mode its config sets: `bind:` is the receiver, and
+`scrape_targets:`, a pull, has no wire yet.
+
+- **An acknowledgment timeout allows one batch of surplus, as a transport error does.**
+  `splunk_hec_out` under `ack: true` counts a batch delivered only once `/ack` answers every id
+  of it, and resends the whole batch once `ack_timeout` passes. `splunk_hec_in` keeps its ack
+  ledger in memory, so a restart forgets ids it issued for bodies it had already delivered, and
+  the resend puts each such batch in W a second time. Each id counted
+  `logit.output.acks{result="timeout"}` allows one batch, an upper bound because one batch can
+  hold several ids. A poll the writer counts under `route="ack"` sends no data, so a poll that
+  fails in transport allows none.
+- **A judged edge allows one batch per request in flight.** The listener counts a batch in W
+  before the writer reads its answer, and under `ack: true` before its acknowledgment arrives,
+  half a second or more later. So a writer at `concurrency: 8` can hold eight batches in W and
+  not in G across a run's edge, and `splunk-hec-ingress`'s first run FAILed a SUT restart's
+  window by 930 points against 700 allowed with nothing lost. Each edge of a judged run now
+  allows the writer's `concurrency:` in batches, 1 when unset, which leaves every writer at the
+  default where it was.

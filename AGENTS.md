@@ -863,7 +863,11 @@ the operator-facing account of all of this.
   `events.sent`, a busy `503` and `logit.input.batches.deferred` are a retry, not loss, and only
   a kill or an `exit` of the SUT is reported; every other window is judged with a surplus of one
   batch per transport-error resend allowed. `otlp_in` has rows of its own on that wire
-  (`checks.HTTP_LISTENERS`). `otlp-fan-out` sends OTLP log records over it whose bodies each
+  (`checks.HTTP_LISTENERS`), and so do `splunk_hec_in`, `datadog_in`, and `prometheus_in`'s
+  remote-write receiver, its wire keyed on its `bind:` mode, which `splunk-hec-ingress`,
+  `datadog-ingress`, and `rw-ingress` run from `splunk_hec_out` under `ack: true`,
+  `datadog_out`, and `prometheus_out`; an ack timeout allows a resend as a transport error does.
+  `otlp-fan-out` sends OTLP log records over it whose bodies each
   hold four line-protocol points into `otlp_in -> line_protocol`, its source declaring
   `fan_out = { points = 4 }`: `ledger.edge` judges the node's children,
   `events.sent − (events.received − events.discarded)`, against 4 × its events received less

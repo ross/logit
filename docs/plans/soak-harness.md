@@ -563,11 +563,14 @@ sut_transforms = ["parse", "labels", "count", "metrics_only"]   # optional, in o
   reads the SUT config and checks the source's `sut_listener` against it: a component of a kind
   and `transport:` the ledger has a wire for (`scenario.LISTENER_WIRES`: `statsd_in` and
   `syslog_in` UDP unless `transport: tcp`, `lines_in` and `graphite_in` TCP unless
-  `transport: udp`, `collectd_in` UDP, `tail_in` and `docker_in` file, `influxdb_in` and
-  `otlp_in` HTTP), whose wire is the source's. A listener the config lacks, a kind or transport
-  with no wire (a Unix socket), and a mismatch are refused. It also reads the generator's
-  config: a file wire's `generator_sink` must be a `file_out`, an HTTP wire's an `influxdb_out`
-  or an `otlp_out`, and any other wire's neither.
+  `transport: udp`, `collectd_in` UDP, `tail_in` and `docker_in` file, `influxdb_in`,
+  `otlp_in`, `splunk_hec_in`, and `datadog_in` HTTP), or of a kind and mode
+  (`scenario.LISTENER_MODES`: `prometheus_in` HTTP on `bind:`, and no wire on
+  `scrape_targets:`), whose wire is the source's. A listener the config lacks, a kind,
+  transport, or mode with no wire (a Unix socket), and a mismatch are refused. It also reads
+  the generator's config: a file wire's `generator_sink` must be a `file_out`, an HTTP wire's
+  one of `scenario.HTTP_WRITER_KINDS` (`influxdb_out`, `otlp_out`, `splunk_hec_out`,
+  `datadog_out`, or `prometheus_out`), and any other wire's neither.
 - `sut_transforms`, optional, lists the nodes between the listener and `aggregate`, distinct, none
   of them a listener, and none on another source's list. Each must send every event it
   receives or count it in `logit.component.events.discarded`, which `ledger.edge` judges hop by
@@ -978,8 +981,8 @@ read the wire's W; `_end_to_end` and `ledger.summary` also subtract F.
 
 On an HTTP wire (W14) G is the writer's `logit.component.events.delivered`, the points of the
 batches the listener answered with a success, and W is the listener's
-`logit.component.events.sent`: neither `influxdb_in` nor `otlp_in` counts points before it sends
-them, so W is also E, and K, D, F, and B are 0, since a request the listener refuses decodes to
+`logit.component.events.sent`: no HTTP listener counts points before it sends them, so W is
+also E, and K, D, F, and B are 0, since a request the listener refuses decodes to
 nothing it sends. The wire compares G with W − X: a batch refused with `503` because every
 consumer had closed is in `events.sent` and its events in X, and the client still holds it.
 `checks.HTTP_LISTENERS` is the per-listener table of what else each counts. `influxdb_in`
@@ -992,7 +995,17 @@ sum to its `logit.component.batches.sent`, and its `busy` ones equal `batches.de
 last interval of counts, so that life is reported unjudged. A busy `503` is a retry the producer makes, not loss. `otlp_in`
 counts no requests and never answers busy: a slow downstream holds the request, and a client
 that gives up leaves its batches to be delivered, so it has no identity beyond W − D == E + B.
-The writer's `logit.component.events.received` is reported beside G as the points attempted,
+From W24 `splunk_hec_in` and `datadog_in` hold the same two identities as `influxdb_in`, on the
+write routes their writers post to, `event` and `series_v2`, under the same 5 s deadline on a
+request's first batch. A `/event` body decodes to one batch per envelope, so the identities
+hold while each body carries one, as a writer with one resource sends. `prometheus_in`'s
+remote-write receiver counts each request in `logit.input.writes{class}`, with no `route` tag,
+decodes it to one batch, and never answers busy: backpressure holds its `204` until the
+pipeline takes the batch, past a writer's timeout, which resends while the held batch still
+delivers. So it holds the first identity alone, `ok` and `closed_consumer` writes summing to
+`batches.sent`, while no write decodes to nothing (a `204` with no batch). Its wire is keyed on
+its mode, since it has no `transport:` (`scenario.LISTENER_MODES`): `bind:` is the receiver, an
+HTTP wire, and `scrape_targets:` has no wire until W25 adds one. The writer's `logit.component.events.received` is reported beside G as the points attempted,
 and its `logit.output.requests{class="5xx"}` as the answers it retried.
 
 From W7b the ledger follows each `[[ledger.sink]]`. A row about a sink (`progress`,
@@ -1191,6 +1204,22 @@ The rows:
   split that class out counts every failed dial as `network_error`, looser still across a SUT
   stop.
 
+  From W24 a writer that polls for acknowledgment adds to that allowance. `splunk_hec_out`
+  under `ack: true` counts a batch delivered only once `/ack` answers every id of it `true`,
+  and resends the whole batch, `Ambiguous`, once its `ack_timeout` passes with an id
+  unanswered. `splunk_hec_in` keeps its ack ledger in memory, so a SUT stop or restart forgets
+  the ids it issued for bodies it had already delivered, and the writer's resend puts each such
+  batch in W again. So each id the writer counted `logit.output.acks{result="timeout"}` allows
+  one batch, an upper bound, since one batch can hold several ids and resends once
+  (`checks.HTTP_ACK_TIMEOUT`). The writer counts its polls in `logit.output.requests` too, under
+  `route="ack"`, and a poll that fails in transport sends no data, so it allows none
+  (`checks.HTTP_ACK_ROUTE`). The same allowance bounds `ledger.summary`'s end to end. Each edge
+  of a judged run allows one batch per request the writer keeps in flight, its `concurrency:`
+  (1 when unset), not one batch: the listener counts a batch in W before the writer reads its
+  answer, and under `ack: true` its acknowledgment, half a second or more later, so up to that
+  many batches straddle an edge in W and not yet in G. `splunk-hec-ingress`'s first run FAILed
+  without it (see "Findings").
+
   On a file wire (W11b) only a lifecycle fault or an `exit` of the ingress SUT affects the wire.
   A tailer reads behind its writer, so a drain interval's gap is lag, not loss: every run of
   drain intervals is reported, and the row judges the run's W + F − G against a **replay band**
@@ -1242,9 +1271,11 @@ The rows:
 - `ledger.intake`: W − D == E + B, for the final life, per listener from W8b, one detail line
   each, a listener off its balance first. A TCP listener's F never reached W, so it's
   `ledger.wire`'s, and `drops` leaves it out. On an HTTP wire (W14) W − D == E + B holds by
-  construction, and every life of `influxdb_in` a kill didn't end must also show its `ok` and
-  `closed_consumer` write requests summing to its `batches.sent`, one request one batch, and
-  its `busy` ones equal to its `batches.deferred`, one line per life, a failed identity first;
+  construction, and every life of `influxdb_in`, `splunk_hec_in`, or `datadog_in` (W24) a kill
+  didn't end must also show its `ok` and `closed_consumer` write requests summing to its
+  `batches.sent`, one request one batch, and its `busy` ones equal to its `batches.deferred`;
+  `prometheus_in`'s receiver (W24) the first, its `logit.input.writes` with no `route` tag; one
+  line per life, a failed identity first;
   a killed life is reported unjudged, and a listener whose kind the SUT config doesn't give is
   reported. Under `split = "target"` (W15) the residual ends at the router, and a stopped
   earlier life's must be 0; see "The target split (W15)".
