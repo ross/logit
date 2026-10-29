@@ -5867,3 +5867,41 @@ development host. Overall PASS, with only inapplicable SKIPs. It confirms the 20
   which the 180 s consumer bound should still cover, but no run has measured it.
 - **RSS and descriptors were flat.** `rss_slope` read +1.7 MiB/h on the SUT and −0.0 on the
   generator, and both kept their descriptor count.
+
+### W22: `sample`, `dedup_timestamps`, and a capped `aggregate` in the path (2026-10-29)
+
+Each scenario ran once on the development host (`sailfish`, 32 cores, Linux 7.2.13), against
+`logit:soak` built with `--no-cache` at 2026-10-29 10:00 PDT from `soak/w22`, whose diff touches
+no product code, over `origin/main` at `5d8fd053`. Other agents' soak runs shared the daemon
+during the last two. Every row of every run was PASS or SKIP:
+
+| Run | Scenario | Duration | Verdict |
+|---|---|---|---|
+| `20261029T170202Z` | `sample-path` | 15m30s, its default | PASS |
+| `20261029T171839Z` | `dedup-merge` | 15m30s, its default | PASS |
+| `20261029T173550Z` | `cardinality-capped` | 25m (`--duration`; its default is 75m) | PASS |
+
+What the runs showed:
+
+- **`sample` kept the same shards in every life.** The backend held 70 series, the 7 kept
+  shards' 10 each, and `ledger.absent` found no series of shards 1, 4, or 8 across 4 SUT lives
+  (a stop, a kill, and a restart). `sample` discarded 30% of each life's lines, 147,600 of
+  492,000 in life 0 and 270,030 of 900,100 in the final life, as 3 of 10 equally loaded shards
+  give, and no verdict was `by="missing"`. `ledger.edge` balanced the node's discards in every
+  life, and the killed life's Ab − V of 7,140 sat inside its band.
+- **Receive-time collisions merge most of a statsd stream at 1 ms.** `dedup` merged 783,792 of
+  the final life's 900,100 lines, 87%: the generator writes 100 lines at a time over 10 series,
+  and a burst's datagrams mostly land in one millisecond. Every merged record emptied its event,
+  so T_disc == M held in the final life, `metrics.absorbed` and `metrics.passed_through` stayed
+  0, and V equaled Ab + M: 900,100 with Ab 116,308. Without the merge term,
+  `ledger.egress` would FAIL the final life on an Ab − V of −783,792.
+- **A capped name's churn costs nothing that grows, over 23 minutes.** After warmup every one
+  of the 200 churn lines a second folded into its name's overflow series, 276,000 of them; 10
+  names were overflowing in every window, `series.active` peaked at 110, no record dropped for
+  `series_limit`, and the backend held 210 series: 100 fixed names, 10 admitted values per churn
+  name, and 10 overflow series. The SUT's interner grew 10.5 strings an hour, so a tag value
+  isn't interned, and `rss_slope` read +4.3 MiB/h on the SUT and +1.2 on the generator against
+  48. A 25-minute run reports growth as WARN at most, so the expected PASS is still owed a run of
+  an hour or more at the scenario's default 75 minutes.
+
+`aggregate`'s `max_series` admission drops got no scenario: see item 19.
