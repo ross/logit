@@ -2417,6 +2417,60 @@ class Ledger:
                 high += files
                 lines.append(f"life {life} (stopped): [0, +{files}]: one split line per file "
                              f"open at its last drain")
+        one_low, one_high, one_lines = self.copytruncate_band(listeners, counted)
+        return low + one_low, high + one_high, lines + one_lines
+
+    def copytruncate_band(self, listeners, counted):
+        """`(low, high, lines)`: what the file sources' `copytruncate` steps add to the replay
+        band of `listeners`, from the ADR `tail-content-identity` residuals.
+
+        Below, each step's `lost_lines` are in neither file, so a tailer reads them only if a
+        read lands between the copy and the truncate, plus what the shared directory's count
+        shows lost beyond the records, at most one writer batch a step (`_file_wire_one`).
+        Above, a step while a tailer runs can duplicate: a read in that window leaves the copy
+        shorter than what the tailer read, so the copy can't claim the original's state and is
+        read from 0, every line it holds again, plus one line the truncation discarded, counted
+        `frames.dropped{reason="truncated"}`, that the copy also holds whole. A step while the
+        ingress SUT is down, between a stop, kill, restart, `exit`, or pause and its revert,
+        adds nothing above: no read lands in the window, so the copy claims at the checkpoint's
+        offset, and a kill's replay is the kill's own allowance."""
+        low = high = 0
+        lines = []
+        down = [fault for fault in self.data.faults
+                if fault.on == self.inn.service and fault.action in FILE_RETENTION_ACTIONS]
+        for source in self.sources:
+            if source.get("sut_listener") not in listeners or source_wire(source) != FILE_WIRE:
+                continue
+            service = source.get("service")
+            ops = copytruncates(self.data, service)
+            if not ops:
+                continue
+            recorded = 0
+            for op in ops:
+                at = op.get("started_at", 0)
+                stopped = next((fault for fault in down if fault.start <= at <= fault.end),
+                               None)
+                lost, copied = op.get("lost_lines", 0), op.get("copied_lines", 0)
+                above = 0 if stopped else copied + 1
+                recorded += lost
+                low -= lost
+                high += above
+                when = (f"the SUT down ({stopped.action})" if stopped else "a tailer running")
+                lines.append(f"copytruncate at {self.data.offset(at)}, {when}: [-{_n(lost)}, "
+                             f"+{_n(above)}]: its lost lines below"
+                             + ("" if stopped else
+                                f"; above, the copy's {_n(copied)} lines read again from 0 "
+                                "if a read lands before the truncate, and one discarded line"))
+            if counted.get("lines") is not None:
+                G = self.gen_stats.get(service, {}).get("G", 0)
+                unrecorded = max(0, min(G - counted["lines"] - recorded,
+                                        len(ops) * self.gen_stats.get(service, {}).get(
+                                            "batch", 0)))
+                if unrecorded:
+                    low -= unrecorded
+                    lines.append(f"copytruncates: [-{_n(unrecorded)}, 0]: lines in no file "
+                                 "past the records, written between a last read and its "
+                                 "truncate")
         return low, high, lines
 
     def egress(self, life, sinks):
@@ -3246,6 +3300,16 @@ def _component_size(text, component, key):
     return None
 
 
+def copytruncates(data, service):
+    """The `copytruncate` steps that ran on writer `service`, as their apply records: each
+    carries `copied_lines` and `lost_lines`, the lines written after the copy's last read and
+    before the truncate (fileops.py). A failed one changed nothing it records, and `timeline`
+    FAILs it."""
+    return [record for record in data.timeline
+            if record.get("event") == "apply" and record.get("action") == "copytruncate"
+            and record.get("on") == service and not record.get("rc")]
+
+
 def _file_writers(data, led, source):
     """`[(sink, rotations, max_files, max_bytes)]`, one per `file_out` writer of a file source:
     its `logit.output.file.rotations` over the run, its `rotate.max_files`
@@ -3324,6 +3388,16 @@ def _file_wire_one(data, led, source):
     kept = sum(min(rotations + 1, max_files) for _, rotations, max_files, _ in writers)
     counted = data.phases.get("shared_counted")
     problems = []
+    # A copytruncate leaves its recorded lost lines in no file, and a write between its last
+    # read and the truncate, at most one writer batch, in none either, unrecorded.
+    ops = copytruncates(data, service)
+    lost = sum(op.get("lost_lines", 0) for op in ops)
+    race = len(ops) * stats.get("batch", 0)
+    for op in ops:
+        lines.append(f"copytruncate {op.get('path')} -> {op.get('to')} at "
+                     f"{data.offset(op.get('started_at', 0))}: {_n(op.get('copied_lines', 0))} "
+                     f"line(s) copied, {_n(op.get('lost_lines', 0))} written after the copy "
+                     "and before the truncate")
     if counted is None:
         problems.append("precondition: no shared_counted phase, so G has no count from the "
                         "shared directory to hold it to")
@@ -3332,10 +3406,16 @@ def _file_wire_one(data, led, source):
         if got_lines > G:
             problems.append(f"precondition: the shared directory holds {_n(got_lines)} "
                             f"line(s), more than the writer's events.delivered {_n(G)}")
-        elif not deleted and got_lines != G:
+        elif not deleted and not ops and got_lines != G:
             problems.append(f"precondition: the shared directory holds {_n(got_lines)} "
                             f"line(s) in {_n(got_files)} file(s), but the writer's "
                             f"events.delivered is {_n(G)}")
+        elif not deleted and ops and not G - lost - race <= got_lines <= G - lost:
+            problems.append(f"precondition: the shared directory holds {_n(got_lines)} "
+                            f"line(s) in {_n(got_files)} file(s), but the writer's "
+                            f"events.delivered {_n(G)} less the {_n(lost)} its copytruncates "
+                            f"lost is {_n(G - lost)}, with up to {_n(race)} more lost "
+                            "unrecorded")
         if deleted and got_files != kept:
             problems.append(f"precondition: the writer's rotations leave {_n(kept)} file(s) "
                             f"in the shared directory, and it holds {_n(got_files)}")
