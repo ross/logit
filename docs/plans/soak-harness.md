@@ -218,7 +218,8 @@ settle window would leave a life no fit. `fanin` and `tcp-ingress` set `60s`, an
   `partition`, on any service of the stack: `logit`, `generator`, `victoria-metrics`, and from
   W7b any service a `compose` override adds. W3 adds `kill`, on the SUT only:
   the lines a killed generator sent after its last telemetry drain reach the SUT with no G
-  behind them, and `ledger.wire` would net them against real loss. W7a adds `mark` and `exit`
+  behind them, and `ledger.wire` would net them against real loss. W25 allows it on a scrape
+  wire's generator too, which sends nothing. W7a adds `mark` and `exit`
   (below). W9a adds `respond`, on a stand-in only (below). W12c adds `signal` and `rename`, on
   a service that runs `logit` (below), and W12d `rotate` and `probe` (below).
 - `[ledger] vm_every_window`, optional, is `true` or `false`; `[ledger] sut_script`, optional,
@@ -563,11 +564,20 @@ sut_transforms = ["parse", "labels", "count", "metrics_only"]   # optional, in o
   reads the SUT config and checks the source's `sut_listener` against it: a component of a kind
   and `transport:` the ledger has a wire for (`scenario.LISTENER_WIRES`: `statsd_in` and
   `syslog_in` UDP unless `transport: tcp`, `lines_in` and `graphite_in` TCP unless
-  `transport: udp`, `collectd_in` UDP, `tail_in` and `docker_in` file, `influxdb_in` and
-  `otlp_in` HTTP), whose wire is the source's. A listener the config lacks, a kind or transport
-  with no wire (a Unix socket), and a mismatch are refused. It also reads the generator's
-  config: a file wire's `generator_sink` must be a `file_out`, an HTTP wire's an `influxdb_out`
-  or an `otlp_out`, and any other wire's neither.
+  `transport: udp`, `collectd_in` UDP, `tail_in` and `docker_in` file, `influxdb_in`,
+  `otlp_in`, `splunk_hec_in`, and `datadog_in` HTTP), or of a kind and mode
+  (`scenario.LISTENER_MODES`: `prometheus_in` HTTP on `bind:`, and scrape on
+  `scrape_targets:`), whose wire is the source's. A listener the config lacks, a kind,
+  transport, or mode with no wire (a Unix socket), and a mismatch are refused. It also reads
+  the generator's config: a file wire's `generator_sink` must be a `file_out`, an HTTP wire's
+  one of `scenario.HTTP_WRITER_KINDS` (`influxdb_out`, `otlp_out`, `splunk_hec_out`,
+  `datadog_out`, or `prometheus_out`), a scrape wire's a `prometheus_out` with `bind:`, and any
+  other wire's neither. A scrape wire (W25) is the one source, into one SUT service with one
+  sink on the local target and no `sut_transforms`, and `load()` refuses `sut_aggregate`,
+  `sut_delta`, `sut_script`, `split`, `hop`, `vm_every_window`, and `[overlap]` beside it
+  (`scenario._scrape_problems`), and a listener scrape `timeout` not below the generator's
+  `aggregate` window. A `kill` on its generator is allowed, the one generator
+  `kill`: a scrape target sends nothing, so a kill only ends a life, which its end band covers.
 - `sut_transforms`, optional, lists the nodes between the listener and `aggregate`, distinct, none
   of them a listener, and none on another source's list. Each must send every event it
   receives or count it in `logit.component.events.discarded`, which `ledger.edge` judges hop by
@@ -987,8 +997,8 @@ read the wire's W; `_end_to_end` and `ledger.summary` also subtract F.
 
 On an HTTP wire (W14) G is the writer's `logit.component.events.delivered`, the points of the
 batches the listener answered with a success, and W is the listener's
-`logit.component.events.sent`: neither `influxdb_in` nor `otlp_in` counts points before it sends
-them, so W is also E, and K, D, F, and B are 0, since a request the listener refuses decodes to
+`logit.component.events.sent`: no HTTP listener counts points before it sends them, so W is
+also E, and K, D, F, and B are 0, since a request the listener refuses decodes to
 nothing it sends. The wire compares G with W − X: a batch refused with `503` because every
 consumer had closed is in `events.sent` and its events in X, and the client still holds it.
 `checks.HTTP_LISTENERS` is the per-listener table of what else each counts. `influxdb_in`
@@ -1001,8 +1011,48 @@ sum to its `logit.component.batches.sent`, and its `busy` ones equal `batches.de
 last interval of counts, so that life is reported unjudged. A busy `503` is a retry the producer makes, not loss. `otlp_in`
 counts no requests and never answers busy: a slow downstream holds the request, and a client
 that gives up leaves its batches to be delivered, so it has no identity beyond W − D == E + B.
-The writer's `logit.component.events.received` is reported beside G as the points attempted,
-and its `logit.output.requests{class="5xx"}` as the answers it retried.
+From W24 `splunk_hec_in` and `datadog_in` hold the same two identities as `influxdb_in`, on the
+write routes their writers post to, `event` and `series_v2`, under a 5 s deadline
+(`splunk_hec_in` on a request's first batch, `datadog_in` on every batch; a series body is one
+batch). A `/event` body decodes to one batch per envelope, so the identities
+hold while each body carries one, as a writer with one resource sends. `prometheus_in`'s
+remote-write receiver counts each request in `logit.input.writes{class}`, with no `route` tag,
+decodes it to one batch, and never answers busy: backpressure holds its `204` until the
+pipeline takes the batch, past a writer's timeout, which resends while the held batch still
+delivers. So it holds the first identity alone, `ok` and `closed_consumer` writes summing to
+`batches.sent`, while no write decodes to nothing (a `204` with no batch). Its wire is keyed on
+its mode, since it has no `transport:` (`scenario.LISTENER_MODES`): `bind:` is the receiver, an
+HTTP wire, and `scrape_targets:` the scrape wire. The writer's
+`logit.component.events.received` is reported beside G as the points attempted, and its
+`logit.output.requests{class="5xx"}` as the answers it retried.
+
+The scrape wire (W25) is a pull of running totals, judged in value per generator life, not in
+lines per drain interval (`checks._scrape_wire_one`). G is the increments a generator life's
+`generate_in`s sent less what they counted in `logit.component.events.dropped` and its
+`aggregate`s in `logit.transform.metrics.dropped`, the increments no total holds (a drop at
+`internal`, its sinks, or an `aggregate`'s output loses none, since the next cumulative point
+carries the value), and V the sink's
+stored counters' reset-aware total in that life, each sample credited to the generator life
+its timestamp, the SUT's scrape time, falls in; a SUT life splits nothing, since a SUT restart
+doesn't reset the generator's totals. `load()` requires the listener's scrape `timeout`
+below the generator's `aggregate` window: a scrape that starts before a generator restart and
+waits for the new process could otherwise read its totals and credit them to the old life. A
+failed, timed-out, or skipped scrape loses only the
+values between two that succeed, so no fault window excuses anything: each life's G − V must
+fall in its end band (`checks.scrape_band`), the increments after its last scrape, at the life's
+median rate per drain interval: up to one scrape `interval` plus one generator `aggregate`
+window plus the scrape `timeout`, and below 0 by one drain interval for a killed life,
+whose last drain's counts go unexported. Past the band it FAILs. The count rows judge samples
+instead: W is the listener's `logit.input.samples`, the target's samples, and Y the three
+synthetic samples each scrape appends (`up`, `scrape_duration_seconds`,
+`scrape_samples_scraped`), three per `logit.input.scrapes`, so `ledger.intake` holds
+W + Y − D == E + B and an earlier life's residual W + Y − D − B − X − S_in in [0, R];
+`ledger.edge` holds E − X == S_in; `ledger.egress` holds W − X to V_n, the distinct stored
+samples the sink's `vm_selector` matches, per SUT life, a killed life reported and a stopped
+one's gap allowed up to the sink's counted drops, X and those drops each less three
+synthetic samples per dropped batch, one batch per scrape; `ledger.aggregate` and
+`ledger.summary` SKIP; and `recovery` reads any sample scraped as ingest recovered, since the
+generator counts increments and a scrape lands in a drain interval or doesn't.
 
 From W7b the ledger follows each `[[ledger.sink]]`. A row about a sink (`progress`,
 `identity.sink`, `recovery`, `ledger.edge`'s sink edges, `ledger.egress`, `ledger.windows`,
@@ -1019,6 +1069,7 @@ and takes the worst status; `report.py` is unchanged.
 | B | per listener, SUT `logit.input.messages.dropped{reason=malformed}` plus `logit.input.frames.dropped{reason=undecodable}` plus `logit.input.frames.dropped{reason=oversize}` (W8b): a line the decoder refused, a datagram it refused whole, and a line over `lines_in`'s `max_line_bytes`, which its decoder drops with a throttled diagnostic and no decoder error. Each is 0 on a listener with no such rule |
 | E | per listener, SUT `logit.component.events.sent{component=<sut_listener>}` |
 | X | per listener, SUT `logit.component.events.dropped{component=<sut_listener>}` under every reason (W7a): events the listener counted as sent and then dropped, such as a batch sent into the inbox of a node that has failed (`closed_consumer`) |
+| Y | on a scrape wire (W25), per listener, 3 × SUT `logit.input.scrapes{component=<sut_listener>}` under every class: the synthetic samples E counts and W leaves out; else 0 |
 | T_in[node], T_out[node] | with a source's `sut_transforms` (W8b), each node's `logit.component.events.received` and `logit.component.events.sent` |
 | T_disc[node] | each such node's `logit.component.events.discarded` (W13a), the events it received and sent no part of, which the runtime counts for every Transform node, only when nonzero, so an absent count is 0; ΣT_disc sums every node of every source |
 | M[node], T_ab[node] | at each `merge` node (W22), its `logit.transform.metrics.merged` and `logit.transform.metrics.absorbed`; M sums every `merge` node. Each merged record's increment reaches V inside its survivor, so every row after the node reads Ab + M where it reads Ab and ΣT_disc − M where it subtracts the discards. With one record per event, as a statsd line has, each merge empties its event, so T_disc[node] == M[node] |
@@ -1040,6 +1091,9 @@ sends one message per datagram, with no packing to bound, and counts both (W8b).
 `statsd_out`'s per-batch name resolution fails `Clean` and nothing is sent. Over TCP (W11a)
 `statsd_out` writes each batch as one frame and counts its lines in `output.messages` only once
 the write completes, so a batch dropped `ambiguous_at_most_once` is counted there and never in G.
+`syslog_out` over TCP (W27) writes each batch as one octet-counted frame and counts it the same
+way; under its default `at_least_once` it resends a batch after an ambiguous attempt, so G counts
+that batch once and W can hold the attempt's lines as well.
 
 **Which life a hop is judged in.** Every SUT config gives `internal` a dedicated pipeline, so
 its final drain runs after every data node has exited
@@ -1140,10 +1194,9 @@ The rows:
   G, before the surplus run's allowance (below) applies to what's left, and the detail line
   shows each transfer. The cap keeps a resend's surplus, or a steady run's, from hiding more
   loss next door than interpolation explains; runs that don't touch, and a reported run, never
-  net. On every wire the boundary from a judged or steady run into the end run nets the same
-  way (W28), since the end allowance covers only the sends the generator cancels at shutdown.
-  `checks._boundary_nets`' doc is the full rule. A judged run's surplus allowance
-  counts every edge it has, a boundary with another judged run included. Apart from that
+  net. On every wire the end run nets the same way with the run before it, before the end
+  allowance applies (W27). `checks._boundary_nets`' doc is the full rule. A judged run's
+  surplus allowance counts every edge it has, a boundary with another judged run included. Apart from that
   netting, each steady run's gap counts at 0 when W + K exceeds G in it, so a surplus in one run
   can't net out loss in another. The
   generator sink's own
@@ -1169,10 +1222,11 @@ The rows:
   `partition` whose record shows the container's address changed or doesn't show the address
   after it (`checks.wire_judgment`). Every other TCP-affecting window is **judged**: its loss
   counts with steady state's, against the same limit and edge tolerance, and its surplus, W + F
-  above G, may not exceed one generator batch per `ambiguous_at_most_once` drop the generator
-  counted inside it, plus one per edge. A write that failed partway leaves whole lines the SUT
-  reads, and under `statsd_out`'s `at_most_once` posture the generator drops that batch and
-  never counts it in G. A partition's label carries the address before and after it. The detail
+  above G, may not exceed one generator batch per ambiguous attempt the generator's stream sink
+  counted inside it, `logit.output.requests{class="ambiguous"}`, plus one per edge. A write
+  that failed partway, or a TLS first write that failed, leaves whole lines the SUT reads that G
+  never counts: under `at_least_once` the generator resends the batch, and under `statsd_out`'s
+  `at_most_once` posture it drops the batch `ambiguous_at_most_once`. A partition's label carries the address before and after it. The detail
   names the generator's counted loss by reason (`overflow_newest`, `ambiguous_at_most_once`)
   beside the gap; none of it is in G.
 
@@ -1202,6 +1256,30 @@ The rows:
   "Amendment: a failed dial counts `connect_error`"). A writer built before the HTTP sinks
   split that class out counts every failed dial as `network_error`, looser still across a SUT
   stop.
+
+  From W24 a writer that polls for acknowledgment adds to that allowance. `splunk_hec_out`
+  under `ack: true` counts a batch delivered only once `/ack` answers every id of it `true`,
+  and resends the whole batch, `Ambiguous`, once its `ack_timeout` passes with an id
+  unanswered. `splunk_hec_in` keeps its ack ledger in memory, so a SUT stop or restart forgets
+  the ids it issued for bodies it had already delivered, and the writer's resend puts each such
+  batch in W again. So each id the writer counted `logit.output.acks{result="timeout"}` allows
+  one batch, an upper bound, since one batch can hold several ids and resends once
+  (`checks.HTTP_ACK_TIMEOUT`). The writer counts its polls in `logit.output.requests` too, under
+  `route="ack"`, and a poll that fails in transport sends no data, so it allows none
+  (`checks.HTTP_ACK_ROUTE`). The same allowance bounds `ledger.summary`'s end to end. The listener
+  counts a batch in W before the writer reads its answer, and under `ack: true` its
+  acknowledgment, half a second or more later, so every request in flight at an edge is a batch
+  in W and not yet in G. The surplus that lag leaves in a run is its lag at the end less its lag
+  at the start, so only the trailing edge's reading backs one. A judged run's leading edge keeps
+  its one batch, and its trailing edge allows the batches the writer's `logit.output.in_flight`
+  gauge read at the two generator drains straddling it, the higher reading, each writer counting
+  at least one, when more than one (`checks.HTTP_IN_FLIGHT`). The gauge changes with every
+  request sent and answered and exports its last value at a drain, so a drain with no point
+  carries the value before it. A writer at a `concurrency:` of 1 emits no gauge and counts one.
+  The reading holds whatever the neighbour: the lag drifts by up to the requests in flight
+  between drains, and a neighbour's own drift can hide the opposite sign `_boundary_nets` needs.
+  A surplus past what was in flight at the end still FAILs. `splunk-hec-ingress`'s first run
+  FAILed without it (see "Findings").
 
   On a file wire (W11b) only a lifecycle fault or an `exit` of the ingress SUT affects the wire.
   A tailer reads behind its writer, so a drain interval's gap is lag, not loss: every run of
@@ -1254,9 +1332,11 @@ The rows:
 - `ledger.intake`: W − D == E + B, for the final life, per listener from W8b, one detail line
   each, a listener off its balance first. A TCP listener's F never reached W, so it's
   `ledger.wire`'s, and `drops` leaves it out. On an HTTP wire (W14) W − D == E + B holds by
-  construction, and every life of `influxdb_in` a kill didn't end must also show its `ok` and
-  `closed_consumer` write requests summing to its `batches.sent`, one request one batch, and
-  its `busy` ones equal to its `batches.deferred`, one line per life, a failed identity first;
+  construction, and every life of `influxdb_in`, `splunk_hec_in`, or `datadog_in` (W24) a kill
+  didn't end must also show its `ok` and `closed_consumer` write requests summing to its
+  `batches.sent`, one request one batch, and its `busy` ones equal to its `batches.deferred`;
+  `prometheus_in`'s receiver (W24) the first, its `logit.input.writes` with no `route` tag; one
+  line per life, a failed identity first;
   a killed life is reported unjudged, and a listener whose kind the SUT config doesn't give is
   reported. Under `split = "target"` (W15) the residual ends at the router, and a stopped
   earlier life's must be 0; see "The target split (W15)".
@@ -2020,8 +2100,8 @@ the other.
   each egress term in `collector`'s, with `ledger.hop` left to judge the hop. Beside them, one
   bound end to end, which no kill or restart can loosen: each egress group's V over the whole
   run is at most G less every counted loss (K, D, B, X, the hop's drops, and X_B, and on a TCP
-  wire F), plus one generator batch per `ambiguous_at_most_once` drop of a TCP source, the
-  partial-frame surplus `ledger.wire` allows. A duplicate
+  wire F), plus one generator batch per ambiguous attempt of a TCP source, the partial-frame
+  surplus `ledger.wire` allows. A duplicate
   forwarded across the hop adds the same increments to E_B, A, Ab, and V, so every per-life term
   balances around it; this bound and `ledger.hop` are what see it, the bound only once the
   surplus exceeds the run's uncounted loss, the wire loss among it.
@@ -2313,8 +2393,10 @@ where it needs them, and a small check extension.
    `logit.internal.spans.dropped{reason="buffer_full"}` and a killed life's last drain interval
    of spans.
 8. **TCP ingress (built in W11a).** `statsd_in` with `transport: tcp` from the generator's
-   `statsd_out` over TCP; a `syslog_in` TCP source is item 24, and a TCP reset counter item 23. A
-   stalled SUT backs up into the sender
+   `statsd_out` over TCP; a `syslog_in` TCP source is item 24. The SUT's listener counts a reset
+   after a connection's first payload byte as `logit.input.connections.closed{reason="reset"}`
+   (item 23), so an `[[expect]]` can bound the resets a fault causes; a reset before the first
+   byte isn't counted. A stalled SUT backs up into the sender
    ([ADR `syslog-tcp-ingress-and-tls`](../adr/syslog-tcp-ingress-and-tls.md), "No receive queue on
    TCP -- the connection itself is the backpressure"): the SUT's kernel keeps ACKing until its
    receive buffer fills, then the generator's write makes no progress for `connect_timeout`.
@@ -2475,9 +2557,10 @@ where it needs them, and a small check extension.
     open, taken off W, since the client resends it. A `503` and
     `logit.input.batches.deferred` are a retry the producer makes, not loss, and a client's
     resend of a request the SUT took before the answer was lost is a surplus, allowed one
-    batch per transport-error attempt, as a TCP window's is per ambiguous drop. `otlp_in` has
-    rows of its own in `checks.HTTP_LISTENERS`, with W per log record (one `Event` per
-    `LogRecord`) and no request identity, for W13b's generator, which `otlp-fan-out` runs.
+    batch per transport-error attempt, as a TCP window's is per ambiguous attempt. `otlp_in` has
+    rows of its own in `checks.HTTP_LISTENERS`, with W per log record and per metric data
+    point (one `Event` each) and no request identity, for W13b's generator, which
+    `otlp-fan-out` runs, and W23's, which `delta-datadog` runs.
     Built as `http-ingress`: each point carries a string field alone, so the SUT decodes no
     gauge, which V can't count, and `kv_metrics` counts one per point. Faults: netem delaying
     the SUT's egress past `influxdb_out`'s 10 s timeout, which carries the answers, and
@@ -2627,11 +2710,13 @@ under "Deferred to a later round" wait.
       `"decrease"`, the point emitted whole), netem, the stand-in's `Clean`, `Ambiguous`, and
       `Refused` cues, and resends, which
       `logit.transform.metrics.skipped{reason="duplicate"|"out_of_order"}` makes idempotent.
-    - Reported, not judged: a cued step that loses value on the SUT, which is a `Rejected`
-      status, a `202` whose `series_errors` body names series, and stale points
-      (`records.dropped{reason="stale"}`). The SUT counts those drops in records, not value, and
-      `cumulative_to_delta` has already moved its baseline past the dropped delta, so no later
-      point restores it.
+    - Judged exactly through U: a cued step that loses value on the SUT, which is a `Rejected`
+      status or a `202` whose `series_errors` body names series. The SUT counts those drops in
+      records, not value, and `cumulative_to_delta` has already moved its baseline past the
+      dropped delta, so no later point restores it, but the stand-in's record holds each lost
+      point's value, so the row takes U from the record and judges I − V − U.
+    - Bounded, not judged exactly: stale points (`records.dropped{reason="stale"}`), which never
+      reach the record, enter the band as drops the record can't see.
     - Reported, not judged (decided with Ross): the first SUT life's start, a SUT restart, and
       a staleness eviction, each inside its window. The transform's state is in memory, and
       `auto` skips a point whose start precedes the component's own, so no counter gives the
@@ -2642,6 +2727,55 @@ under "Deferred to a later round" wait.
     - A delta resent downstream counts twice: `datadog_out` isn't duplicate-safe, and the
       stand-in's `datadog` shape already counts each distinct copy once and reports duplicates
       per life.
+
+    As built (W23), as `delta-datadog`:
+    - `[ledger] sut_delta` names the `cumulative_to_delta` node in place of `sut_aggregate`.
+      The scenario loader refuses it beside `sut_aggregate`, `sut_script`, a hop, a `split`,
+      `vm_every_window`, or `[overlap]`, refuses it with more than one source, a `fan_out`, the
+      node in `sut_transforms`, or any target but a `datadog` stand-in, and refuses a node of
+      another kind.
+    - The count rows judge points with the node in `aggregate`'s place:
+      - Ab is the node's `events.sent`, and Δ_disc its `events.discarded`, the points it skipped.
+        Δ_disc leaves every row after the edge as ΣT_disc does (item 13), and `ledger.aggregate`
+        judges Ab == A − Δ_disc in the final life.
+      - V is the stand-in's distinct stored points, each credited to the life its request
+        reached the stand-in in. A point's timestamp is the generator's window, which can fall
+        in the life before the one that sent it.
+      - The kill band's interval is the generator's `aggregate` interval, the most a killed life
+        held before sending.
+    - `ledger.value`'s symbols:
+
+      | Symbol | Meaning |
+      |---|---|
+      | I | The generator's `generate_in` `events.sent`, less its counted drops ahead of its sink. |
+      | V | The sum of the stand-in's distinct stored delta values. |
+      | U | Each point the stand-in never stored whose last request fell in a `rejected` step or drew a `202` naming `series_errors`, read from the record's bodies. |
+
+      The rest of a cued loss, the gap I − V − U, is judged rather than reported, because the
+      record holds the lost values.
+    - With no reported window and no drop the record can't see, the row is exact:
+      I − V − U == 0. Below 0 it FAILs as a surplus.
+    - A reported window opens at each drain that counts `skipped{reason="initial"}` or
+      `series.evicted` on the node. It runs back to the node's last receiving drain before it
+      in that life, or the previous life's last drain, widened by one generator window and one
+      drain interval. A generator sink's `shutdown` drop adds a window too.
+    - Each window is bounded alone by what it can lose: its skipped (or evicted) series times
+      one generator window of one series' increments, the median stored delta, plus one window
+      of every series as slack for a window boundary. It widens to the generator's increments
+      over its whole span only when the generator's sink counted a dropped batch or event in it,
+      which moves the first point the SUT sees further on, or for a shutdown drop's window.
+      After a kill, which loses the deltas the SUT's sink still held, it adds the points that
+      killed life lost, its Ab − V (the quantity `Ledger.kill_band` judges), each up to the
+      largest stored delta. A kill doesn't widen it: a kill's span holds the whole outage.
+    - With windows, the gap is reported if it's no more than the sum of the windows' bounds,
+      plus each drop the stand-in can't see (`events.dropped` other than `rejected`,
+      `records.dropped` other than `rejected` and `oversize`, stale points included) times the
+      largest stored delta. Past that it FAILs: value was lost outside the windows. A first
+      version bounded the windows by the increments over their whole spans, which on the first
+      run's re-score was 195,000 against a gap of 14,800, so a loss of 13% of I outside every
+      window would have passed.
+    - Stale points can't be cued in a run of 30 minutes or less, because `datadog_out`'s window
+      reaches an hour back, so they enter only the unseen drops' bound.
 21. **More HTTP listeners (W24).** Item 14's `http` wire for three more listeners, each a
     scenario:
     - `splunk-hec-ingress`: generator `splunk_hec_out` with `ack: true` → SUT `splunk_hec_in`.
@@ -2681,15 +2815,17 @@ under "Deferred to a later round" wait.
     forgets its series; a generator kill, whose counter reset `prometheus_in` passes on and
     VictoriaMetrics' totals absorb; and a generator slowed past the scrape `timeout`. Rows:
     `[[expect]]` on `logit.input.scrapes{class}`.
-23. **A TCP reset counter (W26, product, decided with Ross).** A reset after a stream
-    connection's first byte is only a throttled `connection_error` diagnostic today, and one
-    before it is silent (`docs/design/internal-telemetry.md`'s `connection_error` key). W26 adds
-    a counter on the shared TCP driver, `crates/logit-inputs/src/tcp.rs`, such as a
-    `reason="reset"` on `logit.input.connections.closed`, named against
-    [internal-telemetry.md](../design/internal-telemetry.md)'s loss vocabulary. It isn't
-    `*.dropped`: a partial frame lost to a reset is already
-    `logit.input.frames.dropped{reason="truncated"}`. Its own PR, ahead of item 24, which
-    asserts on it; it updates `internal-telemetry.md` and item 8.
+23. **A TCP reset counter (built in W26, product, decided with Ross).** The shared TCP driver,
+    `crates/logit-inputs/src/tcp.rs`, counts a reset (`ECONNRESET`) after a stream connection's
+    first payload byte as `logit.input.connections.closed{reason="reset"}`, beside the throttled
+    `connection_error` diagnostic it already reported. A reset before the first byte stays
+    uncounted, since a load balancer's health check ends that way. It isn't `*.dropped`: a
+    partial frame lost to a reset is already `logit.input.frames.dropped{reason="truncated"}`
+    ([internal-telemetry.md](../design/internal-telemetry.md)'s loss vocabulary). It covers
+    plaintext and TLS on `syslog_in`, `statsd_in`, `graphite_in`, and `lines_in`; their Unix
+    stream sockets share the code but don't count one in practice, because the driver never
+    writes to a peer ([ADR `idle-connection-timeout`](../adr/idle-connection-timeout.md)'s
+    "Amendment: a reset is a third reason on the stream driver"). Item 24 asserts on it.
 24. **`syslog_in` over TCP and TLS (W27).** Generator `syslog_out` over TCP, then over TLS from
     the run's private CA (item 12's `[tls]` table and `rotate` action) → SUT `syslog_in`
     (`transport: tcp`) → `kv` → `kv_metrics` → `aggregate`, on the `tcp` wire, framed by octet
@@ -2701,11 +2837,13 @@ under "Deferred to a later round" wait.
     `logit.output.requests{class="ambiguous"}`. A failed first write over TLS is `Ambiguous`,
     not `Clean` as over plaintext (`crates/logit-outputs/src/stream.rs`'s module table), so the
     same allowance covers the TLS phase. Rows: `ledger.wire` with that allowance, and
-    `[[expect]]` on item 23's reset counter. W27 also writes a `docs/known-gaps/sinks.md` entry,
-    after checking no other gap file has one: a TCP stream sink counts a frame delivered once the
-    kernel accepts it, so the bytes in the sender's send buffer or the receiver's receive buffer
-    when the receiver is killed are lost uncounted. That loss is unmeasured: in `tcp-ingress` it
-    sits inside a kill's gap made mostly of counters the killed process never exported.
+    `[[expect]]` on item 23's reset counter. A TCP stream hop is best-effort by decision
+    ([ADR `delivery-semantics`](../adr/delivery-semantics.md), item 6): the bytes in the
+    sender's send buffer or the receiver's receive buffer when the receiver is killed are lost.
+    W27 writes a `docs/known-gaps/sinks.md` entry for the open part, after checking no other gap
+    file has one: the sink doesn't count the bytes its peer never acknowledged, and the loss is
+    unmeasured, since in `tcp-ingress` it sits inside a kill's gap made mostly of counters the
+    killed process never exported. The operator's workaround goes in `docs/deploying.md`.
 25. **SUT sinks into real receivers (W28).** Three scenarios, each with an `aggregate` under
     `temporality: cumulative` so VictoriaMetrics' reset-aware V applies:
     - `graphite-egress`: SUT `graphite_out`, TCP plaintext, → VictoriaMetrics' Graphite
@@ -2961,9 +3099,9 @@ that items 3, 7, and 11 need.
   `dedup_timestamps` node, an amendment to ADR `soak-harness` for the merge term, self-test
   fixtures for each rule, and the `sample-path`, `dedup-merge`, and `cardinality-capped`
   scenarios, each run recorded under "Findings".
-- **W23**: item 20: the value ledger row against the Datadog-shaped stand-in, the reported
-  windows (value-losing cues, the first SUT life's start, SUT restarts, and staleness
-  evictions), an amendment to ADR `soak-harness` for the value ledger, self-test fixtures for
+- **W23**: item 20: the value ledger row against the Datadog-shaped stand-in, the
+  value-losing cues judged through U, the reported windows (the first SUT life's start, SUT
+  restarts, staleness evictions, and a generator shutdown drop), each bounded alone, an amendment to ADR `soak-harness` for the value ledger, self-test fixtures for
   each rule, and a `cumulative_to_delta` scenario, with a run recorded under "Findings".
 - **W24**: item 21: `LISTENER_WIRES` and `HTTP_LISTENERS` entries for `splunk_hec_in`,
   `datadog_in`, and `prometheus_in`'s remote-write receiver, the mode-keyed wire lookup for
@@ -2978,8 +3116,8 @@ that items 3, 7, and 11 need.
   row in `docs/design/internal-telemetry.md`, and item 8's text updated to name it.
 - **W27**: item 24: the `at_least_once` resend allowance on the `tcp` wire, self-test fixtures
   for it, the `syslog_in` TCP and TLS scenarios with `[[expect]]` rows on W26's counter, each
-  run recorded under "Findings", and the `docs/known-gaps/sinks.md` entry for a TCP stream
-  sink's kernel-buffer loss.
+  run recorded under "Findings", the `docs/known-gaps/sinks.md` entry for a stream sink's
+  uncounted unacknowledged bytes, and the operator's workaround in `docs/deploying.md`.
 - **W28**: item 25: the compose overrides for VictoriaMetrics' Graphite listener and the
   `collector` service, and the `graphite-egress`, `otlp-egress`, and `otlp-grpc-egress`
   scenarios, each run recorded under "Findings".
@@ -5912,3 +6050,301 @@ What the runs showed:
   an hour or more at the scenario's default 75 minutes.
 
 `aggregate`'s `max_series` admission drops got no scenario: see item 19.
+
+### W23: a `cumulative_to_delta` value ledger (2026-10-29)
+
+`delta-datadog` ran for 22 minutes 30 seconds on the development host, against `logit:soak`
+(`sha256:4f9075e1…`) built on 2026-10-29 by a concurrent soak session; no soak branch changes
+Rust. The run is `perf/results/soak/20261029T175130Z`. It first scored one FAIL
+(`ledger.standin`) and one WARN (`recovery`), both harness misreadings fixed on the branch, as
+below. The table is its re-score with `script/soak check`, overall WARN.
+
+| Check | Status | Detail |
+|---|---|---|
+| `run` | PASS | ran from start through end_end |
+| `timeline` | PASS | 22 apply/revert action(s) returned 0; 4 start(s) or unpause(s) each probed; no fail fast |
+| `exit` | PASS | 3 exit(s) of the logit services, each a scheduled stop with code 0 or a scheduled kill with code 137 (1 kill(s)) |
+| `restarts` | PASS | 4 start(s), each a scheduled start or restart |
+| `self_log` | PASS | 9 sink fault line(s) inside fault windows, 0 outside, 0 expected-exit line(s), 0 other ERROR, 0 non-JSON |
+| `ready` | PASS | 96 readiness sample(s) read ok outside fault windows; 4 start(s) or unpause(s) ready in time, slowest ready 0.1s |
+| `progress` | PASS | 10 30s window(s) outside fault windows, judged per sink (standin target: no VictoriaMetrics): datadog: deliveries in 10 of 10, no freshness samples; 270s of 1290s after warmup judged (21%; WARN under 5%) |
+| `rss_slope` | PASS | generator PASS: MiB/h life 0 -0.2, life 1 +41.0 (limit 64); 375s of 1290s after warmup judged (29%; WARN under 5%) \| logit PASS: MiB/h life 0 +8.4, life 1 +30.1, life 2 +11.1 (limit 64); 370s of 1290s after warmup judged (29%; WARN under 5%) |
+| `fd_slope` | PASS | generator PASS: warmup median 15 -> end 15 (limit +8) \| logit PASS: warmup median 17 -> end 17 (limit +8) |
+| `ledger.wire` | PASS | G 5,060 (acknowledged of 5,060 attempted) = W 5,060 − X 0 + gap 0 (19 in reported windows, 0 in judged HTTP-affecting windows, -20 steady, 0 at the end; loss judged 20, each run at 0 or more, against limit 260); the generator's requests: 0 transport-error attempt(s), 7 connect failure(s), 0 answered 5xx and retried; its counted loss, not in G: 0 event(s) in 0 batch(es) |
+| `ledger.intake` | PASS | final life 2: W − D 800 vs E + B 800; final life 2: otlp_in counts no requests: W − D == E + B alone; life 0: W − D − B − X − Δ_disc − Ab 0 within [0, R]; life 1: W − D − B − X − Δ_disc − Ab 0 within [0, R] (R 67,000 = 0 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.edge` | PASS | final life 2: E 800 == A 800 (listener to aggregate); A_sent 780 == S_in[datadog] 780 (aggregate to datadog) |
+| `ledger.script` | SKIP | no [ledger] sut_script |
+| `ledger.aggregate` | PASS | final life 2: Ab 780 == Ad 780 (every point delta didn't skip sent on: Ab its events sent, Ad its events received less Δ_disc) |
+| `ledger.egress` | PASS | datadog: life 0: W − D − B − X − Δ_disc − V 88 = residual 0 + Ab − V 88, counted (batches dropped: rejected 4; records dropped: rejected 88); rejected 4 cued by c0s2, counted; life 1 (killed): Ab 600 − V[datadog] 600 = 0, ok (band [-20, 40]: ingest 4/s over the last drain interval; below, the residual 0 plus one 5.00002s drain interval of ingest, absorbed after the last drain and flushed before the kill; above, one 5s generator window of points sent past delta and not yet stored at the kill plus one drain interval of queue growth after the last drain); residual W − D − B − X − Δ_disc − Ab 0 at its last drain, what the kill lost from the receive queue and inbox, by design, not judged here; D has no shutdown part: a SIGKILL counts no shutdown drops; life 2 (final): Ab 780 − V[datadog] 780 = 0, ok (split copy; R 67,000 = 0 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.windows` | SKIP | not enabled ([ledger] vm_every_window) |
+| `ledger.replay` | PASS | datadog: life 2's first drain replayed 0 vs killed life 1's last-drain buffer.batches 0 (one batch in flight allowed) |
+| `ledger.summary` | PASS | final life 2: uncounted 0 = W − D − E − B 0 + E − A 0 + A − Δ_disc − Ab 0 + Ab − V[datadog] 0; delta's skipped points Δ_disc 20, counted; wire G − (W + K + F) 0 over the run, F 0 counted; ledger.wire judges the rest; end to end over the run, G 5,060 less counted loss 60 plus a resend allowance 0: datadog: V 4,912 <= G − counted + resent 5,000 |
+| `ledger.value` | PASS | I 1,355,500 (generate_in sent 1,355,500 − lost 0) − V 1,318,700 − U 22,000 = 14,800, reported: within the 30,000 that the 3 reported window(s) can lose, each bounded alone; U 2,000 cued by c0s1, 20,000 cued by c0s2 |
+| `ledger.sent` | PASS | to standin: every batch received ended in an accepted response; datadog: requests 2xx 246, 4xx 11, 5xx 7, connect_error 3, network_error 7; records accepted 4,912; cued, excused: request_refused line(s) 3 by c0s3; batch(es) dropped rejected 4 by c0s2; record(s) dropped rejected 8 by c0s1, 80 by c0s2; datadog life 0 at +900s: received 181 vs delivered 177 + dropped 4 + buffer.batches 0, gap 0; datadog life 1 at +1150s: received 30 vs delivered 30 + dropped 0 + buffer.batches 0, gap 0; datadog life 2 at +1375s: received 39 vs delivered 39 + dropped 0 + buffer.batches 0, gap 0 (one batch in flight allowed); ledger.egress and ledger.standin read the stand-in's record |
+| `ledger.topic` | SKIP | standin target: no topic |
+| `ledger.standin` | WARN | 20 pair(s) of points of one series in one second from two requests, first logit.soak.requests_0 at +795s stored 250, then 25: Datadog keeps the later and loses the other uncounted, which datadog_out collapses only within one batch (docs/known-gaps/datadog.md); 271 request(s) recorded, 253 stored, 10 cue(s); 140 duplicate copies of stored points (life 0 140), 35,000 counted twice by the destination, reported; 8 series named by series_errors; 5 classed step(s) (at_least_once) |
+| `identity.sink` | PASS | final life 2 at +1375s: datadog: received 39 vs delivered 39 + dropped 0 + buffer.batches 0, gap 0 (one batch in flight allowed) |
+| `drops` | PASS | no *.dropped count outside the ledger and the sink rows |
+| `recovery` | PASS | 11 of 11 fault(s) judged at 1 sink(s), each recovered within recovery_bound 45s of its end; warmup rate 4/s |
+| `file.reopen` | SKIP | the scenario has no rename step |
+| `tls.served` | SKIP | the scenario has no probe step |
+| `expect.generator-restart-resets` | PASS | delta of logit.transform.series.reset{component=delta} on logit, through c0s8: c0s8 (+795s, +870s]: 20 (over 15 drain(s)), want >= 20 and <= 20 |
+| `expect.restart-skips-initial` | PASS | delta of logit.transform.metrics.skipped{component=delta, reason=initial} on logit, through c0s9: c0s9 (+900s, +975s]: 20 (over 15 drain(s)), want >= 20 and <= 20 |
+| `expect.pause-evicts-idle` | PASS | delta of logit.transform.series.evicted{component=delta, reason=idle} on logit, through c0s10: c0s10 (+1005s, +1150s]: 20 (over 29 drain(s)), want >= 20 and <= 20 |
+| `expect.kill-skips-initial` | PASS | delta of logit.transform.metrics.skipped{component=delta, reason=initial} on logit, through c0s11: c0s11 (+1155s, +1230s]: 20 (over 9 drain(s)), want >= 20 and <= 20 |
+| `expect.netem-skips-no-initial` | PASS | delta of logit.transform.metrics.skipped{component=delta, reason=initial} on logit, through c0s7: c0s7 (+690s, +795s]: 0 (over 21 drain(s)), want <= 0 |
+| `expect.series-errors-drop-records` | PASS | delta of logit.output.records.dropped{component=datadog, reason=rejected} on logit, through c0s1: c0s1 (+60s, +125s]: 8 (over 13 drain(s)), want >= 2 |
+| `expect.rejected-drops` | PASS | delta of logit.component.batches.dropped{component=datadog, reason=rejected} on logit, through c0s2: c0s2 (+165s, +230s]: 4 (over 13 drain(s)), want >= 1 |
+| `expect.refused-holds` | PASS | max of logit.component.retrying{component=datadog} on logit, during c0s3: c0s3 (+270s, +290s]: 1 (1 sample(s)), want >= 1 |
+| `expect.clean-holds` | PASS | max of logit.component.retrying{component=datadog} on logit, during c0s6: c0s6 (+585s, +605s]: 1 (1 sample(s) and the value in force at its start), want >= 1 |
+
+- **The value balanced inside its reported windows.** I was 1,355,500, V 1,318,700, and U
+  22,000: 2,000 from the two series c0s1's `202`s named, four times over, and 20,000 from
+  c0s2's four rejected batches. The gap, 14,800, is about three windows of 20 series × 250:
+  the first point after the SUT restart, after the idle eviction, and after the kill, each
+  skipped and counted 20 times. No window opened at life 0's start: the SUT was up before the
+  generator's first point, so `auto` emitted it whole. Each window is bounded alone at 10,000
+  (20 skips × 250, plus 5,000 of slack): the kill's adds its killed life's Ab − V, which was 0,
+  as `ledger.egress` read it. The three sum to 30,000. Before review the row pooled the
+  windows' whole spans into a band of 195,000, inflated by the 100 s pause and
+  `generate_in`'s catch-up after it, which would have passed a loss of about 13% of I outside
+  every window; widening the kill's window to its span gave 75,000.
+- **Netem, the generator restart, and the cues that lose nothing lost no value.** The 20% loss
+  caused no initial skip (`netem-skips-no-initial` read 0), so each `otlp_out` resend was
+  skipped as a duplicate or emitted once. The generator restart reset all 20 series, each
+  first point emitted whole. The `503` after storing left 140 duplicate copies, 35,000 that
+  Datadog would count twice, which `ledger.standin` reports and V counts once.
+- **The generator restart sent two points of each series in one second.** On shutdown the
+  generator's `aggregate` flushed a 0.5 s partial window, 25 per series, at +795.0, half a
+  second after its last full 5 s window, 250, at +794.5. Both truncate to one epoch second,
+  1793297098, which `datadog_out` sends in two requests, and Datadog keeps the later, so it would lose 250 of each series
+  uncounted. That's the documented gap that `datadog_out` collapses same-second points only
+  within a batch (`docs/known-gaps/datadog.md`), but its workaround, an `aggregate` upstream,
+  doesn't cover that `aggregate`'s own shutdown flush. `ledger.standin` read the pair as a
+  resend that changed a sample and FAILed. `datadog_out` re-encodes a resend's points
+  unchanged, so under the `datadog` shape the row now WARNs on such a pair, naming the gap.
+- **`recovery`'s baseline was the input's rate, not the wire's.** It compared the SUT's
+  ingest, 4 points a second behind the generator's `aggregate`, with `generate_in`'s 1,000
+  events a second, so every fault read as unrecovered at 0%. On an HTTP wire the baseline is
+  now the writer's events received, the same rate wherever `generate_in` feeds the writer.
+- **Every expectation held.** 20 resets for the generator restart, 20 initial skips each for
+  the SUT restart and the kill, 20 idle evictions for the pause, 8 records dropped `rejected`
+  for c0s1's named series, 4 batches dropped `rejected` for c0s2, and `retrying` at 1 under
+  the `401` and the stand-in stop.
+- **`otlp_in`'s W fits metrics.** It counts one event per data point, as G does while each
+  event carries one, so `ledger.wire` balanced at 5,060. Its resend allowance had used the
+  input's batch, 100 events, as the unit; the writer's own batch, 20 points, replaces it.
+
+### W24: HTTP ingress into `splunk_hec_in`, `datadog_in`, and `prometheus_in` (2026-10-29)
+
+Each scenario ran at its default 18 minutes on the development host (`sailfish`, 32 cores, Linux
+7.2.13), with `SOAK_SKIP_IMAGE=1` against the `logit:soak` image built at 2026-10-29 10:00 PDT,
+newer than `origin/main`'s head; `soak/w24` touches no product code. Other agents' soak runs
+shared the daemon throughout.
+
+| Run | Scenario | Verdict |
+|---|---|---|
+| `20261029T175150Z` | `splunk-hec-ingress` | FAIL: `ledger.wire` and `expect.generator-resends`, both harness or scenario defects, fixed below |
+| `20261029T181247Z` | `datadog-ingress` | PASS |
+| `20261029T183141Z` | `rw-ingress` | FAIL: `ledger.intake`, a product defect, below |
+| `20261029T185422Z` | `splunk-hec-ingress` | PASS |
+
+The first `splunk-hec-ingress` run FAILed two rows:
+
+| Check | Status | Detail |
+|---|---|---|
+| `ledger.wire` | FAIL | [+745s, +805s] judged (c0s6 restart on logit): W − X exceeds G by 930, over the 700 its 5 ack timeout(s) and 2 edge(s) allow |
+| `expect.generator-resends` | FAIL | delta of logit.output.requests{class=network_error, component=hec, route=event} on generator, through c0s1: c0s1 (+60s, +165s]: 0 (over 21 drain(s)), want >= 1, FAIL |
+
+`rw-ingress` FAILed one:
+
+| Check | Status | Detail |
+|---|---|---|
+| `ledger.intake` | FAIL | life 0: logit.input.writes ok 9,359 + closed_consumer 0 != batches.sent 9,367, so a request isn't one batch |
+
+What the runs showed:
+
+- **A restart forgets the acknowledgment ledger, and the writer resends after `ack_timeout`.**
+  In both `splunk-hec-ingress` runs the restarted SUT answered the ids its last life issued as
+  unknown (45 and 35 polls in c0s6), and the generator counted 5 ack timeouts there, 20 over
+  each run: 5 under the delay, the stop, the restart, and the kill. Every timed-out id was a
+  whole batch delivered twice: the first run's `ledger.summary` read V 828,900 against
+  G − counted + resent 828,900, the resend allowance of 2,000 used in full.
+- **A judged run's trailing edge holds the batches in flight there.** At `concurrency: 8`
+  under `ack: true`, the batches sent and not yet acknowledged sit in W and not yet in G at a
+  run's edge, and the first run's restart window, next to a reported kill window it couldn't
+  net against, read 930 points of surplus against 700 allowed. A judged run's trailing edge now
+  allows what the writer's `logit.output.in_flight` read at the generator drains straddling it,
+  and its leading edge one batch (see `ledger.wire`'s HTTP paragraph in "6. The checks"). The
+  gauge read 5 at most splunk drains and up to 8 at a few. Re-scored, the first run passes
+  `ledger.wire` with the restart window's 930 against 1,100 (5 ack timeouts, 1, and 5 in
+  flight), and the rerun with 0 judged.
+- **The lag drifts with no trend, so a rule on the neighbour's sign misses it.** A first fix allowed `concurrency:` only at a trailing edge beside a reported run, and
+  re-scored the rerun's c0s3 window as "W − X exceeds G by 298, over the 200 its 0
+  transport-error attempt(s) and 2 edge(s) allow". The window counted no transport error and no
+  ack timeout. The cumulative W − G at each SUT drain wandered between 5,500 and 6,200 across it:
+  5,500 at +359, 6,200 at +369, 5,800 at +469, 5,500 again at +499. The steady run after it
+  gapped −199 over its own 190 s, the same sign, so `_boundary_nets` had no pair to net.
+  `ledger.summary` held end to end, V 836,100 against 836,600, so nothing was duplicated beyond
+  the ack timeouts' resends. With the gauge reading 5 at its trailing edge the window allows 600
+  and passes. A blanket `concurrency:` on every edge would pass a loss of 300 beside 1,000
+  duplicates in one judged run where nothing was in flight, and a reading on both edges would
+  pass 1,500 unexplained with 8 in flight at each; `http-surplus-in-flight-masks` and
+  `http-surplus-in-flight-unexplained` hold both to FAIL.
+- **Under `ack: true`, an 11 s delay on the SUT's answers ends in ack timeouts, not transport
+  errors.** Every request in flight was waiting on its acknowledgment, each poll's answer came
+  late (7 `route="ack"` `network_error`s) and each new dial ended at `connect_timeout`, so the
+  generator counted no `route="event"` `network_error`. The scenario now expects
+  `logit.output.acks{result="timeout"}` in c0s1, which the rerun counted 5 times.
+- **`prometheus_in` misses the count of a write whose sender gave up waiting.** It never
+  answers busy: a full pipeline delays its `204`, and in `rw-ingress`'s VictoriaMetrics stop
+  the generator's 10 s timeout ended 8 such waits (`expect.backend-stop-resends` read 8
+  `network_error`s, "operation timed out" in its self-log). `crate::http::deliver_detached`
+  delivered each batch on its own task, so `batches.sent` counted it, but `handle_write`
+  counts `logit.input.writes` and `logit.input.samples` after `write_response` returns, and
+  hyper dropped that future with the connection: life 0 counted 9,359 `ok` writes against
+  9,367 batches sent, and 1,502,500 samples, 100 per counted write. Nothing was lost:
+  `ledger.wire`, `ledger.egress`, and `ledger.summary` passed. The module doc's "one count per
+  request" is the claim the identity checks, so the row stays. W24b counts a write that reaches
+  delivery on the delivery's own task, `ok` or `closed_consumer`, so a write whose sender gave up
+  still counts `ok` and the identity holds unchanged; `rw-ingress` owes a rerun on it.
+- **`datadog_in` and `splunk_hec_in` held both request identities in every life a kill didn't
+  end**: `ok` requests on `series_v2` and `event` equal to `batches.sent`, and the backend
+  stop's 9 and 18 busy `503`s equal to `batches.deferred`, with no `closed_consumer` answer.
+- **`datadog_out` collapsed nothing.** A distinct `series` tag per event kept every point its
+  own series, so `logit.output.metrics.dropped` stayed 0 and `ledger.aggregate` balanced.
+- All three generators shed load to `overflow: drop_newest` while their writer waited, counted
+  and outside G: 23% of `splunk-hec-ingress`'s attempted events, 21% of `datadog-ingress`'s,
+  and 24% of `rw-ingress`'s.
+
+### W25: a `prometheus_in` scrape (2026-10-29)
+
+`prometheus-scrape` ran at its default 18 minutes on the development host, with
+`SOAK_SKIP_IMAGE=1` against the `logit:soak` image built at 2026-10-29 10:00 PDT; `soak/w25`
+touches no product code. Other agents' soak runs shared the daemon throughout.
+
+| Run | Verdict |
+|---|---|
+| `20261029T195143Z` | FAIL: `expect.partition-fails` and `expect.kill-fails`, a scenario defect, below |
+| `20261029T201553Z` | WARN: `rss_slope` on the generator, below |
+| `20261029T210629Z` | WARN: `rss_slope` on the generator, with the scrape `timeout` at 500 ms |
+
+The first run FAILed two rows:
+
+| Check | Status | Detail |
+|---|---|---|
+| `expect.partition-fails` | FAIL | delta of logit.input.scrapes{class=network_error, component=scrape} on logit, through c0s1: c0s1 (+60s, +150s]: 0 (over 18 drain(s)), want >= 1, FAIL |
+| `expect.kill-fails` | FAIL | delta of logit.input.scrapes{class=network_error, component=scrape} on logit, through c0s4: c0s4 (+540s, +600s]: 0 (over 12 drain(s)), want >= 1, FAIL |
+
+The second run's ledger rows, as it first scored them:
+
+| Check | Status | Detail |
+|---|---|---|
+| `rss_slope` | WARN | generator WARN: MiB/h life 0 +103.7, life 1 -4.0 (limit 64); 635s of 1020s after warmup judged (62%; WARN under 5%) \| logit PASS: MiB/h life 0 +2.0 (limit 64); 640s of 1020s after warmup judged (63%; WARN under 5%) |
+| `ledger.wire` | PASS | G 1,055,200 − V 1,053,000 = 2,200 over the run; generator life 0 (killed): G 545,100 − V 544,000 = 1,100 within its end band [-5,000, 11,000]; generator life 1 (stopped): G 510,100 − V 509,000 = 1,100 within its end band [0, 11,000] |
+| `ledger.intake` | PASS | final life 0: W + Y − D 17,457 vs E + B 17,457 (R 67,000 = 0 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.edge` | PASS | final life 0: E − X 17,457 == S_in[victoria_metrics] 17,457 (listener to victoria_metrics) |
+| `ledger.egress` | PASS | victoria_metrics: life 0 (final): W − X 16,800 − V_n 16,800 = 0, exact (V_n the distinct stored samples) |
+| `recovery` | PASS | 4 of 4 fault(s) judged at 1 sink(s), each recovered within recovery_bound 30s of its end; each by a sample scraped |
+
+What the runs showed:
+
+- **A scrape of a partitioned or killed target times out.** Neither resolving the generator's
+  name nor dialing it failed within the scrape's 2 s `timeout`, so every failed scrape in the
+  partition and the kill counted `timeout` (12 and 6), as in the pause (11) and the delay (17),
+  and none counted `network_error`. The scenario now expects `timeout` in all four.
+- **No increment was lost.** Each generator life's G − V was 1,100 in every run, a fraction of
+  its end band, whatever the faults before it: the next scrape after each fault read the
+  total that held every increment generated during it.
+- **The end band's high edge is the scrape `timeout`, not a drain interval.** Review found
+  that a drain interval hid uncounted loss at a life's end, which nothing else judges on this
+  wire, so the band is now one scrape interval, one generator window, and the scrape
+  `timeout`. Re-scored with `script/soak check`, the second run's `ledger.wire` still passes,
+  each life's 1,100 against a band of [-5,000, 8,000] and [0, 8,000]. `load()` now requires the
+  scrape `timeout` below the generator's `aggregate` window, so a scrape that starts before a
+  generator restart can't read the new process's totals; the scenario's timeout went from 2 s
+  to 500 ms, under its 1 s window. The third run, at 500 ms, scored every ledger and
+  `[[expect]]` row PASS, each life's 1,100 against [-5,000, 6,500] and [0, 6,500], with 12, 12,
+  18, and 6 timeouts in the four fault windows and 156 scrapes answered `2xx`, as at 2 s.
+- **The egress was exact.** VictoriaMetrics stored every sample the listener sent once, so
+  W − X equaled the distinct stored samples in every run.
+- **The generator's RSS steps once after the pause and holds.** In the first run its first
+  life grew from 25 to 33 MiB as it caught up on the minute of generation the pause held back,
+  then stayed flat, and in every run its second life stayed under the limit (+0.7, −4.0, and
+  +8.8 MiB/h). The generator is the load source, not the system under test, so the scenario
+  leaves the WARN reported rather than listing it under `[expected]`. The SUT's RSS stayed
+  flat (+2.0 to +2.9 MiB/h).
+
+### W27: `syslog_in` over TCP and TLS (2026-10-29)
+
+`syslog-tcp-ingress` and `syslog-tls-ingress` ran at their default 14 minutes on the
+development host, from a private image tag (`SOAK_IMAGE=logit:soak-w27`, `SOAK_SKIP_IMAGE=1`)
+so the branch's build didn't replace the shared `logit:soak`. The first two runs used an image
+built from `soak/w27` before it merged `soak/w26`, and the last two an image built at
+2026-10-29 13:50 PDT from the merge. The first two also ran an earlier cut of each scenario:
+the TCP run had no generator stop and neither had `[[expect]]` rows on resets. Other agents'
+soak runs shared the daemon throughout.
+
+| Run | Scenario | Verdict |
+|---|---|---|
+| `20261029T201032Z` | `syslog-tcp-ingress` | PASS |
+| `20261029T202857Z` | `syslog-tls-ingress` | PASS; re-scored with the final `[[expect]]` rows, PASS |
+| `20261029T205142Z` | `syslog-tcp-ingress` | PASS |
+| `20261029T210657Z` | `syslog-tls-ingress` | FAIL: `ledger.wire` at the end, a harness defect, below; re-scored, PASS |
+
+The last TLS run FAILed one row:
+
+| Check | Status | Detail |
+|---|---|---|
+| `ledger.wire` | FAIL | G falls 100 short of W + K at the end, over the end allowance 100 (the generator sink's last buffer.batches + 1 batch); G 1,366,800 = W 1,357,000 + K 0 + counted 0 + gap 9,800 (9,742 in reported windows, 0 in judged TCP-affecting windows, 159 steady, -100 at the end; loss judged 164, each run at 0 or more, against limit 1,900); the generator's requests: 2 ambiguous attempt(s); its counted loss, not in G: 264,400 event(s) in 2,644 batch(es) (overflow_newest 2,644) |
+
+The last TCP run's ledger rows:
+
+| Check | Status | Detail |
+|---|---|---|
+| `ledger.wire` | PASS | G 1,370,700 = W 1,361,560 + K 0 + counted 8 (truncated 8) + gap 9,132 (9,757 in reported windows, -663 in judged TCP-affecting windows, 65 steady, -26 at the end; loss judged 2, each run at 0 or more, against limit 1,900); the generator's requests: 8 ambiguous attempt(s); its counted loss, not in G: 260,500 event(s) in 2,605 batch(es) (overflow_newest 2,605) |
+| `ledger.egress` | PASS | victoria_metrics: life 0: W − D − B − X − ΣT_disc − V 0 = residual 0 + Ab − V 0, ok; life 1 (killed): Ab 109,200 − V[victoria_metrics] 99,200 = 10,000, within band (band [-10,098, 29,994]: ingest 2,000/s over the last drain interval; below, the residual 100 plus one 5.00002s drain interval of ingest, absorbed after the last drain and flushed before the kill; above, one 10s aggregate window (configured) unflushed at the kill plus one drain interval of queue growth after the last drain); residual W − D − B − X − ΣT_disc − Ab 100 at its last drain, what the kill lost from the receive queue and inbox, by design, not judged here; D has no shutdown part: a SIGKILL counts no shutdown drops; life 2 (final): Ab 684,986 − V[victoria_metrics] 684,986 = 0, ok (split copy; R 327,000 = 0 + 262 x 1,000 + 65 x 1,000) |
+| `ledger.summary` | PASS | final life 2: uncounted 0 = W − D − E − B 0 + E − ΣT_disc − A 0 + A − Ab 0 + Ab − V[victoria_metrics] 0; the transforms' ΣT_disc 0, counted; wire G − (W + K + F) 9,132 over the run, F 8 counted; ledger.wire judges the rest |
+| `expect.generator-ambiguous` | PASS | delta of logit.output.requests{class=ambiguous, component=syslog} on generator, through c0s2: c0s2 (+210s, +285s]: 5 (over 15 drain(s)), want >= 1 |
+| `expect.no-resets` | PASS | delta of logit.input.connections.closed{component=syslog, reason=reset} on logit, run: run (+60s, +840s]: 0 (over 143 drain(s)), want <= 0 |
+
+What the runs showed:
+
+- **An `at_least_once` generator needs the allowance counted from its attempts.** The first
+  TCP run's pause window read 338 more lines than G, the lines of failed attempts the generator
+  resent: re-scored under the rule that allowed one batch per `ambiguous_at_most_once` drop, it
+  FAILed `ledger.wire` ("over the 200 its 0 ambiguous attempt(s) and 2 edge(s) allow"), and
+  under one batch per ambiguous attempt it PASSed with 700 allowed for five. The generator
+  counted 6, 2, 8, and 2 ambiguous attempts over the four runs, under the netem loss, the pause,
+  and the partition, and never an `ambiguous_at_most_once` drop.
+- **No fault reset a connection.** `logit.input.connections.closed{reason="reset"}` read 0 in
+  every run, over plaintext and TLS, through the SUT's pause, stop, kill, and partition and the
+  generator's stop. The listener never writes to a plaintext peer, so a closing generator sends
+  a FIN, and over TLS the generator's close sent no reset either. The scenarios hold the counter
+  at 0; a fault built to reset a connection, such as `ss -K` in the netem image, would be a new
+  action.
+- **A kill showed no loss from the socket buffers.** With each end's buffer capped at 256 KiB,
+  the four kills' gaps were 9,916, 9,812, 9,800, and 9,814 lines, while the killed life's last
+  drain came 5.0 s before each kill, about 10,000 lines at 2,000 a second that it read and never
+  exported. Each gap fell within about 400 lines of that, the estimate's error, so the buffers
+  held little at the kill. That loss is the best-effort hop
+  [ADR `delivery-semantics`](../adr/delivery-semantics.md) item 6 decides; counting it, and a
+  receiver stalled behind a full buffer before the kill, which no scenario measures, are a
+  [known gap](../known-gaps/sinks.md).
+- **A stop or kill cuts a plaintext frame.** The plaintext runs counted 6 and 8
+  `logit.input.frames.dropped{reason="truncated"}`, octet-counted frames a closing connection
+  ended mid-frame, which `ledger.wire` counts in F. The TLS runs counted none.
+- **A partition kept the SUT's address.** Each partition left the SUT at the same IP, so
+  `ledger.wire` judged it, and its window read no more surplus than one ambiguous attempt
+  allowed.
+- **The rotation reloaded in place.** In both TLS runs the SIGHUP reloaded the server
+  certificate once, its expiry rose by a day, and the probe read the rotated serial; the
+  stop after it made the generator handshake against the new certificate, and lines arrived in
+  every drain after it.
+- **The end run's boundary needed netting.** The last TLS run's steady run before the end read
+  98 of loss and the end run 100.1 of surplus, one batch the generator counted before the
+  boundary and the listener read after it. Only a boundary touching a judged run netted, so
+  the end run met its 100-line allowance whole and FAILed. The end run now nets with the run
+  before it under the same cap ([ADR `soak-harness`](../adr/soak-harness.md)'s "Amendment: the
+  end run nets at its boundary"); re-scored, the run PASSes with 98 netted and 2 left, and the
+  last TCP run reads as before.

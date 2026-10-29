@@ -28,7 +28,9 @@
 //! its acknowledgment, which it answers by resending, and never a batch part-way through a send.
 //! Two shapes satisfy the rule: [`deliver_detached`] sends on a task of its own, which the abort
 //! doesn't reach, and [`deliver_with_deadline`] sends nothing until it holds a slot on every
-//! consumer, so a wait dropped before then has sent and counted nothing.
+//! consumer, so a wait dropped before then has sent and counted nothing. The first shape's wait
+//! can still be dropped after the send, so a listener counts a detached delivery's outcome in
+//! its `settle` callback, on that task, never after the wait.
 
 use crate::tcp::AcceptQueueSampler;
 use bytes::{Bytes, BytesMut};
@@ -625,26 +627,38 @@ impl Undelivered {
 /// that batch and the rest: a closed consumer never reopens, so offering the rest would only
 /// count them dropped a second time.
 ///
+/// `settle` runs on the task with the outcome, before this future sees it. A listener counts
+/// there whatever a delivered or refused request must count, because a client that closes
+/// mid-wait drops this future, and anything counted after it then never runs while the batches
+/// still count `logit.component.batches.sent`. `settle` doesn't run when there are no batches.
+///
 /// The task holds a `Fanout` clone until the downstream takes the last batch, as a parked handler
 /// does ([`drive_connection`]'s wait-out loop). A panic inside it is resumed here; a task cancelled
 /// by a runtime shutting down reports every batch as undelivered, since which of them went out is
-/// unknown and the client must not be told they all did.
-pub(crate) async fn deliver_detached(
+/// unknown and the client must not be told they all did. `settle` doesn't run for that task.
+pub(crate) async fn deliver_detached<F>(
     sink: &logit_pipeline::Fanout,
     batches: Vec<logit_core::EventBatch>,
-) -> Result<(), Undelivered> {
+    settle: F,
+) -> Result<(), Undelivered>
+where
+    F: FnOnce(Result<(), Undelivered>) + Send + 'static,
+{
     if batches.is_empty() {
         return Ok(());
     }
     let total = batches.len();
     let sink = sink.clone();
     let delivery = tokio::spawn(async move {
+        let mut outcome = Ok(());
         for (sent, batch) in batches.into_iter().enumerate() {
             if !sink.send(batch).await {
-                return Err(Undelivered::Closed(total - sent));
+                outcome = Err(Undelivered::Closed(total - sent));
+                break;
             }
         }
-        Ok(())
+        settle(outcome);
+        outcome
     });
     match delivery.await {
         Ok(outcome) => outcome,

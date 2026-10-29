@@ -1,0 +1,38 @@
+# The load source in `script/soak`'s rw-ingress scenario: 2,000 remote-write 2.0 samples a second
+# to the system under test, each batch of 100 one request. Its `internal` telemetry goes to
+# stdout as NDJSON, so the harness reads what it sent.
+admin: { bind: 127.0.0.1:9600 }
+components:
+  load:
+    type: generate_in               # unbounded
+    rate: 2000
+    batch: 100
+    event:
+      # One sample per event. A batch shares one timestamp and holds each `series` label once,
+      # so no two samples in one request share a series and millisecond, which prometheus_out
+      # would collapse into one.
+      metric: { name: soak_gen, kind: sum, value: 1 }
+      attributes:
+        series: "{seq%100}"
+  typed:
+    # prometheus_out drops a delta sum, and a gauge would reach the SUT's `aggregate` as a
+    # series it absorbs beside the SUT's own counter. Marked cumulative, each sample leaves as a
+    # counter, which 2.0 types inline, and the SUT's `aggregate` passes it through unabsorbed.
+    type: lua
+    sources: [load]
+    script: |
+      function process(event)
+        event.metrics[1].temporality = "cumulative"
+        return event
+      end
+  remote_write:
+    type: prometheus_out
+    sources: [typed]
+    endpoint: http://logit:9090/api/v1/write
+    version: 2
+    # 50 batches is 2.5 s of load, so a SUT that answers nothing for longer overflows it and
+    # the loss is counted here; never stall generate_in. The default posture, at_least_once,
+    # resends a batch whose answer was lost.
+    buffer: { max_batches: 50, overflow: drop_newest, retry_max_delay: 1s }
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }
