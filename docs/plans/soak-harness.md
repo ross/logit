@@ -1761,7 +1761,7 @@ the pause, so `ledger.topic`'s no-duplicate verdict rests on resends, and `retry
 during the stop and 0 after it. `kafka-otlp-broker-restart` is the same run under `format:
 otlp_proto`, `topics: {metrics: soak}`, with the same expectations: one record per window.
 
-### 8c. Stand-in targets (W9a, W9b, W16)
+### 8c. Stand-in targets (W9a, W9b, W16, W29)
 
 A `[target]` table with `kind = "standin"` runs a scripted HTTP destination in place of
 VictoriaMetrics, so every row of a sink's response-class table
@@ -1770,7 +1770,7 @@ VictoriaMetrics, so every row of a sink's response-class table
 ```toml
 [target]
 kind = "standin"          # name defaults to "standin"
-shape = "remote_write"    # or "datadog" (W9b) or "influxdb" (W16); "remote_write" by default
+shape = "remote_write"    # or "datadog" (W9b), "influxdb" (W16), "otlp" or "splunk" (W29)
 
 [[ledger.sink]]           # one sink, with no backend or vm_selector
 id = "remote_write"
@@ -1787,15 +1787,27 @@ stdlib-only.
 stock `python:3.13.16-alpine3.24` image, so `script/soak` builds nothing for it. Its data port
 takes the sink's writes on the shape's path (`--shape remote_write`: `/api/v1/write`, default
 answer `200`; `--shape datadog`, W9b: `/api/v2/series`, default answer `202`; `--shape
-influxdb`, W16: `/api/v2/write`, default answer `204` with no body and no `Content-Length`); a
-write to any other path answers `404`. The path is compared without its query string, because
+influxdb`, W16: `/api/v2/write`, default answer `204` with no body and no `Content-Length`;
+`--shape otlp`, W29: `/v1/metrics`, default answer `200` with an empty
+`ExportMetricsServiceResponse`; `--shape splunk`, W29: `/services/collector/event`, default
+answer `200` with HEC's success body); a write to any other path answers `404`. The path is compared without its query string, because
 `influxdb_out` always sends one (`org`, `orgID`, `bucket`, `precision=ns`); compared whole, every
 write would answer `404`, which a carried-mode sink reads as `Rejected`, a silent drop. Under `datadog`, a cue's `series_errors` makes a `2xx` answer's body
 the series route's `errors` list, protobuf field 1 (`repeated string`), with N entries; the
 stand-in decodes nothing, so the entries name series by their place in the request. Under
 `remote_write`, a `2xx` other than `202` to a remote-write 2.0 request carries
 `X-Prometheus-Remote-Write-{Samples,Histograms,Exemplars}-Written` with the counts the stand-in
-reads from the body, as a 2.0 receiver must, unless the cue's `headers` replaces them. Its control port takes the driver's
+reads from the body, as a 2.0 receiver must, unless the cue's `headers` replaces them. Under
+`otlp`, a cue's `partial_success` makes a `2xx` answer's body a `partial_success` rejecting N data
+points, which the stand-in names as the request's first N. Under `splunk` (W29), the default
+answer carries an `ackId` minted per `X-Splunk-Request-Channel` from 0, since without one
+`splunk_hec_out` under `ack: true` reads the token as not acknowledging and never polls; the
+stand-in also answers `/services/collector/ack`, each id `true` once minted on the poll's
+channel, and `false` under a `withhold_acks` cue or for an id a restarted stand-in hasn't minted
+since. A poll is no write: it spends no `count` and stores nothing. A cue's `invalid_event`
+answers a `400` with code 6 naming object N, and `after = K` lets K writes through with the
+default answer before the cue answers, so a busy `503` lands on a batch's second body after its
+first was accepted. Its control port takes the driver's
 cues and answers `/health`. It prints one JSON line per request to stdout: the time, the path and the
 query string apart, `Content-Encoding`, the cue in force (none once a counted cue is spent), how it answered (`status` or `reset`), whether it stored
 the write (`apply`, else whether the status is `2xx`), the cue's `series_errors` when it set one,
@@ -1857,6 +1869,18 @@ the sum over distinct `(series, timestamp)` of the stored value, credited to the
 timestamp falls in, and a negative gap is a `surplus`, as under `datadog`. A different value at the
 same key FAILs `ledger.standin`, since the sink's resend can't produce one.
 
+Under `otlp` and `splunk` (W29) the SUT's `aggregate` runs `temporality: cumulative`, the remedy
+both sinks' docs name for a resent `Sum`, and V is `remote_write`'s: one sample per
+`(label set, timestamp)`, a later write replacing an earlier one. An `otlp` body is an
+`ExportMetricsServiceRequest`, gzip or none, read by W20's `soaklib/otlp.py`; each data point is a
+sample of `{__name__: metric, resource, attributes}`, the last two the hex of their encoded
+`KeyValue`s, so the label set needs no attribute decoder. A `splunk` body is a run of HEC
+`/event` JSON objects, gzip or none; each `metric_name:<n>` field of an object is a sample of
+`{__name__: n, host, index, source, sourcetype, ...dimensions}`, at the object's `time` in
+milliseconds. A `partial_success` answer stores every point of its request but the first N, and
+an `invalid_event` answer stores the objects before object N, as Splunk indexes them. Both name
+the loss by position, so the stand-in decodes nothing to answer.
+
 **`ledger.sent` against a `datadog` stand-in (W9b)** judges the sink by the verdicts in
 "External targets", so they run without a real org; that list says which refusals and drops a
 `respond` step's cue excuses. `drops` leaves the sink's `records.dropped` and `metrics.dropped`
@@ -1902,6 +1926,16 @@ to it, as on an external target. Under `remote_write` and `influxdb`, `ledger.se
   such as each resend after a `503` with `apply = true`, is reported as a rewrite, and FAILs only
   under `at_most_once`, or when the write it repeats was answered `2xx` in the same life. As under
   `datadog`, every `respond` other than a `2xx` needs a `class`.
+- Under `otlp` (W29), also: per SUT life, the sink's `records.dropped{reason="rejected"}` equals
+  the data points the `partial_success` answers rejected plus the points of the requests
+  answered under the cue of a step classed `rejected`. Every `respond` other than a `2xx` needs
+  a `class`.
+- Under `splunk` (W29), also: per SUT life, the sink's `records.dropped{reason="invalid_event"}`
+  equals the records of the objects the `invalid_event` answers named, one per `metric_name`
+  field; every default `2xx` carried an `ackId`; and the row reports the polls' answers. Every
+  `respond` other than a `2xx` needs a `class`, but an `invalid_event` takes none, because the
+  sink drops the one object and resends the rest, and a `withhold_acks` needs
+  `class = "ambiguous"`, the sink's reading at `ack_timeout`.
 
 **The scenarios.**
 
@@ -1943,6 +1977,20 @@ to it, as on an external target. Under `remote_write` and `influxdb`, `ledger.se
 - `standin-influxdb-mixed` (W16): the bucket carried by the `set` and the org from
   `default_org:`, so a `403`, a `404` naming the bucket, and a `404` naming neither are
   `rejected`, and a `404` naming the org or an orgID, the operator's, is `refused`.
+- `standin-otlp` (W29): `standin-influxdb`'s generator and an SUT under cumulative temporality,
+  with `otlp_out` sending metrics over OTLP/HTTP under gzip to `endpoint: http://standin:8080`.
+  Thirteen 20 s steps, 105 s apart: a `200` with `partial_success = 2`, then `429`, a `503`
+  after storing (its resend a rewrite), `408`, `400`, `401`, `405`, `407`, `500`, `422`, `302`, a
+  reset, and a `stop` of the stand-in. Not cued: a DNS failure, a failed TLS handshake, a dial
+  past `connect_timeout:`, the fixed 10 s request timeout, and the four gRPC rows.
+- `standin-splunk` (W29): the same generator, with `splunk_hec_out` under gzip, `ack: true`, a
+  5 s `ack_timeout`, and 4 KiB bodies, so a batch spans several bodies. Fourteen 20 s steps,
+  105 s apart: a `400` code 6 naming object 3 of one body, then `401` code 3, `403` code 4, `400`
+  code 10, `429` code 26 and `503` code 9 before any body was accepted (`clean`), `503` code 9 on
+  a batch's second body (`after = 1`, `ambiguous`), `500` code 8, `400` code 5, `404`, `302`, a
+  reset, every ack withheld (`ambiguous`), and a `stop` of the stand-in. Not cued: Splunk Cloud's
+  code 6 at object 0 of a body over 5 MiB, a connect failure after a body was accepted, and the
+  two `connect_timeout:` rows.
 
 The black-hole control is a `2xx` the stand-in doesn't store (`status = 200`, `apply = false`).
 `ledger.standin` FAILs it wherever it falls. Under cumulative temporality the next stored totals
@@ -6048,3 +6096,44 @@ below. The table is its re-score with `script/soak check`, overall WARN.
 - **`otlp_in`'s W fits metrics.** It counts one event per data point, as G does while each
   event carries one, so `ledger.wire` balanced at 5,060. Its resend allowance had used the
   input's batch, 100 events, as the unit; the writer's own batch, 20 points, replaces it.
+
+### W29: OTLP- and HEC-shaped stand-ins (2026-10-29)
+
+W29 adds the stand-in's `otlp` and `splunk` shapes, their V and `ledger.standin` rules, and the
+`standin-otlp` and `standin-splunk` scenarios. Both ran at their default duration on the
+development host (Docker 29.8.2), one after the other, against `logit:soak`
+(`sha256:4f9075e1…`, built 2026-10-29; W29 changes no Rust) and `python:3.13.16-alpine3.24`
+(`sha256:2d9aefe2fef0`). `standin-otlp` ran before the merges of `soak/w23` and `soak/w28`,
+`standin-splunk` after them. Every row of both runs passed.
+
+| Run | Scenario | `ledger.egress` | `ledger.standin` |
+|---|---|---|---|
+| `20261029T183855Z` | `standin-otlp` | Ab 3,031,400 − V 3,031,400 = 0; 8 batches dropped `rejected`, 2 cued by each of `c0s5`, `c0s6`, `c0s10`, `c0s11` | 199 requests, 151 stored; 600 rewritten with the same value; 804 records dropped `rejected` by the record and by the sink |
+| `20261029T190638Z` | `standin-splunk` | Ab 3,241,300 − V 3,241,300 = 0; 4 batches dropped `rejected`, 2 cued by each of `c0s9`, `c0s11` | 883 requests, 649 stored; 329 rewritten; 1 record dropped `invalid_event` by the record and by the sink; 174 `/ack` polls, 636 ids answered `true` and 60 withheld; 649 `ackId`s minted |
+
+Class signatures, from `ledger.standin`'s lines:
+
+| Scenario | Read as `ambiguous` | `rejected` | `refused` | `clean` |
+|---|---|---|---|---|
+| `standin-otlp` | `429`, `503` after storing, `408`, `500`, a reset | `400`, `401`, `422`, `302` | `405`, `407` | a stop of the stand-in |
+| `standin-splunk` | `503` code 9 on a second body, `500` code 8, a reset, acks withheld | `400` code 5, `302` | `401` code 3, `403` code 4, `400` code 10, `404` | `429` code 26, `503` code 9 before any body, a stop |
+
+What the runs showed about `logit` and the harness:
+
+- **Both sinks read every cued row of their tables as documented.** Each step's class matched
+  the sink's `retrying` line or its batch drop, and no step needed a reclass.
+- **A partial success counts its points and drops no batch.** `c0s1` answered two requests
+  with `partial_success = 2`; the sink counted 4 records `rejected` and dropped no batch. The
+  run's 804 is those 4 plus the 8 rejected batches' 100 points each.
+- **A code 6 drops one object and resends the rest.** `c0s1`'s one answer named object 3; the
+  sink counted 1 record `invalid_event`, that object's one `metric_name`, and the objects before
+  it were stored once, the resend of the rest after them.
+- **`after_delivery` splits the busy answer.** A `503` code 9 before any body of a batch was
+  accepted held the queue as `clean`, and the same answer on a batch's second body (`after = 1`)
+  read `ambiguous`, with one retry.
+- **Withheld acks time out as `Ambiguous`.** Under `c0s13` the sink counted 12
+  `acks{result=timeout}` and held its batches `ambiguous`; the resends rewrote the same samples.
+- **The sinks counted 3 (`otlp_out`) and 4 (`splunk_hec_out`) `connect_error` requests** against
+  the stopped stand-in, which never reach the record, as in W9a.
+- **Self-test**: 2,375 expectations after the merges. Each new rule was reverted in turn and
+  failed at least one expectation; the PR lists them.
