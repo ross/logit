@@ -241,7 +241,8 @@ HTTP_WIRE = "http"
 FILE_WRITER_KIND = "file_out"
 # An HTTP wire's writers, whose G is also `events.delivered`: the events of the batches the
 # listener answered with a success.
-HTTP_WRITER_KINDS = ("influxdb_out", "otlp_out")
+HTTP_WRITER_KINDS = ("influxdb_out", "otlp_out", "splunk_hec_out", "datadog_out",
+                     "prometheus_out")
 # Each listener kind the ledger can follow: the wire it takes with no `transport:`, and the
 # wire each `transport:` value it accepts gives. A kind or transport missing here has no wire.
 LISTENER_WIRES = {
@@ -254,6 +255,14 @@ LISTENER_WIRES = {
     "docker_in": ("file", {}),
     "influxdb_in": ("http", {}),
     "otlp_in": ("http", {}),
+    "splunk_hec_in": ("http", {}),
+    "datadog_in": ("http", {}),
+}
+# Each listener kind with no `transport:` that runs in one of several modes, each chosen by the
+# config key it sets: that key and its mode's wire, None for a mode the ledger has no wire for.
+# `prometheus_in` receives remote-write on `bind:` and scrapes `scrape_targets:`.
+LISTENER_MODES = {
+    "prometheus_in": (("bind", "http"), ("scrape_targets", None)),
 }
 # `[overlap]`: two or more SUT services, `instances`, each running the whole pipeline on one
 # shared UDP port under `reuse_port`, in the network namespace of the `holder` service, each
@@ -1195,14 +1204,20 @@ def component_blocks(text, component):
 
 def listener_wire(text, component):
     """`(wire, kind, transport)` for SUT listener `component` in config `text`: the wire its
-    `type:` and `transport:` give (`LISTENER_WIRES`), or None for a kind or transport the ledger
-    has no wire for; `(None, None, None)` when no block of `component` names a `type:`. Comments
-    are ignored."""
+    `type:` and `transport:` give (`LISTENER_WIRES`), or for a kind in `LISTENER_MODES` the wire
+    of the first mode whose key it sets, that key in `transport`'s place; the wire is None for a
+    kind, transport, or mode the ledger has no wire for. `(None, None, None)` when no block of
+    `component` names a `type:`. Comments are ignored."""
     for block in component_blocks(text, component):
         body = "\n".join(re.sub(r"(^|\s)#.*$", "", line) for line in block.splitlines())
         kind = re.search(r"\btype\s*:\s*[\"']?([a-z_]+)", body)
         if not kind:
             continue
+        if kind.group(1) in LISTENER_MODES:
+            for key, wire in LISTENER_MODES[kind.group(1)]:
+                if re.search(rf"(?<![\w.]){key}\s*:", body):
+                    return wire, kind.group(1), key
+            return None, kind.group(1), None
         found = re.search(r"\btransport\s*:\s*[\"']?([a-z_]+)", body)
         transport = found.group(1) if found else None
         default, by_transport = LISTENER_WIRES.get(kind.group(1), (None, {}))
@@ -1421,7 +1436,7 @@ def _target_router_problems(ledger, sut_text):
 def _wire_problems(ledger, sut_text):
     """What each `[[ledger.source]]`'s `wire` breaks against the SUT config `sut_text`: its
     `sut_listener` must be a component there, of a kind and transport `LISTENER_WIRES` gives a
-    wire for, and that wire must be the source's own, `udp` when it names none."""
+    wire for, or a kind and mode `LISTENER_MODES` does, and that wire must be the source's own, `udp` when it names none."""
     sources = ledger.get("source")
     if not isinstance(sources, list):
         return []
@@ -1433,7 +1448,10 @@ def _wire_problems(ledger, sut_text):
         where = f"ledger.source {index + 1}"
         declared = source.get("wire", DEFAULT_WIRE)
         wire, kind, transport = listener_wire(sut_text, listener)
-        over = f"over {transport}" if transport else "with no transport:"
+        if kind in LISTENER_MODES:
+            over = f"on {transport}:" if transport else "with no mode's key set"
+        else:
+            over = f"over {transport}" if transport else "with no transport:"
         if kind is None:
             problems.append(f"{where}: `sut_listener` {listener!r} isn't a component of the "
                             "SUT config")

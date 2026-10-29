@@ -1413,8 +1413,9 @@ WIRES = {
 class HttpListener:
     """One HTTP listener kind's symbols beside its wire's: `requests`, its per-request counter,
     whose `class` tags `ok`, `busy`, and `closed_consumer` split the answers on its write route
-    `route`, or None for a listener that counts no requests; and `deferred`, the batches a busy
-    `503` left with the client, or None for a listener that never answers busy."""
+    `route`, or None for a listener that counts no requests; `route`, None for a counter with no
+    `route` tag, one the listener counts on its write path alone; and `deferred`, the batches a
+    busy `503` left with the client, or None for a listener that never answers busy."""
 
     requests: object
     route: object
@@ -1428,10 +1429,22 @@ class HttpListener:
 # `closed_consumer` requests sum to its `batches.sent`, and its `busy` requests equal its
 # `batches.deferred`. `otlp_in` counts no requests and never answers busy: a slow downstream
 # holds the request, and a client that gives up leaves its batches to be delivered
-# (crates/logit-inputs/src/otlp.rs).
+# (crates/logit-inputs/src/otlp.rs). `splunk_hec_in` and `datadog_in` answer as `influxdb_in`
+# does on the route each writer posts to, `event` and `series_v2`, under the same 5 s deadline
+# on a request's first batch: a `/event` body decodes to one batch per envelope and a series
+# body to one batch, so the identities hold while each body carries one envelope
+# (crates/logit-inputs/src/splunk.rs and datadog.rs, "Backpressure"). `prometheus_in`'s
+# remote-write receiver counts each request once in `logit.input.writes{class}`, with no
+# `route` tag, decodes it to one batch, and never answers busy: backpressure delays its `204`
+# (crates/logit-inputs/src/prometheus.rs, "What a decoded request becomes").
 HTTP_LISTENERS = {
     "influxdb_in": HttpListener("logit.input.requests", "write", "logit.input.batches.deferred"),
     "otlp_in": HttpListener(None, None, None),
+    "splunk_hec_in": HttpListener("logit.input.requests", "event",
+                                  "logit.input.batches.deferred"),
+    "datadog_in": HttpListener("logit.input.requests", "series_v2",
+                               "logit.input.batches.deferred"),
+    "prometheus_in": HttpListener("logit.input.writes", None, None),
 }
 # A file wire's tailer reads at most this much of one file per read, so a kill can replay up to
 # one read's lines per file past its last checkpoint (docs/known-gaps/tailing.md, "The tail
@@ -1479,6 +1492,16 @@ AMBIGUOUS_DROP = "ambiguous_at_most_once"
 HTTP_REPORTED_ACTIONS = ("kill", "exit")
 HTTP_AMBIGUOUS_CLASS = "network_error"
 HTTP_CONNECT_CLASS = "connect_error"
+# A writer that polls for acknowledgment (`splunk_hec_out` under `ack: true`) resends a batch
+# whose ids weren't acknowledged within its `ack_timeout`, counted once per pending id, after
+# the listener answered every body of it: a listener restart loses its in-memory ack ledger, so
+# the ids it issued before poll unknown. Each timed-out id allows one batch, an upper bound,
+# since one batch can hold several pending ids and resends once. A poll is on its own route,
+# `HTTP_ACK_ROUTE`, and a poll that fails in transport sends no data, so it allows none.
+HTTP_ACK_TIMEOUT = ("logit.output.acks", {"result": "timeout"})
+HTTP_ACK_ROUTE = "ack"
+# Every HTTP sink's `concurrency:` when its config sets none.
+HTTP_DEFAULT_CONCURRENCY = 1
 
 
 def source_wire(source):
@@ -1682,10 +1705,11 @@ class Ledger:
                 symbols = HTTP_LISTENERS[kind]
                 one["batches"] = sut.counter_by_life("logit.component.batches.sent",
                                                      component=listener)
+                route = {} if symbols.route is None else {"route": symbols.route}
                 for cls in ("ok", "busy", "closed_consumer"):
                     one[f"requests_{cls}"] = (
                         sut.counter_by_life(symbols.requests, component=listener,
-                                            route=symbols.route, **{"class": cls})
+                                            **route, **{"class": cls})
                         if symbols.requests else {})
                 one["deferred"] = (sut.counter_by_life(symbols.deferred, component=listener)
                                    if symbols.deferred else {})
@@ -1883,7 +1907,17 @@ class Ledger:
                 batches = total("logit.component.batches.sent", [load])
                 input_batch[load] = sent / batches if batches else 0.0
             batch = sum(input_batch.values())
+            # On an HTTP wire, the batches each edge of a judged run may hold in W and not yet
+            # in G: every request in flight, the writers' `concurrency:` summed
+            # (`HTTP_DEFAULT_CONCURRENCY` when unset), since the listener counts a batch before
+            # the writer reads its answer, or under `ack: true` its acknowledgment.
+            in_flight = 1
+            if source_wire(source) == HTTP_WIRE:
+                text = self._sut_config_text(service) or ""
+                in_flight = sum(component_int(text, sink, "concurrency")
+                                or HTTP_DEFAULT_CONCURRENCY for sink in sinks)
             self.gen_stats[service] = {
+                "in_flight": in_flight,
                 "G": total(self.wires[source.get("sut_listener")].g, sinks),
                 "dropped_by": dropped_by,
                 "G_datagrams": total("logit.output.datagrams", sinks),
@@ -3025,8 +3059,9 @@ def _ambiguous_drops(led, source):
     generator sink's `ambiguous_at_most_once` batch drops, each a write that failed partway, and
     on an HTTP wire its attempts that ended in an ambiguous transport error
     (`HTTP_AMBIGUOUS_CLASS`), each a request the listener may have taken before the answer was
-    lost; a connect failure (`HTTP_CONNECT_CLASS`) sent nothing and isn't one. Empty on any
-    other wire."""
+    lost, and its pending requests whose acknowledgment wait timed out (`_ack_timeouts`); a
+    connect failure (`HTTP_CONNECT_CLASS`) sent nothing and isn't one. Empty on any other
+    wire."""
     wire = source_wire(source)
     if wire == "tcp":
         name, attrs = "logit.component.batches.dropped", {"reason": AMBIGUOUS_DROP}
@@ -3034,6 +3069,25 @@ def _ambiguous_drops(led, source):
         name, attrs = "logit.output.requests", {"class": HTTP_AMBIGUOUS_CLASS}
     else:
         return []
+    gen = led.gens[source.get("service")]
+    drops = [(ts, v) for sink in source_ids(source, "generator_sink")
+             for ts, v, _ in gen.counter_points(name, component=sink, **attrs)]
+    if wire == HTTP_WIRE:
+        polls = [(ts, -v) for sink in source_ids(source, "generator_sink")
+                 for ts, v, _ in gen.counter_points(name, component=sink, route=HTTP_ACK_ROUTE,
+                                                    **attrs)]
+        drops += polls + _ack_timeouts(led, source)
+    by_ts = {}
+    for ts, v in drops:
+        by_ts[ts] = by_ts.get(ts, 0) + v
+    return sorted((ts, v) for ts, v in by_ts.items() if v)
+
+
+def _ack_timeouts(led, source):
+    """`[(timestamp, count)]` of an HTTP source's generator sink's requests whose
+    acknowledgment wait timed out (`HTTP_ACK_TIMEOUT`), each a body the listener answered and
+    the writer resends whole."""
+    name, attrs = HTTP_ACK_TIMEOUT
     return sorted((ts, v) for sink in source_ids(source, "generator_sink")
                   for ts, v, _ in led.gens[source.get("service")].counter_points(
                       name, component=sink, **attrs))
@@ -3085,14 +3139,17 @@ def _wire_one(data, led, source, instances=None):
     sums = {"fault": 0.0, "judged": 0.0, "steady": 0.0, "end": 0.0}
     batch = stats["batch"]
     ambiguous = _ambiguous_drops(led, source)
+    acks = _ack_timeouts(led, source) if http else []
+    in_flight = stats.get("in_flight", 1)
     allowances = {}
     for index, (start, end, kind, _, _, _, _) in enumerate(runs):
         if kind == "judged":
             # A judged run's surplus has no pool to fall into, so every edge it has, a boundary
-            # with another judged run included, allows its one batch of interpolation error.
+            # with another judged run included, allows its one batch of interpolation error, or
+            # on an HTTP wire one per request in flight, each counted in W before G.
             sides = sum(1 for other in (index - 1, index + 1) if 0 <= other < len(runs))
             drops = sum(v for ts, v in ambiguous if start < ts <= end)
-            allowances[index] = (drops + sides) * batch
+            allowances[index] = (drops + sides * in_flight) * batch
     connects = (sorted((ts, v) for sink in source_ids(source, "generator_sink")
                        for ts, v, _ in led.gens[service].counter_points(
                            "logit.output.requests", component=sink,
@@ -3137,16 +3194,24 @@ def _wire_one(data, led, source, instances=None):
             sides = sum(1 for other in (index - 1, index + 1) if 0 <= other < len(runs))
             allowed = allowances[index]
             what = "transport-error attempt(s)" if http else "ambiguous drop(s)"
+            timed_out = sum(v for ts, v in acks if start < ts <= end)
+            if timed_out:
+                what = (f"transport-error attempt(s) or ack timeout(s) ({_n(timed_out)} ack "
+                        "timeout(s))")
             dials = sum(v for ts, v in connects if start < ts <= end)
             lines[-1] += (f", surplus allowed {_n(allowed)} ({_n(drops)} {what} + "
-                          f"{sides} edge(s), x one {_n(batch)}-line batch"
+                          f"{sides} edge(s)"
+                          + (f" x {in_flight} in flight" if in_flight > 1 else "")
+                          + f", x one {_n(batch)}-line batch"
                           + (f"; {_n(dials)} connect failure(s) allow none" if dials else "")
                           + ")")
             if -net > allowed:
                 took = "W − X" if http else "W + counted"
                 surplus.append(f"{span}: {took} exceeds G by {_n(round(-net))}, over "
                                f"the {_n(allowed)} its {_n(drops)} {what} and "
-                               f"{sides} edge(s) allow")
+                               f"{sides} edge(s)"
+                               + (f" x {in_flight} in flight" if in_flight > 1 else "")
+                               + " allow")
     if surplus:
         status = FAIL
         lines[:0] = surplus
@@ -3194,8 +3259,10 @@ def _wire_one(data, led, source, instances=None):
                   f"windows, {_n(round(sums['steady']))} steady, {_n(round(sums['end']))} at "
                   f"the end; loss judged {_n(round(steady_lost))}, each run at 0 or more, "
                   f"against limit {_n(round(allowed))}); the generator's requests: "
-                  f"{_n(sum(v for _, v in ambiguous))} transport-error attempt(s), "
-                  f"{_n(sum(v for _, v in connects))} connect failure(s), {retries}; "
+                  f"{_n(sum(v for _, v in ambiguous) - sum(v for _, v in acks))} "
+                  f"transport-error attempt(s), "
+                  + (f"{_n(sum(v for _, v in acks))} ack timeout(s), " if acks else "")
+                  + f"{_n(sum(v for _, v in connects))} connect failure(s), {retries}; "
                   f"its counted loss, not in G: {_n(stats['dropped_events'])} event(s) in "
                   f"{_n(stats['dropped_batches'])} batch(es)"
                   + (f" ({_reasons(stats['dropped_by'])})" if stats["dropped_by"] else ""))
@@ -3441,6 +3508,8 @@ def _http_intake(led, listener, life):
 
 def _route_text(symbols):
     """An `HttpListener`'s write-route requests, as text."""
+    if symbols.route is None:
+        return symbols.requests
     return f"{symbols.requests}{{route={symbols.route}}}"
 
 
@@ -4179,7 +4248,8 @@ def _end_to_end(data, led):
     the whole run against what the generators sent less every counted loss on the way (K, D, B,
     X, the hop sink's drops, X_B, and the path's counted discards; on a TCP or file wire F too;
     on an HTTP wire no X, which the client resends), plus one generator batch per ambiguous drop
-    on a TCP wire and per transport-error attempt on an HTTP wire, as `ledger.wire` allows, and
+    on a TCP wire and per transport-error attempt or ack timeout on an HTTP wire, as
+    `ledger.wire` allows, and
     on a file wire the replay band's upper edge. With a `fan_out`, each source's share is
     carried through its chain instead (`Ledger.through`). A kill on either side shifts lives but
     never adds increments, so V above that is a surplus whatever was killed; V below it is the

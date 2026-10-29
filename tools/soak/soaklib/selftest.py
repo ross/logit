@@ -103,11 +103,13 @@ generator netem judged on TCP but not on UDP, a SUT netem judged, a judged windo
 against its ambiguous drops, a partition judged or reported by its address, `recovery` and a
 killed life's band reading the frames, and a source naming `wire = "udp"` scoring as one
 naming none. On an HTTP wire it covers the generator sink's kind checked at load either way,
-the fault predicates and judgments, and runs into `influxdb_in` and `otlp_in`: G from the
+the fault predicates and judgments, `prometheus_in`'s wire keyed on its mode, and runs into
+`influxdb_in`, `otlp_in`, `splunk_hec_in`, `datadog_in`, and `prometheus_in`: G from the
 writer's acknowledged events, a stop judged and a kill reported, a judged window's surplus
-against its transport-error attempts and not its `5xx` answers, a `closed_consumer` refusal
-taken off W, `influxdb_in`'s request and deferral identities in `ledger.intake` each broken,
-the end-to-end bound in `ledger.summary`, and a listener kind the checks can't read.
+against its transport-error attempts and its ack timeouts and not its `5xx` answers or failed
+`/ack` polls, a `closed_consumer` refusal taken off W, each listener's request and deferral
+identities in `ledger.intake` broken, `prometheus_in`'s with no route tag, the end-to-end bound
+in `ledger.summary`, and a listener kind the checks can't read.
 
 For two SUT services, it covers a further SUT declared by its own `[configs]` key and the
 `[[ledger.hop]]` joining it to `logit` (the chain they make, their config variable, and each
@@ -6548,6 +6550,17 @@ def _tcp_rules(root):
 HTTP_SUT_CONFIGS = {
     "influxdb_in": "components:\n  in: { type: influxdb_in, bind: 0.0.0.0:8086 }\n",
     "otlp_in": "components:\n  in:\n    type: otlp_in\n    bind: 0.0.0.0:4318\n",
+    "splunk_hec_in": "components:\n  in: { type: splunk_hec_in, bind: 0.0.0.0:8088 }\n",
+    "datadog_in": "components:\n  in: { type: datadog_in, bind: 0.0.0.0:8080 }\n",
+    "prometheus_in": "components:\n  in:\n    type: prometheus_in\n    bind: 0.0.0.0:9090\n",
+}
+# Each kind's request counter on its write path, as `_http_run` writes it: the name and the tags
+# beside `class`.
+HTTP_REQUESTS = {
+    "influxdb_in": ("logit.input.requests", {"route": "write"}),
+    "splunk_hec_in": ("logit.input.requests", {"route": "event"}),
+    "datadog_in": ("logit.input.requests", {"route": "series_v2"}),
+    "prometheus_in": ("logit.input.writes", {}),
 }
 
 
@@ -6556,7 +6569,7 @@ def _http_run(tmp, name, kind="influxdb_in", sut_edit=None, gen_edit=None, stop_
     """`_ledger_run`'s two-life run directory with its one source on an HTTP wire into a `kind`
     listener `in`, whose config the run's `configs/` holds: W is the listener's
     `events.sent`, so no datagram is counted and life 0 reads nothing it doesn't send; under
-    `influxdb_in` each drain's 10 batches are 10 `ok` write requests; G is the generator sink's
+    a kind in `HTTP_REQUESTS` each drain's 10 batches are 10 `ok` write requests; G is the generator sink's
     `events.delivered`, its `events.received` beside it, and during the stop over `STOP` the
     sink has nothing acknowledged and, with `stop_dropped`, counts its overflow dropped; the stop
     is HTTP-affecting, as the driver records it. `sut_edit(record)` and `gen_edit(record)` may
@@ -6582,10 +6595,11 @@ def _http_run(tmp, name, kind="influxdb_in", sut_edit=None, gen_edit=None, stop_
             batches = metric["value"] // 100
             records.append(json.loads(_line(record["timestamp"], "logit.component.batches.sent",
                                             "sum", batches, component="in")))
-            if kind == "influxdb_in":
+            if kind in HTTP_REQUESTS:
+                name, tags = HTTP_REQUESTS[kind]
                 records.append(json.loads(_line(
-                    record["timestamp"], "logit.input.requests", "sum", batches, component="in",
-                    attrs={"route": "write", "class": "ok"})))
+                    record["timestamp"], name, "sum", batches, component="in",
+                    attrs={**tags, "class": "ok"})))
         for one in records:
             emit(out, one, sut_edit)
     (run_dir / "logs" / "logit.stdout").write_text("\n".join(out) + "\n")
@@ -6840,6 +6854,87 @@ def _http_ledger():
                f"three transport-error attempts cover 300 end to end, got "
                f"{covered['ledger.summary'].detail}")
 
+        # A timed-out acknowledgment wait resends a batch the listener answered: each timed-out
+        # id allows one batch, like a transport-error attempt, on the wire and end to end.
+        acked_late = results("http-surplus-ack-timeouts", steady_surplus=350,
+                             timeline_extra=late, gen_edit=_at_offset(
+                                 "logit.output.acks", 230, 2, "out", attrs={"result": "timeout"}))
+        expect(acked_late["ledger.wire"].status == checks.PASS
+               and "surplus allowed 400 (2 transport-error attempt(s) or ack timeout(s) (2 ack "
+               "timeout(s)) + 2 edge(s), x one 100-line batch)"
+               in "\n".join(acked_late["ledger.wire"].lines)
+               and "0 transport-error attempt(s), 2 ack timeout(s), 0 connect failure(s)"
+               in acked_late["ledger.wire"].detail,
+               f"two ack timeouts allow two batches, got {acked_late['ledger.wire']}")
+        acked_v = results("http-v-ack-timeouts", v1_short=-300, gen_edit=_at_offset(
+            "logit.output.acks", 230, 3, "out", attrs={"result": "timeout"}))
+        expect("V 54,300 <= G − counted + resent 54,300" in acked_v["ledger.summary"].detail,
+               f"three ack timeouts cover 300 end to end, got {acked_v['ledger.summary'].detail}")
+        # A poll of `/ack` that fails in transport sends no data and allows nothing.
+        polled = results("http-surplus-ack-polls", steady_surplus=350, timeline_extra=late,
+                         gen_edit=_at_offset("logit.output.requests", 230, 2, "out",
+                                             attrs={"route": "ack",
+                                                    "class": "network_error"}))
+        expect(polled["ledger.wire"].status == checks.FAIL
+               and "W − X exceeds G by 350, over the 200 its 0 transport-error attempt(s) and 2 "
+               "edge(s) allow" in polled["ledger.wire"].detail,
+               f"a failed ack poll allows no surplus, got {polled['ledger.wire']}")
+
+        # Each request in flight is a batch the listener counted before the writer read its
+        # answer, so a judged edge allows one batch per request the writer's `concurrency:`
+        # keeps in flight.
+        concurrent_dir = _http_run(tmp, "http-surplus-in-flight", steady_surplus=350,
+                                   timeline_extra=late)
+        (concurrent_dir / "configs" / "generator.yaml").write_text(
+            "components:\n  out:\n    type: splunk_hec_out\n    concurrency: 2\n")
+        resolved = json.loads((concurrent_dir / "scenario.resolved.json").read_text())
+        resolved["configs"]["generator"] = "generator.yaml"
+        (concurrent_dir / "scenario.resolved.json").write_text(json.dumps(resolved))
+        concurrent = {r.id: r for r in checks.run_all(concurrent_dir)}
+        expect(concurrent["ledger.wire"].status == checks.PASS
+               and "surplus allowed 400 (0 transport-error attempt(s) + 2 edge(s) x 2 in "
+               "flight, x one 100-line batch)" in "\n".join(concurrent["ledger.wire"].lines),
+               f"two requests in flight allow two batches an edge, got "
+               f"{concurrent['ledger.wire']}")
+
+        # `splunk_hec_in` and `datadog_in` hold their write route's requests to batches as
+        # `influxdb_in` does, each on its own route; `prometheus_in`'s receiver counts
+        # `logit.input.writes{class}` with no route tag, and never answers busy.
+        for kind, route_text in (
+                ("splunk_hec_in", "logit.input.requests{route=event}"),
+                ("datadog_in", "logit.input.requests{route=series_v2}"),
+                ("prometheus_in", "logit.input.writes")):
+            got = results(f"http-{kind}", kind=kind)
+            intake = got["ledger.intake"].detail
+            expect(got["ledger.wire"].status == checks.PASS
+                   and got["ledger.intake"].status == checks.PASS
+                   and f"final life 1: {route_text} ok 340 + closed_consumer 0 == batches.sent "
+                   "340" in intake
+                   and ("busy" in intake) == (kind != "prometheus_in"),
+                   f"{kind}'s intake judges its request identities, got {got['ledger.intake']}")
+            name, tags = HTTP_REQUESTS[kind]
+            unanswered = results(f"http-{kind}-unanswered", kind=kind, sut_edit=_chain(
+                _at_offset("logit.component.events.sent", 250, 300, "in", add=True),
+                _at_offset("logit.component.batches.sent", 250, 3, "in", add=True),
+                _at_offset("logit.component.events.dropped", 250, 300, "in",
+                           attrs={"reason": "closed_consumer"})))
+            expect(unanswered["ledger.intake"].status == checks.FAIL
+                   and f"{route_text} ok 340 + closed_consumer 0 != batches.sent 343"
+                   in unanswered["ledger.intake"].detail,
+                   f"{kind}: a batch sent with no request counted FAILs, got "
+                   f"{unanswered['ledger.intake']}")
+            refused = results(f"http-{kind}-refused", kind=kind, sut_edit=_chain(
+                _at_offset("logit.component.events.sent", 250, 300, "in", add=True),
+                _at_offset("logit.component.batches.sent", 250, 3, "in", add=True),
+                _at_offset("logit.component.events.dropped", 250, 300, "in",
+                           attrs={"reason": "closed_consumer"}),
+                _at_offset(name, 250, 3, "in", attrs={**tags, "class": "closed_consumer"})))
+            expect(refused["ledger.intake"].status == checks.PASS
+                   and f"{route_text} ok 340 + closed_consumer 3 == batches.sent 343"
+                   in refused["ledger.intake"].detail,
+                   f"{kind}: a closed_consumer request is one batch sent, got "
+                   f"{refused['ledger.intake']}")
+
         # `otlp_in` counts no requests: its intake has no identity of its own, and its wire
         # still FAILs uncounted loss.
         otlp = results("http-otlp", kind="otlp_in")
@@ -6907,7 +7002,8 @@ def _http_rules(root):
            f"influxdb_in with no wire named is refused, got {problems}")
     problems = with_configs(influx_in, statsd_out, "http", "influx", "statsd")
     expect(problems == ["ledger.source 1: an http wire's `generator_sink` must be one of "
-                        "influxdb_out, otlp_out, and 'statsd' is a statsd_out"],
+                        "influxdb_out, otlp_out, splunk_hec_out, datadog_out, prometheus_out, "
+                        "and 'statsd' is a statsd_out"],
            f"an http wire's writer must be an HTTP sink, got {problems}")
     problems = with_configs(statsd_in, influx_out, None, "statsd", "influx")
     expect(problems == ["ledger.source 1: `generator_sink` 'influx' is an influxdb_out, which "
@@ -6917,6 +7013,37 @@ def _http_rules(root):
     expect(any("`wire` is http, but `sut_listener` 'statsd' is a statsd_in with no transport:, "
                "a udp listener" in p for p in problems),
            f"an http source on a UDP listener is refused, got {problems}")
+
+    # Three more listeners, each with its writer. `prometheus_in` has no `transport:`: its mode
+    # gives its wire, `bind:` the remote-write receiver, an http listener, and
+    # `scrape_targets:` a scrape, which no wire follows yet.
+    for listener, writer in (
+            ("splunk: { type: splunk_hec_in, bind: 0.0.0.0:8088 }",
+             "splunk: { type: splunk_hec_out, endpoint: http://logit:8088/services/collector }"),
+            ("splunk: { type: datadog_in, bind: 0.0.0.0:8080 }",
+             "splunk: { type: datadog_out, api_key: k }"),
+            ("splunk:\n    type: prometheus_in\n    bind_auth: {}\n    bind: 0.0.0.0:9090",
+             "splunk: { type: prometheus_out, endpoint: http://logit:9090/api/v1/write }")):
+        loaded = with_configs(f"components:\n  {listener}\n", f"components:\n  {writer}\n",
+                              "http", "splunk", "splunk")
+        expect(loaded == [], f"an http source from {writer} into {listener} loads, got {loaded}")
+    scrape = ("components:\n  prom:\n    type: prometheus_in\n    bind_tls: {}\n"
+              "    scrape_targets: [{ url: http://generator:9464/metrics }]\n")
+    prom_out = "components:\n  prom: { type: prometheus_out, endpoint: http://x/api/v1/write }\n"
+    problems = with_configs(scrape, prom_out, "http", "prom", "prom")
+    expect(problems == ["ledger.source 1: `sut_listener` 'prom' is a prometheus_in on "
+                        "scrape_targets:, which the ledger has no wire for"],
+           f"prometheus_in scraping has no wire yet, got {problems}")
+    problems = with_configs("components:\n  prom: { type: prometheus_in, bind: 0.0.0.0:9090 }\n",
+                            prom_out, None, "prom", "prom")
+    expect(any("`wire` is udp, but `sut_listener` 'prom' is a prometheus_in on bind:, an http "
+               "listener" in p for p in problems),
+           f"prometheus_in on bind: with no wire named is refused, got {problems}")
+    problems = with_configs("components:\n  prom: { type: prometheus_in, bind_tls: {} }\n",
+                            prom_out, "http", "prom", "prom")
+    expect(problems == ["ledger.source 1: `sut_listener` 'prom' is a prometheus_in with no "
+                        "mode's key set, which the ledger has no wire for"],
+           f"prometheus_in with neither mode's key has no wire, got {problems}")
 
     roles = scenario.BASE_ROLES
     for action, on, http in (
@@ -6948,6 +7075,14 @@ def _http_rules(root):
                "generator-dials-time-out", "sink-never-drops"],
            f"http-ingress names an HTTP source, its seven faults, and its expects, got "
            f"{http.sources}")
+    for name, transforms in (("splunk-hec-ingress", ["count"]), ("datadog-ingress", None),
+                             ("rw-ingress", ["count"])):
+        one = scenario.load(root / "scenarios" / name / "scenario.toml")
+        expect(one.sources[0].get("wire") == "http"
+               and one.sources[0].get("sut_transforms") == transforms
+               and [step.action for step in one.steps] == [
+                   "netem", "netem", "netem", "stop", "stop", "restart", "kill"],
+               f"{name} names an HTTP source and its seven faults, got {one.sources}")
 
 
 def _as_file_wire(run_dir, w_minus_g=0, counted=True, line_bytes=95, files_open=None,
