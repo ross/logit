@@ -27,6 +27,8 @@ script/soak run kafka-broker-restart             # a Kafka target; see "Kafka ta
 script/soak run standin-remote-write             # a stand-in target; see "Stand-in targets"
 script/soak run standin-datadog                  # a Datadog-shaped stand-in, no key needed
 script/soak run standin-influxdb                 # an InfluxDB-shaped stand-in, no token needed
+script/soak run standin-otlp                     # an OTLP/HTTP stand-in for otlp_out
+script/soak run standin-splunk                   # a HEC stand-in for splunk_hec_out, with acks
 script/soak check perf/results/soak/<stamp>      # re-score a run offline
 ```
 
@@ -249,7 +251,7 @@ diagnostic inside the stop, `clean` attempts and `retrying` inside both endpoint
 `ambiguous` rate to 20 an hour, both derived in its `scenario.toml`. No attempt is `refused`:
 the sink never sends a token it knows has expired.
 
-Nine scenarios run a sink against a scripted stand-in in place of VictoriaMetrics (see
+Eleven scenarios run a sink against a scripted stand-in in place of VictoriaMetrics (see
 [Stand-in targets](#stand-in-targets)):
 
 | Scenario | Length | What it drives |
@@ -262,6 +264,8 @@ Nine scenarios run a sink against a scripted stand-in in place of VictoriaMetric
 | `standin-influxdb` | 35 minutes 40 seconds | `influxdb_out` (line protocol, delta) with `bucket:` and `org:` configured, through every row of its response-class table: nineteen 20 s steps, 105 s apart, from a `204` and each `400` body, through both `401` bodies, `403`, a `404` naming the bucket, the org, an orgID, and neither, `413`, `422`, `429`, `500`, a `503` after storing (its resend a rewrite), `408`, and `302`, to a connection reset and a stop of the stand-in. Every `403` and `404` holds, since every value is the operator's. The request timeout isn't cued: the sink's 10 s timeout isn't configurable |
 | `standin-influxdb-carried` | 35 minutes 40 seconds | the same steps with the bucket, org, and orgID carried on each batch by a `set`, as `influxdb_in` would carry them, and none configured: every `403` and `404` drops the batch |
 | `standin-influxdb-mixed` | 35 minutes 40 seconds | the same steps with the bucket carried and the org from `default_org:`: a `403`, a `404` naming the bucket, and a `404` naming neither drop the batch, and a `404` naming the org or an orgID holds |
+| `standin-otlp` | 25 minutes 10 seconds | `otlp_out` (OTLP/HTTP metrics, gzip, cumulative) through the 10 rows of its response-class table that are neither gRPC nor dial rows: thirteen 20 s steps, 105 s apart, from a `200` whose `partial_success` rejects two data points (counted, not retried), through `429`, a `503` after storing (its resend a rewrite), `408`, `400`, `401` (for the row it shares with `403`, `404`, and `501`), `405`, `407`, `500`, `422`, and `302`, to a connection reset and a stop of the stand-in, the connect-refused row. Not cued: a DNS failure, a failed TLS handshake, a dial past `connect_timeout:`, the fixed 10 s request timeout, and the four gRPC rows. With one signal it makes no claim about settlement per signal |
+| `standin-splunk` | 26 minutes 55 seconds | `splunk_hec_out` (gzip, `ack: true` with a 5 s `ack_timeout`, 4 KiB bodies, cumulative) through the rows of its response-class table a stand-in can produce: fourteen 20 s steps, 105 s apart, from a `400` code 6 naming one object of one body (that object dropped, counted `invalid_event`, and the rest resent), through `401` code 3, `403` code 4, `400` code 10, `429` code 26 and `503` code 9 before any body of the batch was accepted (`clean`), a `503` code 9 on a batch's second body after its first was accepted (`ambiguous`), `500` code 8, `400` code 5, `404`, and `302`, to a connection reset, every ack withheld past `ack_timeout` (`ambiguous`), and a stop of the stand-in. Not cued: Splunk Cloud's code 6 at object 0 of a body over 5 MiB, a connect failure after a body was accepted, and the two `connect_timeout:` rows |
 | `delta-datadog` | 22 minutes 30 seconds | a generator `aggregate` (cumulative) sending 20 running totals over OTLP/HTTP into `otlp_in`, through `cumulative_to_delta` (`initial_value: auto`, `max_staleness: 60s`) into `datadog_out`, judged in value by `ledger.value` (see [A delta transform's value](#a-delta-transforms-value)): a `202` naming two series dropped and a `400`, both losing value the record holds; a `401`, a `503` after storing, a reset, and a stand-in stop, losing none; 20% loss on the generator's requests and a generator restart, judged exact; and an SUT restart, a 100 s generator pause past `max_staleness`, and an SUT kill, each skipping every series' next point, reported. Its expectations count 20 resets, skips, or evictions for each of the last four, and no skip under netem |
 
 Two scenarios run a second `logit` under test, `collector`, at the far end of the native hop
@@ -640,7 +644,7 @@ requires one completes the handshake and logs no `connection_error`.
 | `partition` | `docker network disconnect` from every network, recording the container's address on each (`ips`) | `docker network connect`, passing back each alias recorded before the disconnect, and recording the address after it (`ips_after`), which can differ |
 | `mark` | nothing: it marks a window for an event the SUT's own config causes, such as a stalled script. An optional `ready` names a readiness word the SUT must report inside it | nothing |
 | `exit` | nothing: on a SUT service only, it names an exit the SUT makes on its own inside the window, with the `code` it leaves and the `key` of the ERROR line that explains it | `docker start` if the container has exited |
-| `respond` | on a stand-in only: POSTs the step's cue to its control port, so it answers `status` (with an optional `body`) or `answer = "reset"`, storing the write when `apply` says to or, by default, when the status is `2xx`. With `count = N` the cue answers the next N writes and is then spent, and the stand-in answers its default again, so with several requests in flight a cue lands on one of them. Under the `datadog` shape a `2xx` can carry `series_errors = N`, a body naming the request's first N series dropped. `headers`, a table of header names to strings, replaces the response headers the stand-in adds itself | an empty cue, which restores the default answer |
+| `respond` | on a stand-in only: POSTs the step's cue to its control port, so it answers `status` (with an optional `body`) or `answer = "reset"`, storing the write when `apply` says to or, by default, when the status is `2xx`. With `count = N` the cue answers the next N writes and is then spent, and the stand-in answers its default again, so with several requests in flight a cue lands on one of them. With `after = K` the next K writes get the default answer first, so a cue lands on a batch's second body. Under the `datadog` shape a `2xx` can carry `series_errors = N`, a body naming the request's first N series dropped; under the `otlp` shape a `2xx` can carry `partial_success = N`, a body rejecting the request's first N data points; under the `splunk` shape a `400` can carry `invalid_event = N`, HEC's code 6 naming object N, and a `2xx` `withhold_acks = true`, which answers every `/ack` poll `false`. `headers`, a table of header names to strings, replaces the response headers the stand-in adds itself | an empty cue, which restores the default answer |
 | `signal` | `docker kill -s HUP`, on a service that runs `logit`, with `signal = "HUP"`, the one signal it takes: the process reopens its file targets and reloads its TLS material | none |
 | `rename` | on the host, moves `path` to `to` inside `<run>/shared`, both bare names, refusing a `to` that exists. `path` is a `stdio_out` target in `/shared` in the config of the service the step is `on`, and a `signal` step on that service must start inside the rename's `for` | none |
 | `rotate` | issues `cert`'s next generation into `<run>/tls`, valid `days`, with a mismatched key under `broken = true`, and repoints its `live` link; records the new serial and `notAfter`. See [TLS certificates](#tls-certificates) | none |
@@ -653,9 +657,12 @@ can lose data, so every row judges straight through it, and only `[[expect]]`, `
 or `probe` may start inside a `rename` or `rotate` on its own service, and no other step may
 overlap one of these on its service. None of these seven can go in a `[random]` schedule. A `respond` or a `stop` of
 a stand-in may name the `class` the sink must read its answers as (`clean`, `ambiguous`,
-`rejected`, or `refused`), which `ledger.standin` judges. Under the `datadog` and `influxdb`
-shapes every `respond` other than a `2xx` must name one, because its class is the only statement
-of what the sink should do with the answer, and a `2xx` takes none.
+`rejected`, or `refused`), which `ledger.standin` judges. Under the `datadog`, `influxdb`,
+`otlp`, and `splunk` shapes every `respond` other than a `2xx` must name one, because its class
+is the only statement of what the sink should do with the answer, and a `2xx` takes none. Two
+`splunk` answers take the opposite rule: an `invalid_event` takes no class, because the sink
+drops the one object and sends the rest, and a `withhold_acks` needs `class = "ambiguous"`,
+because the sink reads an ack it never gets as `Ambiguous` at its `ack_timeout`.
 
 ```toml
 [[step]]
@@ -817,7 +824,8 @@ response-class table distinguishes runs under load, on cue:
 ```toml
 [target]
 kind = "standin"
-# shape = "datadog"        # or "influxdb": the destination it plays; "remote_write" by default
+# shape = "datadog"        # or "influxdb", "otlp", or "splunk": the destination it plays;
+                           # "remote_write" by default
 
 [[ledger.sink]]
 id = "remote_write"        # the sink; no backend or vm_selector
@@ -836,8 +844,14 @@ What changes for a stand-in target:
 
 - The stack runs `standin` in place of `victoria-metrics`. The SUT writes to `standin:8080`.
   With no cue, the stand-in answers its shape's default: `200` on `/api/v1/write` for
-  `remote_write`, `202` on `/api/v2/series` for `datadog`, and `204` with no body on
-  `/api/v2/write` for `influxdb`. It compares the path without its query string, which it
+  `remote_write`, `202` on `/api/v2/series` for `datadog`, `204` with no body on
+  `/api/v2/write` for `influxdb`, `200` with an empty `ExportMetricsServiceResponse` on
+  `/v1/metrics` for `otlp`, and `200` on `/services/collector/event` for `splunk`, with HEC's
+  success body and an `ackId` minted per `X-Splunk-Request-Channel` from 0. Under `splunk` it
+  also answers `/services/collector/ack` polls, each id `true` once minted on the poll's channel
+  unless a `withhold_acks` cue is in force; a poll is no write and spends no `count`. A stand-in
+  that restarts mints from 0 again and answers `false` for an id it hasn't minted since, so a
+  batch polling across a `stop` waits out its `ack_timeout`. It compares the path without its query string, which it
   records apart (`query`). It answers `404` on any other path, and whatever the cue in force
   says otherwise. The driver cues it on its control port,
   published on loopback. A fault may name `standin` (`netem`, `pause`, `stop`, `restart`,
@@ -847,8 +861,9 @@ What changes for a stand-in target:
   the host with Python's standard library, which has no zstd before 3.14. So a `remote_write`
   sink must send `compression: snappy`, under either `version:`, and `datadog_out` gzip (its
   default) or `none`. Point `datadog_out` at the stand-in with `endpoints: { api:
-  http://standin:8080 }`, and `influxdb_out` with `url: http://standin:8080`; it sends no
-  compression.
+  http://standin:8080 }`, `influxdb_out` with `url: http://standin:8080` (it sends no
+  compression), `otlp_out` with `endpoint: http://standin:8080` over HTTP (gzip or none), and
+  `splunk_hec_out` with `endpoint: http://standin:8080/services/collector` (gzip or none).
 - The stand-in closes a keep-alive connection idle for 5 s. A sink that writes on a pooled
   connection as that close reaches it reads a reset, an `Ambiguous` answer no step cued, and
   netem delay on the SUT's egress widens that race to the delay. A scenario that delays the
@@ -881,6 +896,14 @@ What changes for a stand-in target:
   `ledger.standin`. To carry a bucket or org as `influxdb_in` would, stamp the
   `_logit.influxdb.bucket`, `_logit.influxdb.org`, and `_logit.influxdb.org_id` resource
   attributes with a `set`. `ledger.sent` SKIPs.
+- Under `otlp` and `splunk`, the SUT's `aggregate` runs `temporality: cumulative`, the remedy
+  both sinks name for a resent `Sum`, and V is `remote_write`'s: one sample per
+  `(label set, timestamp)`, a later write replacing an earlier one. An OTLP data point is a
+  sample of `{__name__: metric, resource, attributes}`, the last two the hex of their encoded
+  `KeyValue`s; a HEC object's `metric_name:<n>` field is a sample of `{__name__: n, host, index,
+  source, sourcetype, ...dimensions}`. A `partial_success` answer stores every point of its
+  request but the first N, and an `invalid_event` answer stores the objects before object N, as
+  Splunk indexes them. `ledger.sent` SKIPs.
 - Under every shape, `ledger.egress` and `ledger.summary` judge V as an export, and so does
   `ledger.windows` under `[ledger] vm_every_window`.
 - `ledger.standin` judges the record against the sink: every body decodes; every sample of a write
@@ -903,7 +926,13 @@ What changes for a stand-in target:
   `influxdb`, also: per SUT life no point of a request answered under a step classed `rejected`
   is stored, and the egress gap equals those points' sum; the writes name one
   `(org, orgID, bucket)`, which the row reports; and a rewrite is reported, and FAILs under
-  `at_most_once` or after a `2xx` in the same life, as a duplicate does under `datadog`.
+  `at_most_once` or after a `2xx` in the same life, as a duplicate does under `datadog`. Under
+  `otlp`, also: per SUT life the sink's `records.dropped{reason="rejected"}` equals the data points
+  the `partial_success` answers rejected plus the points of the requests answered under a step
+  classed `rejected`. Under `splunk`, also: per SUT life the sink's
+  `records.dropped{reason="invalid_event"}` equals the records of the objects the
+  `invalid_event` answers named, every default `2xx` carried an `ackId`, and the row reports the
+  polls' answers.
 - A batch dropped `rejected` inside a `respond` step with `class = "rejected"`, up to one
   aggregate interval plus `recovery_bound` after it, counts its gap without FAILing
   `ledger.egress` or `ledger.summary`. Outside every such step it FAILs, as on any target.
@@ -1194,10 +1223,10 @@ vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'    # local only: the se
 | `ledger.summary` | the final life's uncounted loss, (W − D − E − B) + (E − A) + (A − Ab) + (Ab − V), isn't 0, or any one sink's Ab − V isn't, with a script's hop in place of E − A, E − ΣT_disc − A with `sut_transforms` (with a `fan_out`, `ledger.edge`'s chain terms summed, and the end-to-end bound's G carried through each chain), either path's discards shown as counted, and one Ab − V term per sink under `copy`; a counted egress term is shown and not judged, unless a `rejected` or `disk_corrupt` drop is in its group's credit, which FAILs the row; on an external target the Ab − V term SKIPs. Across a native hop E − A becomes E − S_hop in `logit`'s final life and E_B − A in `collector`'s, and the row FAILs a sink group whose V over the run exceeds G less every counted loss; so it does from a file source, plus its replay band, and from an HTTP source, plus one generator batch per transport-error attempt and with the listener's X, which the client resends, not counted. Under `split = "target"` the terms are W − D − E − B, every `ledger.edge` term, the router's balance among them, and per sink A − Ab and Ab − V, each judged on its own, so two terms of opposite sign can't net to 0; the router's term pools its targets, which `ledger.edge`'s bounds cover only above R_in − R_disc |
 | `ledger.value` | under `[ledger] sut_delta` only, else SKIP: the generator's increments less the stand-in's stored deltas and the deltas the record shows a cued step lost (I − V − U) is below 0, or isn't 0 with no reported window and no drop the record can't see, or exceeds the band the reported windows give: the increments inside them plus the drops the record can't see times the largest stored delta. See [A delta transform's value](#a-delta-transforms-value) |
 | `ledger.sent` | an external, Kafka, or `datadog` stand-in target only, else SKIP: a batch a sink received didn't end in an accepted response; a clean external run's detail starts with `SENT`. See [External targets](#external-targets) |
-| `ledger.standin` | a stand-in target only, else SKIP: the record has a line that isn't JSON or a body that doesn't decode, a sample answered `2xx` wasn't stored, a resend stored a different value, its requests by status class differ from the sink's in a SUT life, an answer other than the default falls outside its `respond` step, a step with a `count` answered another number of writes under its cue, or a step's `class` doesn't show at the sink; under the `datadog` shape also a `records.dropped` count the record doesn't explain, or a duplicate under `at_most_once` or after a `2xx`; under the `remote_write` shape also a short `Samples-Written` count the sink's `samples.dropped{reason="not_written"}` doesn't match; under the `influxdb` shape also a stored point of a rejected request, an egress gap other than the rejected requests' points, writes to more than one org and bucket, or a rewrite under `at_most_once` or after a `2xx`. See [Stand-in targets](#stand-in-targets) |
+| `ledger.standin` | a stand-in target only, else SKIP: the record has a line that isn't JSON or a body that doesn't decode, a sample answered `2xx` wasn't stored, a resend stored a different value, its requests by status class differ from the sink's in a SUT life, an answer other than the default falls outside its `respond` step, a step with a `count` answered another number of writes under its cue, or a step's `class` doesn't show at the sink; under the `datadog` shape also a `records.dropped` count the record doesn't explain, or a duplicate under `at_most_once` or after a `2xx`; under the `remote_write` shape also a short `Samples-Written` count the sink's `samples.dropped{reason="not_written"}` doesn't match; under the `otlp` shape also a `records.dropped{reason="rejected"}` count other than the points the partial successes and rejected requests carried; under the `splunk` shape also a `records.dropped{reason="invalid_event"}` count other than the named objects' records, or a default `2xx` with no `ackId`; under the `influxdb` shape also a stored point of a rejected request, an egress gap other than the rejected requests' points, writes to more than one org and bucket, or a rewrite under `at_most_once` or after a `2xx`. See [Stand-in targets](#stand-in-targets) |
 | `ledger.topic` | a Kafka target only, else SKIP: the topic wasn't read back; its distinct records number fewer than the sink saw accepted, or more with no dropped attempt to explain them (`WARN` with one, and `WARN` either way across a killed life); or a record is stored twice in a SUT life with no epoch bump (`WARN` after one). See [Kafka targets](#kafka-targets) |
 | `identity.sink` | at the final life's last drain before its final one, a sink's batches received, plus those a disk spool replayed at open and the one it counts dropped with a torn tail (`batches.dropped{reason="disk_torn"}`, a batch an earlier life received), differ from delivered + dropped + queued by more than one batch in flight |
-| `drops` | the SUT counts a `logit.*.dropped` no other row judges with a `rejected` or `disk_corrupt` reason; any other reason `WARN`s. The ledger's own terms (every `batches.dropped`, a node's `events.dropped` beside a batch drop of the same reason, `bytes.dropped`, a listener's D, K, X, and B, and the script's `script_error`) and, on an external, Kafka, or `datadog` stand-in target, a sink's `records.dropped` and `metrics.dropped` stay with the rows that balance them, and so does a TCP listener's F, which `ledger.wire` judges, so each drop is counted once. On an external target, where `ledger.egress` SKIPs, a `rejected` or `disk_corrupt` batch drop at a sink is `ledger.sent`'s FAIL, and one at any other node stays in this row |
+| `drops` | the SUT counts a `logit.*.dropped` no other row judges with a `rejected` or `disk_corrupt` reason; any other reason `WARN`s. The ledger's own terms (every `batches.dropped`, a node's `events.dropped` beside a batch drop of the same reason, `bytes.dropped`, a listener's D, K, X, and B, and the script's `script_error`) and, on an external, Kafka, or `datadog` stand-in target, a sink's `records.dropped` and `metrics.dropped`, and on a stand-in target the sink drops `ledger.standin` holds to the answers (`samples.dropped{reason="not_written"}` under `remote_write`, `records.dropped{reason="rejected"}` under `otlp`, and `records.dropped{reason="invalid_event"}` under `splunk`), stay with the rows that balance them, and so does a TCP listener's F, which `ledger.wire` judges, so each drop is counted once. On an external target, where `ledger.egress` SKIPs, a `rejected` or `disk_corrupt` batch drop at a sink is `ledger.sent`'s FAIL, and one at any other node stays in this row |
 | `recovery` | within `recovery_bound` of a fault's end, for any sink, no drain interval clear of other faults shows that sink not retrying, its buffer under 5% full or holding at most one batch, every UDP listener's receive queue under 5% full, and the listeners' summed ingest at 95% of the generators' summed warmup rate (on an HTTP wire, their writers' events received, which an `aggregate` ahead of the writer sets); a generator `rate_behind` diagnostic turns a rate shortfall into a `WARN`, and so does a run where no fault had an eligible interval |
 | `file.reopen.<step>` | one row per `rename` step, else one `file.reopen` row that SKIPs: the rename or the SIGHUP inside it didn't apply; the renamed file is missing or has a line stamped more than 2 s after the signal's apply finished; the new file, the next rename's `to` or `path` after the last, is missing or has a line stamped more than 2 s before the signal started; or the lines in every file of the path's renames differ from the target's `events.delivered` over the service's lives, which a `kill` or an `exit` of it leaves reported, not judged. An empty new file `WARN`s. The plan's [6. The checks](../../docs/plans/soak-harness.md#6-the-checks-w1a-w1b) has the bounds |
 | `tls.served.<step>` | one row per `probe` step, else one `tls.served` row that SKIPs: the probe didn't apply; the served serial or `notAfter` isn't the generation in force, the latest rotation of the certificate before the probe that wasn't `broken`, else the first issue; the served chain didn't verify against the run's CA; or the run recorded no first issue |

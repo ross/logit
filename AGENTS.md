@@ -57,9 +57,10 @@ exists or a contract other `logit` processes depend on:
   holds the queue and retries with no budget and no exit, so reading a destination fault as
   `Rejected` loses data and reading a bad batch as `Refused` wedges the sink. A sink's own
   transport timeout is the only bound on an attempt, so every write and acknowledgment wait a sink
-  makes must have one. `prometheus_out`'s, `datadog_out`'s, and `influxdb_out`'s tables are also
-  restated as cued steps in the `standin-*` soak scenarios under `tools/soak/scenarios/`, and a
-  change to any of them updates those scenarios' steps in the same PR.
+  makes must have one. `prometheus_out`'s, `datadog_out`'s, `influxdb_out`'s, `otlp_out`'s, and
+  `splunk_hec_out`'s tables are also restated as cued steps in the `standin-*` soak scenarios
+  under `tools/soak/scenarios/`, and a change to any of them updates those scenarios' steps in
+  the same PR.
 - **A sink counts encode-side outcomes only through its gated handles.** `write_loop` calls
   `Output::send` once per attempt and every sink re-encodes on each, so a degraded, omitted, or
   dropped record counted from an encode is counted again on every retry and every bisection
@@ -939,6 +940,13 @@ the operator-facing account of all of this.
   stored deltas' sum, plus the values the record shows a cued step lost, to the generator's
   increments, exact unless the transform skipped a first point (an SUT start or restart, an
   idle eviction), where the gap is reported within the increments those windows hold.
+  `standin-otlp` points `otlp_out` at an OTLP/HTTP stand-in on `/v1/metrics`
+  (`[target] shape = "otlp"`), cueing the table's rows that are neither gRPC nor dial rows and a
+  `partial_success` whose rejected points `ledger.standin` holds to the sink's
+  `records.dropped{reason="rejected"}`. `standin-splunk` points `splunk_hec_out` at a HEC
+  stand-in (`[target] shape = "splunk"`) that mints an `ackId` per channel and answers `/ack`
+  polls, cueing a code 6 naming one object, a busy `503` before and after a batch's first body
+  was accepted, and acks withheld past `ack_timeout`, among the rows a stand-in can produce.
   `standin-concurrency` points `prometheus_out` at `concurrency: 8` and `at_most_once` at the
   remote-write stand-in with several batches in flight, and its `respond` steps' `count = 1`
   lands a `401`, a `400`, and a reset on one write each: a held head, a batch dropped alone,

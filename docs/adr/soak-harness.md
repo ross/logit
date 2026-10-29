@@ -643,3 +643,31 @@ of the deltas a Datadog-shaped stand-in stored, V, to the increments the generat
 The node replaces `sut_aggregate` rather than sitting beside one, since an `aggregate` after it
 would resum the deltas the row judges. [`docs/plans/soak-harness.md`](../plans/soak-harness.md),
 "10. Next scenarios", item 20, has the rules.
+
+## Amendment: OTLP and HEC stand-ins overwrite under cumulative temporality, and name loss by position (2026-10-29)
+
+A stand-in target can play OTLP/HTTP's metrics route (`[target] shape = "otlp"`) and Splunk's
+HTTP Event Collector (`[target] shape = "splunk"`). Both run the SUT's `aggregate` under
+`temporality: cumulative`, the remedy both sinks' module docs name for a resent `Sum`, and take
+`remote_write`'s V: one sample per `(label set, timestamp)`, a later write replacing an earlier
+one, so a resend is a rewrite and a rejected window is overwritten by the next. Delta temporality
+with the Datadog shape's duplicate counting was the alternative; neither destination documents
+how it stores a resent point, so counting copies would judge a semantic the harness can't
+verify.
+
+Two answers lose part of a request, and the stand-in decodes nothing, so the record names the
+lost part by position, as a `series_errors` answer does under `datadog`. A `partial_success`
+of N rejects the request's first N data points, and `ledger.standin` holds N to the sink's
+`records.dropped{reason="rejected"}`, beside the points of each request answered under a step
+classed `rejected`, which `otlp_out` counts the same way. An `invalid_event` of N is HEC's code
+6 naming object N: the objects before it count as stored, as Splunk indexes them, and that
+object's records are held to `records.dropped{reason="invalid_event"}`. An `invalid_event`
+step takes no `class`, since the sink resends the rest and settles the batch.
+
+The HEC shape has a second path. Each default `/event` answer mints an `ackId` per channel,
+without which `splunk_hec_out` reads the token as not acknowledging, and `/ack` polls are
+answered from the ids minted; a `withhold_acks` cue answers every poll `false`, which the sink
+must read as `ambiguous` at its `ack_timeout`. A poll is no write: it spends no `count` and
+holds no samples. `after = K` lets K writes through before a cue answers, so a busy `503` lands
+on a batch's second body, after its first was accepted.
+[`docs/plans/soak-harness.md`](../plans/soak-harness.md), "Stand-in targets", has the rules.
