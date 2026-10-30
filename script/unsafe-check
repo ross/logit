@@ -140,7 +140,7 @@ FUZZ_TARGETS=(
     "prom_text|65536|16|-fork=1 -ignore_ooms=0"
     "proxy_header|65552|16|"
     "forwarded|4096|16|"
-    "cri|65537|16|"
+    "cri|65536|16|"
     "http_auth|4096|16|"
     "stream_framing|65546|16|"
     "statsd|65536|56|-fork=1 -ignore_ooms=0"

@@ -14,7 +14,9 @@
 //!
 //! - **Timestamp.** The kubelet parses RFC 3339 with 0 to 9 fraction digits and `Z` or `±hh:mm`
 //!   (`RFC3339NanoLenient`). [`parse`] hands the field to
-//!   [`logit_core::time::parse_rfc3339_to_nanos`], which accepts the same set. A timestamp that
+//!   [`logit_core::time::parse_rfc3339_to_nanos`], which accepts every form either runtime
+//!   writes. Go's parser is wider (more than nine fraction digits, a `,` separator, an offset
+//!   hour of 24 or a minute of 60); logit reads those as a timestamp error. A timestamp that
 //!   doesn't parse doesn't reject the line: [`CriLine::timestamp_nanos`] carries the error and the
 //!   rest of the line is still returned, so the caller can fall back to read time. The kubelet
 //!   rejects such a line; logit keeps the data.
