@@ -26,7 +26,7 @@ pub(crate) use pattern::{is_container_dir, log_restart_count, name_of, pod_dir_p
 pub use pattern::{PathPattern, Scan};
 
 // `pub(crate)` so `crate::docker` and `crate::cri` can build their kinds on the same driver.
-pub(crate) use driver::{DecoderFactory, Refresh, Tailer};
+pub(crate) use driver::{ensure_utf8, DecoderFactory, Refresh, Tailer};
 use logit_core::{Diagnostics, Resource, Telemetry};
 use logit_pipeline::Fanout;
 use std::path::PathBuf;

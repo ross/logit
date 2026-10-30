@@ -1166,3 +1166,255 @@ async fn a_checkpoint_during_a_splitter_drop_stays_at_the_dropped_records_start(
     running.stop().await;
     std::fs::remove_dir_all(&root).ok();
 }
+
+// -- cri-dockerd's Docker json-file files (section 9) ------------------------------------------
+
+/// One json-file entry, without its `\n`.
+fn docker_entry(stream: &str, log: &str) -> String {
+    serde_json::json!({"log": log, "stream": stream, "time": TS}).to_string()
+}
+
+/// A decoder latched to Docker json-file, as the driver latches it from a file's first bytes.
+fn docker_probed(max_line_bytes: usize, probe: &mut TelemetryProbe) -> CriDecoder {
+    let mut d = probed(max_line_bytes, probe);
+    d.file_head(b"{\"log\":\"");
+    d
+}
+
+fn decode_docker(d: &mut CriDecoder, stream: &str, log: &str, out: &mut Vec<Event>) {
+    d.decode_line(Bytes::from(docker_entry(stream, log)), 7, out).expect("a json-file entry");
+}
+
+/// A file whose first byte is `{` decodes as `docker_in` decodes it: fragments reassembled per
+/// stream, the entry's time, and `attrs` as event attributes. A CRI record in it is malformed.
+#[test]
+fn a_file_opening_with_a_brace_is_decoded_as_docker_json_file() {
+    let mut probe = TelemetryProbe::new();
+    let mut d = docker_probed(1024, &mut probe);
+    let mut out = Vec::new();
+    decode_docker(&mut d, "stdout", "a ", &mut out);
+    decode_docker(&mut d, "stderr", "err\n", &mut out);
+    let attrs = serde_json::json!({"log": "b\n", "stream": "stdout", "time": TS,
+        "attrs": {"tag": "web"}});
+    d.decode_line(Bytes::from(attrs.to_string()), 7, &mut out).unwrap();
+    assert_eq!(lines(&out), pairs(&[("err", "stderr"), ("a b", "stdout")]));
+    assert_eq!(out[1].timestamp, T0);
+    assert_eq!(out[1].attributes.get("tag").and_then(|v| v.as_str()), Some("web"));
+    assert!(d.decode_line(rec("stdout", "F", "cri"), 7, &mut out).is_err());
+    assert_eq!(dropped(&mut probe, "malformed"), 1.0);
+}
+
+/// The latch comes from the file's first byte, not each line: in a CRI file, a line that opens
+/// with `{` is a malformed record.
+#[test]
+fn a_file_opening_with_anything_else_stays_cri() {
+    let mut probe = TelemetryProbe::new();
+    let mut d = probed(1024, &mut probe);
+    d.file_head(TS.as_bytes());
+    let mut out = Vec::new();
+    assert!(d.decode_line(Bytes::from(docker_entry("stdout", "x\n")), 7, &mut out).is_err());
+    assert_eq!(dropped(&mut probe, "malformed"), 1.0);
+}
+
+/// The Docker branch takes raw bytes from the driver, as the CRI branch does, and converts each
+/// entry itself: an invalid byte is replaced, not a rejected entry.
+#[test]
+fn a_docker_entry_with_invalid_utf8_is_converted_not_rejected() {
+    let mut probe = TelemetryProbe::new();
+    let mut d = docker_probed(1024, &mut probe);
+    let mut bytes = br#"{"log":"bad "#.to_vec();
+    bytes.push(0xff);
+    bytes.extend_from_slice(format!(r#"\n","stream":"stdout","time":"{TS}"}}"#).as_bytes());
+    let mut out = Vec::new();
+    d.decode_line(Bytes::from(bytes), 7, &mut out).expect("converted, then decoded");
+    assert_eq!(lines(&out), pairs(&[("bad \u{fffd}", "stdout")]));
+    assert_eq!(diagnosed(&mut probe, "invalid_utf8"), 1.0);
+    assert_eq!(dropped(&mut probe, "malformed"), 0.0);
+}
+
+/// A Docker file's fragment with no closing entry is flushed by `partial_timeout`, as a CRI run
+/// is, counted `frames.truncated`.
+#[tokio::test(start_paused = true)]
+async fn a_docker_files_dangling_fragment_is_flushed_after_partial_timeout() {
+    let mut probe = TelemetryProbe::new();
+    let mut d = docker_probed(1024, &mut probe);
+    let mut out = Vec::new();
+    decode_docker(&mut d, "stdout", "exited mid-line", &mut out);
+    tokio::time::advance(Duration::from_millis(4999)).await;
+    d.flush_idle(Instant::now(), &mut out);
+    assert!(out.is_empty() && d.holds_entry());
+    tokio::time::advance(Duration::from_millis(1)).await;
+    d.flush_idle(Instant::now(), &mut out);
+    assert_eq!(lines(&out), pairs(&[("exited mid-line", "stdout")]));
+    assert!(!d.holds_entry());
+    assert_eq!(probe.sum("logit.input.frames.truncated", &[("reason", "partial_timeout")]), 1.0);
+}
+
+/// A splitter drop in a Docker file can't be read from its head (`stream` follows `log`), so it
+/// ends both streams' reassembly, as under `docker_in`: each held fragment discarded and counted
+/// once with the drop folded in, and the drop counted alone when nothing was held.
+#[test]
+fn a_splitter_drop_in_a_docker_file_ends_both_streams_reassembly() {
+    let mut probe = TelemetryProbe::new();
+    let mut d = docker_probed(1024, &mut probe);
+    let mut out = Vec::new();
+    let head = br#"{"log":"yyyyyyyy"#;
+    decode_docker(&mut d, "stdout", "out-", &mut out);
+    decode_docker(&mut d, "stderr", "err-", &mut out);
+    assert!(d.line_dropped(head, 0, &mut out));
+    assert!(!d.holds_entry());
+    decode_docker(&mut d, "stdout", "o\n", &mut out);
+    assert_eq!(lines(&out), pairs(&[("o", "stdout")]));
+    assert_eq!(dropped(&mut probe, "oversize"), 2.0);
+    assert!(d.line_dropped(head, 0, &mut out));
+    assert_eq!(dropped(&mut probe, "oversize"), 3.0);
+}
+
+/// A resource replaced for a later-found `container.id` reaches the Docker branch's events.
+#[test]
+fn a_new_resource_reaches_the_docker_branch() {
+    let mut d = docker_probed(1024, &mut TelemetryProbe::new());
+    let resource = with_container_id(&Resource::default(), &"a".repeat(64));
+    d.set_resource(resource.clone());
+    let mut out = Vec::new();
+    let got = d.decode_line(Bytes::from(docker_entry("stdout", "x\n")), 7, &mut out).unwrap();
+    assert!(Arc::ptr_eq(&got, &resource));
+    assert!(Arc::ptr_eq(&d.resource(), &resource));
+}
+
+/// `<root>/docker/<id>/<id>-json.log`, Docker's own file, and the pods tree's `0.log` as a
+/// symlink to it, the layout cri-dockerd makes. Returns the target.
+fn cri_dockerd_container(root: &Path, id: &str) -> PathBuf {
+    let docker_dir = root.join("docker").join(id);
+    std::fs::create_dir_all(&docker_dir).unwrap();
+    let target = docker_dir.join(format!("{id}-json.log"));
+    std::fs::write(&target, "").unwrap();
+    std::os::unix::fs::symlink(&target, container_dir(&root.join("pods")).join("0.log")).unwrap();
+    target
+}
+
+/// A cri-dockerd tree: the pods entry is a symlink into Docker's directory. The driver reads
+/// through it, the path's resource is on the events, and Docker's rotation (a rename of the
+/// target to `.1` and a new file at its name) reads as a rotation of the target inode: the
+/// renamed file drains, the new one is read from its start, and nothing is read twice.
+#[tokio::test]
+async fn cri_in_follows_a_cri_dockerd_symlink_through_a_docker_rotation() {
+    let root = scratch_dir("cri-in-cri-dockerd");
+    let id = "c".repeat(64);
+    let target = cri_dockerd_container(&root, &id);
+    append(&target, &format!("{}\n", docker_entry("stdout", "a ")));
+    append(&target, &format!("{}\n", docker_entry("stdout", "b\n")));
+
+    let (fanout, mut rx) = fanout_channel(8);
+    let mut probe = TelemetryProbe::new();
+    let pods = root.join("pods");
+    let running =
+        spawn_input(input(&pods, Duration::ZERO, fast_config(), &mut probe), fanout).await;
+    let batch = logit_pipeline::test_util::recv_batch(&mut rx).await;
+    assert_eq!(lines(&batch.events), pairs(&[("a b", "stdout")]));
+    let attr = |k: &str| batch.resource.attributes.get(k).cloned();
+    assert_eq!(attr("k8s.pod.name"), Some(Value::str("web-0")));
+    assert_eq!(attr("k8s.container.name"), Some(Value::str("nginx")));
+
+    let rotated = target.with_file_name(format!("{id}-json.log.1"));
+    std::fs::rename(&target, &rotated).unwrap();
+    append(&rotated, &format!("{}\n", docker_entry("stdout", "draining\n")));
+    append(&target, &format!("{}\n", docker_entry("stdout", "fresh\n")));
+    let mut events = recv_events(&mut rx, 2).await;
+    events.sort_by_key(|e| e.log.as_ref().unwrap().message.as_str().unwrap().to_string());
+    assert_eq!(lines(&events), pairs(&[("draining", "stdout"), ("fresh", "stdout")]));
+    assert_no_batch(&mut rx, Duration::from_millis(60), "no line twice").await;
+    assert_eq!(probe.sum("logit.input.frames.dropped", &[]), 0.0);
+    running.stop().await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The format is latched from the file's first byte even when a restart resumes past it: a line
+/// of the other format after the checkpoint is malformed in either kind of file, not read as its
+/// own format.
+#[tokio::test]
+async fn the_format_latch_holds_across_a_checkpoint_resume() {
+    let root = scratch_dir("cri-in-latch-resume");
+    let dir = container_dir(&root);
+    let cri_log = dir.join("0.log");
+    let docker_log = dir.join("1.log");
+    append(&cri_log, &record("stdout", "F", "cri one"));
+    append(&docker_log, &format!("{}\n", docker_entry("stdout", "docker one\n")));
+    let config = TailConfig { checkpoint_path: Some(root.join("ckpt.json")), ..fast_config() };
+
+    let (fanout, mut rx) = fanout_channel(8);
+    let mut probe = TelemetryProbe::new();
+    let running =
+        spawn_input(input(&root, Duration::ZERO, config.clone(), &mut probe), fanout).await;
+    let mut events = recv_events(&mut rx, 2).await;
+    events.sort_by_key(|e| e.log.as_ref().unwrap().message.as_str().unwrap().to_string());
+    assert_eq!(lines(&events), pairs(&[("cri one", "stdout"), ("docker one", "stdout")]));
+    running.stop().await;
+
+    append(&cri_log, &format!("{}\n", docker_entry("stdout", "json in a cri file\n")));
+    append(&docker_log, &record("stdout", "F", "cri in a docker file"));
+    let mut probe = TelemetryProbe::new();
+    let (fanout, mut rx) = fanout_channel(8);
+    let running = spawn_input(input(&root, Duration::ZERO, config, &mut probe), fanout).await;
+    probe
+        .wait_for("both lines rejected", |t| {
+            t.sum("logit.input.frames.dropped", &[("reason", "malformed")]) >= 2.0
+        })
+        .await;
+    append(&cri_log, &record("stdout", "F", "cri two"));
+    append(&docker_log, &format!("{}\n", docker_entry("stdout", "docker two\n")));
+    let mut events = recv_events(&mut rx, 2).await;
+    events.sort_by_key(|e| e.log.as_ref().unwrap().message.as_str().unwrap().to_string());
+    assert_eq!(lines(&events), pairs(&[("cri two", "stdout"), ("docker two", "stdout")]));
+    running.stop().await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// An empty file stays undecided until its first byte, and a truncation latches again from the
+/// new first byte.
+#[tokio::test]
+async fn an_empty_file_waits_for_its_first_byte_and_a_truncation_latches_again() {
+    let root = scratch_dir("cri-in-latch-empty");
+    let log = container_dir(&root).join("0.log");
+    append(&log, "");
+    let (fanout, mut rx) = fanout_channel(8);
+    let mut probe = TelemetryProbe::new();
+    let running =
+        spawn_input(input(&root, Duration::ZERO, fast_config(), &mut probe), fanout).await;
+    probe
+        .wait_for("the empty file to be open", |t| {
+            t.gauge("logit.input.files.open", &[]) == Some(1.0)
+        })
+        .await;
+    append(&log, &format!("{}\n", docker_entry("stdout", "a docker line, then cri\n")));
+    assert_eq!(lines(&recv_events(&mut rx, 1).await), pairs(&[("a docker line, then cri", "stdout")]));
+
+    std::fs::write(&log, record("stdout", "F", "cri")).unwrap();
+    assert_eq!(lines(&recv_events(&mut rx, 1).await), pairs(&[("cri", "stdout")]));
+    assert_eq!(probe.sum("logit.input.frames.dropped", &[]), 0.0);
+    running.stop().await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A Docker file's splitter drop through the driver: the held fragment is discarded, counted with
+/// the drop as one line, and the closing entry after the drop leaves alone.
+#[tokio::test]
+async fn a_splitter_drop_after_a_held_docker_fragment_splices_nothing() {
+    let root = scratch_dir("cri-in-docker-splitter-drop");
+    let log = container_dir(&root).join("0.log");
+    let config = TailConfig { max_line_bytes: 200, ..fast_config() };
+    let mut text = format!("{}\n", docker_entry("stdout", "head-"));
+    text.push_str(&format!("{}\n", docker_entry("stdout", &"x".repeat(envelope_cap(200)))));
+    text.push_str(&format!("{}\n", docker_entry("stdout", "tail\n")));
+    append(&log, &text);
+
+    let (fanout, mut rx) = fanout_channel(8);
+    let mut probe = TelemetryProbe::new();
+    let running = spawn_input(input(&root, Duration::ZERO, config, &mut probe), fanout).await;
+    assert_eq!(lines(&recv_events(&mut rx, 1).await), pairs(&[("tail", "stdout")]));
+    assert_no_batch(&mut rx, Duration::from_millis(60), "no other line").await;
+    assert_eq!(probe.sum("logit.input.frames.dropped", &[("reason", "oversize")]), 1.0);
+    assert_eq!(diagnosed(&mut probe, "long_line"), 1.0);
+    running.stop().await;
+    std::fs::remove_dir_all(&root).ok();
+}

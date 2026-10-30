@@ -25,10 +25,10 @@
 //!   and `logit.input.frames.truncated{reason="partial_timeout"}` ([`CriDecoder`]). **Diagnostics**
 //!   of its own: `bad_time` and `long_line`, beside the driver's `bad_line` and `invalid_utf8`.
 
-use crate::docker::envelope_cap;
+use crate::docker::{envelope_cap, DockerDecoder};
 use crate::tail::{
-    is_container_dir, log_restart_count, name_of, pod_dir_parts, DecoderFactory, PathPattern,
-    Refresh, TailConfig, TailDecoder, Tailer,
+    ensure_utf8, is_container_dir, log_restart_count, name_of, pod_dir_parts, DecoderFactory,
+    PathPattern, Refresh, TailConfig, TailDecoder, Tailer,
 };
 use bytes::Bytes;
 use logit_core::{AttrMap, BodyFormat, Diagnostics, Event, LogRecord, Resource, Telemetry, Value};
@@ -70,8 +70,23 @@ impl StreamState {
     }
 }
 
+/// A file's format, latched from its first byte (section 9).
+enum Format {
+    /// No byte at offset 0 yet.
+    Undecided,
+    Cri,
+    /// cri-dockerd's file: Docker json-file, decoded by `docker_in`'s decoder.
+    Docker(DockerDecoder),
+}
+
+/// The byte a Docker json-file line opens with.
+const DOCKER_FIRST_BYTE: u8 = b'{';
+
 /// `cri_in`'s [`TailDecoder`]: reassembles each stream's `P` run into one line, and stamps each
-/// event with the file's resource and its stream as `log.iostream`.
+/// event with the file's resource and its stream as `log.iostream`. A file whose first byte is
+/// `{` is cri-dockerd's Docker json-file instead, and goes to a [`DockerDecoder`] under this
+/// file's resource, with this decoder's diagnostics, telemetry, and `partial_timeout`; the rest of
+/// this doc is the CRI branch's.
 ///
 /// `max_line_bytes` bounds the reassembled content and is checked before each append, so a held
 /// run never exceeds it. What it counts, one per line:
@@ -94,6 +109,7 @@ pub struct CriDecoder {
     partial_timeout: Duration,
     diag: Diagnostics,
     telemetry: Telemetry,
+    format: Format,
 }
 
 const STREAMS: [Stream; 2] = [Stream::Stdout, Stream::Stderr];
@@ -118,6 +134,38 @@ impl CriDecoder {
             partial_timeout,
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
+            format: Format::Undecided,
+        }
+    }
+
+    /// Replaces the resource, the Docker branch's included.
+    fn set_resource(&mut self, resource: Arc<Resource>) {
+        if let Format::Docker(docker) = &mut self.format {
+            docker.set_resource(resource.clone());
+        }
+        self.resource = resource;
+    }
+
+    /// Latches the format from the file's first byte. The same format again keeps the state.
+    fn latch(&mut self, first: u8) {
+        match (&self.format, first == DOCKER_FIRST_BYTE) {
+            (Format::Cri, false) | (Format::Docker(_), true) => {}
+            (_, false) => self.format = Format::Cri,
+            (_, true) => {
+                let docker = DockerDecoder::new(self.resource.clone(), self.max_line_bytes)
+                    .with_diagnostics(self.diag.clone())
+                    .with_telemetry(self.telemetry.clone())
+                    .with_partial_timeout(self.partial_timeout);
+                self.format = Format::Docker(docker);
+            }
+        }
+    }
+
+    /// Latches from `first` while undecided. [`TailDecoder::file_head`] latches before any line
+    /// reaches the decoder, so this decides only for a caller that skips it.
+    fn decide(&mut self, first: Option<u8>) {
+        if let (Format::Undecided, Some(first)) = (&self.format, first) {
+            self.latch(first);
         }
     }
 
@@ -280,6 +328,12 @@ impl TailDecoder for CriDecoder {
         read_at: i64,
         out: &mut Vec<Event>,
     ) -> Result<Arc<Resource>, logit_proto::CodecError> {
+        self.decide(line.first().copied());
+        if let Format::Docker(docker) = &mut self.format {
+            // The CRI branch's raw bytes: the Docker branch converts each envelope whole, as
+            // `docker_in`'s driver does.
+            return docker.decode_line(ensure_utf8(line, &mut self.diag), read_at, out);
+        }
         match cri::parse(&line) {
             Ok(record) => {
                 self.decode_record(&line, record, read_at, out);
@@ -295,7 +349,11 @@ impl TailDecoder for CriDecoder {
 
     /// Section 4's splitter drop. A head that doesn't parse flushes both streams' runs, as a
     /// malformed record does, and leaves the count to the driver.
-    fn line_dropped(&mut self, head: &[u8], _start: u64, out: &mut Vec<Event>) -> bool {
+    fn line_dropped(&mut self, head: &[u8], start: u64, out: &mut Vec<Event>) -> bool {
+        self.decide(head.first().copied());
+        if let Format::Docker(docker) = &mut self.format {
+            return docker.line_dropped(head, start, out);
+        }
         let Some((stream, partial)) = parse_head(head) else {
             self.flush_held(out);
             return false;
@@ -317,6 +375,9 @@ impl TailDecoder for CriDecoder {
     /// Section 5: each stream whose last record is at least `partial_timeout` old is flushed, or
     /// its drop ended.
     fn flush_idle(&mut self, now: Instant, out: &mut Vec<Event>) {
+        if let Format::Docker(docker) = &mut self.format {
+            return docker.flush_idle(now, out);
+        }
         if self.partial_timeout.is_zero() {
             return;
         }
@@ -336,19 +397,36 @@ impl TailDecoder for CriDecoder {
         }
     }
 
+    fn file_head(&mut self, head: &[u8]) {
+        if let Some(&first) = head.first() {
+            self.latch(first);
+        }
+    }
+
     fn close(&mut self, out: &mut Vec<Event>) {
-        self.flush_held(out);
+        match &mut self.format {
+            Format::Docker(docker) => docker.close(out),
+            _ => self.flush_held(out),
+        }
     }
 
     fn holds_entry(&self) -> bool {
-        self.streams.iter().any(StreamState::holds)
+        match &self.format {
+            Format::Docker(docker) => docker.holds_entry(),
+            _ => self.streams.iter().any(StreamState::holds),
+        }
     }
 
     fn hold_at_shutdown(&self) -> bool {
         true
     }
 
+    /// The format stays latched until the truncated file's new first byte reaches
+    /// [`TailDecoder::file_head`].
     fn reset(&mut self) {
+        if let Format::Docker(docker) = &mut self.format {
+            return docker.reset();
+        }
         let held = self.streams.iter().filter(|s| s.run.is_some()).count();
         if held > 0 {
             self.telemetry.count(FRAMES_DROPPED, held as f64, &[("reason", "truncated")]);
@@ -524,8 +602,6 @@ impl DecoderFactory<CriDecoder> for CriDecoderFactory {
         true
     }
 
-    // Each file is decoded as CRI. cri-dockerd's Docker-format files (section 9) need a per-file
-    // format latch on the first byte, which belongs here and in `CriDecoder::decode_line`.
     fn open(&mut self, path: &Path) -> anyhow::Result<CriDecoder> {
         let mut resource = path_resource(path)
             .ok_or_else(|| anyhow::anyhow!("{}: not a kubelet pod log path", path.display()))?;
@@ -545,7 +621,8 @@ impl DecoderFactory<CriDecoder> for CriDecoderFactory {
             return Refresh::Unchanged;
         }
         let Some(id) = self.container_ids.id_for(path) else { return Refresh::Unchanged };
-        decoder.resource = with_container_id(&decoder.resource, &id);
+        let resource = with_container_id(&decoder.resource, &id);
+        decoder.set_resource(resource);
         Refresh::Identity
     }
 

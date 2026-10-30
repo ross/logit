@@ -19,9 +19,10 @@
 //!   `metadata_error` diagnostic.
 //! - **Diagnostics** of its own: `bad_time` (read time used instead), `long_line`,
 //!   `metadata_error`, and the info keys `container_renamed` and `container_deselected`.
-//! - **Counters** of its own: the decoder counts a reassembled message it loses as
-//!   `logit.input.frames.dropped{reason="oversize"|"truncated"}`, as the driver counts a line
-//!   ([`DockerDecoder`]).
+//! - **Counters** of its own: the decoder counts a message it loses as
+//!   `logit.input.frames.dropped{reason="oversize"|"truncated"|"malformed"}`, as the driver counts
+//!   a line, and takes the splitter's drops itself ([`DockerDecoder`]). `cri_in` decodes
+//!   cri-dockerd's files with the same decoder.
 //!
 //! See `docs/adr/file-tailing-and-docker-json-logs.md` and
 //! `docs/adr/docker-container-identity-and-minimal-watches.md`.
@@ -35,7 +36,9 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::watch as shutdown_watch;
+use tokio::time::Instant;
 
 /// Which containers under `root` this listener follows: only those named, unless `discover: true`
 /// follows every one, including containers that appear after startup. The file-tailing ADR's
@@ -216,6 +219,10 @@ struct StreamState {
     /// fragments are discarded, the message already counted, until the entry that ends the line
     /// clears it, as in `LineSplitter`'s `dropping`.
     dropping: bool,
+    /// When an entry last left this stream holding a fragment or dropping, for
+    /// [`TailDecoder::flush_idle`]. Kept only while `partial_timeout` is nonzero, which only
+    /// `cri_in` sets.
+    last: Option<Instant>,
 }
 
 /// `docker_in`'s [`TailDecoder`]: decodes Docker's json-file envelope, reassembles split lines
@@ -229,13 +236,22 @@ struct StreamState {
 /// progress stays in progress.
 ///
 /// It counts the messages it loses as `logit.input.frames.dropped`, one per message: `oversize`
-/// when a drop starts, and `truncated` for each stream's held reassembly that
-/// [`TailDecoder::reset`] discards. A stream already dropping holds nothing to count again.
+/// when a drop starts, `truncated` for each stream's held reassembly that [`TailDecoder::reset`]
+/// discards, and `malformed` for each rejected entry. A stream already dropping holds nothing to
+/// count again.
+///
+/// A line the splitter drops can't name its stream (an envelope writes `stream` after `log`), so
+/// [`TailDecoder::line_dropped`] ends both streams' reassembly: each held fragment is discarded and
+/// counted `oversize`, each drop in progress ends, and the drop itself is counted only when
+/// neither stream held or was dropping a message it could belong to
+/// (`docs/adr/cri-container-logs.md`, section 9).
 pub struct DockerDecoder {
     resource: Arc<Resource>,
     /// Indexed as [`STREAMS`].
     streams: [StreamState; 2],
     max_line_bytes: usize,
+    /// `cri_in`'s idle flush; `Duration::ZERO`, `docker_in`'s, turns it off.
+    partial_timeout: Duration,
     diag: Diagnostics,
     telemetry: Telemetry,
 }
@@ -246,6 +262,7 @@ impl DockerDecoder {
             resource,
             streams: Default::default(),
             max_line_bytes,
+            partial_timeout: Duration::ZERO,
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
         }
@@ -261,14 +278,37 @@ impl DockerDecoder {
         self
     }
 
+    pub(crate) fn with_partial_timeout(mut self, partial_timeout: Duration) -> Self {
+        self.partial_timeout = partial_timeout;
+        self
+    }
+
+    pub(crate) fn set_resource(&mut self, resource: Arc<Resource>) {
+        self.resource = resource;
+    }
+
+    /// Now, when the idle flush is on.
+    fn stamp(&self) -> Option<Instant> {
+        (!self.partial_timeout.is_zero()).then(Instant::now)
+    }
+
     /// Emits every stream's held fragment as its own event, stdout first. A drop in progress is
     /// left as it is.
     fn flush_held(&mut self, out: &mut Vec<Event>) {
-        for (index, stream) in STREAMS.iter().enumerate() {
-            if let Some(partial) = self.streams[index].partial.take() {
-                self.emit(partial.timestamp, stream, &partial.attrs, partial.message, out);
-            }
+        for index in 0..STREAMS.len() {
+            self.flush_stream(index, out);
         }
+    }
+
+    /// Emits stream `index`'s held fragment, if it has one. Returns whether it had.
+    fn flush_stream(&mut self, index: usize, out: &mut Vec<Event>) -> bool {
+        let state = &mut self.streams[index];
+        let Some(partial) = state.partial.take() else { return false };
+        if !state.dropping {
+            state.last = None;
+        }
+        self.emit(partial.timestamp, STREAMS[index], &partial.attrs, partial.message, out);
+        true
     }
 
     fn emit(
@@ -302,6 +342,7 @@ impl DockerDecoder {
 }
 
 const FRAMES_DROPPED: &str = "logit.input.frames.dropped";
+const FRAMES_TRUNCATED: &str = "logit.input.frames.truncated";
 
 /// One json-file entry. Every string is a `Cow`: `serde_json` borrows a string only when it has
 /// no escapes, and dockerd writes `<`, `>`, `&`, and control bytes as `\u00XX` in `attrs` keys and
@@ -329,6 +370,7 @@ impl TailDecoder for DockerDecoder {
             Ok(entry) => entry,
             Err(err) => {
                 self.flush_held(out);
+                self.telemetry.count(FRAMES_DROPPED, 1.0, &[("reason", "malformed")]);
                 return Err(logit_proto::CodecError::Malformed(format!(
                     "docker json-file entry: {err}"
                 )));
@@ -342,6 +384,7 @@ impl TailDecoder for DockerDecoder {
                     "unknown docker log stream {other:?}"
                 ));
                 self.flush_held(out);
+                self.telemetry.count(FRAMES_DROPPED, 1.0, &[("reason", "malformed")]);
                 return Err(err);
             }
         };
@@ -352,8 +395,10 @@ impl TailDecoder for DockerDecoder {
 
         // Length before `time` and `attrs`: an entry discarded here never becomes an event, so it
         // pays for neither and can't report `bad_time`.
+        let stamp = if is_complete { None } else { self.stamp() };
         let state = &mut self.streams[index];
         if state.dropping {
+            state.last = stamp;
             if is_complete {
                 state.dropping = false;
             }
@@ -363,6 +408,7 @@ impl TailDecoder for DockerDecoder {
         if held_len + text.len() > self.max_line_bytes {
             state.partial = None;
             state.dropping = !is_complete;
+            state.last = stamp;
             self.telemetry.count(FRAMES_DROPPED, 1.0, &[("reason", "oversize")]);
             self.diag.warn_throttled(
                 "long_line",
@@ -392,12 +438,57 @@ impl TailDecoder for DockerDecoder {
             held.message.push_str(text);
             held.timestamp = timestamp;
             held.attrs = attrs;
+            state.last = stamp;
             return Ok(self.resource.clone());
         }
+        state.last = None;
         let mut message = state.partial.take().map(|p| p.message).unwrap_or_default();
         message.push_str(text);
         self.emit(timestamp, STREAMS[index], &attrs, message, out);
         Ok(self.resource.clone())
+    }
+
+    /// The splitter dropped an envelope, whose stream its head can't name: both streams'
+    /// reassembly ends, so no message is joined across the dropped entry and no later entry is
+    /// discarded on a guess. Each held fragment is discarded and counted `oversize`, a drop in
+    /// progress ends (counted when it began), and the drop counts as a message of its own only
+    /// when neither stream held or was dropping one it could continue.
+    fn line_dropped(&mut self, _head: &[u8], _start: u64, _out: &mut Vec<Event>) -> bool {
+        let held = self.streams.iter().filter(|s| s.partial.is_some()).count();
+        let dropping = self.streams.iter().any(|s| s.dropping);
+        self.streams = Default::default();
+        let lost = if held == 0 && !dropping { 1 } else { held };
+        if lost > 0 {
+            self.telemetry.count(FRAMES_DROPPED, lost as f64, &[("reason", "oversize")]);
+            self.diag.warn_throttled(
+                "long_line",
+                "a docker log entry exceeded the line-length bound and was dropped, with every \
+                 fragment held across it",
+            );
+        }
+        true
+    }
+
+    /// `cri_in`'s idle flush (`docs/adr/cri-container-logs.md`, sections 5 and 9): each stream
+    /// whose last entry is at least `partial_timeout` old is flushed, or its drop ended.
+    fn flush_idle(&mut self, now: Instant, out: &mut Vec<Event>) {
+        if self.partial_timeout.is_zero() {
+            return;
+        }
+        for index in 0..STREAMS.len() {
+            let state = &mut self.streams[index];
+            let expired = state
+                .last
+                .is_some_and(|last| now.saturating_duration_since(last) >= self.partial_timeout);
+            if !expired {
+                continue;
+            }
+            state.dropping = false;
+            state.last = None;
+            if self.flush_stream(index, out) {
+                self.telemetry.count(FRAMES_TRUNCATED, 1.0, &[("reason", "partial_timeout")]);
+            }
+        }
     }
 
     fn close(&mut self, out: &mut Vec<Event>) {
@@ -1126,6 +1217,99 @@ mod tests {
         assert_eq!(message_streams(&out), pairs(&[("ok", "stdout")]));
         assert_eq!(probe.sum("logit.input.frames.dropped", &[("reason", "oversize")]), 2.0);
         assert_eq!(probe.sum("logit.input.frames.dropped", &[("reason", "truncated")]), 0.0);
+    }
+
+    fn probed(max_line_bytes: usize, probe: &mut TelemetryProbe) -> DockerDecoder {
+        let telemetry = probe.telemetry("docker", "docker_in", "listener");
+        DockerDecoder::new(Arc::new(Resource::default()), max_line_bytes)
+            .with_diagnostics(Diagnostics::new("docker").with_telemetry(telemetry.clone()))
+            .with_telemetry(telemetry)
+    }
+
+    fn dropped(probe: &mut TelemetryProbe, reason: &str) -> f64 {
+        probe.sum("logit.input.frames.dropped", &[("reason", reason)])
+    }
+
+    /// A rejected entry is a lost line, so it's counted beside the driver's `bad_line`: invalid
+    /// JSON and an unknown stream alike.
+    #[test]
+    fn a_rejected_entry_counts_one_malformed_frame() {
+        let mut probe = TelemetryProbe::new();
+        let mut d = probed(1024, &mut probe);
+        let mut out = Vec::new();
+        d.decode_line(entry("stdout", "held "), 0, &mut out).unwrap();
+        assert!(d.decode_line(line("not json"), 0, &mut out).is_err());
+        assert!(d.decode_line(entry("stdin", "x\n"), 0, &mut out).is_err());
+        assert_eq!(message_streams(&out), pairs(&[("held ", "stdout")]), "flushed, not lost");
+        assert_eq!(dropped(&mut probe, "malformed"), 2.0);
+        assert_eq!(dropped(&mut probe, "oversize"), 0.0);
+    }
+
+    /// The splitter dropped an envelope after a held fragment. Its stream is unknown, so the held
+    /// fragment is discarded rather than joined to a later entry, and the two count as one line:
+    /// the dropped envelope continues the held message whenever it's that stream's.
+    #[test]
+    fn a_splitter_drop_discards_a_held_fragment_counted_once_with_no_splice() {
+        let mut probe = TelemetryProbe::new();
+        let mut d = probed(1024, &mut probe);
+        let mut out = Vec::new();
+        d.decode_line(entry("stdout", "head-"), 0, &mut out).unwrap();
+        assert!(d.line_dropped(b"", 0, &mut out), "the decoder takes the drop");
+        assert!(!d.holds_entry());
+        d.decode_line(entry("stdout", "tail\n"), 0, &mut out).unwrap();
+        assert_eq!(message_streams(&out), pairs(&[("tail", "stdout")]));
+        assert_eq!(dropped(&mut probe, "oversize"), 1.0);
+        assert_eq!(probe.sum("logit.component.diagnostics", &[("key", "long_line")]), 1.0);
+    }
+
+    /// Both streams held a fragment: both are discarded, one line each, and the drop is folded
+    /// into them.
+    #[test]
+    fn a_splitter_drop_discards_both_streams_fragments_one_count_each() {
+        let mut probe = TelemetryProbe::new();
+        let mut d = probed(1024, &mut probe);
+        let mut out = Vec::new();
+        d.decode_line(entry("stdout", "out-"), 0, &mut out).unwrap();
+        d.decode_line(entry("stderr", "err-"), 0, &mut out).unwrap();
+        d.line_dropped(b"", 0, &mut out);
+        d.decode_line(entry("stderr", "e\n"), 0, &mut out).unwrap();
+        d.decode_line(entry("stdout", "o\n"), 0, &mut out).unwrap();
+        assert_eq!(message_streams(&out), pairs(&[("e", "stderr"), ("o", "stdout")]));
+        assert_eq!(dropped(&mut probe, "oversize"), 2.0);
+    }
+
+    /// With nothing held or dropping, the dropped envelope is a line of its own, counted once.
+    #[test]
+    fn a_splitter_drop_with_nothing_held_counts_one_line() {
+        let mut probe = TelemetryProbe::new();
+        let mut d = probed(1024, &mut probe);
+        let mut out = Vec::new();
+        assert!(d.line_dropped(b"", 0, &mut out));
+        d.decode_line(entry("stdout", "next\n"), 0, &mut out).unwrap();
+        assert_eq!(message_streams(&out), pairs(&[("next", "stdout")]));
+        assert_eq!(dropped(&mut probe, "oversize"), 1.0);
+    }
+
+    /// A drop in progress ends at a splitter drop, which may have been its closing entry, so the
+    /// stream's next complete entry is delivered rather than discarded uncounted. The drop was
+    /// counted when it began, and a fragment held on the other stream counts once.
+    #[test]
+    fn a_splitter_drop_ends_a_drop_in_progress_without_counting_it_again() {
+        let mut probe = TelemetryProbe::new();
+        let mut d = probed(10, &mut probe);
+        let mut out = Vec::new();
+        d.decode_line(entry("stdout", "0123456789AB"), 0, &mut out).unwrap();
+        assert_eq!(dropped(&mut probe, "oversize"), 1.0);
+        d.line_dropped(b"", 0, &mut out);
+        assert_eq!(dropped(&mut probe, "oversize"), 1.0, "folded into the drop in progress");
+        d.decode_line(entry("stdout", "next\n"), 0, &mut out).unwrap();
+        assert_eq!(message_streams(&out), pairs(&[("next", "stdout")]));
+
+        d.decode_line(entry("stdout", "0123456789AB"), 0, &mut out).unwrap();
+        d.decode_line(entry("stderr", "err-"), 0, &mut out).unwrap();
+        d.line_dropped(b"", 0, &mut out);
+        assert_eq!(dropped(&mut probe, "oversize"), 3.0, "the new drop, then the held fragment");
+        assert!(!d.holds_entry());
     }
 
     /// `reset` counts one `frames.dropped{reason="truncated"}` per stream holding a reassembly,
@@ -2447,28 +2631,37 @@ mod tests {
     }
 
     /// A json-file line the splitter drops as over `envelope_cap`, read after a held fragment,
-    /// never reaches the decoder, and the checkpoint still stops at the fragment's start. It pins
-    /// the gap in `docs/known-gaps/tailing.md`'s "An envelope over the cap is dropped by the
-    /// splitter" entry: a splitter-dropped envelope is invisible to the decoder, so the held
-    /// fragment and the next closing entry are joined across it.
+    /// ends the reassembly: the held fragment is discarded, the two counted as one line, so the
+    /// next closing entry leaves alone instead of joined to it across the drop, and the checkpoint
+    /// moves past both once nothing is held.
     #[tokio::test]
-    async fn an_oversized_line_dropped_after_a_held_fragment_keeps_the_checkpoint_at_the_fragment_start(
+    async fn an_oversized_line_dropped_after_a_held_fragment_discards_it_and_releases_the_checkpoint(
     ) {
         let oversized = format!("{}\n", "x".repeat(envelope_cap(200) + 1));
         let (root, log, checkpoint, head_start, mut config) =
             fragment_fixture("docker-held-oversized", &oversized);
         config.max_line_bytes = 200;
+        let head_len = json_file_line("head-").len() as u64;
 
+        let mut probe = TelemetryProbe::new();
         let (fanout, mut rx) = fanout_channel(8);
         let input =
-            DockerInput::new(root.clone(), ContainerFilter::new(vec![], true), vec![], config);
+            DockerInput::new(root.clone(), ContainerFilter::new(vec![], true), vec![], config)
+                .with_telemetry(probe.telemetry("docker", "docker_in", "listener"));
         let running = spawn_input(input, fanout).await;
 
         assert_eq!(messages(&recv_events(&mut rx, 1).await), vec!["whole"]);
+        // Before the drop is read, a checkpoint stops at the fragment; once nothing is held, it
+        // reaches the end of the dropped line.
+        let end = head_start + head_len + oversized.len() as u64;
+        wait_until("the checkpoint to move past the dropped line", || {
+            checkpointed_offset(&checkpoint) == Some(end)
+        })
+        .await;
         assert_eq!(
-            first_nonzero_checkpoint(&checkpoint).await,
-            head_start,
-            "the checkpoint must stop at the held fragment's first byte, not inside it"
+            probe.sum("logit.input.frames.dropped", &[("reason", "oversize")]),
+            1.0,
+            "the held fragment and the dropped envelope are one line"
         );
 
         std::fs::OpenOptions::new()
@@ -2477,7 +2670,7 @@ mod tests {
             .unwrap()
             .write_all(json_file_line("tail\n").as_bytes())
             .unwrap();
-        assert_eq!(messages(&recv_events(&mut rx, 1).await), vec!["head-tail"]);
+        assert_eq!(messages(&recv_events(&mut rx, 1).await), vec!["tail"]);
         // 4x the 15ms flush tick that would deliver a second copy.
         assert_no_batch(&mut rx, Duration::from_millis(60), "the message must be emitted once")
             .await;

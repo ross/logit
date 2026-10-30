@@ -97,6 +97,13 @@ pub trait TailDecoder: Send {
     /// enough by `now`. Called only when [`TailDecoder::FLUSHES_IDLE`]. Default: nothing.
     fn flush_idle(&mut self, _now: tokio::time::Instant, _out: &mut Vec<Event>) {}
 
+    /// The file's first bytes, from offset 0 (at most `HEAD_BYTES`, never empty), once they show
+    /// it isn't compressed: before any of its lines reaches [`TailDecoder::decode_line`] or
+    /// [`TailDecoder::line_dropped`], whatever offset reading starts at, and again after a
+    /// truncation, after [`TailDecoder::reset`]. `cri_in` latches a file's format from them.
+    /// Default: nothing.
+    fn file_head(&mut self, _head: &[u8]) {}
+
     /// This decoder's resource, readable before any line is decoded.
     ///
     /// [`LineDecoder`]'s never changes. `docker_in`'s can: `DecoderFactory::refresh` may swap in
