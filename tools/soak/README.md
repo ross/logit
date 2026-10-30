@@ -350,11 +350,13 @@ path of [ADR `tail-content-identity`](../../docs/adr/tail-content-identity.md): 
 the original's position, a rejected entry a copy claims isn't counted gone, and a compressed
 file is skipped. `ledger.wire` holds the shared directory's count, which reads a gzip file
 decompressed, to G less the lines the copytruncates lost, and widens the replay band below by
-those lines and above, for a copytruncate while the SUT runs, by its copy's lines and one, the
-ADR's residual for a copy shorter than what the tailer read, which is read from 0. Its
-expectations assert three claims or more (the stop's, the kill's, and the replace's), two
-rejected resumes, four truncations seen, two compressed files skipped, and none of a gone
-entry's bytes, an ambiguous claim, an invalid UTF-8 line, or a checkpoint error.
+those lines. It widens the band above by a copy's lines and its cut line only for a
+copytruncate while the SUT runs whose record shows bytes appended after the copy's last read,
+the ADR's residual for a copy shorter than what the tailer read, which is read from 0; any
+other copy must claim, so a read from 0 FAILs the row. Its expectations assert a claim after
+the stop and two after the kill (its copy's and the replace's), two rejected resumes, four
+truncations seen, two compressed files skipped, and none of a gone entry's bytes, an ambiguous
+claim, an invalid UTF-8 line, or a checkpoint error.
 
 `otlp-fan-out` (16 minutes) sends 500 OTLP log records a second with `otlp_out` over HTTP, 50
 to a request, into `otlp_in`, its source declared `wire = "http"`. Each record's body is four
@@ -1009,9 +1011,10 @@ directory at the end; once it deleted one, the count must not exceed G, the dire
 the files the writer keeps, and no SUT fault may last long enough for the writer to delete a
 file the tailer hadn't read. A `copytruncate` step's lost lines leave the count short of G by
 that many, plus at most one writer batch a step written between its last read and its
-truncate, and widen the band below; one while the SUT runs widens it above by its copy's lines
-and one, since a read between the copy and the truncate leaves the copy unable to claim, and
-it's read from 0.
+truncate, and widen the band below; one while the SUT runs whose record shows bytes appended
+after the copy's last read widens it above by its copy's lines and its cut line, since a read of
+those bytes leaves the copy unable to claim, and it's read from 0. Every other copy adds nothing
+above.
 `ledger.wire` judges each source on its own, against the fault windows of its own
 generator and of every service that isn't a generator that affect its wire, and
 `ledger.intake` judges each listener's final life; each reports a line per source or listener

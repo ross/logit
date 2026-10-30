@@ -1247,12 +1247,15 @@ The rows:
   - a `copytruncate` step (`Ledger.copytruncate_band`): below, its `lost_lines`, which a tailer
     reads only if a read lands between the copy and the truncate, and whatever the shared
     directory's count shows lost past the records, up to one writer batch a step; above, for a
-    step while the ingress SUT runs, its copy's lines and one: a read in that window leaves the
-    copy shorter than what the tailer read, so it can't claim and is read from 0, and the
-    truncation's discarded line, counted `frames.dropped{reason="truncated"}`, is also whole in
-    the copy ([ADR `tail-content-identity`](../adr/tail-content-identity.md), "What a claim
-    still duplicates or loses"). A step inside a stop, kill, restart, `exit`, or pause adds
-    nothing above: no read lands in its window, so the copy claims the checkpoint's offset.
+    step while the ingress SUT runs whose record has `lost_bytes` above 0, or every such step
+    when the count shows a loss no record holds, its copy's lines and one: a read of the bytes
+    appended after the copy's last read leaves the copy shorter than what the tailer read, so it
+    can't claim and is read from 0, and the one is the copy's trailing fragment, which a stop
+    emits as a line ([ADR `tail-content-identity`](../adr/tail-content-identity.md), "What a
+    claim still duplicates or loses"). Any other step adds nothing above: a copy with nothing
+    appended after its last read holds everything the tailer read, and inside a stop, kill,
+    restart, `exit`, or pause no read lands in its window, so either copy claims, and a read
+    from 0 FAILs the row.
 
   While the writer deleted no file, G must also equal the lines the driver counted in the
   shared directory at the end (`shared_counted`), else the row FAILs its precondition; with
@@ -2398,9 +2401,9 @@ where it needs them, and a small check extension.
    the item to the paths [ADR `tail-content-identity`](../adr/tail-content-identity.md) added,
    which rename rotation never reaches: a writer that never rotates, `copytruncate` steps while
    the SUT runs, inside a stop, and inside a kill, `gzip` steps on finished copies, and a
-   `replace` inside the kill, with `[[expect]]` on claims, rejected resumes, truncations,
-   compressed skips, and none of a gone entry's bytes, an ambiguous claim, an invalid UTF-8
-   line, or a checkpoint error.
+   `replace` inside the kill, with `[[expect]]` on the claims after the stop and the kill,
+   rejected resumes, truncations, compressed skips, and none of a gone entry's bytes, an
+   ambiguous claim, an invalid UTF-8 line, or a checkpoint error.
 10. **Deterministic destination errors (built in W9a, for `prometheus_out`, and W9b, for
     `datadog_out`).** A scripted HTTP stand-in answering `429`, `5xx`, `400`,
     and `413` on cue and recording what it accepts, so every row of a sink's response-class table
@@ -5259,8 +5262,12 @@ is `f0d225e8`'s (run `20261029T233857Z`). Every row passed:
   the one inside the kill, and the replace (`files.claimed` 7, expected 3 or more). So no copy
   was read from 0, and W − G was −300 against the band [−5,000, 467,188]: the killed life's
   unexported last drain interval (its run of drain intervals shows a gap of 294), as in
-  `tail-rotate`. The band's upper edge is the six copies' lines, read again only if a copy can't
-  claim; it's that wide by design, and the claim count shows none was.
+  `tail-rotate`. The band's upper edge was the four copies made while the SUT ran plus the
+  kill's replay allowance, read again only if a copy can't claim, and the claim count shows none
+  was. Re-scored offline under the band that grants a running copy's re-read only to a step that
+  recorded appended bytes, the band is [−5,000, 6,384], the kill's replay allowance alone, and
+  the row still passes; the anchored expectations read 1 claim after the stop and 2 after the
+  kill.
 - Every copytruncate recorded `lost_lines` 0, and the shared directory held G's 905,700 lines
   in 7 files, the two `.gz` files read decompressed. The window between the copy's last read and
   the truncate is a few system calls, and the writer writes a batch every 100 ms, so the run

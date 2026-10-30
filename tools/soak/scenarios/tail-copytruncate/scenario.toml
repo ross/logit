@@ -8,8 +8,8 @@
 # `tail-content-identity` added: a copy claims the original's position (decision 5), a rejected
 # entry a copy claims isn't counted gone (decision 6), and a compressed file is skipped
 # (decision 2). `ledger.wire` takes each copytruncate's lost and duplicated lines from that
-# ADR's residuals (checks.py's `Ledger.copytruncate_band`). The schema is
-# docs/plans/soak-harness.md's "The scenario schema".
+# ADR's residuals and the step's own record (checks.py's `Ledger.copytruncate_band`). The
+# schema is docs/plans/soak-harness.md's "The scenario schema".
 
 name = "tail-copytruncate"
 description = "writer -> file_out (copytruncate, gzip, replace steps) -> tail_in app.log* -> json -> aggregate 10s cumulative -> prometheus_out RW1 zstd (disk spool) -> VictoriaMetrics"
@@ -53,8 +53,9 @@ rss_growth_mib_per_hour = 64   # WARN under 1h, FAIL above
 fd_growth = 10
 
 # A copytruncate while the tailer runs: the copy claims the original's state from before the
-# truncation and is read from there. A read between the copy and the truncate leaves the copy
-# shorter than what the tailer read, and it's read from 0 instead, inside the band.
+# truncation and is read from there. Only bytes appended after the copy's last read, which the
+# step records, can leave the copy shorter than what the tailer read, and it's read from 0
+# instead, inside the band that record grants.
 [[step]]
 at = "0s"
 action = "copytruncate"
@@ -147,17 +148,30 @@ path = "app.log"
 to = "app.log-06"
 for = "5s"
 
-# The copies made while the SUT was down, the stop's and the kill's, and the replaced copy each
-# claim a checkpoint entry; the four made while it ran claim unless a read lands between the
-# copy and the truncate, so they add to the count without being counted on.
+# The copy made inside the stop claims app.log's rejected entry at the restart. The copies made
+# while the SUT runs claim too, unless a step records bytes appended after its copy's last read;
+# `ledger.wire` guards those, granting a re-read of a copy only to such a step.
 [[expect]]
-name = "files-claimed"
+name = "stop-copy-claimed"
 service = "logit"
 metric = "logit.input.files.claimed"
 component = "tail"
-window = "run"
+step = 2
+window = "after"
 reduce = "delta"
-min = 3
+min = 1
+
+# The copy made inside the kill claims app.log's last checkpointed entry, and the replaced copy
+# its old inode's entry, both at the restart.
+[[expect]]
+name = "kill-copy-and-replace-claimed"
+service = "logit"
+metric = "logit.input.files.claimed"
+component = "tail"
+step = 6
+window = "after"
+reduce = "delta"
+min = 2
 
 # The restart after the stop and the one after the kill each find app.log refilled under its
 # checkpointed inode.

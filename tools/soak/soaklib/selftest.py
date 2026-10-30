@@ -11684,8 +11684,33 @@ def _file_ops():
                f"got {refused} {errors.getvalue()!r}")
 
     compose = (Path(__file__).resolve().parent.parent / "compose.yaml").read_text()
-    expect(f"image: {faults.FILEOPS_IMAGE}" in compose,
+    expect(f"image: {faults.FILEOPS_IMAGE}" in compose
+           and faults.FILEOPS_IMAGE == driver.STANDIN_IMAGE,
            "a file operation runs in the stand-in's image, so a run pulls one Python image")
+
+    class PullDocker:
+        """Answers `image inspect` with `present` and `pull` with `pulled`, recording calls."""
+
+        def __init__(self, present, pulled=0):
+            self.present, self.pulled, self.calls = present, pulled, []
+
+        def run(self, args, timeout=None):
+            self.calls.append((list(args), timeout))
+            if args[0] == "image":
+                return docker.Result(self.present, "", "")
+            return docker.Result(self.pulled, "", "" if self.pulled == 0 else "denied")
+
+    there = PullDocker(0)
+    expect(faults.ensure_fileops_image(there) is None and len(there.calls) == 1,
+           f"an image on the daemon isn't pulled again, got {there.calls}")
+    missing = PullDocker(1)
+    expect(faults.ensure_fileops_image(missing) is None
+           and missing.calls[1] == (["pull", faults.FILEOPS_IMAGE],
+                                    faults.FILEOPS_PULL_TIMEOUT_S),
+           f"a missing image is pulled before the schedule, got {missing.calls}")
+    refused = faults.ensure_fileops_image(PullDocker(1, pulled=1))
+    expect(refused is not None and "denied" in refused,
+           f"a failed pull is reported, got {refused}")
 
     class SourceDocker:
         """Runs the shipped source here, with the container's shared mount mapped back."""
@@ -11790,19 +11815,29 @@ def _file_action_rules(root):
 
 def _copytruncate_ledger():
     """`ledger.wire` over copytruncate steps: the shared directory's count held to G less their
-    lost lines, with one writer batch a step unrecorded allowed; and the replay band widened
-    below by the lost lines and above, for a step while the tailer runs, by the copy's lines
-    and one, and for a step while the SUT is down by nothing."""
-    ops = [_action("apply", "c0s7", "copytruncate", "generator", 50, 51, path="app.log",
-                   to="app.log-01", copied_lines=5_000, lost_lines=30),
-           _action("revert", "c0s7", "copytruncate", "generator", 55, 55),
-           _action("apply", "c0s8", "copytruncate", "generator", 110, 111, path="app.log",
-                   to="app.log-02", copied_lines=4_000, lost_lines=20),
-           _action("revert", "c0s8", "copytruncate", "generator", 115, 115),
-           _action("apply", "c0s9", "copytruncate", "generator", 140, 141, path="app.log",
-                   to="app.log-03", rc=1)]
+    lost lines, with one writer batch a step unrecorded allowed; the replay band widened below
+    by the lost lines, and above, for a step while the tailer runs, by the copy's lines and one
+    only when its record shows bytes appended after the copy's last read, or the count shows a
+    shortfall past the records; and nothing above for a step while the SUT is down. So a copy
+    read from 0 with nothing appended FAILs, whether made while the tailer ran or while it was
+    down."""
+    def ops_of(*steps):
+        records = []
+        for n, (offset, copied, lost, lost_bytes) in enumerate(steps, start=7):
+            records += [_action("apply", f"c0s{n}", "copytruncate", "generator", offset,
+                                offset + 1, path="app.log", to=f"app.log-{n:02d}",
+                                copied_lines=copied, lost_lines=lost, lost_bytes=lost_bytes),
+                        _action("revert", f"c0s{n}", "copytruncate", "generator", offset + 5,
+                                offset + 5)]
+        return records
+
+    # +50 and +70 while the tailer runs, the first with bytes appended after its copy, the
+    # second with none; +110 inside the stop over STOP; +140 failed and changes nothing.
+    mixed = ops_of((50, 5_000, 30, 2_850), (70, 3_000, 0, 0), (110, 4_000, 20, 1_900)) + [
+        _action("apply", "c0s20", "copytruncate", "generator", 140, 141, path="app.log",
+                to="app.log-20", rc=1)]
     with tempfile.TemporaryDirectory() as tmp:
-        def run(name, w_minus_g, short=50):
+        def run(name, w_minus_g, short=50, ops=mixed):
             run_dir = _ledger_run(tmp, name, shutdown_drops=0, life0_extra=30,
                                   timeline_extra=ops)
             counted = lambda g: {"files": 3, "lines": g - short, "bytes": (g - short) * 95}
@@ -11814,31 +11849,57 @@ def _copytruncate_ledger():
         expect(low.status == checks.PASS
                and "against the replay band [-50, 5,002]" in low.detail
                and "copytruncate at +50s, a tailer running: [-30, +5,001]" in lines
+               and "copytruncate at +70s, a tailer running: [-0, +0]: its lost lines below; "
+               "nothing above" in lines
                and "copytruncate at +110s, the SUT down (stop): [-20, +0]" in lines
-               and "copytruncate app.log -> app.log-01 at +50s: 5,000 line(s) copied, 30 "
+               and "copytruncate app.log -> app.log-07 at +50s: 5,000 line(s) copied, 30 "
                "written after the copy and before the truncate" in lines
                and "+140s" not in lines,
                f"each copytruncate widens the band by its own terms, got {low} {low.lines}")
         expect(run("ct-lower", -51)["ledger.wire"].status == checks.FAIL,
                "a line short of the lost lines FAILs")
         expect(run("ct-high", 5_002)["ledger.wire"].status == checks.PASS,
-               "a running copytruncate's whole copy read again passes")
+               "a copy read again from 0 after bytes were appended to it passes")
         expect(run("ct-higher", 5_003)["ledger.wire"].status == checks.FAIL,
-               "more than the running copy's lines again FAILs")
+               "more than that copy's lines again FAILs")
+        # Regressions the band must catch: a copy read from 0 though nothing was appended
+        # after its copy, made while the tailer ran, and made while the SUT was down beside a
+        # running step whose copy is larger.
+        clean = ops_of((50, 3_000, 0, 0))
+        reread = run("ct-reread-running", 3_000, short=0, ops=clean)["ledger.wire"]
+        expect(reread.status == checks.FAIL
+               and reread.detail.startswith("W + F − G 3,000 is surplus, outside the replay "
+                                            "band [0, 1]"),
+               f"a running copy read from 0 with nothing appended FAILs, got {reread}")
+        down = ops_of((50, 5_000, 0, 0), (110, 4_000, 0, 0))
+        reread = run("ct-reread-down", 4_000, short=0, ops=down)["ledger.wire"]
+        expect(reread.status == checks.FAIL
+               and reread.detail.startswith("W + F − G 4,000 is surplus, outside the replay "
+                                            "band [0, 1]"),
+               f"a copy made while the SUT was down read from 0 FAILs, got {reread}")
+        # A shortfall past the records means a write landed unrecorded: every running step may
+        # then have read past its copy.
+        short = run("ct-shortfall", 8_003, short=150)["ledger.wire"]
+        expect(short.status == checks.PASS
+               and "against the replay band [-150, 8,003]" in short.detail
+               and "copytruncate at +70s, a tailer running: [-0, +3,001]" in
+               "\n".join(short.lines),
+               f"an unrecorded shortfall grants every running step its copy, got {short} "
+               f"{short.lines}")
         above = run("ct-count-above", 0, short=49)["ledger.wire"]
         expect(above.status == checks.FAIL
                and "the shared directory holds 53,981 line(s) in 3 file(s), but the writer's "
                "events.delivered 54,030 less the 50 its copytruncates lost is 53,980" in
                above.detail,
                f"a count above G less the lost lines FAILs, got {above}")
-        race = run("ct-race", -250, short=250)["ledger.wire"]
+        race = run("ct-race", -350, short=350)["ledger.wire"]
         expect(race.status == checks.PASS
-               and any("copytruncates: [-200, 0]: lines in no file past the records" in line
+               and any("copytruncates: [-300, 0]: lines in no file past the records" in line
                        for line in race.lines),
                f"a batch a step lost unrecorded widens the band below, got {race} "
                f"{race.lines}")
-        past = run("ct-race-past", -250, short=251)["ledger.wire"]
-        expect(past.status == checks.FAIL and "with up to 200 more lost unrecorded" in past.detail,
+        past = run("ct-race-past", -350, short=351)["ledger.wire"]
+        expect(past.status == checks.FAIL and "with up to 300 more lost unrecorded" in past.detail,
                f"more than a batch a step unrecorded FAILs, got {past}")
 
 

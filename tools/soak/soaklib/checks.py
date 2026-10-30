@@ -79,9 +79,11 @@ A rolling overlap (`[overlap]`) runs several instances of one pipeline on one sh
 rows about a process life judge each instance on its own lives, and the wire, `progress`,
 `recovery`, and `ledger.overlap` judge them together ("a rolling overlap" below).
 
-A `signal`, `rename`, `rotate`, or `probe` step opens no fault window (`RunData.events`): only
-`[[expect]]`, `file.reopen`, `tls.served`, and `self_log`'s excusal of a broken rotation's
-failed reload read it, and every other row judges straight through it.
+A `signal`, `rename`, `rotate`, `probe`, `copytruncate`, `gzip`, or `replace` step opens no
+fault window (`RunData.events`): only `[[expect]]`, `file.reopen`, `tls.served`, and
+`self_log`'s excusal of a broken rotation's failed reload read its window, `ledger.wire` reads a
+`copytruncate`'s record (`Ledger.copytruncate_band`), and every other row judges straight
+through it.
 
 `rss_slope` and `fd_slope` judge each `logit` service on its own line, and a scenario's
 `[expected]` table can set the verdict a service should get on either (`judge_services`).
@@ -2427,13 +2429,20 @@ class Ledger:
         Below, each step's `lost_lines` are in neither file, so a tailer reads them only if a
         read lands between the copy and the truncate, plus what the shared directory's count
         shows lost beyond the records, at most one writer batch a step (`_file_wire_one`).
-        Above, a step while a tailer runs can duplicate: a read in that window leaves the copy
-        shorter than what the tailer read, so the copy can't claim the original's state and is
-        read from 0, every line it holds again, plus one line the truncation discarded, counted
-        `frames.dropped{reason="truncated"}`, that the copy also holds whole. A step while the
-        ingress SUT is down, between a stop, kill, restart, `exit`, or pause and its revert,
-        adds nothing above: no read lands in the window, so the copy claims at the checkpoint's
-        offset, and a kill's replay is the kill's own allowance."""
+
+        Above, a copy is read from 0 instead of claiming only when the tailer read past the
+        copy's end, since a truncated file's candidate needs the copy to reach the original's
+        read offset. Before the truncate the original grows past the copy's end only by bytes
+        appended after the copy's last read: the step's own `lost_bytes`, or a write the count
+        shows lost unrecorded. So a step while a tailer runs whose record has `lost_bytes`, or
+        every such step when the count shows an unrecorded shortfall, may read its copy's lines
+        again, plus one: the copy then ends inside the line the truncation cut, and a tailer
+        reading it from 0 holds that fragment unterminated and emits it at a stop. Any other
+        step adds nothing above, and one while the ingress SUT is down, between a stop, kill,
+        restart, `exit`, or pause and its revert, adds nothing either: no read lands in its
+        window, so the copy claims at the checkpoint's offset, and a kill's replay is the
+        kill's own allowance. The step records are the harness's measurement, never the SUT's
+        claim count."""
         low = high = 0
         lines = []
         down = [fault for fault in self.data.faults
@@ -2445,32 +2454,36 @@ class Ledger:
             ops = copytruncates(self.data, service)
             if not ops:
                 continue
-            recorded = 0
+            recorded = sum(op.get("lost_lines", 0) for op in ops)
+            shortfall = 0
+            if counted.get("lines") is not None:
+                G = self.gen_stats.get(service, {}).get("G", 0)
+                shortfall = max(0, G - counted["lines"] - recorded)
             for op in ops:
                 at = op.get("started_at", 0)
                 stopped = next((fault for fault in down if fault.start <= at <= fault.end),
                                None)
                 lost, copied = op.get("lost_lines", 0), op.get("copied_lines", 0)
-                above = 0 if stopped else copied + 1
-                recorded += lost
+                appended = op.get("lost_bytes", 0) > 0 or shortfall > 0
+                above = copied + 1 if appended and not stopped else 0
                 low -= lost
                 high += above
                 when = (f"the SUT down ({stopped.action})" if stopped else "a tailer running")
+                why = ("" if stopped else
+                       f"; above, the copy's {_n(copied)} lines and its cut line read again "
+                       "from 0, since bytes were appended after the copy's last read"
+                       if appended else
+                       "; nothing above, since nothing was appended after the copy's last "
+                       "read, so the copy claims")
                 lines.append(f"copytruncate at {self.data.offset(at)}, {when}: [-{_n(lost)}, "
-                             f"+{_n(above)}]: its lost lines below"
-                             + ("" if stopped else
-                                f"; above, the copy's {_n(copied)} lines read again from 0 "
-                                "if a read lands before the truncate, and one discarded line"))
-            if counted.get("lines") is not None:
-                G = self.gen_stats.get(service, {}).get("G", 0)
-                unrecorded = max(0, min(G - counted["lines"] - recorded,
-                                        len(ops) * self.gen_stats.get(service, {}).get(
-                                            "batch", 0)))
-                if unrecorded:
-                    low -= unrecorded
-                    lines.append(f"copytruncates: [-{_n(unrecorded)}, 0]: lines in no file "
-                                 "past the records, written between a last read and its "
-                                 "truncate")
+                             f"+{_n(above)}]: its lost lines below{why}")
+            unrecorded = min(shortfall, len(ops) * self.gen_stats.get(service, {}).get(
+                "batch", 0))
+            if unrecorded:
+                low -= unrecorded
+                lines.append(f"copytruncates: [-{_n(unrecorded)}, 0]: lines in no file "
+                             "past the records, written between a last read and its "
+                             "truncate")
         return low, high, lines
 
     def egress(self, life, sinks):
