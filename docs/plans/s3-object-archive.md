@@ -116,7 +116,8 @@ each waiting on an observable through `logit_pipeline::test_util`:
   window's answers are read, and the N - 1 answers behind the head come with no fill or wait
   between them;
 - the grace deadline passes between the head's answer and the owed ones: every owed answer is
-  read, each batch counts delivered, and nothing is counted dropped or left to replay;
+  read, each batch counts delivered, and nothing is counted dropped or left to replay; and a
+  grace that passes during the head's own upload still cuts it;
 - a submit failure past the head makes the head's next `await_ack` fail without `HeadOnly`, and
   the loop resubmits from the head, the failed batch included;
 - pressure closes it in a memory store under `block` and under `drop_oldest`, and in a disk store

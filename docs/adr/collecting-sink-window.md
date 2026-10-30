@@ -191,11 +191,13 @@ read before the next window opens.
   counts, which are mid-send.
 - **The grace doesn't cut a closed window's owed answers.** They belong to a window the
   destination already stored, and the sink answers them at once, so reading them costs no wait.
-  While the sink's `window()` reads an owed count, `deliver_window`'s grace early return and
-  `write_loop`'s grace arms don't fire; the loop reads every owed answer, commits each batch as
-  delivered, and only then honors the expired grace. Without this, a grace that passed between
-  the head's answer and the rest would count stored batches as shutdown drops, or replay them
-  from a disk store as duplicates.
+  The loop samples `window()` before each round's `select!`. A round that starts with an owed
+  count, which only happens after the head's answer, skips `deliver_window`'s grace early return
+  and `write_loop`'s grace arms; the loop reads every owed answer, commits each batch as
+  delivered, and only then honors the expired grace. The head's own round, which runs the
+  upload, starts with `window()` at `usize::MAX`, so the grace still cuts a stuck upload. Without
+  this, a grace that passed between the head's answer and the rest would count stored batches as
+  shutdown drops, or replay them from a disk store as duplicates.
 - **The grace is short for an upload.** Under the memory store, a grace cut counts the open
   window's batches as shutdown drops. `s3_out`'s operator doc will recommend a
   `buffer.shutdown_grace` long enough for one object's upload, and `buffer.disk:`, which replays
