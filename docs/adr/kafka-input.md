@@ -256,11 +256,14 @@ from Redpanda at all.
   (default 64 MiB, item 10). One fetch request is bounded by `max_bytes`, and its answer is read
   under the Fetch cap, `max_bytes` plus `max_batch_bytes` plus 1 MiB, so the one batch KIP-74
   returns over `max_bytes` fits; every other answer is held to 64 MiB.
-- **Every send goes through `Fanout::send_with_deadline`**, which reserves a slot on every consumer
+- **Every send goes through `Fanout::send_resumable`**, which reserves a slot on every consumer
   before it sends, so a send that times out has sent nothing and none is dropped part way
   ([`fanout.rs`](../../crates/logit-pipeline/src/fanout.rs)'s module doc). While no revoke is
-  pending, a timeout retries the same batch; once one is pending, the deadline is the drain
-  deadline (item 8).
+  pending, the input offers the same batch in 250 ms attempts, reading the revoke and shutdown
+  signals between them; once one is pending, the deadline is the drain deadline (item 8). An
+  attempt that times out releases every slot it holds but keeps its wait queued on the consumer
+  it was parked on, so on a fan-in edge a peer that queued after `kafka_in` doesn't take the
+  freed slot first, and no reservation outlives its deadline.
 - **A closed consumer** ends the input as it ends `tail_in`: the batch no consumer took is counted
   `logit.input.batches.dropped{reason="closed_consumer"}` and not committed, the commit before it
   is made, and the member leaves the group so another member reads on.
@@ -322,7 +325,9 @@ A revoke, at every rebalance and at shutdown, runs in this order:
 1. Every fetch loop stops, and buffered records not yet in a batch are discarded; the next owner
    reads them.
 2. The batch in flight gets the drain deadline, `drain_timeout` (default 5 s, kept below
-   `rebalance_timeout` by graph rule 101; at shutdown also bounded by `shutdown_grace`). A batch
+   `rebalance_timeout` by graph rule 101). Shutdown caps it at the lesser of `drain_timeout` and
+   half of `shutdown_grace` from when shutdown is seen, over a revoke's drain already running,
+   so the other half is left for step 3 and LeaveGroup. A batch
    accepted by then advances the position. One that isn't is not sent, not committed, and counted
    `logit.input.batches.deferred`, with the batches decoded behind it.
 3. A synchronous commit of every revoked partition's position.

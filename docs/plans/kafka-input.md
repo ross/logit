@@ -153,7 +153,7 @@ The protocol client, with no `Input` and no config: everything W3 drives.
   or dropped batch), each with its test, beside a pointer to `logit_kafka::consumer`'s table of
   broker outcomes (the ADR's item 9), the carriers, and the commit rule; `input.rs`, the `Input` with `run_until_shutdown` overridden for the item 8
   sequence; `decode.rs`, the `json`, `text` (both `record:` modes), and `native` decoders and the
-  carriers. Batches go through `Fanout::send_with_deadline` as item 5 describes.
+  carriers. Batches go through `Fanout::send_resumable` as item 5 describes.
 - **`kafka_out` changes.**
   - `format: text` under `record: batch` escapes `\` and LF, in `encode.rs` and its module doc.
     [ADR `kafka-output`](../adr/kafka-output.md) gets an amendment superseding "Amendment: what W3
