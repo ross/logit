@@ -6,7 +6,7 @@
 //! # The commit rule
 //!
 //! A partition's offset is committed only once every record before it is in a batch
-//! `Fanout::send_with_deadline` accepted into every open downstream inbox, never on a sink's
+//! `Fanout::send_resumable` accepted into every open downstream inbox, never on a sink's
 //! delivery. Each `Fetched` is decoded whole, cut into batches in offset order at
 //! `receive.batch_max_events` and `batch_max_bytes` (record value bytes; a record is never
 //! split), and each cut's offset range goes to `Consumer::mark_accepted` once all of its batches
@@ -14,10 +14,13 @@
 //! falls in. A dropped record is committed past, the third exception to
 //! [ADR `delivery-semantics`](../../../../docs/adr/delivery-semantics.md) item 3.
 //!
-//! While no revoke is pending, a batch that finds no room is offered again with no end. Once a
-//! revoke is pending, the batch in flight has `drain_timeout`; at shutdown it has the lesser of
-//! `drain_timeout` and half of `receive.shutdown_grace`, leaving the other half for the commit
-//! and the LeaveGroup.
+//! While no revoke is pending, a batch that finds no room is offered again with no end, in
+//! 250 ms attempts between which the loop reads the revoke and shutdown signals. Its
+//! `Reservation` keeps its place in line on the inbox it waits for, so a fan-in peer that queued
+//! after it never takes a freed slot first. Once a revoke is pending, the batch in flight has
+//! `drain_timeout`. Shutdown caps that deadline, whether or not a revoke's is running, at the
+//! lesser of `drain_timeout` and half of `receive.shutdown_grace` from when it's seen, leaving
+//! the other half for the commit and the LeaveGroup.
 //!
 //! # Outcomes
 //!

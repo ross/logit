@@ -7,14 +7,15 @@ use std::time::Duration;
 
 use logit_core::{Diagnostics, EventBatch, Telemetry};
 use logit_kafka::consumer::{Consumer, ConsumerSettings, Fetched, Next};
-use logit_pipeline::{Fanout, Input, SendTimeout};
+use logit_pipeline::{Fanout, Input, Reservation, SendTimeout};
 use tokio::sync::watch;
 use tokio::time::Instant;
 
 use super::decode::{Decoded, KafkaInFormat, RecordDecoder};
 
 /// How long one attempt at a send waits before the loop checks for a revoke or a shutdown and
-/// offers the batch again. A timed-out attempt sent nothing, so a retry is no duplicate.
+/// offers the batch again. A timed-out attempt sent nothing, so a retry is no duplicate, and its
+/// [`Reservation`] keeps the input's place in line on the inbox it waits for.
 const SEND_SLICE: Duration = Duration::from_millis(250);
 
 /// Everything a [`KafkaInput`] is built from; `logit-cli` fills it from config.
@@ -53,6 +54,34 @@ struct Cut {
     /// Offsets this cut covers, from [`Fetched::cut`].
     range: Range<i64>,
     batches: Vec<EventBatch>,
+}
+
+/// The drain deadline of one delivery: set when a revoke is first seen pending, and capped once
+/// when shutdown is first seen, whichever came first.
+#[derive(Default)]
+struct Drain {
+    deadline: Option<Instant>,
+    /// Whether shutdown's cap is applied.
+    capped: bool,
+}
+
+impl Drain {
+    /// Starts or tightens the deadline. Shutdown caps it at the lesser of `drain_timeout` and
+    /// half of `shutdown_grace` from now, over a revoke's deadline already running, so the other
+    /// half is left for the commit and the LeaveGroup.
+    fn update(&mut self, settings: &KafkaInSettings, shutdown: bool, revoke: bool) {
+        if shutdown && !self.capped {
+            let cap = Instant::now() + settings.drain_timeout.min(settings.shutdown_grace / 2);
+            self.deadline = Some(self.deadline.map_or(cap, |d| d.min(cap)));
+            self.capped = true;
+        } else if self.deadline.is_none() && revoke {
+            self.deadline = Some(Instant::now() + settings.drain_timeout);
+        }
+    }
+
+    fn passed(&self) -> bool {
+        self.deadline.is_some_and(|d| Instant::now() >= d)
+    }
 }
 
 /// How a delivery ended.
@@ -161,34 +190,29 @@ impl KafkaInput {
     }
 
     /// Sends each cut in order and marks it accepted once every batch of it is. While no revoke
-    /// is pending, a batch that finds no room is offered again with no end; once one is pending,
-    /// or shutdown fires, the batch in flight has until the drain deadline, and a batch not
-    /// accepted by then is deferred with every batch behind it.
+    /// is pending, a batch that finds no room is offered again with no end, keeping its place in
+    /// line; once one is pending, or shutdown fires, the batch in flight has until the drain
+    /// deadline, and a batch not accepted by then is deferred with every batch behind it.
     async fn deliver(
         &mut self,
         fetched: Fetched,
         sink: &Fanout,
         shutdown: &watch::Receiver<bool>,
-        drain: &mut Option<Instant>,
     ) -> Delivery {
+        let mut drain = Drain::default();
         let cuts = self.decode(&fetched);
         let consumer = self.consumer.as_mut().expect("bound before delivery");
         let mut cuts = cuts.into_iter();
         while let Some(cut) = cuts.next() {
             let mut batches = cut.batches.into_iter();
             while let Some(mut batch) = batches.next() {
+                let mut reservation = Reservation::default();
                 loop {
-                    if drain.is_none() {
-                        if *shutdown.borrow() {
-                            let grace = self.settings.shutdown_grace / 2;
-                            *drain = Some(Instant::now() + self.settings.drain_timeout.min(grace));
-                        } else if consumer.revoke_pending().is_some() {
-                            *drain = Some(Instant::now() + self.settings.drain_timeout);
-                        }
-                    }
+                    let revoke = consumer.revoke_pending().is_some();
+                    drain.update(&self.settings, *shutdown.borrow(), revoke);
                     let slice = Instant::now() + SEND_SLICE;
-                    let deadline = drain.map_or(slice, |d| d.min(slice));
-                    match sink.send_with_deadline(batch, deadline).await {
+                    let deadline = drain.deadline.map_or(slice, |d| d.min(slice));
+                    match sink.send_resumable(&mut reservation, batch, deadline).await {
                         Ok(true) => break,
                         Ok(false) => {
                             let behind = batches.len()
@@ -216,7 +240,7 @@ impl KafkaInput {
                             return Delivery::Closed;
                         }
                         Err(SendTimeout(back)) => {
-                            if drain.is_some_and(|d| Instant::now() >= d) {
+                            if drain.passed() {
                                 let behind = 1
                                     + batches.len()
                                     + cuts.by_ref().map(|c| c.batches.len()).sum::<usize>();
@@ -298,13 +322,10 @@ impl Input for KafkaInput {
                 _ = shutdown.wait_for(|&due| due) => break,
             };
             match next {
-                Next::Records(fetched) => {
-                    let mut drain = None;
-                    match self.deliver(fetched, &sink, &shutdown, &mut drain).await {
-                        Delivery::Done => {}
-                        Delivery::Shutdown | Delivery::Closed => break,
-                    }
-                }
+                Next::Records(fetched) => match self.deliver(fetched, &sink, &shutdown).await {
+                    Delivery::Done => {}
+                    Delivery::Shutdown | Delivery::Closed => break,
+                },
                 // The next `next` commits what was accepted and rejoins.
                 Next::Revoke(_) => {}
             }
