@@ -16,12 +16,10 @@
 //! mechanism and [`Authenticator::principal`], never a secret, and adds [`Session::failure`] to a
 //! broker's refusal.
 
-mod aws_creds;
 mod msk_iam;
 mod oauth;
 mod plain;
 mod scram;
-mod sigv4;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,11 +35,11 @@ use super::conn::{Conn, SASL_HANDSHAKE_VERSION};
 use super::fault;
 
 #[cfg(test)]
-pub(crate) use aws_creds::{Endpoints, Env};
+pub(crate) use logit_aws::creds::{Endpoints, Env};
+#[cfg(test)]
+pub(crate) use logit_aws::sigv4::{AmzDate, Signer};
 #[cfg(test)]
 pub(crate) use scram::{escape_username, ScramHash};
-#[cfg(test)]
-pub(crate) use sigv4::{AmzDate, Signer};
 
 /// A `kafka_out` sink's SASL credentials. Mirrors `logit_config::KafkaSasl`; its `Debug` leaves
 /// the password, the token, and the client secret out. `AwsMskIam` holds no secret: its
@@ -147,7 +145,7 @@ pub(crate) fn authenticator(settings: &KafkaSasl, timeout: Duration) -> Arc<dyn 
             timeout,
         )),
         KafkaSasl::AwsMskIam { region } => {
-            Arc::new(msk_iam::MskIam::new(region, aws_creds::Chain::new(timeout)))
+            Arc::new(msk_iam::MskIam::new(region, logit_aws::creds::Chain::new(timeout)))
         }
     }
 }
@@ -162,7 +160,7 @@ pub(crate) fn msk_iam_with(
 ) -> Arc<dyn Authenticator> {
     Arc::new(msk_iam::MskIam::new(
         region.map(String::from),
-        aws_creds::Chain::with(env, endpoints, timeout),
+        logit_aws::creds::Chain::with(env, endpoints, timeout),
     ))
 }
 
