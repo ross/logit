@@ -19,7 +19,11 @@
 //!   records aren't counted.
 //! - **Bad batches.** A CRC mismatch or an unparsable batch refetches the partition once from
 //!   the same offset; a second failure at the same batch skips it, counted
-//!   `records.dropped{reason="corrupt"}`. An oversize batch (`oversize`) and a magic 0 or 1
+//!   `records.dropped{reason="corrupt"}` per offset skipped. The skip ends at the next decoded
+//!   batch's base offset in the answer; else at the base offset in the first 12 bytes of a batch
+//!   the answer cut short, when it's above the failed batch's base and at or below the high
+//!   watermark; else at the high watermark (the last stable offset under `read_committed`). It
+//!   never ends at an offset the failed batch's header names. An oversize batch (`oversize`) and a magic 0 or 1
 //!   message set (`legacy_format`) are skipped at once. Each skip has a throttled diagnostic
 //!   naming the topic, partition, and offset.
 //! - **A loop's response is applied only to partitions still at the requested offset, led by
@@ -28,6 +32,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -40,7 +45,7 @@ use tokio::time::Instant;
 
 use super::group::Failure;
 use super::offsets::{self, Tracker, EARLIEST, LATEST};
-use super::pool::{Link, Pool, Slot, Target};
+use super::pool::{CallError, Link, Pool, Slot, Target};
 use super::{
     intern, partition_code, Backoff, FetchBounds, Isolation, PartitionCode, TopicPartition,
 };
@@ -49,6 +54,9 @@ use super::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fetched {
     pub tp: TopicPartition,
+    /// The partition's reset epoch when these were fetched, for
+    /// [`super::Consumer::mark_accepted`]: a range from before a reset is ignored.
+    pub epoch: u64,
     pub records: Vec<Record>,
     /// Every offset this fetch consumed: the records, and any control record, aborted record,
     /// skipped batch, or compaction gap between them.
@@ -84,10 +92,23 @@ pub(crate) enum Position {
     OutOfRange(i64),
 }
 
+/// A process-unique reset epoch, so no two partition states, or two resets of one, share one.
+pub(crate) fn next_epoch() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 /// One assigned partition's fetch state.
 #[derive(Debug)]
 pub(crate) struct Part {
     pub(crate) leader: Option<i32>,
+    /// Changes with every tracker reset; [`Fetched::epoch`] carries it.
+    pub(crate) epoch: u64,
+    /// The epoch the state started with: an older one belongs to another assignment.
+    first_epoch: u64,
+    /// Per reset, the epoch it replaced and the lowest offset any reset at or after it moved
+    /// the tracker to, so `reset_at` rises with the epoch.
+    resets: Vec<(u64, i64)>,
     pub(crate) position: Position,
     pub(crate) buffer: Option<Fetched>,
     /// No fetch before this, after an error.
@@ -100,14 +121,44 @@ pub(crate) struct Part {
 
 impl Part {
     pub(crate) fn new(position: Position, tracker: Tracker) -> Self {
+        let epoch = next_epoch();
         Self {
             leader: None,
+            epoch,
+            first_epoch: epoch,
+            resets: Vec::new(),
             position,
             buffer: None,
             retry_at: None,
             backoff: Backoff::new(),
             corrupt_at: None,
             tracker,
+        }
+    }
+
+    /// Resets the tracker to `position`, the end of a log that no longer holds the offsets
+    /// fetched before it, and starts a new epoch.
+    pub(crate) fn reset(&mut self, position: i64) {
+        self.tracker.reset(position);
+        for (_, at) in &mut self.resets {
+            *at = (*at).min(position);
+        }
+        self.resets.retain(|&(_, at)| at != position);
+        self.resets.push((self.epoch, position));
+        self.epoch = next_epoch();
+    }
+
+    /// Marks `range`, fetched in `epoch`, done. A range from before a reset is cut at the lowest
+    /// offset a reset since then moved to: offsets below it named the same records then as now,
+    /// and leaving them unmarked would hold the commit below them forever. A range from another
+    /// assignment is ignored.
+    pub(crate) fn accept(&mut self, epoch: u64, range: Range<i64>) {
+        if epoch == self.epoch {
+            self.tracker.mark(range);
+        } else if (self.first_epoch..self.epoch).contains(&epoch) {
+            if let Some(&(_, at)) = self.resets.iter().find(|&&(replaced, _)| replaced >= epoch) {
+                self.tracker.mark(range.start..range.end.min(at));
+            }
         }
     }
 
@@ -147,6 +198,21 @@ pub(crate) struct LoopSettings {
     pub(crate) max_batch_bytes: usize,
 }
 
+/// What a Fetch answer adds beyond its records: the response, topic, and partition headers and
+/// the aborted-transaction lists.
+const FETCH_ANSWER_SLACK: usize = 1 << 20;
+
+impl LoopSettings {
+    /// The largest Fetch answer to read: `max_bytes` of records, plus one batch past it, which
+    /// KIP-74 returns whole and `max_batch_bytes` bounds, plus the answer's own framing. A
+    /// batch over `max_batch_bytes` in a larger answer fails as a transport error.
+    pub(crate) fn max_response(&self) -> usize {
+        usize::try_from(self.bounds.max_bytes.max(0)).unwrap_or(0)
+            + self.max_batch_bytes
+            + FETCH_ANSWER_SLACK
+    }
+}
+
 /// Runs the fetch loop for broker `node` until aborted.
 pub(crate) async fn run(
     node: i32,
@@ -155,7 +221,8 @@ pub(crate) async fn run(
     wakes: Arc<Wakes>,
     settings: LoopSettings,
 ) {
-    let mut link = Link::new(Slot::Fetch(node), Target::Node(node));
+    let mut link =
+        Link::new(Slot::Fetch(node), Target::Node(node)).with_max_response(settings.max_response());
     let mut backoff = Backoff::new();
     loop {
         let wake = wakes.loops.notified();
@@ -280,7 +347,7 @@ async fn resolve(
                 part.tracker.mark(*from..start);
                 start
             } else if *from > end {
-                part.tracker.reset(end);
+                part.reset(end);
                 end
             } else {
                 *from
@@ -393,6 +460,19 @@ async fn fetch(
         .await;
     let response = match result {
         Ok((_, response)) => response,
+        // A batch the answer can't skip without reading: the same fetch draws the same answer.
+        Err(CallError::TooLarge(err)) => {
+            pool.counters.warn(
+                "response_too_large",
+                format_args!(
+                    "Kafka broker {node}: a Fetch answer declares {} bytes, over the {}-byte cap \
+                     of fetch.max_bytes plus max_batch_bytes plus 1 MiB; a record batch this \
+                     large holds its partition until max_batch_bytes is raised",
+                    err.declared, err.cap
+                ),
+            );
+            return Err(());
+        }
         Err(_) => {
             shared.lock().unwrap().refresh = true;
             return Err(());
@@ -452,15 +532,16 @@ async fn fetch(
                 Isolation::ReadUncommitted => Vec::new(),
             };
             let blob = data.records.clone().unwrap_or_default();
-            let read = read(&blob, from, &aborted, settings.max_batch_bytes, part.corrupt_at);
-            part.corrupt_at = read.corrupt_at;
-            part.backoff.reset();
-            part.retry_at = None;
-            count_read(pool, &tp, &read);
             let stable = match settings.isolation {
                 Isolation::ReadCommitted => data.last_stable_offset,
                 Isolation::ReadUncommitted => data.high_watermark,
             };
+            let read =
+                read(&blob, from, &aborted, settings.max_batch_bytes, part.corrupt_at, stable);
+            part.corrupt_at = read.corrupt_at;
+            part.backoff.reset();
+            part.retry_at = None;
+            count_read(pool, &tp, &read);
             if stable >= 0 {
                 pool.counters.telemetry.gauge(
                     "logit.input.lag",
@@ -477,6 +558,7 @@ async fn fetch(
             } else {
                 part.buffer = Some(Fetched {
                     tp: tp.clone(),
+                    epoch: part.epoch,
                     records: read.records,
                     span: from..read.position,
                 });
@@ -506,38 +588,66 @@ pub(crate) struct Read {
 
 /// Reads a partition's records blob from offset `from`. `aborted` is the answer's aborted
 /// transactions, `(producer id, first offset)`, empty under `read_uncommitted`; `corrupt_at` is
-/// the base offset of a batch that already failed once.
+/// the base offset of a batch that already failed once; `end` is the answer's high watermark, or
+/// its last stable offset under `read_committed`.
+///
+/// A corrupt batch's skip never trusts its header past the base offset, since the CRC covers
+/// `last_offset_delta` and `record_count`: it lands on the next entry's base offset when one
+/// follows in the blob; else on the base offset of a batch the blob ends inside of, read from its
+/// first 12 bytes, when that is above the failed batch's base and at or below `end`; else on
+/// `end`. It counts the offsets it passes.
 pub(crate) fn read(
     blob: &Bytes,
     from: i64,
     aborted: &[(i64, i64)],
     max_batch_bytes: usize,
     corrupt_at: Option<i64>,
+    end: i64,
 ) -> Read {
     let mut pending: Vec<(i64, i64)> = aborted.to_vec();
     pending.sort_by_key(|&(_, first)| first);
     let mut pending = pending.into_iter().peekable();
     let mut aborting: HashSet<i64> = HashSet::new();
     let mut out = Read { position: from, ..Read::default() };
-    for entry in logit_proto::kafka::decode(blob, max_batch_bytes) {
+    let decoded = logit_proto::kafka::decode(blob, max_batch_bytes);
+    let entries = decoded.entries;
+    let bases: Vec<i64> = entries
+        .iter()
+        .map(|e| match e {
+            Ok(batch) => batch.base_offset,
+            Err(err) => err.base_offset,
+        })
+        .collect();
+    for (i, entry) in entries.into_iter().enumerate() {
         let batch = match entry {
             Ok(batch) => batch,
+            Err(err) if err.kind == BatchErrorKind::Corrupt => {
+                if corrupt_at != Some(err.base_offset) {
+                    out.corrupt_at = Some(err.base_offset);
+                    return out;
+                }
+                let base = err.base_offset;
+                let partial = decoded.partial_base.filter(|&b| b > base && b <= end);
+                let next = match bases.get(i + 1) {
+                    Some(&next) => next,
+                    None => partial.unwrap_or(end),
+                }
+                .max(out.position + 1);
+                out.dropped.push(("corrupt", next - out.position, err.base_offset));
+                out.position = next;
+                continue;
+            }
             Err(err) => {
-                let next = err.last_offset.map_or(err.base_offset.max(out.position) + 1, |l| l + 1);
+                let last = err.last_offset.unwrap_or(err.base_offset).max(err.base_offset);
+                let next = last + 1;
                 if next <= out.position {
                     continue;
                 }
                 let reason = match err.kind {
                     BatchErrorKind::Oversize => "oversize",
-                    BatchErrorKind::LegacyFormat => "legacy_format",
-                    BatchErrorKind::Corrupt if corrupt_at != Some(err.base_offset) => {
-                        out.corrupt_at = Some(err.base_offset);
-                        return out;
-                    }
-                    BatchErrorKind::Corrupt => "corrupt",
+                    _ => "legacy_format",
                 };
-                // A legacy entry, or a header too broken to count, declares no records: its
-                // offsets stand in for them.
+                // A legacy entry declares no records: its offsets stand in for them.
                 let records = match err.record_count {
                     n if n > 0 => i64::from(n),
                     _ => next - out.position,
@@ -603,5 +713,60 @@ fn count_read(pool: &Pool, tp: &TopicPartition, read: &Read) {
             read.aborted as f64,
             &[("reason", "aborted")],
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn part(position: i64, committed: i64) -> Part {
+        Part::new(Position::At(position), Tracker::new(position, Some(committed)))
+    }
+
+    /// A range handed out before a reset stays markable below the reset point, so the commit it
+    /// held back can move once the reset's own records are done.
+    #[test]
+    fn a_range_from_before_a_reset_is_cut_at_the_reset_point() {
+        let mut p = part(2, 2);
+        let before = p.epoch;
+        p.reset(3);
+        assert_eq!(p.tracker.candidate(), 2);
+        p.accept(before, 2..6);
+        assert_eq!(p.tracker.candidate(), 3);
+        p.accept(p.epoch, 3..4);
+        assert_eq!(p.tracker.candidate(), 4);
+    }
+
+    /// Two resets: a range from between them is cut at the second's point, and one from before
+    /// both at the lower of the two.
+    #[test]
+    fn each_epoch_is_cut_at_the_lowest_reset_since_it() {
+        let mut p = part(0, 0);
+        let first = p.epoch;
+        p.reset(8);
+        let second = p.epoch;
+        p.reset(10);
+        p.accept(second, 8..12);
+        assert_eq!(p.tracker.candidate(), 0);
+        p.accept(first, 0..9);
+        assert_eq!(p.tracker.candidate(), 10);
+
+        let mut p = part(0, 0);
+        let first = p.epoch;
+        p.reset(8);
+        p.reset(4);
+        p.accept(first, 0..9);
+        assert_eq!(p.tracker.candidate(), 4);
+    }
+
+    /// Even after a reset, whose cut would otherwise apply to every older epoch.
+    #[test]
+    fn a_range_from_another_assignment_is_ignored() {
+        let old = part(0, 0);
+        let mut p = part(0, 0);
+        p.reset(5);
+        p.accept(old.epoch, 0..5);
+        assert_eq!(p.tracker.candidate(), 0);
     }
 }

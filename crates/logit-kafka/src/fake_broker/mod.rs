@@ -88,7 +88,7 @@ use sasl::{sasl_authenticate, Auth};
 const DEDUP_WINDOW: usize = 5;
 
 /// The bound on one batch's decompressed records section: far above any batch a test sends.
-const MAX_RECORDS_BYTES: usize = 64 << 20;
+const MAX_RECORDS_BYTES: usize = 256 << 20;
 
 /// What Kafka 2.4.0 advertises in `ApiVersions` for the APIs the Kafka clients send, from its
 /// `clients/src/main/resources/common/message/*Request.json`, for [`State::api_versions`].

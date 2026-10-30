@@ -19,7 +19,8 @@
 //!
 //! - A blob can end with a truncated batch, because a broker cuts a response at its byte limit.
 //!   Fewer than 12 bytes left, or a batch length that reaches past the end, ends decoding with no
-//!   entry; the consumer refetches from there.
+//!   entry; the consumer refetches from there. When the cut batch's first 12 bytes are there, its
+//!   base offset is [`Decoded::partial_base`].
 //! - A negative batch length, or one too short to hold a header, is [`BatchErrorKind::Corrupt`]
 //!   with no last offset, and ends decoding, because the next batch's start is unknown.
 //! - Magic 0 and 1 are [`BatchErrorKind::LegacyFormat`] and skipped; any other magic but 2 is
@@ -183,10 +184,21 @@ fn be_i16(b: &[u8], at: usize) -> i16 {
     i16::from_be_bytes(b[at..at + 2].try_into().unwrap_or_default())
 }
 
+/// What [`decode`] read from one records blob.
+#[derive(Debug, Default)]
+pub struct Decoded {
+    /// Every complete batch, in order.
+    pub entries: Vec<Result<RecordBatch, BatchError>>,
+    /// The base offset of a batch the blob ends inside of, when at least its first 12 bytes
+    /// (base offset and batch length) are there. No CRC covers them.
+    pub partial_base: Option<i64>,
+}
+
 /// Decodes every complete batch in `bytes`, in order. Each batch's records section decompresses
 /// to at most `max_records_bytes`.
-pub fn decode(bytes: &Bytes, max_records_bytes: usize) -> Vec<Result<RecordBatch, BatchError>> {
+pub fn decode(bytes: &Bytes, max_records_bytes: usize) -> Decoded {
     let mut out = Vec::new();
+    let mut partial_base = None;
     let mut pos = 0usize;
     while bytes.len() - pos >= 12 {
         let head = &bytes[pos..];
@@ -205,6 +217,7 @@ pub fn decode(bytes: &Bytes, max_records_bytes: usize) -> Vec<Result<RecordBatch
         };
         let total = 12 + length;
         if total > head.len() {
+            partial_base = Some(base_offset);
             break;
         }
         let batch = bytes.slice(pos..pos + total);
@@ -234,7 +247,7 @@ pub fn decode(bytes: &Bytes, max_records_bytes: usize) -> Vec<Result<RecordBatch
         }
         out.push(decode_v2(&batch, max_records_bytes));
     }
-    out
+    Decoded { entries: out, partial_base }
 }
 
 /// Decodes one magic-2 batch of at least [`HEADER`] bytes.
@@ -515,9 +528,78 @@ mod tests {
     }
 
     fn one(b: Vec<u8>) -> Result<RecordBatch, BatchError> {
-        let mut got = decode(&Bytes::from(b), MAX);
+        let mut got = decode(&Bytes::from(b), MAX).entries;
         assert_eq!(got.len(), 1);
         got.remove(0)
+    }
+
+    /// The reason a one-record batch over `body` (one record's fields, unframed) fails with.
+    fn record_failure(body: &[u8], count: i32) -> String {
+        let mut section = Vec::new();
+        varint(&mut section, body.len() as i64);
+        section.extend_from_slice(body);
+        one(batch(0, count, &section)).unwrap_err().reason
+    }
+
+    /// A record's fields up to its header count: attributes, timestamp and offset deltas, and a
+    /// null key and value.
+    fn fields(header_count: i64) -> Vec<u8> {
+        let mut body = vec![0u8];
+        varint(&mut body, 0);
+        varint(&mut body, 0);
+        field(&mut body, None);
+        field(&mut body, None);
+        varint(&mut body, header_count);
+        body
+    }
+
+    /// The bound keeps `Vec::with_capacity` from sizing itself by the header's count.
+    #[test]
+    fn a_record_count_the_section_cant_hold_is_refused_before_reading() {
+        let reason = record_failure(&fields(0), 1_000);
+        assert!(reason.contains("record count exceeds the records section"), "{reason}");
+    }
+
+    #[test]
+    fn a_header_count_the_record_cant_hold_is_refused_before_reading() {
+        let reason = record_failure(&fields(50), 1);
+        assert!(reason.contains("header count exceeds the record"), "{reason}");
+    }
+
+    /// Java refuses a record whose fields end before its declared length.
+    #[test]
+    fn a_record_with_bytes_left_inside_its_length_is_refused() {
+        let mut body = fields(0);
+        body.push(0);
+        let reason = record_failure(&body, 1);
+        assert!(reason.contains("record shorter than its declared length"), "{reason}");
+    }
+
+    /// Six bytes encoding 0 for the offset delta, one past an `int32` varint's five.
+    #[test]
+    fn a_varint_over_five_bytes_is_refused() {
+        let mut body = vec![0u8];
+        varint(&mut body, 0);
+        body.extend_from_slice(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x00]);
+        field(&mut body, None);
+        field(&mut body, None);
+        varint(&mut body, 0);
+        let reason = record_failure(&body, 1);
+        assert!(reason.contains("varint too long"), "{reason}");
+    }
+
+    /// A timestamp delta whose tenth byte carries more than the 64th bit.
+    #[test]
+    fn a_varlong_past_64_bits_is_refused() {
+        let mut body = vec![0u8];
+        body.extend_from_slice(&[0xff; 9]);
+        body.push(0x02);
+        varint(&mut body, 0);
+        field(&mut body, None);
+        field(&mut body, None);
+        varint(&mut body, 0);
+        let reason = record_failure(&body, 1);
+        assert!(reason.contains("varint overflows 64 bits"), "{reason}");
     }
 
     fn kind(b: Vec<u8>) -> BatchErrorKind {
@@ -550,7 +632,7 @@ mod tests {
         for (producer, times) in timestamps {
             for (name, codec) in CODECS {
                 let file = format!("{producer}-{name}.segment");
-                let got = decode(&corpus(&file), MAX);
+                let got = decode(&corpus(&file), MAX).entries;
                 assert_eq!(got.len(), 1, "{file}");
                 let b = got[0].as_ref().unwrap_or_else(|e| panic!("{file}: {e}"));
                 assert_eq!(b.compression(), codec, "{file}");
@@ -585,7 +667,7 @@ mod tests {
         let records = sample(5);
         let stamp = Stamp { producer_id: 7, producer_epoch: 3, base_sequence: 40 };
         for (name, codec) in CODECS {
-            let got = decode(&encode(&records, stamp, codec).unwrap(), MAX);
+            let got = decode(&encode(&records, stamp, codec).unwrap(), MAX).entries;
             assert_eq!(got.len(), 1, "{name}");
             let b = got[0].as_ref().unwrap();
             assert_eq!(b.compression(), codec, "{name}");
@@ -671,8 +753,8 @@ mod tests {
         let section = record(0, 0, None, Some(&[b'x'; 300]), &[]);
         let b = batch(0, 1, &section);
         let blob = Bytes::from(b);
-        assert!(decode(&blob, section.len())[0].is_ok());
-        let err = decode(&blob, section.len() - 1).remove(0).unwrap_err();
+        assert!(decode(&blob, section.len()).entries[0].is_ok());
+        let err = decode(&blob, section.len() - 1).entries.remove(0).unwrap_err();
         assert_eq!(err.kind, BatchErrorKind::Oversize);
         assert_eq!(err.last_offset, Some(100));
     }
@@ -684,7 +766,7 @@ mod tests {
         for (name, codec) in CODECS.into_iter().skip(1) {
             let blob = encode(&records, Stamp::NONE, codec).unwrap();
             assert!(blob.len() < 5_000, "{name} compresses the run");
-            let err = decode(&blob, 10_000).remove(0).unwrap_err();
+            let err = decode(&blob, 10_000).entries.remove(0).unwrap_err();
             assert_eq!(err.kind, BatchErrorKind::Oversize, "{name}");
         }
     }
@@ -714,7 +796,7 @@ mod tests {
     fn a_legacy_message_set_is_reported_and_the_next_batch_still_decodes() {
         let good = batch(0, 1, &record(0, 0, None, Some(b"v"), &[]));
         let blob = Bytes::from([legacy_message_set(), good].concat());
-        let got = decode(&blob, MAX);
+        let got = decode(&blob, MAX).entries;
         assert_eq!(got.len(), 2);
         let err = got[0].as_ref().unwrap_err();
         assert_eq!(err.kind, BatchErrorKind::LegacyFormat);
@@ -727,21 +809,26 @@ mod tests {
         let mut bad = batch(0, 1, &record(0, 0, None, Some(b"v"), &[]));
         bad[16] = 9;
         let good = batch(0, 1, &record(0, 0, None, Some(b"v"), &[]));
-        let got = decode(&Bytes::from([bad, good].concat()), MAX);
+        let got = decode(&Bytes::from([bad, good].concat()), MAX).entries;
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].as_ref().unwrap_err().kind, BatchErrorKind::Corrupt);
         assert!(got[1].is_ok());
     }
 
+    /// A cut batch with its 12-byte head present reports its base offset, so a skip past a corrupt
+    /// batch before it can land there.
     #[test]
     fn a_trailing_truncated_batch_yields_only_the_complete_one() {
         let good = batch(0, 1, &record(0, 0, None, Some(b"v"), &[]));
-        for cut in [0, 5, 12, 40, good.len() - 1] {
+        for cut in [0, 5, 11, 12, 40, good.len() - 1] {
             let blob = Bytes::from([good.clone(), good[..cut].to_vec()].concat());
             let got = decode(&blob, MAX);
-            assert_eq!(got.len(), 1, "cut at {cut}");
-            assert!(got[0].is_ok());
+            assert_eq!(got.entries.len(), 1, "cut at {cut}");
+            assert!(got.entries[0].is_ok());
+            let partial = (cut >= 12).then_some(100);
+            assert_eq!(got.partial_base, partial, "cut at {cut}");
         }
+        assert_eq!(decode(&Bytes::from(good), MAX).partial_base, None);
     }
 
     #[test]
@@ -751,7 +838,7 @@ mod tests {
             let mut bad = batch(0, 1, &record(0, 0, None, Some(b"v"), &[]));
             bad[8..12].copy_from_slice(&length.to_be_bytes());
             let blob = Bytes::from([bad, good.clone()].concat());
-            let got = decode(&blob, MAX);
+            let got = decode(&blob, MAX).entries;
             assert_eq!(got.len(), 1, "length {length}");
             let err = got[0].as_ref().unwrap_err();
             assert_eq!((err.kind, err.last_offset), (BatchErrorKind::Corrupt, None), "{length}");
@@ -786,9 +873,9 @@ mod tests {
         for i in 0..mangled.len() {
             let saved = mangled[i];
             mangled[i] = 0xff;
-            let _ = decode(&Bytes::from(mangled.clone()), MAX);
+            let _ = decode(&Bytes::from(mangled.clone()), MAX).entries;
             refresh_crc(&mut mangled);
-            let _ = decode(&Bytes::from(mangled.clone()), MAX);
+            let _ = decode(&Bytes::from(mangled.clone()), MAX).entries;
             mangled[i] = saved;
         }
         for blob in [vec![], vec![0; 100], vec![0xff; 100], random, good[..30].to_vec()] {

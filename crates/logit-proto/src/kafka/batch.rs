@@ -166,7 +166,7 @@ mod tests {
     }
 
     fn decode(bytes: Bytes) -> Vec<super::super::RecordBatch> {
-        super::super::decode(&bytes, MAX).into_iter().map(|b| b.unwrap()).collect()
+        super::super::decode(&bytes, MAX).entries.into_iter().map(|b| b.unwrap()).collect()
     }
 
     fn sample(n: usize) -> Vec<ProducerRecord> {

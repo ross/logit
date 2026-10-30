@@ -16,7 +16,9 @@ pub mod compression;
 pub mod record;
 pub mod text;
 
-pub use record::{decode, BatchError, BatchErrorKind, Header, Record, RecordBatch, TimestampType};
+pub use record::{
+    decode, BatchError, BatchErrorKind, Decoded, Header, Record, RecordBatch, TimestampType,
+};
 
 /// `seq + count` on the broker's sequence ring, which wraps from `i32::MAX` to 0
 /// (`DefaultRecordBatch.incrementSequence`).

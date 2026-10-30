@@ -109,8 +109,10 @@ const API_VERSIONS_VERSION: i16 = 3;
 pub const PRODUCE_ZSTD_MIN: i16 = 7;
 /// The first `Produce` version whose response names records in `record_errors`.
 pub const PRODUCE_RECORD_ERRORS_MIN: i16 = 8;
-/// A response size no broker answer to these four requests comes near; a larger length prefix
-/// is a framing error, not an allocation to make.
+/// The default bound on a response's length prefix: no answer but a Fetch's comes near it, and a
+/// larger prefix is a framing error, not an allocation to make. A Fetch answer can carry
+/// `max_bytes` of records and one record batch past it (KIP-74), so the consumer reads Fetch
+/// through [`Conn::request_capped`] with a cap sized from its own bounds.
 pub const MAX_RESPONSE_BYTES: usize = 64 << 20;
 
 /// The step of [`Dialer::connect_staged`] a dial failed in.
@@ -187,6 +189,23 @@ impl Versions {
     }
 }
 
+/// A response whose length prefix is over the cap its request was read under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResponseTooLarge {
+    pub api: ApiKey,
+    pub declared: usize,
+    pub cap: usize,
+}
+
+impl std::fmt::Display for ResponseTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { api, declared, cap } = self;
+        write!(f, "a {api:?} response declares {declared} bytes, over the {cap}-byte cap")
+    }
+}
+
+impl std::error::Error for ResponseTooLarge {}
+
 /// A failed request: the error, and whether any byte of it could have reached the broker.
 #[derive(Debug)]
 pub struct RequestError {
@@ -201,6 +220,12 @@ impl RequestError {
 
     fn sent(error: anyhow::Error) -> Self {
         Self { sent: true, error }
+    }
+
+    /// The response's declared length when it was over the request's cap. The connection's
+    /// framing is lost with it, and the same request draws the same answer again.
+    pub fn too_large(&self) -> Option<&ResponseTooLarge> {
+        self.error.downcast_ref()
     }
 
     /// `Clean` when nothing left, `Ambiguous` once anything may have.
@@ -433,8 +458,20 @@ impl Conn {
         version: i16,
         wait: Duration,
     ) -> Result<R::Response, RequestError> {
+        self.request_capped(request, version, wait, MAX_RESPONSE_BYTES).await
+    }
+
+    /// [`Conn::request_within`] refusing a response whose length prefix is over `max_response`
+    /// bytes in place of [`MAX_RESPONSE_BYTES`].
+    pub async fn request_capped<R: Request>(
+        &mut self,
+        request: &R,
+        version: i16,
+        wait: Duration,
+        max_response: usize,
+    ) -> Result<R::Response, RequestError> {
         let correlation = self.write(request, version).await?;
-        self.read::<R>(version, correlation, wait).await
+        self.read::<R>(version, correlation, wait, max_response).await
     }
 
     /// Sends `request` at `version` without waiting: a `Produce` with `acks: none`, which the
@@ -506,14 +543,17 @@ impl Conn {
         version: i16,
         correlation: i32,
         wait: Duration,
+        max_response: usize,
     ) -> Result<R::Response, RequestError> {
         let key = ApiKey::try_from(R::KEY).expect("every request type has an API key");
         let body = async {
             let len = self.stream.read_i32().await?;
             let len = usize::try_from(len)
-                .ok()
-                .filter(|&n| n <= MAX_RESPONSE_BYTES)
-                .ok_or_else(|| anyhow!("a {key:?} response declares {len} bytes"))?;
+                .map_err(|_| anyhow!("a {key:?} response declares {len} bytes"))?;
+            if len > max_response {
+                let err = ResponseTooLarge { api: key, declared: len, cap: max_response };
+                return Err(anyhow::Error::new(err));
+            }
             let mut body = vec![0; len];
             self.stream.read_exact(&mut body).await?;
             anyhow::Ok(Bytes::from(body))

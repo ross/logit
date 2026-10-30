@@ -1594,12 +1594,12 @@ Kafka record is the unit.
 | `logit.input.rebalances{reason="start"\|"rebalance"\|"membership_lost"\|"metadata"}` | count | each completed join |
 | `logit.input.commits{class="ok"\|"error"\|"fenced"}` | count | each OffsetCommit |
 | `logit.input.offsets.reset{reason="no_commit"\|"out_of_range"}` | count | a partition starting with no committed offset, or moved after `OFFSET_OUT_OF_RANGE` |
-| `logit.input.broker.errors{api, error}` | count | each broker error code, by its snake_case Kafka name, or `transport`, `tls`, `sasl`, or `unsupported_version` for a failed dial or request |
+| `logit.input.broker.errors{api, error}` | count | each broker error code, by its snake_case Kafka name, or `transport`, `tls`, `sasl`, or `unsupported_version` for a failed dial or request, or `response_too_large` for a Fetch answer over its cap |
 | `logit.input.reconnects` | count | a redial of a connection the consumer dialed before |
 
 `Diagnostics` keys, each throttled: `records_dropped` (naming the topic, partition, and offset),
-`topic_missing`, `auth_failed`, `group_refused`, `not_authorized`, `unsupported_version`, and
-`broker_error` for any other code.
+`topic_missing`, `auth_failed`, `group_refused`, `not_authorized`, `unsupported_version`,
+`response_too_large` (naming `max_batch_bytes`), and `broker_error` for any other code.
 
 The input itself (`crates/logit-inputs/src/kafka/`) counts what it does with the records the
 client hands it; the outcome table in its module doc is the canonical copy. Its `Fanout` counts

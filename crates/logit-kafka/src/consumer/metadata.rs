@@ -10,6 +10,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use kafka_protocol::messages::metadata_request::MetadataRequestTopic;
+use kafka_protocol::messages::metadata_response::MetadataResponsePartition;
 use kafka_protocol::messages::{ApiKey, MetadataRequest, TopicName};
 use kafka_protocol::protocol::StrBytes;
 
@@ -56,6 +57,18 @@ impl Cluster {
             _ => None,
         }
     }
+}
+
+/// Each partition's leader by index, `-1` for one answered with an error or no leader; `None`
+/// when an index isn't one of `0..partitions.len()`, which no broker sends. The vector is sized
+/// by the entries, never by an index the answer carries.
+fn leaders(partitions: &[MetadataResponsePartition]) -> Option<Vec<i32>> {
+    let mut leaders = vec![-1; partitions.len()];
+    for p in partitions {
+        let i = usize::try_from(p.partition_index).ok().filter(|&i| i < partitions.len())?;
+        leaders[i] = if p.error_code == code::NONE { p.leader_id.0 } else { -1 };
+    }
+    Some(leaders)
 }
 
 /// Asks any broker for `topics`; counts each topic-level error, and reports a missing topic
@@ -107,26 +120,22 @@ pub(crate) async fn fetch(
                 }
                 TopicState::Error(t.error_code)
             }
-            Some(t) => {
-                let count = t
-                    .partitions
-                    .iter()
-                    .filter_map(|p| usize::try_from(p.partition_index).ok())
-                    .map(|i| i + 1)
-                    .max()
-                    .unwrap_or(0);
-                let mut leaders = vec![-1; count];
-                for p in &t.partitions {
-                    if let Ok(i) = usize::try_from(p.partition_index) {
-                        leaders[i] = if p.error_code == code::NONE { p.leader_id.0 } else { -1 };
-                    }
+            Some(t) => match leaders(&t.partitions) {
+                Some(leaders) if leaders.is_empty() => TopicState::Missing,
+                Some(leaders) => TopicState::Partitions(leaders),
+                None => {
+                    pool.counters.broker_error(ApiKey::Metadata, "malformed");
+                    pool.counters.warn(
+                        "broker_error",
+                        format_args!(
+                            "Kafka topic {name:?}: Metadata answered a partition index outside \
+                             its {} entries",
+                            t.partitions.len()
+                        ),
+                    );
+                    TopicState::Error(code::UNKNOWN_SERVER_ERROR)
                 }
-                if count == 0 {
-                    TopicState::Missing
-                } else {
-                    TopicState::Partitions(leaders)
-                }
-            }
+            },
         };
         if state == TopicState::Missing {
             pool.counters.warn(
@@ -137,4 +146,34 @@ pub(crate) async fn fetch(
         out.insert(name.clone(), state);
     }
     Ok(Cluster { brokers, topics: out })
+}
+
+#[cfg(test)]
+mod tests {
+    use kafka_protocol::messages::BrokerId;
+
+    use super::*;
+
+    fn partition(index: i32, leader: i32, error: i16) -> MetadataResponsePartition {
+        MetadataResponsePartition::default()
+            .with_partition_index(index)
+            .with_leader_id(BrokerId(leader))
+            .with_error_code(error)
+    }
+
+    #[test]
+    fn leaders_are_placed_by_index_and_an_errored_partition_has_none() {
+        let got =
+            leaders(&[partition(1, 7, code::NONE), partition(0, 5, code::LEADER_NOT_AVAILABLE)]);
+        assert_eq!(got, Some(vec![-1, 7]));
+    }
+
+    /// An index past the entries would size the vector from the wire: near `i32::MAX`, about
+    /// 8 GiB.
+    #[test]
+    fn an_index_outside_the_entries_is_malformed() {
+        assert_eq!(leaders(&[partition(i32::MAX - 1, 0, code::NONE)]), None);
+        assert_eq!(leaders(&[partition(0, 0, code::NONE), partition(2, 0, code::NONE)]), None);
+        assert_eq!(leaders(&[partition(-1, 0, code::NONE)]), None);
+    }
 }
