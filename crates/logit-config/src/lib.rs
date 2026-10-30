@@ -2562,7 +2562,8 @@ pub enum ComponentKind {
     /// Tails one or more files as a log source, one line per event; rotation-, truncation-, and
     /// checkpoint-aware. `paths` entries are absolute paths; a `*` is permitted only in the final
     /// path component (`/var/log/app/*.log`) and matches any run of non-`/` characters. An empty
-    /// entry is rejected; an empty list tails nothing.
+    /// entry is rejected; an empty list tails nothing. A matched file that starts with a gzip,
+    /// zstd, xz, or bzip2 header is skipped and counted, never read as text or decompressed.
     TailIn {
         paths: Vec<String>,
         #[serde(flatten)]
