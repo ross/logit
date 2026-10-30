@@ -373,8 +373,9 @@ Recorded per workstream as each lands.
   input: a record's batches always fall in one cut, which is marked after its last batch. A logs
   request on the metrics topic is `undecodable` under both encodings. OTLP/JSON ignores a field it
   doesn't know, so under `otlp_json` such a request decodes to no event, and the input reads its
-  top-level `resourceLogs`, `resourceMetrics`, or `resourceSpans` key to tell it from an empty
-  request. `kafka_out` never writes a request of
+  top-level `resourceLogs`, `resourceMetrics`, or `resourceSpans` list, or the snake_case
+  `resource_logs`, `resource_metrics`, or `resource_spans` the decoder also reads, to tell it from
+  an empty request. A list with no entry carried nothing, and the request stays `empty`. `kafka_out` never writes a request of
   several resources, so the test builds one by concatenating two protobuf requests. The OTLP
   encoder stamps a log with no observed time with the clock, so the split round trip sets one.
 - **W5**: `kafka_out` under an OTLP format dropped an event with no log, span, or metric
