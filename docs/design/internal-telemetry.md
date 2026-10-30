@@ -1608,7 +1608,8 @@ client hands it; the outcome table in its module doc is the canonical copy. Its 
 | Name | Kind | Meaning |
 |---|---|---|
 | `logit.input.records.dropped{reason="undecodable"}` | count | a record whose value doesn't decode in `format:`, committed past |
-| `logit.input.records.skipped{reason="tombstone"\|"empty"}` | count | a record with a null value, or a `json` or `native` value holding no event, committed past |
+| `logit.input.records.skipped{reason="tombstone"\|"empty"}` | count | a record with a null value, or a `json`, `msgpack`, or `native` value or an OTLP request holding no event, committed past |
+| `logit.input.metrics.skipped{metric_kind, reason}`, `logit.input.metrics.degraded{reason}` | count | under `format: otlp_proto` or `otlp_json`, what the OTLP codec counts, as on `otlp_in`: a metric with no data skipped, a histogram whose count isn't its buckets' sum degraded |
 | `logit.input.headers.omitted{reason="invalid_name"}` | count | a header whose name isn't UTF-8, left out of `_logit.kafka.headers` on a record still delivered |
 | `logit.input.batches.dropped{reason="closed_consumer"}` | count | a batch no consumer directly downstream took; the input commits what came before it, leaves the group, and ends |
 | `logit.input.batches.deferred` | count | a batch not accepted by the drain deadline of a revoke or shutdown, and every batch behind it, or the batches behind a `closed_consumer` drop. Nothing past them is committed, so the next owner of the partition reads them again |
