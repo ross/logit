@@ -6,6 +6,9 @@
 //! config is built once around swappable pieces, [`ReloadingCert`], [`ReloadingClientVerifier`],
 //! and [`ReloadingServerVerifier`], so a reload reaches the next full handshake with no rebuilt
 //! config or client, and an open connection keeps the certificate it handshook with.
+//! [`AsyncStream`], [`PendingClose`], and [`poll_pending_close`] are the stream pieces every raw
+//! TCP client shares, TLS or not: the sinks and `logit-kafka`'s broker connection.
+//!
 //! `docs/adr/tls-certificate-reload.md` has the design. The facts a maintainer needs at the code:
 //!
 //! - **A change is a change in content.** [`TlsReloader::check_now`] reads every file of a set and
@@ -22,9 +25,12 @@
 //! - **Errors name a file's config key and path, never a value from the config.**
 
 use std::fmt;
+use std::future::poll_fn;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::task::Poll;
 use std::time::Duration;
 
 use logit_core::{Diagnostics, Telemetry};
@@ -37,6 +43,7 @@ use rustls::sign::CertifiedKey;
 use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::watch;
 
 /// Server-side TLS for a listener's `tls:` config block, mirroring
@@ -1092,6 +1099,80 @@ fn der_time(tag: u8, value: &[u8]) -> Option<i64> {
     // Civil arithmetic, not `jiff::Timestamp`: a timestamp's range stops short of
     // 9999-12-31T23:59:59Z, the notAfter RFC 5280 gives a certificate with no expiry.
     Some(datetime.duration_since(jiff::civil::datetime(1970, 1, 1, 0, 0, 0, 0)).as_secs())
+}
+
+/// A plain `TcpStream` or a TLS-wrapped one, behind one object-safe trait, so a connection field
+/// isn't generic (a generic field would make the sink type generic, which
+/// `logit-cli::pipeline::build_spec` would have to know about). Shared by every sink, and by
+/// `logit-kafka`'s broker connection, that dials a raw TCP connection that may be TLS-wrapped.
+pub trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncStream for T {}
+
+/// What one poll of a pooled stream found ([`poll_pending_close`]'s answer).
+pub enum PendingClose {
+    /// Nothing readable now. Every protocol these connections speak has a peer that is silent
+    /// unless answering, so this is the healthy case: write.
+    Open,
+    /// The peer closed its end (an immediate EOF), or the poll failed; either way the connection
+    /// is finished.
+    Eof,
+    /// The peer sent something unprompted: from `logit_in`, a `Reject{GOING_AWAY}` before a
+    /// graceful shutdown or idle close; a line-oriented receiver or a Kafka broker never sends
+    /// anything unasked. Either way, don't write a request into it.
+    Bytes(usize),
+}
+
+impl fmt::Display for PendingClose {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PendingClose::Open => f.write_str("still open"),
+            PendingClose::Eof => f.write_str("closed by the peer"),
+            PendingClose::Bytes(n) => write!(f, "carrying {n} unsolicited byte(s) from the peer"),
+        }
+    }
+}
+
+/// Polls `stream` for readability **once**, never waiting: the check a pooled connection runs on
+/// a *reused* stream before a send attempt's first write, so a request isn't written into a
+/// socket the peer already closed (`docs/adr/idle-connection-timeout.md`'s "The client-side
+/// probe" section).
+///
+/// **One `poll_read`, because the probe must not wait.** The peers these connections talk to are
+/// silent unless answering, so a healthy connection has nothing to read, and any wait, however
+/// short, would be added to every send. One poll answers from what has already arrived.
+///
+/// **What a `Pending` poll can move.** On a TLS stream, tokio-rustls reads whatever the socket
+/// holds into the session before it answers: part of a record, or whole records that carry no
+/// plaintext (the TLS 1.3 session tickets a server sends after the handshake). `Pending` then
+/// means no plaintext is ready, not that nothing was read. Nothing is lost: the session keeps
+/// those bytes, and [`PendingClose::Open`] keeps the stream and so the session, so a later read
+/// completes the record. A read future dropped mid-record loses nothing either, since the bytes
+/// belong to the session and not to the read call (`logit-outputs`' `stream_pins` pins both). The
+/// answers that may take plaintext off the stream ([`PendingClose::Eof`],
+/// [`PendingClose::Bytes`]) both drop the connection.
+///
+/// `?Sized` so `&mut *boxed_stream` (a `&mut dyn AsyncStream`) works like a `&mut TcpStream`.
+///
+/// Point-in-time only: a FIN arriving between this poll and the write is still missed
+/// (`Fault::Ambiguous` for `logit_out` and `kafka_out`, undetected for the line-oriented sinks).
+/// It catches the common case, a FIN already in this host's receive queue.
+pub async fn poll_pending_close<S: AsyncRead + Unpin + ?Sized>(
+    stream: &mut S,
+    buf: &mut [u8],
+) -> PendingClose {
+    poll_fn(|cx| {
+        let mut read_buf = ReadBuf::new(buf);
+        Poll::Ready(match Pin::new(&mut *stream).poll_read(cx, &mut read_buf) {
+            Poll::Pending => PendingClose::Open,
+            Poll::Ready(Ok(())) if read_buf.filled().is_empty() => PendingClose::Eof,
+            Poll::Ready(Ok(())) => PendingClose::Bytes(read_buf.filled().len()),
+            // A reset, a TLS alert or a peer closing without `close_notify`, or a bad record all
+            // leave nothing worth writing to, and a transient error costs one reconnect with
+            // nothing written.
+            Poll::Ready(Err(_)) => PendingClose::Eof,
+        })
+    })
+    .await
 }
 
 #[cfg(test)]
