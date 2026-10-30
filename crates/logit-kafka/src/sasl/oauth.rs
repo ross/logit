@@ -34,8 +34,8 @@
 //!   (Redpanda), so the next dial fetches a new one rather than resending a token the broker
 //!   refused.
 //!
-//! An endpoint fault that fails the dial takes its class from `super::super`'s response-class
-//! table: unreachable, timed out, `429`, or `5xx` is `Clean`, and so is a `2xx` whose body is cut
+//! An endpoint fault that fails the dial takes its class from `kafka_out`'s response-class
+//! table (`crates/logit-outputs/src/kafka/mod.rs`, "Response classes"): unreachable, timed out, `429`, or `5xx` is `Clean`, and so is a `2xx` whose body is cut
 //! off by the timeout or a closed connection; any other answer but a `2xx` is `Refused`, and so
 //! is a `2xx` whose body, read up to `MAX_RESPONSE_BYTES`, holds no usable `access_token`. No message carries the token
 //! or the client secret, and the endpoint is printed through `logit_core::redact::url`.
@@ -69,7 +69,7 @@ const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 /// How much of an endpoint's `error_description` or a broker's error status a message quotes.
 const MAX_QUOTED: usize = 256;
 
-pub(crate) struct OAuthBearer {
+pub struct OAuthBearer {
     source: Source,
     extensions: Vec<(String, String)>,
 }
@@ -80,11 +80,11 @@ enum Source {
 }
 
 impl OAuthBearer {
-    pub(crate) fn fixed(token: String, extensions: Vec<(String, String)>) -> Self {
+    pub fn fixed(token: String, extensions: Vec<(String, String)>) -> Self {
         Self { source: Source::Fixed(token), extensions }
     }
 
-    pub(crate) fn client_credentials(
+    pub fn client_credentials(
         url: String,
         client_id: &str,
         client_secret: &str,
@@ -97,7 +97,6 @@ impl OAuthBearer {
                 timeout,
                 crate::http::DEFAULT_CONNECT_TIMEOUT,
                 crate::http::DEFAULT_IDLE_TIMEOUT,
-                None,
             ),
             url,
             client_id: client_id.to_string(),
@@ -152,7 +151,7 @@ impl Authenticator for OAuthBearer {
 }
 
 /// Kafka's `OAuthBearerClientInitialResponse::toBytes` with no authorization id.
-pub(crate) fn client_message(token: &str, extensions: &[(String, String)]) -> Vec<u8> {
+pub fn client_message(token: &str, extensions: &[(String, String)]) -> Vec<u8> {
     let mut out = Vec::with_capacity(32 + token.len());
     out.extend_from_slice(b"n,,");
     out.push(KVSEP);
@@ -406,7 +405,7 @@ fn oauth_error(body: &[u8]) -> String {
 
 /// The access token of an RFC 6749 §5.1 response, and how long it's valid, given the wall clock
 /// `now` for a JWT's `exp`.
-pub(crate) fn parse_token_response(
+pub fn parse_token_response(
     body: &[u8],
     now: SystemTime,
 ) -> anyhow::Result<(String, Option<Duration>)> {
@@ -460,7 +459,7 @@ fn is_bearer_token(token: &str) -> bool {
 
 /// `Basic base64(id ":" secret)`, as Kafka's `ClientCredentialsRequestFormatter` writes it with
 /// `sasl.oauthbearer.header.urlencode` at its default, `false`.
-pub(crate) fn basic_authorization(client_id: &str, client_secret: &str) -> String {
+pub fn basic_authorization(client_id: &str, client_secret: &str) -> String {
     format!("Basic {}", STANDARD.encode(format!("{client_id}:{client_secret}")))
 }
 
@@ -473,7 +472,7 @@ fn token_request_body(scope: Option<&str>) -> String {
 
 /// The `application/x-www-form-urlencoded` byte serializer (RFC 6749 Appendix B): ASCII
 /// letters, digits, and `*-._` as they are, space as `+`, every other byte `%XX`.
-pub(crate) fn form_urlencode(value: &str) -> String {
+pub fn form_urlencode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for b in value.bytes() {
         match b {
@@ -490,7 +489,7 @@ pub(crate) fn form_urlencode(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kafka::fake_broker::TokenEndpoint;
+    use crate::fake_broker::TokenEndpoint;
     use logit_pipeline::test_util::RECV_TIMEOUT;
 
     /// Kafka's `OAuthBearerClientInitialResponse::toBytes` writes

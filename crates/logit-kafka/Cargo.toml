@@ -1,0 +1,48 @@
+[package]
+name = "logit-kafka"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "The Kafka broker connection, SASL, and error codes kafka_out and kafka_in share."
+
+[dependencies]
+logit-core.workspace = true
+logit-pipeline.workspace = true
+logit-proto.workspace = true
+logit-aws.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+# The request and response codecs (docs/adr/kafka-output.md, item 1). `broker` is for the fake
+# broker; the crate has no feature finer than that to gate on.
+kafka-protocol.workspace = true
+# SCRAM's HMAC, PBKDF2, and nonce, and its base64 attributes (docs/adr/kafka-sasl.md).
+ring.workspace = true
+base64.workspace = true
+# OAUTHBEARER's token endpoint (docs/adr/kafka-sasl.md): the request, and the answer, a JWT's
+# claims, and a broker's error challenge.
+reqwest.workspace = true
+serde_json.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+# The fake broker's token endpoint and the AWS endpoints' stub, under `test-util`.
+http = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
+
+# The fake broker and the scripted stream, shared with `logit-outputs`' and `logit-inputs`' tests.
+[features]
+test-util = ["logit-aws/test-util", "dep:http", "dep:http-body-util", "dep:hyper", "dep:hyper-util"]
+
+[dev-dependencies]
+logit-aws = { workspace = true, features = ["test-util"] }
+logit-pipeline = { workspace = true, features = ["fault-injection", "test-util"] }
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

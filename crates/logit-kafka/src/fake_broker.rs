@@ -1,4 +1,4 @@
-//! An in-process Kafka cluster for the producer's tests: one TCP listener per broker node over
+//! An in-process Kafka cluster for the Kafka clients' tests: one TCP listener per broker node over
 //! shared state, answering `ApiVersions`, `Metadata`, `InitProducerId`, and `Produce` through
 //! `kafka-protocol`'s `broker` feature, optionally over TLS.
 //!
@@ -6,7 +6,7 @@
 //!
 //! - only a partition's leader appends to it; any other node answers `NOT_LEADER_OR_FOLLOWER`;
 //! - a request carries one record batch per partition, decompressed with the producer's own
-//!   codecs (`super::compression`);
+//!   codecs (`logit_proto::kafka::compression`);
 //! - an idempotent batch is checked as `ProducerAppendInfo.checkSequence` checks it: an older
 //!   epoch is `INVALID_PRODUCER_EPOCH`; a known producer at a new epoch must start at
 //!   sequence 0; a producer the partition has no state for is accepted at any sequence; the
@@ -19,7 +19,7 @@
 //! requires: `SaslHandshake` v1 naming a configured mechanism, then `SaslAuthenticate` with
 //! `PLAIN`, the server side of SCRAM (RFC 5802), `OAUTHBEARER` (RFC 7628, refusing a token with
 //! Kafka's error challenge), or `AWS_MSK_IAM` (the payload's fields and its SigV4 signature,
-//! recomputed with `super::sasl`'s signer), checked against the configured credentials.
+//! recomputed with `logit_aws`'s signer), checked against the configured credentials.
 //! Any request but `ApiVersions` before that closes the connection, as does one after the
 //! session's `session_lifetime_ms` has passed (KIP-368's expiry).
 //!
@@ -55,8 +55,8 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 use tokio_rustls::TlsAcceptor;
 
-use super::fault::code;
-use super::sasl::{escape_username, AmzDate, ScramHash, Signer};
+use crate::error::code;
+use crate::sasl::{escape_username, AmzDate, ScramHash, Signer};
 use logit_proto::kafka::next_sequence;
 
 /// How many appended batches per producer per partition the broker remembers for dedup
@@ -68,7 +68,7 @@ const MAX_RECORDS_BYTES: usize = 64 << 20;
 
 /// What a scripted request gets instead of the broker's own answer.
 #[derive(Debug, Clone)]
-pub(crate) enum Action {
+pub enum Action {
     /// Answer this error code without appending: a partition's code for `Produce`, the topic's
     /// for `Metadata`, the top-level code for `InitProducerId`.
     Error(i16),
@@ -89,25 +89,25 @@ pub(crate) enum Action {
 /// One scripted departure: the first request of `api` (for `Produce`, naming `partition` when
 /// set; for `Produce` and `Metadata`, naming `topic` when set) gets `action`.
 #[derive(Debug, Clone)]
-pub(crate) struct Step {
-    pub(crate) api: ApiKey,
-    pub(crate) partition: Option<i32>,
-    pub(crate) topic: Option<String>,
-    pub(crate) action: Action,
+pub struct Step {
+    pub api: ApiKey,
+    pub partition: Option<i32>,
+    pub topic: Option<String>,
+    pub action: Action,
 }
 
 impl Step {
-    pub(crate) fn produce(partition: Option<i32>, action: Action) -> Self {
+    pub fn produce(partition: Option<i32>, action: Action) -> Self {
         Self { api: ApiKey::Produce, partition, topic: None, action }
     }
 
     /// `action` for the first `Metadata` request asking about `topic`.
-    pub(crate) fn metadata(topic: &str, action: Action) -> Self {
+    pub fn metadata(topic: &str, action: Action) -> Self {
         Self { api: ApiKey::Metadata, partition: None, topic: Some(topic.to_string()), action }
     }
 
     /// The same step, matching only requests for `topic`.
-    pub(crate) fn on_topic(mut self, topic: &str) -> Self {
+    pub fn on_topic(mut self, topic: &str) -> Self {
         self.topic = Some(topic.to_string());
         self
     }
@@ -115,25 +115,25 @@ impl Step {
 
 /// A record batch the broker received, appended or not.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Received {
-    pub(crate) node: i32,
-    pub(crate) topic: String,
-    pub(crate) partition: i32,
-    pub(crate) version: i16,
-    pub(crate) acks: i16,
-    pub(crate) producer_id: i64,
-    pub(crate) producer_epoch: i16,
-    pub(crate) base_sequence: i32,
-    pub(crate) records: usize,
-    pub(crate) compression: Compression,
+pub struct Received {
+    pub node: i32,
+    pub topic: String,
+    pub partition: i32,
+    pub version: i16,
+    pub acks: i16,
+    pub producer_id: i64,
+    pub producer_epoch: i16,
+    pub base_sequence: i32,
+    pub records: usize,
+    pub compression: Compression,
     /// The code the broker answered, `NONE` for an append or a deduplicated resend.
-    pub(crate) answered: i16,
+    pub answered: i16,
 }
 
 /// A batch appended to a partition's log.
 #[derive(Debug, Clone)]
-pub(crate) struct Appended {
-    pub(crate) records: Vec<Record>,
+pub struct Appended {
+    pub records: Vec<Record>,
 }
 
 #[derive(Debug, Default)]
@@ -145,48 +145,48 @@ struct ProducerEntry {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct Partition {
-    pub(crate) leader: i32,
-    pub(crate) log: Vec<Appended>,
+pub struct Partition {
+    pub leader: i32,
+    pub log: Vec<Appended>,
     next_offset: i64,
     producers: HashMap<i64, ProducerEntry>,
 }
 
 impl Partition {
     /// Every appended record, in offset order.
-    pub(crate) fn records(&self) -> Vec<&Record> {
+    pub fn records(&self) -> Vec<&Record> {
         self.log.iter().flat_map(|b| &b.records).collect()
     }
 }
 
 /// The SASL a broker requires before any request but `ApiVersions`.
 #[derive(Debug, Clone)]
-pub(crate) struct Sasl {
+pub struct Sasl {
     /// The mechanisms `SaslHandshake` accepts.
-    pub(crate) mechanisms: Vec<String>,
-    pub(crate) username: String,
-    pub(crate) password: String,
+    pub mechanisms: Vec<String>,
+    pub username: String,
+    pub password: String,
     /// What a successful `SaslAuthenticate` (v1 and later) answers as `session_lifetime_ms`; 0
     /// for no limit.
-    pub(crate) session_lifetime_ms: i64,
+    pub session_lifetime_ms: i64,
     /// The iteration count a SCRAM server-first message asks for.
-    pub(crate) iterations: u32,
+    pub iterations: u32,
     /// Answers a valid SCRAM proof with a server signature from another password, as a broker
     /// that doesn't hold the user's credential would.
-    pub(crate) forge_signature: bool,
+    pub forge_signature: bool,
     /// The one `OAUTHBEARER` token accepted; `None` accepts any.
-    pub(crate) oauth_token: Option<String>,
+    pub oauth_token: Option<String>,
     /// Refuses an `OAUTHBEARER` token as Redpanda v26.2.3 does: `SASL_AUTHENTICATION_FAILED` on
     /// the first message, with no error challenge.
-    pub(crate) oauth_no_challenge: bool,
+    pub oauth_no_challenge: bool,
     /// The one `AWS_MSK_IAM` session token accepted; `None` accepts a payload with any or none.
     /// `AWS_MSK_IAM` takes `username` as the access key id and `password` as the secret key.
-    pub(crate) msk_session_token: Option<String>,
+    pub msk_session_token: Option<String>,
 }
 
 impl Sasl {
-    /// Every mechanism `kafka_out` speaks, for `username` and `password`, with no lifetime.
-    pub(crate) fn new(username: &str, password: &str) -> Self {
+    /// Every mechanism `logit` speaks, for `username` and `password`, with no lifetime.
+    pub fn new(username: &str, password: &str) -> Self {
         Self {
             mechanisms: ["PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512", "OAUTHBEARER", "AWS_MSK_IAM"]
                 .map(String::from)
@@ -238,36 +238,36 @@ const SCRAM_SALT: &[u8] = b"fake-broker-salt";
 
 /// The cluster's shared state; tests read and change it through [`FakeCluster::state`].
 #[derive(Debug, Default)]
-pub(crate) struct State {
-    pub(crate) topics: BTreeMap<String, Vec<Partition>>,
+pub struct State {
+    pub topics: BTreeMap<String, Vec<Partition>>,
     /// Partitions for a topic `Metadata` asks to create, `None` when auto-creation is off.
-    pub(crate) auto_create: Option<usize>,
+    pub auto_create: Option<usize>,
     /// The highest `Produce` version every node advertises; the minimum is always 0, as a 4.x
     /// broker advertises it.
-    pub(crate) produce_max: i16,
+    pub produce_max: i16,
     /// Required before any request but `ApiVersions` when set.
-    pub(crate) sasl: Option<Sasl>,
+    pub sasl: Option<Sasl>,
     /// Leaves `SaslHandshake` and `SaslAuthenticate` out of `ApiVersions`.
-    pub(crate) hide_sasl: bool,
+    pub hide_sasl: bool,
     /// Every successful SASL exchange.
-    pub(crate) authentications: usize,
+    pub authentications: usize,
     /// Every `OAUTHBEARER` client message, in arrival order.
-    pub(crate) oauth_messages: Vec<Vec<u8>>,
+    pub oauth_messages: Vec<Vec<u8>>,
     /// Every `AWS_MSK_IAM` payload that parsed as a JSON object, in arrival order.
-    pub(crate) msk_payloads: Vec<serde_json::Map<String, serde_json::Value>>,
+    pub msk_payloads: Vec<serde_json::Map<String, serde_json::Value>>,
     /// When each session that has a lifetime ends, in order.
-    pub(crate) session_ends: Vec<Instant>,
+    pub session_ends: Vec<Instant>,
     /// Connections closed for a request that arrived after their session ended.
-    pub(crate) expired_closes: usize,
-    pub(crate) script: Vec<Step>,
-    pub(crate) received: Vec<Received>,
+    pub expired_closes: usize,
+    pub script: Vec<Step>,
+    pub received: Vec<Received>,
     /// `(node, api, version)` of every request, in arrival order.
-    pub(crate) requests: Vec<(i32, ApiKey, i16)>,
+    pub requests: Vec<(i32, ApiKey, i16)>,
     /// Every topic a `Metadata` request asked about, in arrival order.
-    pub(crate) metadata_topics: Vec<String>,
-    pub(crate) accepted_connections: usize,
+    pub metadata_topics: Vec<String>,
+    pub accepted_connections: usize,
     /// Connections being served now.
-    pub(crate) open_connections: usize,
+    pub open_connections: usize,
     next_producer_id: i64,
     advertised_host: String,
     ports: Vec<u16>,
@@ -294,11 +294,11 @@ impl State {
         Some(self.script.remove(at).action)
     }
 
-    pub(crate) fn partition(&self, topic: &str, partition: i32) -> &Partition {
+    pub fn partition(&self, topic: &str, partition: i32) -> &Partition {
         &self.topics[topic][partition as usize]
     }
 
-    pub(crate) fn add_topic(&mut self, name: &str, leaders: &[i32]) {
+    pub fn add_topic(&mut self, name: &str, leaders: &[i32]) {
         let partitions =
             leaders.iter().map(|&leader| Partition { leader, ..Partition::default() }).collect();
         self.topics.insert(name.to_string(), partitions);
@@ -306,7 +306,7 @@ impl State {
 }
 
 /// A running fake cluster. Dropping it stops every node and closes every connection.
-pub(crate) struct FakeCluster {
+pub struct FakeCluster {
     state: Arc<Mutex<State>>,
     addrs: Vec<SocketAddr>,
     tls: Option<TlsAcceptor>,
@@ -323,12 +323,12 @@ impl Drop for FakeCluster {
 
 impl FakeCluster {
     /// Starts `nodes` brokers, ids 0 up, on loopback, advertising `127.0.0.1`.
-    pub(crate) async fn start(nodes: usize) -> Self {
+    pub async fn start(nodes: usize) -> Self {
         Self::start_with(nodes, None, "127.0.0.1").await
     }
 
     /// Starts `nodes` brokers serving TLS from `tls`, advertising `host`.
-    pub(crate) async fn start_with(
+    pub async fn start_with(
         nodes: usize,
         tls: Option<Arc<rustls::ServerConfig>>,
         host: &str,
@@ -352,23 +352,23 @@ impl FakeCluster {
         Self { state, addrs, tls, tasks }
     }
 
-    pub(crate) fn state(&self) -> MutexGuard<'_, State> {
+    pub fn state(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap()
     }
 
     /// Node `node`'s `host:port` on loopback.
-    pub(crate) fn addr(&self, node: usize) -> String {
+    pub fn addr(&self, node: usize) -> String {
         self.addrs[node].to_string()
     }
 
-    pub(crate) fn port(&self, node: usize) -> u16 {
+    pub fn port(&self, node: usize) -> u16 {
         self.addrs[node].port()
     }
 
     /// Stops node `node` and waits until its listener is closed, so a dial to it is refused.
     /// Its connections close as their tasks are cancelled; [`State::open_connections`] counts
     /// them down.
-    pub(crate) async fn stop(&mut self, node: usize) {
+    pub async fn stop(&mut self, node: usize) {
         if let Some(task) = self.tasks[node].take() {
             task.abort();
             let _ = task.await;
@@ -376,7 +376,7 @@ impl FakeCluster {
     }
 
     /// Stops node `node` and starts it again on the same port, as a broker restart does.
-    pub(crate) async fn restart(&mut self, node: usize) {
+    pub async fn restart(&mut self, node: usize) {
         self.stop(node).await;
         let listener = TcpListener::bind(self.addrs[node]).await.unwrap();
         let task =
@@ -384,7 +384,7 @@ impl FakeCluster {
         self.tasks[node] = Some(task);
     }
 
-    pub(crate) fn script(&self, step: Step) {
+    pub fn script(&self, step: Step) {
         self.state().script.push(step);
     }
 }
@@ -957,7 +957,8 @@ fn produce(
             let infos = RecordBatchDecoder::decode_batch_info(&mut info_buf).unwrap();
             assert_eq!(infos.len(), 1, "a producer sends one batch per partition per request");
             let info = &infos[0];
-            let sets = super::batch::decode(records, MAX_RECORDS_BYTES).expect("the batch decodes");
+            let sets = logit_proto::kafka::batch::decode(records, MAX_RECORDS_BYTES)
+                .expect("the batch decodes");
             let decoded: Vec<Record> = sets.into_iter().flat_map(|s| s.records).collect();
 
             let (code, base_offset, record_errors) = match &step {
@@ -1071,25 +1072,25 @@ fn append(
 
 /// One request a [`TokenEndpoint`] received.
 #[derive(Debug, Clone)]
-pub(crate) struct TokenRequest {
-    pub(crate) authorization: String,
-    pub(crate) content_type: String,
-    pub(crate) body: String,
+pub struct TokenRequest {
+    pub authorization: String,
+    pub content_type: String,
+    pub body: String,
 }
 
 /// What a [`TokenEndpoint`] answers its `n`th request (from 0): a status and a body.
-pub(crate) type TokenAnswer = Box<dyn Fn(usize) -> (u16, String) + Send>;
+pub type TokenAnswer = Box<dyn Fn(usize) -> (u16, String) + Send>;
 
 /// The shared state of a [`TokenEndpoint`].
-pub(crate) struct TokenState {
-    pub(crate) requests: Vec<TokenRequest>,
-    pub(crate) answer: TokenAnswer,
+pub struct TokenState {
+    pub requests: Vec<TokenRequest>,
+    pub answer: TokenAnswer,
 }
 
 /// An OAuth 2.0 token endpoint on `127.0.0.1` over HTTP/1.1, answering every `POST` with
 /// [`TokenState::answer`]. By default it issues `token-<n>` with an hour's `expires_in`.
-pub(crate) struct TokenEndpoint {
-    pub(crate) url: String,
+pub struct TokenEndpoint {
+    pub url: String,
     state: Arc<Mutex<TokenState>>,
     task: JoinHandle<()>,
 }
@@ -1101,7 +1102,7 @@ impl Drop for TokenEndpoint {
 }
 
 impl TokenEndpoint {
-    pub(crate) async fn start() -> Self {
+    pub async fn start() -> Self {
         use http_body_util::{BodyExt, Full};
         use hyper::service::service_fn;
         use hyper_util::rt::TokioIo;
@@ -1167,17 +1168,17 @@ impl TokenEndpoint {
         Self { url, state, task }
     }
 
-    pub(crate) fn state(&self) -> MutexGuard<'_, TokenState> {
+    pub fn state(&self) -> MutexGuard<'_, TokenState> {
         self.state.lock().unwrap()
     }
 
     /// How many token requests have arrived.
-    pub(crate) fn fetches(&self) -> usize {
+    pub fn fetches(&self) -> usize {
         self.state().requests.len()
     }
 }
 
-pub(crate) use logit_aws::test_stub::HttpStub;
+pub use logit_aws::test_stub::HttpStub;
 
 #[cfg(test)]
 mod tests {

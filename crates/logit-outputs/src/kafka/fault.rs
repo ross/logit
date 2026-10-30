@@ -1,48 +1,9 @@
 //! What one partition's error code in a `Produce` response means for its partition batch. The
 //! table this implements is [`super`]'s "Response classes"; each row there names its test.
 
-use kafka_protocol::ResponseError;
 use logit_pipeline::Fault;
 
-/// Kafka error codes `kafka_out` reads by name. A code that [`classify`] reaches through its
-/// default arm is named here for the tests that pin its row.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) mod code {
-    pub(crate) const NONE: i16 = 0;
-    pub(crate) const CORRUPT_MESSAGE: i16 = 2;
-    pub(crate) const UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
-    pub(crate) const LEADER_NOT_AVAILABLE: i16 = 5;
-    pub(crate) const NOT_LEADER_OR_FOLLOWER: i16 = 6;
-    pub(crate) const REQUEST_TIMED_OUT: i16 = 7;
-    pub(crate) const MESSAGE_TOO_LARGE: i16 = 10;
-    pub(crate) const NETWORK_EXCEPTION: i16 = 13;
-    pub(crate) const COORDINATOR_LOAD_IN_PROGRESS: i16 = 14;
-    pub(crate) const COORDINATOR_NOT_AVAILABLE: i16 = 15;
-    pub(crate) const NOT_COORDINATOR: i16 = 16;
-    pub(crate) const RECORD_LIST_TOO_LARGE: i16 = 18;
-    pub(crate) const NOT_ENOUGH_REPLICAS: i16 = 19;
-    pub(crate) const NOT_ENOUGH_REPLICAS_AFTER_APPEND: i16 = 20;
-    pub(crate) const INVALID_REQUIRED_ACKS: i16 = 21;
-    pub(crate) const TOPIC_AUTHORIZATION_FAILED: i16 = 29;
-    pub(crate) const CLUSTER_AUTHORIZATION_FAILED: i16 = 31;
-    pub(crate) const INVALID_TIMESTAMP: i16 = 32;
-    pub(crate) const UNSUPPORTED_SASL_MECHANISM: i16 = 33;
-    pub(crate) const ILLEGAL_SASL_STATE: i16 = 34;
-    pub(crate) const UNSUPPORTED_VERSION: i16 = 35;
-    pub(crate) const POLICY_VIOLATION: i16 = 44;
-    pub(crate) const OUT_OF_ORDER_SEQUENCE_NUMBER: i16 = 45;
-    pub(crate) const DUPLICATE_SEQUENCE_NUMBER: i16 = 46;
-    pub(crate) const INVALID_PRODUCER_EPOCH: i16 = 47;
-    pub(crate) const TRANSACTIONAL_ID_AUTHORIZATION_FAILED: i16 = 53;
-    pub(crate) const KAFKA_STORAGE_ERROR: i16 = 56;
-    pub(crate) const SASL_AUTHENTICATION_FAILED: i16 = 58;
-    pub(crate) const UNKNOWN_PRODUCER_ID: i16 = 59;
-    pub(crate) const UNSUPPORTED_COMPRESSION_TYPE: i16 = 76;
-    pub(crate) const INVALID_RECORD: i16 = 87;
-    pub(crate) const THROTTLING_QUOTA_EXCEEDED: i16 = 89;
-    pub(crate) const UNKNOWN_TOPIC_ID: i16 = 100;
-    pub(crate) const INCONSISTENT_TOPIC_ID: i16 = 103;
-}
+pub(crate) use logit_kafka::error::{code, name};
 
 /// What a partition's error code asks of the producer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,30 +80,6 @@ pub(crate) fn classify_control(error_code: i16) -> Fault {
     }
 }
 
-/// The class of a non-zero error code in a `SaslHandshake` or `SaslAuthenticate` answer. A
-/// mechanism the broker doesn't offer, an exchange its state machine refuses, and credentials it
-/// won't take each get the same answer on every connection, so they hold the queue; anything
-/// else is a state the broker leaves on its own, as [`classify_control`] reads it.
-pub(crate) fn classify_sasl(error_code: i16) -> Fault {
-    use code::*;
-    match error_code {
-        UNSUPPORTED_SASL_MECHANISM
-        | ILLEGAL_SASL_STATE
-        | SASL_AUTHENTICATION_FAILED
-        | UNSUPPORTED_VERSION => Fault::Refused,
-        _ => Fault::Clean,
-    }
-}
-
-/// `NAME (code)` for a diagnostic, from `kafka-protocol`'s table.
-pub(crate) fn name(error_code: i16) -> String {
-    match ResponseError::try_from_code(error_code) {
-        None => format!("NONE ({error_code})"),
-        Some(ResponseError::Unknown(_)) => format!("unknown error code {error_code}"),
-        Some(err) => format!("{err} ({error_code})"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::code::*;
@@ -192,23 +129,6 @@ mod tests {
         for (code, want) in rows {
             assert_eq!(classify(code), want, "{}", name(code));
         }
-    }
-
-    #[test]
-    fn sasl_answers_refuse_for_the_mechanism_the_state_and_the_credentials() {
-        for code in [UNSUPPORTED_SASL_MECHANISM, ILLEGAL_SASL_STATE, SASL_AUTHENTICATION_FAILED, 35]
-        {
-            assert_eq!(classify_sasl(code), Fault::Refused, "{}", name(code));
-        }
-        for code in [15, 7, 999] {
-            assert_eq!(classify_sasl(code), Fault::Clean, "{}", name(code));
-        }
-    }
-
-    #[test]
-    fn names_come_from_the_protocol_table() {
-        assert_eq!(name(OUT_OF_ORDER_SEQUENCE_NUMBER), "OutOfOrderSequenceNumber (45)");
-        assert_eq!(name(999), "unknown error code 999");
     }
 
     #[test]

@@ -1147,6 +1147,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "logit-core",
+ "logit-kafka",
  "logit-outputs",
  "logit-pipeline",
  "logit-proto",
@@ -1170,6 +1171,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "logit-kafka"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "bytes",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "kafka-protocol",
+ "logit-aws",
+ "logit-core",
+ "logit-pipeline",
+ "logit-proto",
+ "reqwest",
+ "ring",
+ "rustls",
+ "rustls-pki-types",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+]
+
+[[package]]
 name = "logit-outputs"
 version = "0.1.0"
 dependencies = [
@@ -1187,6 +1214,7 @@ dependencies = [
  "logit-aws",
  "logit-core",
  "logit-inputs",
+ "logit-kafka",
  "logit-pipeline",
  "logit-proto",
  "logit-script",

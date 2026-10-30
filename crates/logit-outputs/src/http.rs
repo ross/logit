@@ -313,24 +313,6 @@ pub(crate) async fn read_body_bytes(mut response: reqwest::Response, limit: usiz
     buf
 }
 
-/// [`read_body_bytes`], but a read error, such as the request's timeout or a connection closed
-/// mid-body, is returned rather than ending the body, for a caller that parses the body and
-/// must not read a cut-off one as complete.
-pub(crate) async fn try_read_body_bytes(
-    mut response: reqwest::Response,
-    limit: usize,
-) -> Result<Vec<u8>, reqwest::Error> {
-    let mut buf: Vec<u8> = Vec::new();
-    while buf.len() < limit {
-        match response.chunk().await? {
-            Some(chunk) => buf.extend_from_slice(&chunk),
-            None => break,
-        }
-    }
-    buf.truncate(limit);
-    Ok(buf)
-}
-
 /// The first `max` bytes of `body`, trimmed, on a character boundary, with an ellipsis when
 /// anything was cut. [`read_body_prefix`] has already bounded what reaches here.
 pub(crate) fn body_snippet(body: &str, max: usize) -> String {

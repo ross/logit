@@ -38,21 +38,21 @@ use logit_aws::creds::{Chain, Credentials};
 use logit_aws::sigv4::{AmzDate, Signer};
 
 /// The payload version `aws-msk-iam-auth` sends.
-pub(crate) const VERSION: &str = "2020_10_22";
+pub const VERSION: &str = "2020_10_22";
 
 /// The action every payload asks for.
-pub(crate) const ACTION: &str = "kafka-cluster:Connect";
+pub const ACTION: &str = "kafka-cluster:Connect";
 
 /// The service the signature is scoped to.
-pub(crate) const SERVICE: &str = "kafka-cluster";
+pub const SERVICE: &str = "kafka-cluster";
 
 /// How long the presigned query is valid, `aws-msk-iam-auth`'s 15 minutes.
-pub(crate) const EXPIRES_SECS: u32 = 900;
+pub const EXPIRES_SECS: u32 = 900;
 
 /// The domains MSK brokers are named under, the region's label immediately before each.
 const AWS_DOMAINS: &[&str] = &[".amazonaws.com", ".amazonaws.com.cn", ".api.aws"];
 
-pub(crate) struct MskIam {
+pub struct MskIam {
     region: Option<String>,
     chain: Arc<Chain>,
     /// Where the last credentials came from, for messages.
@@ -60,7 +60,7 @@ pub(crate) struct MskIam {
 }
 
 impl MskIam {
-    pub(crate) fn new(region: Option<String>, chain: Chain) -> Self {
+    pub fn new(region: Option<String>, chain: Chain) -> Self {
         Self { region, chain: Arc::new(chain), source: Mutex::new(None) }
     }
 
@@ -109,12 +109,7 @@ impl Authenticator for MskIam {
 }
 
 /// The client message for a broker at `host` in `region`, signed with `credentials` at `date`.
-pub(crate) fn payload(
-    credentials: &Credentials,
-    host: &str,
-    region: &str,
-    date: &AmzDate,
-) -> Vec<u8> {
+pub fn payload(credentials: &Credentials, host: &str, region: &str, date: &AmzDate) -> Vec<u8> {
     let signer = Signer {
         access_key_id: &credentials.access_key_id,
         secret_access_key: &credentials.secret_access_key,
@@ -140,7 +135,7 @@ pub(crate) fn payload(
 
 /// The region label immediately before an AWS domain at the end of `host`, when it has a
 /// region's shape.
-pub(crate) fn region_from_host(host: &str) -> Option<String> {
+pub fn region_from_host(host: &str) -> Option<String> {
     let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
     AWS_DOMAINS.iter().find_map(|domain| {
         let rest = host.strip_suffix(domain)?;
@@ -151,7 +146,7 @@ pub(crate) fn region_from_host(host: &str) -> Option<String> {
 
 /// An AWS region's shape: a two-letter prefix, one or more words, and a number, such as
 /// `us-east-1` or `us-gov-west-1`.
-pub(crate) fn is_region(region: &str) -> bool {
+pub fn is_region(region: &str) -> bool {
     let parts: Vec<&str> = region.split('-').collect();
     parts.len() >= 3
         && parts[0].len() == 2

@@ -41,7 +41,7 @@ use bytes::Bytes;
 use kafka_protocol::messages::metadata_request::MetadataRequestTopic;
 use kafka_protocol::messages::produce_request::{PartitionProduceData, TopicProduceData};
 use kafka_protocol::messages::{
-    InitProducerIdRequest, InitProducerIdResponse, MetadataRequest, MetadataResponse,
+    ApiKey, InitProducerIdRequest, InitProducerIdResponse, MetadataRequest, MetadataResponse,
     ProduceRequest, ProducerId, TopicName,
 };
 use kafka_protocol::protocol::StrBytes;
@@ -289,6 +289,12 @@ pub(crate) struct Producer {
     dialed: HashSet<Node>,
 }
 
+/// The APIs a broker must offer the producer a version of; the dialer refuses one that doesn't.
+const APIS: [ApiKey; 3] = [ApiKey::Produce, ApiKey::Metadata, ApiKey::InitProducerId];
+
+/// Why a version of each of [`APIS`] is there: the dialer refused the connection otherwise.
+const REQUIRED: &str = "the dialer requires a version of this API";
+
 /// Splits a bootstrap `host:port`; a bracketed IPv6 literal loses its brackets.
 fn host_port(entry: &str) -> anyhow::Result<(String, u16)> {
     let (host, port) =
@@ -312,6 +318,7 @@ impl Producer {
             timeout: config.timeout,
             client_id: StrBytes::from_string(config.client_id.clone()),
             sasl: config.sasl.clone(),
+            required: &APIS,
         };
         Ok(Self {
             topic: StrBytes::from_string(config.topic.clone()),
@@ -764,7 +771,7 @@ impl Producer {
             .with_producer_id(ProducerId(-1))
             .with_producer_epoch(-1);
         let (node, mut conn) = self.control_conn().await?;
-        let version = conn.versions().init_producer_id;
+        let version = conn.versions().for_key(ApiKey::InitProducerId).expect(REQUIRED);
         let response = conn
             .request(&request, version)
             .await
@@ -817,7 +824,7 @@ impl Producer {
             .with_topics(Some(vec![topic]))
             .with_allow_auto_topic_creation(true);
         let (node, mut conn) = self.control_conn().await?;
-        let version = conn.versions().metadata;
+        let version = conn.versions().for_key(ApiKey::Metadata).expect(REQUIRED);
         let response = conn
             .request(&request, version)
             .await
@@ -1001,7 +1008,7 @@ impl BrokerJob {
                 }
             },
         };
-        let version = conn.versions().produce;
+        let version = conn.versions().for_key(ApiKey::Produce).expect(REQUIRED);
         if compression == Compression::Zstd && version < PRODUCE_ZSTD_MIN {
             let why = format!(
                 "Kafka broker {} offers Produce up to v{version}; zstd needs v{PRODUCE_ZSTD_MIN}",
