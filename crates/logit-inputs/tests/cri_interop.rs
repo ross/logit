@@ -135,9 +135,14 @@ async fn replay(runtime: &str, count: usize, probe: &mut TelemetryProbe) -> Vec<
     let root = scratch_dir(&format!("cri-interop-{runtime}"));
     copy_tree(&recorded(runtime).join("pods"), &root);
     let telemetry = probe.telemetry("pods", "cri_in", "listener");
-    let input = CriInput::new(root.clone(), Duration::from_millis(100), fast_config())
-        .with_diagnostics(Diagnostics::new("pods").with_telemetry(telemetry.clone()))
-        .with_telemetry(telemetry);
+    let input = CriInput::new(
+        root.clone(),
+        root.join("no-links"),
+        Duration::from_millis(100),
+        fast_config(),
+    )
+    .with_diagnostics(Diagnostics::new("pods").with_telemetry(telemetry.clone()))
+    .with_telemetry(telemetry);
     let (fanout, mut rx) = fanout_channel(64);
     let running = spawn_input(input, fanout).await;
 
