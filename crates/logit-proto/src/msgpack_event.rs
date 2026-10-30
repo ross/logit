@@ -133,7 +133,7 @@ fn read_node(
                 let key = read_string(r, budget)?;
                 entries.push((key, read_node(r, src, depth + 1, budget)?));
             }
-            Node::Map(Obj(entries))
+            Node::Map(Obj::new(entries))
         }
         Type::Ext => return Err(malformed("an ext value, which the grammar never holds")),
     })
@@ -230,6 +230,32 @@ mod tests {
         let Some(Value::Array(nested)) = a.get("nested") else { panic!("an array") };
         assert_eq!(nested[0], Value::Null);
         assert!(matches!(&nested[1], Value::Map(m) if m.get("k") == Some(&Value::Bool(true))));
+    }
+
+    #[test]
+    fn a_nested_map_reads_sorted_with_a_repeated_keys_last_value() {
+        let mut w = Writer::new();
+        event(&mut w, None, 1, |w| {
+            w.write_str("name");
+            w.write_map_len(3);
+            for (k, v) in [("route", "/a"), ("method", "GET"), ("route", "/cart")] {
+                w.write_str(k);
+                w.write_str(v);
+            }
+        });
+        let batches = decode(&w).unwrap();
+        let Some(Value::Map(m)) = batches[0].events[0].attributes.get("name") else {
+            panic!("a map")
+        };
+        let entries: Vec<_> = m
+            .iter()
+            .map(|(k, v)| (logit_core::interner::resolve(k).to_owned(), v.clone()))
+            .collect();
+        assert_eq!(
+            entries,
+            [("method".to_owned(), Value::str("GET")), ("route".to_owned(), Value::str("/cart"))],
+            "the JSON reader's order, so both formats render a nested map alike",
+        );
     }
 
     #[test]

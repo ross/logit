@@ -29,14 +29,29 @@ pub(crate) enum Node {
     Map(Obj),
 }
 
-/// An object's entries in input order. A repeated key reads as its last value, as a
-/// `serde_json::Map` keeps it.
+/// An object's entries, sorted by key with one entry per key, the last value of a repeated key
+/// kept: a `serde_json::Map`'s order and its duplicate rule. A nested map's key order reaches
+/// the event's [`logit_core::Value::Map`], and from there a sink that renders it as text, so
+/// both front ends build through [`Obj::new`] to read alike.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub(crate) struct Obj(pub(crate) Vec<(String, Node)>);
+pub(crate) struct Obj(Vec<(String, Node)>);
 
 impl Obj {
+    pub(crate) fn new(mut entries: Vec<(String, Node)>) -> Self {
+        // A stable sort keeps a repeated key's entries in input order, so the last one wins.
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut out: Vec<(String, Node)> = Vec::with_capacity(entries.len());
+        for (k, v) in entries {
+            match out.last_mut() {
+                Some(last) if last.0 == k => last.1 = v,
+                _ => out.push((k, v)),
+            }
+        }
+        Obj(out)
+    }
+
     pub(crate) fn get(&self, key: &str) -> Option<&Node> {
-        self.0.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v)
+        self.0.binary_search_by(|(k, _)| k.as_str().cmp(key)).ok().map(|i| &self.0[i].1)
     }
 }
 
@@ -160,6 +175,6 @@ impl<'de> Visitor<'de> for NodeVisitor {
         while let Some(entry) = map.next_entry::<String, Node>()? {
             entries.push(entry);
         }
-        Ok(Node::Map(Obj(entries)))
+        Ok(Node::Map(Obj::new(entries)))
     }
 }
