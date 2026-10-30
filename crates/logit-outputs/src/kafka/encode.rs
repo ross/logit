@@ -22,9 +22,11 @@
 //! [`EncodeStats::metrics_omitted`] and [`EncodeStats::spans_omitted`], at encode, so a record
 //! the producer later drops as oversize, or the broker rejects or names, has still counted them.
 //! An event dropped as `oversize` under `record: batch` counts only there. An OTLP format counts
-//! an event with no log, span, or metric, which no request holds, in [`EncodeStats::no_payload`]. What each log field, span, and
-//! attribute becomes under `json` and `text` is the generated table under "What each log, span,
-//! and attribute becomes".
+//! an event with no log, span, or metric, which no request holds, in [`EncodeStats::no_payload`],
+//! and each attribute value it writes as a double, a `u64` above `i64::MAX`, in
+//! [`EncodeStats::u64_as_double`]. What each metric kind, log field, span, and attribute
+//! becomes, in every format, is the generated table under "What each metric, log, span, and
+//! attribute becomes".
 //!
 //! Under `record: batch`, events go into a record in batch order until the next would push its
 //! value over the encoder's `budget`, which the sink sets so a value that fits never trips the
@@ -81,7 +83,7 @@
 //! encoder wrote it: a request holds many events, and one future-stamped event would otherwise
 //! lose the whole request to Kafka's rule against records stamped more than an hour ahead.
 //!
-//! # What each log, span, and attribute becomes
+//! # What each metric, log, span, and attribute becomes
 //!
 //! The tables below are generated from `kafka_out`'s column of `spec/transit/mapping.yaml`, the
 //! canonical copy, by `script/transit docs`, and a test fails when they're stale: change the
@@ -628,6 +630,7 @@ use logit_proto::frame::{write_frame, Compression};
 use logit_proto::kafka::text::escape_line_into;
 use logit_proto::msgpack::Writer;
 use logit_proto::native::{encode_events_omitting, CODEC_BATCH};
+use logit_proto::otlp::common::u64_as_double_count;
 use logit_proto::otlp::{OtlpEncoder, OtlpRequest};
 use logit_proto::{FramedEncoder, MessageBuf, Signal};
 
@@ -714,6 +717,10 @@ pub struct EncodeStats {
     /// Events an OTLP format skipped for carrying no log, span, or metric, which no request
     /// holds, as `otlp_out` skips one.
     pub no_payload: usize,
+    /// Attribute values an OTLP format wrote as a double for being a `u64` above `i64::MAX`, on
+    /// the events it wrote and the batch's resource and scope, once per batch as `otlp_out`
+    /// counts them.
+    pub u64_as_double: usize,
     /// Metric records `format: text` left out of a record it wrote from the event's log.
     pub metrics_omitted: usize,
     /// Spans `format: text` left out of a record it wrote from the event's log.
@@ -1115,11 +1122,19 @@ impl KafkaEncoder {
     ) {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
         let timestamp = millis(i64::try_from(nanos).unwrap_or(i64::MAX));
-        stats.no_payload += batch
-            .events
-            .iter()
-            .filter(|e| e.log.is_none() && e.span.is_none() && e.metrics.is_empty())
-            .count();
+        let mut written = false;
+        for event in &batch.events {
+            if event.log.is_none() && event.span.is_none() && event.metrics.is_empty() {
+                stats.no_payload += 1;
+            } else {
+                written = true;
+                stats.u64_as_double += u64_as_double_count(&event.attributes);
+            }
+        }
+        if written {
+            stats.u64_as_double += u64_as_double_count(&batch.resource.attributes)
+                + batch.scope.as_ref().map_or(0, |s| u64_as_double_count(&s.attributes));
+        }
         for signal in SIGNALS {
             let groups = self.groups(signal, batch);
             for group in groups {
@@ -2005,6 +2020,25 @@ mod tests {
             let (out, stats) = records(&mut encoder(format, RecordMode::Request, usize::MAX), &b);
             assert_eq!(stats.no_payload, 1, "{format:?}: the event with no payload");
             assert_eq!(out.len(), 1, "{format:?}: one logs request");
+        }
+    }
+
+    /// A `u64` attribute above `i64::MAX` leaves an OTLP format as a double, counted once per
+    /// value on a written event and on the batch's resource, as `otlp_out` counts it; one on an
+    /// event no request holds isn't written, so it isn't counted.
+    #[test]
+    fn an_otlp_format_counts_a_u64_attribute_written_as_a_double() {
+        let big = |k: &str| {
+            let mut a = AttrMap::new();
+            a.insert(k, Value::U64(u64::MAX));
+            a
+        };
+        for format in [RecordFormat::OtlpProto, RecordFormat::OtlpJson] {
+            let mut log = log_event(1, Value::str("m"));
+            log.attributes = big("big");
+            let b = batch(big("res"), vec![log, Event::empty(0, big("unsent"))]);
+            let (_, stats) = records(&mut encoder(format, RecordMode::Request, usize::MAX), &b);
+            assert_eq!(stats.u64_as_double, 2, "{format:?}: the event's and the resource's");
         }
     }
 }
