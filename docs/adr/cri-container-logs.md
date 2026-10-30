@@ -24,10 +24,10 @@ in six workstreams; this record holds the decisions they share.
 /var/log/pods/<namespace>_<pod name>_<pod uid>/<container name>/<restart count>.log
 ```
 
-A namespace, a pod name, and a container name can't hold `_`, and a uid the API server or the
-kubelet generates is hex and `-`, so such a directory name splits on `_` into three parts. A static
-pod's manifest can set its own uid, and nothing stops that uid from holding `_` (section 2). The
-kubelet also writes a symlink per container attempt,
+A namespace, a pod name, and a container name can't hold `_`, so a pod directory name's first two
+`_` end its namespace and its pod name, and the rest is its uid. A uid the API server or the kubelet
+generates is hex and `-`, but a static pod's manifest can set its own uid, and that uid may hold `_`
+(section 2). The kubelet also writes a symlink per container attempt,
 `/var/log/containers/<pod>_<namespace>_<container>-<container id>.log`, pointing at that file
 (`pkg/kubelet/kuberuntime/legacy.go`, `logSymlink`). It cuts the link's name to 251 bytes before
 appending `.log`, so a long name loses its container id.
@@ -111,14 +111,18 @@ then each container directory, and match two names in it:
 - `<n>.log`, where `<n>` is decimal digits that fit an `i64`: the live file.
 - `<n>.log.<YYYYMMDD-HHMMSS>`: a rotated file the kubelet hasn't compressed yet.
 
-A pod directory name that doesn't split on `_` into three non-empty parts, a container directory
-name holding `_` or `.`, and every other file name won't be matched: no `.gz`, no `.tmp`, and no
-conmon `.new` or `.1`. An unmatched name is skipped with no counter and no diagnostic, as a name
-outside a `tail_in` pattern is. That includes a static pod whose manifest-set uid holds `_`: its
-directory doesn't split into three parts, so none of its logs are read. A symlinked directory won't
-be followed, as `docker_in`'s walk doesn't follow one. A file name will be matched whether it's a
-regular file or a symlink to one (section 9). Failed listings will follow the driver's rule: a
-listing that failed retires nothing
+A pod directory name will be split at its first two `_`: the namespace, the pod name, and the rest
+as the uid, so a static pod whose manifest-set uid holds `_` is read with its whole uid. The
+kubelet's own reader of this name, `parsePodUIDFromLogsDirectory`
+(`pkg/kubelet/kuberuntime/helpers.go`, for its log garbage collection), also splits on `_`, but
+takes the last part as the uid, which such a uid would cut short; splitting at the first two `_` is
+the form `BuildPodLogsDirectory` writes. A pod directory name with fewer than two `_` or an empty
+part, a container directory name holding `_` or `.`, and every other file name won't be matched: no
+`.gz`, no `.tmp`, and no conmon `.new` or `.1`. An unmatched name is skipped with no counter and no
+diagnostic, as a name outside a `tail_in` pattern is. A symlinked directory won't be followed, as
+`docker_in`'s walk doesn't follow one. A file name will be matched whether it's a regular file or a
+symlink to one (section 9). Failed listings will follow the driver's rule: a listing that failed
+retires nothing
 ([ADR `tail-discovery-failure-and-resume-identity`](tail-discovery-failure-and-resume-identity.md),
 decision 1).
 
@@ -275,7 +279,7 @@ Each file's resource will hold the semantic-convention keys its path names:
 |---|---|---|
 | `k8s.namespace.name` | string | the pod directory's first part |
 | `k8s.pod.name` | string | its second part |
-| `k8s.pod.uid` | string | its third part |
+| `k8s.pod.uid` | string | the rest, after its second `_` |
 | `k8s.container.name` | string | the container directory |
 | `k8s.container.restart_count` | `i64` | the file name's `<n>` |
 | `container.id` | string | section 8, when known |
@@ -424,8 +428,6 @@ batch-assembly fields and `shutdown_grace`.
   (section 5). A reader that is behind doesn't split one: the timer arms only at the file's end.
 - **A static pod's `k8s.pod.uid` is the kubelet's hash, not the mirror pod's uid**, unless its
   manifest sets a uid (section 7).
-- **A static pod whose manifest sets a uid holding `_` isn't read**, and nothing counts it: its
-  directory doesn't split into three parts (section 2).
 - **A symlink name the kubelet cut short writes no `container.id`**, and neither does a container
   whose link isn't there yet or was removed before `cri_in` listed it (section 8).
 - **No pod labels or annotations, and no node name** (section 10). An enrichment stage or `set` adds
