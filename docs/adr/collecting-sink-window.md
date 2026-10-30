@@ -115,7 +115,9 @@ read before the next window opens.
   `EventBatch::estimated_heap_bytes` reach `buffer.max_bytes`, the operator's memory budget for
   the sink. Under the memory store the store's own bound already enforces it; under a disk store
   it bounds the decoded read-ahead the window holds, and graph rule 35 will accept a non-default
-  `buffer.max_bytes` beside `disk:` on a collecting sink for that one use. A window's size is
+  `buffer.max_bytes` beside `disk:` on a collecting sink for that one use ([ADR
+  `disk-backed-sink-buffer`](disk-backed-sink-buffer.md)'s amendment of 2026-10-30). The default
+  64 MiB applies when the operator sets none. A window's size is
   bounded by that budget on either store, and a larger window means raising `buffer.max_bytes`.
 - **Every stop goes to `await_ack`**, as a stop does today. The loop records why the window
   closed (decision 4).
@@ -187,6 +189,13 @@ read before the next window opens.
   rest stay reserved, so a memory store's `finish` counts them as still queued at shutdown and a
   disk store replays them. Its warning keeps the words "cut off mid-send" for the batches it
   counts, which are mid-send.
+- **The grace doesn't cut a closed window's owed answers.** They belong to a window the
+  destination already stored, and the sink answers them at once, so reading them costs no wait.
+  While the sink's `window()` reads an owed count, `deliver_window`'s grace early return and
+  `write_loop`'s grace arms don't fire; the loop reads every owed answer, commits each batch as
+  delivered, and only then honors the expired grace. Without this, a grace that passed between
+  the head's answer and the rest would count stored batches as shutdown drops, or replay them
+  from a disk store as duplicates.
 - **The grace is short for an upload.** Under the memory store, a grace cut counts the open
   window's batches as shutdown drops. `s3_out`'s operator doc will recommend a
   `buffer.shutdown_grace` long enough for one object's upload, and `buffer.disk:`, which replays

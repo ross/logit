@@ -29,7 +29,8 @@ Goals:
 
 Non-goals, each the ADR's "Not in v1":
 
-- Native append, conditional writes, and persisted upload ids.
+- Native append and persisted upload ids.
+- Conditional writes (`If-None-Match: *`): safe under the pin, a follow-up (maintainer, W0).
 - Several objects or parts in flight at once.
 - The OTLP formats and Parquet.
 - Partitions by attribute or by event time.
@@ -97,8 +98,10 @@ closing the window; the grace count; and graph rule 35 accepting a non-default
 `buffer.max_bytes` beside `disk:` on a collecting sink. No sink uses it yet.
 
 **Files.** `crates/logit-pipeline/src/output.rs`, `runtime.rs`, `queue.rs`, `disk_queue.rs`,
-`buffer_full.rs`, and `graph.rs` (rule 35), and `crates/logit-proto/src/buffer.rs` if the memory
-buffer needs a pressure read.
+`buffer_full.rs`, and `graph.rs` (rule 35 and its doc); `crates/logit-config/src/lib.rs`
+(`BufferConfig.disk`'s and `DiskBufferConfig.max_bytes`'s field docs) and
+`schema/logit.schema.json` through `script/schema`; and `crates/logit-proto/src/buffer.rs` if the
+memory buffer needs a pressure read.
 
 **Tests**, on a collecting variant of the `WindowedOutput` fake in `runtime.rs`'s window tests,
 each waiting on an observable through `logit_pipeline::test_util`:
@@ -112,6 +115,8 @@ each waiting on an observable through `logit_pipeline::test_util`:
 - a batch that arrives while a closed window uploads isn't submitted until all N of that
   window's answers are read, and the N - 1 answers behind the head come with no fill or wait
   between them;
+- the grace deadline passes between the head's answer and the owed ones: every owed answer is
+  read, each batch counts delivered, and nothing is counted dropped or left to replay;
 - a submit failure past the head makes the head's next `await_ack` fail without `HeadOnly`, and
   the loop resubmits from the head, the failed batch included;
 - pressure closes it in a memory store under `block` and under `drop_oldest`, and in a disk store
@@ -128,7 +133,8 @@ The existing window tests for `logit_out` and the HTTP slot sinks pass unchanged
 "nothing changes for existing windowed sinks".
 
 **Docs.** `docs/design/internal-telemetry.md` (`logit.component.window.closed`),
-`docs/design/pipeline-graph.md`'s "Cancellation points" and rule 35, `docs/deploying.md`'s sink buffering
+`docs/design/pipeline-graph.md`'s "Cancellation points" and rule 35, the two field docs above
+(operator docs, through `script/schema`), `graph.rs`'s rule 35 doc, `docs/deploying.md`'s sink buffering
 section (the `drop_oldest` note), and the `Output` trait's doc.
 
 ### W3: `s3_out`
@@ -228,7 +234,8 @@ harness list, and the ADR's decision 6 rows each run confirms or corrects.
 - **Delivery model: decided by the maintainer.** One object per window, every batch delivered at
   its object's completion, as Kafka Connect does; no acknowledgment on staging and no sink-owned
   staging directory.
-- **Key: decided by the maintainer.** The first batch's store identity, with no conditional write.
+- **Key: decided by the maintainer.** The first batch's store identity, with no conditional write
+  in v1; on review the maintainer confirmed that, though the pin makes one safe, it is a follow-up.
 - **Scope: decided by the maintainer.** The interop harness covers MinIO, Ceph RGW, and AWS;
   `replay_in` reads gzip and zstd in this stream; the formats, native append, concurrency, and the
   soak stand-in wait.
@@ -248,8 +255,9 @@ These came out of writing the ADRs; a reviewer may push on any of them:
 - An upload abandoned in the process is aborted once, best effort, and a failed part poisons its
   object (decision 1).
 - The head pins its batch count, which only falls, and `object_time` carries milliseconds, so a
-  restart can't repeat a dead process's key (decision 3). With the pin, the maintainer's reason
-  against `If-None-Match` no longer arises; the ADR keeps the decision on other grounds.
+  restart can't repeat a dead process's key (decision 3).
+- Conditional writes: the pin makes a `412` safe to read as delivered, and the maintainer
+  confirmed on review that they stay out of v1, as a follow-up (`s3-object-archive`, decision 3).
 - `InvalidPart`, `InvalidPartOrder`, and `EntityTooSmall` are `Clean`, holding on a sink defect
   rather than dropping a batch per attempt, and every `503` with an S3 code is `Clean`
   (`s3-object-archive`, decision 6).
@@ -260,7 +268,9 @@ These came out of writing the ADRs; a reviewer may push on any of them:
   `collecting-sink-window`](../adr/collecting-sink-window.md), decision 2). Dropping read-ahead
   and re-reading on a fault is rejected for now.
 - A closed window's answers are all read before the next window opens, through `window()`
-  reading the answers owed (decision 1 of that ADR).
+  reading the answers owed, and the grace deadline doesn't cut them (decisions 1 and 5 of that
+  ADR). Rule 35's change is recorded as an amendment to [ADR
+  `disk-backed-sink-buffer`](../adr/disk-backed-sink-buffer.md).
 - zstd writes one frame per staged batch, since `ruzstd` 0.9 has no streaming encoder (`s3-object-archive`, decision 4).
 - A hand-rolled XML extractor, not an XML crate, and a `Content-Type` per format (`s3-object-archive`, decisions 4 and 5).
 - `timeout` defaults to `60s` (`s3-object-archive`, decision 7).

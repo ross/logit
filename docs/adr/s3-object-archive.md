@@ -157,9 +157,9 @@ batch of the object is answered, its `window()` reads the answers it still owes 
   answered, so a batch that arrives during an upload waits in the store. Parts of one object
   upload one at a time, too.
 
-### 3. The key is the first batch's identity, with no conditional write
+### 3. The key is the first batch's identity, with no conditional write in v1
 
-The maintainer chose this key and ruled out conditional writes.
+The maintainer chose this key and kept conditional writes out of v1.
 
 ```text
 {prefix}{partition formatted at object_time}{object_time}-{store id}-{first seq}.{ext}
@@ -208,11 +208,12 @@ logs/dt=2026-10-30/hour=14/20261030T142501.123Z-6f1c...e09a-00000000000000000042
   a deterministic encoding, though the `json` and native encoders are deterministic.
 - **What an overwrite looks like.** It is the at-least-once duplicate in S3's terms: a second
   `ObjectCreated` event notification for the key, and a second version on a versioned bucket.
-- **No `If-None-Match: *`.** The maintainer ruled it out because a retry could hold more batches
-  than the object already at its key, and a `412` would drop the extra ones. The pin now keeps a
-  retry from holding more, so that case no longer arises; the decision stands because an
-  overwrite is already loss-free, and a conditional write would add an answer to classify for no
-  gain.
+- **No `If-None-Match: *` in v1.** The maintainer first ruled it out because a retry could hold
+  more batches than the object already at its key, and a `412` would drop the extra ones. The pin
+  removes that case: a retry never holds more than an earlier attempt at its key, so a `412` means
+  an object at least as complete is already there, and reading it as delivered would be safe. The
+  maintainer confirmed it stays out of v1 anyway, since an overwrite is already loss-free; it is a
+  follow-up.
 - **No secret in a key, and none in a message.** The key holds no config value but `prefix` and
   `partition`. Messages name the bucket and print `endpoint:` only through
   `logit_core::redact::url`.
@@ -346,7 +347,8 @@ Every field but `bucket:` and `region:` will default. The fields:
 
 - **Why these defaults.** `max_age: 5m` matches Vector's, Cribl's, and Firehose's 300 s.
   `max_bytes: 32MiB` matches Cribl's 32 MB and fits under the memory store's default 64 MiB
-  `buffer.max_bytes` with room for the next object to collect while one uploads. `part_size:
+  `buffer.max_bytes`, below the memory bound, with room for arrivals to queue in the store while
+  an object uploads. `part_size:
   8MiB` is above S3's 5 MiB minimum and keeps one part's buffer small.
 - **No `concurrency:`.** One object uploads at a time (decision 2); the field is absent rather
   than fixed at 1.
@@ -388,7 +390,7 @@ The maintainer set both.
     requires restated as soak steps, and it's a follow-up;
   - the OTLP formats and Parquet;
   - native append, on S3 Express One Zone or Ceph RGW;
-  - conditional writes;
+  - conditional writes (`If-None-Match: *`), safe under the pin (decision 3) and a follow-up;
   - several objects, or several parts, in flight at once;
   - an object-store reader for `replay_in`;
   - partitions by attribute or by event time;
@@ -414,8 +416,8 @@ The maintainer set both.
   be chosen when the upload starts.
 - **A random key per object** (the OTel exporter). Rejected: every retry is a new object, a
   duplicate even when the first attempt failed.
-- **Conditional writes (`If-None-Match: *`).** Rejected, as decision 3 says: an overwrite is
-  loss-free, and a `412` would be one more answer to classify.
+- **Conditional writes (`If-None-Match: *`) in v1.** Deferred, as decision 3 says: the pin makes
+  them safe, and an overwrite is already loss-free, so v1 doesn't need them.
 - **Retry `CompleteMultipartUpload` on the same upload id before starting over.** It would let a
   late Complete and its retry be the same request. Rejected for the pinned count, which covers a
   late `PutObject` as well and keeps every retry on the loop's one path.
