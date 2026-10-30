@@ -1017,8 +1017,8 @@ the operator-facing account of all of this.
   traces, `graphite_in`, `syslog_in`, and `splunk_hec_in`'s logs and spans; the columns are `statsd_out`,
   `prometheus_out`, `influxdb_out`, `otlp_out`, `datadog_out`, `datadog_trace_out` (read back
   through `datadog_trace_in`'s decoding), `graphite_out`, `syslog_out`, `splunk_hec_out`, and
-  `kafka_out` (`format: json` and `text`, read back by a driver convention, since there's no
-  `kafka_in`), through 28 like-pair flows (statsd, InfluxDB, Prometheus, Datadog, the Datadog tracer API,
+  `kafka_out` (`format: json` and `text`, read back by a driver convention until the spec gains a
+  `kafka_in` source, the [kafka-input plan](docs/plans/kafka-input.md)'s W5), through 28 like-pair flows (statsd, InfluxDB, Prometheus, Datadog, the Datadog tracer API,
   OTLP, Graphite, syslog, and Splunk; 4 of them through an `aggregate`) and 101 cross-protocol
   flows ([ADR `transit-spec`](docs/adr/transit-spec.md), [plan](docs/plans/transit-spec.md)).
 

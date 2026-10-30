@@ -415,14 +415,14 @@ batch`.
 
 - **`record:` exists only under `format: text`**, default `event`, because only `text` can't tell a
   batch record from an event record by its bytes. The other formats read both forms.
-- **The `text` batch form changes in `kafka_out`.** Today it joins bodies with `\n` unescaped, so a
-  body that holds a newline reads as two ([ADR `kafka-output`](kafka-output.md), "Amendment: what
-  W3 settled", point 5). `logit` is pre-release, so the encoder changes rather than the pair
-  listing a normalization: under `record: batch`, each body escapes `\` as `\\` and LF as `\n`,
-  and the bodies are joined by LF with none after the last. `kafka_in` splits on LF and unescapes.
-  The escape works on bytes, so a body's UTF-8 validity and its `Str` or `Bytes` type survive. An
-  escaped form stays one line per body for a console consumer; a length prefix wouldn't. The
-  stream records it as a `kafka-output` amendment. `record: event` text is unchanged: the OTel
+- **A `text` batch record is escaped lines.** Under `record: batch`, `kafka_out` escapes each
+  body's `\` as `\\` and LF as `\n` and joins the bodies by LF with none after the last;
+  `kafka_in` splits on LF and unescapes ([ADR `kafka-output`](kafka-output.md), "Amendment: `text`
+  batch records escape newlines (2026-10-30)", which supersedes the unescaped join of its
+  "Amendment: what W3 settled", point 5). `logit` is pre-release, so the encoder escapes rather
+  than the pair listing a normalization. The escape works on bytes, so a body's UTF-8 validity and
+  its `Str` or `Bytes` type survive. An escaped form stays one line per body for a console
+  consumer; a length prefix wouldn't. `record: event` text is one body as it is: the OTel
   `kafkaexporter`'s `raw` encoding.
 - **`text` reads a third-party producer's lines.** Filebeat, Fluent Bit, and Vector write
   application JSON. That arrives as `format: text` plus a `json` transform, the stance of

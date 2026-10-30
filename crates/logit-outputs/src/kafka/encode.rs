@@ -86,7 +86,8 @@
 //! canonical copy, by `script/transit docs`, and a test fails when they're stale: change the
 //! table there, not here. They cover `format: json` and `format: text`, the latter as each cell's
 //! `format: text` condition, and logs, spans, and attributes: the spec has no metric cells for
-//! `kafka_out`. No `kafka_in` exists, so "consumer" means the transit driver's reading of a record
+//! `kafka_out`. Until the spec gains a `kafka_in` source, "consumer" means the transit driver's
+//! reading of a record
 //! (`crates/logit-cli/src/transit/wire.rs`'s module doc): a `format: json` record through the
 //! event JSON reader, and a `format: text` record as one log whose message is the value.
 //!
