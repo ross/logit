@@ -1578,6 +1578,29 @@ those values as *fields*, not as a rendered message.
 `Diagnostics` keys: `bad_line` (a refused JSON line, with its line number), `bad_frame` (a skipped
 frame, with its byte offset), `truncated` (the file ends inside a frame), and `closed_consumer`.
 
+##### `kafka_in`
+
+`crates/logit-kafka/src/consumer/`, [ADR `kafka-input`](../adr/kafka-input.md). The consumer-group
+client counts these; the outcome table in its module doc says which broker answer counts what. A
+Kafka record is the unit.
+
+| Name | Kind | Meaning |
+|---|---|---|
+| `logit.input.records` / `.record.bytes` | count | data records handed to the input, and their value bytes, plus every record a skip below counts; a buffered record a revoke discards isn't counted |
+| `logit.input.records.dropped{reason="corrupt"\|"oversize"\|"legacy_format"\|"retention"}` | count | a skipped batch's records: a CRC mismatch twice at one batch, or records that don't decompress or parse (`corrupt`), records decompressing past `max_batch_bytes` (`oversize`), a magic 0 or 1 message set, one per offset (`legacy_format`), or the offsets retention deleted below a position before they were read (`retention`) |
+| `logit.input.records.skipped{reason="aborted"}` | count | under `read_committed`, records of an aborted transaction; control records aren't counted |
+| `logit.input.partitions` | gauge | partitions assigned, on every assignment |
+| `logit.input.lag{topic, partition}` | gauge | the high watermark, or under `read_committed` the last stable offset, less the position, from each Fetch answer |
+| `logit.input.rebalances{reason="start"\|"rebalance"\|"membership_lost"\|"metadata"}` | count | each completed join |
+| `logit.input.commits{class="ok"\|"error"\|"fenced"}` | count | each OffsetCommit |
+| `logit.input.offsets.reset{reason="no_commit"\|"out_of_range"}` | count | a partition starting with no committed offset, or moved after `OFFSET_OUT_OF_RANGE` |
+| `logit.input.broker.errors{api, error}` | count | each broker error code, by its snake_case Kafka name, or `transport`, `tls`, `sasl`, or `unsupported_version` for a failed dial or request |
+| `logit.input.reconnects` | count | a redial of a connection the consumer dialed before |
+
+`Diagnostics` keys, each throttled: `records_dropped` (naming the topic, partition, and offset),
+`topic_missing`, `auth_failed`, `group_refused`, `not_authorized`, `unsupported_version`, and
+`broker_error` for any other code.
+
 #### Transforms
 
 ##### `route`
