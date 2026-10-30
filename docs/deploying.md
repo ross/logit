@@ -581,9 +581,9 @@ row uses the stage above with that row's attribute name:
 | Producer | Arrives through | Where the host is | Recipe |
 |---|---|---|---|
 | Telegraf, `outputs.influxdb_v2` | `influxdb_in` | the `host` tag on every point, an attribute `host` | copy `host` |
-| pino, pino-http | `tail_in` or `docker_in`, then `json` | the `hostname` field, an attribute `hostname` | copy `hostname` |
-| bunyan | `tail_in` or `docker_in`, then `json` | the `hostname` field, an attribute `hostname` | copy `hostname` |
-| semantic_logger (Ruby), JSON format | `tail_in` or `docker_in`, then `json` | the `host` field, an attribute `host` | copy `host` |
+| pino, pino-http | `tail_in`, `docker_in`, or `cri_in`, then `json` | the `hostname` field, an attribute `hostname` | copy `hostname` |
+| bunyan | `tail_in`, `docker_in`, or `cri_in`, then `json` | the `hostname` field, an attribute `hostname` | copy `hostname` |
+| semantic_logger (Ruby), JSON format | `tail_in`, `docker_in`, or `cri_in`, then `json` | the `host` field, an attribute `host` | copy `host` |
 | collectd `write_graphite`, Telegraf `outputs.graphite` | `graphite_in` | the metric path's first segment (`<host>.<plugin>...`, or Telegraf's default template `host.tags.measurement.field`), after any `prefix` | split the segment off the metric name in a `lua` stage; to label the whole stream instead, `set` a constant `host.name` |
 
 python-json-logger, structlog, Go's `log/slog`, and zap write no host by default; a `set` of a
@@ -2568,9 +2568,10 @@ re-apply `read_from`: under `end`, the default, the lines written while no pod r
 under `beginning`, every file on the node is replayed. A run of `P` pieces still waiting for its
 `F` at a clean stop is kept unread when a checkpoint is configured, and read whole on the restart.
 
-**Roll a `cri_in` DaemonSet with `maxUnavailable: 1` and `maxSurge: 0`, not the surging rollout
-below.** Two pods on one node both read every file, so a surge delivers every line twice while it
-lasts, and two pods writing one `hostPath` checkpoint overwrite each other's offsets.
+**Roll a `cri_in` DaemonSet with `maxUnavailable: 1` and `maxSurge: 0`, not the
+[surging rollout](#kubernetes-a-surging-daemonset).** Two pods on one node both read every file,
+so a surge delivers every line twice while it lasts, and two pods writing one `hostPath`
+checkpoint overwrite each other's offsets.
 
 **`host.name`.** The path names no node, so `cri_in` writes no `host.name`. A sink that fills a
 missing host uses `logit`'s hostname, which in a pod is the pod's name unless the pod runs with

@@ -148,7 +148,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   can't detect in advance.
   - **Workaround:** for a config on such a mount, set `watch: poll` explicitly. `poll_interval`
     is the only mechanism proven to work everywhere.
-- **`tail_in`/`docker_in`'s `inotify` wake source is Linux-only.** Every other platform runs
+- **The tail listeners' `inotify` wake source is Linux-only.** Every other platform runs
   `watch: poll` regardless of config, and an explicit `watch: inotify` is a startup error, not a
   silent downgrade.
 - **A *file* watch that fails to register is never retried for that file.** `Watcher::watch_file`

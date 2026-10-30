@@ -1094,3 +1094,75 @@ async fn a_missing_containers_dir_gives_no_id_and_no_error() {
     assert_eq!(probe.sum("logit.input.bytes.dropped", &[]), 0.0);
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// The offset in a `cri_in` checkpoint's only entry.
+fn checkpointed_offset(path: &Path) -> Option<u64> {
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<serde_json::Value>(&text).ok()?["files"][0]["offset"].as_u64()
+}
+
+/// An idle flush that only ends an oversize drop emits nothing, but it releases the pin, and the
+/// next interval write moves the checkpoint past the dropped line.
+#[tokio::test]
+async fn an_idle_flush_that_ends_a_drop_advances_the_checkpoint() {
+    let root = scratch_dir("cri-in-idle-drop-checkpoint");
+    let log = container_dir(&root).join("0.log");
+    let text = record("stdout", "P", &"x".repeat(40));
+    append(&log, &text);
+    let checkpoint = root.join("ckpt.json");
+    let config = TailConfig {
+        checkpoint_path: Some(checkpoint.clone()),
+        checkpoint_interval: Duration::from_millis(10),
+        max_line_bytes: 16,
+        ..fast_config()
+    };
+    let (fanout, mut rx) = fanout_channel(8);
+    let mut probe = TelemetryProbe::new();
+    let running =
+        spawn_input(input(&root, Duration::from_millis(150), config, &mut probe), fanout).await;
+    // Pinned at the dropped line's start while the drop lasts.
+    wait_until("the pinned checkpoint", || checkpointed_offset(&checkpoint) == Some(0)).await;
+    wait_until("the checkpoint past the drop", || {
+        checkpointed_offset(&checkpoint) == Some(text.len() as u64)
+    })
+    .await;
+    assert_no_batch(&mut rx, Duration::from_millis(1), "a drop emits nothing").await;
+    running.stop().await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A checkpoint written while a splitter-dropped record's line is still being dropped stays at
+/// that record's start, though a later line of the other stream was read past it.
+#[tokio::test]
+async fn a_checkpoint_during_a_splitter_drop_stays_at_the_dropped_records_start() {
+    let root = scratch_dir("cri-in-splitter-drop-checkpoint");
+    let log = container_dir(&root).join("0.log");
+    let before = record("stdout", "F", "before");
+    let mut text = before.clone();
+    text.push_str(&record("stdout", "P", &"y".repeat(envelope_cap(1024) + 1)));
+    text.push_str(&record("stderr", "F", "other"));
+    append(&log, &text);
+    let checkpoint = root.join("ckpt.json");
+    let config = TailConfig {
+        checkpoint_path: Some(checkpoint.clone()),
+        checkpoint_interval: Duration::from_millis(10),
+        max_line_bytes: 1024,
+        ..fast_config()
+    };
+    let (fanout, mut rx) = fanout_channel(8);
+    let mut probe = TelemetryProbe::new();
+    let running = spawn_input(input(&root, Duration::ZERO, config, &mut probe), fanout).await;
+    let events = recv_events(&mut rx, 2).await;
+    assert_eq!(lines(&events), pairs(&[("before", "stdout"), ("other", "stderr")]));
+    // A write before the whole record was read sits at its start through the splitter's pending
+    // bytes alone, so wait for one after the last line.
+    let writes = probe.sum("logit.input.checkpoint.writes", &[]);
+    probe
+        .wait_for("a write after the last line", |t| {
+            t.sum("logit.input.checkpoint.writes", &[]) > writes
+        })
+        .await;
+    assert_eq!(checkpointed_offset(&checkpoint), Some(before.len() as u64));
+    running.stop().await;
+    std::fs::remove_dir_all(&root).ok();
+}

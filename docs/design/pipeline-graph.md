@@ -242,7 +242,7 @@ literal argument string.
 
 | Kind class | `sources` | May be another component's source |
 |---|---|---|
-| Listener (`statsd_in`, `lines_in`, `collectd_in`, `graphite_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`, `internal`, `prometheus_in`, `generate_in`, `replay_in`) | must be empty | required (≥1 consumer) |
+| Listener (`statsd_in`, `lines_in`, `collectd_in`, `graphite_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `cri_in`, `logit_in`, `internal`, `prometheus_in`, `generate_in`, `replay_in`) | must be empty | required (≥1 consumer) |
 | Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `has_stale`, `drop_stale`, `cumulative_to_delta`, `dedup_timestamps`, `keep_values`, `bucket`, `logfmt`, `kv`, `regex`, `shape`, `flatten`, `line_protocol`, `http_access`, `sample`, `timestamp`, `route`, `route_signals`) | ≥1 required | required (≥1 consumer), except `route_signals`, which must have none (rule 92) |
 | Sink (`influxdb_out`, `stdio_out`, `file_out`, `otlp_out`, `datadog_out`, `datadog_trace_out`, `splunk_hec_out`, `kafka_out`, `syslog_out`, `logit_out`, `statsd_out`, `collectd_out`, `graphite_out`, `prometheus_out`, `null_out`) | ≥1 required | must not be |
 | Target (`target`) | must be empty | required (≥1 consumer), and ≥1 directing router (rule 49) |
@@ -372,8 +372,10 @@ a black hole counts what it discards as `events.discarded`.
 24. An inconsistent `otlp_out` `tls:`, or one under a non-`https://` endpoint.
 25. A `trace_context` `span:` with an empty `name` or a `0s` `max_skew`.
 26. A `tail_in` `paths` entry that is empty or has a `*` outside the final path component.
-27. A `docker_in` with an empty or duplicate entry or an empty `root`.
-28. A `tail_in`/`docker_in` `poll_interval`, `checkpoint_interval`, or `max_line_bytes` of `0`.
+27. A `docker_in` with an empty or duplicate entry or an empty `root`, or a `cri_in` with an empty
+    `root`.
+28. A `tail_in`/`docker_in`/`cri_in` `poll_interval`, `checkpoint_interval`, or `max_line_bytes`
+    of `0`.
 29. A `file_out` `rotate.max_bytes`/`max_files` of `0`, or a `max_files` above 1000
     (`logit_config::MAX_ROTATE_FILES`).
 31. A `regex` with an empty `field`, or a `pattern` that fails to compile.
@@ -427,7 +429,7 @@ a black hole counts what it discards as `events.discarded`.
     route rule, or a `max_length` key it never caps.
 61. A `sample` rate that is non-finite or outside `[0, 1]`, an empty field name, a malformed
     `always_keep`, or `missing:` without `key:`.
-62. Two `tail_in`/`docker_in` components sharing a `checkpoint_path`, or one whose
+62. Two `tail_in`/`docker_in`/`cri_in` components sharing a `checkpoint_path`, or one whose
     `checkpoint_path` is another's `<checkpoint_path>.tmp`.
 63. A `datadog_in` with an empty `bind`, or an `api_keys` entry that is empty or has surrounding
     whitespace.
@@ -912,7 +914,7 @@ topology, not a rare one, with these consequences:
 consumers or all closed. That answers the input's half. An acknowledging listener refuses, or
 doesn't acknowledge, a batch its direct consumers have all closed: `logit_in` answers
 `GOING_AWAY`, the HTTP listeners answer `503` (gRPC `UNAVAILABLE`, `splunk_hec_in` `503` code 9
-or `500` code 8), and `tail_in` and `docker_in` freeze their checkpoint and stop. A sink closing
+or `500` code 8), and `tail_in`, `docker_in`, and `cri_in` freeze their checkpoint and stop. A sink closing
 behind an open transform is still acknowledged. Propagating the closure as a shutdown signal
 stays open and isn't built.
 

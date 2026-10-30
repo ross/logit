@@ -438,9 +438,10 @@ empty-path checks, rather than under a rule number of its own.
   a `checkpoint_path` with another tail listener would overwrite its offsets.
 - The driver has the hooks and choices in "Implementation notes for W2". `tail_in` and
   `docker_in` keep their behavior. The splitter reports its drops in sequence with its lines, so the
-  driver counts a drop the decoder didn't take where it decodes, not in bulk after the read: a drop
-  that falls after a batch the closed consumer didn't take goes uncounted, as a line there goes
-  undelivered.
+  driver counts a drop the decoder didn't take where it decodes, not in bulk after the read. A
+  batch a closed consumer refused stops decoding, so the decoder never sees a drop reported after
+  it; the driver counts each such drop as `oversize` itself, so no splitter drop goes uncounted,
+  and one the decoder would have folded into a drop it already counted is counted twice.
 - A file's splitter can hold up to `envelope_cap(max_line_bytes)` of an unterminated record, about 6
   MiB at the default, as `docker_in`'s can.
 - `DockerDecoder`'s envelope decoding and reassembly will become reachable from `cri_in`, and the
