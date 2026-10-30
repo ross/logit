@@ -3,7 +3,8 @@
 `script/s3-interop` checks `s3_out` against a real MinIO and a real Ceph RGW, or, in
 [AWS mode](#aws-mode), a real S3 bucket. It runs the legs in [What it runs](#what-it-runs) against
 each store, fetches every object with the AWS CLI, tests each with the stock `gzip` and `zstd`, and
-prints one row per leg and store. [Recorded run](#recorded-run) records what a run in each mode showed.
+prints one row per leg and store. [Recorded run](#recorded-run) records what a run in each mode
+showed.
 
 The script runs on the host and drives docker (`$DOCKER`, `sudo docker` by default), like
 `script/kafka-interop` and `script/splunk-interop`. It isn't part of `script/cibuild`, and no test
