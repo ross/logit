@@ -310,7 +310,7 @@ soak harness share no file, and neither changes `kafka_in`.
 | # | Branch | PR title | Size | Depends on | Status |
 |---|---|---|---|---|---|
 | W0 | `kin/w0` | `kin/w0: ADR and plan for kafka_in, a consumer-group client` | S | — | open |
-| W1 | `kin/w1` | `kin/w1: the logit-kafka crate, shared by kafka_out and kafka_in` | M | W0, the `s3` stream's `logit-aws` PR | not started |
+| W1 | `kin/w1` | `kin/w1: the logit-kafka crate, shared by kafka_out and kafka_in` | M | W0, the `s3` stream's `logit-aws` PR | open |
 | W2 | `kin/w2` | `kin/w2: the consumer core: group membership, assignors, offsets, and fetch` | L | W1 | not started |
 | W3 | `kin/w3` | `kin/w3: kafka_in, with json, text, and native, and kafka_out's text batch escape` | L | W2 | not started |
 | W4 | `kin/w4` | `kin/w4: kafka_in's msgpack and OTLP formats` | M | W3 | not started |
@@ -326,3 +326,10 @@ Recorded per workstream as each lands.
   classic group APIs at Kafka 2.4's versions or above (JoinGroup v0 to v6, SyncGroup v0 to v4,
   Fetch v4 to v13), checked with `kafka-broker-api-versions.sh`. `kafka-protocol`'s `Record`
   collapses repeated header names, so W2 decodes records itself.
+- **W1**: `kafka_out`'s `http::try_read_body_bytes` had no caller once `oauth.rs` moved, so it
+  left `logit-outputs` rather than staying unchanged. `prometheus::compression::decompress_bounded`
+  refuses a zstd frame whose declared window exceeds the bound, and the Java client's corpus batch
+  declares such a window, so `logit_proto::kafka`'s zstd decompressor streams through a
+  `take(max + 1)` under `ruzstd`'s 128 MiB window cap instead of reusing it. `Dialer` gained a
+  `required` list of API keys a broker must offer or be `Refused`, which the producer sets to
+  Produce, Metadata, and InitProducerId; the consumer sets its own.
