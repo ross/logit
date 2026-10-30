@@ -482,8 +482,8 @@
 //! | `log/observed_timestamp`, under `format: otlp_json` | exact | -- | As at otlp_out: The `LogRecord`'s `observed_time_unix_nano`. |
 //! | `log/observed_timestamp`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `log/observed_timestamp_unset`, under `format: text` | exact | -- | Nothing is written, and nothing reads back. |
-//! | `log/observed_timestamp_unset`, under `format: otlp_proto` | normalized | `observed_timestamp` | As at otlp_out: otlp_out stamps a log that has no observed time with the time it encodes the request, as `logs.proto` defines the field. |
-//! | `log/observed_timestamp_unset`, under `format: otlp_json` | normalized | `observed_timestamp` | As at otlp_out: otlp_out stamps a log that has no observed time with the time it encodes the request, as `logs.proto` defines the field. |
+//! | `log/observed_timestamp_unset`, under `format: otlp_proto` | normalized | `observed_timestamp` | As at otlp_out: the sink stamps a log that has no observed time with the time it encodes the request, as `logs.proto` defines the field. |
+//! | `log/observed_timestamp_unset`, under `format: otlp_json` | normalized | `observed_timestamp` | As at otlp_out: the sink stamps a log that has no observed time with the time it encodes the request, as `logs.proto` defines the field. |
 //! | `log/observed_timestamp_unset`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `log/trace`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the log's trace and span ids are left off. |
 //! | `log/trace`, under `format: otlp_proto` | exact | -- | As at otlp_out: The `LogRecord`'s `trace_id` and `span_id`. |
