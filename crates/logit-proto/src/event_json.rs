@@ -29,6 +29,7 @@
 //! resource or scope changes partway, since its signature returns one pair; a caller with mixed
 //! input feeds it a run at a time or calls `decode_batches`. Blank lines are skipped.
 
+use crate::event_tree::{Node, Obj};
 use crate::{CodecError, Decoder};
 use base64::Engine;
 use bytes::Bytes;
@@ -40,7 +41,6 @@ use logit_core::{
     Samples, Scope, Severity, SketchStats, SpanEvent, SpanExt, SpanKind, SpanLink, SpanRecord,
     SpanStatus, Sum, Summary, Temporality, TraceRef, Value,
 };
-use serde_json::{Map, Value as Json};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -66,13 +66,18 @@ impl EventJsonDecoder {
 
     /// Decodes one line, without its newline.
     pub fn decode_line(&mut self, line: &[u8]) -> Result<Line, CodecError> {
-        let json: Json = serde_json::from_slice(line)
+        let json: Node = serde_json::from_slice(line)
             .map_err(|e| CodecError::Malformed(format!("not a JSON line: {e}")))?;
-        let Json::Object(obj) = json else {
+        let Node::Map(obj) = json else {
             return Err(malformed("a line is not a JSON object"));
         };
-        let mut types = Types::new(&obj)?;
-        let event = read_event(&obj, &mut types)?;
+        self.decode_object(&obj)
+    }
+
+    /// Decodes one event object, however its front end parsed it.
+    pub(crate) fn decode_object(&mut self, obj: &Obj) -> Result<Line, CodecError> {
+        let mut types = Types::new(obj)?;
+        let event = read_event(obj, &mut types)?;
         let resource = match obj.get("resource") {
             Some(r) => read_resource(as_object(r, "resource")?, &mut types)?,
             None => Resource::default(),
@@ -89,13 +94,7 @@ impl EventJsonDecoder {
     pub fn decode_batches(&mut self, bytes: &[u8]) -> Result<Vec<EventBatch>, CodecError> {
         let mut batches: Vec<EventBatch> = Vec::new();
         for line in lines(bytes) {
-            let Line { resource, scope, event } = self.decode_line(line)?;
-            match batches.last_mut() {
-                Some(b) if Arc::ptr_eq(&b.resource, &resource) && same_scope(&b.scope, &scope) => {
-                    b.events.push(event)
-                }
-                _ => batches.push(EventBatch { resource, scope, events: vec![event] }),
-            }
+            push_line(&mut batches, self.decode_line(line)?);
         }
         Ok(batches)
     }
@@ -158,6 +157,18 @@ impl Decoder for EventJsonDecoder {
     }
 }
 
+/// Appends `line` to the last batch when it shares that batch's resource and scope `Arc`s, else
+/// starts a batch.
+pub(crate) fn push_line(batches: &mut Vec<EventBatch>, line: Line) {
+    let Line { resource, scope, event } = line;
+    match batches.last_mut() {
+        Some(b) if Arc::ptr_eq(&b.resource, &resource) && same_scope(&b.scope, &scope) => {
+            b.events.push(event)
+        }
+        _ => batches.push(EventBatch { resource, scope, events: vec![event] }),
+    }
+}
+
 fn same_scope(a: &Option<Arc<Scope>>, b: &Option<Arc<Scope>>) -> bool {
     match (a, b) {
         (None, None) => true,
@@ -186,7 +197,7 @@ struct Types {
 }
 
 impl Types {
-    fn new(obj: &Map<String, Json>) -> Result<Self, CodecError> {
+    fn new(obj: &Obj) -> Result<Self, CodecError> {
         let mut tags = HashMap::new();
         if let Some(table) = obj.get("types") {
             for (pointer, tag) in as_object(table, "types")? {
@@ -238,54 +249,54 @@ impl Types {
     }
 }
 
-fn as_object<'a>(json: &'a Json, what: &str) -> Result<&'a Map<String, Json>, CodecError> {
+fn as_object<'a>(json: &'a Node, what: &str) -> Result<&'a Obj, CodecError> {
     json.as_object().ok_or_else(|| malformed(format!("{what} is not an object")))
 }
 
-fn as_array<'a>(json: &'a Json, what: &str) -> Result<&'a Vec<Json>, CodecError> {
+fn as_array<'a>(json: &'a Node, what: &str) -> Result<&'a Vec<Node>, CodecError> {
     json.as_array().ok_or_else(|| malformed(format!("{what} is not an array")))
 }
 
-fn as_str<'a>(json: &'a Json, what: &str) -> Result<&'a str, CodecError> {
+fn as_str<'a>(json: &'a Node, what: &str) -> Result<&'a str, CodecError> {
     json.as_str().ok_or_else(|| malformed(format!("{what} is not a string")))
 }
 
-fn field<'a>(obj: &'a Map<String, Json>, key: &str) -> Result<&'a Json, CodecError> {
+fn field<'a>(obj: &'a Obj, key: &str) -> Result<&'a Node, CodecError> {
     obj.get(key).ok_or_else(|| malformed(format!("missing {key}")))
 }
 
-fn opt_u64(obj: &Map<String, Json>, key: &str) -> Result<u64, CodecError> {
+fn opt_u64(obj: &Obj, key: &str) -> Result<u64, CodecError> {
     obj.get(key).map_or(Ok(0), |v| {
         v.as_u64().ok_or_else(|| malformed(format!("{key} is not an unsigned integer")))
     })
 }
 
-fn opt_u32(obj: &Map<String, Json>, key: &str) -> Result<u32, CodecError> {
+fn opt_u32(obj: &Obj, key: &str) -> Result<u32, CodecError> {
     u32::try_from(opt_u64(obj, key)?).map_err(|_| malformed(format!("{key} is out of range")))
 }
 
-fn req_u64(obj: &Map<String, Json>, key: &str) -> Result<u64, CodecError> {
+fn req_u64(obj: &Obj, key: &str) -> Result<u64, CodecError> {
     field(obj, key)?.as_u64().ok_or_else(|| malformed(format!("{key} is not an unsigned integer")))
 }
 
-fn req_i32(obj: &Map<String, Json>, key: &str) -> Result<i32, CodecError> {
+fn req_i32(obj: &Obj, key: &str) -> Result<i32, CodecError> {
     field(obj, key)?
         .as_i64()
         .and_then(|n| i32::try_from(n).ok())
         .ok_or_else(|| malformed(format!("{key} is not a 32-bit integer")))
 }
 
-fn req_bool(obj: &Map<String, Json>, key: &str) -> Result<bool, CodecError> {
+fn req_bool(obj: &Obj, key: &str) -> Result<bool, CodecError> {
     field(obj, key)?.as_bool().ok_or_else(|| malformed(format!("{key} is not a boolean")))
 }
 
-/// An `f64` field: any JSON number, or a non-finite string.
-fn f64_of(json: &Json, what: &str) -> Result<f64, CodecError> {
+/// An `f64` field: any number, or a non-finite string.
+fn f64_of(json: &Node, what: &str) -> Result<f64, CodecError> {
+    if let Some(f) = json.as_f64() {
+        return Ok(f);
+    }
     match json {
-        Json::Number(n) => n.as_f64().ok_or_else(|| malformed(format!("{what} is not a number"))),
-        Json::String(s) => {
-            non_finite(s).ok_or_else(|| malformed(format!("{what} is not a number")))
-        }
+        Node::Str(s) => non_finite(s).ok_or_else(|| malformed(format!("{what} is not a number"))),
         _ => Err(malformed(format!("{what} is not a number"))),
     }
 }
@@ -299,24 +310,24 @@ fn non_finite(s: &str) -> Option<f64> {
     }
 }
 
-fn req_f64(obj: &Map<String, Json>, key: &str) -> Result<f64, CodecError> {
+fn req_f64(obj: &Obj, key: &str) -> Result<f64, CodecError> {
     f64_of(field(obj, key)?, key)
 }
 
-fn opt_f64(obj: &Map<String, Json>, key: &str) -> Result<Option<f64>, CodecError> {
+fn opt_f64(obj: &Obj, key: &str) -> Result<Option<f64>, CodecError> {
     obj.get(key).map(|v| f64_of(v, key)).transpose()
 }
 
-fn timestamp_of(json: &Json, what: &str) -> Result<i64, CodecError> {
+fn timestamp_of(json: &Node, what: &str) -> Result<i64, CodecError> {
     parse_rfc3339_to_nanos(as_str(json, what)?)
         .map_err(|_| malformed(format!("{what} is not an RFC 3339 timestamp")))
 }
 
-fn opt_timestamp(obj: &Map<String, Json>, key: &str) -> Result<i64, CodecError> {
+fn opt_timestamp(obj: &Obj, key: &str) -> Result<i64, CodecError> {
     obj.get(key).map_or(Ok(0), |v| timestamp_of(v, key))
 }
 
-fn hex_of<const N: usize>(json: &Json, what: &str) -> Result<[u8; N], CodecError> {
+fn hex_of<const N: usize>(json: &Node, what: &str) -> Result<[u8; N], CodecError> {
     let s = as_str(json, what)?.as_bytes();
     let bad = || malformed(format!("{what} is not {N} bytes of hex"));
     if s.len() != N * 2 {
@@ -352,41 +363,50 @@ fn text_bytes(s: &str) -> Bytes {
     Bytes::from(out)
 }
 
-fn opt_text_bytes(obj: &Map<String, Json>, key: &str) -> Result<Option<Bytes>, CodecError> {
+fn opt_text_bytes(obj: &Obj, key: &str) -> Result<Option<Bytes>, CodecError> {
     obj.get(key).map(|v| as_str(v, key).map(text_bytes)).transpose()
 }
 
-fn temporality(obj: &Map<String, Json>) -> Result<Temporality, CodecError> {
+fn temporality(obj: &Obj) -> Result<Temporality, CodecError> {
     Temporality::from_name(as_str(field(obj, "temporality")?, "temporality")?)
         .ok_or_else(|| malformed("unknown temporality"))
 }
 
-fn read_value(json: &Json, types: &mut Types) -> Result<Value, CodecError> {
+fn read_value(json: &Node, types: &mut Types) -> Result<Value, CodecError> {
     let tag = types.tag();
     let bad = |what: &str| malformed(format!("{} is not a {what}", types_path(types)));
     match tag {
         Some("u64") => json.as_u64().map(Value::U64).ok_or_else(|| bad("u64")),
         Some("f64") => f64_of(json, "an f64 value").map(Value::F64),
+        Some("bytes") if matches!(json, Node::Bin(_)) => read_untagged(json, types),
         Some("bytes") => as_str(json, "a bytes value")?
             .strip_prefix("b\"")
             .and_then(|s| s.strip_suffix('"'))
             .map(|body| Value::Bytes(text_bytes(body)))
             .ok_or_else(|| bad("b\"...\" string")),
         Some("timestamp") => timestamp_of(json, "a timestamp value").map(Value::Timestamp),
-        _ => match json {
-            Json::Null => Ok(Value::Null),
-            Json::Bool(b) => Ok(Value::Bool(*b)),
-            Json::Number(n) => Ok(number_value(n)),
-            Json::String(s) => Ok(Value::str(s.as_str())),
-            Json::Array(items) => {
-                let mut out = Vec::with_capacity(items.len());
-                for (i, item) in items.iter().enumerate() {
-                    out.push(types.at_index(i, |t| read_value(item, t))?);
-                }
-                Ok(Value::Array(out))
+        _ => read_untagged(json, types),
+    }
+}
+
+/// A value by its own type. A MessagePack `bin` is `Bytes` whether or not the table tags it.
+fn read_untagged(json: &Node, types: &mut Types) -> Result<Value, CodecError> {
+    match json {
+        Node::Null => Ok(Value::Null),
+        Node::Bool(b) => Ok(Value::Bool(*b)),
+        Node::I64(n) => Ok(Value::I64(*n)),
+        Node::U64(n) => Ok(Value::U64(*n)),
+        Node::F64(f) => Ok(Value::F64(*f)),
+        Node::Str(s) => Ok(Value::str(s.as_str())),
+        Node::Bin(b) => Ok(Value::Bytes(b.clone())),
+        Node::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for (i, item) in items.iter().enumerate() {
+                out.push(types.at_index(i, |t| read_value(item, t))?);
             }
-            Json::Object(map) => Ok(Value::Map(Box::new(read_attrs(map, types)?))),
-        },
+            Ok(Value::Array(out))
+        }
+        Node::Map(map) => Ok(Value::Map(Box::new(read_attrs(map, types)?))),
     }
 }
 
@@ -394,18 +414,8 @@ fn types_path(types: &Types) -> &str {
     &types.path
 }
 
-/// An untagged JSON number: `F64` when spelled with a fraction or exponent, else `I64`, or `U64`
-/// past `i64::MAX`.
-fn number_value(n: &serde_json::Number) -> Value {
-    match (n.is_f64(), n.as_i64(), n.as_u64()) {
-        (false, Some(i), _) => Value::I64(i),
-        (false, None, Some(u)) => Value::U64(u),
-        _ => Value::F64(n.as_f64().unwrap_or(f64::NAN)),
-    }
-}
-
 fn read_metric_value(
-    json: &Json,
+    json: &Node,
     types: &mut Types,
     what: &str,
 ) -> Result<MetricValue, CodecError> {
@@ -414,19 +424,16 @@ fn read_metric_value(
         return json.as_u64().map(MetricValue::U64).ok_or_else(bad);
     }
     match json {
-        Json::Bool(b) => Ok(MetricValue::Bool(*b)),
-        Json::Number(n) => Ok(match number_value(n) {
-            Value::I64(i) => MetricValue::I64(i),
-            Value::U64(u) => MetricValue::U64(u),
-            Value::F64(f) => MetricValue::F64(f),
-            _ => unreachable!("number_value returns a number"),
-        }),
-        Json::String(s) => non_finite(s).map(MetricValue::F64).ok_or_else(bad),
+        Node::Bool(b) => Ok(MetricValue::Bool(*b)),
+        Node::I64(i) => Ok(MetricValue::I64(*i)),
+        Node::U64(u) => Ok(MetricValue::U64(*u)),
+        Node::F64(f) => Ok(MetricValue::F64(*f)),
+        Node::Str(s) => non_finite(s).map(MetricValue::F64).ok_or_else(bad),
         _ => Err(bad()),
     }
 }
 
-fn read_attrs(map: &Map<String, Json>, types: &mut Types) -> Result<AttrMap, CodecError> {
+fn read_attrs(map: &Obj, types: &mut Types) -> Result<AttrMap, CodecError> {
     let mut attrs = AttrMap::new();
     for (key, json) in map {
         let value = types.at(key, |t| read_value(json, t))?;
@@ -436,7 +443,7 @@ fn read_attrs(map: &Map<String, Json>, types: &mut Types) -> Result<AttrMap, Cod
 }
 
 /// `obj[key]` as attributes under the pointer segment `key`, empty when absent.
-fn opt_attrs(obj: &Map<String, Json>, key: &str, types: &mut Types) -> Result<AttrMap, CodecError> {
+fn opt_attrs(obj: &Obj, key: &str, types: &mut Types) -> Result<AttrMap, CodecError> {
     match obj.get(key) {
         Some(json) => {
             let map = as_object(json, key)?;
@@ -446,7 +453,7 @@ fn opt_attrs(obj: &Map<String, Json>, key: &str, types: &mut Types) -> Result<At
     }
 }
 
-fn read_trace_ref(obj: &Map<String, Json>) -> Result<Option<TraceRef>, CodecError> {
+fn read_trace_ref(obj: &Obj) -> Result<Option<TraceRef>, CodecError> {
     let Some(trace_id) = obj.get("trace_id") else {
         return Ok(None);
     };
@@ -456,7 +463,7 @@ fn read_trace_ref(obj: &Map<String, Json>) -> Result<Option<TraceRef>, CodecErro
     Ok(Some(TraceRef { trace_id: hex_of::<16>(trace_id, "trace_id")?, span_id, flags }))
 }
 
-fn read_event(obj: &Map<String, Json>, types: &mut Types) -> Result<Event, CodecError> {
+fn read_event(obj: &Obj, types: &mut Types) -> Result<Event, CodecError> {
     let timestamp = timestamp_of(field(obj, "timestamp")?, "timestamp")?;
     let log = obj
         .get("log")
@@ -479,7 +486,7 @@ fn read_event(obj: &Map<String, Json>, types: &mut Types) -> Result<Event, Codec
     Ok(Event { timestamp, attributes, log, metrics, span })
 }
 
-fn read_log(obj: &Map<String, Json>, types: &mut Types) -> Result<LogRecord, CodecError> {
+fn read_log(obj: &Obj, types: &mut Types) -> Result<LogRecord, CodecError> {
     let severity = obj
         .get("severity")
         .map(|s| {
@@ -502,7 +509,7 @@ fn read_log(obj: &Map<String, Json>, types: &mut Types) -> Result<LogRecord, Cod
     })
 }
 
-fn read_metric(obj: &Map<String, Json>, types: &mut Types) -> Result<MetricRecord, CodecError> {
+fn read_metric(obj: &Obj, types: &mut Types) -> Result<MetricRecord, CodecError> {
     let name = intern(as_str(field(obj, "name")?, "name")?);
     let kind = read_kind(obj, types)?;
     let mut record = MetricRecord::new(name, kind);
@@ -523,7 +530,7 @@ fn read_metric(obj: &Map<String, Json>, types: &mut Types) -> Result<MetricRecor
     Ok(record)
 }
 
-fn read_exemplar(obj: &Map<String, Json>, types: &mut Types) -> Result<Exemplar, CodecError> {
+fn read_exemplar(obj: &Obj, types: &mut Types) -> Result<Exemplar, CodecError> {
     Ok(Exemplar {
         timestamp: timestamp_of(field(obj, "timestamp")?, "an exemplar's timestamp")?,
         value: types.at("value", |t| read_metric_value(field(obj, "value")?, t, "value"))?,
@@ -532,7 +539,7 @@ fn read_exemplar(obj: &Map<String, Json>, types: &mut Types) -> Result<Exemplar,
     })
 }
 
-fn read_kind(obj: &Map<String, Json>, types: &mut Types) -> Result<MetricKind, CodecError> {
+fn read_kind(obj: &Obj, types: &mut Types) -> Result<MetricKind, CodecError> {
     let kind = as_str(field(obj, "kind")?, "kind")?;
     let metric_value = |types: &mut Types, key: &str| {
         types.at(key, |t| read_metric_value(field(obj, key)?, t, key))
@@ -627,10 +634,7 @@ fn read_kind(obj: &Map<String, Json>, types: &mut Types) -> Result<MetricKind, C
 }
 
 /// A distribution's `sketch`, with the `sum` the distribution carries beside it.
-fn read_sketch(
-    sketch: &Map<String, Json>,
-    metric: &Map<String, Json>,
-) -> Result<DdSketch, CodecError> {
+fn read_sketch(sketch: &Obj, metric: &Obj) -> Result<DdSketch, CodecError> {
     let mapping = match as_str(field(sketch, "mapping")?, "mapping")? {
         "agent" => Mapping::agent(),
         "logarithmic" => {
@@ -673,7 +677,7 @@ fn read_sketch(
     ))
 }
 
-fn read_span(obj: &Map<String, Json>, types: &mut Types) -> Result<SpanRecord, CodecError> {
+fn read_span(obj: &Obj, types: &mut Types) -> Result<SpanRecord, CodecError> {
     let name = types.at("name", |t| read_value(field(obj, "name")?, t))?;
     let kind = SpanKind::from_name(as_str(field(obj, "kind")?, "kind")?)
         .ok_or_else(|| malformed("unknown span kind"))?;
@@ -748,7 +752,7 @@ fn read_span(obj: &Map<String, Json>, types: &mut Types) -> Result<SpanRecord, C
     })
 }
 
-fn read_resource(obj: &Map<String, Json>, types: &mut Types) -> Result<Resource, CodecError> {
+fn read_resource(obj: &Obj, types: &mut Types) -> Result<Resource, CodecError> {
     types.at("resource", |t| {
         Ok(Resource {
             attributes: opt_attrs(obj, "attributes", t)?,
@@ -758,7 +762,7 @@ fn read_resource(obj: &Map<String, Json>, types: &mut Types) -> Result<Resource,
     })
 }
 
-fn read_scope(obj: &Map<String, Json>, types: &mut Types) -> Result<Scope, CodecError> {
+fn read_scope(obj: &Obj, types: &mut Types) -> Result<Scope, CodecError> {
     types.at("scope", |t| {
         Ok(Scope {
             name: opt_text_bytes(obj, "name")?.unwrap_or_default(),
