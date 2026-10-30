@@ -103,15 +103,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
   different container whose id begins `deadbeefcafe`.
   - **Workaround:** don't give a container a name shaped like an id prefix. See [ADR
     `docker-container-identity-and-minimal-watches`](../adr/docker-container-identity-and-minimal-watches.md).
-- **An `attrs` object larger than the envelope bound's slack can drop entries as `long_line`.**
-  The bound leaves fixed room for `attrs` beside a worst-case-escaped fragment. An envelope whose
-  `attrs` outgrows that room can exceed the bound, and the splitter drops it. Such a container's
-  long messages lose their full-size fragments this way, and the fragments after a dropped one can
-  leave as a line without its head ([ADR `cri-container-logs`](../adr/cri-container-logs.md),
-  section 9). `attrs` comes from `--log-opt labels`, `env`, and `tag`. The slack and the bound are
-  `envelope_cap` in `crates/logit-inputs/src/docker.rs`.
-  - **Workaround:** keep `attrs` small, or raise `max_line_bytes`: the bound grows by six bytes for
-    each byte of it.
 - **A truncation counts at most one of a held entry and the unterminated line behind it.**
   When `docker_in`'s file is truncated in place, the decoder counts each stream's held reassembly
   `logit.input.frames.dropped{reason="truncated"}` (a drop in progress was counted `oversize`

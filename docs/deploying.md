@@ -2537,11 +2537,13 @@ The line splitter reads each json-file line before the decoder does, bounded at 
 `max_line_bytes` plus 64 KiB of room for the envelope's `attrs` (about 6 MiB at the default). An
 envelope over that is dropped before the decoder sees it, and since json-file writes `stream` after
 `log`, nothing says which stream it was on. So every fragment either stream was holding is dropped
-with it, counted `logit.input.frames.dropped{reason="oversize"}` once per line, with a `long_line`
-diagnostic. No delivered line is joined across the dropped entry, but the fragments after it, up to
-its line's last entry, leave as a line without its head, and when the dropped entry starts a line
-while the other stream holds one, the count is one short. An envelope dockerd writes fits the bound
-unless its `attrs` object outgrows the 64 KiB room; a writer other than dockerd can exceed it too.
+with it, counted `logit.input.frames.dropped{reason="oversize"}` with a `long_line` diagnostic. No
+delivered line is joined across the dropped entry, but the fragments after it, up to its line's last
+entry, leave as a line without its head. The count isn't one per line: when the dropped entry
+starts a line while the other stream holds one or is dropping, it's one short, and when several
+fragments of one line are dropped in a row, each counts once. An envelope dockerd writes fits the
+bound unless its `attrs` object outgrows the 64 KiB room; a writer other than dockerd can exceed it
+too.
 Keep `attrs` small, or raise `max_line_bytes`, which raises the bound six bytes for each byte.
 
 ### Kubernetes container logs: `cri_in`

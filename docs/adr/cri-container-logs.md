@@ -417,8 +417,7 @@ through the splitter-drop hook (Implementation notes for W2) and, not knowing th
   each;
 - ends each stream's drop in progress, already counted when it began;
 - counts the drop itself as one `oversize` line only when neither stream held a fragment or was
-  dropping a line, and otherwise folds it into the line it most likely continues, so no line is
-  counted twice;
+  dropping a line, and otherwise folds it into the line it most likely continues;
 - reports one `long_line` whenever it counts.
 
 What that closes, and what it can't:
@@ -435,6 +434,12 @@ What that closes, and what it can't:
   nothing while the other stream holds a fragment or is dropping, the drop is folded into the other
   stream's line, and the dropped line's head goes uncounted. Counting it would count the drop twice
   in the common case, where the dropped envelope continues the held line.
+- **The count can be high.** When the splitter drops several fragments of one line in a row, each
+  drop finds nothing held or dropping, since the one before it ended both streams' reassembly, so
+  each counts once. Folding a drop that follows a drop would instead undercount whole entries
+  dropped back to back, and counting too much loss is the safer error. This is the reachable case:
+  a container whose `attrs` outgrows the slack loses every full-size fragment, so each of its lines
+  with several of them counts once per fragment.
 
 Under `envelope_cap`, only an `attrs` object past the bound's slack or a writer other than dockerd
 writes an envelope the splitter drops, and the operator's remedy for either is in
@@ -559,7 +564,8 @@ empty-path checks, rather than under a rule number of its own.
 - **Under cri-dockerd, a Docker-rotated file (`-json.log.1`) is outside `root:`**, so its unread
   tail at a restart counts `gone`, the same as `docker_in` counts it.
 - **Under cri-dockerd and `docker_in`, the fragments after an envelope the splitter dropped can leave
-  as a line without its head**, and the drop's count can be one short (section 9).
+  as a line without its head**, and the drop's count can be one short, or one per fragment when
+  several of a line's fragments are dropped in a row (section 9).
 
 ## Implementation notes for W2
 
