@@ -99,9 +99,9 @@
 //!     `MAX_SANE_UNCOMPRESSED_LEN`, which the frame reader enforces regardless.
 //! 35. A `buffer.disk:` alongside a non-default `buffer.max_batches`, or a non-default
 //!     `buffer.max_bytes` on a sink that doesn't collect windows (disk replaces them; on a
-//!     collecting sink `max_bytes` bounds the window's decoded batches, and `collects_windows`
-//!     names no kind), a disk bound of `0` or with `segment_bytes > max_bytes`, or two sinks sharing a
-//!     literal `disk.path` (`docs/adr/disk-backed-sink-buffer.md` and its 2026-10-30 amendment).
+//!     collecting sink, `s3_out`, `max_bytes` bounds the window's decoded batches), a disk bound
+//!     of `0` or with `segment_bytes > max_bytes`, or two sinks sharing a literal `disk.path`
+//!     (`docs/adr/disk-backed-sink-buffer.md` and its 2026-10-30 amendment).
 //! 36. A `has_attributes`/`drop_attributes` with an empty key, a non-finite value, or a presence
 //!     key repeated or also named in the same side's map. Nothing configured is legal: zero pairs
 //!     match vacuously, so `has_*` forwards every event and `drop_*` discards every one
@@ -357,6 +357,15 @@
 //!     whitespace: none could match a request's credential. Also a basic username containing
 //!     `:`, which RFC 7617 forbids and which would alias another entry's encoding. Empty lists
 //!     accept any request (`docs/adr/listener-authentication.md`).
+//! 100. An `s3_out` with an empty `bucket`, `region`, or `storage_class`; an `endpoint` that
+//!      isn't an `http://` or `https://` URL with a host and no path, query, fragment, or user
+//!      info; a `partition` jiff can't format, or a `prefix` and `partition` whose longest key
+//!      passes S3's 1,024 bytes; a `max_bytes` of `0` or above 9,000 times `part_size`, which
+//!      would pass S3's 10,000 parts; a `part_size` outside S3's 5 MiB to 5 GiB; a `max_age`,
+//!      `timeout`, or `connect_timeout` of `0s`; an `sse` `kms_key_id` or `bucket_key` outside
+//!      `aws_kms`, or an empty `kms_key_id`; `credentials` with an empty value; or a `tls` failing
+//!      rule 24's checks, a block under an `http://` `endpoint` included
+//!      (`docs/adr/s3-object-archive.md`, decision 7).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -486,6 +495,7 @@ pub fn role(kind: &ComponentKind) -> Role {
         | DatadogTraceOut { .. }
         | SplunkHecOut { .. }
         | KafkaOut { .. }
+        | S3Out { .. }
         | LogitOut { .. }
         | StdioOut { .. }
         | FileOut { .. }
@@ -564,6 +574,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         DatadogTraceOut { .. } => "datadog_trace_out",
         SplunkHecOut { .. } => "splunk_hec_out",
         KafkaOut { .. } => "kafka_out",
+        S3Out { .. } => "s3_out",
         LogitOut { .. } => "logit_out",
         StdioOut { .. } => "stdio_out",
         FileOut { .. } => "file_out",
@@ -692,6 +703,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::DatadogTraceOut { .. }
             | ComponentKind::SplunkHecOut { .. }
             | ComponentKind::KafkaOut { .. }
+            | ComponentKind::S3Out { .. }
             | ComponentKind::StdioOut { .. }
             | ComponentKind::FileOut { .. }
             | ComponentKind::SyslogOut { .. }
@@ -4140,6 +4152,13 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 100: `s3_out` (`docs/adr/s3-object-archive.md`, decision 7).
+    for (id, component) in &components {
+        if let ComponentKind::S3Out { .. } = &component.kind {
+            validate_s3_out(id, &component.kind)?;
+        }
+    }
+
     // Rule 94: `cumulative_to_delta` (`docs/adr/cumulative-to-delta-transform.md`). Both bounds
     // are impossible at `0`: a zero `max_staleness` evicts every series at the next batch, so no
     // point is ever differenced, and the transform would clamp a zero `max_series` to `1`.
@@ -4857,18 +4876,179 @@ fn check_recover_below(id: &str, block: &str, value: f64) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// S3's part bounds, and the most parts `max_bytes` may need: 9,000 leaves room under S3's
+/// 10,000 for compression overhead on incompressible data and the batch that crosses `max_bytes`.
+const S3_MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
+const S3_MAX_PART_SIZE: u64 = 5 * 1024 * 1024 * 1024;
+const S3_MAX_BYTES_PARTS: u64 = 9_000;
+
+/// Rule 100's checks on one `s3_out`. A bucket name is checked only for being empty: S3's naming
+/// rules and those of S3-compatible stores differ, and a name the store refuses holds the sink
+/// with `InvalidBucketName`.
+fn validate_s3_out(id: &str, kind: &ComponentKind) -> anyhow::Result<()> {
+    let ComponentKind::S3Out {
+        bucket,
+        region,
+        endpoint,
+        prefix,
+        partition,
+        max_bytes,
+        max_age,
+        part_size,
+        storage_class,
+        sse,
+        credentials,
+        timeout,
+        connect_timeout,
+        tls,
+        ..
+    } = kind
+    else {
+        return Ok(());
+    };
+    for (field, value) in [("bucket", Some(bucket)), ("region", Some(region))]
+        .into_iter()
+        .chain([("storage_class", storage_class.as_ref())])
+    {
+        if value.is_some_and(|v| v.is_empty()) {
+            anyhow::bail!("component '{id}': s3_out '{field}' is empty");
+        }
+    }
+    if let Some(endpoint) = endpoint {
+        if let Err(why) = check_s3_endpoint(endpoint) {
+            anyhow::bail!("component '{id}': s3_out 'endpoint' ({}) {why}", redact::url(endpoint));
+        }
+    }
+    let longest = longest_partition(partition).map_err(|err| {
+        anyhow::anyhow!(
+            "component '{id}': s3_out 'partition' isn't a pattern jiff can format: {err}"
+        )
+    })?;
+    let key = prefix.len() + longest + logit_config::S3_KEY_TAIL_BYTES;
+    if key > logit_config::S3_MAX_KEY_BYTES {
+        anyhow::bail!(
+            "component '{id}': s3_out 'prefix' and 'partition' can make a {key}-byte key -- S3 \
+             takes at most {} bytes, and the rest of a key takes {}",
+            logit_config::S3_MAX_KEY_BYTES,
+            logit_config::S3_KEY_TAIL_BYTES
+        );
+    }
+    if !(S3_MIN_PART_SIZE..=S3_MAX_PART_SIZE).contains(part_size) {
+        anyhow::bail!(
+            "component '{id}': s3_out 'part_size' is {part_size} bytes -- S3 takes parts from \
+             5 MiB to 5 GiB"
+        );
+    }
+    if *max_bytes == 0 || *max_bytes > part_size.saturating_mul(S3_MAX_BYTES_PARTS) {
+        anyhow::bail!(
+            "component '{id}': s3_out 'max_bytes' is {max_bytes} -- it must be above 0 and at \
+             most {S3_MAX_BYTES_PARTS} times 'part_size', so an object stays under S3's 10,000 \
+             parts"
+        );
+    }
+    for (field, value) in
+        [("max_age", max_age), ("timeout", timeout), ("connect_timeout", connect_timeout)]
+    {
+        if value.is_zero() {
+            anyhow::bail!("component '{id}': s3_out '{field}' is 0s -- it must be above 0s");
+        }
+    }
+    if let Some(sse) = sse {
+        let kms = sse.algorithm == logit_config::S3SseAlgorithm::AwsKms;
+        if !kms && (sse.kms_key_id.is_some() || sse.bucket_key.is_some()) {
+            anyhow::bail!(
+                "component '{id}': s3_out 'sse.kms_key_id' and 'sse.bucket_key' apply only to \
+                 'algorithm: aws_kms'"
+            );
+        }
+        if sse.kms_key_id.as_deref().is_some_and(str::is_empty) {
+            anyhow::bail!("component '{id}': s3_out 'sse.kms_key_id' is empty");
+        }
+    }
+    if let Some(credentials) = credentials {
+        if credentials.access_key_id.is_empty()
+            || credentials.secret_access_key.is_empty()
+            || credentials.session_token.as_deref().is_some_and(str::is_empty)
+        {
+            anyhow::bail!(
+                "component '{id}': s3_out 'credentials' has an empty value -- an 'access_key_id' \
+                 and 'secret_access_key', and a 'session_token' when one is set, must not be empty"
+            );
+        }
+    }
+    if tls.cert_file.is_some() != tls.key_file.is_some() {
+        anyhow::bail!(
+            "component '{id}': 'tls.cert_file' and 'tls.key_file' must both be set for mutual \
+             TLS, or both omitted -- one alone can't be used"
+        );
+    }
+    if tls.insecure_skip_verify && tls.ca_file.is_some() {
+        anyhow::bail!(
+            "component '{id}': 'tls.insecure_skip_verify' and 'tls.ca_file' can't both be set -- \
+             'insecure_skip_verify' trusts any certificate, which makes a specific trusted CA \
+             meaningless"
+        );
+    }
+    if let Some(endpoint) = endpoint {
+        if !tls.is_empty() && !endpoint.to_ascii_lowercase().starts_with("https://") {
+            anyhow::bail!(
+                "component '{id}': 'tls' is set, but 'endpoint' ({}) isn't 'https://' -- TLS is \
+                 selected by the endpoint's scheme, so a 'tls:' block here would have no effect",
+                redact::url(endpoint)
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Why an `s3_out` `endpoint` can't be used, if it can't: the sink appends the bucket and key to
+/// it, so it must be a scheme and a host with nothing after them but an optional `/`.
+fn check_s3_endpoint(endpoint: &str) -> Result<(), &'static str> {
+    let lower = endpoint.to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix("http://").or_else(|| lower.strip_prefix("https://"))
+    else {
+        return Err("isn't an http:// or https:// URL");
+    };
+    let authority = rest.strip_suffix('/').unwrap_or(rest);
+    if authority.is_empty() {
+        return Err("names no host");
+    }
+    if authority.contains('@') {
+        return Err("carries user info -- give credentials in 'credentials'");
+    }
+    if authority.contains(['/', '?', '#']) {
+        return Err("has a path, query, or fragment -- give the store's base URL alone");
+    }
+    Ok(())
+}
+
+/// The most bytes `partition` formats to, in UTC: the longest over one instant per month and
+/// weekday in year 9999, the longest year jiff formats, at the last millisecond of a day, so
+/// month and weekday names and every numeric field are at their widest.
+fn longest_partition(partition: &str) -> Result<usize, jiff::Error> {
+    let mut longest = 0;
+    for month in 1..=12 {
+        for day in 20..=26 {
+            let instant = jiff::civil::date(9999, month, day)
+                .at(23, 59, 59, 999_000_000)
+                .to_zoned(jiff::tz::TimeZone::UTC)?;
+            longest = longest.max(jiff::fmt::strtime::format(partition, &instant)?.len());
+        }
+    }
+    Ok(longest)
+}
+
+/// Whether a sink of `kind` keeps a window open across arrivals through `Output::collecting`
+/// (`docs/adr/collecting-sink-window.md`). Rule 35 reads it: beside `buffer.disk:`, such a sink's
+/// `buffer.max_bytes` bounds its window's decoded batches.
+fn collects_windows(kind: &ComponentKind) -> bool {
+    matches!(kind, ComponentKind::S3Out { .. })
+}
+
 /// Rules 17/18/57's datagram predicate: the kinds the datagram listener driver backs
 /// (`logit-inputs::udp::UdpListener`, `docs/adr/decoupled-listener-io.md`), a Unix datagram
 /// `statsd_in` or `lines_in` included. An explicit list, not
 /// [`Role`], so a new listener kind rejects `receive:` until it is wired to a driver.
-/// Whether a sink of `kind` keeps a window open across arrivals through `Output::collecting`
-/// (`docs/adr/collecting-sink-window.md`). Rule 35 reads it: beside `buffer.disk:`, such a sink's
-/// `buffer.max_bytes` bounds its window's decoded batches. No kind does.
-fn collects_windows(kind: &ComponentKind) -> bool {
-    let _ = kind;
-    false
-}
-
 fn is_datagram_listener(kind: &ComponentKind) -> bool {
     matches!(
         kind,
@@ -8701,6 +8881,99 @@ mod tests {
         }
     }
 
+    /// An `s3_out` from its required fields and `extra`, JSON object members that add to them or
+    /// replace them.
+    fn s3_out(extra: &str) -> ComponentKind {
+        let mut json = serde_json::json!({"type": "s3_out", "bucket": "b", "region": "us-east-1"});
+        let extra: serde_json::Value =
+            serde_json::from_str(&format!("{{{extra}}}")).expect("JSON object members");
+        for (key, value) in extra.as_object().expect("an object") {
+            json[key] = value.clone();
+        }
+        serde_json::from_value::<Component>(json).expect("an s3_out").kind
+    }
+
+    /// Rule 100 accepts every default, and each bound at its edge.
+    #[test]
+    fn an_s3_out_at_its_defaults_and_bounds_validates() {
+        for extra in [
+            "",
+            r#""endpoint": "http://minio:9000""#,
+            r#""endpoint": "https://minio.internal:9000/", "tls": {"ca_file": "ca.pem"}"#,
+            r#""part_size": "5MiB", "max_bytes": "1""#,
+            r#""part_size": "5GiB""#,
+            r#""part_size": "5MiB", "max_bytes": "45000MiB""#,
+            r#""sse": {"algorithm": "aws_kms", "kms_key_id": "k", "bucket_key": true}"#,
+            r#""sse": {"algorithm": "aes256"}, "storage_class": "STANDARD_IA""#,
+            r#""credentials": {"access_key_id": "a", "secret_access_key": "s"}"#,
+            r#""partition": "%A/%B/%s/""#,
+        ] {
+            resolve(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], s3_out(extra))]))
+                .unwrap_or_else(|err| panic!("{extra}: {err}"));
+        }
+        let fits = "p"
+            .repeat(logit_config::S3_MAX_KEY_BYTES - logit_config::S3_KEY_TAIL_BYTES - "dt=".len());
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], s3_out(&format!(r#""prefix": "{fits}", "partition": "dt=""#))),
+        ]))
+        .expect("a key of 1,024 bytes fits");
+    }
+
+    /// Rule 100 rejects each bound of `docs/adr/s3-object-archive.md`'s decision 7.
+    #[test]
+    fn an_s3_out_past_each_bound_is_rejected() {
+        let over = "p".repeat(
+            logit_config::S3_MAX_KEY_BYTES - logit_config::S3_KEY_TAIL_BYTES - "dt=".len() + 1,
+        );
+        let long_prefix = format!(r#""prefix": "{over}", "partition": "dt=""#);
+        let cases: Vec<(String, &str)> = vec![
+            (r#""bucket": """#.into(), "'bucket' is empty"),
+            (r#""region": """#.into(), "'region' is empty"),
+            (r#""storage_class": """#.into(), "'storage_class' is empty"),
+            (r#""endpoint": "minio:9000""#.into(), "isn't an http:// or https:// URL"),
+            (r#""endpoint": "https://""#.into(), "names no host"),
+            (r#""endpoint": "https://u:p@minio""#.into(), "carries user info"),
+            (r#""endpoint": "https://minio/base""#.into(), "has a path, query, or fragment"),
+            (r#""endpoint": "https://minio?x=1""#.into(), "has a path, query, or fragment"),
+            (r#""partition": "dt=%""#.into(), "isn't a pattern jiff can format"),
+            (long_prefix, "can make a 1025-byte key"),
+            (r#""part_size": "5242879""#.into(), "S3 takes parts from"),
+            (r#""part_size": "5121MiB""#.into(), "S3 takes parts from"),
+            (r#""max_bytes": "0""#.into(), "'max_bytes' is 0"),
+            (r#""part_size": "5MiB", "max_bytes": "47185920001""#.into(), "at most 9000 times"),
+            (r#""max_age": "0s""#.into(), "'max_age' is 0s"),
+            (r#""timeout": "0s""#.into(), "'timeout' is 0s"),
+            (r#""connect_timeout": "0s""#.into(), "'connect_timeout' is 0s"),
+            (r#""sse": {"algorithm": "aes256", "kms_key_id": "k"}"#.into(), "apply only to"),
+            (r#""sse": {"algorithm": "aes256", "bucket_key": true}"#.into(), "apply only to"),
+            (r#""sse": {"algorithm": "aws_kms", "kms_key_id": ""}"#.into(), "'sse.kms_key_id' is empty"),
+            (
+                r#""credentials": {"access_key_id": "", "secret_access_key": "s"}"#.into(),
+                "has an empty value",
+            ),
+            (
+                r#""credentials": {"access_key_id": "a", "secret_access_key": "s", "session_token": ""}"#
+                    .into(),
+                "has an empty value",
+            ),
+            (r#""tls": {"cert_file": "c.pem"}"#.into(), "must both be set"),
+            (
+                r#""tls": {"insecure_skip_verify": true, "ca_file": "ca.pem"}"#.into(),
+                "can't both be set",
+            ),
+            (
+                r#""endpoint": "http://minio:9000", "tls": {"ca_file": "ca.pem"}"#.into(),
+                "isn't 'https://'",
+            ),
+        ];
+        for (extra, want) in cases {
+            let config = cfg(vec![("in", vec![], listener()), ("out", vec!["in"], s3_out(&extra))]);
+            let Err(err) = resolve(config) else { panic!("{extra}: validated") };
+            assert!(err.to_string().contains(want), "{extra}: got {err}");
+        }
+    }
+
     /// Rule 98: rule 24's `tls` checks on an `influxdb_out`, including a block under `http://`.
     #[test]
     fn an_influxdb_out_tls_block_that_cant_take_effect_is_rejected() {
@@ -12329,6 +12602,25 @@ mod tests {
             ("out", vec!["in"], sink(), buffer),
         ]));
         assert!(err.contains("are ignored once 'buffer.disk' is set"), "got: {err}");
+    }
+
+    /// Rule 35: beside `disk:`, a collecting sink's `buffer.max_bytes` bounds its window, so it
+    /// may be set; its `max_batches` is still ignored.
+    #[test]
+    fn a_disk_buffer_beside_max_bytes_validates_on_s3_out_alone() {
+        let mut buffer = disk_buffer("spool");
+        buffer.max_bytes = 256 * 1024 * 1024;
+        resolve(cfg_with_buffer(vec![
+            ("in", vec![], listener(), BufferConfig::default()),
+            ("out", vec!["in"], s3_out(""), buffer.clone()),
+        ]))
+        .expect("max_bytes bounds a collecting sink's window");
+        buffer.max_batches = 4096;
+        let err = expect_err(cfg_with_buffer(vec![
+            ("in", vec![], listener(), BufferConfig::default()),
+            ("out", vec!["in"], s3_out(""), buffer),
+        ]));
+        assert!(err.contains("'buffer.max_batches' is ignored"), "got: {err}");
     }
 
     #[test]

@@ -1230,6 +1230,83 @@ pub enum KafkaCompression {
     Zstd,
 }
 
+/// How `s3_out` writes an object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum S3Format {
+    /// One JSON object per event per line, as `stdio_out`'s `format: json` writes them. The key
+    /// ends `.ndjson`.
+    #[default]
+    Json,
+    /// `logit`'s own binary frames, one per batch, as `file_out`'s `format: native` writes them.
+    /// The key ends `.logit`.
+    Native,
+}
+
+/// How `s3_out` compresses an object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum S3Compression {
+    /// One gzip member per object. The key ends `.gz`.
+    #[default]
+    Gzip,
+    /// One zstd frame per batch, which a zstd reader reads as one stream. The key ends `.zst`.
+    Zstd,
+    /// No compression.
+    None,
+}
+
+/// `s3_out`'s server-side encryption.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct S3Sse {
+    /// `aes256`, S3-managed keys, or `aws_kms`, a KMS key.
+    pub algorithm: S3SseAlgorithm,
+    /// Under `aws_kms`, the KMS key's id or ARN. Unset, the account's AWS-managed key for S3 is
+    /// used. Must not be empty.
+    #[serde(default)]
+    pub kms_key_id: Option<String>,
+    /// Under `aws_kms`, turns the S3 Bucket Key on or off for each object, overriding the
+    /// bucket's setting. Unset, the bucket's setting applies.
+    #[serde(default)]
+    pub bucket_key: Option<bool>,
+}
+
+/// The algorithm `s3_out`'s `sse:` names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum S3SseAlgorithm {
+    /// `AES256`: keys S3 manages.
+    Aes256,
+    /// `aws:kms`: a key in AWS KMS.
+    AwsKms,
+}
+
+/// `s3_out`'s static credentials. Give each value with `!env` so it stays out of the config
+/// file.
+// `Debug` is written by hand so no secret reaches a log line or an error.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct S3Credentials {
+    /// The access key id. Must not be empty.
+    pub access_key_id: String,
+    /// The secret access key. Must not be empty.
+    pub secret_access_key: String,
+    /// A session token, for temporary credentials. Must not be empty when set.
+    #[serde(default)]
+    pub session_token: Option<String>,
+}
+
+impl std::fmt::Debug for S3Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Credentials")
+            .field("access_key_id", &"<redacted>")
+            .field("secret_access_key", &"<redacted>")
+            .field("session_token", &self.session_token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
 /// Which replicas must have a `kafka_out` batch before the broker answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -4072,6 +4149,110 @@ pub enum ComponentKind {
         #[serde(default)]
         sasl: Option<KafkaSasl>,
     },
+    /// Archives batches to an S3 bucket, or an S3-compatible store, as objects: each object
+    /// collects batches until `max_bytes`, `max_age`, or the buffer's bounds close it, then is
+    /// written whole. A batch counts as delivered only once its object is stored, so every batch
+    /// of an open object stays in this sink's buffer until then; `buffer.disk:` keeps them
+    /// across a restart. The bucket needs a lifecycle rule that aborts incomplete multipart
+    /// uploads.
+    #[serde(rename = "s3_out")]
+    S3Out {
+        /// The bucket objects are written to. Must not be empty.
+        bucket: String,
+        /// The bucket's AWS region, such as `us-east-1`: part of every request's signature, and
+        /// of the endpoint when `endpoint` is unset. An S3-compatible store takes the region it
+        /// was configured with, often `us-east-1`. Must not be empty.
+        region: String,
+        /// The store's base URL, `http://` or `https://`, with no path, query, or user info, such
+        /// as `https://minio.internal:9000`. Unset, the sink writes to AWS's regional endpoint
+        /// for `region`.
+        #[serde(default)]
+        endpoint: Option<String>,
+        /// Puts the bucket in the request path (`<endpoint>/<bucket>/<key>`) rather than in the
+        /// host name (`<bucket>.<endpoint host>`). Defaults to `true` with `endpoint` and `false`
+        /// without it. On AWS, a bucket name containing `.` needs `true` over TLS, because AWS's
+        /// certificate covers one label of the host name.
+        #[serde(default)]
+        path_style: Option<bool>,
+        /// Prepended to every object key, as written: end it with `/` to make it a folder, such
+        /// as `logs/`. Empty by default.
+        #[serde(default)]
+        prefix: String,
+        /// A strftime pattern formatted in UTC at the time the object's first batch was staged,
+        /// placed after `prefix`. It's the time `logit` wrote the object, not any event's own
+        /// time. Defaults to `dt=%Y-%m-%d/hour=%H/`, the Hive-style layout query engines read as
+        /// partitions. The longest key `prefix` and `partition` can produce must fit S3's
+        /// 1,024-byte limit.
+        #[serde(default = "default_s3_partition")]
+        partition: String,
+        /// How each object is written: `json` (the default), one JSON object per event per line
+        /// as `stdio_out`'s `format: json` writes them, or `native`, `logit`'s own binary frames.
+        /// `replay_in` reads both.
+        #[serde(default)]
+        format: S3Format,
+        /// How each object is compressed: `gzip` (the default), `zstd`, or `none`. The object is
+        /// stored compressed, with no `Content-Encoding`, so a client downloads the bytes its
+        /// name says.
+        #[serde(default)]
+        compression: S3Compression,
+        /// Closes an object once its batches' encoded, uncompressed bytes reach this. A
+        /// byte-count string. Defaults to `"32MiB"`. Must be above `0` and at most 9,000 times
+        /// `part_size`. Keep `buffer.max_bytes` above it: the batches of an open object stay in
+        /// the buffer, and an object closes early once they fill it.
+        #[serde(default = "default_s3_max_bytes", with = "human_bytes")]
+        #[schemars(with = "String")]
+        max_bytes: u64,
+        /// Closes an object this long after its first batch was staged. Defaults to `5m`; `0s`
+        /// is rejected.
+        #[serde(default = "default_s3_max_age", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        max_age: Duration,
+        /// The size of each part of a multipart upload, in compressed bytes. A byte-count
+        /// string. Defaults to `"8MiB"`; must be between `"5MiB"` and `"5GiB"`, S3's part
+        /// bounds. Each object is written with one request today, so an object also closes once
+        /// its compressed bytes reach this.
+        #[serde(default = "default_s3_part_size", with = "human_bytes")]
+        #[schemars(with = "String")]
+        part_size: u64,
+        /// The storage class objects are written in, such as `STANDARD_IA` or `GLACIER_IR`, sent
+        /// as `x-amz-storage-class`. Unset, the bucket's default applies. Must not be empty.
+        #[serde(default)]
+        storage_class: Option<String>,
+        /// Server-side encryption for each object: `{algorithm: aes256}`, or `{algorithm:
+        /// aws_kms}` with an optional `kms_key_id` and `bucket_key`. Unset, the bucket's default
+        /// applies.
+        #[serde(default)]
+        sse: Option<S3Sse>,
+        /// Static credentials: `access_key_id` and `secret_access_key`, with an optional
+        /// `session_token`. Write each with `!env` to keep it out of the config file. Unset,
+        /// credentials come from the environment, a web identity token file (EKS IRSA), the
+        /// shared credentials and config files, the ECS or EKS Pod Identity container endpoint,
+        /// or the EC2 instance metadata service, in that order.
+        #[serde(default)]
+        credentials: Option<S3Credentials>,
+        /// Bounds every request, the upload of a whole object or part included, and each
+        /// credential lookup. Defaults to `60s`; `0s` is rejected.
+        #[serde(default = "default_s3_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        timeout: Duration,
+        /// How long this sink waits for a new connection to open: the DNS lookup, the TCP dial,
+        /// and the TLS handshake together. A connection that doesn't open in time sent nothing,
+        /// so the upload is retried under either `buffer.delivery`. Defaults to `5s`; `0s` is
+        /// rejected.
+        #[serde(default = "default_sink_connect_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        connect_timeout: Duration,
+        /// How long a pooled connection may sit idle before this sink closes it instead of
+        /// reusing it. Keep it below the store's keep-alive idle timeout. Defaults to `30s`. `0s`
+        /// never reuses an idle connection: every request opens its own.
+        #[serde(default = "default_sink_idle_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        idle_timeout: Duration,
+        /// Tunes TLS to an `https://` store: a private CA, a client certificate, or no
+        /// verification. A non-default block with an `http://` endpoint is rejected.
+        #[serde(default)]
+        tls: TlsClientConfig,
+    },
     /// The native `logit`-to-`logit` protocol, the mirror of `logit_in`: one TCP (optionally TLS)
     /// connection, one native frame per batch, one `Ack` before that batch counts as delivered.
     LogitOut {
@@ -5281,6 +5462,38 @@ pub fn default_kafka_max_request_bytes() -> u64 {
 pub fn default_kafka_timeout() -> Duration {
     Duration::from_secs(30)
 }
+
+/// Mirrors `logit_outputs::s3::DEFAULT_PARTITION`, kept in sync by hand.
+pub fn default_s3_partition() -> String {
+    "dt=%Y-%m-%d/hour=%H/".to_string()
+}
+
+/// Mirrors `logit_outputs::s3::DEFAULT_MAX_BYTES`, kept in sync by hand.
+pub fn default_s3_max_bytes() -> u64 {
+    32 * 1024 * 1024
+}
+
+/// Mirrors `logit_outputs::s3::DEFAULT_MAX_AGE`, kept in sync by hand.
+pub fn default_s3_max_age() -> Duration {
+    Duration::from_secs(300)
+}
+
+/// Mirrors `logit_outputs::s3::DEFAULT_PART_SIZE`, kept in sync by hand.
+pub fn default_s3_part_size() -> u64 {
+    8 * 1024 * 1024
+}
+
+/// Mirrors `logit_outputs::s3::DEFAULT_TIMEOUT`, kept in sync by hand.
+pub fn default_s3_timeout() -> Duration {
+    Duration::from_secs(60)
+}
+
+/// S3's limit on an object key's length, in bytes.
+pub const S3_MAX_KEY_BYTES: usize = 1024;
+
+/// The longest `s3_out` key's tail after `prefix` and `partition`:
+/// `20261030T142501.123Z-<32 hex>-<20 digits>.ndjson.zst`. `logit_outputs::s3`'s key tests pin it.
+pub const S3_KEY_TAIL_BYTES: usize = 20 + 1 + 32 + 1 + 20 + ".ndjson.zst".len();
 
 /// Mirrors `logit_outputs::logit::DEFAULT_TIMEOUT`, kept in sync by hand.
 fn default_logit_out_request_timeout() -> Duration {
@@ -9017,6 +9230,65 @@ mod tests {
             }
             other => panic!("expected SplunkHecOut, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn s3_out_defaults_and_the_credentials_debug_redacts() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "s3_out", "bucket": "archive", "region": "us-east-1"}"#,
+        )
+        .unwrap();
+        let ComponentKind::S3Out {
+            bucket,
+            region,
+            endpoint,
+            path_style,
+            prefix,
+            partition,
+            format,
+            compression,
+            max_bytes,
+            max_age,
+            part_size,
+            storage_class,
+            sse,
+            credentials,
+            timeout,
+            connect_timeout,
+            idle_timeout,
+            tls,
+        } = component.kind
+        else {
+            panic!("expected S3Out");
+        };
+        assert_eq!((bucket.as_str(), region.as_str()), ("archive", "us-east-1"));
+        assert_eq!((endpoint, path_style), (None, None));
+        assert_eq!((prefix.as_str(), partition.as_str()), ("", "dt=%Y-%m-%d/hour=%H/"));
+        assert_eq!((format, compression), (S3Format::Json, S3Compression::Gzip));
+        assert_eq!((max_bytes, part_size), (32 * 1024 * 1024, 8 * 1024 * 1024));
+        assert_eq!(max_age, Duration::from_secs(300));
+        assert_eq!((storage_class, sse, credentials), (None, None, None));
+        assert_eq!(timeout, Duration::from_secs(60));
+        assert_eq!(connect_timeout, Duration::from_secs(5));
+        assert_eq!(idle_timeout, Duration::from_secs(30));
+        assert!(tls.is_empty());
+
+        let component: Component = serde_json::from_str(
+            r#"{"type": "s3_out", "bucket": "b", "region": "r", "format": "native",
+                "compression": "zstd", "sse": {"algorithm": "aws_kms", "kms_key_id": "k"},
+                "credentials": {"access_key_id": "AKID", "secret_access_key": "SECRET",
+                                "session_token": "TOKEN"}}"#,
+        )
+        .unwrap();
+        let debug = format!("{:?}", component.kind);
+        for secret in ["AKID", "SECRET", "TOKEN"] {
+            assert!(!debug.contains(secret), "{secret} in {debug}");
+        }
+        let ComponentKind::S3Out { format, compression, sse, .. } = component.kind else {
+            panic!("expected S3Out");
+        };
+        assert_eq!((format, compression), (S3Format::Native, S3Compression::Zstd));
+        assert_eq!(sse.unwrap().algorithm, S3SseAlgorithm::AwsKms);
     }
 
     #[test]
