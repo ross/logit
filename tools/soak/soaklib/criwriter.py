@@ -5,15 +5,17 @@ kubelet does it. Stdlib only, so it runs in a stock Python image.
 Usage: `python -u criwriter.py CONFIG`, where CONFIG is a JSON object (`validate()` lists its
 keys). It writes `<root>/<namespace>_<pod>_<uid>/<container>/<restart>.log` until SIGTERM.
 
-What it writes, per containerd and the kubelet (`testdata/interop/cri/README.md` records both):
+What it writes, per containerd and the kubelet (`testdata/interop/cri/README.md` records both),
+and a short `P` as CRI-O's conmon writes one:
 
 - Records are `<RFC 3339 time> <stream> <tag> <content>\\n`, the time in containerd's form
   (`Z`, trailing zeros of the fraction trimmed), stdout and stderr interleaved.
 - A line longer than 16 KiB leaves as 16,384-byte `P` pieces and a closing `F`, with a whole
   stderr line between two pieces, as containerd interleaves the streams.
-- Every `dangle_every_s`, a stdout line's head leaves as a `P` and its `F` follows
+- Every `dangle_every_s`, a stdout line's head leaves as a short `P` and its `F` follows
   `dangle_s` later, while only stderr writes in between: a stall longer than the reader's
-  `partial_timeout` splits the line into two events.
+  `partial_timeout` splits the line into two events. A short `P` is how CRI-O's conmon writes
+  a partial write; containerd writes a `P` only at 16 KiB or at a reopen.
 - Every `rotate_every_s`, the kubelet's rotation, in its order: remove the oldest rotated files
   past `max_files - 2`, gzip every uncompressed rotated file (to `.gz.tmp`, renamed to `.gz`,
   the original removed), rename the live file to `<n>.log.<YYYYMMDD-HHMMSS>`, then reopen. The

@@ -432,11 +432,13 @@ claim, an invalid UTF-8 line, or a checkpoint error.
 
 `cri-rotate` (10 minutes 10 seconds) has `soaklib/criwriter.py`, a stdlib Python writer in the
 stand-in's image, write one container's log into a kubelet pod log tree under `<run>/shared`
-(`<namespace>_<pod>_<uid>/app/0.log`) in containerd's CRI format: 500 lines a second, stdout and
+(`<namespace>_<pod>_<uid>/app/0.log`) in the CRI format: 500 lines a second, stdout and
 stderr interleaved, every hundredth line 20 to 50 KB long and split into 16 KiB `P` pieces with
-a stderr line between two of them, and a stdout line stalled for 12 s after its first `P` every
-37 s, longer than `cri_in`'s 5 s `partial_timeout`. Every 45 s it rotates as the kubelet does:
-it removes rotated files past five, gzips every uncompressed rotated file, renames the live file
+a stderr line between two of them, and every 37 s a stdout line stalled for 12 s after a short
+`P`, longer than `cri_in`'s 5 s `partial_timeout`. A short `P` is CRI-O's conmon's form of a
+partial write; containerd writes a `P` only at 16 KiB or at a reopen. Every 45 s it rotates as
+the kubelet does: it removes the oldest rotated files past three, keeping five files in all,
+gzips every uncompressed rotated file, renames the live file
 to `0.log.<YYYYMMDD-HHMMSS>`, writes a line's head to the renamed file as a `P`, and reopens,
 the head's `F` starting the new file. At 330 s it restarts the container into `1.log`. It
 reports in `internal`'s NDJSON grammar, so the ledger reads its G as a `logit` writer's. The SUT
@@ -1220,7 +1222,11 @@ A line leaves as two events when its run waits past `partial_timeout`, a stall o
 in a renamed file, and `cri_in` counts each such flush in
 `logit.input.frames.truncated{reason="partial_timeout"}`, S. The row judges W − S + F − G
 against the replay band, which holds while every flushed run's rest arrives, as the writer
-finishes every line before it exits, and the end-to-end bound adds S. The driver counts the
+finishes every line before it exits, and the end-to-end bound adds S. `cri_in` pins a file's
+checkpoint at a held run's first record while it has already sent the other stream's lines
+after it, so a stop or a kill while a run is held replays those lines: on a `cri` wire every
+stopped and killed life widens the band above by its rate over its last drain interval times
+`partial_timeout` plus `poll_interval`. The driver counts the
 `F` records in the tree, gzip files decompressed, and that count plus the lines the writer's
 rotations removed (`soak.writer.lines.removed`) must equal G. A rotation gzips every rotated
 file but the one it renames, and `cri_in` never reads a `.gz`, so the row FAILs a SUT stop,
