@@ -491,7 +491,9 @@ mod tests {
     };
     use logit_core::{Event, Resource};
     use logit_outputs::stdio::StreamEncoder;
-    use logit_pipeline::test_util::{fanout_channel, recv_batch, scratch_dir, TelemetryProbe};
+    use logit_pipeline::test_util::{
+        fanout_channel, recv_batch, scratch_dir, TelemetryProbe, RECV_TIMEOUT,
+    };
     use logit_proto::frame::{write_frame, Compression};
     use logit_proto::Encoder;
 
@@ -1065,7 +1067,7 @@ mod tests {
             input.bind().await.expect("bind opens the file");
             let (fanout, rx) = fanout_channel(1);
             drop(rx);
-            tokio::time::timeout(std::time::Duration::from_secs(5), input.run(fanout))
+            tokio::time::timeout(RECV_TIMEOUT, input.run(fanout))
                 .await
                 .expect("run returns once no consumer takes a batch")
                 .expect("a closed consumer is not an error");
