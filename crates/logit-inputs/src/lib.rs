@@ -24,6 +24,7 @@ pub mod graphite;
 mod http;
 pub mod influxdb;
 pub mod internal;
+pub mod kafka;
 pub mod lines;
 mod listener;
 pub mod logit;
