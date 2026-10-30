@@ -73,7 +73,8 @@ from .scenario import (BACKEND_ROLE, BROKER_ROLE, GENERATOR_ROLE, IDP_ROLE, NETN
 NETEM_LIMIT = "100000"
 # The timeline key recording, per `[[ledger.source]]` wire, whether a step can affect it.
 INGRESS_KEYS = {"udp": "affects_udp_ingress", "tcp": "affects_tcp_ingress",
-                "file": "affects_file_ingress", "http": "affects_http_ingress"}
+                "file": "affects_file_ingress", "http": "affects_http_ingress",
+                "kafka": "affects_kafka_ingress"}
 # 128 + SIGKILL: the exit code Docker records for a container a `kill` ended.
 KILL_EXIT_CODE = 137
 CUE_TIMEOUT_S = 10
@@ -132,10 +133,15 @@ class Action:
     affects_tcp_ingress: object
     affects_file_ingress: object
     affects_http_ingress: object
+    # On `kafka` a fault on the generator, the broker, or the ingress SUT can delay records on
+    # their way, and one on the SUT can replay them; the wire row judges the run against its
+    # replay band and reports these windows.
+    affects_kafka_ingress: object = None
 
     def affects(self, wire, step, roles):
         """Whether the fault can lose lines on a `wire` source's way into the SUT."""
-        return bool(getattr(self, INGRESS_KEYS[wire])(step, roles))
+        predicate = getattr(self, INGRESS_KEYS[wire])
+        return bool(predicate and predicate(step, roles))
 
 
 def _record(result, **extra):
@@ -437,6 +443,12 @@ def _on_ingress_sut_or_generator(step, roles):
     return _on_ingress_side(step, roles) or _on_generator(step, roles)
 
 
+def _on_kafka_path(step, roles):
+    """On an ingress SUT, its namespace's holder, a generator, or the broker between them."""
+    return (_on_ingress_side(step, roles) or _on_generator(step, roles)
+            or roles.get(step.on) == BROKER_ROLE)
+
+
 def _always(step, roles):
     return True
 
@@ -454,6 +466,7 @@ ACTIONS = {
         affects_tcp_ingress=_on_ingress_side,
         affects_file_ingress=_never,
         affects_http_ingress=_on_ingress_sut_or_generator,
+        affects_kafka_ingress=_on_kafka_path,
     ),
     "pause": Action(
         apply=pause_apply,
@@ -463,6 +476,7 @@ ACTIONS = {
         affects_tcp_ingress=_on_ingress_sut_or_generator,
         affects_file_ingress=_on_ingress_side,
         affects_http_ingress=_on_ingress_sut_or_generator,
+        affects_kafka_ingress=_on_kafka_path,
     ),
     "stop": Action(
         apply=stop_apply,
@@ -472,6 +486,7 @@ ACTIONS = {
         affects_tcp_ingress=_on_ingress_sut_or_generator,
         affects_file_ingress=_on_ingress_side,
         affects_http_ingress=_on_ingress_sut_or_generator,
+        affects_kafka_ingress=_on_kafka_path,
     ),
     "kill": Action(
         apply=kill_apply,
@@ -481,6 +496,7 @@ ACTIONS = {
         affects_tcp_ingress=_on_ingress_sut_or_generator,
         affects_file_ingress=_on_ingress_side,
         affects_http_ingress=_on_ingress_sut_or_generator,
+        affects_kafka_ingress=_on_kafka_path,
     ),
     "restart": Action(
         apply=restart_apply,
@@ -490,6 +506,7 @@ ACTIONS = {
         affects_tcp_ingress=_on_ingress_sut_or_generator,
         affects_file_ingress=_on_ingress_side,
         affects_http_ingress=_on_ingress_sut_or_generator,
+        affects_kafka_ingress=_on_kafka_path,
     ),
     "partition": Action(
         apply=partition_apply,
@@ -499,6 +516,7 @@ ACTIONS = {
         affects_tcp_ingress=_on_ingress_sut_or_generator,
         affects_file_ingress=_never,
         affects_http_ingress=_on_ingress_sut_or_generator,
+        affects_kafka_ingress=_on_kafka_path,
     ),
     # A mark on the SUT holds what it marks, such as a stalled script backing up into the UDP
     # receive queue.
@@ -510,6 +528,7 @@ ACTIONS = {
         affects_tcp_ingress=_on_ingress_sut,
         affects_file_ingress=_never,
         affects_http_ingress=_on_ingress_sut,
+        affects_kafka_ingress=_on_ingress_sut,
     ),
     "exit": Action(
         apply=no_op,
@@ -519,6 +538,7 @@ ACTIONS = {
         affects_tcp_ingress=_on_ingress_sut,
         affects_file_ingress=_on_ingress_side,
         affects_http_ingress=_on_ingress_sut,
+        affects_kafka_ingress=_on_ingress_sut,
     ),
     "respond": Action(
         apply=respond_apply,

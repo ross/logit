@@ -261,8 +261,9 @@ FAN_OUT_KIND = "line_protocol"
 MERGE_KIND = "dedup_timestamps"
 # The wires a source's lines can cross into the SUT, each with its own ledger symbols
 # (checks.py's `WIRES`): datagrams, a TCP stream of LF-terminated lines, a file the SUT tails,
-# HTTP requests a listener answers, or an exposition a listener scrapes.
-WIRES = ("udp", "tcp", "file", "http", "scrape")
+# HTTP requests a listener answers, an exposition a listener scrapes, or a Kafka topic a
+# listener consumes.
+WIRES = ("udp", "tcp", "file", "http", "scrape", "kafka")
 DEFAULT_WIRE = "udp"
 # `rss_settle` when a scenario doesn't set it, and for a run directory recorded before the key:
 # how long past `recovery_bound` `rss_slope` keeps excusing a fault, while the allocator returns
@@ -272,6 +273,7 @@ DEFAULT_RSS_SETTLE_S = 0.0
 FILE_WIRE = "file"
 HTTP_WIRE = "http"
 SCRAPE_WIRE = "scrape"
+KAFKA_WIRE = "kafka"
 # A file wire's writer: a generator sink whose G is `events.delivered` (checks.py's `WIRES`),
 # since it counts no `output.messages`.
 FILE_WRITER_KIND = "file_out"
@@ -282,6 +284,8 @@ HTTP_WRITER_KINDS = ("influxdb_out", "otlp_out", "splunk_hec_out", "datadog_out"
 # A scrape wire's writer: an exposition on `bind:`, whose G is its generator's increments, since
 # a scrape reads running totals (checks.py's `check_ledger_wire`).
 SCRAPE_WRITER_KIND = "prometheus_out"
+# A Kafka wire's writer, whose G is `logit.output.records`, the records the broker accepted.
+KAFKA_WRITER_KIND = "kafka_out"
 # The `[ledger]` keys refused beside a scrape wire, whose rows judge the generator's increments
 # against V and read no `aggregate` in the SUT.
 SCRAPE_REFUSED_KEYS = ("sut_aggregate", "sut_delta", "sut_script", "hop", "split",
@@ -300,6 +304,7 @@ LISTENER_WIRES = {
     "otlp_in": ("http", {}),
     "splunk_hec_in": ("http", {}),
     "datadog_in": ("http", {}),
+    "kafka_in": ("kafka", {}),
 }
 # Each listener kind with no `transport:` that runs in one of several modes, each chosen by the
 # config key it sets: that key and its mode's wire.
@@ -679,6 +684,18 @@ class Scenario:
         return self.target.get("kind") == STANDIN_TARGET
 
     @property
+    def kafka_sources(self):
+        """The `[[ledger.source]]` tables whose `wire` is `kafka`, whose generator produces to
+        the stack's broker and whose SUT listener consumes from it."""
+        return [source for source in self.sources if source.get("wire") == KAFKA_WIRE]
+
+    @property
+    def runs_broker(self):
+        """Whether the stack runs the `kafka` profile's broker: for a Kafka target, or beside
+        the local target's backends for a Kafka wire."""
+        return self.kafka or bool(self.kafka_sources)
+
+    @property
     def standin_shape(self):
         """A stand-in target's shape, or None for any other target."""
         return self.target.get("shape") if self.standin else None
@@ -962,6 +979,7 @@ def from_dict(raw, path):
                                          sut_text, configs, path.parent)
             if target["kind"] == KAFKA_TARGET:
                 target["format"] = kafka_format(ledger, sut_text, target["topic"], problems)
+            problems += _kafka_wire_problems(ledger, configs, path.parent, sut_text)
         problems += _writer_problems(ledger, configs, path.parent)
         problems += _extra_sut_problems(extra_suts, ledger)
         if overlap is None:
@@ -1615,6 +1633,70 @@ def _writer_problems(ledger, configs, directory):
             elif wire != HTTP_WIRE and kind in HTTP_WRITER_KINDS:
                 problems.append(f"{where}: `generator_sink` {sink!r} is an {kind}, which only "
                                 "an http wire reads")
+            elif wire == KAFKA_WIRE and kind != KAFKA_WRITER_KIND:
+                problems.append(f"{where}: a kafka wire's `generator_sink` must be a "
+                                f"{KAFKA_WRITER_KIND}, and {sink!r} is "
+                                + (f"a {kind}" if kind else "no component of its config"))
+            elif wire != KAFKA_WIRE and kind == KAFKA_WRITER_KIND:
+                problems.append(f"{where}: `generator_sink` {sink!r} is a {KAFKA_WRITER_KIND}, "
+                                "which only a kafka wire reads")
+    return problems
+
+
+def _scalar(block, key):
+    """A plain scalar `key:` in one component's uncommented block, unquoted, or None."""
+    found = re.search(rf"(?<![\w.]){key}\s*:\s*[\"']?([\w.-]+)", block)
+    return found.group(1) if found else None
+
+
+def _kafka_wire_problems(ledger, configs, directory, sut_text):
+    """What a `kafka` wire breaks between its generator's `kafka_out` and the SUT's `kafka_in`,
+    read from the two configs: the writer's `topic:` must be one of the listener's `topics:`
+    (a flow list), the two `format:`s must agree (`kafka_out` defaults to `json`), and the
+    listener must set `start: earliest`, or the records the generator wrote before the group's
+    first join are never read and the wire reads as loss. The kinds are `_wire_problems()` and
+    `_writer_problems()`'s to check."""
+    sources = ledger.get("source")
+    if not isinstance(sources, list) or not isinstance(configs, dict):
+        return []
+    problems = []
+    for index, source in enumerate(sources):
+        if not isinstance(source, dict) or source.get("wire") != KAFKA_WIRE:
+            continue
+        where = f"ledger.source {index + 1}"
+        listener, service = source.get("sut_listener"), source.get("service")
+        name = configs.get(service) if isinstance(service, str) else None
+        if (not isinstance(listener, str) or not isinstance(name, str)
+                or not (directory / name).is_file()):
+            continue
+        reader = "\n".join(_uncommented(block) for block in component_blocks(sut_text, listener))
+        listed = re.search(r"(?<![\w.])topics\s*:\s*\[([^\]]*)\]", reader)
+        topics = ([one.strip().strip("\"'") for one in listed.group(1).split(",") if one.strip()]
+                  if listed else None)
+        if topics is None:
+            problems.append(f"{where}: `sut_listener` {listener!r} lists no `topics:` the "
+                            "ledger can read; write them as a flow list, `[name, ...]`")
+        if _scalar(reader, "start") != "earliest":
+            problems.append(f"{where}: `sut_listener` {listener!r} must set `start: earliest`, "
+                            "or the records written before the group's first join are never "
+                            "read")
+        text = (directory / name).read_text()
+        for sink in source_ids(source, "generator_sink"):
+            if not isinstance(sink, str):
+                continue
+            writer = "\n".join(_uncommented(block) for block in component_blocks(text, sink))
+            if not writer:
+                continue
+            topic = _scalar(writer, "topic")
+            if topics is not None and topic not in topics:
+                problems.append(f"{where}: `generator_sink` {sink!r} writes the topic "
+                                f"{topic!r}, which `sut_listener` {listener!r} doesn't read "
+                                f"({', '.join(topics) or 'no topics'})")
+            wrote = _scalar(writer, "format") or "json"
+            read = _scalar(reader, "format")
+            if wrote != read:
+                problems.append(f"{where}: `generator_sink` {sink!r} writes format {wrote}, "
+                                f"and `sut_listener` {listener!r} reads {read}")
     return problems
 
 
@@ -3235,7 +3317,7 @@ def base_roles(scenario):
     `STANDIN_ROLES`, which the `standin` profile holds, for a stand-in target."""
     roles = {name: role for name, role in BASE_ROLES.items()
              if scenario.has_vm or role != BACKEND_ROLE}
-    if scenario.kafka:
+    if scenario.runs_broker:
         roles.update(KAFKA_ROLES)
     if scenario.standin:
         roles.update(STANDIN_ROLES)
