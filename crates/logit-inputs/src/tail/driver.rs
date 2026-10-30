@@ -5,11 +5,26 @@
 //! A file's identity is its [`FileId`]. On each `scan`, a discovered path whose inode differs from
 //! the one tracked under it is a rotation: the old inode is read to EOF and closed once it has
 //! stayed there for one `poll_interval` ([`Tailer::reap_drained`]), and the new one opened at the
-//! beginning. A tracked file whose size is below the offset already read was
-//! truncated in place: it's re-read from `0` with its partial-line state discarded.
+//! beginning. A tracked file whose size is below the offset already read was truncated in place:
+//! it's re-read from `0` with its partial-line state discarded ([`Tailer::reconcile_truncation`]),
+//! and the bytes the driver last saw past that offset, and the discarded line, are counted lost
+//! unless a copy claims the file's state from before the truncation.
+//!
+//! An inode no checkpoint entry or tracked file names may claim an earlier position by content,
+//! its head and the marker of the bytes before the position matching, and resume there
+//! ([`Tailer::claim_unmatched`], `docs/adr/tail-content-identity.md`): a `copytruncate` copy, a
+//! restored backup, a migrated volume. A scan reconciles in two passes
+//! ([`Tailer::reconcile_all`]) so every candidate exists before any new inode is probed, whatever
+//! order the listing yields.
+//!
+//! A file whose first bytes are a gzip, zstd, xz, or bzip2 magic is never read as text: it's
+//! closed before any line of it is emitted and counted
+//! `logit.input.files.skipped{reason="compressed"}`, once per inode ([`sniff`],
+//! `Tailer::skipped`). Under a pattern like `app.log*`, its content was already read under the
+//! uncompressed name, so decompressing it would replay it.
 
 use super::checkpoint::{
-    CheckpointStore, FileId, Head, Loaded, Persisted, Retained, Source, HEAD_BYTES,
+    marker, CheckpointStore, FileId, Head, Loaded, Persisted, Retained, Source, HEAD_BYTES,
 };
 use super::line::{LineSplitter, TailDecoder};
 use super::pattern::PathPattern;
@@ -31,6 +46,104 @@ const READ_CHUNK_BYTES: usize = 64 * 1024;
 /// [`READ_CHUNK_BYTES`] (reclaiming the old allocation if no event still slices it). Above it,
 /// small reads (a wake per short write) share one allocation instead of taking one each.
 const READ_REFILL_BYTES: usize = 16 * 1024;
+
+/// The fewest head bytes a content claim's candidate must cover. A shorter head is too likely to be
+/// a timestamp prefix or a header that unrelated files share (`docs/adr/tail-content-identity.md`,
+/// decision 5, which takes Filebeat's minimum fingerprint size).
+const CLAIM_MIN_HEAD: u32 = 64;
+
+/// How many consecutive scans a new inode that may yet claim a candidate is left unopened
+/// ([`Tailer::claim_unmatched`]). One scan covers a copy seen before the original's truncation;
+/// the second, a copy a scan found still being written.
+const CLAIM_DEFER_SCANS: u32 = 2;
+
+/// How many scans' claim passes offer a truncated file's state before its counts are recorded
+/// ([`Tailer::count_truncations`]), whether or not their listings failed, so one failed listing
+/// doesn't count a truncation a copy would have claimed and a persistent one doesn't hold it
+/// until a stop. An inode still waiting to claim it keeps it up to [`CLAIM_DEFER_SCANS`] more.
+const TRUNCATION_OFFERS: u32 = 2;
+
+/// One byte of a magic: any value in `lo..=hi`.
+type MagicByte = (u8, u8);
+
+/// A magic byte that takes one value.
+const fn is(b: u8) -> MagicByte {
+    (b, b)
+}
+
+/// The header opening each compressed format the driver won't read as text, with the name the
+/// `compressed` diagnostic gives it. Each is long enough that text can't open with it by chance:
+/// gzip's ID bytes take its one defined method, deflate (`08`), and bzip2's printable `BZh` takes
+/// a block-size digit and the magic of a first block or of an empty stream's end.
+const COMPRESSED_MAGIC: [(&str, &[MagicByte]); 5] = [
+    ("gzip", &[is(0x1f), is(0x8b), is(0x08)]),
+    ("zstd", &[is(0x28), is(0xb5), is(0x2f), is(0xfd)]),
+    ("xz", &[is(0xfd), is(b'7'), is(b'z'), is(b'X'), is(b'Z'), is(0x00)]),
+    (
+        "bzip2",
+        &[
+            is(b'B'),
+            is(b'Z'),
+            is(b'h'),
+            (b'1', b'9'),
+            is(0x31),
+            is(0x41),
+            is(0x59),
+            is(0x26),
+            is(0x53),
+            is(0x59),
+        ],
+    ),
+    (
+        "bzip2",
+        &[
+            is(b'B'),
+            is(b'Z'),
+            is(b'h'),
+            (b'1', b'9'),
+            is(0x17),
+            is(0x72),
+            is(0x45),
+            is(0x38),
+            is(0x50),
+            is(0x90),
+        ],
+    ),
+];
+
+/// What a file's first bytes say about whether to read it as text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sniff {
+    Text,
+    /// Opens with the named format's magic.
+    Compressed(&'static str),
+    /// Shorter than a magic it's a prefix of, an empty head included. A compressor creates its
+    /// output before writing the header (logrotate's `compress` does), so a scan can find a
+    /// compressed file empty; reading its first byte as text then would emit garbage.
+    Undecided,
+}
+
+/// Classifies a file by `head`, its first bytes. An undecided file is read no further until more
+/// bytes decide it, so a text file whose whole content is a magic's prefix (`BZh`, say)
+/// isn't read until it grows past it, and if it's closed first, never.
+fn sniff(head: &[u8]) -> Sniff {
+    let mut undecided = false;
+    for (format, magic) in COMPRESSED_MAGIC {
+        let n = head.len().min(magic.len());
+        if !head[..n].iter().zip(magic).all(|(b, (lo, hi))| (lo..=hi).contains(&b)) {
+            continue;
+        }
+        if n == magic.len() {
+            return Sniff::Compressed(format);
+        }
+        undecided = true;
+    }
+    if undecided {
+        Sniff::Undecided
+    } else {
+        Sniff::Text
+    }
+}
 
 /// The fault seam's point for `read_one`'s read of a tracked file.
 pub(crate) const READ: fault::Point = fault::Point::new(fault::sites::TAIL_READ, fault::Op::Read);
@@ -125,10 +238,16 @@ enum DrainEnd {
 enum StartOffset {
     Beginning,
     End,
-    /// A retained offset and the head it was recorded with. `Tailer::open_tracked` resumes there
-    /// only if the head still matches and the offset is within the file, else starts at `0`
-    /// (`checkpoint.rs`'s module doc has the rule).
-    Resume(u64, Head),
+    /// A retained offset, with the head and the marker it was recorded with. `Tailer::open_tracked`
+    /// resumes there only if both still match and the offset is within the file, else starts at
+    /// `0` (`checkpoint.rs`'s module doc has the rule).
+    Resume(u64, Head, u64),
+    /// Another file's position that this one claimed by content ([`Tailer::claim_unmatched`]).
+    /// Read and checked as `Resume` is, but a mismatch (the file changed since the claim's probe)
+    /// starts at `0` uncounted, since no entry named this inode.
+    Claim(u64, Head, u64),
+    /// Not opened in this scan: it may yet claim a candidate ([`Tailer::claim_unmatched`]).
+    Defer,
 }
 
 impl From<super::ReadFrom> for StartOffset {
@@ -180,6 +299,20 @@ impl Listing {
     }
 }
 
+/// A compressed file the driver skipped, in `Tailer::skipped`.
+struct Skipped {
+    /// Where it was last found.
+    path: PathBuf,
+    /// Its size when last sniffed, or `None` until a scan's `stat` records it (`read_one` skips
+    /// a file without one).
+    len: Option<u64>,
+    /// The `Tailer::scan_generation` of the scan that recorded it at open, or `None` for a
+    /// record `read_one` made between scans. [`Tailer::prune_skipped`] keeps a record from the
+    /// running scan: one made at open under `read_from: end` falls in a scan that may not have
+    /// collected the discovered inodes.
+    scan: Option<u64>,
+}
+
 /// A checkpoint entry whose file is gone with `unread` bytes past its offset, held in
 /// `Tailer::gone` until a checkpoint write without it lands.
 struct Gone {
@@ -189,6 +322,109 @@ struct Gone {
     unread: u64,
 }
 
+/// A position a new inode may claim by content: its offset, the head and marker recorded with it,
+/// and where it came from ([`Tailer::claim_unmatched`]).
+struct Candidate<'a> {
+    from: ClaimFrom,
+    offset: u64,
+    head: Head,
+    /// The head's bytes, where they're in memory: what decides whether a short file may still
+    /// grow into a match. A checkpoint entry has only the hash.
+    head_bytes: Option<&'a [u8]>,
+    marker: u64,
+    /// The length a claimant must reach: the offset, or for a truncated file's state its read
+    /// offset before the truncation, so a copy shorter than what was read claims nothing.
+    min_len: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimFrom {
+    /// An unspent checkpoint entry whose inode this scan didn't find, so the scan prunes it
+    /// unless it's claimed.
+    Orphan(FileId),
+    /// A checkpoint entry its own inode's content rejected in this scan: `Tailer::rejected`'s
+    /// index.
+    Rejected(usize),
+    /// A tracked file's state from before a truncation: `Tailer::truncations`' index.
+    Truncated(usize),
+    /// A tracked file as it is now, at its line boundary.
+    Live(FileId),
+}
+
+/// What [`Tailer::claim_unmatched`] decided for one inode: `None` for no claim, else its start
+/// and the candidate it claims (none for [`StartOffset::Defer`]).
+type Claim = Option<(StartOffset, Option<ClaimFrom>)>;
+
+/// A [`Candidate`] that owns its head bytes, for [`Tailer::claim_snapshot`].
+struct OwnedCandidate {
+    from: ClaimFrom,
+    offset: u64,
+    head: Head,
+    head_bytes: Option<Vec<u8>>,
+    marker: u64,
+    min_len: u64,
+}
+
+impl From<&Candidate<'_>> for OwnedCandidate {
+    fn from(c: &Candidate<'_>) -> Self {
+        Self {
+            from: c.from,
+            offset: c.offset,
+            head: c.head,
+            head_bytes: c.head_bytes.map(<[u8]>::to_vec),
+            marker: c.marker,
+            min_len: c.min_len,
+        }
+    }
+}
+
+impl OwnedCandidate {
+    fn borrow(&self) -> Candidate<'_> {
+        Candidate {
+            from: self.from,
+            offset: self.offset,
+            head: self.head,
+            head_bytes: self.head_bytes.as_deref(),
+            marker: self.marker,
+            min_len: self.min_len,
+        }
+    }
+}
+
+/// How a new inode's content compares with one [`Candidate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// The head and the marker match, and the file reaches the offset.
+    Match,
+    /// Too short to decide, and every byte so far agrees: a copy still being written.
+    Maybe,
+    No,
+}
+
+/// A truncation `Tailer::reconcile_truncation` saw, held in `Tailer::truncations` until a copy
+/// claims its pre-truncation state or a scan shows none will.
+struct Truncation {
+    /// What a copy may claim, as `(offset, head, head bytes, marker)`: `None` when the head is
+    /// under [`CLAIM_MIN_HEAD`] or the marker at the line boundary isn't in memory (a
+    /// `docker_in` decoder holding lines).
+    candidate: Option<(u64, Head, Vec<u8>, u64)>,
+    /// The read offset before the truncation: a copy shorter than it lacks bytes `logit` read,
+    /// so it can't claim the state ([`Candidate::min_len`]).
+    read_offset: u64,
+    /// Bytes the last size observation saw past the read offset, for
+    /// `logit.input.bytes.dropped{reason="truncated"}`.
+    unread: u64,
+    /// Whether the truncation discarded an unterminated line, for
+    /// `logit.input.frames.dropped{reason="truncated"}`.
+    partial: bool,
+    /// The truncated file: a second truncation of it records this one's counts and replaces it.
+    id: FileId,
+    /// How many claim passes have offered it ([`TRUNCATION_OFFERS`]).
+    offers: u32,
+    /// Whether an inode deferred in this scan may still claim it, which keeps it a scan longer.
+    pinned: bool,
+}
+
 struct TrackedFile<D> {
     path: PathBuf,
     id: FileId,
@@ -196,7 +432,9 @@ struct TrackedFile<D> {
     offset: u64,
     /// The file's size at the latest observation the driver already makes: a scan's `stat`, an
     /// `fstat` of the handle, or a read returning `0` bytes (size equals `offset`). The latest,
-    /// not the largest, so a truncation lowers it. A checkpoint persists the larger of it and
+    /// not the largest, so a truncation lowers it. A zero read when this is past `offset` means
+    /// the file shrank, so `read_one` runs the truncation check instead of overwriting it, which
+    /// would lose the bytes `reconcile_truncation` counts. A checkpoint persists the larger of it and
     /// `offset`, which `Tailer::prune_checkpoint_entries` counts a gone file's unread bytes
     /// against.
     last_len: u64,
@@ -224,6 +462,32 @@ struct TrackedFile<D> {
     /// them and cleared on a truncation. Invariant: `head.len() >= min(HEAD_BYTES, offset)`, so
     /// the fingerprint written beside any offset covers what `checkpoint.rs`'s module doc says.
     head: Vec<u8>,
+    /// The `min(HEAD_BYTES, offset)` bytes ending at `offset`: the marker of a checkpoint taken
+    /// with nothing pending.
+    window: Vec<u8>,
+    /// The splitter's last line boundary, `offset - pending_bytes()` as of the last read, or
+    /// `u64::MAX` when `boundary_tail` isn't known.
+    boundary_at: u64,
+    /// The `min(HEAD_BYTES, boundary_at)` bytes ending at `boundary_at`: the marker of a
+    /// checkpoint taken with a partial line pending, and of a truncated file's pre-truncation
+    /// state, whose bytes are gone from the file.
+    boundary_tail: Vec<u8>,
+    /// The last marker [`Tailer::marker_of`] read back from the descriptor, with its offset.
+    read_marker: Option<(u64, u64)>,
+    /// The last `(offset, marker)` a checkpoint persisted whose marker was taken, for a write
+    /// whose read-back fails ([`TrackedFile::checkpoint_position`]). Cleared on a truncation.
+    last_good: Option<(u64, u64)>,
+    /// Whether [`sniff`] has found `head` to be text. Until it does, `read_one` emits nothing
+    /// from the file. Cleared with `head` on a truncation, since the new content starts over.
+    sniffed: bool,
+    /// Opened empty at `0`, not from a resume or a claim, and nothing read since. logrotate's
+    /// `copytruncate` creates its copy empty and then fills it, so a scan can open the copy
+    /// before it holds anything. Until the file's first non-empty read it may still claim a
+    /// position, since it has emitted nothing ([`Tailer::claim_waits`]).
+    claimable: bool,
+    /// Set by [`Tailer::claim_waits`] when a claimable file's bytes match, or may grow into, a
+    /// candidate's: nothing is read from it until the next scan's claim pass decides its start.
+    claim_pending: bool,
     /// When the file became [`FileState::Draining`], set by [`TrackedFile::start_draining`] and
     /// cleared by a rebind. `None` in every other state. `Tailer::reap_drained` reads it.
     draining_since: Option<tokio::time::Instant>,
@@ -243,6 +507,48 @@ impl<D> TrackedFile<D> {
             self.draining_since = Some(tokio::time::Instant::now());
             self.draining_scan = scan;
             self.rescanned = false;
+        }
+    }
+
+    /// The offset a checkpoint persists: the splitter's line boundary, or the start of the oldest
+    /// line the decoder holds, if earlier (`Tailer::write_checkpoint` has why).
+    fn persisted_offset(&self) -> u64 {
+        let boundary = self.offset.saturating_sub(self.splitter.pending_bytes());
+        boundary.min(self.held_from.unwrap_or(u64::MAX))
+    }
+
+    /// The marker at `boundary_at`, from memory, when the decoder holds no line that starts before
+    /// it: what a content claim compares against this file.
+    fn boundary_marker(&self) -> Option<u64> {
+        let covered = self.boundary_at.min(HEAD_BYTES as u64) as usize;
+        (self.held_from.is_none()
+            && self.boundary_at != u64::MAX
+            && self.boundary_tail.len() == covered)
+            .then(|| marker(&self.boundary_tail))
+    }
+
+    /// The marker at `at` if it's in memory: `at` is the read offset or the last line boundary,
+    /// or the last offset [`read_marker`] read back.
+    fn known_marker(&self, at: u64) -> Option<u64> {
+        let covered = at.min(HEAD_BYTES as u64) as usize;
+        if at == self.offset && self.window.len() == covered {
+            Some(marker(&self.window))
+        } else if at == self.boundary_at && self.boundary_tail.len() == covered {
+            Some(marker(&self.boundary_tail))
+        } else {
+            self.read_marker.filter(|(cached, _)| *cached == at).map(|(_, hash)| hash)
+        }
+    }
+
+    /// The `(offset, marker)` a checkpoint persists: the persisted offset with its marker when
+    /// that's known, else the last position persisted with a known marker, else `0`, whose
+    /// marker is the empty one. Never an offset whose marker couldn't be taken: a restart would
+    /// reject it, replay the file, and count its unread bytes gone besides.
+    fn checkpoint_position(&self) -> (u64, u64) {
+        let offset = self.persisted_offset();
+        match self.known_marker(offset) {
+            Some(marker) => (offset, marker),
+            None => self.last_good.unwrap_or((0, marker(&[]))),
         }
     }
 }
@@ -267,6 +573,34 @@ pub(crate) struct Tailer<D: TailDecoder, F: DecoderFactory<D>> {
     /// prune instead, a process that ended before that write would leave the entry on disk, and
     /// the next process would count the same bytes again.
     gone: Vec<Gone>,
+    /// Truncations not yet claimed or counted ([`Truncation`]), at most one per file. A scan
+    /// counts each once [`TRUNCATION_OFFERS`] claim passes have offered it, so a copy the
+    /// truncation leaves under a matched name cancels the count instead of being counted and then
+    /// read.
+    truncations: Vec<Truncation>,
+    /// Checkpoint entries rejected on their own inode's content in this scan, which a new inode
+    /// may still claim. Emptied by every scan's claim pass, which counts the unclaimed ones gone.
+    rejected: Vec<(FileId, Retained)>,
+    /// New inodes `claim_unmatched` left unopened, with how many consecutive scans it has.
+    deferred: HashMap<FileId, u32>,
+    /// Each compressed inode found, so it's never counted again. A scan leaves it closed while
+    /// its path and size are unchanged, and sniffs it again, uncounted, after a rename or a size
+    /// change ([`Tailer::still_skipped`]). Keyed by inode so a rename (`.1.gz` to `.2.gz`) isn't
+    /// counted again. A scan forgets an entry whose inode it found under no path, once its path
+    /// is listed ([`Tailer::prune_skipped`]).
+    skipped: HashMap<FileId, Skipped>,
+    /// File watches `read_one` released with a compressed file, for the next `drain` or `scan`
+    /// to remove: `read_one` has no `Watcher`.
+    unwatch: Vec<super::watch::WatchId>,
+    /// The truncated and tracked files' candidates, taken at the current drain's first non-empty
+    /// read of a claimable file ([`Tailer::claim_waits`]); `None` until then.
+    claim_snapshot: Option<Vec<OwnedCandidate>>,
+    /// How many times [`Tailer::claim_waits`] has built [`Tailer::claim_snapshot`].
+    #[cfg(test)]
+    snapshot_builds: usize,
+    /// Inodes nothing names that `DecoderFactory::accept` took in this scan's first pass, so
+    /// `open_tracked` doesn't ask again. Cleared at the end of `reconcile_all`.
+    accepted: HashSet<FileId>,
     /// Where a file found by the first scan with no `resume` entry starts. Set at `bind`:
     /// `Beginning` after [`Loaded::Unusable`], else from `read_from`.
     first_scan_start: StartOffset,
@@ -314,6 +648,15 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             checkpoint: None,
             resume: HashMap::new(),
             gone: Vec::new(),
+            truncations: Vec::new(),
+            rejected: Vec::new(),
+            deferred: HashMap::new(),
+            skipped: HashMap::new(),
+            unwatch: Vec::new(),
+            accepted: HashSet::new(),
+            claim_snapshot: None,
+            #[cfg(test)]
+            snapshot_builds: 0,
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
             watched_dirs: HashSet::new(),
@@ -502,6 +845,8 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
 
         if !self.untaken {
             self.close_all_for_shutdown(&sink).await;
+        } else {
+            self.count_truncations(true);
         }
         if !self.untaken {
             self.flush_all(&sink, FlushReason::Shutdown).await;
@@ -580,6 +925,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     /// handle is `fstat`ed instead, which still sees an unlinked file and a truncation.
     async fn scan(&mut self, first: bool, watcher: &mut super::watch::Watcher) {
         self.reconcile_watches(watcher);
+        self.release_watches(watcher);
         let mut listing = self.list();
         self.report_scan_errors(&listing, first);
         let mut pruned = self.prune_deselected(&listing);
@@ -607,25 +953,21 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             self.keep_unlisted(path, id).await;
         }
 
-        // Only needed while a checkpoint entry is unspent, which is rarely past the first scan.
+        // Only needed while a checkpoint entry is unspent, which is rarely past the first scan, or
+        // a compressed file is remembered.
         let unspent = self.resume.values().any(|r| r.source == Source::Checkpoint);
-        let discovered_ids: HashSet<FileId> =
-            if !unspent { HashSet::new() } else { listing.discovered_ids().collect() };
+        let discovered_ids: HashSet<FileId> = if !unspent && self.skipped.is_empty() {
+            HashSet::new()
+        } else {
+            listing.discovered_ids().collect()
+        };
         self.count_rotations(&listing.discovered);
-        for (path, meta) in std::mem::take(&mut listing.discovered) {
-            self.reconcile_discovered(path, &meta, first, watcher).await;
-        }
-        // A `Draining` file is bound to no path, so nothing above looked at it.
-        let draining: Vec<FileId> = self
-            .files
-            .iter()
-            .filter(|(_, f)| f.state == FileState::Draining)
-            .map(|(id, _)| *id)
-            .collect();
-        for id in draining {
-            self.recheck_length(id).await;
-        }
+        let discovered: Vec<(PathBuf, std::fs::Metadata)> =
+            std::mem::take(&mut listing.discovered).into_iter().collect();
+        self.reconcile_all(discovered, first, &listing, &discovered_ids, watcher).await;
         pruned |= self.prune_checkpoint_entries(&listing, &discovered_ids);
+        self.prune_skipped(&listing, &discovered_ids);
+        self.count_truncations(false);
         if pruned {
             if let Some(cp) = &mut self.checkpoint {
                 cp.mark_dirty();
@@ -681,14 +1023,498 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         }
     }
 
+    /// Reconciles every discovered path in two passes, so a new inode's claim
+    /// ([`Tailer::claim_unmatched`]) sees every tracked file and every rejected entry as this
+    /// scan leaves them, whatever order `discovered` holds:
+    ///
+    /// 1. [`Tailer::release_rotated`] unbinds each path whose inode changed.
+    /// 2. Each inode tracked, retained, or skipped is reconciled: rebound, checked for
+    ///    truncation, or opened from its entry. A claimable file that now holds bytes
+    ///    (`TrackedFile::claimable`) has emitted nothing, so it's untracked and joins step 4.
+    /// 3. Each `Draining` file's handle is checked for truncation, so a truncation this scan can
+    ///    see is offered to a copy this scan found.
+    /// 4. The rest, inodes nothing names, are probed for a claim and opened, or deferred.
+    async fn reconcile_all(
+        &mut self,
+        discovered: Vec<(PathBuf, std::fs::Metadata)>,
+        first: bool,
+        listing: &Listing,
+        discovered_ids: &HashSet<FileId>,
+        watcher: &mut super::watch::Watcher,
+    ) {
+        self.release_rotated(&discovered);
+        let mut unmatched = Vec::new();
+        for (path, meta) in discovered {
+            let id = FileId::from_metadata(&meta);
+            if meta.len() > 0
+                && self
+                    .files
+                    .get(&id)
+                    .is_some_and(|f| f.claimable && f.state != FileState::Deselected)
+            {
+                self.untrack_claimable(id, watcher);
+                unmatched.push((path, meta));
+            } else if self.files.contains_key(&id)
+                || self.resume.contains_key(&id)
+                || self.skipped.contains_key(&id)
+            {
+                self.reconcile_discovered(path, &meta, first, None, watcher).await;
+            } else if self.factory.accept(&path) {
+                self.accepted.insert(id);
+                unmatched.push((path, meta));
+            }
+            // A path the factory rejects (a container `containers:` doesn't select) is neither
+            // probed nor a taker, and isn't opened; the next scan asks again.
+        }
+        self.recheck_draining().await;
+        let (claims, matched) = self.claim_unmatched(&unmatched, first, listing, discovered_ids);
+        let mut taken = Vec::new();
+        for ((path, meta), claim) in unmatched.into_iter().zip(claims) {
+            let id = FileId::from_metadata(&meta);
+            let (start, from) = match claim {
+                Some((start, from)) => (Some(start), from),
+                None => (None, None),
+            };
+            self.reconcile_discovered(path, &meta, first, start, watcher).await;
+            if let (Some(StartOffset::Claim(offset, ..)), Some(from)) = (start, from) {
+                // The open re-reads what the probe read; a file that changed in between starts
+                // at `0` instead, and claims nothing.
+                if let Some(f) = self.files.get(&id).filter(|f| f.offset == offset) {
+                    taken.push((from, f.last_len.max(meta.len())));
+                }
+            }
+        }
+        self.settle_claims(&taken, &matched);
+        self.accepted.clear();
+        // A file the second pass rotated away started draining after step 3.
+        self.recheck_draining().await;
+    }
+
+    /// Stops tracking claimable file `id`, which has read and emitted nothing, so the scan's
+    /// claim pass decides its start as it does a new inode's. Its watch goes at once: reopening
+    /// the same inode gets the same watch descriptor back, which a deferred release would remove.
+    fn untrack_claimable(&mut self, id: FileId, watcher: &mut super::watch::Watcher) {
+        let Some(tracked) = self.files.remove(&id) else { return };
+        if self.by_path.get(&tracked.path) == Some(&id) {
+            self.by_path.remove(&tracked.path);
+        }
+        if let Some(watch) = tracked.watch {
+            watcher.unwatch(watch);
+        }
+        if let Some(cp) = &mut self.checkpoint {
+            cp.mark_dirty();
+        }
+    }
+
+    /// Whether `read_one` leaves claimable file `id` unread for the next scan's claim pass, after
+    /// a read returned its first `n` bytes: it's `Active`, and its bytes match, or may grow into,
+    /// a candidate in [`Tailer::claim_snapshot`] (`docs/adr/tail-content-identity.md`, decision
+    /// 5). It then seeks back to `0` and is marked `claim_pending`; otherwise it stops being
+    /// claimable and the read goes on, so a rename rotation's new file, which matches nothing, is
+    /// read at once. Decided from the read, so a write landing before it can't slip past.
+    ///
+    /// The snapshot is built here, once per drain, so an empty claimable file costs nothing on a
+    /// wake that finds it still empty. Each pass of `drain` visits claimable files first, so the
+    /// snapshot holds the candidates as they stood when the first pass that reads a claimable
+    /// file's bytes began, whatever order that pass visits the other files in; what a read adds
+    /// after that isn't seen.
+    async fn claim_waits(&mut self, id: FileId, n: usize) -> bool {
+        let Some(tracked) = self.files.get_mut(&id) else { return false };
+        if !tracked.claimable {
+            return false;
+        }
+        tracked.claimable = false;
+        tracked.claim_pending = false;
+        if tracked.state != FileState::Active {
+            // Draining: no scan will offer it a claim, so it's read.
+            return false;
+        }
+        if self.claim_snapshot.is_none() {
+            self.claim_snapshot =
+                Some(self.read_candidates().iter().map(OwnedCandidate::from).collect());
+            #[cfg(test)]
+            {
+                self.snapshot_builds += 1;
+            }
+        }
+        let snapshot = self.claim_snapshot.as_deref().unwrap_or_default();
+        if snapshot.is_empty() {
+            return false;
+        }
+        let Some(tracked) = self.files.get_mut(&id) else { return false };
+        let len = match tracked.file.metadata().await {
+            Ok(meta) => meta.len().max(n as u64),
+            Err(_) => n as u64,
+        };
+        // Probed through the descriptor: the path may name another inode since the last scan.
+        let Ok(file) = tracked.file.try_clone().await else { return false };
+        let file = file.into_std().await;
+        let candidates: Vec<Candidate<'_>> = snapshot.iter().map(OwnedCandidate::borrow).collect();
+        let wait = probe_file(&file, &tracked.path, len, &candidates)
+            .is_ok_and(|verdicts| verdicts.iter().any(|v| *v != Verdict::No));
+        if !wait {
+            return false;
+        }
+        let offset = tracked.offset;
+        if let Err(err) = tracked.file.seek(std::io::SeekFrom::Start(offset)).await {
+            self.diag.warn_throttled("read_error", format!("{}: {err}", tracked.path.display()));
+            return false;
+        }
+        tracked.claimable = true;
+        tracked.claim_pending = true;
+        true
+    }
+
+    /// The truncation check of every `Draining` file, bound to no path, so nothing that walks
+    /// `discovered` looks at it.
+    async fn recheck_draining(&mut self) {
+        let draining: Vec<FileId> = self
+            .files
+            .iter()
+            .filter(|(_, f)| f.state == FileState::Draining)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in draining {
+            self.recheck_length(id).await;
+        }
+    }
+
+    /// Unbinds each discovered path bound to an inode other than the one now there. The old
+    /// inode starts draining unless this listing found it under another name, where
+    /// [`Tailer::reconcile_all`]'s first pass rebinds it. Done before any file is opened, so no
+    /// path's arm in [`Tailer::reconcile_discovered`] depends on the order paths are visited in.
+    fn release_rotated(&mut self, discovered: &[(PathBuf, std::fs::Metadata)]) {
+        let mut found: Option<HashSet<FileId>> = None;
+        for (path, meta) in discovered {
+            let id = FileId::from_metadata(meta);
+            let Some(&old) = self.by_path.get(path) else { continue };
+            if old == id {
+                continue;
+            }
+            self.by_path.remove(path);
+            let found = found.get_or_insert_with(|| {
+                discovered.iter().map(|(_, m)| FileId::from_metadata(m)).collect()
+            });
+            if !found.contains(&old) {
+                if let Some(tracked) = self.files.get_mut(&old) {
+                    tracked.start_draining(self.scan_generation);
+                }
+            }
+        }
+    }
+
+    /// Decides, for each inode in `unmatched` (one no entry, tracked file, or skip names), whether
+    /// it claims a [`Candidate`] by content, waits, or starts where it would have without a claim
+    /// (`docs/adr/tail-content-identity.md`, decision 5). Returns one entry per inode: `None` for
+    /// no claim, or the start and the candidate it claims ([`StartOffset::Defer`] with none).
+    ///
+    /// The candidates are an unspent checkpoint entry whose inode this scan didn't find, an entry
+    /// its own inode rejected in this scan (`Tailer::rejected`), a truncated file's state from
+    /// before the truncation (`Tailer::truncations`), and a tracked file at its line boundary, each
+    /// only with a head of at least [`CLAIM_MIN_HEAD`] bytes. An inode claims a candidate iff its
+    /// head and marker match and it's at least the candidate's [`Candidate::min_len`] long
+    /// ([`probe`]), and no other inode or candidate matches either. Two of either is ambiguous:
+    /// nothing is claimed, diagnosed `claim_ambiguous`, so the inode starts where it would have,
+    /// which favors duplicates over loss.
+    ///
+    /// A scan after the first defers an inode, leaving it unopened, for at most
+    /// [`CLAIM_DEFER_SCANS`] scans in a row, when a claim now could duplicate or a later scan
+    /// could still find one:
+    /// - It matches a tracked file that hasn't been truncated: under `copytruncate`, a copy seen
+    ///   before the truncate. Claimed now, both would read the bytes the original reads before
+    ///   its truncation. Once the truncation is seen, the copy claims the original's state from
+    ///   before it instead. If the original is never truncated (a plain copy), the copy claims it
+    ///   as it is once the deferral runs out.
+    /// - It's shorter than a candidate whose head bytes are in memory, and every byte agrees: a
+    ///   copy still being written. An empty file is never deferred, so a rename rotation's new
+    ///   file isn't delayed. One opened empty stays claimable until its first non-empty read
+    ///   ([`Tailer::claim_waits`]), and `reconcile_all` offers it here again once it holds
+    ///   bytes.
+    ///
+    /// The first scan defers nothing: `read_from` decides only files it opens.
+    ///
+    /// Also returns each `Tailer::rejected` index some inode matched, claimed or not: a file
+    /// that matched one ambiguously starts at `0` under either `read_from`, so it delivers what
+    /// the entry described.
+    fn claim_unmatched(
+        &mut self,
+        unmatched: &[(PathBuf, std::fs::Metadata)],
+        first: bool,
+        listing: &Listing,
+        discovered_ids: &HashSet<FileId>,
+    ) -> (Vec<Claim>, HashSet<usize>) {
+        for t in &mut self.truncations {
+            t.offers += 1;
+            t.pinned = false;
+        }
+        let mut out = vec![None; unmatched.len()];
+        let mut deferred = HashMap::new();
+        // Probed under one borrow of the candidates, whose head bytes borrow the tracked files.
+        let (candidates, verdicts): (Vec<(ClaimFrom, u64, Head, u64)>, Vec<_>) = {
+            let candidates = if unmatched.is_empty() {
+                Vec::new()
+            } else {
+                self.candidates(listing, discovered_ids)
+            };
+            let verdicts = if candidates.is_empty() {
+                Vec::new()
+            } else {
+                unmatched.iter().map(|(path, meta)| probe(path, meta.len(), &candidates)).collect()
+            };
+            (candidates.iter().map(|c| (c.from, c.offset, c.head, c.marker)).collect(), verdicts)
+        };
+        let verdicts: Vec<Vec<Verdict>> = verdicts
+            .into_iter()
+            .enumerate()
+            .map(|(i, probed)| {
+                probed.unwrap_or_else(|err| {
+                    // Says nothing about the content; the next scan probes again.
+                    let path = &unmatched[i].0;
+                    self.diag.warn_throttled("open_error", format!("{}: {err}", path.display()));
+                    out[i] = Some((StartOffset::Defer, None));
+                    vec![Verdict::No; candidates.len()]
+                })
+            })
+            .collect();
+        let mut takers = vec![0usize; candidates.len()];
+        for v in &verdicts {
+            for (c, verdict) in v.iter().enumerate() {
+                takers[c] += usize::from(*verdict == Verdict::Match);
+            }
+        }
+        let matched = candidates
+            .iter()
+            .zip(&takers)
+            .filter_map(|((from, ..), &n)| match from {
+                ClaimFrom::Rejected(ix) if n > 0 => Some(*ix),
+                _ => None,
+            })
+            .collect();
+        for (i, v) in verdicts.iter().enumerate() {
+            if out[i].is_some() {
+                continue;
+            }
+            let (path, meta) = &unmatched[i];
+            let id = FileId::from_metadata(meta);
+            let waited = self.deferred.get(&id).copied().unwrap_or(0);
+            let may_defer = !first && waited < CLAIM_DEFER_SCANS;
+            let matched: Vec<usize> = (0..v.len()).filter(|&c| v[c] == Verdict::Match).collect();
+            let maybe = v.contains(&Verdict::Maybe);
+            let defer = match matched.as_slice() {
+                [c] if takers[*c] == 1 => {
+                    let (from, offset, head, marker) = candidates[*c];
+                    if may_defer && matches!(from, ClaimFrom::Live(_)) {
+                        true
+                    } else {
+                        out[i] = Some((StartOffset::Claim(offset, head, marker), Some(from)));
+                        false
+                    }
+                }
+                [] => maybe && may_defer,
+                _ => {
+                    let files = matched.iter().map(|&c| takers[c]).max().unwrap_or(0);
+                    self.diag.warn_throttled(
+                        "claim_ambiguous",
+                        claim_ambiguous_message(path, matched.len(), files),
+                    );
+                    // A rejected entry it matched isn't counted gone (`settle_claims`), so the
+                    // file delivers that entry's bytes from `0`, whatever `read_from` says.
+                    if matched.iter().any(|&c| matches!(candidates[c].0, ClaimFrom::Rejected(_))) {
+                        out[i] = Some((StartOffset::Beginning, None));
+                    }
+                    false
+                }
+            };
+            if defer {
+                out[i] = Some((StartOffset::Defer, None));
+                deferred.insert(id, waited + 1);
+                for (c, verdict) in v.iter().enumerate() {
+                    if let (ClaimFrom::Truncated(ix), Verdict::Match | Verdict::Maybe) =
+                        (candidates[c].0, verdict)
+                    {
+                        self.truncations[ix].pinned = true;
+                    }
+                }
+            }
+        }
+        self.deferred = deferred;
+        (out, matched)
+    }
+
+    /// Every [`Candidate`] [`Tailer::claim_unmatched`] offers this scan.
+    fn candidates(
+        &self,
+        listing: &Listing,
+        discovered_ids: &HashSet<FileId>,
+    ) -> Vec<Candidate<'_>> {
+        let long_enough = |head: &Head| head.len >= CLAIM_MIN_HEAD;
+        let mut out = Vec::new();
+        for (id, r) in &self.resume {
+            if r.source == Source::Checkpoint
+                && long_enough(&r.head)
+                && listing.listed(&self.patterns, &r.path)
+                && !discovered_ids.contains(id)
+            {
+                out.push(Candidate {
+                    from: ClaimFrom::Orphan(*id),
+                    offset: r.offset,
+                    head: r.head,
+                    head_bytes: None,
+                    marker: r.marker,
+                    min_len: r.offset,
+                });
+            }
+        }
+        for (ix, (_, r)) in self.rejected.iter().enumerate() {
+            if long_enough(&r.head) {
+                out.push(Candidate {
+                    from: ClaimFrom::Rejected(ix),
+                    offset: r.offset,
+                    head: r.head,
+                    head_bytes: None,
+                    marker: r.marker,
+                    min_len: r.offset,
+                });
+            }
+        }
+        out.extend(self.read_candidates());
+        out
+    }
+
+    /// The candidates that live outside a scan: each held truncation's state and each tracked
+    /// file at its line boundary. [`Tailer::claim_waits`] probes against these alone.
+    fn read_candidates(&self) -> Vec<Candidate<'_>> {
+        let mut out = Vec::new();
+        for (ix, t) in self.truncations.iter().enumerate() {
+            if let Some((offset, head, bytes, marker)) = &t.candidate {
+                out.push(Candidate {
+                    from: ClaimFrom::Truncated(ix),
+                    offset: *offset,
+                    head: *head,
+                    head_bytes: Some(bytes),
+                    marker: *marker,
+                    min_len: t.read_offset,
+                });
+            }
+        }
+        for (id, f) in &self.files {
+            if f.state == FileState::Deselected || f.head.len() < CLAIM_MIN_HEAD as usize {
+                continue;
+            }
+            if let Some(marker) = f.boundary_marker() {
+                out.push(Candidate {
+                    from: ClaimFrom::Live(*id),
+                    offset: f.boundary_at,
+                    head: Head::of(&f.head),
+                    head_bytes: Some(&f.head),
+                    marker,
+                    min_len: f.boundary_at,
+                });
+            }
+        }
+        out
+    }
+
+    /// Spends each candidate a new inode claimed in this scan, given with the claimant's length,
+    /// then counts each rejected entry no inode matched as gone
+    /// (`docs/adr/tail-content-identity.md`, decision 6): one in `matched` that nothing claimed was
+    /// matched ambiguously, and the file that matched it starts at `0` and delivers it. A claimed
+    /// checkpoint entry, rejected or not, leaves the checkpoint. A claimed truncation's discarded
+    /// line isn't counted, since the copy resumes at its start, but the bytes the original was last
+    /// seen to hold past the copy's end are: they're in neither file.
+    fn settle_claims(&mut self, taken: &[(ClaimFrom, u64)], matched: &HashSet<usize>) {
+        if !taken.is_empty() {
+            self.telemetry.count("logit.input.files.claimed", taken.len() as f64, &[]);
+        }
+        let mut truncated = Vec::new();
+        let mut rejected_taken = HashSet::new();
+        for &(from, len) in taken {
+            match from {
+                ClaimFrom::Orphan(id) => {
+                    self.resume.remove(&id);
+                }
+                ClaimFrom::Rejected(ix) => {
+                    rejected_taken.insert(ix);
+                }
+                ClaimFrom::Truncated(ix) => {
+                    let t = &self.truncations[ix];
+                    // A claim needs `len >= read_offset`, so this is what the copy lacks.
+                    let lost = (t.read_offset + t.unread).saturating_sub(len.max(t.read_offset));
+                    if lost > 0 {
+                        self.telemetry.count(
+                            "logit.input.bytes.dropped",
+                            lost as f64,
+                            &[("reason", "truncated")],
+                        );
+                    }
+                    truncated.push(ix);
+                }
+                ClaimFrom::Live(_) => {}
+            }
+        }
+        truncated.sort_unstable();
+        for ix in truncated.into_iter().rev() {
+            self.truncations.remove(ix);
+        }
+        for (ix, (id, r)) in std::mem::take(&mut self.rejected).into_iter().enumerate() {
+            let unread = r.len.saturating_sub(r.offset);
+            if !rejected_taken.contains(&ix)
+                && !matched.contains(&ix)
+                && unread > 0
+                && self.patterns.iter().any(|p| p.covers(&r.path))
+            {
+                self.gone.push(Gone { id, path: r.path, offset: r.offset, unread });
+            }
+        }
+        if !taken.is_empty() {
+            if let Some(cp) = &mut self.checkpoint {
+                cp.mark_dirty();
+            }
+        }
+    }
+
+    /// Counts each held truncation's unread bytes and discarded line once [`TRUNCATION_OFFERS`]
+    /// claim passes have offered it and no deferred inode may still claim it, or once
+    /// [`CLAIM_DEFER_SCANS`] more have, or every one when `all` (at shutdown, when no later scan
+    /// can).
+    fn count_truncations(&mut self, all: bool) {
+        let mut kept = Vec::new();
+        for t in std::mem::take(&mut self.truncations) {
+            let due = t.offers >= TRUNCATION_OFFERS
+                && (!t.pinned || t.offers >= TRUNCATION_OFFERS + CLAIM_DEFER_SCANS);
+            if !all && !due {
+                kept.push(t);
+                continue;
+            }
+            self.count_truncation(&t);
+        }
+        self.truncations = kept;
+    }
+
+    /// Counts one truncation's discarded line and unread bytes.
+    fn count_truncation(&mut self, t: &Truncation) {
+        if t.partial {
+            self.telemetry.count("logit.input.frames.dropped", 1.0, &[("reason", "truncated")]);
+        }
+        if t.unread > 0 {
+            self.telemetry.count(
+                "logit.input.bytes.dropped",
+                t.unread as f64,
+                &[("reason", "truncated")],
+            );
+        }
+    }
+
     /// Reconciles one discovered `path` against what's tracked under it: the same inode is
     /// checked for truncation and identity, another inode is a rotation, and an untracked path is
-    /// opened (or rebound, by `open_tracked`).
+    /// opened (or rebound, by `open_tracked`) at `claim`, if given, else at its retained entry or
+    /// where `first` puts it.
     async fn reconcile_discovered(
         &mut self,
         path: PathBuf,
         meta: &std::fs::Metadata,
         first: bool,
+        claim: Option<StartOffset>,
         watcher: &mut super::watch::Watcher,
     ) {
         let id = FileId::from_metadata(meta);
@@ -698,10 +1524,11 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         // it: whether a rotated path is still bound when it's reached depends on `discovered`'s
         // order (a rebind of its old inode elsewhere may have released it first), and the start
         // must not.
-        let start = match self.resume.get(&id) {
-            Some(retained) => StartOffset::Resume(retained.offset, retained.head),
-            None if first => self.first_scan_start,
-            None => StartOffset::Beginning,
+        let start = match (claim, self.resume.get(&id)) {
+            (Some(start), _) => start,
+            (None, Some(r)) => StartOffset::Resume(r.offset, r.head, r.marker),
+            (None, None) if first => self.first_scan_start,
+            (None, None) => StartOffset::Beginning,
         };
         match self.by_path.get(&path).copied() {
             Some(existing_id) if existing_id == id => {
@@ -723,7 +1550,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     /// same-path arm runs. A rebound inode may have been truncated in place while it was unbound
     /// (retired by a `stat` that raced a rename, then copytruncated); left unchecked, a refill past
     /// its offset before the next scan would be read from mid-line. `len` is the scan's `stat` of
-    /// `path`, which names `id`.
+    /// `path`, which names `id`. A compressed file already skipped stays closed.
     async fn open_or_rebind(
         &mut self,
         path: PathBuf,
@@ -732,6 +1559,14 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         start: StartOffset,
         watcher: &mut super::watch::Watcher,
     ) {
+        if start == StartOffset::Defer {
+            return;
+        }
+        if !self.files.contains_key(&id) && self.still_skipped(&path, id, len) {
+            // Neither `accept` nor `refresh` runs for it, as for a rebind.
+            self.factory.retain(&path);
+            return;
+        }
         let rebind = self.files.get(&id).is_some_and(|f| f.state != FileState::Deselected);
         self.open_tracked(path, id, start, watcher).await;
         if rebind {
@@ -798,6 +1633,76 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             }
         }
         dropped
+    }
+
+    /// Forgets each compressed inode this scan found under no path, once a listing could have
+    /// named its recorded path: removed, or its path now names another inode. A rename keeps it,
+    /// since the inode is found under its new name.
+    fn prune_skipped(&mut self, listing: &Listing, discovered_ids: &HashSet<FileId>) {
+        let (patterns, generation) = (&self.patterns, self.scan_generation);
+        self.skipped.retain(|id, s| {
+            s.scan == Some(generation)
+                || discovered_ids.contains(id)
+                || !listing.listed(patterns, &s.path)
+        });
+    }
+
+    /// Whether `id`, found at `path` with size `len`, is a compressed file already skipped, so
+    /// `scan` leaves it closed. Another name, or another size, is sniffed again: a rename keeps
+    /// the inode, but a size change at the same path can be a recycled inode now holding a text
+    /// file, which `FileId` alone can't tell apart. A compressor still writing its output is
+    /// reopened at each scan that sees it grow.
+    fn still_skipped(&mut self, path: &Path, id: FileId, len: u64) -> bool {
+        let Some(skipped) = self.skipped.get_mut(&id) else { return false };
+        if skipped.path != path {
+            return false;
+        }
+        *skipped.len.get_or_insert(len) == len
+    }
+
+    /// Removes the file watches `read_one` released with a compressed file.
+    fn release_watches(&mut self, watcher: &mut super::watch::Watcher) {
+        for id in self.unwatch.drain(..) {
+            watcher.unwatch(id);
+        }
+    }
+
+    /// Records `id`, found at `path` with size `len`, as compressed. Counted and diagnosed only
+    /// the first time this process skips the inode, so sniffing it again after a rename isn't
+    /// counted again. Its resume entry is spent, and the checkpoint drops it at the next write.
+    fn skip_compressed(&mut self, id: FileId, path: PathBuf, len: Option<u64>, format: &str) {
+        // Only an open, inside a scan, knows the size.
+        let scan = len.map(|_| self.scan_generation);
+        let skipped = Skipped { path: path.clone(), len, scan };
+        if self.skipped.insert(id, skipped).is_none() {
+            self.telemetry.count("logit.input.files.skipped", 1.0, &[("reason", "compressed")]);
+            self.diag.warn_throttled("compressed", compressed_message(&path, format));
+        }
+        self.resume.remove(&id);
+        if let Some(cp) = &mut self.checkpoint {
+            cp.mark_dirty();
+        }
+    }
+
+    /// Stops tracking a file `read_one` found compressed, closing its descriptor. Nothing of the
+    /// compressed content was read, but a file rewritten in place after a truncation can still
+    /// hold the old content's lines in its accumulator: they're emitted first
+    /// (`FlushReason::Closed`), as `Tailer::reap_drained` does. A refused emit sets
+    /// [`Tailer::untaken`].
+    async fn untrack_compressed(&mut self, id: FileId, format: &str, sink: &Fanout) {
+        let Some(mut tracked) = self.files.remove(&id) else { return };
+        if let Some(batch) = tracked.accumulator.take() {
+            if !emit(sink, &self.telemetry, batch, FlushReason::Closed).await {
+                self.untaken = true;
+            }
+        }
+        if self.by_path.get(&tracked.path) == Some(&id) {
+            self.by_path.remove(&tracked.path);
+        }
+        if let Some(watch) = tracked.watch {
+            self.unwatch.push(watch);
+        }
+        self.skip_compressed(id, tracked.path, None, format);
     }
 
     /// `scan`'s listing step: every pattern's [`PathPattern::scan`], then one `stat` per distinct
@@ -898,10 +1803,12 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     }
 
     /// The truncation check for a file no path is bound to: an `fstat` of its handle against its
-    /// offset. `scan` runs it for every `Draining` file, and `drain` before each read of one, since
+    /// offset. `read_one` also runs it on a zero read that contradicts the last size seen. `scan`
+    /// runs it for every `Draining` file, and `drain` before each read of one, since
     /// the drain loop runs far more often than `scan` and a refill past the offset before the
     /// first check is the one truncation size-based detection can't see
-    /// (`docs/known-gaps/tailing.md`). An `fstat` error says nothing; a later check decides.
+    /// (`docs/adr/tail-content-identity.md`, decision 8). An `fstat` error says nothing; a later
+    /// check decides.
     async fn recheck_length(&mut self, id: FileId) {
         let Some(tracked) = self.files.get(&id) else { return };
         let Ok(meta) = tracked.file.metadata().await else { return };
@@ -932,23 +1839,59 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     /// truncated in place: seek to `0` and reset the splitter and decoder. `len` must come from
     /// the same inode as `id`. Called by `scan`, [`Tailer::on_data_wake`], and `drain` (through
     /// [`Tailer::recheck_length`]).
+    ///
+    /// A truncation counts `logit.input.bytes.dropped{reason="truncated"}`: the bytes the last
+    /// size observation (`TrackedFile::last_len`) saw past the read offset, which no read reached.
+    /// It's usually `0`, since what a `copytruncate` loses is mostly written after the last
+    /// observation, and those writes survive only in the copy, read only if a pattern matches it.
+    /// The held partial line is below the offset and counted in `frames.dropped`, so it's not in
+    /// this count.
+    ///
+    /// When a copy could claim it, neither count is emitted here. The file's state from before the
+    /// truncation (its head, its line boundary, and the marker there) waits in
+    /// `Tailer::truncations` for a copy to claim ([`Tailer::claim_unmatched`]). A claim resumes the
+    /// copy at that boundary, so the copy delivers the unterminated line whole and whatever the
+    /// copy holds of what the original never read, and only the bytes past the copy's end are
+    /// counted ([`Tailer::settle_claims`]). A scan that finds no claimant counts both
+    /// ([`Tailer::count_truncations`]): a copy made before the truncate is listable by any scan
+    /// after the truncation is seen, and a second scan covers one whose listing failed. A state no
+    /// copy can claim (a head under [`CLAIM_MIN_HEAD`], or no known marker at the boundary) is
+    /// counted at once.
     async fn reconcile_truncation(&mut self, id: FileId, len: u64) {
         let max_line_bytes = self.config.max_line_bytes;
         let Some(tracked) = self.files.get_mut(&id) else { return };
-        tracked.last_len = len;
         if len >= tracked.offset {
+            tracked.last_len = len;
             return;
         }
+        // `last_len` is left as it was on a failed seek, so the retry still counts what it saw.
         if let Err(err) = tracked.file.seek(std::io::SeekFrom::Start(0)).await {
             self.diag.warn_throttled("read_error", err);
             return;
         }
         let prev_offset = tracked.offset;
+        let unread = tracked.last_len.saturating_sub(prev_offset);
+        tracked.last_len = len;
         // A decoder holding an entry (`docker_in`'s reassembly, or a drop in progress) has
         // counted its loss, in `reset` or when its drop began, and the unterminated line most
         // often continues that entry, so it isn't counted a second time here.
         let discarded_partial = tracked.splitter.holds_partial() && !tracked.decoder.holds_entry();
+        // Taken before the reset below. A boundary inside a line being dropped for
+        // `max_line_bytes` is that line's start, so a copy claiming it drops the line again,
+        // counted `oversize` a second time.
+        let candidate = match tracked.boundary_marker() {
+            Some(marker) if tracked.head.len() >= CLAIM_MIN_HEAD as usize => {
+                let head = std::mem::take(&mut tracked.head);
+                Some((tracked.boundary_at, Head::of(&head), head, marker))
+            }
+            _ => None,
+        };
         tracked.offset = 0;
+        tracked.window.clear();
+        tracked.boundary_at = 0;
+        tracked.boundary_tail.clear();
+        tracked.read_marker = None;
+        tracked.last_good = None;
         // Discard, not emit, the held partial (or a stale `dropping`): it belongs to content
         // that's gone, and would otherwise be spliced onto, or swallow, the new first line. The
         // decoder gets the same reset for its own cross-line state (`docker_in`'s partial-entry
@@ -957,11 +1900,30 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         tracked.decoder.reset();
         tracked.held_from = None;
         tracked.head.clear();
+        tracked.sniffed = false;
         let path = tracked.path.clone();
-        self.diag.warn_throttled("truncated", truncated_message(&path, prev_offset, len));
+        self.diag.warn_throttled("truncated", truncated_message(&path, prev_offset, len, unread));
         self.telemetry.count("logit.input.files.truncated", 1.0, &[]);
-        if discarded_partial {
-            self.telemetry.count("logit.input.frames.dropped", 1.0, &[("reason", "truncated")]);
+        let truncation = Truncation {
+            candidate,
+            id,
+            read_offset: prev_offset,
+            unread,
+            partial: discarded_partial,
+            offers: 0,
+            pinned: false,
+        };
+        // Its content is gone again, so a copy of it can no longer be told from this one's.
+        // Not during a claim pass: no tracked file is truncated between `claim_unmatched` and
+        // `settle_claims`, so no `ClaimFrom::Truncated` index shifts.
+        if let Some(ix) = self.truncations.iter().position(|t| t.id == id) {
+            let earlier = self.truncations.remove(ix);
+            self.count_truncation(&earlier);
+        }
+        if truncation.candidate.is_some() {
+            self.truncations.push(truncation);
+        } else {
+            self.count_truncation(&truncation);
         }
         // The persisted offset is now past the file's end. A write before the next read must
         // replace it with `0`: the head fingerprint would reject it at a restart, but only as a
@@ -1035,7 +1997,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             );
             return;
         }
-        if !self.factory.accept(&path) {
+        if !self.accepted.remove(&id) && !self.factory.accept(&path) {
             return;
         }
         let opened = match fault::check(super::pattern::OPEN, &path, 0) {
@@ -1063,13 +2025,21 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         }
         let len = meta.len();
         let mut head = Vec::with_capacity(HEAD_BYTES);
+        // The bytes ending at the start offset, for the marker a checkpoint writes beside it.
+        let mut window = Vec::new();
         let mut rejected = None;
         let offset = match start {
-            StartOffset::Beginning => 0,
+            StartOffset::Beginning | StartOffset::Defer => 0,
             StartOffset::End => {
-                // `read_one` never sees the bytes skipped here, so the head is read once, now.
-                match read_head(&mut file, len.min(HEAD_BYTES as u64) as usize).await {
-                    Ok(bytes) => head = bytes,
+                // `read_one` never sees the bytes skipped here, so the head and the bytes before
+                // the end are read once, now.
+                let n = len.min(HEAD_BYTES as u64) as usize;
+                let read = match read_head(&mut file, n).await {
+                    Ok(bytes) => read_tail(&mut file, len, &bytes).await.map(|tail| (bytes, tail)),
+                    Err(err) => Err(err),
+                };
+                match read {
+                    Ok((bytes, tail)) => (head, window) = (bytes, tail),
                     Err(err) => {
                         self.diag
                             .warn_throttled("open_error", format!("{}: {err}", path.display()));
@@ -1078,17 +2048,22 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 }
                 len
             }
-            StartOffset::Resume(off, retained) => {
+            StartOffset::Resume(off, retained, want) | StartOffset::Claim(off, retained, want) => {
                 // Read at least `min(HEAD_BYTES, off)` bytes, so the invariant on
                 // `TrackedFile::head` holds from here without re-reading.
                 let n = off.max(u64::from(retained.len)).min(HEAD_BYTES as u64);
                 let current = if off <= len && u64::from(retained.len) <= len {
                     let read = match fault::check(super::pattern::HEAD_READ, &path, 0) {
-                        Ok(()) => read_head(&mut file, n as usize).await,
+                        Ok(()) => match read_head(&mut file, n as usize).await {
+                            Ok(bytes) => {
+                                read_tail(&mut file, off, &bytes).await.map(|tail| (bytes, tail))
+                            }
+                            Err(err) => Err(err),
+                        },
                         Err(err) => Err(err),
                     };
                     match read {
-                        Ok(bytes) => Some(bytes),
+                        Ok(pair) => Some(pair),
                         // Shrank since the `metadata` above: the head can't match.
                         Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => None,
                         // Says nothing about the file's identity, so keep the entry for the next
@@ -1103,16 +2078,33 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                     None
                 };
                 match current {
-                    Some(mut bytes) if retained.matches(&bytes) => {
+                    Some((mut bytes, tail))
+                        if retained.matches(&bytes) && marker(&tail) == want =>
+                    {
                         bytes.truncate(off.min(HEAD_BYTES as u64) as usize);
                         head = bytes;
+                        window = tail;
                         off
                     }
                     _ => {
-                        rejected = Some(off);
+                        if matches!(start, StartOffset::Resume(..)) {
+                            rejected = Some(off);
+                        }
                         0
                     }
                 }
+            }
+        };
+        // `head` is empty for a `Beginning` start, so its first read decides there.
+        let sniffed = match sniff(&head) {
+            Sniff::Text => {
+                self.skipped.remove(&id);
+                true
+            }
+            Sniff::Undecided => false,
+            Sniff::Compressed(format) => {
+                self.skip_compressed(id, path, Some(len), format);
+                return;
             }
         };
         // After any head read, even to `0`: the read moved the cursor.
@@ -1154,6 +2146,16 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             held_from: None,
             watch,
             head,
+            boundary_tail: window.clone(),
+            window,
+            boundary_at: offset,
+            read_marker: None,
+            last_good: None,
+            sniffed,
+            claimable: offset == 0
+                && len == 0
+                && !matches!(start, StartOffset::Resume(..) | StartOffset::Claim(..)),
+            claim_pending: false,
             draining_since: None,
             draining_scan: 0,
             rescanned: false,
@@ -1161,6 +2163,11 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         if let Some(off) = rejected {
             self.telemetry.count("logit.input.files.resume_rejected", 1.0, &[]);
             self.diag.warn_throttled("resume_rejected", resume_rejected_message(&path, off));
+            // Still a candidate for a new inode's claim in this scan: under `copytruncate` while
+            // `logit` was down, the copy holds what this entry describes.
+            if let Some(r) = self.resume.get(&id).filter(|r| r.source == Source::Checkpoint) {
+                self.rejected.push((id, r.clone()));
+            }
         }
         self.by_path.insert(path, id);
         self.files.insert(id, tracked);
@@ -1191,6 +2198,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         watcher: &mut super::watch::Watcher,
         due: tokio::time::Instant,
     ) -> DrainEnd {
+        self.claim_snapshot = None;
         loop {
             if self.untaken {
                 return DrainEnd::Untaken;
@@ -1201,9 +2209,12 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             let mut ids = std::mem::take(&mut self.pass_ids);
             let mut at_eof = std::mem::take(&mut self.pass_at_eof);
             ids.clear();
-            ids.extend(self.files.keys().copied());
+            // Claimable files first: see `claim_waits`.
+            ids.extend(self.files.iter().filter(|(_, f)| f.claimable).map(|(id, _)| *id));
+            ids.extend(self.files.iter().filter(|(_, f)| !f.claimable).map(|(id, _)| *id));
             at_eof.clear();
             let (any_progress, stopped) = self.read_pass(&ids, &mut at_eof, sink, shutdown).await;
+            self.release_watches(watcher);
             if stopped.is_none() {
                 self.reap_drained(&at_eof, pass_start, sink, watcher).await;
             }
@@ -1257,16 +2268,21 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
 
     /// Reads one chunk from `id`, decodes its complete lines, and emits any batch that reaches a
     /// bound. Returns `false` (eligible for [`Tailer::reap_drained`]) at EOF, on a read error,
-    /// or for a [`FileState::Deselected`] file. A refused emit sets [`Tailer::untaken`] and
+    /// or for a [`FileState::Deselected`] file, and `true` for a zero read that found the file
+    /// truncated, since the rewound file has more to read. A refused emit sets [`Tailer::untaken`] and
     /// leaves the chunk's remaining lines undecoded.
     async fn read_one(&mut self, id: FileId, sink: &Fanout) -> bool {
         if self.files.get(&id).is_some_and(|t| t.state == FileState::Deselected) {
+            return false;
+        }
+        if self.files.get(&id).is_some_and(|t| t.claim_pending && t.state == FileState::Active) {
             return false;
         }
         if self.read_buf.capacity() < READ_REFILL_BYTES {
             self.read_buf.reserve(READ_CHUNK_BYTES);
         }
         debug_assert!(self.read_buf.is_empty(), "every read is split off whole");
+        let mut shrank = false;
         let n = match self.files.get_mut(&id) {
             Some(tracked) => match logit_pipeline::fault_io!(
                 READ,
@@ -1275,7 +2291,11 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 tracked.file.read_buf(&mut (&mut self.read_buf).limit(READ_CHUNK_BYTES)).await
             ) {
                 Ok(0) => {
-                    tracked.last_len = tracked.offset;
+                    if tracked.last_len > tracked.offset {
+                        shrank = true;
+                    } else {
+                        tracked.last_len = tracked.offset;
+                    }
                     0
                 }
                 Ok(n) => n,
@@ -1288,10 +2308,47 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             None => return false,
         };
         if n == 0 {
+            if !shrank {
+                return false;
+            }
+            let before = self.files.get(&id).map_or(0, |t| t.offset);
+            self.recheck_length(id).await;
+            return self.files.get(&id).is_some_and(|t| t.offset < before);
+        }
+        if self.claim_waits(id, n).await {
+            self.read_buf.clear();
             return false;
         }
         let read_at = now_nanos();
         let bytes = self.read_buf.split().freeze();
+
+        let Some(tracked) = self.files.get_mut(&id) else { return false };
+        capture_head(&mut tracked.head, tracked.offset, &bytes);
+        // Before any line is split, so nothing of a compressed file is emitted.
+        if !tracked.sniffed {
+            match sniff(&tracked.head) {
+                Sniff::Text => {
+                    tracked.sniffed = true;
+                    self.skipped.remove(&id);
+                }
+                Sniff::Undecided => {
+                    // Unconsumed: the next read starts at the same offset, and `capture_head`
+                    // keeps what the head already holds.
+                    let offset = tracked.offset;
+                    if let Err(err) = tracked.file.seek(std::io::SeekFrom::Start(offset)).await {
+                        self.diag.warn_throttled(
+                            "read_error",
+                            format!("{}: {err}", tracked.path.display()),
+                        );
+                    }
+                    return false;
+                }
+                Sniff::Compressed(format) => {
+                    self.untrack_compressed(id, format, sink).await;
+                    return false;
+                }
+            }
+        }
 
         // Each line with the file offset it starts at, for `TrackedFile::held_from`.
         let mut lines = std::mem::take(&mut self.lines);
@@ -1301,13 +2358,36 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 None => return false,
             };
             let chunk_start = tracked.offset;
-            capture_head(&mut tracked.head, chunk_start, &bytes);
             let partial_start = chunk_start - tracked.splitter.pending_bytes();
-            let stats = tracked.splitter.push(bytes, |line, start| {
+            let stats = tracked.splitter.push(bytes.clone(), |line, start| {
                 let start = start.map_or(partial_start, |i| chunk_start + i as u64);
                 lines.push((line, start));
             });
             tracked.offset += n as u64;
+            // The marker bytes. A boundary moves only to the byte after a newline in this chunk, so
+            // the bytes before it are the window as it stood before the chunk, then the chunk
+            // up to it.
+            let boundary = tracked.offset - tracked.splitter.pending_bytes();
+            let in_chunk = boundary != tracked.boundary_at && boundary != tracked.offset;
+            if in_chunk {
+                if boundary >= chunk_start
+                    && tracked.window.len() == chunk_start.min(HEAD_BYTES as u64) as usize
+                {
+                    tracked.boundary_tail.clone_from(&tracked.window);
+                    push_tail(
+                        &mut tracked.boundary_tail,
+                        &bytes[..(boundary - chunk_start) as usize],
+                    );
+                    tracked.boundary_at = boundary;
+                } else {
+                    tracked.boundary_at = u64::MAX;
+                }
+            }
+            push_tail(&mut tracked.window, &bytes);
+            if boundary == tracked.offset && boundary != tracked.boundary_at {
+                tracked.boundary_tail.clone_from(&tracked.window);
+                tracked.boundary_at = boundary;
+            }
             stats.dropped_lines
         };
         if dropped > 0 {
@@ -1468,13 +2548,19 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 // leaves is a line still being dropped: by the splitter (`pending_bytes`, so the
                 // boundary is that line's start) or by the decoder (`held_from`). Resume at the
                 // earlier of the two, so a rename back drops that line whole again. The head is
-                // checked again on re-selection, since the file may be rewritten meanwhile.
-                let boundary = tracked.offset - tracked.splitter.pending_bytes();
+                // checked again on re-selection, with the marker, since the file may be
+                // rewritten meanwhile.
+                let at = tracked.persisted_offset();
+                if tracked.known_marker(at).is_none() {
+                    read_marker(&mut tracked, at, &mut self.diag).await;
+                }
+                let (offset, marker) = tracked.checkpoint_position();
                 let retained = Retained {
                     path: tracked.path.clone(),
-                    offset: tracked.held_from.map_or(boundary, |h| h.min(boundary)),
+                    offset,
                     len: tracked.last_len.max(tracked.offset),
                     head: Head::of(&tracked.head),
+                    marker,
                     source: Source::Deselected,
                 };
                 self.resume.insert(id, retained);
@@ -1493,6 +2579,9 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     /// [`Tailer::reap_drained`], files stay tracked: `write_checkpoint` runs next and needs their
     /// offsets.
     async fn close_all_for_shutdown(&mut self, sink: &Fanout) {
+        // No later scan can offer a held truncation to a copy, and a restart can't claim the
+        // state from before it, so each is counted now.
+        self.count_truncations(true);
         let ids: Vec<FileId> = self.files.keys().copied().collect();
         let replayed = self.checkpoint.is_some();
         for id in ids {
@@ -1554,13 +2643,35 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         if self.untaken {
             return;
         }
+        let Some(checkpoint) = &self.checkpoint else { return };
+        if checkpoint.is_dirty() || force {
+            // A marker memory doesn't hold is read back first, into `TrackedFile::read_marker`.
+            for f in self.files.values_mut() {
+                let offset = f.persisted_offset();
+                if f.known_marker(offset).is_none() {
+                    read_marker(f, offset, &mut self.diag).await;
+                }
+            }
+        }
+        for f in self.files.values_mut() {
+            let offset = f.persisted_offset();
+            if let Some(marker) = f.known_marker(offset) {
+                f.last_good = Some((offset, marker));
+            }
+        }
         let Some(checkpoint) = &mut self.checkpoint else { return };
         let tracked = self.files.values().map(|f| {
-            let boundary = f.offset.saturating_sub(f.splitter.pending_bytes());
-            let offset = boundary.min(f.held_from.unwrap_or(u64::MAX));
+            let (offset, marker) = f.checkpoint_position();
             // `offset` is a size observation too: the file held every byte read.
             let len = f.last_len.max(f.offset);
-            Persisted { id: f.id, path: f.path.as_path(), offset, len, head: Head::of(&f.head) }
+            Persisted {
+                id: f.id,
+                path: f.path.as_path(),
+                offset,
+                len,
+                head: Head::of(&f.head),
+                marker,
+            }
         });
         // An entry not yet spent persists until `scan` prunes it: dropping it here would lose
         // the position of a file whose listing failed, and a restart under `read_from: end`
@@ -1573,6 +2684,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                     offset: r.offset,
                     len: r.len,
                     head: r.head,
+                    marker: r.marker,
                 }
             });
         let landed =
@@ -1678,6 +2790,154 @@ async fn read_head(file: &mut tokio::fs::File, n: usize) -> std::io::Result<Vec<
     Ok(buf)
 }
 
+/// Reads the `min(HEAD_BYTES, at)` bytes that end at `at`, from `head`, a newly opened file's
+/// first bytes, when it covers them, else from the file. A short file is an error
+/// (`UnexpectedEof`). Moves the cursor: the caller seeks to its start offset after.
+async fn read_tail(file: &mut tokio::fs::File, at: u64, head: &[u8]) -> std::io::Result<Vec<u8>> {
+    let n = at.min(HEAD_BYTES as u64);
+    if at <= head.len() as u64 {
+        return Ok(head[(at - n) as usize..at as usize].to_vec());
+    }
+    file.seek(std::io::SeekFrom::Start(at - n)).await?;
+    let mut buf = vec![0u8; n as usize];
+    file.read_exact(&mut buf).await?;
+    Ok(buf)
+}
+
+/// Keeps `tail` the last [`HEAD_BYTES`] of `tail` followed by `bytes`.
+fn push_tail(tail: &mut Vec<u8>, bytes: &[u8]) {
+    if bytes.len() >= HEAD_BYTES {
+        tail.clear();
+        tail.extend_from_slice(&bytes[bytes.len() - HEAD_BYTES..]);
+        return;
+    }
+    let excess = (tail.len() + bytes.len()).saturating_sub(HEAD_BYTES);
+    tail.drain(..excess);
+    tail.extend_from_slice(bytes);
+}
+
+/// Compares the file at `path`, `len` bytes long, with each candidate for a content claim
+/// (`Tailer::claim_unmatched`), which it matches only once it's [`Candidate::min_len`] long: at
+/// most two reads of up to [`HEAD_BYTES`] each, the head and the
+/// bytes ending at a candidate's offset, plus one per further distinct offset whose head matches.
+/// Blocking, like `Tailer::list`.
+fn probe(path: &Path, len: u64, candidates: &[Candidate<'_>]) -> std::io::Result<Vec<Verdict>> {
+    if len == 0 {
+        // Never deferred: a rename rotation's new file is empty, and must not wait. A file
+        // opened empty may still claim before its first read (`Tailer::claim_waits`).
+        return Ok(vec![Verdict::No; candidates.len()]);
+    }
+    fault::check(super::pattern::OPEN, path, 0)?;
+    let file = std::fs::File::open(path)?;
+    probe_file(&file, path, len, candidates)
+}
+
+/// [`probe`] over an open `file`, which `path` names for the fault seam and nothing else.
+fn probe_file(
+    file: &std::fs::File,
+    path: &Path,
+    len: u64,
+    candidates: &[Candidate<'_>],
+) -> std::io::Result<Vec<Verdict>> {
+    use std::os::unix::fs::FileExt;
+    let read_at = |buf: &mut [u8], at: u64| -> std::io::Result<usize> {
+        fault::check(super::pattern::HEAD_READ, path, 0)?;
+        let mut filled = 0;
+        while filled < buf.len() {
+            match file.read_at(&mut buf[filled..], at + filled as u64)? {
+                0 => break,
+                n => filled += n,
+            }
+        }
+        Ok(filled)
+    };
+    let mut head = vec![0u8; len.min(HEAD_BYTES as u64) as usize];
+    let got = read_at(&mut head, 0)?;
+    head.truncate(got);
+    // Shorter than the scan's `stat` said: it was truncated since, so what's there decides.
+    let len = if got < len.min(HEAD_BYTES as u64) as usize { got as u64 } else { len };
+    let mut markers: HashMap<u64, Option<u64>> = HashMap::new();
+    // One hash per distinct candidate head length, however many candidates share it.
+    let mut heads: HashMap<u32, Head> = HashMap::new();
+    let mut verdicts = Vec::with_capacity(candidates.len());
+    for c in candidates {
+        let head_len = c.head.len as usize;
+        let verdict = if head.len() < head_len {
+            match c.head_bytes {
+                Some(bytes) if bytes.starts_with(&head) => Verdict::Maybe,
+                _ => Verdict::No,
+            }
+        } else if *heads.entry(c.head.len).or_insert_with(|| Head::of(&head[..head_len])) != c.head
+        {
+            Verdict::No
+        } else if len < c.min_len {
+            if c.head_bytes.is_some() {
+                Verdict::Maybe
+            } else {
+                Verdict::No
+            }
+        } else {
+            let at = c.offset;
+            let found = match markers.get(&at) {
+                Some(found) => *found,
+                None => {
+                    let n = at.min(HEAD_BYTES as u64) as usize;
+                    let found = if at <= head.len() as u64 {
+                        Some(marker(&head[at as usize - n..at as usize]))
+                    } else {
+                        let mut buf = vec![0u8; n];
+                        (read_at(&mut buf, at - n as u64)? == n).then(|| marker(&buf))
+                    };
+                    markers.insert(at, found);
+                    found
+                }
+            };
+            if found == Some(c.marker) {
+                Verdict::Match
+            } else {
+                Verdict::No
+            }
+        };
+        verdicts.push(verdict);
+    }
+    Ok(verdicts)
+}
+
+/// Reads back the marker at `at` from `tracked`'s descriptor, for an offset
+/// [`TrackedFile::known_marker`] doesn't cover: the start of a line a `docker_in` decoder holds.
+/// Cached in `TrackedFile::read_marker`, so a file whose persisted offset stays put is read
+/// once. An error is diagnosed `read_error` and caches nothing, so
+/// [`TrackedFile::checkpoint_position`] falls back to a position whose marker it has.
+async fn read_marker<D>(tracked: &mut TrackedFile<D>, at: u64, diag: &mut Diagnostics) {
+    let n = at.min(HEAD_BYTES as u64);
+    let mut buf = vec![0u8; n as usize];
+    let path = tracked.path.clone();
+    let file = &mut tracked.file;
+    let read = async {
+        file.seek(std::io::SeekFrom::Start(at - n)).await?;
+        logit_pipeline::fault_io!(READ, &path, 0, file.read_exact(&mut buf).await)
+    }
+    .await;
+    // `read_one` reads from the cursor, so it goes back to the read offset whatever happened.
+    let back = file.seek(std::io::SeekFrom::Start(tracked.offset)).await;
+    match read.and(back.map(|_| ())) {
+        Ok(()) => tracked.read_marker = Some((at, marker(&buf))),
+        Err(err) => {
+            diag.warn_throttled("read_error", format!("{}: {err}", tracked.path.display()));
+        }
+    }
+}
+
+/// The `claim_ambiguous` diagnostic's text.
+fn claim_ambiguous_message(path: &Path, candidates: usize, files: usize) -> String {
+    format!(
+        "{} matches {candidates} earlier file position(s) by content, and {files} new file(s) \
+         match one of them -- claiming none, so it starts where it would have without a claim; \
+         expect duplicates",
+        path.display()
+    )
+}
+
 /// Appends to `head` the part of `chunk`, read at file offset `chunk_start`, that falls below
 /// [`HEAD_BYTES`] and past what `head` already holds. `TrackedFile::head`'s invariant puts
 /// `chunk_start` at or below `head.len()` whenever the head is short of `HEAD_BYTES`.
@@ -1729,10 +2989,27 @@ fn ensure_utf8(line: Bytes, diag: &mut Diagnostics) -> Bytes {
 }
 
 /// The `truncated` diagnostic's text. It reports the *pre*-truncation offset, which tells an
-/// operator how much was in flight; a free function so a test can assert that.
-fn truncated_message(path: &Path, prev_offset: u64, len: u64) -> String {
+/// operator how much was in flight, and `unread`, the bytes counted
+/// `bytes.dropped{reason="truncated"}`; a free function so a test can assert both.
+fn truncated_message(path: &Path, prev_offset: u64, len: u64, unread: u64) -> String {
+    let seen = if unread > 0 {
+        format!("{unread} byte(s) seen past that offset were never read, and ")
+    } else {
+        String::new()
+    };
     format!(
-        "{} shrank from an offset of {prev_offset} bytes to {len} -- resuming from the beginning",
+        "{} shrank from an offset of {prev_offset} bytes to {len} -- resuming from the \
+         beginning; {seen}lines written before the truncation may be lost unless a pattern also \
+         matches the copy",
+        path.display()
+    )
+}
+
+/// The `compressed` diagnostic's text.
+fn compressed_message(path: &Path, format: &str) -> String {
+    format!(
+        "{} starts with a {format} header -- not tailed, since a compressed file isn't read as \
+         text",
         path.display()
     )
 }
@@ -3114,6 +4391,11 @@ mod tests {
             1.0,
             "the discarded partial is counted lost"
         );
+        assert_eq!(
+            probe.sum("logit.input.bytes.dropped", &[]),
+            0.0,
+            "the partial was read, so it's below the offset and not counted again as bytes"
+        );
         assert_eq!(probe.sum("logit.input.files.truncated", &[]), 1.0);
 
         running.stop().await;
@@ -3371,9 +4653,14 @@ mod tests {
 
     #[test]
     fn the_truncated_diagnostic_reports_the_pre_truncation_offset() {
-        let msg = truncated_message(Path::new("/var/log/app.log"), 4096, 12);
+        let msg = truncated_message(Path::new("/var/log/app.log"), 4096, 12, 0);
         assert!(msg.contains("from an offset of 4096 bytes to 12"), "{msg}");
         assert!(!msg.contains("offset of 0 bytes"));
+        assert!(msg.contains("may be lost unless a pattern also matches the copy"), "{msg}");
+        assert!(!msg.contains("never read"), "no unread bytes to report: {msg}");
+
+        let msg = truncated_message(Path::new("/var/log/app.log"), 4096, 12, 100);
+        assert!(msg.contains("100 byte(s) seen past that offset were never read"), "{msg}");
     }
 
     // -- the pattern directory's watch is re-armed on every scan -----------------------------
@@ -4410,10 +5697,17 @@ mod tests {
         config
     }
 
-    /// One format 3 checkpoint entry, as JSON.
-    fn entry_json(id: FileId, path: &Path, offset: u64, len: u64, head: Head) -> String {
+    /// One format 4 checkpoint entry, as JSON.
+    fn entry_json(
+        id: FileId,
+        path: &Path,
+        offset: u64,
+        len: u64,
+        head: Head,
+        marker: u64,
+    ) -> String {
         format!(
-            r#"{{"dev":{},"ino":{},"path":"{}","offset":{offset},"len":{len},"head_len":{},"head_hash":{}}}"#,
+            r#"{{"dev":{},"ino":{},"path":"{}","offset":{offset},"len":{len},"head_len":{},"head_hash":{},"marker":{marker}}}"#,
             id.dev,
             id.ino,
             path.display(),
@@ -4422,26 +5716,43 @@ mod tests {
         )
     }
 
-    /// Writes a format 3 checkpoint holding `entries` (from [`entry_json`]) to `dir`.
+    /// Writes a format 4 checkpoint holding `entries` (from [`entry_json`]) to `dir`.
     fn write_checkpoint_doc(dir: &Path, entries: &[String]) {
-        let text = format!(r#"{{"version":3,"files":[{}]}}"#, entries.join(","));
+        let text = format!(r#"{{"version":4,"files":[{}]}}"#, entries.join(","));
         std::fs::write(dir.join("checkpoint.json"), text).unwrap();
     }
 
-    /// A format 3 checkpoint naming `file`'s live `(dev, ino)` at `offset` with `head`, and its
-    /// current length.
+    /// A format 4 checkpoint naming `file`'s live `(dev, ino)` at `offset` with `head`, its
+    /// current length, and the marker of its bytes before `offset` (the empty marker past its
+    /// end).
     fn write_checkpoint_for(dir: &Path, file: &Path, offset: u64, head: Head) {
         let meta = std::fs::metadata(file).unwrap();
-        let entry =
-            entry_json(FileId::from_metadata(&meta), file, offset, meta.len().max(offset), head);
+        let entry = entry_json(
+            FileId::from_metadata(&meta),
+            file,
+            offset,
+            meta.len().max(offset),
+            head,
+            content_marker(file, offset),
+        );
         write_checkpoint_doc(dir, &[entry]);
+    }
+
+    /// The marker of `file`'s bytes ending at `offset`, or the empty marker past its end.
+    fn content_marker(file: &Path, offset: u64) -> u64 {
+        let bytes = std::fs::read(file).unwrap();
+        let end = offset as usize;
+        if end > bytes.len() {
+            return marker(&[]);
+        }
+        marker(&bytes[end - end.min(HEAD_BYTES)..end])
     }
 
     /// The first entry of the checkpoint on disk, as `(offset, head_len, head_hash)`.
     fn checkpointed_entry(dir: &Path) -> (u64, u32, u64) {
         let text = std::fs::read_to_string(dir.join("checkpoint.json")).unwrap();
         let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(doc["version"], 3, "{text}");
+        assert_eq!(doc["version"], 4, "{text}");
         let entry = &doc["files"][0];
         (
             entry["offset"].as_u64().unwrap(),
@@ -4770,12 +6081,19 @@ mod tests {
             fast_config(ReadFrom::Beginning),
         );
         let head = Head::of(b"one\n");
-        let retained =
-            Retained { path: path.clone(), offset: 4, len: 4, head, source: Source::Checkpoint };
+        let marker = marker(b"one\n");
+        let retained = Retained {
+            path: path.clone(),
+            offset: 4,
+            len: 4,
+            head,
+            marker,
+            source: Source::Checkpoint,
+        };
         tailer.resume.insert(scanned, retained.clone());
         let mut watcher = crate::tail::watch::Watcher::Poll;
         tailer
-            .open_tracked(path.clone(), scanned, StartOffset::Resume(4, head), &mut watcher)
+            .open_tracked(path.clone(), scanned, StartOffset::Resume(4, head, marker), &mut watcher)
             .await;
 
         assert!(tailer.files.is_empty(), "the other inode isn't tracked under the scanned id");
@@ -4893,11 +6211,12 @@ mod tests {
         let meta = std::fs::metadata(&path).unwrap();
         let entry = |ino: u64, name: &str, offset: u64, head: Head| {
             format!(
-                r#"{{"dev":{},"ino":{ino},"path":"{}","offset":{offset},"len":{offset},"head_len":{},"head_hash":{}}}"#,
+                r#"{{"dev":{},"ino":{ino},"path":"{}","offset":{offset},"len":{offset},"head_len":{},"head_hash":{},"marker":{}}}"#,
                 meta.dev(),
                 dir.join(name).display(),
                 head.len,
-                head.hash
+                head.hash,
+                marker(b"one\n"),
             )
         };
         let files = [
@@ -4907,7 +6226,7 @@ mod tests {
         ];
         std::fs::write(
             dir.join("checkpoint.json"),
-            format!(r#"{{"version":3,"files":[{}]}}"#, files.join(",")),
+            format!(r#"{{"version":4,"files":[{}]}}"#, files.join(",")),
         )
         .unwrap();
 
@@ -5223,7 +6542,7 @@ mod tests {
 
     // -- accounting
 
-    /// Runs `count_rotations` and then `reconcile_discovered` over `order`, as `scan` does over
+    /// Runs `count_rotations` and then `reconcile_all` over `order`, as `scan` does over
     /// `discovered` in whatever order its `HashMap` yields. Returns `files.rotated`.
     async fn rotated_in_order(
         tailer: &mut Tailer<LineDecoder, LineFactory>,
@@ -5234,9 +6553,10 @@ mod tests {
             order.iter().map(|p| (p.clone(), std::fs::metadata(p).unwrap())).collect();
         let mut watcher = crate::tail::watch::Watcher::Poll;
         tailer.count_rotations(&discovered);
-        for path in order {
-            tailer.reconcile_discovered(path.clone(), &discovered[path], false, &mut watcher).await;
-        }
+        let ordered: Vec<(PathBuf, std::fs::Metadata)> =
+            order.iter().map(|p| (p.clone(), discovered[p].clone())).collect();
+        let ids: HashSet<FileId> = discovered.values().map(FileId::from_metadata).collect();
+        tailer.reconcile_all(ordered, false, &Listing::default(), &ids, &mut watcher).await;
         for path in order {
             let id = FileId::from_metadata(&discovered[path]);
             assert_eq!(tailer.by_path.get(path), Some(&id), "{path:?} is bound to its inode");
@@ -5446,6 +6766,40 @@ mod tests {
 
     /// `end_scan` evicts what no call touched, so a path missing from one scan's calls loses its
     /// cached state: a rebind and a de-selected file awaiting its reap included.
+    /// A path the factory rejects (`docker_in`'s unselected container) is asked once per scan
+    /// and never probed for a claim, though a tracked file's head offers a candidate every scan.
+    #[tokio::test]
+    async fn a_path_the_factory_rejects_is_never_probed_for_a_claim() {
+        let dir = scratch_dir("factory-rejects-probe");
+        let (kept, other) = (dir.join("app.log"), dir.join("other.log"));
+        let line = long_line("same");
+        std::fs::write(&kept, format!("{line}\n{line}\n")).unwrap();
+        let offered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let deselect = Arc::new(std::sync::Mutex::new(Some(other.clone())));
+        let factory = RecordingFactory { offered: offered.clone(), deselect };
+        let mut hand = Hand::bind(
+            vec![PathPattern::new(dir.join("*.log"))],
+            factory,
+            fast_config(ReadFrom::Beginning),
+        )
+        .await;
+        hand.pump().await;
+        // Its content matches the tracked file's candidate, so a probe would take it.
+        std::fs::write(&other, format!("{line}\n{line}\n")).unwrap();
+        let scope = fault::scope(&other);
+        scope.record();
+        offered.lock().unwrap().clear();
+        for _ in 0..3 {
+            hand.scan().await;
+        }
+        let probes = scope.hits().iter().filter(|h| h.point == crate::tail::pattern::OPEN).count();
+        assert_eq!(probes, 0, "never opened to probe");
+        let asked = offered.lock().unwrap().iter().filter(|p| **p == other).count();
+        assert_eq!(asked, 3, "asked once per scan");
+        assert!(!hand.tailer.files.contains_key(&id_of(&other)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn every_discovered_path_is_offered_to_the_factory_once_per_scan() {
         let dir = scratch_dir("factory-offers");
@@ -5694,7 +7048,8 @@ mod tests {
 
     /// A draining file truncated in place is checked by `drain` before each read, so a refill
     /// past the old offset after that check, but before any scan rebinds the file, is still read
-    /// from `0`. Only a refill before the first check goes unseen (`docs/known-gaps/tailing.md`).
+    /// from `0`. Only a refill before the first check goes unseen
+    /// (`docs/adr/tail-content-identity.md`, decision 8).
     #[tokio::test]
     async fn a_draining_inode_truncated_and_refilled_before_its_rebind_is_read_from_zero() {
         let dir = scratch_dir("draining-truncated-refilled");
@@ -5841,11 +7196,598 @@ mod tests {
         }
     }
 
-    /// `copytruncate` under `app.log*`: the copy is a new inode the pattern matches, so it's read
-    /// from its beginning, re-emitting what the truncated original already had
-    /// (`docs/known-gaps/tailing.md`).
+    // -- content identity (docs/adr/tail-content-identity.md)
+
+    /// A line long enough that two of them pass `CLAIM_MIN_HEAD`, unique by `tag`.
+    fn long_line(tag: &str) -> String {
+        format!("{tag}-{}", "x".repeat(70))
+    }
+
+    /// `count_rotations`, `reconcile_all` over `order`, and the end-of-scan truncation count, as
+    /// a clean `scan` runs them over `discovered` in whatever order its `HashMap` yields.
+    async fn scan_in_order(tailer: &mut Tailer<LineDecoder, LineFactory>, order: &[PathBuf]) {
+        let discovered: Vec<(PathBuf, std::fs::Metadata)> =
+            order.iter().map(|p| (p.clone(), std::fs::metadata(p).unwrap())).collect();
+        tailer.count_rotations(&discovered.iter().cloned().collect());
+        let ids: HashSet<FileId> =
+            discovered.iter().map(|(_, m)| FileId::from_metadata(m)).collect();
+        let mut watcher = crate::tail::watch::Watcher::Poll;
+        tailer.reconcile_all(discovered, false, &Listing::default(), &ids, &mut watcher).await;
+        tailer.count_truncations(false);
+        tailer.scan_generation += 1;
+    }
+
+    /// A `drain` to idle and a flush, returning what they emitted.
+    async fn read_out(tailer: &mut Tailer<LineDecoder, LineFactory>) -> Vec<String> {
+        let (fanout, mut rx) = fanout_channel(64);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut watcher = crate::tail::watch::Watcher::Poll;
+        let _ = tailer.drain(&fanout, &shutdown_rx, &mut watcher, no_timer_due()).await;
+        tailer.flush_all(&fanout, FlushReason::Interval).await;
+        let mut out = Vec::new();
+        while let Ok(delivered) = rx.try_recv() {
+            out.extend(messages(&unwrap_batch(delivered).events));
+        }
+        out
+    }
+
+    fn id_of(path: &Path) -> FileId {
+        FileId::from_metadata(&std::fs::metadata(path).unwrap())
+    }
+
+    fn truncated_drops(probe: &mut TelemetryProbe) -> (f64, f64) {
+        (
+            probe.sum("logit.input.bytes.dropped", &[("reason", "truncated")]),
+            probe.sum("logit.input.frames.dropped", &[("reason", "truncated")]),
+        )
+    }
+
+    fn truncate(path: &Path) {
+        std::fs::OpenOptions::new().write(true).open(path).unwrap().set_len(0).unwrap();
+    }
+
+    /// `copytruncate` under `app.log*`, with a line half read and bytes a scan saw but no read
+    /// reached: the copy claims the original's state from before the truncation and resumes at
+    /// its line boundary, so it delivers the half-read line whole and the unread bytes, replays
+    /// nothing, and neither truncation count is emitted. In either discovery order.
     #[tokio::test]
-    async fn copytruncate_under_a_wildcard_replays_the_copy_from_its_beginning() {
+    async fn copytruncate_under_a_wildcard_resumes_the_copy_where_the_original_stopped() {
+        for reversed in [false, true] {
+            let dir = scratch_dir("claim-copytruncate");
+            let (path, copy) = (dir.join("app.log"), dir.join("app.log.1"));
+            let (one, two, three) = (long_line("one"), long_line("two"), long_line("three"));
+            std::fs::write(&path, format!("{one}\n{two}\npar")).unwrap();
+            let mut probe = TelemetryProbe::new();
+            let mut tailer = probed_tailer(
+                vec![PathPattern::new(dir.join("app.log*"))],
+                ReadFrom::Beginning,
+                &probe,
+            );
+            assert_eq!(tick(&mut tailer, true).await, vec![one.clone(), two.clone()]);
+            append(&path, format!("tial\n{three}\n").as_bytes());
+            tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+
+            std::fs::copy(&path, &copy).unwrap();
+            truncate(&path);
+            let mut order = vec![path.clone(), copy.clone()];
+            if reversed {
+                order.reverse();
+            }
+            scan_in_order(&mut tailer, &order).await;
+            assert_eq!(
+                read_out(&mut tailer).await,
+                vec!["partial".to_string(), three],
+                "{order:?}"
+            );
+            assert_eq!(probe.sum("logit.input.files.claimed", &[]), 1.0);
+            assert_eq!(probe.sum("logit.input.files.truncated", &[]), 1.0);
+            assert_eq!(truncated_drops(&mut probe), (0.0, 0.0), "the claim cancels both counts");
+            tailer.count_truncations(true);
+            assert_eq!(truncated_drops(&mut probe), (0.0, 0.0), "and nothing is left to count");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// A copy cut inside the line pending at the truncation lacks bytes `logit` read from the
+    /// original, so it can't claim the state from before the truncation: it waits as a copy
+    /// still being written, then replays, and the discarded line is counted. Lines over
+    /// `HEAD_BYTES`, so the candidate's head ends before the pending line.
+    #[tokio::test]
+    async fn a_copy_shorter_than_the_read_offset_claims_nothing() {
+        let dir = scratch_dir("claim-short-copy");
+        let (path, copy) = (dir.join("app.log"), dir.join("app.log.1"));
+        let (one, two) = (format!("one-{}", "x".repeat(300)), format!("two-{}", "y".repeat(300)));
+        std::fs::write(&path, format!("{one}\n{two}\na")).unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(
+            vec![PathPattern::new(dir.join("app.log*"))],
+            ReadFrom::Beginning,
+            &probe,
+        );
+        assert_eq!(tick(&mut tailer, true).await, vec![one.clone(), two.clone()]);
+        std::fs::copy(&path, &copy).unwrap();
+        append(&path, b"bc");
+        assert!(drain_by_hand(&mut tailer).await.is_empty());
+        truncate(&path);
+        for _ in 0..=CLAIM_DEFER_SCANS {
+            scan_in_order(&mut tailer, &[path.clone(), copy.clone()]).await;
+        }
+        assert_eq!(probe.sum("logit.input.files.claimed", &[]), 0.0);
+        assert_eq!(read_out(&mut tailer).await, vec![one, two], "the copy replays");
+        assert_eq!(truncated_drops(&mut probe), (0.0, 1.0), "the discarded line is counted");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Bytes a scan saw appended after the copy and before the truncate are in neither file: a
+    /// copy that claims the truncated state counts them, though its claim cancels the discarded
+    /// line's count.
+    #[tokio::test]
+    async fn a_claimed_truncation_counts_the_bytes_the_copy_lacks() {
+        let dir = scratch_dir("claim-lost");
+        let (path, copy) = (dir.join("app.log"), dir.join("app.log.1"));
+        let (one, two, three) = (long_line("one"), long_line("two"), long_line("three"));
+        std::fs::write(&path, format!("{one}\n{two}\n")).unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(
+            vec![PathPattern::new(dir.join("app.log*"))],
+            ReadFrom::Beginning,
+            &probe,
+        );
+        assert_eq!(tick(&mut tailer, true).await, vec![one, two]);
+        std::fs::copy(&path, &copy).unwrap();
+        append(&path, format!("{three}\n").as_bytes());
+        // Sees the appended bytes and defers the copy, which matches the live original.
+        scan_in_order(&mut tailer, &[path.clone(), copy.clone()]).await;
+        truncate(&path);
+        scan_in_order(&mut tailer, &[path.clone(), copy.clone()]).await;
+        assert_eq!(probe.sum("logit.input.files.claimed", &[]), 1.0);
+        assert!(read_out(&mut tailer).await.is_empty(), "nothing replays");
+        assert_eq!(truncated_drops(&mut probe), (three.len() as f64 + 1.0, 0.0));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// logrotate's `copytruncate` creates the copy empty, then fills it: a scan that opens the
+    /// copy empty hasn't read anything from it, so once it's filled and the original truncated,
+    /// it still claims the original's state and replays nothing. Whether a drain reaches the
+    /// filled copy before the scan or not.
+    #[tokio::test]
+    async fn a_copy_opened_empty_claims_once_it_holds_the_original() {
+        for drain_between in [false, true] {
+            let dir = scratch_dir("claim-empty-copy");
+            let (path, copy) = (dir.join("app.log"), dir.join("app.log.1"));
+            let (one, two) = (long_line("one"), long_line("two"));
+            std::fs::write(&path, format!("{one}\n{two}\n")).unwrap();
+            let mut probe = TelemetryProbe::new();
+            let mut tailer = probed_tailer(
+                vec![PathPattern::new(dir.join("app.log*"))],
+                ReadFrom::Beginning,
+                &probe,
+            );
+            assert_eq!(tick(&mut tailer, true).await, vec![one, two]);
+            std::fs::File::create_new(&copy).unwrap();
+            assert!(tick(&mut tailer, false).await.is_empty());
+            assert!(tailer.files.contains_key(&id_of(&copy)), "opened empty");
+            std::fs::copy(&path, &copy).unwrap();
+            if drain_between {
+                assert!(read_out(&mut tailer).await.is_empty(), "the copy waits");
+            }
+            truncate(&path);
+            let second = tick(&mut tailer, false).await;
+            assert!(second.is_empty(), "drain_between: {drain_between}: {second:?}");
+            assert_eq!(probe.sum("logit.input.files.claimed", &[]), 1.0);
+            assert_eq!(truncated_drops(&mut probe), (0.0, 0.0));
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// A claimable file that stays empty costs a drain no candidate snapshot: it's built at the
+    /// drain's first read that returns a claimable file's bytes, once.
+    #[tokio::test]
+    async fn an_empty_claimable_file_builds_no_candidate_snapshot() {
+        let dir = scratch_dir("claim-snapshot-lazy");
+        let (path, copy, other) =
+            (dir.join("app.log"), dir.join("app.log.1"), dir.join("app.log.2"));
+        std::fs::write(&path, format!("{}\n{}\n", long_line("one"), long_line("two"))).unwrap();
+        let mut tailer = Tailer::new(
+            vec![PathPattern::new(dir.join("app.log*"))],
+            LineFactory,
+            fast_config(ReadFrom::Beginning),
+        );
+        assert_eq!(tick(&mut tailer, true).await.len(), 2);
+        std::fs::File::create_new(&copy).unwrap();
+        std::fs::File::create_new(&other).unwrap();
+        assert!(tick(&mut tailer, false).await.is_empty());
+        for _ in 0..3 {
+            append(&path, format!("{}\n", long_line("more")).as_bytes());
+            assert_eq!(read_out(&mut tailer).await.len(), 1);
+        }
+        assert_eq!(tailer.snapshot_builds, 0, "no drain built one while both stayed empty");
+        std::fs::copy(&path, &copy).unwrap();
+        std::fs::copy(&path, &other).unwrap();
+        assert!(read_out(&mut tailer).await.is_empty(), "both left for the scan");
+        assert_eq!(tailer.snapshot_builds, 1, "built once for both");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A pass reads claimable files before the others, so a tracked file whose head the drain
+    /// grows past 64 bytes isn't in the snapshot a copy of it is decided against, wherever the
+    /// map puts it: the copy is read at once. Files are added until the copy isn't first in the
+    /// map's order, so a pass in that order would read a tracked file, and offer its candidate,
+    /// before the copy.
+    #[tokio::test]
+    async fn a_pass_reads_claimable_files_before_the_others() {
+        let dir = scratch_dir("claim-pass-order");
+        let copy = dir.join("copy.log");
+        let long = long_line("long");
+        std::fs::write(dir.join("f0.log"), "short\n").unwrap();
+        let mut tailer = Tailer::new(
+            vec![PathPattern::new(dir.join("*.log"))],
+            LineFactory,
+            fast_config(ReadFrom::Beginning),
+        );
+        assert_eq!(tick(&mut tailer, true).await.len(), 1);
+        std::fs::File::create_new(&copy).unwrap();
+        assert!(tick(&mut tailer, false).await.is_empty());
+        let mut originals = vec![dir.join("f0.log")];
+        while tailer.files.keys().next() == Some(&id_of(&copy)) {
+            assert!(originals.len() < 32, "the map keeps the copy first");
+            let next = dir.join(format!("f{}.log", originals.len()));
+            std::fs::write(&next, "short\n").unwrap();
+            assert_eq!(tick(&mut tailer, false).await.len(), 1);
+            originals.push(next);
+        }
+        assert!(tailer.files[&id_of(&copy)].claimable);
+
+        for original in &originals {
+            append(original, format!("{long}\n").as_bytes());
+        }
+        std::fs::write(&copy, format!("short\n{long}\n")).unwrap();
+        let mut lines = read_out(&mut tailer).await;
+        lines.sort();
+        let mut expected = vec![long.clone(); originals.len() + 1];
+        expected.push("short".to_owned());
+        expected.sort();
+        assert_eq!(lines, expected, "the copy is read at once");
+        assert!(!tailer.files[&id_of(&copy)].claim_pending);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A claimable file a read leaves for the scan goes back to `0`: renamed out of every pattern
+    /// before any scan decides it, it drains, and its lines are all read.
+    #[tokio::test]
+    async fn a_claimable_file_left_unread_is_read_from_zero_once_it_drains() {
+        let dir = scratch_dir("claim-pending-drains");
+        let (path, copy) = (dir.join("app.log"), dir.join("app.log.1"));
+        let (one, two) = (long_line("one"), long_line("two"));
+        std::fs::write(&path, format!("{one}\n{two}\n")).unwrap();
+        let mut tailer = Tailer::new(
+            vec![PathPattern::new(dir.join("app.log*"))],
+            LineFactory,
+            fast_config(ReadFrom::Beginning),
+        );
+        assert_eq!(tick(&mut tailer, true).await.len(), 2);
+        std::fs::File::create_new(&copy).unwrap();
+        assert!(tick(&mut tailer, false).await.is_empty());
+        std::fs::copy(&path, &copy).unwrap();
+        assert!(read_out(&mut tailer).await.is_empty(), "left for the scan");
+        assert!(tailer.files[&id_of(&copy)].claim_pending);
+        std::fs::rename(&copy, dir.join("moved.txt")).unwrap();
+        assert_eq!(tick(&mut tailer, false).await, vec![one, two], "drained from 0");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A rename rotation's new file is created empty too, but matches nothing once written, so
+    /// it's read at once rather than at the next scan.
+    #[tokio::test]
+    async fn a_new_file_opened_empty_that_matches_nothing_is_read_at_once() {
+        let dir = scratch_dir("claim-empty-new");
+        let path = dir.join("app.log");
+        let (one, two) = (long_line("one"), long_line("two"));
+        std::fs::write(&path, format!("{one}\n{two}\n")).unwrap();
+        let mut tailer = Tailer::new(
+            vec![PathPattern::new(dir.join("app.log*"))],
+            LineFactory,
+            fast_config(ReadFrom::Beginning),
+        );
+        assert_eq!(tick(&mut tailer, true).await.len(), 2);
+        std::fs::rename(&path, dir.join("app.log.1")).unwrap();
+        std::fs::File::create_new(&path).unwrap();
+        assert!(tick(&mut tailer, false).await.is_empty());
+        append(&path, b"fresh\n");
+        assert_eq!(read_out(&mut tailer).await, vec!["fresh"], "no scan between");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Under an exact pattern nothing can claim a truncation, and its counts wait only for the
+    /// end of the second scan that offers it: a drain that finds it emits neither.
+    #[tokio::test]
+    async fn a_truncation_nothing_claims_is_counted_at_the_end_of_the_second_scan() {
+        let dir = scratch_dir("claim-none");
+        let path = dir.join("app.log");
+        let (one, two) = (long_line("one"), long_line("two"));
+        std::fs::write(&path, format!("{one}\n{two}\npar")).unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(vec![PathPattern::new(&path)], ReadFrom::Beginning, &probe);
+        assert_eq!(tick(&mut tailer, true).await.len(), 2);
+        append(&path, b"tial\n");
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+
+        truncate(&path);
+        assert!(drain_by_hand(&mut tailer).await.is_empty());
+        assert_eq!(probe.sum("logit.input.files.truncated", &[]), 1.0, "seen at once");
+        assert_eq!(truncated_drops(&mut probe), (0.0, 0.0), "counted only once no copy claims it");
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        assert_eq!(truncated_drops(&mut probe), (0.0, 0.0), "offered once");
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        assert_eq!(truncated_drops(&mut probe), (5.0, 1.0));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A listing that keeps failing, of another pattern's directory here, doesn't hold a
+    /// truncation until a stop: it's counted once two scans have offered it, as under clean
+    /// listings. A second truncation of the same file counts the first at once and replaces it,
+    /// so at most one is held per file.
+    #[tokio::test]
+    async fn a_truncation_is_counted_after_two_offers_whatever_the_listings() {
+        let dir = scratch_dir("claim-offers");
+        let path = dir.join("app.log");
+        let locked = dir.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        let fill =
+            || std::fs::write(&path, format!("{}\n{}\n", long_line("one"), long_line("two")));
+        fill().unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(
+            vec![PathPattern::new(&path), PathPattern::new(locked.join("*.log"))],
+            ReadFrom::Beginning,
+            &probe,
+        );
+        assert_eq!(tick(&mut tailer, true).await.len(), 2);
+        let scope = fault::scope(&locked);
+        scope.fail(READ_DIR, errno::EACCES);
+
+        // Seen by a drain, so neither scan below is the one that finds it.
+        append(&path, b"x\n");
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        truncate(&path);
+        assert!(drain_by_hand(&mut tailer).await.is_empty());
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        assert_eq!(truncated_drops(&mut probe), (0.0, 0.0), "offered once");
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        assert_eq!(truncated_drops(&mut probe), (2.0, 0.0), "offered twice");
+
+        // A second truncation before two scans offer the first counts the first and replaces it.
+        fill().unwrap();
+        assert_eq!(read_out(&mut tailer).await.len(), 2);
+        append(&path, b"z\n");
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        truncate(&path);
+        assert!(drain_by_hand(&mut tailer).await.is_empty());
+        fill().unwrap();
+        assert_eq!(read_out(&mut tailer).await.len(), 2);
+        append(&path, b"y\n");
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        truncate(&path);
+        assert!(drain_by_hand(&mut tailer).await.is_empty());
+        assert_eq!(tailer.truncations.len(), 1);
+        assert_eq!(truncated_drops(&mut probe), (4.0, 0.0), "the first one's z, offered once");
+        assert_eq!(probe.sum("logit.input.files.truncated", &[]), 3.0);
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        assert!(tailer.truncations.is_empty());
+        assert_eq!(truncated_drops(&mut probe), (6.0, 0.0));
+        drop(scope);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A deferred copy that may still claim a truncation pins it past its two offers, but only
+    /// up to `TRUNCATION_OFFERS + CLAIM_DEFER_SCANS`: a second copy that keeps it pinned once the
+    /// first's wait runs out doesn't hold it longer.
+    #[tokio::test]
+    async fn a_pinned_truncation_is_counted_once_its_wait_runs_out() {
+        let dir = scratch_dir("claim-pinned-cap");
+        let path = dir.join("app.log");
+        let content = format!("{}\n{}\n", long_line("one"), long_line("two"));
+        std::fs::write(&path, &content).unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(
+            vec![PathPattern::new(dir.join("app.log*"))],
+            ReadFrom::Beginning,
+            &probe,
+        );
+        assert_eq!(tick(&mut tailer, true).await.len(), 2);
+
+        // Seen by a drain, so the first scan below offers it once.
+        append(&path, b"x\n");
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        truncate(&path);
+        assert!(drain_by_hand(&mut tailer).await.is_empty());
+        // A prefix of the original's head too short to decide: it may grow into a match.
+        let prefix = &content.as_bytes()[..30];
+        std::fs::write(dir.join("app.log.1"), prefix).unwrap();
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        assert_eq!(truncated_drops(&mut probe), (0.0, 0.0), "offered once");
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        assert_eq!(truncated_drops(&mut probe), (0.0, 0.0), "pinned at two offers");
+        std::fs::write(dir.join("app.log.2"), prefix).unwrap();
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        assert!(tailer.files.contains_key(&id_of(&dir.join("app.log.1"))), "its wait ran out");
+        assert_eq!(truncated_drops(&mut probe), (0.0, 0.0), "pinned by the second copy");
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        assert_eq!(tailer.truncations.len(), 0);
+        assert_eq!(truncated_drops(&mut probe), (2.0, 0.0), "counted at four offers");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A scan whose listing failed may have missed a copy, so it holds the truncation it found
+    /// through the open handle; a clean stop counts it, since no later scan can offer it.
+    #[tokio::test]
+    async fn a_truncation_held_at_shutdown_is_counted_by_the_stop() {
+        let dir = scratch_dir("claim-shutdown");
+        let path = dir.join("app.log");
+        std::fs::write(&path, format!("{}\n{}\npar", long_line("one"), long_line("two"))).unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(vec![PathPattern::new(&path)], ReadFrom::Beginning, &probe);
+        assert_eq!(tick(&mut tailer, true).await.len(), 2);
+        truncate(&path);
+        let scope = fault::scope(&dir);
+        scope.fail(READ_DIR, errno::EACCES);
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        drop(scope);
+        assert_eq!(probe.sum("logit.input.files.truncated", &[]), 1.0);
+        assert_eq!(truncated_drops(&mut probe), (0.0, 0.0));
+        let (fanout, _rx) = fanout_channel(64);
+        tailer.close_all_for_shutdown(&fanout).await;
+        assert_eq!(truncated_drops(&mut probe), (0.0, 1.0));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A copy a scan finds before the truncate matches the live original, so it waits: claimed
+    /// now, both would read what the original reads before its truncation. The next scan sees
+    /// the truncation, and the copy claims the state from before it. In either order.
+    #[tokio::test]
+    async fn a_copy_seen_before_the_truncate_waits_and_then_claims_the_state_before_it() {
+        for reversed in [false, true] {
+            let dir = scratch_dir("claim-copy-first");
+            let (path, copy) = (dir.join("app.log"), dir.join("app.log.1"));
+            std::fs::write(&path, format!("{}\n{}\n", long_line("one"), long_line("two"))).unwrap();
+            let mut probe = TelemetryProbe::new();
+            let mut tailer = probed_tailer(
+                vec![PathPattern::new(dir.join("app.log*"))],
+                ReadFrom::Beginning,
+                &probe,
+            );
+            assert_eq!(tick(&mut tailer, true).await.len(), 2);
+            std::fs::copy(&path, &copy).unwrap();
+            let mut order = vec![path.clone(), copy.clone()];
+            if reversed {
+                order.reverse();
+            }
+            scan_in_order(&mut tailer, &order).await;
+            assert_eq!(tailer.deferred.get(&id_of(&copy)), Some(&1), "{order:?}");
+            assert!(!tailer.files.contains_key(&id_of(&copy)), "{order:?}: left unopened");
+
+            truncate(&path);
+            scan_in_order(&mut tailer, &order).await;
+            assert!(read_out(&mut tailer).await.is_empty(), "{order:?}: nothing replayed");
+            assert_eq!(probe.sum("logit.input.files.claimed", &[]), 1.0);
+            append(&copy, b"late\n");
+            assert_eq!(read_out(&mut tailer).await, vec!["late"]);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// A plain copy of a live file, never followed by a truncate, waits `CLAIM_DEFER_SCANS`
+    /// scans and then claims the original as it is: the copy resumes at the original's line
+    /// boundary.
+    #[tokio::test]
+    async fn a_plain_copy_of_a_live_file_claims_it_once_the_wait_runs_out() {
+        let dir = scratch_dir("claim-plain-copy");
+        let (path, copy) = (dir.join("app.log"), dir.join("app.log.1"));
+        std::fs::write(&path, format!("{}\n{}\n", long_line("one"), long_line("two"))).unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(
+            vec![PathPattern::new(dir.join("app.log*"))],
+            ReadFrom::Beginning,
+            &probe,
+        );
+        assert_eq!(tick(&mut tailer, true).await.len(), 2);
+        std::fs::copy(&path, &copy).unwrap();
+        for waited in 1..=CLAIM_DEFER_SCANS {
+            assert!(tick(&mut tailer, false).await.is_empty());
+            assert_eq!(tailer.deferred.get(&id_of(&copy)), Some(&waited));
+        }
+        assert!(tick(&mut tailer, false).await.is_empty(), "claimed, not replayed");
+        assert!(tailer.files.contains_key(&id_of(&copy)));
+        assert_eq!(probe.sum("logit.input.files.claimed", &[]), 1.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A copy still being written agrees with every byte of the original it has, so it waits
+    /// rather than start from `0`; once the copy is whole and the original truncated, it claims.
+    #[tokio::test]
+    async fn a_copy_still_being_written_waits_and_then_claims() {
+        let dir = scratch_dir("claim-partial-copy");
+        let (path, copy) = (dir.join("app.log"), dir.join("app.log.1"));
+        let content = format!("{}\n{}\n{}\n", long_line("one"), long_line("two"), long_line("3"));
+        std::fs::write(&path, &content).unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(
+            vec![PathPattern::new(dir.join("app.log*"))],
+            ReadFrom::Beginning,
+            &probe,
+        );
+        assert_eq!(tick(&mut tailer, true).await.len(), 3);
+        std::fs::write(&copy, &content.as_bytes()[..100]).unwrap();
+        assert!(tick(&mut tailer, false).await.is_empty());
+        assert_eq!(tailer.deferred.get(&id_of(&copy)), Some(&1));
+
+        append(&copy, &content.as_bytes()[100..]);
+        truncate(&path);
+        assert!(tick(&mut tailer, false).await.is_empty(), "claimed, not replayed");
+        assert_eq!(probe.sum("logit.input.files.claimed", &[]), 1.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A rename rotation's new file is empty, and an empty file claims nothing and never waits.
+    #[tokio::test]
+    async fn an_empty_new_file_is_opened_by_the_scan_that_finds_it() {
+        let dir = scratch_dir("claim-empty");
+        let path = dir.join("app.log");
+        std::fs::write(&path, format!("{}\n{}\n", long_line("one"), long_line("two"))).unwrap();
+        let probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(
+            vec![PathPattern::new(dir.join("app.log*"))],
+            ReadFrom::Beginning,
+            &probe,
+        );
+        assert_eq!(tick(&mut tailer, true).await.len(), 2);
+        std::fs::rename(&path, dir.join("app.log.1")).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        tick(&mut tailer, false).await;
+        assert!(tailer.deferred.is_empty());
+        assert_eq!(tailer.by_path.get(&path), Some(&id_of(&path)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Two copies match one truncated state: nothing is claimed, the ambiguity is diagnosed, and
+    /// both copies start from `0`, which duplicates rather than loses. In either order.
+    #[tokio::test]
+    async fn an_ambiguous_claim_claims_nothing_and_is_diagnosed() {
+        for reversed in [false, true] {
+            let dir = scratch_dir("claim-ambiguous");
+            let path = dir.join("app.log");
+            let (copy1, copy2) = (dir.join("app.log.1"), dir.join("app.log.2"));
+            let (one, two) = (long_line("one"), long_line("two"));
+            std::fs::write(&path, format!("{one}\n{two}\n")).unwrap();
+            let mut probe = TelemetryProbe::new();
+            let mut tailer = probed_tailer(
+                vec![PathPattern::new(dir.join("app.log*"))],
+                ReadFrom::Beginning,
+                &probe,
+            );
+            assert_eq!(tick(&mut tailer, true).await.len(), 2);
+            std::fs::copy(&path, &copy1).unwrap();
+            std::fs::copy(&path, &copy2).unwrap();
+            truncate(&path);
+            let mut order = vec![path.clone(), copy1.clone(), copy2.clone()];
+            if reversed {
+                order.reverse();
+            }
+            scan_in_order(&mut tailer, &order).await;
+            let mut lines = read_out(&mut tailer).await;
+            lines.sort();
+            assert_eq!(lines, vec![one.clone(), one, two.clone(), two], "{order:?}");
+            assert_eq!(probe.sum("logit.input.files.claimed", &[]), 0.0);
+            assert_eq!(tailer.diag.occurrences("claim_ambiguous"), 2);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// A head under `CLAIM_MIN_HEAD` bytes says too little to claim by: a short file's
+    /// `copytruncate` under `app.log*` still replays the copy from its beginning.
+    #[tokio::test]
+    async fn copytruncate_of_a_file_under_the_claim_floor_replays_the_copy() {
         let dir = scratch_dir("copytruncate-wildcard");
         let path = dir.join("app.log");
         std::fs::write(&path, b"one\ntwo\n").unwrap();
@@ -5858,9 +7800,254 @@ mod tests {
         assert_eq!(tick(&mut tailer, true).await, vec!["one", "two"]);
 
         std::fs::copy(&path, dir.join("app.log.1")).unwrap();
-        std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(0).unwrap();
+        truncate(&path);
         assert_eq!(tick(&mut tailer, false).await, vec!["one", "two"], "the copy, from 0");
         assert_eq!(probe.sum("logit.input.files.truncated", &[]), 1.0);
+        assert_eq!(probe.sum("logit.input.files.claimed", &[]), 0.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `copytruncate` while `logit` was down: the original's entry is rejected on its own inode,
+    /// and the copy claims it, resuming where the last checkpoint left the original. The claimed
+    /// entry isn't counted gone. In either discovery order.
+    #[tokio::test]
+    async fn a_copytruncate_while_logit_was_down_resumes_the_copy() {
+        for reversed in [false, true] {
+            let dir = scratch_dir("claim-while-down");
+            let (path, copy) = (dir.join("app.log"), dir.join("app.log.1"));
+            let (one, two, three) = (long_line("one"), long_line("two"), long_line("three"));
+            std::fs::write(&path, format!("{one}\n{two}\npar")).unwrap();
+            let patterns = vec![PathPattern::new(dir.join("app.log*"))];
+            let config = checkpointed(&dir, ReadFrom::Beginning);
+            let mut hand = Hand::bind(patterns.clone(), LineFactory, config.clone()).await;
+            assert_eq!(hand.pump().await.len(), 2);
+            hand.checkpoint().await;
+            drop(hand);
+
+            append(&path, format!("tial\n{three}\n").as_bytes());
+            std::fs::copy(&path, &copy).unwrap();
+            truncate(&path);
+            // The first scan's listing fails, so the order below decides the reconciliation.
+            let scope = fault::scope(&dir);
+            scope.fail(READ_DIR, errno::EACCES);
+            let mut hand = Hand::bind(patterns, LineFactory, config).await;
+            drop(scope);
+            let mut order = vec![path.clone(), copy.clone()];
+            if reversed {
+                order.reverse();
+            }
+            scan_in_order(&mut hand.tailer, &order).await;
+            assert_eq!(hand.pump().await, vec!["partial".to_string(), three], "{order:?}");
+            assert_eq!(hand.rejected(), 1.0);
+            assert_eq!(hand.probe.sum("logit.input.files.claimed", &[]), 1.0);
+            hand.checkpoint().await;
+            assert_eq!(gone_bytes(&mut hand.probe), 0.0, "claimed, so not gone");
+            assert_eq!(hand.diag.occurrences("file_gone"), 0);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// `copytruncate` while `logit` was down, with two copies of the original: both match its
+    /// rejected entry, so neither claims it and each is read from `0`, under `read_from: end` too,
+    /// and the entry isn't counted gone, since the copies deliver its bytes.
+    #[tokio::test]
+    async fn a_rejected_entry_matched_ambiguously_is_not_counted_gone() {
+        for read_from in [ReadFrom::Beginning, ReadFrom::End] {
+            let dir = scratch_dir("claim-rejected-ambiguous");
+            let path = dir.join("app.log");
+            let (one, two) = (long_line("one"), long_line("two"));
+            std::fs::write(&path, format!("{one}\n{two}\n")).unwrap();
+            let patterns = vec![PathPattern::new(dir.join("app.log*"))];
+            let config = checkpointed(&dir, ReadFrom::Beginning);
+            let mut hand = Hand::bind(vec![PathPattern::new(&path)], LineFactory, config).await;
+            assert_eq!(hand.pump().await.len(), 2);
+            hand.checkpoint().await;
+            drop(hand);
+            // Leave the entry `two` unread: rewind it to the end of `one`.
+            let head = std::fs::read(&path).unwrap();
+            let offset = one.len() as u64 + 1;
+            write_checkpoint_for(&dir, &path, offset, Head::of(&head[..offset as usize]));
+
+            std::fs::copy(&path, dir.join("app.log.1")).unwrap();
+            std::fs::copy(&path, dir.join("app.log.2")).unwrap();
+            copytruncate_and_refill(&path, b"new\n");
+            let config = checkpointed(&dir, read_from);
+            let mut hand = Hand::bind(patterns, LineFactory, config).await;
+            let mut lines = hand.pump().await;
+            lines.sort();
+            let mut want = vec![one.clone(), one, two.clone(), two, "new".to_string()];
+            want.sort();
+            assert_eq!(lines, want, "{read_from:?}");
+            assert_eq!(hand.rejected(), 1.0);
+            assert_eq!(hand.diag.occurrences("claim_ambiguous"), 2, "one per copy");
+            hand.checkpoint().await;
+            assert_eq!(gone_bytes(&mut hand.probe), 0.0, "the copies deliver it");
+            assert_eq!(hand.diag.occurrences("file_gone"), 0);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// An entry its own inode rejects and no new file matches is a file that's gone: its unread
+    /// bytes are counted once a checkpoint write without it lands.
+    #[tokio::test]
+    async fn a_rejected_entry_nothing_claims_counts_its_unread_bytes_gone() {
+        let dir = scratch_dir("claim-rejected-gone");
+        let path = dir.join("app.log");
+        let (one, two) = (long_line("one"), long_line("two"));
+        std::fs::write(&path, format!("{one}\n{two}\n")).unwrap();
+        let offset = one.len() as u64 + 1;
+        let head = std::fs::read(&path).unwrap();
+        write_checkpoint_for(&dir, &path, offset, Head::of(&head[..offset as usize]));
+        copytruncate_and_refill(&path, b"new\n");
+
+        let mut hand = Hand::bind(
+            vec![PathPattern::new(&path)],
+            LineFactory,
+            checkpointed(&dir, ReadFrom::Beginning),
+        )
+        .await;
+        assert_eq!(hand.pump().await, vec!["new"]);
+        assert_eq!(hand.rejected(), 1.0);
+        assert_eq!(gone_bytes(&mut hand.probe), 0.0, "not before a write drops it");
+        hand.checkpoint().await;
+        assert_eq!(gone_bytes(&mut hand.probe), (two.len() + 1) as f64);
+        assert_eq!(hand.diag.occurrences("file_gone"), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A restored backup or a migrated volume gives every file a new `(dev, ino)`: each entry
+    /// is orphaned, and the new inode holding its content claims it and resumes there, under
+    /// `read_from: end` (which would skip what was written since) and `read_from: beginning`
+    /// (which would replay what was read).
+    #[tokio::test]
+    async fn a_restored_file_claims_its_orphaned_entry_under_either_read_from() {
+        for read_from in [ReadFrom::End, ReadFrom::Beginning] {
+            let dir = scratch_dir("claim-restored");
+            let path = dir.join("app.log");
+            let (one, two, three) = (long_line("one"), long_line("two"), long_line("three"));
+            let content = format!("{one}\n{two}\n");
+            std::fs::write(&path, &content).unwrap();
+            let offset = content.len() as u64;
+            write_checkpoint_for(
+                &dir,
+                &path,
+                offset,
+                Head::of(&content.as_bytes()[..offset as usize]),
+            );
+            // Restored beside the original first, so the new inode can't reuse its number.
+            let restored = dir.join("restored");
+            std::fs::write(&restored, format!("{content}{three}\n")).unwrap();
+            std::fs::rename(&restored, &path).unwrap();
+
+            let mut hand = Hand::bind(
+                vec![PathPattern::new(&path)],
+                LineFactory,
+                checkpointed(&dir, read_from),
+            )
+            .await;
+            assert_eq!(hand.pump().await, vec![three], "{read_from:?}");
+            assert_eq!(hand.probe.sum("logit.input.files.claimed", &[]), 1.0);
+            assert!(hand.tailer.resume.is_empty(), "the claim spends the entry");
+            hand.checkpoint().await;
+            assert_eq!(gone_bytes(&mut hand.probe), 0.0);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// The marker guards what the head can't: past `HEAD_BYTES`, a file rewritten in place with
+    /// the same first bytes no longer holds the bytes before the offset, and the resume is
+    /// rejected.
+    #[tokio::test]
+    async fn a_resume_whose_head_matches_but_whose_marker_differs_is_rejected() {
+        use std::os::unix::fs::FileExt;
+        let dir = scratch_dir("resume-marker-mismatch");
+        let path = dir.join("app.log");
+        let lines: Vec<String> = (0..5).map(|i| long_line(&format!("line{i}"))).collect();
+        std::fs::write(&path, lines.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
+        let content = std::fs::read(&path).unwrap();
+        let offset = (lines[0].len() + 1) * 4;
+        assert!(offset > HEAD_BYTES);
+        write_checkpoint_for(&dir, &path, offset as u64, Head::of(&content[..HEAD_BYTES]));
+        // Same length, same head: only bytes past the head and before the offset change.
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.write_all_at(b"YYYY", (offset - 10) as u64).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap()[..HEAD_BYTES], content[..HEAD_BYTES]);
+
+        let mut hand = Hand::bind(
+            vec![PathPattern::new(&path)],
+            LineFactory,
+            checkpointed(&dir, ReadFrom::Beginning),
+        )
+        .await;
+        assert_eq!(hand.pump().await.len(), 5, "read from 0");
+        assert_eq!(hand.rejected(), 1.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A persisted offset whose marker can't be read back (`docker_in`'s held line, on a read
+    /// error) falls back to the last position persisted with a known marker, else to `0`, so the
+    /// restart replays from there with no rejected resume and no `gone` count.
+    #[tokio::test]
+    async fn a_failed_marker_read_back_persists_a_position_whose_marker_is_known() {
+        for checkpointed_first in [false, true] {
+            let dir = scratch_dir("marker-read-back");
+            let path = dir.join("app.log");
+            std::fs::write(&path, b"one\ntwo\n").unwrap();
+            let patterns = vec![PathPattern::new(&path)];
+            let config = checkpointed(&dir, ReadFrom::Beginning);
+            let mut hand = Hand::bind(patterns.clone(), LineFactory, config.clone()).await;
+            assert_eq!(hand.pump().await, vec!["one", "two"]);
+            if checkpointed_first {
+                hand.checkpoint().await;
+            }
+            // A held line from offset 4, as `docker_in` leaves one, whose bytes aren't in memory.
+            let id = id_of(&path);
+            hand.tailer.files.get_mut(&id).unwrap().held_from = Some(4);
+            let scope = fault::scope(&path);
+            scope.fail(READ, errno::EIO);
+            hand.checkpoint().await;
+            drop(scope);
+            let want = if checkpointed_first { 8 } else { 0 };
+            assert_eq!(
+                checkpointed_entry(&dir).0,
+                want,
+                "checkpointed first: {checkpointed_first}"
+            );
+            drop(hand);
+
+            let mut hand = Hand::bind(patterns, LineFactory, config).await;
+            let replay: Vec<String> =
+                if checkpointed_first { Vec::new() } else { vec!["one".into(), "two".into()] };
+            assert_eq!(hand.pump().await, replay);
+            assert_eq!(hand.rejected(), 0.0);
+            hand.checkpoint().await;
+            assert_eq!(gone_bytes(&mut hand.probe), 0.0);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// A checkpoint taken with a line pending persists the line's start and the marker of the
+    /// bytes before it.
+    #[tokio::test]
+    async fn the_marker_persisted_with_a_pending_line_ends_at_its_start() {
+        let dir = scratch_dir("marker-pending");
+        let path = dir.join("app.log");
+        let one = long_line("one");
+        std::fs::write(&path, format!("{one}\npar")).unwrap();
+        let mut hand = Hand::bind(
+            vec![PathPattern::new(&path)],
+            LineFactory,
+            checkpointed(&dir, ReadFrom::Beginning),
+        )
+        .await;
+        assert_eq!(hand.pump().await, vec![one.clone()]);
+        hand.checkpoint().await;
+        let text = std::fs::read_to_string(dir.join("checkpoint.json")).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let entry = &doc["files"][0];
+        let offset = one.len() as u64 + 1;
+        assert_eq!(entry["offset"].as_u64(), Some(offset));
+        assert_eq!(entry["marker"].as_u64(), Some(content_marker(&path, offset)), "{text}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -5963,7 +8150,8 @@ mod tests {
     async fn a_checkpointed_file_gone_at_a_restart_counts_its_unread_bytes_once() {
         let dir = scratch_dir("gone-unread");
         let path = dir.join("app.log");
-        let mut hand = bind_over(&dir, &[entry_json(GONE, &path, 4, 10, Head::of(b"one\n"))]).await;
+        let mut hand =
+            bind_over(&dir, &[entry_json(GONE, &path, 4, 10, Head::of(b"one\n"), 0)]).await;
         assert!(hand.tailer.resume.is_empty(), "the entry is pruned");
         assert_eq!(gone_bytes(&mut hand.probe), 0.0, "not before a write drops it from disk");
 
@@ -5985,7 +8173,7 @@ mod tests {
     async fn a_gone_file_is_counted_by_the_life_whose_checkpoint_drops_it_and_never_again() {
         let dir = scratch_dir("gone-three-lives");
         let path = dir.join("app.log");
-        write_checkpoint_doc(&dir, &[entry_json(GONE, &path, 4, 10, Head::of(b"x"))]);
+        write_checkpoint_doc(&dir, &[entry_json(GONE, &path, 4, 10, Head::of(b"x"), 0)]);
         let patterns = || vec![PathPattern::new(dir.join("*.log"))];
         let config = checkpointed(&dir, ReadFrom::Beginning);
 
@@ -6015,7 +8203,7 @@ mod tests {
     async fn a_gone_file_is_counted_only_once_a_checkpoint_write_lands() {
         let dir = scratch_dir("gone-write-fails");
         let path = dir.join("app.log");
-        let mut hand = bind_over(&dir, &[entry_json(GONE, &path, 4, 10, Head::of(b"x"))]).await;
+        let mut hand = bind_over(&dir, &[entry_json(GONE, &path, 4, 10, Head::of(b"x"), 0)]).await;
 
         let scope = fault::scope(&dir);
         scope.fail_nth(
@@ -6046,7 +8234,7 @@ mod tests {
     async fn a_gone_file_is_counted_when_its_write_lands_but_the_directory_sync_fails() {
         let dir = scratch_dir("gone-sync-dir-fails");
         let path = dir.join("app.log");
-        let mut hand = bind_over(&dir, &[entry_json(GONE, &path, 4, 10, Head::of(b"x"))]).await;
+        let mut hand = bind_over(&dir, &[entry_json(GONE, &path, 4, 10, Head::of(b"x"), 0)]).await;
 
         let scope = fault::scope(&dir);
         scope.fail_nth(
@@ -6091,7 +8279,7 @@ mod tests {
     async fn a_gone_file_read_to_its_recorded_length_counts_nothing() {
         let dir = scratch_dir("gone-read");
         let path = dir.join("app.log");
-        let mut hand = bind_over(&dir, &[entry_json(GONE, &path, 10, 10, Head::of(b"x"))]).await;
+        let mut hand = bind_over(&dir, &[entry_json(GONE, &path, 10, 10, Head::of(b"x"), 0)]).await;
         assert!(hand.tailer.resume.is_empty(), "the entry is pruned");
         hand.checkpoint().await;
         assert_eq!(gone_bytes(&mut hand.probe), 0.0);
@@ -6104,7 +8292,7 @@ mod tests {
     async fn a_stored_path_no_pattern_covers_counts_nothing() {
         let dir = scratch_dir("gone-uncovered");
         let path = dir.join("elsewhere.txt");
-        let mut hand = bind_over(&dir, &[entry_json(GONE, &path, 4, 10, Head::of(b"x"))]).await;
+        let mut hand = bind_over(&dir, &[entry_json(GONE, &path, 4, 10, Head::of(b"x"), 0)]).await;
         assert!(hand.tailer.resume.is_empty(), "the entry is pruned");
         hand.checkpoint().await;
         assert_eq!(gone_bytes(&mut hand.probe), 0.0);
@@ -6119,7 +8307,7 @@ mod tests {
         let path = dir.join("app.log");
         let scope = fault::scope(&dir);
         scope.fail(READ_DIR, errno::EACCES);
-        let mut hand = bind_over(&dir, &[entry_json(GONE, &path, 4, 10, Head::of(b"x"))]).await;
+        let mut hand = bind_over(&dir, &[entry_json(GONE, &path, 4, 10, Head::of(b"x"), 0)]).await;
         hand.scan().await;
         hand.checkpoint().await;
         assert_eq!(hand.tailer.resume.len(), 1, "kept while the listing fails");
@@ -6298,6 +8486,346 @@ mod tests {
         assert_eq!(probe.gauge("logit.input.files.open", &[]), Some(1.0), "sampled before it");
         tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
         assert_eq!(probe.gauge("logit.input.files.open", &[]), Some(0.0));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -- compressed files are skipped, never read as text
+
+    fn skipped_compressed(probe: &mut TelemetryProbe) -> f64 {
+        probe.sum("logit.input.files.skipped", &[("reason", "compressed")])
+    }
+
+    fn diagnostics(probe: &mut TelemetryProbe, key: &str) -> f64 {
+        probe.sum("logit.component.diagnostics", &[("key", key)])
+    }
+
+    /// A real header of each format `sniff` knows, bzip2's both kinds.
+    const HEADERS: [&[u8]; 5] = [
+        b"\x1f\x8b\x08\x00",
+        b"\x28\xb5\x2f\xfd",
+        b"\xfd7zXZ\x00",
+        b"BZh91AY&SY",
+        b"BZh9\x17\x72\x45\x38\x50\x90",
+    ];
+
+    /// A header followed by a few bytes and newlines, so a text read would emit lines.
+    fn compressed_bytes(magic: &[u8]) -> Vec<u8> {
+        let mut bytes = magic.to_vec();
+        bytes.extend_from_slice(b"\x08\x00\xffgarbage\nmore garbage\n");
+        bytes
+    }
+
+    #[test]
+    fn sniff_names_each_magic_and_waits_on_a_prefix_of_one() {
+        assert_eq!(sniff(b"\x1f\x8b\x08\x00"), Sniff::Compressed("gzip"));
+        assert_eq!(sniff(b"\x28\xb5\x2f\xfd\x00"), Sniff::Compressed("zstd"));
+        assert_eq!(sniff(b"\xfd7zXZ\x00\x00"), Sniff::Compressed("xz"));
+        assert_eq!(sniff(b"BZh91AY&SY\x00"), Sniff::Compressed("bzip2"));
+        assert_eq!(sniff(b"BZh1\x17\x72\x45\x38\x50\x90"), Sniff::Compressed("bzip2"), "empty");
+        for header in HEADERS {
+            assert!(matches!(sniff(header), Sniff::Compressed(_)), "a whole header decides");
+        }
+        for prefix in [
+            &b""[..],
+            b"\x1f",
+            b"\x1f\x8b",
+            b"\x28\xb5\x2f",
+            b"\xfd7zXZ",
+            b"B",
+            b"BZh",
+            b"BZh91AY&S",
+        ] {
+            assert_eq!(sniff(prefix), Sniff::Undecided, "{prefix:?}");
+        }
+        for text in [
+            &b"Bob\n"[..],
+            b"BZx",
+            b"BZh is a line\n",
+            b"BZh91AY&SX",
+            b"BZh0\x17",
+            b"\x1f\x8b\x07",
+            b"\x1f\x00",
+            b"\xfd7zXY",
+            b"2026-10-29 hello\n",
+            b"a",
+        ] {
+            assert_eq!(sniff(text), Sniff::Text, "{text:?}");
+        }
+    }
+
+    /// Under `app.log*`, a compressed rotation of every format is skipped and counted once, with
+    /// no line emitted and no descriptor kept, and a later scan doesn't reopen it.
+    #[tokio::test(start_paused = true)]
+    async fn a_compressed_file_of_each_format_is_skipped_counted_once_and_closed() {
+        let dir = scratch_dir("compressed-skipped");
+        std::fs::write(dir.join("app.log"), b"one\n").unwrap();
+        for (i, header) in HEADERS.iter().enumerate() {
+            std::fs::write(dir.join(format!("app.log.{}.z", i + 1)), compressed_bytes(header))
+                .unwrap();
+        }
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(
+            vec![PathPattern::new(dir.join("app.log*"))],
+            ReadFrom::Beginning,
+            &probe,
+        );
+        assert_eq!(tick(&mut tailer, true).await, vec!["one"]);
+        assert_eq!(skipped_compressed(&mut probe), 5.0);
+        assert_eq!(diagnostics(&mut probe, "compressed"), 5.0);
+        assert_eq!(diagnostics(&mut probe, "invalid_utf8"), 0.0);
+        assert_eq!(tailer.tracked_len(), 1, "only app.log is still open");
+
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        assert_eq!(tailer.tracked_len(), 1, "a scan leaves a skipped file closed");
+        append(&dir.join("app.log"), b"two\n");
+        assert_eq!(tick(&mut tailer, false).await, vec!["two"]);
+        assert_eq!(skipped_compressed(&mut probe), 5.0, "counted once per inode");
+        assert_eq!(diagnostics(&mut probe, "compressed"), 5.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Under `read_from: end`, the head read at open finds it, so it's never tracked.
+    #[tokio::test]
+    async fn a_compressed_file_is_skipped_at_open_under_read_from_end() {
+        let dir = scratch_dir("compressed-end");
+        let path = dir.join("app.log.1.gz");
+        std::fs::write(&path, compressed_bytes(&[0x1f, 0x8b])).unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(vec![PathPattern::new(&path)], ReadFrom::End, &probe);
+        tailer.scan(true, &mut crate::tail::watch::Watcher::Poll).await;
+        assert_eq!(tailer.tracked_len(), 0);
+        assert_eq!(skipped_compressed(&mut probe), 1.0);
+        for _ in 0..3 {
+            assert!(tick(&mut tailer, false).await.is_empty());
+        }
+        assert_eq!(skipped_compressed(&mut probe), 1.0, "the first scan's record outlives it");
+        assert_eq!(diagnostics(&mut probe, "compressed"), 1.0);
+        append(&path, b"\nappended\n");
+        assert!(tick(&mut tailer, false).await.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A compressor creates its output before writing to it: a file found empty, then given a
+    /// first byte that could open a magic, emits nothing until the header decides it.
+    #[tokio::test(start_paused = true)]
+    async fn a_compressed_file_found_empty_is_skipped_once_its_header_arrives() {
+        let dir = scratch_dir("compressed-late");
+        let path = dir.join("app.log.1.gz");
+        std::fs::write(&path, b"").unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(vec![PathPattern::new(&path)], ReadFrom::Beginning, &probe);
+        assert!(tick(&mut tailer, true).await.is_empty());
+        assert_eq!(tailer.tracked_len(), 1, "an empty file is tracked, undecided");
+
+        append(&path, b"\x1f");
+        assert!(tick(&mut tailer, false).await.is_empty());
+        assert_eq!(tailer.tracked_len(), 1, "one byte doesn't decide it");
+        assert_eq!(tailer.files.values().next().map(|f| f.offset), Some(0), "unconsumed");
+
+        append(&path, &compressed_bytes(&[0x8b]));
+        assert!(tick(&mut tailer, false).await.is_empty());
+        assert_eq!(tailer.tracked_len(), 0, "closed once the header decides it");
+        assert_eq!(skipped_compressed(&mut probe), 1.0);
+        assert_eq!(probe.sum("logit.input.lines", &[]), 0.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A text file whose first byte could open a magic is read whole once it grows past it.
+    #[tokio::test(start_paused = true)]
+    async fn a_text_file_starting_with_a_magic_prefix_is_read_once_it_grows() {
+        let dir = scratch_dir("compressed-prefix-text");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"B").unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(vec![PathPattern::new(&path)], ReadFrom::Beginning, &probe);
+        assert!(tick(&mut tailer, true).await.is_empty());
+        append(&path, b"ob\n");
+        assert_eq!(tick(&mut tailer, false).await, vec!["Bob"]);
+        assert_eq!(skipped_compressed(&mut probe), 0.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `BZh` is printable: a text log whose first line starts with it is tailed, since only a
+    /// whole bzip2 stream header is a match.
+    #[tokio::test(start_paused = true)]
+    async fn a_text_file_starting_with_bzh_is_tailed() {
+        let dir = scratch_dir("compressed-bzh-text");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"BZh9 is not a header\n").unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(vec![PathPattern::new(&path)], ReadFrom::Beginning, &probe);
+        assert_eq!(tick(&mut tailer, true).await, vec!["BZh9 is not a header"]);
+        assert_eq!(skipped_compressed(&mut probe), 0.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// logrotate shifting `.1.gz` to `.2.gz` keeps the inode: it's sniffed again under its new
+    /// name, found compressed, and not counted again.
+    #[tokio::test(start_paused = true)]
+    async fn a_skipped_file_renamed_under_the_pattern_is_not_counted_again() {
+        let dir = scratch_dir("compressed-renamed");
+        let (one, two) = (dir.join("app.log.1.gz"), dir.join("app.log.2.gz"));
+        std::fs::write(&one, compressed_bytes(&[0x1f, 0x8b])).unwrap();
+        let id = FileId::from_metadata(&std::fs::metadata(&one).unwrap());
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(
+            vec![PathPattern::new(dir.join("app.log*"))],
+            ReadFrom::Beginning,
+            &probe,
+        );
+        assert!(tick(&mut tailer, true).await.is_empty());
+        std::fs::rename(&one, &two).unwrap();
+        assert!(tick(&mut tailer, false).await.is_empty());
+        assert_eq!(tailer.skipped.get(&id).map(|s| s.path.clone()), Some(two));
+        assert_eq!(tailer.tracked_len(), 0);
+        assert_eq!(skipped_compressed(&mut probe), 1.0);
+        assert_eq!(diagnostics(&mut probe, "compressed"), 1.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A size change at a skipped path is sniffed again, since `FileId` can't tell a recycled
+    /// inode at the same path apart: rewritten in place as text, the file is tailed.
+    #[tokio::test(start_paused = true)]
+    async fn a_skipped_file_rewritten_as_text_in_place_is_tailed() {
+        let dir = scratch_dir("compressed-rewritten");
+        let path = dir.join("app.log.1");
+        std::fs::write(&path, compressed_bytes(&[0x1f, 0x8b])).unwrap();
+        let id = FileId::from_metadata(&std::fs::metadata(&path).unwrap());
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(vec![PathPattern::new(&path)], ReadFrom::Beginning, &probe);
+        assert!(tick(&mut tailer, true).await.is_empty());
+        assert!(tick(&mut tailer, false).await.is_empty(), "this scan records its size");
+        copytruncate_and_refill(&path, b"text\n");
+        assert_eq!(tick(&mut tailer, false).await, vec!["text"]);
+        assert!(!tailer.skipped.contains_key(&id));
+        assert_eq!(skipped_compressed(&mut probe), 1.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A skipped file is forgotten once a listing shows its path gone.
+    #[tokio::test(start_paused = true)]
+    async fn a_skipped_file_is_forgotten_once_its_path_is_gone() {
+        let dir = scratch_dir("compressed-gone");
+        let path = dir.join("app.log.1.gz");
+        std::fs::write(&path, compressed_bytes(&[0x1f, 0x8b])).unwrap();
+        let probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(
+            vec![PathPattern::new(dir.join("app.log*"))],
+            ReadFrom::Beginning,
+            &probe,
+        );
+        tick(&mut tailer, true).await;
+        assert_eq!(tailer.skipped.len(), 1);
+        std::fs::remove_file(&path).unwrap();
+        tick(&mut tailer, false).await;
+        assert!(tailer.skipped.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Under `inotify`, the watch `open_tracked` added for a file found undecided is removed by
+    /// the `drain` whose read skips it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_skipped_files_watch_is_removed_by_the_drain_that_skips_it() {
+        let dir = scratch_dir("compressed-unwatch");
+        let path = dir.join("app.log.1.gz");
+        std::fs::write(&path, b"").unwrap();
+        let probe = TelemetryProbe::new();
+        let (mut tailer, mut watcher) = inotify_tailer(PathPattern::new(&path), &probe);
+        tailer.scan(true, &mut watcher).await;
+        assert!(tailer.files.values().next().is_some_and(|f| f.watch.is_some()));
+        append(&path, &compressed_bytes(&[0x1f, 0x8b]));
+        let (fanout, _rx) = fanout_channel(8);
+        let (_tx, shutdown) = watch::channel(false);
+        tailer.drain(&fanout, &shutdown, &mut watcher, no_timer_due()).await;
+        assert_eq!(tailer.tracked_len(), 0);
+        assert!(tailer.unwatch.is_empty(), "drain released the watch");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -- a truncation counts what it knew was unread
+
+    /// The same, but a drain reaches the file before any scan checks its size: its zero read at
+    /// the old offset runs the truncation check, so the 10 bytes the scan saw are still counted,
+    /// and the refill is read in the same drain.
+    #[tokio::test(start_paused = true)]
+    async fn a_drain_that_reaches_a_truncation_first_still_counts_the_bytes_seen() {
+        let dir = scratch_dir("truncated-bytes-drain");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\n").unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(vec![PathPattern::new(&path)], ReadFrom::Beginning, &probe);
+        assert_eq!(tick(&mut tailer, true).await, vec!["one"]);
+
+        append(&path, b"two\nthree\n");
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        copytruncate_and_refill(&path, b"x\n");
+        drain_by_hand(&mut tailer).await;
+        assert_eq!(probe.sum("logit.input.files.truncated", &[]), 1.0);
+        assert_eq!(probe.sum("logit.input.bytes.dropped", &[("reason", "truncated")]), 10.0);
+        assert_eq!(tailer.files.values().next().map(|f| f.offset), Some(2), "the refill is read");
+        assert_eq!(tick(&mut tailer, false).await, vec!["x"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A tailed file rewritten in place with a compressed file (`cp app.log.1.gz app.log`) is
+    /// untracked, but the lines it read before the truncation, still in its accumulator, are
+    /// emitted first.
+    #[tokio::test(start_paused = true)]
+    async fn a_file_rewritten_compressed_emits_its_held_lines_before_it_is_skipped() {
+        let dir = scratch_dir("compressed-after-truncation");
+        let path = dir.join("app.log");
+        let line = "a".repeat(40);
+        std::fs::write(&path, format!("{line}\n{line}\n")).unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(vec![PathPattern::new(&path)], ReadFrom::Beginning, &probe);
+        tailer.scan(true, &mut crate::tail::watch::Watcher::Poll).await;
+        assert!(drain_by_hand(&mut tailer).await.is_empty(), "held in the accumulator");
+
+        copytruncate_and_refill(&path, &compressed_bytes(&[0x1f, 0x8b]));
+        assert_eq!(tick(&mut tailer, false).await, vec![line.clone(), line]);
+        assert_eq!(tailer.tracked_len(), 0);
+        assert_eq!(skipped_compressed(&mut probe), 1.0);
+        assert_eq!(closed_flushes(&mut probe), 1.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A scan saw the file at 14 bytes with 4 read; a copytruncate then empties it before a read
+    /// reaches the other 10, which are counted lost.
+    #[tokio::test(start_paused = true)]
+    async fn a_truncation_counts_the_bytes_last_seen_past_the_offset() {
+        let dir = scratch_dir("truncated-bytes");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\n").unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(vec![PathPattern::new(&path)], ReadFrom::Beginning, &probe);
+        assert_eq!(tick(&mut tailer, true).await, vec!["one"]);
+
+        append(&path, b"two\nthree\n");
+        tailer.scan(false, &mut crate::tail::watch::Watcher::Poll).await;
+        copytruncate_and_refill(&path, b"x\n");
+        assert_eq!(tick(&mut tailer, false).await, vec!["x"]);
+        assert_eq!(probe.sum("logit.input.files.truncated", &[]), 1.0);
+        assert_eq!(probe.sum("logit.input.bytes.dropped", &[("reason", "truncated")]), 10.0);
+        assert_eq!(probe.sum("logit.input.frames.dropped", &[]), 0.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Bytes written after the last observation are invisible: with the file read to its end
+    /// before the copytruncate, nothing is counted, though the truncation is.
+    #[tokio::test(start_paused = true)]
+    async fn a_truncation_after_a_read_to_the_end_counts_no_bytes() {
+        let dir = scratch_dir("truncated-no-bytes");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\ntwo\n").unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer = probed_tailer(vec![PathPattern::new(&path)], ReadFrom::Beginning, &probe);
+        assert_eq!(tick(&mut tailer, true).await, vec!["one", "two"]);
+        append(&path, b"unseen\n");
+        copytruncate_and_refill(&path, b"x\n");
+        assert_eq!(tick(&mut tailer, false).await, vec!["x"]);
+        assert_eq!(probe.sum("logit.input.files.truncated", &[]), 1.0);
+        assert!(!probe.poll().has("logit.input.bytes.dropped", &[("reason", "truncated")]));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

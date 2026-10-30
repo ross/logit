@@ -1,6 +1,6 @@
 ---
 created: 2026-09-06
-updated: 2026-10-24
+updated: 2026-10-29
 ---
 
 # `tail_in`: generic file tailing, and `docker_in` on top of it for Docker's json-file logs
@@ -504,8 +504,10 @@ accepts.
 **At-least-once ends at the downstream in-memory queues.** Shutdown flushes every accumulator and
 then force-writes the checkpoint, so the offset covers lines already handed to a sink's inbox. A
 sink whose own grace then drops that batch (`batches.dropped{reason="shutdown"}`) has lost it:
-the restart resumes past it. `docs/known-gaps/tailing.md` records this, along with a rotated file
-still draining at shutdown whose new name matches no pattern, which the restart never finds.
+the restart resumes past it. [ADR `tail-content-identity`](tail-content-identity.md), decision 1,
+makes this a decided limit, with `buffer.disk:` on the sink as the remedy.
+`docs/known-gaps/tailing.md` records a rotated file still draining at shutdown whose new name
+matches no pattern, which the restart never finds.
 
 ## Amendment: removal needs a successful listing, truncation is size-only, and a rejected json-file entry flushes the held fragments (2026-09-28)
 
@@ -526,8 +528,9 @@ where a scan or a read sees the length. A `copytruncate` that the writer refills
 offset before that check isn't detected: the tailer keeps its offset and reads from the middle of
 the new content, so the bytes before that offset aren't emitted during the run. A size comparison can't tell
 the two apart, and the inode is unchanged. A restart replays the file through the head fingerprint
-(decision 2), so those bytes arrive late. The window is one `poll_interval` or one wake, and it's a documented gap
-(`docs/known-gaps/tailing.md`); a writer that rotates by rename has no such window.
+(decision 2), so those bytes arrive late. The window is one `poll_interval` or one wake, and it's
+a decided limit ([ADR `tail-content-identity`](tail-content-identity.md), decision 8); a writer
+that rotates by rename has no such window.
 
 **"Checkpoints": unconsumed entries are persisted.** "A checkpoint write only persists the tailer's
 *currently tracked* files, so ... pruning falls out of the write contract" no longer holds. A write
@@ -655,3 +658,13 @@ rename does.
 `docker_in` writes the image tag as `container.image.tags`, a one-element array, OpenTelemetry's
 semantic-convention key, in place of the string `container.image.tag`
 ([ADR `process-hostname`](process-hostname.md)'s "Amendment: container identity (2026-10-24)").
+
+## Amendment: content identity, compressed files, and counted truncation (2026-10-29)
+
+[ADR `tail-content-identity`](tail-content-identity.md) amends "Rotation and truncation" and
+"Checkpoints". `(dev, ino)` stays the primary identity, and an inode no checkpoint entry matches
+may claim one by content. A compressed file is skipped and counted instead of tailed as text, and
+a truncation counts the bytes the tailer knew it hadn't read. A checkpoint entry gains an offset
+marker. `tailid/w1` and `tailid/w2` implement those decisions. That ADR's decision 1 also
+records the shutdown
+loss in the 2026-09-26 amendment as a decided limit.
