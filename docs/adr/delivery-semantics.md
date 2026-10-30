@@ -1,6 +1,6 @@
 ---
 created: 2026-09-29
-updated: 2026-10-23
+updated: 2026-10-29
 ---
 
 # Delivery semantics: at-least-once per hop, duplicates absorbed by the data model, and an effectively-once native hop
@@ -289,7 +289,11 @@ rule no longer applies to them, and a failed request's own class is the batch's.
 
 `tail_in` and `docker_in` checkpoint an offset once its lines are acknowledged as item 3
 defines it. A crash replays the lines since the last checkpoint and loses the checkpointed
-lines that were still in memory. Two records decide the details:
+lines that were still in memory, and a clean stop loses what a sink drops at its shutdown
+grace. A `buffer.disk:` sink keeps what the grace would drop, and on a crash keeps only what
+reached its spool: lines in a transform's inbox, on an edge, or in an `aggregate` window are lost
+([ADR `tail-content-identity`](tail-content-identity.md), decision 1). Two records decide the
+details:
 [ADR `file-tailing-and-docker-json-logs`](file-tailing-and-docker-json-logs.md) and
 [ADR `tail-discovery-failure-and-resume-identity`](tail-discovery-failure-and-resume-identity.md).
 

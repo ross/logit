@@ -36,6 +36,13 @@ Facts a maintainer needs here (docs/plans/soak-harness.md, "Netem scope"):
   is an `os.rename` on the host inside `<run>/shared`, which the containers mount. Neither can
   lose data on any leg, so every `affects_*` predicate is false, and neither revert does
   anything. A `rename` refuses to replace a file already at its `to`.
+- A `copytruncate`, `gzip`, or `replace` runs `fileops.py`'s source in a one-shot
+  `FILEOPS_IMAGE` container, as root and with no network, with `<run>/shared` mounted at
+  `SHARED_MOUNT`: the writer's files belong to the `logit` user in its container, which the host
+  user can't truncate. Each records what fileops.py printed, the lines it copied, compressed, or
+  wrote, and for a `copytruncate` the lines written after the copy and before the truncate
+  (`lost_lines`). Each opens no window and affects no leg: `ledger.wire` accounts for a
+  `copytruncate`'s lines from its record instead.
 - A `rotate` and a `probe` run `certs.sh` (tools/soak/netem/certs.sh) in the netem image, as
   the host user. A `rotate` issues the certificate's next generation into `<run>/tls` and
   repoints its `live` symlink there in one rename; generations count from the driver's first
@@ -56,9 +63,12 @@ import os
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from pathlib import Path
 
+from . import fileops
 from .scenario import (BACKEND_ROLE, BROKER_ROLE, GENERATOR_ROLE, IDP_ROLE, NETNS_ROLE,
-                       STANDIN_ROLE, STOP_TIMEOUT_S, SUT_ROLE, SUT_SERVICE, TLS_MOUNT)
+                       SHARED_MOUNT, STANDIN_ROLE, STOP_TIMEOUT_S, SUT_ROLE, SUT_SERVICE,
+                       TLS_MOUNT)
 
 NETEM_LIMIT = "100000"
 # The timeline key recording, per `[[ledger.source]]` wire, whether a step can affect it.
@@ -71,6 +81,15 @@ CUE_TIMEOUT_S = 10
 # holding each certificate's last generation.
 CERTS_ENTRYPOINT = "/certs.sh"
 TLS_GEN_KEY = "tls_gen"
+# The image a file operation runs in: the stand-in's (compose.yaml), so a run pulls one Python
+# image, and the source it runs there. The driver pulls the image before the schedule starts
+# (`ensure_fileops_image`): a pull inside a step could hold the tick past the driver's stall
+# bound, which ends the run. An operation's own timeout then covers a container start and a
+# copy of the writer's file.
+FILEOPS_IMAGE = "python:3.13.16-alpine3.24"
+FILEOPS_SOURCE = Path(fileops.__file__).read_text()
+FILEOPS_TIMEOUT_S = 60
+FILEOPS_PULL_TIMEOUT_S = 600
 
 
 @dataclass
@@ -189,6 +208,41 @@ def rename_apply(ctx, step):
     except OSError as err:
         return {"rc": 1, "stderr": str(err)}
     return {"rc": 0, "stderr": "", "path": step.path, "to": step.to}
+
+
+def ensure_fileops_image(docker):
+    """`None` once `FILEOPS_IMAGE` is on the daemon, pulling it if it isn't, else why not."""
+    if docker.run(["image", "inspect", FILEOPS_IMAGE]).rc == 0:
+        return None
+    result = docker.run(["pull", FILEOPS_IMAGE], timeout=FILEOPS_PULL_TIMEOUT_S)
+    if result.rc != 0:
+        return f"pulling {FILEOPS_IMAGE} failed: {result.stderr.strip()[-500:]}"
+    return None
+
+
+def file_op_apply(ctx, step):
+    """A `copytruncate`, `gzip`, or `replace` of `step.path` in `<run>/shared` (fileops.py),
+    its record carrying what the operation printed. A failed operation, or one that printed no
+    JSON object, is `rc` 1."""
+    if ctx.shared_dir is None:
+        return {"rc": 1, "stderr": "the run has no shared directory"}
+    names = [step.path] + ([step.to] if step.to is not None else [])
+    result = ctx.docker.run_oneshot(
+        ["--network", "none", "--volume", f"{ctx.shared_dir}:{SHARED_MOUNT}:z", FILEOPS_IMAGE,
+         "python", "-I", "-c", FILEOPS_SOURCE, step.action, SHARED_MOUNT, *names],
+        timeout=FILEOPS_TIMEOUT_S,
+    )
+    record = _record(result, path=step.path, **({"to": step.to} if step.to is not None else {}))
+    if result.rc == 0:
+        try:
+            done = json.loads(result.stdout.strip().splitlines()[-1])
+        except (IndexError, ValueError):
+            done = None
+        if isinstance(done, dict):
+            record.update(done)
+        else:
+            record.update(rc=1, stderr=f"no JSON object in {result.stdout.strip()[-200:]!r}")
+    return record
 
 
 def certs_argv(ctx, command, *args, network=None, read_only=False):
@@ -493,6 +547,15 @@ ACTIONS = {
         affects_file_ingress=_never,
         affects_http_ingress=_never,
     ),
+    **{name: Action(
+        apply=file_op_apply,
+        revert=no_op,
+        affects_udp_ingress=_never,
+        affects_egress=_never,
+        affects_tcp_ingress=_never,
+        affects_file_ingress=_never,
+        affects_http_ingress=_never,
+    ) for name in ("copytruncate", "gzip", "replace")},
     "rotate": Action(
         apply=rotate_apply,
         revert=no_op,
