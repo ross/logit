@@ -8,6 +8,6 @@ metadata:
 spec:
   containers:
     - name: hello
-      image: docker.io/library/busybox:1.37.0
+      image: docker.io/library/busybox:1.37.0@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec
       imagePullPolicy: IfNotPresent
       command: ["sh", "-c", "echo static hello; echo static stderr >&2; sleep 3600"]

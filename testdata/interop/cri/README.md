@@ -40,14 +40,14 @@ Pods live in the namespace `cri-fixture`, so each directory is `cri-fixture_<pod
 
 | Pod and container | Files | Construct |
 |---|---|---|
-| `edge`, `writer` | `0.log.<ts>`, `0.log` | One run, rotated by the kubelet part way through. Lines over the runtime's split size: 20,500 bytes of `y` with no newline until after a `stderr` line (a `P` run on stdout with a whole stderr record inside it), 17,384 bytes of `x`, and 16,383 `a` bytes, an e-acute, and 100 `b` bytes (containerd's 16,384-byte cut falls between the two bytes of the e-acute; conmon's pieces don't). A CRLF line, a line with an inner `\r`, an empty line, invalid UTF-8 (`\xff\xfe`), `stdout` and `stderr` interleaved, and an unterminated `held across rotation` the kubelet's reopen splits: the head is a `P` at the end of `0.log.<ts>` and ` rest` is the first record of the new `0.log`. The run ends on an unterminated line (`dangling no newline`), a final `P` |
-| `edge`, `writer` | `1.log`, `2.log`, `3.log` | Container restarts. Each run is `second run` and an unterminated `second run dangling`. Their files carry restart counts 1 to 3 |
+| `edge`, `writer` | `0.log.<ts>`, `0.log` | One run, rotated by the kubelet part way through. Lines over the runtime's split size: 20,500 bytes of `y` with no newline until after a `stderr` line (a `P` run on stdout with a whole stderr record inside it), 17,384 bytes of `x`, and 16,383 `a` bytes, an e-acute, and 100 `b` bytes (containerd's 16,384-byte cut falls between the two bytes of the e-acute; conmon's pieces don't). A CRLF line, a line with an inner `\r`, an empty line, invalid UTF-8 (`\xff\xfe`), `stdout` and `stderr` interleaved, and an unterminated `held across rotation` the kubelet's reopen splits: the head is a `P` at the end of `0.log.<ts>` and ` rest` is the first stdout record of the new `0.log`. The run ends on an unterminated line (`dangling no newline`), a final `P` |
+| `edge`, `writer` | `1.log` and later (three in `containerd/`, two in `crio/`) | Container restarts. Each run is `second run` and an unterminated `second run dangling`. The kubelet keeps restarting the container until the recording ends, so the count varies. Their files carry restart counts 1 and up |
 | `rotator`, `spin` | `0.log`, `0.log.<ts>`, two `0.log.<ts>.gz` | 850 numbered lines and an unterminated tail, rotated three times: two compressed (never read by `cri_in`), one newest rotated file left uncompressed, and the live file |
 | `static-hello-<node>`, `hello` | `0.log` | A static pod from `/etc/kubernetes/manifests`. Its directory carries the kubelet's 32-character manifest hash where a regular pod has an API uid |
 
 `symlinks.txt` holds one entry per container attempt, named
 `<pod>_<namespace>_<container>-<64 hex container id>.log`, with an absolute target under
-`/var/log/pods`. `edge` has four, one per attempt. The test checks each name against its target
+`/var/log/pods`. `edge` has one per attempt. The test checks each name against its target
 and the tree.
 
 ## What the recordings settled
@@ -57,9 +57,10 @@ rotated file names, and symlink form. Observations the ADR doesn't state:
 
 - **Timestamps.** containerd writes `Z` and trims trailing zeros, so the fraction is 6 to 9
   digits wide (`.5260678Z`). conmon writes a fixed nine digits and `+00:00`, and every record
-  from one `read(2)` carries the same time, across both streams.
-- **Split size.** containerd cut at 16,384 bytes. conmon's pieces are the size of one read:
-  8,192, 8,192, then the remainder. A line whose newline arrives in a later read ends in an
+  from one `read(2)` of a stream carries the same time.
+- **Split size.** containerd cut at 16,384 bytes. conmon's pieces are one read's bytes, 4,096
+  or 8,192 in these recordings (`y` is 4,096 four times then 4,116; `x` is 8,192, 8,192, 1,000),
+  depending on how the writer's pipe delivered them. A line whose newline arrives in a later read ends in an
   empty `F` record.
 - **A late first piece.** In a trial recording, containerd held an unterminated 16,394-byte write
   on stdout until the kubelet's reopen flushed it as a 16,384-byte `P` and a 10-byte `P`. It
@@ -83,10 +84,13 @@ rotated file names, and symlink form. Observations the ADR doesn't state:
 - `crio/versions.txt` is the script's output: the first lines of `crio --version`, the Kubernetes
   version, and the BusyBox image id. The `kubelet: not found` line is the lookup on the node's
   `PATH` that fails before the script tries `/var/lib/minikube/binaries/`.
-- `containerd/` was recorded with the pod image named `busybox:1.37.0`; the pod specs now say
-  `docker.io/library/busybox:1.37.0`, which CRI-O needs to resolve a short name and containerd
-  treats as the same reference.
-- Each directory is about 150 KB, mostly the 55 KB rotated `edge` file and the rotator's files.
+- Both recordings ran BusyBox 1.37.0, index digest
+  `sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec`; the CRI-O node's
+  `versions.txt` shows the amd64 manifest inside it, `66a6306db78bf`. The recordings pulled the
+  tag `busybox:1.37.0`; the pod specs now pin that digest, which is the one the tag resolved to
+  when the containerd recording ran, and use the full `docker.io/library` name that CRI-O needs.
+- Each directory is about 110 KB: 110,555 bytes for `containerd/` and 114,080 for `crio/`, mostly
+  the 55 KB rotated `edge` file and the rotator's files. Rotation needs files over 24 KiB.
 
 ## Recording notes
 
@@ -104,3 +108,14 @@ rotated file names, and symlink form. Observations the ADR doesn't state:
 `fuzz/seedgen` reads the uncompressed files here and writes a few records of each as seeds for the
 `cri` fuzz target: the first two short records, the first `P`, the first empty one, and the first
 with invalid UTF-8. Regenerate them with `script/unsafe-check fuzz-seed` after a new recording.
+
+## What isn't covered here (yet)
+
+- Other runtimes and versions: one containerd (2.3.4) and one CRI-O (1.35.7), each on Kubernetes
+  v1.37.0. cri-dockerd's Docker-format files and older conmon versions aren't recorded.
+- `containerLogMaxFiles` pruning: the kubelet kept every rotated file, so no recording shows it
+  deleting the oldest.
+- A line over `max_line_bytes`: no pod writes one, so the oversize drop is covered only by unit
+  tests.
+- A TTY container.
+- Non-UTC node time zones, which give containerd a `+hh:mm` offset instead of `Z`.

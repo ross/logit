@@ -441,14 +441,14 @@ fn cri_lines() -> Vec<(&'static str, Vec<u8>)> {
 }
 
 /// A few records of each uncompressed file under `testdata/interop/cri/<runtime>/pods/`: the first
-/// two short ones, the first `P` record, the first empty one, and the first whose content isn't
+/// two short ones, the first `P` record of at most 9000 bytes, the first empty one, and the first whose content isn't
 /// UTF-8. A record is one line without its terminator, which is what `cri::parse` reads. Names
 /// leave out the pod uid and the rotation time, which change between recordings.
 fn cri_recorded_seeds(testdata: &Path) -> std::io::Result<Vec<(String, Vec<u8>)>> {
     const SHORT: usize = 300;
     const LONG: usize = 9000;
     let mut out = Vec::new();
-    let mut sorted_entries = |dir: &Path| -> std::io::Result<Vec<std::path::PathBuf>> {
+    let sorted_entries = |dir: &Path| -> std::io::Result<Vec<std::path::PathBuf>> {
         let mut paths = std::fs::read_dir(dir)?
             .map(|e| e.map(|e| e.path()))
             .collect::<std::io::Result<Vec<_>>>()?;

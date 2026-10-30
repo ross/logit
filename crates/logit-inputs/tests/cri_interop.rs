@@ -42,10 +42,13 @@ struct Raw {
     stream: String,
     tag: String,
     content: Vec<u8>,
+    /// The record begins a line: the previous record of its stream in the same file closed a
+    /// line (an `F`), or there is none.
+    starts: bool,
 }
 
 fn raw_records(bytes: &[u8]) -> Vec<Raw> {
-    let mut records = Vec::new();
+    let mut records: Vec<Raw> = Vec::new();
     for line in bytes.split(|&b| b == b'\n') {
         if line.is_empty() {
             continue;
@@ -54,7 +57,8 @@ fn raw_records(bytes: &[u8]) -> Vec<Raw> {
         let mut next = || String::from_utf8(fields.next().unwrap().to_vec()).unwrap();
         let (time, stream, tag) = (next(), next(), next());
         let content = fields.next().unwrap_or_default().to_vec();
-        records.push(Raw { time, stream, tag, content });
+        let starts = records.iter().rfind(|r| r.stream == stream).is_none_or(|r| r.tag == "F");
+        records.push(Raw { time, stream, tag, content, starts });
     }
     records
 }
@@ -256,25 +260,26 @@ fn all_raw(dir: &Path, only: impl Fn(&str) -> bool) -> Vec<Raw> {
     names.iter().flat_map(|n| raw_records(&std::fs::read(dir.join(n)).unwrap())).collect()
 }
 
-/// Each delivered line's time is its first record's: the first raw record of the same stream
-/// whose content starts the line (the whole line when it is short).
+/// Each delivered line's time is its first record's: the first raw record of the same stream that
+/// begins a line and whose content starts with the line (the whole line when it is short).
 fn assert_first_record_time(delivered: &[&Delivered], raw: &[Raw], expected_bytes: &[Vec<u8>]) {
     assert_eq!(delivered.len(), expected_bytes.len());
     for (d, want) in delivered.iter().zip(expected_bytes) {
         let head = &want[..want.len().min(64)];
-        let mut times = raw.iter().filter(|r| {
-            r.stream == d.stream
-                && if want.len() <= 64 { r.content == head } else { r.content.starts_with(head) }
-        });
         let what = s(head);
-        if want.len() > 64 {
-            // A long line is unique: its first record is the one that starts it.
-            let first = times.next().unwrap_or_else(|| panic!("no record starts {what:?}"));
-            assert_eq!(d.timestamp, nanos(&first.time), "time of {what:?}");
-        } else {
-            // A short line can repeat (several empty lines), so any identical record's time fits.
-            assert!(times.any(|r| nanos(&r.time) == d.timestamp), "time of {what:?}");
-        }
+        let first = raw
+            .iter()
+            .find(|r| {
+                r.starts
+                    && r.stream == d.stream
+                    && if want.len() <= 64 {
+                        r.content == head
+                    } else {
+                        r.content.starts_with(head)
+                    }
+            })
+            .unwrap_or_else(|| panic!("no record starts {what:?}"));
+        assert_eq!(d.timestamp, nanos(&first.time), "time of {what:?}");
     }
 }
 

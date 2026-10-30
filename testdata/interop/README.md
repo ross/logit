@@ -218,8 +218,13 @@ messages per construct is the right size. Keep fixtures to these rough sizes:
 - **Prometheus scrape:** about 150 KB at most for the whole corpus, since a scrape body is a whole
   exporter's output and can't be trimmed; shrink it by dropping a collector. As of 2026-10-09 its
   three bodies total about 31 KB.
-- **Whole directory:** well under 100 KB total. As of 2026-09-25, the fixtures, excluding READMEs,
-  total about 92 KB.
+- **CRI container logs:** about 110 KB per runtime directory. The kubelet rotates a log only past
+  its `containerLogMaxSize`, and the recording needs rotated, compressed, and live files, so the
+  pods write files over 24 KiB and a line over 16 KiB; trimming the payloads means a smaller
+  rotation limit and a new recording.
+- **Whole directory:** no fixed bound. As of 2026-10-30, the fixtures excluding READMEs total about
+  410 KB: about 225 KB of CRI logs and about 180 KB for everything else. The earlier "well under
+  100 KB" (92 KB as of 2026-09-25) no longer holds.
 
 The sibling tree [`../differential/`](../differential/README.md) isn't counted here. It holds
 generated cases, not captures, and its README gives its own size.

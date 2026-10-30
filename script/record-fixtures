@@ -1251,6 +1251,8 @@ cri_teardown() {
         cri_as_root "${CRI_WORK}/minikube" delete -p "${CRIO_PROFILE}" >/dev/null 2>&1 || true
     fi
     ${DOCKER} rm -f -v "${CRI_NODE}" "${CRIO_PROFILE}" >/dev/null 2>&1 || true
+    # minikube keeps a named volume for its node, which `rm -v` leaves.
+    ${DOCKER} volume rm "${CRIO_PROFILE}" "${CRI_NODE}" >/dev/null 2>&1 || true
     ${DOCKER} network rm "${CRIO_PROFILE}" >/dev/null 2>&1 || true
 }
 
