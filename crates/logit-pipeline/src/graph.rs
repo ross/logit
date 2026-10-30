@@ -4857,10 +4857,6 @@ fn check_recover_below(id: &str, block: &str, value: f64) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Rules 17/18/57's datagram predicate: the kinds the datagram listener driver backs
-/// (`logit-inputs::udp::UdpListener`, `docs/adr/decoupled-listener-io.md`), a Unix datagram
-/// `statsd_in` or `lines_in` included. An explicit list, not
-/// [`Role`], so a new listener kind rejects `receive:` until it is wired to a driver.
 /// Whether a sink of `kind` keeps a window open across arrivals through `Output::collecting`
 /// (`docs/adr/collecting-sink-window.md`). Rule 35 reads it: beside `buffer.disk:`, such a sink's
 /// `buffer.max_bytes` bounds its window's decoded batches. No kind does.
@@ -4869,6 +4865,10 @@ fn collects_windows(kind: &ComponentKind) -> bool {
     false
 }
 
+/// Rules 17/18/57's datagram predicate: the kinds the datagram listener driver backs
+/// (`logit-inputs::udp::UdpListener`, `docs/adr/decoupled-listener-io.md`), a Unix datagram
+/// `statsd_in` or `lines_in` included. An explicit list, not
+/// [`Role`], so a new listener kind rejects `receive:` until it is wired to a driver.
 fn is_datagram_listener(kind: &ComponentKind) -> bool {
     matches!(
         kind,

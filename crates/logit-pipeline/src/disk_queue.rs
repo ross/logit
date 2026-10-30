@@ -1793,9 +1793,9 @@ impl DiskQueue {
     }
 
     /// Waits for the `n`-th record from the head, as [`DiskQueue::peek_at`] reads it, until
-    /// `deadline`: [`StoreWait::Pressure`] while the store-pressure signal is raised, checked
-    /// first, else the record once one is readable, else [`StoreWait::Closed`] once the queue is
-    /// closed, else [`StoreWait::Deadline`] at `deadline`. Reserves records `0..=n` only when it
+    /// `deadline`: the record once one is readable, else [`StoreWait::Pressure`] while the
+    /// store-pressure signal is raised, else [`StoreWait::Closed`] once the queue is closed, else
+    /// [`StoreWait::Deadline`] at `deadline`. Reserves records `0..=n` only when it
     /// returns the record. Cancellation-safe, as `peek_at` is: a read dropped mid-way caches
     /// nothing.
     pub async fn wait_at(&self, n: usize, deadline: tokio::time::Instant) -> StoreWait<StoreItem> {
@@ -1804,11 +1804,11 @@ impl DiskQueue {
             // lands after a check still wakes this wait.
             let notified = self.not_empty.notified();
             let raised = self.watch.pressure_raised();
-            if self.watch.under_pressure() {
-                return StoreWait::Pressure;
-            }
             if let Some(item) = self.peek_at(n).await {
                 return StoreWait::Item(item);
+            }
+            if self.watch.under_pressure() {
+                return StoreWait::Pressure;
             }
             if self.closed() {
                 return StoreWait::Closed;

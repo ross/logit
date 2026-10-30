@@ -109,7 +109,8 @@ read before the next window opens.
   never-waits contract.
 - **The fill loop.** At each position, when `peek_at` returns `None` and `collecting()` returns
   `Some(deadline)`, the loop waits for that position until `deadline`, store pressure, the store
-  closing, or the shutdown signal, then submits on `Item` and stops the fill on anything else. It
+  closing, or the shutdown signal, then submits on `Item` and stops the fill on anything else. A
+  batch the store already holds is taken without waiting, under pressure too (decision 3). It
   reads `collecting()` again after each submit and stops on `None`. It also stops at
   `min(window, store.max_in_flight())`, so a memory store still caps an open window at
   `buffer.max_batches`.
@@ -144,8 +145,13 @@ read before the next window opens.
   otherwise grow past its bound for as long as the window collects. The signal clears once the
   store is back under its bounds with no push waiting. The
   memory store raises it against `buffer.max_batches` and `buffer.max_bytes`, and the disk store
-  against `disk.max_bytes`. The wait primitive returns `Pressure` while it's raised, and the fill
-  checks it before each submit.
+  against `disk.max_bytes`. The wait primitive returns `Pressure` while it's raised and no item is
+  at the position it waits for, so pressure ends only the wait for new arrivals. It never stops
+  the window taking a batch the store already holds. That batch grows neither store: a memory
+  store already counts it, and the memory bound limits what a disk store reads ahead. Closing
+  frees only the one slot the next push takes, so a window that checked pressure before each
+  batch it took would close at one batch, and every object would be one batch for as long as the
+  overload lasts.
 - **Why the window closes on it.** Under `block`, a window held open stalls every source feeding
   the sink until the deadline; closing it starts the upload that commits the staged batches and
   frees the room. Under a drop policy, closing it bounds the shedding to the time the upload
@@ -154,7 +160,9 @@ read before the next window opens.
 - **What `drop_oldest` does under a collecting window.** The batches in an open or uploading
   window are reserved, so `drop_oldest` sheds the oldest batch behind the window, which arrived
   after the window closed: in effect the newest. A memory store with nothing unreserved accepts
-  one push over its bound, as it does under any window, and the next push evicts it. The disk
+  one push over its bound, as it does under any window, and the next push evicts it. An open
+  window takes that batch like any other the store holds and then closes on the memory bound, so
+  the store holds at most one batch over its bound. The disk
   store already behaves this way while any record is read ahead. The operator docs say so beside
   `buffer.overflow`; validation doesn't reject the combination, since it runs as written.
 
@@ -267,10 +275,11 @@ W2 settled these, which the decisions above leave open:
   submit. A `Some` there opens a collecting window; a `None` leaves the ordinary fill, which ends
   at the first empty `peek_at`, so a sink that closes its window at its first batch gets no wait.
 - **The order of the checks before each submit past the head:** `collecting()` reading `None`
-  (`full`), the deadline passed, the memory bound, then pressure. The deadline is checked even
-  when the store has a batch ready, so a store that never empties can't hold a window open past
-  its deadline. Only then does an empty `peek_at` wait (decision 2), and after the shutdown signal
-  it closes the window instead (`shutdown`).
+  (`full`), the deadline passed, then the memory bound. The deadline is checked even when the
+  store has a batch ready, so a store that never empties can't hold a window open past its
+  deadline. Pressure isn't among them (decision 3). Only an empty `peek_at` waits (decision 2),
+  and after the shutdown signal it closes the window instead (`shutdown`). The wait checks for an
+  item before pressure, so a batch that arrives with pressure raised still joins the window.
 - **A window a submit failure ends isn't counted** in `logit.component.window.closed`: it never
   completes, and the loop reopens it from the head (decision 2's poisoned window), whose close is
   counted.
