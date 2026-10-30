@@ -371,7 +371,9 @@ Recorded per workstream as each lands.
   has no decode budget to reuse: `otlp_in`'s one bound is its 4 MiB cap on an HTTP body, so an
   OTLP record is bounded by `max_batch_bytes` alone. A request's batches needed no change to the
   input: a record's batches always fall in one cut, which is marked after its last batch. A logs
-  request on the metrics topic is `undecodable` under `otlp_proto` but reads as an empty request
-  under `otlp_json`, which ignores fields it doesn't know. `kafka_out` never writes a request of
+  request on the metrics topic is `undecodable` under both encodings. OTLP/JSON ignores a field it
+  doesn't know, so under `otlp_json` such a request decodes to no event, and the input reads its
+  top-level `resourceLogs`, `resourceMetrics`, or `resourceSpans` key to tell it from an empty
+  request. `kafka_out` never writes a request of
   several resources, so the test builds one by concatenating two protobuf requests. The OTLP
   encoder stamps a log with no observed time with the clock, so the split round trip sets one.
