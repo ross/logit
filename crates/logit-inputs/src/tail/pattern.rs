@@ -6,7 +6,8 @@
 //! match never matches, like an empty directory.
 //!
 //! [`PathPattern::docker_containers`] isn't a glob: it's `docker_in`'s two-level walk under
-//! `root`.
+//! `root`. Nor is [`PathPattern::pod_logs`], `cri_in`'s three-level walk of the kubelet's pod log
+//! directory.
 //!
 //! **A failure to look is no information.** A scan that couldn't list a directory or `stat` a
 //! path says nothing about whether a tracked file is still there, so `Tailer::scan` (`driver.rs`)
@@ -16,11 +17,13 @@
 //!
 //! | Operation | Ok | `NotFound` / `NotADirectory` | Other error |
 //! |---|---|---|---|
-//! | `read_dir(dir)`, either matcher | list | `Ok(Scan::default())`: an empty listing, not counted (the "not there yet" case) | `Err`: the listing failed |
+//! | `read_dir(dir)`, any matcher | list | `Ok(Scan::default())`: an empty listing, not counted (the "not there yet" case) | `Err`: the listing failed |
 //! | a `ReadDir` iterator item | use | `Err` (the listing is incomplete) | `Err` |
+//! | pods `read_dir` of a pod or container directory, or an item of it | list | absent (removed mid-walk) | [`Scan::failed_dirs`]: that subtree's listing failed |
+//! | pods `entry.file_type()` of a pod or container directory | a directory is walked; anything else is absent (a symlink isn't followed) | absent | [`Scan::failed_dirs`] |
 //! | docker `entry.file_type()` | a directory is walked; anything else is absent (a symlink isn't followed) | absent | [`Scan::unknown`] (the built log path) |
 //! | docker log-path `metadata` | a regular file is matched; anything else is absent | absent (the log isn't written yet; a later scan finds it) | [`Scan::unknown`] |
-//! | `Tailer::scan`'s per-path `metadata`, once per distinct matched path | a regular file is discovered; anything else is absent | absent | unknown |
+//! | `Tailer::scan`'s per-path `metadata`, once per distinct matched path | a regular file, or a symlink to one (a cri-dockerd pods entry), is discovered as its target's inode; anything else is absent | absent, a dangling symlink included | unknown |
 //!
 //! A name that isn't UTF-8 is skipped: no pattern can name it. A tracked path that is absent is
 //! retired. A tracked path that is unknown, or that a failed listing [covers](PathPattern::covers),
@@ -56,6 +59,8 @@ enum Matcher {
     Wildcard { prefix: String, suffix: String },
     /// `docker_in`'s discovery; see [`PathPattern::docker_containers`].
     DockerContainers,
+    /// `cri_in`'s discovery; see [`PathPattern::pod_logs`].
+    PodLogs,
 }
 
 /// What one [`PathPattern::scan`] found.
@@ -68,6 +73,9 @@ pub struct Scan {
     pub unknown: Vec<PathBuf>,
     /// The error that put `unknown[0]` there, for the driver's `scan_error` diagnostic.
     pub first_unknown_error: Option<io::Error>,
+    /// Directories below the pattern's own whose listing failed (`cri_in` only), with the error:
+    /// no path under one is known to be gone.
+    pub failed_dirs: Vec<(PathBuf, io::Error)>,
 }
 
 impl Scan {
@@ -114,6 +122,17 @@ impl PathPattern {
         Self { dir: root.into(), matcher: Matcher::DockerContainers }
     }
 
+    /// `cri_in`'s discovery: every `<root>/<namespace>_<pod>_<uid>/<container>/<file>` whose pod
+    /// directory splits into its three parts ([`pod_dir_parts`]), whose container directory
+    /// name is valid ([`is_container_dir`]), and whose file name is a live or uncompressed
+    /// rotated log ([`log_restart_count`]). Directories are walked without following a symlink;
+    /// a file name is matched whatever it is, and `Tailer::scan`'s `stat` decides. Anything
+    /// else is skipped uncounted, as a name outside a glob is (`docs/adr/cri-container-logs.md`,
+    /// section 2).
+    pub fn pod_logs(root: impl Into<PathBuf>) -> Self {
+        Self { dir: root.into(), matcher: Matcher::PodLogs }
+    }
+
     pub fn dir(&self) -> &Path {
         &self.dir
     }
@@ -135,7 +154,8 @@ impl PathPattern {
                     && name.starts_with(prefix.as_str())
                     && name.ends_with(suffix.as_str())
             }
-            Matcher::DockerContainers => false, // scan() below never calls this for this variant
+            // scan() below never calls this for these variants
+            Matcher::DockerContainers | Matcher::PodLogs => false,
         }
     }
 
@@ -153,6 +173,14 @@ impl PathPattern {
                     && dir_name.is_some_and(|dir_name| {
                         file_name.and_then(|f| f.strip_suffix("-json.log")) == Some(dir_name)
                     })
+            }
+            Matcher::PodLogs => {
+                let container_dir = path.parent();
+                let pod_dir = container_dir.and_then(Path::parent);
+                pod_dir.and_then(Path::parent) == Some(self.dir.as_path())
+                    && name_of(pod_dir).and_then(pod_dir_parts).is_some()
+                    && name_of(container_dir).is_some_and(is_container_dir)
+                    && file_name.and_then(log_restart_count).is_some()
             }
             Matcher::Literal(_) | Matcher::Wildcard { .. } => {
                 path.parent() == Some(self.dir.as_path())
@@ -183,11 +211,39 @@ impl PathPattern {
             };
             if self.matcher == Matcher::DockerContainers {
                 self.scan_container(&entry, &name, &mut out);
+            } else if self.matcher == Matcher::PodLogs {
+                if pod_dir_parts(&name).is_some() {
+                    self.scan_pod(&entry, self.dir.join(name), &mut out);
+                }
             } else if self.matches_name(&name) {
                 out.matched.push(self.dir.join(name));
             }
         }
         Ok(out)
+    }
+
+    /// One pod directory of `cri_in`'s walk: each valid container directory in it, and each log
+    /// name in those.
+    fn scan_pod(&self, entry: &DirEntry, pod_dir: PathBuf, out: &mut Scan) {
+        if !walkable(entry, &pod_dir, out) {
+            return;
+        }
+        let Some(containers) = list_dir(&pod_dir, out) else { return };
+        for (name, entry) in containers {
+            if !is_container_dir(&name) {
+                continue;
+            }
+            let container_dir = pod_dir.join(&name);
+            if !walkable(&entry, &container_dir, out) {
+                continue;
+            }
+            let Some(files) = list_dir(&container_dir, out) else { continue };
+            for (file, _) in files {
+                if log_restart_count(&file).is_some() {
+                    out.matched.push(container_dir.join(file));
+                }
+            }
+        }
     }
 
     /// One `root` entry of `docker_in`'s walk: `<root>/<name>/<name>-json.log` if `name` is a
@@ -213,9 +269,216 @@ impl PathPattern {
     }
 }
 
+/// Whether a directory `entry` at `path` is one to walk: a directory, not a symlink to one. A type
+/// that can't be read puts `path` in [`Scan::failed_dirs`].
+fn walkable(entry: &DirEntry, path: &Path, out: &mut Scan) -> bool {
+    match fault::check(STAT, path, 0).and_then(|()| entry.file_type()) {
+        Ok(file_type) => file_type.is_dir(),
+        Err(err) if is_absent(&err) => false,
+        Err(err) => {
+            out.failed_dirs.push((path.to_path_buf(), err));
+            false
+        }
+    }
+}
+
+/// `dir`'s UTF-8 entries, or `None` when it's gone (absent) or its listing failed (recorded in
+/// [`Scan::failed_dirs`]). An entry's error fails the whole listing, as for `root`.
+fn list_dir(dir: &Path, out: &mut Scan) -> Option<Vec<(String, DirEntry)>> {
+    let listing = fault::check(READ_DIR, dir, 0).and_then(|()| std::fs::read_dir(dir));
+    let entries = match listing {
+        Ok(entries) => entries,
+        Err(err) if is_absent(&err) => return None,
+        Err(err) => {
+            out.failed_dirs.push((dir.to_path_buf(), err));
+            return None;
+        }
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        match fault::check(READ_DIR, dir, 0).and(entry) {
+            Ok(entry) => {
+                if let Ok(name) = entry.file_name().into_string() {
+                    names.push((name, entry));
+                }
+            }
+            Err(err) if is_absent(&err) => return None,
+            Err(err) => {
+                out.failed_dirs.push((dir.to_path_buf(), err));
+                return None;
+            }
+        }
+    }
+    Some(names)
+}
+
+/// `path`'s final component, when there is one and it's UTF-8.
+pub(crate) fn name_of(path: Option<&Path>) -> Option<&str> {
+    path.and_then(Path::file_name).and_then(|n| n.to_str())
+}
+
+/// A kubelet pod directory name, `<namespace>_<pod name>_<pod uid>`, split at its first two `_`:
+/// a namespace and a pod name can't hold one, and the rest is the uid, which a static pod's
+/// manifest can set to anything. `None` unless all three parts are non-empty.
+pub(crate) fn pod_dir_parts(name: &str) -> Option<(&str, &str, &str)> {
+    let mut parts = name.splitn(3, '_');
+    let namespace = parts.next().filter(|p| !p.is_empty())?;
+    let pod = parts.next().filter(|p| !p.is_empty())?;
+    let uid = parts.next().filter(|p| !p.is_empty())?;
+    Some((namespace, pod, uid))
+}
+
+/// Whether `name` can be a kubelet container directory: non-empty, with no `_` or `.`, which a
+/// container name (a DNS label) can't hold.
+pub(crate) fn is_container_dir(name: &str) -> bool {
+    !name.is_empty() && !name.contains(['_', '.'])
+}
+
+/// The restart count a kubelet log file name carries: `<n>.log`, the live file, or
+/// `<n>.log.<YYYYMMDD-HHMMSS>`, a rotated one not yet compressed, where `<n>` is decimal digits
+/// that fit an `i64`. `None` for every other name, `.gz` and `.tmp` included.
+pub(crate) fn log_restart_count(name: &str) -> Option<i64> {
+    let (count, rest) = name.split_once(".log")?;
+    let rotated = match rest.strip_prefix('.') {
+        None if rest.is_empty() => true,
+        Some(stamp) => is_rotation_stamp(stamp),
+        None => false,
+    };
+    if !rotated || count.is_empty() || !count.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    count.parse().ok()
+}
+
+/// `YYYYMMDD-HHMMSS`, the kubelet's rotation suffix, by shape.
+fn is_rotation_stamp(stamp: &str) -> bool {
+    let b = stamp.as_bytes();
+    b.len() == 15
+        && b[8] == b'-'
+        && b[..8].iter().all(u8::is_ascii_digit)
+        && b[9..].iter().all(u8::is_ascii_digit)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pod_log_names_follow_the_kubelet_layout() {
+        assert_eq!(pod_dir_parts("default_web-0_1b2c-3d"), Some(("default", "web-0", "1b2c-3d")));
+        assert_eq!(
+            pod_dir_parts("kube-system_etcd_my_static_uid"),
+            Some(("kube-system", "etcd", "my_static_uid"))
+        );
+        for bad in ["default_web", "default__uid", "_web_uid", "default_web_", "plain"] {
+            assert_eq!(pod_dir_parts(bad), None, "{bad}");
+        }
+        assert!(is_container_dir("nginx"));
+        for bad in ["", "a_b", "a.b"] {
+            assert!(!is_container_dir(bad), "{bad}");
+        }
+        assert_eq!(log_restart_count("0.log"), Some(0));
+        assert_eq!(log_restart_count("12.log.20261030-141516"), Some(12));
+        assert_eq!(log_restart_count("9223372036854775807.log"), Some(i64::MAX));
+        for bad in [
+            "0.log.20261030-141516.gz",
+            "0.log.tmp",
+            "0.log.1",
+            "0.log.new",
+            "0.log.2026103-141516",
+            "0.log.20261030_141516",
+            ".log",
+            "+1.log",
+            "x.log",
+            "9223372036854775808.log",
+            "0.logx",
+        ] {
+            assert_eq!(log_restart_count(bad), None, "{bad}");
+        }
+    }
+
+    /// A scratch pods tree: one valid pod with a live, a rotated, a compressed, and a tmp file,
+    /// and the shapes the walk skips.
+    fn pods_tree(label: &str) -> (PathBuf, Vec<PathBuf>) {
+        let root = crate::tail::test_support::scratch_dir(label);
+        let container = root.join("default_web-0_0123-abcd").join("nginx");
+        std::fs::create_dir_all(&container).unwrap();
+        for name in ["0.log", "0.log.20261030-141516", "0.log.20261029-101010.gz", "0.log.tmp"] {
+            std::fs::write(container.join(name), b"").unwrap();
+        }
+        for skipped in ["default_web-0", "notapod", "default_web-0_0123-abcd/bad.name"] {
+            std::fs::create_dir_all(root.join(skipped)).unwrap();
+            std::fs::write(root.join(skipped).join("0.log"), b"").unwrap();
+        }
+        std::fs::create_dir_all(root.join("default_web-0_0123-abcd/bad.name/x")).unwrap();
+        std::fs::write(root.join("default_web-0_0123-abcd/bad.name/x/0.log"), b"").unwrap();
+        // A symlinked container directory isn't followed.
+        std::os::unix::fs::symlink(&container, root.join("default_web-0_0123-abcd/linked"))
+            .unwrap();
+        let mut want = vec![container.join("0.log"), container.join("0.log.20261030-141516")];
+        want.sort();
+        (root, want)
+    }
+
+    #[test]
+    fn pod_logs_finds_live_and_uncompressed_rotated_files_only() {
+        let (root, want) = pods_tree("pattern-pods");
+        let p = PathPattern::pod_logs(&root);
+        let scan = p.scan().unwrap();
+        let mut matched = scan.matched;
+        matched.sort();
+        assert_eq!(matched, want);
+        assert!(scan.unknown.is_empty() && scan.failed_dirs.is_empty());
+        assert_eq!(p.dir(), root.as_path());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn pod_logs_covers_agrees_with_scan() {
+        let (root, want) = pods_tree("pattern-pods-covers");
+        let p = PathPattern::pod_logs(&root);
+        let mut every = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.symlink_metadata().unwrap().is_dir() {
+                    stack.push(path);
+                } else {
+                    every.push(path);
+                }
+            }
+        }
+        assert!(every.len() > want.len());
+        for path in &every {
+            assert_eq!(p.covers(path), want.contains(path), "{}", path.display());
+        }
+        assert!(!p
+            .covers(&root.with_file_name("elsewhere").join("default_web-0_0123-abcd/nginx/0.log")));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// An unreadable container directory is a failed subtree, not an empty one: the driver keeps
+    /// what it tracks there.
+    #[test]
+    fn pod_logs_reports_a_failed_subdirectory_listing() {
+        let (root, want) = pods_tree("pattern-pods-failed");
+        let other = root.join("default_db-0_4567-ef01").join("pg");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("0.log"), b"").unwrap();
+
+        let scope = fault::scope(&other);
+        scope.fail(READ_DIR, fault::errno::EACCES);
+        let scan = PathPattern::pod_logs(&root).scan().unwrap();
+        let mut matched = scan.matched;
+        matched.sort();
+        assert_eq!(matched, want);
+        assert_eq!(scan.failed_dirs.len(), 1);
+        assert_eq!(scan.failed_dirs[0].0, other);
+        assert_eq!(scan.failed_dirs[0].1.raw_os_error(), Some(fault::errno::EACCES));
+        drop(scope);
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     #[test]
     fn a_literal_path_matches_only_its_own_name() {

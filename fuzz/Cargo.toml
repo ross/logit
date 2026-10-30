@@ -123,6 +123,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "cri"
+path = "fuzz_targets/cri.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "forwarded"
 path = "fuzz_targets/forwarded.rs"
 test = false
