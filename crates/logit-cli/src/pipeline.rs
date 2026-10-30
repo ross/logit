@@ -26,6 +26,7 @@ use logit_inputs::generate::{GenerateInput, GenerateMetricKind};
 use logit_inputs::graphite::GraphiteInput;
 use logit_inputs::influxdb::InfluxDbInput;
 use logit_inputs::internal::InternalInput;
+use logit_inputs::kafka::{KafkaInFormat, KafkaInSettings, KafkaInput};
 use logit_inputs::lines::LinesInput;
 use logit_inputs::logit::LogitInput;
 use logit_inputs::otlp::{OtlpInput, OtlpTransport as OtlpInTransport};
@@ -978,6 +979,31 @@ pub(crate) fn build_spec(
                     metric.value,
                 )?;
             }
+            NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
+        }
+
+        KafkaIn { tls, .. } => {
+            let diag = Diagnostics::new(id).with_telemetry(telemetry.clone());
+            let mut settings = kafka_in_settings(id, &component.kind, &component.receive)?;
+            if let Some(tls) = tls {
+                if tls.insecure_skip_verify {
+                    diag.warn(
+                        "tls.insecure_skip_verify is set -- the connection is encrypted, but this \
+                         input will accept any certificate a broker presents, self-signed or \
+                         otherwise",
+                    );
+                }
+                let config = logit_pipeline::tls::build_client_config(
+                    &to_tls_client_settings(tls),
+                    base_dir,
+                    tls_reloader,
+                    &diag,
+                    &telemetry,
+                )?;
+                settings.consumer.tls = Some(Arc::new(config));
+            }
+            let input =
+                KafkaInput::new(settings).with_diagnostics(diag).with_telemetry(telemetry.clone());
             NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
 
@@ -2002,6 +2028,108 @@ fn kafka_settings(id: &str, kind: &logit_config::ComponentKind) -> anyhow::Resul
         headers: headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         client_id: format!("logit-{id}"),
         sasl: sasl.clone().map(kafka_sasl).transpose()?,
+    })
+}
+
+/// The settings of `kind`, a `kafka_in` named `id`, with `receive`'s batch bounds and grace. A
+/// format `kafka_in` doesn't read yet fails here, at `logit run`'s startup, so `logit validate`
+/// keeps accepting every value the schema does.
+fn kafka_in_settings(
+    id: &str,
+    kind: &logit_config::ComponentKind,
+    receive: &logit_config::ReceiveConfig,
+) -> anyhow::Result<KafkaInSettings> {
+    use logit_kafka::consumer::{
+        Assignor, ConsumerSettings, FetchBounds, Isolation, StartPosition,
+    };
+    let logit_config::ComponentKind::KafkaIn {
+        brokers,
+        topics,
+        group,
+        format,
+        record,
+        client_id,
+        start,
+        isolation,
+        assignment,
+        session_timeout,
+        heartbeat_interval,
+        rebalance_timeout,
+        drain_timeout,
+        commit_interval,
+        fetch,
+        max_batch_bytes,
+        timeout,
+        sasl,
+        ..
+    } = kind
+    else {
+        anyhow::bail!("{} isn't a kafka_in", graph::kind_name(kind));
+    };
+    let format = match format {
+        logit_config::KafkaFormat::Json => KafkaInFormat::Json,
+        logit_config::KafkaFormat::Native => KafkaInFormat::Native,
+        logit_config::KafkaFormat::Text => {
+            KafkaInFormat::Text { batch: *record == Some(logit_config::KafkaRecord::Batch) }
+        }
+        other @ (logit_config::KafkaFormat::Msgpack
+        | logit_config::KafkaFormat::OtlpProto
+        | logit_config::KafkaFormat::OtlpJson) => {
+            let name = match other {
+                logit_config::KafkaFormat::Msgpack => "msgpack",
+                logit_config::KafkaFormat::OtlpProto => "otlp_proto",
+                _ => "otlp_json",
+            };
+            anyhow::bail!(
+                "component '{id}': kafka_in can't read 'format: {name}' yet -- it reads json, \
+                 text, and native"
+            )
+        }
+    };
+    let topics = match topics {
+        logit_config::KafkaInTopics::List(list) => list.clone(),
+        logit_config::KafkaInTopics::Signals(map) => map.values().cloned().collect(),
+    };
+    // Rule 100 bounds every byte count by 64 MiB or `max_batch_bytes`' u64; these saturate.
+    let bytes = |n: u64| i32::try_from(n).unwrap_or(i32::MAX);
+    let mut consumer = ConsumerSettings::new(brokers.clone(), group, topics);
+    consumer.client_id = client_id.clone();
+    consumer.assignment = match assignment {
+        logit_config::KafkaAssignment::Range => Assignor::Range,
+        logit_config::KafkaAssignment::Roundrobin => Assignor::RoundRobin,
+    };
+    consumer.start = match start {
+        logit_config::KafkaStart::Latest => StartPosition::Latest,
+        logit_config::KafkaStart::Earliest => StartPosition::Earliest,
+    };
+    consumer.isolation = match isolation {
+        logit_config::KafkaIsolation::ReadUncommitted => Isolation::ReadUncommitted,
+        logit_config::KafkaIsolation::ReadCommitted => Isolation::ReadCommitted,
+    };
+    consumer.session_timeout = *session_timeout;
+    consumer.heartbeat_interval = *heartbeat_interval;
+    consumer.rebalance_timeout = *rebalance_timeout;
+    consumer.commit_interval = *commit_interval;
+    consumer.timeout = *timeout;
+    consumer.fetch = FetchBounds {
+        min_bytes: bytes(fetch.min_bytes),
+        max_bytes: bytes(fetch.max_bytes),
+        max_partition_bytes: bytes(fetch.max_partition_bytes),
+        max_wait: fetch.max_wait,
+    };
+    consumer.max_batch_bytes = usize::try_from(*max_batch_bytes).unwrap_or(usize::MAX);
+    consumer.sasl = sasl
+        .clone()
+        .map(kafka_sasl)
+        .transpose()?
+        .map(|sasl| logit_kafka::sasl::authenticator(&sasl, *timeout));
+    Ok(KafkaInSettings {
+        consumer,
+        format,
+        batch_max_events: receive.batch_max_events,
+        batch_max_bytes: usize::try_from(receive.batch_max_bytes).unwrap_or(usize::MAX),
+        drain_timeout: *drain_timeout,
+        shutdown_grace: receive.shutdown_grace,
     })
 }
 
@@ -4876,6 +5004,93 @@ mod tests {
             consumers,
             kind,
         }
+    }
+
+    /// A `kafka_in` from config JSON, through serde as `logit run` reads it.
+    fn kafka_in_kind(json: &str) -> ComponentKind {
+        serde_json::from_str::<Component>(json).expect("a kafka_in").kind
+    }
+
+    #[test]
+    fn kafka_in_settings_carry_every_field_into_the_consumer() {
+        let kind = kafka_in_kind(
+            r#"{"type": "kafka_in", "brokers": ["k:9092"], "topics": ["a", "b"], "group": "g",
+                "format": "text", "record": "batch", "client_id": "c", "start": "earliest",
+                "isolation": "read_committed", "assignment": "roundrobin",
+                "session_timeout": "10s", "heartbeat_interval": "1s", "rebalance_timeout": "1m",
+                "drain_timeout": "2s", "commit_interval": "3s", "max_batch_bytes": "1MiB",
+                "timeout": "7s", "fetch": {"min_bytes": "2", "max_bytes": "8MiB",
+                "max_partition_bytes": "256KiB", "max_wait": "100ms"},
+                "sasl": {"mechanism": "plain", "username": "u", "password": "p"}}"#,
+        );
+        let receive = logit_config::ReceiveConfig {
+            batch_max_events: 7,
+            batch_max_bytes: 4096,
+            shutdown_grace: Duration::from_secs(9),
+            ..Default::default()
+        };
+        let s = kafka_in_settings("in", &kind, &receive).unwrap();
+        assert_eq!(s.format, KafkaInFormat::Text { batch: true });
+        assert_eq!((s.batch_max_events, s.batch_max_bytes), (7, 4096));
+        assert_eq!(s.drain_timeout, Duration::from_secs(2));
+        assert_eq!(s.shutdown_grace, Duration::from_secs(9));
+        let c = &s.consumer;
+        assert_eq!(c.brokers, ["k:9092"]);
+        assert_eq!(c.topics, ["a", "b"]);
+        assert_eq!((c.group.as_str(), c.client_id.as_str()), ("g", "c"));
+        assert_eq!(c.start, logit_kafka::consumer::StartPosition::Earliest);
+        assert_eq!(c.isolation, logit_kafka::consumer::Isolation::ReadCommitted);
+        assert_eq!(c.assignment, logit_kafka::consumer::Assignor::RoundRobin);
+        assert_eq!(c.session_timeout, Duration::from_secs(10));
+        assert_eq!(c.heartbeat_interval, Duration::from_secs(1));
+        assert_eq!(c.rebalance_timeout, Duration::from_secs(60));
+        assert_eq!(c.commit_interval, Duration::from_secs(3));
+        assert_eq!(c.timeout, Duration::from_secs(7));
+        assert_eq!(c.max_batch_bytes, 1 << 20);
+        assert_eq!(
+            c.fetch,
+            logit_kafka::consumer::FetchBounds {
+                min_bytes: 2,
+                max_bytes: 8 << 20,
+                max_partition_bytes: 256 << 10,
+                max_wait: Duration::from_millis(100),
+            }
+        );
+        assert!(c.sasl.is_some() && c.tls.is_none());
+    }
+
+    /// `msgpack` and the OTLP formats parse and validate, and `logit run` refuses them at
+    /// startup, naming the format and never the config.
+    #[test]
+    fn kafka_in_refuses_the_formats_it_does_not_read_yet() {
+        for (format, topics) in [
+            ("msgpack", r#"["t"]"#),
+            ("otlp_proto", r#"{"logs": "t"}"#),
+            ("otlp_json", r#"{"logs": "t"}"#),
+        ] {
+            let kind = kafka_in_kind(&format!(
+                r#"{{"type": "kafka_in", "brokers": ["k:9092"], "topics": {topics}, "group": "g",
+                    "format": "{format}",
+                    "sasl": {{"mechanism": "plain", "username": "u", "password": "secret"}}}}"#
+            ));
+            let err = kafka_in_settings("in", &kind, &Default::default()).err().unwrap();
+            let err = format!("{err:#}");
+            assert!(err.contains(&format!("'format: {format}' yet")), "{err}");
+            assert!(!err.contains("secret"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn build_spec_builds_a_kafka_in_with_its_receive_grace() {
+        let kind = kafka_in_kind(
+            r#"{"type": "kafka_in", "brokers": ["k:9092"], "topics": ["t"], "group": "g",
+                "format": "json"}"#,
+        );
+        let mut component = resolved(kind, vec![], vec!["out".to_string()]);
+        component.receive.shutdown_grace = Duration::from_secs(3);
+        let (spec, _) = build_spec("in", &component, Path::new("."), None).unwrap();
+        let NodeSpec::Input(_, runtime) = spec else { panic!("a kafka_in is an input") };
+        assert_eq!(runtime.shutdown_grace, Duration::from_secs(3));
     }
 
     /// The status `method path` gets at `addr` carrying `authorization`, if any.
