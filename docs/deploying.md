@@ -4245,10 +4245,16 @@ sink doesn't recognize drops the object's first batch, counted
 `batches.dropped{reason="rejected"}`. The sink's module doc, `crates/logit-outputs/src/s3/mod.rs`,
 lists every answer.
 
-**Duplicates.** A retry writes the same key with the same batches, so an upload that landed
-before its answer was lost is overwritten, not doubled. A replay after a restart writes its
-batches under a new key, so an object the old process stored and couldn't commit is stored
-twice; deduplicate downstream if that matters.
+**Duplicates.** A retry writes the same key with no more batches than any attempt before it, so
+an attempt that lands after its retry loses nothing. Batches can still be stored twice:
+
+- A retry that closes with fewer batches, on store pressure, the memory bound, or shutdown, or a
+  first batch dropped as rejected, moves batches an earlier attempt may have stored to the next
+  object, under the next key.
+- A replay after a restart writes its batches under a new key, so an object the old process
+  stored and couldn't commit is stored twice.
+
+Deduplicate downstream if that matters.
 
 ## Prometheus remote-write: receiving, sending, and picking a version
 

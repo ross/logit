@@ -535,9 +535,10 @@ is `crates/logit-outputs/src/s3/mod.rs`'s module doc, "Response classes". It dep
 in four directions:
 
 - **`Refused` where the default drops.** A `3xx` (the sink follows no redirect, and a wrong
-  region or endpoint answers every object alike), `413` and `400` `EntityTooLarge` (every body is
-  at most the sink's `part_size`, so a smaller limit is configuration), `411`, and the `400`
-  codes that name configuration. S3 never interprets an object's content, so no S3 answer names
+  region or endpoint answers every object alike), `413` and `400` `EntityTooLarge` (a body's size
+  is set by configuration: at most `part_size`, or about `part_size` plus one batch while every
+  object is one `PutObject`, so a smaller limit is configuration), `411`, and the `400` codes
+  that name configuration. `401`, `405`, and `407` keep the default `Refused`. S3 never interprets an object's content, so no S3 answer names
   one batch.
 - **`Clean` where the default drops or doubts.** A `400` whose body never arrived whole, an
   expired token (after a credential refresh), a bad upload the sink assembled, a `409`

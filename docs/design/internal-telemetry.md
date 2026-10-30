@@ -576,7 +576,7 @@ receive and processing side from their own loops, which already see every batch 
 | `logit.component.events.copied` | count | `run_router` (`route_batch`) and `run_route_signals` (`route_signals_batch`): one per delivery past an event's first, for an event a `route` list sends to several destinations, or a `route_signals` sends whole (`strip: false`) or splits into parts (`strip: true`, one per part past the first). Counted on the shared-`Arc` path too, so it counts deliveries, not deep clones. Untagged, and recorded only when nonzero |
 | `logit.component.events.dropped{reason="script_error"}` | count | `run_lua`, one per event whose `process()` call raised an error: that event is lost. Counted beside `errors{reason="process"}` |
 | `logit.component.flush.events` / `.flush.duration` | count / timing | a flush-bearing node's `flush()` |
-| `logit.component.send.duration` | timing | one delivery attempt, `deliver_with_retry` (`write_loop`); for a sink with a send window above 1, one windowed round (the fill and the head's acknowledgment wait), `deliver_window`, except on a sink that times each batch (`Output::send_duration_per_batch`: every sink on the HTTP slot helper, which is `influxdb_out`, `prometheus_out`'s remote-write sender, `otlp_out`, `datadog_out`, `datadog_trace_out`, and `splunk_hec_out`), where it's one sample per answer to the oldest batch: that batch's requests, from the first one's send to the last one's response (`Output::answered_send_duration`) |
+| `logit.component.send.duration` | timing | one delivery attempt, `deliver_with_retry` (`write_loop`); for a sink with a send window above 1, one windowed round (the fill and the head's acknowledgment wait), `deliver_window`, except on a sink that times each batch (`Output::send_duration_per_batch`: `s3_out`, and every sink on the HTTP slot helper, which is `influxdb_out`, `prometheus_out`'s remote-write sender, `otlp_out`, `datadog_out`, `datadog_trace_out`, and `splunk_hec_out`), where it's one sample per answer to the oldest batch: that batch's requests, from the first one's send to the last one's response (`Output::answered_send_duration`); for `s3_out`, from its object's close to the answer, and none for the batches behind the head, whose answers its object's answer settled |
 | `logit.component.retries` | count | a retried delivery attempt or windowed round, `deliver_with_retry` or `deliver_window` (`write_loop`) |
 | `logit.component.window.closed{cause}` | count | `window_round` (`write_loop`), once per window a collecting sink keeps open across arrivals ([ADR `collecting-sink-window`](../adr/collecting-sink-window.md)), by what closed it: `full` (the sink takes no more, or the window reached a memory store's `max_batches`), `deadline`, `pressure` (a push found no room in the sink's buffer), `memory` (the staged batches reached `buffer.max_bytes`), `closed` (the buffer closed), or `shutdown`. A window a submit failure ends isn't counted: it's reopened from its head. Closes on `pressure` mean the buffer is too small for the window. `s3_out` is the one sink that collects |
 | `logit.component.errors` | count | `Output::send` failed (any attempt), or a Lua script error |
@@ -2536,9 +2536,9 @@ so the sink holds no `BatchAccounting` gate, and loss is the runtime's to count.
 
 The window's own `logit.component.window.closed{cause}`, and `send.duration` measured from an
 object's close to its answer, are layer 2's
-([ADR `collecting-sink-window`](../adr/collecting-sink-window.md), decision 4). The multipart path
-adds the `create_upload`, `upload_part`, `complete_upload`, and `abort_upload` ops,
-`logit.output.parts`, and `logit.output.uploads.abandoned{aborted}` (the plan's W3b). No
+([ADR `collecting-sink-window`](../adr/collecting-sink-window.md), decision 4). Multipart upload
+isn't built yet; it adds the `create_upload`, `upload_part`, `complete_upload`, and
+`abort_upload` ops, `logit.output.parts`, and `logit.output.uploads.abandoned{aborted}`. No
 `Diagnostics` key: a failed request's error carries the bucket, the key, the status, and S3's
 `<Code>` and `<Message>`, never a credential.
 

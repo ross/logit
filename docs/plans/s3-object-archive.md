@@ -276,7 +276,7 @@ These came out of writing the ADRs; a reviewer may push on any of them:
   reading the answers owed, and the grace deadline doesn't cut them (decisions 1 and 5 of that
   ADR). Rule 35's change is recorded as an amendment to [ADR
   `disk-backed-sink-buffer`](../adr/disk-backed-sink-buffer.md).
-- zstd writes one frame per staged batch, since `ruzstd` 0.9 has no streaming encoder (`s3-object-archive`, decision 4).
+- zstd writes one frame per 1 MiB of encoded input, since `ruzstd` 0.9 has no streaming encoder (`s3-object-archive`, decision 4 and its implementation notes).
 - A hand-rolled XML extractor, not an XML crate, and a `Content-Type` per format (`s3-object-archive`, decisions 4 and 5).
 - `timeout` defaults to `60s` (`s3-object-archive`, decision 7).
 
@@ -288,9 +288,12 @@ Recorded per workstream as each lands.
 
 - The single-`PutObject` path closes an object at `part_size` until W3b lands
   (`docs/known-gaps/sinks.md`).
-- `zstd`'s frame per batch costs ratio: on fifty 100-event nginx batches it's 13% larger than one
-  frame for `json` and 3.3 times for `native`, and larger than `gzip` in both
+- A zstd frame per batch cost up to ten times one frame's size, more than `gzip` everywhere, so
+  `zstd` writes a frame per 1 MiB of encoded input instead, within 0.5% of one frame
   ([ADR `s3-object-archive`](../adr/s3-object-archive.md)'s "Implementation notes (2026-10-30)").
+- Review found that a head filling the object alone opened no collecting window, so the loop's
+  ordinary fill submitted the whole backlog into a pinned object. The sink's `window()` now bounds
+  that fill.
 - W4 isn't on W3a's base, so the round-trip test decompresses with `flate2` and `ruzstd` before
   `replay_in`'s decoders read the object.
 - W3b owes the multipart rows' tests (`InvalidPart`, `InvalidPartOrder`, `EntityTooSmall`,
