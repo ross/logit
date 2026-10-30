@@ -321,7 +321,7 @@ soak harness share no file, and neither changes `kafka_in`.
 | W3 | `kin/w3` | `kin/w3: kafka_in, with json, text, and native, and kafka_out's text batch escape` | L | W2 | open |
 | W4 | `kin/w4` | `kin/w4: kafka_in's msgpack and OTLP formats` | M | W3 | open |
 | W5 | `kin/w5` | `kin/w5: kafka_in in the transit spec, the eleventh lossless pair, and fuzz targets` | M | W4 | not started |
-| W6a | `kin/w6a` | `kin/w6a: kafka_in interop legs on Apache Kafka and Redpanda` | M | W5 | not started |
+| W6a | `kin/w6a` | `kin/w6a: kafka_in interop legs on Apache Kafka and Redpanda` | M | W5 | open |
 | W6b | `kin/w6b` | `kin/w6b: the kafka-consume-broker-restart soak scenario` | M | W5 | not started |
 
 ## Findings
@@ -375,3 +375,17 @@ Recorded per workstream as each lands.
   under `otlp_json`, which ignores fields it doesn't know. `kafka_out` never writes a request of
   several resources, so the test builds one by concatenating two protobuf requests. The OTLP
   encoder stamps a log with no observed time with the clock, so the split round trip sets one.
+- **W6a**: Every consumer leg passed on both brokers, with no `kafka_in` bug and nothing in the
+  ADR's protocol table contradicted. A broker restart within the session timeout doesn't cost a
+  classic group its members: Apache Kafka 4.2.0 and Redpanda v26.2.3 both reload the group with
+  its offsets, so the member read through the restart with no rejoin, and the leg restarts the
+  broker a second time with the member stopped to show a later life resuming from the commit.
+  Java 4.2's console consumer and `kafka_in` settle on `range` on both brokers, and each side's
+  revoke commits before the rejoin, so partitions move with nothing read twice. Both brokers name
+  the aborted transactions under `read_committed`, Redpanda included. The OTLP formats' relay
+  differs only by the two OTLP normalizations, the observed time `kafka_out` stamps and the
+  `_logit.otel.severity_*` carriers the decoder writes. The broker image's runtime is a JRE with
+  no `jdk.compiler`, so `Txn.java` compiles in a pinned `eclipse-temurin` JDK image and runs on the
+  broker image's JRE and client jars. `kafka-console-producer.sh`'s `null.marker` writes a null
+  header value. `rpk topic create` creates the harness's 119 topics on each broker in a
+  call per partition count, where a `kafka-topics.sh` per topic starts a JVM each time.

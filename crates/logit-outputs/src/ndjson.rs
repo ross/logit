@@ -95,8 +95,9 @@
 //!
 //! Readers that mirror this grammar: `tools/shape-survey/summarize.py`,
 //! `tools/shape-survey/check_interop.py`, `tools/shape-survey/producers/oteldemo.sh`'s Python,
-//! `tools/splunk-interop/check.py`, `tools/victoria-interop/check.py`, and
-//! `tools/soak/soaklib/telemetry.py`. A change here is mirrored there.
+//! `tools/splunk-interop/check.py`, `tools/victoria-interop/check.py`,
+//! `tools/kafka-interop/check.py`, and `tools/soak/soaklib/telemetry.py`. A change here is
+//! mirrored there.
 //!
 //! One walker visits every field through [`TreeWriter`]: [`Json`] writes this grammar, and
 //! `crate::msgpack` writes the same object as MessagePack for `kafka_out`'s `format: msgpack`, so a
