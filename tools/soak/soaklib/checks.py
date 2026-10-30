@@ -1452,8 +1452,11 @@ WIRES = {
                   ("logit.input.records.dropped", "logit.input.records.skipped")),
 }
 # A Kafka wire's G is the records the writer's `kafka_out` saw the broker accept, and W the
-# records the consumer handed `kafka_in`, a record that won't decode or holds no event included
-# (B); a record buffered and discarded at a revoke is in neither. The broker keeps every record,
+# records the consumer counted when fetched: those it handed `kafka_in`, a record that won't
+# decode or holds no event included (B), and those the client dropped or skipped itself
+# (`corrupt`, `oversize`, `legacy_format`, `retention`, `aborted`, also B). A fetched record
+# the client buffered and discarded at a revoke is counted again when it is read again, a W
+# surplus the band doesn't model. The broker keeps every record,
 # so a replay is surplus and only a deficit is loss: `ledger.wire` judges the run's W − G
 # against `Ledger.kafka_band`. A batch the listener deferred at a revoke or shutdown is in W
 # and never sent, and is read again: Q, `logit.input.batches.deferred`, bounds its records at
@@ -2838,7 +2841,9 @@ class Ledger:
             gap += self.residual(life, sinks)
         if gap == 0:
             return PASS, "ok", gap
-        if 0 < gap <= self.deferred(life):
+        # A deferred batch is in W and never reaches `aggregate`, so only an earlier life's
+        # residual can hold its records; in the final life it can't explain Ab − V.
+        if life != self.final and 0 < gap <= self.deferred(life):
             return PASS, "deferred", gap
         if gap > 0 and (sum(self.drop_credit(life, sinks).values()) > 0
                         or self.record_drops(life, sinks)):
@@ -4764,14 +4769,21 @@ def check_ledger_summary(data):
         terms.append(("A − Δ_disc − Ab", g("Ad", life) - g("Ab", life)))
     else:
         terms.append(("A − Ab", g("A", life) - g("Ab", life)))
-    shown = [f"{name} {_n(value)}" for name, value in terms]
     uncounted_egress = False
     faults = []
+    shown = [f"{name} {_n(value)}" for name, value in terms]
+    # A batch the Kafka listener deferred is in W and in neither E nor B, so the final life's
+    # intake term may hold up to Q's records, as `ledger.intake` allows.
+    excused = 0
+    deferred = led.deferred(first) if led.hop is None else 0
+    if 0 < terms[0][1] <= deferred:
+        excused = terms[0][1]
+        shown[0] += f" within the deferred batches' {_n(deferred)} records"
     if data.external:
-        judged = sum(value for _, value in terms)
+        judged = sum(value for _, value in terms) - excused
         shown.append(f"{led.ab_text} − V SKIP ({NO_BACKEND})")
     else:
-        judged = sum(value for _, value in terms)
+        judged = sum(value for _, value in terms) - excused
         for _, sinks in led.egress_groups():
             _, verdict, egress_gap = led.egress(life, sinks)
             counted = verdict == "counted"
