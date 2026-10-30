@@ -1,6 +1,6 @@
 ---
 created: 2026-10-04
-updated: 2026-10-26
+updated: 2026-10-30
 ---
 
 # Sink fault classes: a rejected batch drops, a refused destination holds, and the process never exits for a sink
@@ -187,6 +187,10 @@ and in an amendment to the sink's own record:
   server failure stays `Ambiguous` where the OTLP specification says not to retry it
   (`crates/logit-outputs/src/otlp.rs`, "Response classes"; "Amendment: `otlp_out` departs from the
   OTLP specification's non-retryable list (2026-10-04)", below).
+
+[2026-10-30: `s3_out`, not yet built, will depart on the rows "Amendment: `s3_out`'s departures
+from the status-only default (2026-10-30)", below, lists; its full table is in [ADR
+`s3-object-archive`](s3-object-archive.md), decision 6, until its module doc carries it.]
 
 Sinks with no application response (`syslog_out`, `statsd_out`, `graphite_out`, `collectd_out`,
 `file_out`, `stdio_out`) classify by I/O error alone: a connect failure is `Clean`, a mid-write
@@ -521,3 +525,34 @@ reports it is `buffer_full` once the queue fills.
 A runtime backstop timeout above every sink's own was declined. Each sink's timeout is set per
 component, so a backstop above it needs a graph rule tying the two, for a case the per-sink rule
 already covers.
+
+## Amendment: `s3_out`'s departures from the status-only default (2026-10-30)
+
+[ADR `s3-object-archive`](s3-object-archive.md) decides `s3_out`, which stores many batches as
+one object and counts them delivered only once the object is complete. Its decision 6 holds the
+sink's full response-class table, as each sink's own record does, until W3 moves it into
+`crates/logit-outputs/src/s3/`'s module doc. The rows where it will depart from this record's
+status-only default:
+
+| Answer | Default | `s3_out` | Why |
+|---|---|---|---|
+| any `3xx` (`PermanentRedirect`, `TemporaryRedirect`) | `Rejected` | `Refused` | a wrong region or endpoint, the same for every object; the diagnostic carries `x-amz-bucket-region` and the sink follows no redirect |
+| `429`; `503` with an S3 XML `<Code>` (`SlowDown`, `ServiceUnavailable`) | `Ambiguous` | `Clean` | S3 turned the request away before processing it, and `PutObject` and `UploadPart` are atomic; a bare `503` from a load balancer keeps the default |
+| `400` `RequestTimeout`, `IncompleteBody`, `BadDigest`, `XAmzContentSHA256Mismatch` | `Rejected` | `Clean` | the body didn't arrive whole, so nothing was stored |
+| `400` `ExpiredToken`, `TokenRefreshRequired` | `Rejected` | `Clean`, after a credential refresh | the credentials expired, not the batch |
+| `400` `EntityTooLarge`, `413` | `Rejected` | `Refused` | every body is at most the sink's `part_size`, so a size limit below it is configuration |
+| `400` `InvalidArgument`, `InvalidToken`, `AuthorizationHeaderMalformed`, `KMS.*`, `InvalidStorageClass`, `AccessControlListNotSupported`, `KeyTooLongError`, `InvalidRequest`; `411` | `Rejected` | `Refused` | configuration, the same answer for every object |
+| `404` `NoSuchUpload` | `Refused` | `Clean` | the multipart upload was aborted underneath the sink, which starts the object again |
+| `409` `OperationAborted` | `Rejected` | `Clean` | a conflicting operation was in progress; nothing was stored |
+| `200` to `CompleteMultipartUpload` with an `<Error>` body | delivered | the class of its `<Code>` | S3 reports a failed completion this way |
+| an `Ambiguous` answer to `CreateMultipartUpload` or `UploadPart`, transport errors included | `Ambiguous` | `Clean` | nothing is visible at the key until the upload completes |
+
+Every other row follows the default, and an S3 `4xx` the sink doesn't list stays `Rejected`, the
+rule this record sets for an answer a sink can't attribute. S3 never interprets an object's
+content, so these rows lean toward `Refused` and `Clean`: no S3 answer names one batch.
+
+**Consequence.** A destination that answers `3xx`, `413`, or a configuration code holds the
+sink's queue, announced by `logit.component.retrying`, where the default would have dropped a
+batch per attempt; the operator fixes `region:`, `endpoint:`, `part_size`, or the bucket, and the
+held objects go through. The departures list under "Each sink attributes from everything its
+destination gives it" gains an `s3_out` bullet when the sink lands.

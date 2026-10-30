@@ -10,6 +10,8 @@ the same date, write the record, then add a row here.
 
 | ADR | Created | Updated |
 |---|---|---|
+| [`s3_out`: one object per time and size window, delivered at completion, under a key its first batch names](s3-object-archive.md) | 2026-10-30 | 2026-10-30 |
+| [Collecting sink window: a windowed sink keeps its window open across arrivals until its own bound, a deadline, store pressure, or shutdown closes it](collecting-sink-window.md) | 2026-10-30 | 2026-10-30 |
 | [Tail content identity: the inode stays primary, content claims an unmatched inode, and what a restart or rotation still loses is decided or counted](tail-content-identity.md) | 2026-10-29 | 2026-10-29 |
 | [Listener authentication: static bearer and basic credentials on the HTTP listeners, and a proxy for everything else](listener-authentication.md) | 2026-10-25 | 2026-10-25 |
 | [Sink request concurrency: a per-sink `concurrency:` keeps several batches in flight, each settled on its own](sink-request-concurrency.md) | 2026-10-25 | 2026-10-25 |
@@ -57,7 +59,7 @@ the same date, write the record, then add a row here.
 | [Listener peer address: opt-in `network.peer.*` on the shared drivers, and PROXY protocol on TCP](listener-peer-address.md) | 2026-10-05 | 2026-10-18 |
 | [`lines_in`: a plain-lines listener that emits one raw log event per line and parses nothing](plain-lines-listener.md) | 2026-10-05 | 2026-10-05 |
 | [Native hop ack status: the sender pair leads the hop payload, and a rejected `Ack` settles one frame by name](native-hop-ack-status.md) | 2026-10-04 | 2026-10-25 |
-| [Sink fault classes: a rejected batch drops, a refused destination holds, and the process never exits for a sink](sink-fault-classes.md) | 2026-10-04 | 2026-10-26 |
+| [Sink fault classes: a rejected batch drops, a refused destination holds, and the process never exits for a sink](sink-fault-classes.md) | 2026-10-04 | 2026-10-30 |
 | [jiff is the one calendar implementation, behind the codecs' strict RFC 5424 contract](jiff-for-calendar-time.md) | 2026-10-04 | 2026-10-04 |
 | [`timestamp`: resolving `event.timestamp` from an attribute, with jiff for calendar time](timestamp-transform.md) | 2026-10-04 | 2026-10-18 |
 | [Lua refusals: `Event.new` raises a refusal from a Lua shim, not as an mlua callback error](lua-refusals-raised-from-lua.md) | 2026-10-03 | 2026-10-03 |
