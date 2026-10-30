@@ -42,7 +42,12 @@
 //! consumer it has reached while it waits for the next. In a diamond (`in -> [a, b]`, `b -> a`),
 //! enough parked senders can hold all of `a`'s capacity while waiting on `b`, `b` can then never
 //! send into `a`, so `b` never drains and no sender ever gets `b`'s slot. Only the deadline
-//! releases the held slots and breaks that cycle, so there is no deadline-less reservation. See
+//! releases the held slots and breaks that cycle, so there is no deadline-less reservation.
+//! [`Fanout::send_resumable`] keeps that rule and also keeps a sender's place in line: at its
+//! deadline it releases every slot it holds but leaves its `reserve()` on the one consumer it was
+//! parked on queued in a [`Reservation`], and the next attempt resumes that wait. A queued
+//! waiter holds no slot while it waits, so a listener that offers one batch under short
+//! deadlines (`kafka_in`) isn't sent to the back of a shared inbox's line at every attempt. See
 //! `docs/design/pipeline-graph.md`'s "Trace context propagation" section for which node kinds
 //! propagate a parent and which mint a root, and its "Provenance propagation" section for the
 //! stamping rule ([`Fanout::stamp`]/[`Fanout::stamp_relayed`]).
@@ -177,9 +182,9 @@ impl Delivered {
     }
 }
 
-/// [`Fanout::send_with_deadline`]'s deadline passed before every consumer had room for the
-/// batch, so no consumer received it. It hands the batch back, for a caller that offers it again
-/// (`kafka_in`).
+/// [`Fanout::send_with_deadline`]'s or [`Fanout::send_resumable`]'s deadline passed before every
+/// consumer had room for the batch, so no consumer received it. It hands the batch back, for a
+/// caller that offers it again (`kafka_in`).
 #[derive(Debug, PartialEq)]
 pub struct SendTimeout(pub EventBatch);
 
@@ -190,6 +195,40 @@ impl std::fmt::Display for SendTimeout {
 }
 
 impl std::error::Error for SendTimeout {}
+
+/// A send's place in line, kept across [`Fanout::send_resumable`] attempts: the `reserve()` it
+/// is parked on, if any, and its `send.blocked.duration` timer. Holds no slot between attempts
+/// beyond the one a parked waiter may be handed. Dropping it gives up the place and records
+/// nothing as sent.
+#[derive(Default)]
+pub struct Reservation {
+    waiting: Option<Waiting>,
+    blocked: Option<Timer>,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if let Some(timer) = self.blocked.take() {
+            timer.cancel();
+        }
+    }
+}
+
+type ReserveOwned = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<mpsc::OwnedPermit<Delivered>, mpsc::error::SendError<()>>,
+            > + Send,
+    >,
+>;
+
+/// A `reserve()` queued on one consumer's channel. Its `_blocked` timer records that consumer's
+/// `inbox.blocked.duration` when the wait ends, resolved or dropped.
+struct Waiting {
+    edge: usize,
+    reserve: ReserveOwned,
+    _blocked: Timer,
+}
 
 /// One outbound edge of a [`Fanout`]: the consumer's inbox `Sender` and the consumer's telemetry
 /// handle, under which the edge records `logit.component.inbox.full` and
@@ -474,6 +513,102 @@ impl Fanout {
         }
         self.record_send(n);
         drop(timer);
+        span.finish();
+        Ok(taken)
+    }
+
+    /// [`Fanout::send_with_deadline`] that keeps its place in line across attempts: the call for
+    /// a listener that offers one batch again and again under short deadlines (`kafka_in`).
+    ///
+    /// An attempt reserves a slot on every consumer, as `send_with_deadline` does, and delivers
+    /// all or nothing. When `deadline` passes first it returns [`SendTimeout`], releasing every
+    /// slot it holds, but `reservation` keeps the `reserve()` it was parked on, still queued on
+    /// that consumer's channel. The next attempt with the same `reservation` awaits that waiter
+    /// first, so a sender that queued after it never takes the freed slot ahead of it. Dropping
+    /// `reservation` gives up the place.
+    ///
+    /// Between attempts the parked waiter can be handed a slot that nobody polls; that one slot
+    /// is held until the next attempt or the drop, so the caller attempts again at once or drops
+    /// `reservation`. A slot is never held while waiting on another consumer past `deadline`.
+    ///
+    /// Counts as `send_with_deadline` does: one `inbox.full` per wait begun on a consumer (an
+    /// attempt resuming a kept wait counts none), and `batches.sent`, `events.sent`, the span, and
+    /// `send.blocked.duration` only once the batch goes out. That duration runs from the first
+    /// attempt with this `reservation`.
+    pub async fn send_resumable(
+        &self,
+        reservation: &mut Reservation,
+        batch: EventBatch,
+        deadline: tokio::time::Instant,
+    ) -> Result<bool, SendTimeout> {
+        if self.consumers.is_empty() {
+            return Ok(false);
+        }
+        if reservation.blocked.is_none() {
+            reservation.blocked =
+                Some(self.telemetry.timer("logit.component.send.blocked.duration"));
+        }
+        // `None` is a consumer not reached yet; `Some(None)` a closed one.
+        let mut permits: Vec<Option<Option<mpsc::OwnedPermit<Delivered>>>> =
+            (0..self.consumers.len()).map(|_| None).collect();
+        let reserve_all = async {
+            loop {
+                if let Some(wait) = reservation.waiting.as_mut() {
+                    let got = wait.reserve.as_mut().await;
+                    permits[wait.edge] = Some(got.ok());
+                    reservation.waiting = None;
+                }
+                let Some(i) = permits.iter().position(Option::is_none) else { break };
+                // As in `send_with_deadline`: `try_reserve` can't overtake a parked reserver.
+                tokio::task::coop::consume_budget().await;
+                let edge = &self.consumers[i];
+                match edge.tx.clone().try_reserve_owned() {
+                    Ok(permit) => permits[i] = Some(Some(permit)),
+                    Err(TrySendError::Closed(_)) => permits[i] = Some(None),
+                    Err(TrySendError::Full(tx)) => {
+                        reservation.waiting = Some(Waiting {
+                            edge: i,
+                            reserve: Box::pin(tx.reserve_owned()),
+                            _blocked: edge.found_full(),
+                        });
+                    }
+                }
+            }
+        };
+        if tokio::time::timeout_at(deadline, reserve_all).await.is_err() {
+            // Dropping `permits` releases every slot held; `reservation.waiting` stays queued.
+            return Err(SendTimeout(batch));
+        }
+        let trace = TraceContext::new_root();
+        let mut span =
+            self.telemetry.span("send", SpanKind::Producer, trace.trace_id, trace.span_id, None);
+        span.events(batch.events.len() as u64);
+        let ctx = self.stamp(trace.into());
+        let n = batch.events.len();
+        let mut taken = false;
+        let mut permits = permits.into_iter().flatten();
+        if self.consumers.len() == 1 {
+            match permits.next().flatten() {
+                Some(permit) => {
+                    permit.send(Delivered::Owned(batch, ctx));
+                    taken = true;
+                }
+                None => self.record_dropped_on_close(n),
+            }
+        } else {
+            let batch = Arc::new(batch);
+            for permit in permits {
+                match permit {
+                    Some(permit) => {
+                        permit.send(Delivered::Shared(batch.clone(), ctx));
+                        taken = true;
+                    }
+                    None => self.record_dropped_on_close(n),
+                }
+            }
+        }
+        self.record_send(n);
+        drop(reservation.blocked.take());
         span.finish();
         Ok(taken)
     }
@@ -873,6 +1008,50 @@ mod tests {
         rx_b.recv().await.expect("b's prefill");
         assert!(rx_b.try_recv().is_err(), "b must not receive the timed-out batch either");
         assert_nothing_recorded_as_sent(&registry.drain(0));
+    }
+
+    /// The resumable case: a timed-out attempt releases the slot it held on `a` but keeps its
+    /// wait queued on `b`, so a sender that queued on `b` after it doesn't take `b`'s freed slot.
+    #[tokio::test(start_paused = true)]
+    async fn send_resumable_keeps_its_place_on_the_full_consumer_across_attempts() {
+        let registry = Registry::with_span_sampling(1.0);
+        let telemetry = registry.telemetry_for("in", "kafka_in", "listener");
+        let (tx_a, mut rx_a) = mpsc::channel(1);
+        let (tx_b, mut rx_b) = mpsc::channel(1);
+        tx_b.try_send(Delivered::Owned(batch(1), BatchContext::default())).expect("prefill b");
+        let probe_a = tx_a.clone();
+        let later = tx_b.clone();
+        let b_handle = registry.telemetry_for("b", "stdio_out", "sink");
+        let fanout =
+            Fanout::from_edges(vec![Edge::new(tx_a), Edge::new(tx_b).with_telemetry(b_handle)])
+                .with_telemetry(telemetry);
+        let mut reservation = Reservation::default();
+
+        let Err(SendTimeout(back)) =
+            fanout.send_resumable(&mut reservation, batch(2), in_ms(100)).await
+        else {
+            panic!("b is full: the deadline passes first")
+        };
+        assert_eq!(probe_a.capacity(), 1, "a's slot is released at the deadline");
+        let events = registry.drain(0);
+        assert_nothing_recorded_as_sent(&events);
+        assert_eq!(counter_value(&events, "logit.component.inbox.full"), Some(1.0));
+
+        // A sender that queues on `b` after the timed-out attempt.
+        let later = tokio::spawn(async move { later.reserve_owned().await.map(|_| ()) });
+        tokio::task::yield_now().await;
+        rx_b.recv().await.expect("b's prefill");
+        fanout.send_resumable(&mut reservation, back, in_ms(100)).await.expect("b's freed slot");
+
+        let a = rx_a.recv().await.expect("a should receive");
+        let b = rx_b.recv().await.expect("b should receive ahead of the later sender");
+        assert_eq!(a.batch_context(), b.batch_context(), "one fan-out is one emission");
+        assert!(!later.is_finished(), "the later sender is still waiting");
+        let events = registry.drain(0);
+        assert_eq!(counter_value(&events, "logit.component.batches.sent"), Some(1.0));
+        assert_eq!(counter_value(&events, "logit.component.inbox.full"), None, "a resumed wait");
+        assert_eq!(timing_count(&events, "logit.component.send.blocked.duration"), 1);
+        later.abort();
     }
 
     #[tokio::test(start_paused = true)]

@@ -354,7 +354,8 @@ SASL isn't part of this stream (Consequences).
 | `msgpack` | `event` | The NDJSON grammar's object, key for key, as MessagePack, written with `logit_proto::msgpack::Writer`, so a consumer can switch codecs without remapping fields. |
 | `native` | `batch` | One `CODEC_BATCH` frame ([ADR `file-output-native-format`](file-output-native-format.md)). |
 
-With `record: batch`, `json` writes NDJSON and `text` writes the bodies joined by newlines. With
+With `record: batch`, `json` writes NDJSON and `text` writes each body escaped onto one line,
+the lines joined by newlines ("Amendment: `text` batch records escape newlines"). With
 `record: event`, `native` writes a one-event batch per record, which repeats the frame's
 dictionary on every record.
 
@@ -367,7 +368,8 @@ every record. The `otlp_proto` and `otlp_json` formats write a topic per signal 
 `kafka-otlp-formats`](kafka-otlp-formats.md)). Kafka headers keep their order and, in `kafka-protocol`'s `Record`, can't repeat a
 key.
 
-Each format stays decodable, so a future `kafka_in` can round-trip it.
+Each format stays decodable: `kafka_in` reads `json`, `text`, and `native` back
+([ADR `kafka-input`](kafka-input.md)), and refuses `msgpack` at startup.
 
 ## Alternatives considered
 
