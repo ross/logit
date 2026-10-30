@@ -523,8 +523,8 @@ mod tests {
         assert!(err.to_string().contains("Produce v0 to v2"), "{err}");
     }
 
-    /// A required API the broker's answer omits altogether is an error, which `dial` classifies
-    /// `Refused`.
+    /// A required API the broker's answer omits altogether is an error, which `Dialer::connect`
+    /// classifies `Refused`.
     #[test]
     fn a_broker_that_omits_a_required_api_is_refused() {
         let err = negotiate(
