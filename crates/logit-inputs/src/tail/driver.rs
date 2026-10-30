@@ -2132,13 +2132,16 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 return;
             }
         }
-        let decoder = match self.factory.open(&path) {
+        let mut decoder = match self.factory.open(&path) {
             Ok(d) => d,
             Err(err) => {
                 self.diag.warn_throttled("open_error", format!("{}: {err}", path.display()));
                 return;
             }
         };
+        if sniffed {
+            decoder.file_head(&head);
+        }
         // A failure is non-fatal (the file relies on `poll_interval`) but diagnosed: at scale
         // it's `ENOSPC` against `fs.inotify.max_user_watches`, and this diagnostic is the only
         // sign. Registered once per tracked inode and never retried (`docs/known-gaps/tailing.md`).
@@ -2354,6 +2357,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             match sniff(&tracked.head) {
                 Sniff::Text => {
                     tracked.sniffed = true;
+                    tracked.decoder.file_head(&tracked.head);
                     self.skipped.remove(&id);
                 }
                 Sniff::Undecided => {
@@ -2449,7 +2453,8 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         read_at: i64,
         sink: &Fanout,
     ) -> bool {
-        for (piece, line_start) in lines.drain(..) {
+        let mut pieces = lines.drain(..);
+        for (piece, line_start) in pieces.by_ref() {
             let line = match piece {
                 Piece::Line(line) => line,
                 Piece::Dropped(head) => {
@@ -2511,6 +2516,18 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                     self.untaken = true;
                     break;
                 }
+            }
+        }
+        // A refused emit stops decoding, so the decoder never sees a drop the splitter reported
+        // after it. Each is counted here so none goes uncounted; one the decoder would have folded
+        // into a drop it already counted is counted twice.
+        for (piece, _) in pieces {
+            if let Piece::Dropped(_) = piece {
+                self.telemetry.count("logit.input.frames.dropped", 1.0, &[("reason", "oversize")]);
+                self.diag.warn_throttled(
+                    "long_line",
+                    "a line exceeded the line-length bound and was dropped whole",
+                );
             }
         }
         true
@@ -2646,16 +2663,21 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 // says nothing: not idle.
                 _ => continue,
             }
+            let was_pinned = tracked.held_from.is_some();
             tracked.decoder.flush_idle(now, &mut scratch);
             if !tracked.decoder.holds_entry() {
                 tracked.held_from = None;
                 tracked.at_end = false;
             }
+            // Releasing the pin moves the persisted offset even when nothing is emitted (an idle
+            // flush that only ends an oversize drop), and an interval write skips a clean store.
+            if was_pinned != tracked.held_from.is_some() || !scratch.is_empty() {
+                if let Some(cp) = &mut self.checkpoint {
+                    cp.mark_dirty();
+                }
+            }
             if scratch.is_empty() {
                 continue;
-            }
-            if let Some(cp) = &mut self.checkpoint {
-                cp.mark_dirty();
             }
             let resource = tracked.decoder.resource();
             if let Some((batch, reason)) = tracked.accumulator.absorb(resource, None, &mut scratch)
@@ -3084,7 +3106,7 @@ fn new_splitter<D: TailDecoder>(max_line_bytes: usize) -> LineSplitter {
 
 /// Lossily converts (and diagnoses `invalid_utf8`) a line that isn't UTF-8, upholding
 /// `Value::Str`'s invariant for every [`TailDecoder`].
-fn ensure_utf8(line: Bytes, diag: &mut Diagnostics) -> Bytes {
+pub(crate) fn ensure_utf8(line: Bytes, diag: &mut Diagnostics) -> Bytes {
     match std::str::from_utf8(&line) {
         Ok(_) => line,
         Err(_) => {
@@ -5438,6 +5460,70 @@ mod tests {
         append(&path, b"two\n");
         assert_eq!(tick(&mut tailer, false).await, vec!["two"], "no replay after recovery");
         assert_eq!(scan_errors(&mut probe, "read_dir"), 1.0, "the clean scan counts nothing");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Under the pods layout, a pod directory whose listing failed retires no file beneath it,
+    /// although `root` itself listed.
+    #[tokio::test]
+    async fn a_failed_pod_directory_listing_keeps_the_file_beneath_it() {
+        let root = scratch_dir("scan-pod-dir-fails");
+        let pod = root.join("default_web-0_0123-abcd");
+        std::fs::create_dir_all(pod.join("nginx")).unwrap();
+        let path = pod.join("nginx").join("0.log");
+        std::fs::write(&path, b"one\n").unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer =
+            probed_tailer(vec![PathPattern::pod_logs(&root)], ReadFrom::Beginning, &probe);
+        assert_eq!(tick(&mut tailer, true).await, vec!["one"]);
+
+        let scope = fault::scope(&pod);
+        scope.fail(READ_DIR, errno::EACCES);
+        assert!(tick(&mut tailer, false).await.is_empty());
+        assert_eq!(state_of(&tailer, &path), Some(FileState::Active));
+        assert_eq!(scan_errors(&mut probe, "read_dir"), 1.0);
+        drop(scope);
+
+        append(&path, b"two\n");
+        assert_eq!(tick(&mut tailer, false).await, vec!["two"], "no replay after recovery");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `tail_in`'s decoder keeps [`TailDecoder::STRIPS_CR`]'s default: a CRLF line loses its
+    /// `\r`.
+    #[tokio::test]
+    async fn a_crlf_line_loses_its_cr_under_tail_in() {
+        let dir = scratch_dir("tail-crlf");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\r\n").unwrap();
+        let probe = TelemetryProbe::new();
+        let mut tailer =
+            probed_tailer(vec![PathPattern::new(dir.join("*.log"))], ReadFrom::Beginning, &probe);
+        assert_eq!(tick(&mut tailer, true).await, vec!["one"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A refused emit stops decoding, and a splitter drop reported after it in the same read is
+    /// still counted.
+    #[tokio::test]
+    async fn a_splitter_drop_after_a_refused_emit_is_counted() {
+        let dir = scratch_dir("tail-drop-after-refusal");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"first\nthis line is over the bound\n").unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut config = fast_config(ReadFrom::Beginning);
+        config.max_line_bytes = 8;
+        config.batching.max_events = 1;
+        let mut tailer = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config)
+            .with_telemetry(probe.telemetry("tail_in", "tail_in", "listener"));
+        let (fanout, rx) = fanout_channel(1);
+        drop(rx);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut watcher = crate::tail::watch::Watcher::Poll;
+        tailer.scan(true, &mut watcher).await;
+        let _ = tailer.drain(&fanout, &shutdown_rx, &mut watcher, no_timer_due()).await;
+        assert!(tailer.untaken);
+        assert_eq!(probe.sum("logit.input.frames.dropped", &[("reason", "oversize")]), 1.0);
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -581,9 +581,9 @@ row uses the stage above with that row's attribute name:
 | Producer | Arrives through | Where the host is | Recipe |
 |---|---|---|---|
 | Telegraf, `outputs.influxdb_v2` | `influxdb_in` | the `host` tag on every point, an attribute `host` | copy `host` |
-| pino, pino-http | `tail_in` or `docker_in`, then `json` | the `hostname` field, an attribute `hostname` | copy `hostname` |
-| bunyan | `tail_in` or `docker_in`, then `json` | the `hostname` field, an attribute `hostname` | copy `hostname` |
-| semantic_logger (Ruby), JSON format | `tail_in` or `docker_in`, then `json` | the `host` field, an attribute `host` | copy `host` |
+| pino, pino-http | `tail_in`, `docker_in`, or `cri_in`, then `json` | the `hostname` field, an attribute `hostname` | copy `hostname` |
+| bunyan | `tail_in`, `docker_in`, or `cri_in`, then `json` | the `hostname` field, an attribute `hostname` | copy `hostname` |
+| semantic_logger (Ruby), JSON format | `tail_in`, `docker_in`, or `cri_in`, then `json` | the `host` field, an attribute `host` | copy `host` |
 | collectd `write_graphite`, Telegraf `outputs.graphite` | `graphite_in` | the metric path's first segment (`<host>.<plugin>...`, or Telegraf's default template `host.tags.measurement.field`), after any `prefix` | split the segment off the metric name in a `lua` stage; to label the whole stream instead, `set` a constant `host.name` |
 
 python-json-logger, structlog, Go's `log/slog`, and zap write no host by default; a `set` of a
@@ -2523,15 +2523,39 @@ time to trust; put a `timestamp` stage after the parser to resolve one from a pa
 [ADR `file-tailing-and-docker-json-logs`](adr/file-tailing-and-docker-json-logs.md)'s
 "`docker_in` timestamps" section.
 
+### Lines `docker_in` can't read whole
+
+The same rules hold for a cri-dockerd file under `cri_in`.
+
+**A rejected entry** (not JSON, or a `stream` that's neither `stdout` nor `stderr`) is counted
+`logit.input.frames.dropped{reason="malformed"}` with a `bad_line` diagnostic, after both streams'
+waiting fragments are delivered as they stand.
+
+#### The Docker splitter's bound
+
+The line splitter reads each json-file line before the decoder does, bounded at about six times
+`max_line_bytes` plus 64 KiB of room for the envelope's `attrs` (about 6 MiB at the default). An
+envelope over that is dropped before the decoder sees it, and since json-file writes `stream` after
+`log`, nothing says which stream it was on. So every fragment either stream was holding is dropped
+with it, counted `logit.input.frames.dropped{reason="oversize"}` with a `long_line` diagnostic. No
+delivered line is joined across the dropped entry, but the fragments after it, up to its line's last
+entry, leave as a line without its head. The count isn't one per line: when the dropped entry
+starts a line while the other stream holds one or is dropping, it's one short, and when several
+fragments of one line are dropped in a row, each counts once. An envelope dockerd writes fits the
+bound unless its `attrs` object outgrows the 64 KiB room; a writer other than dockerd can exceed it
+too.
+Keep `attrs` small, or raise `max_line_bytes`, which raises the bound six bytes for each byte.
+
 ### Kubernetes container logs: `cri_in`
 
 `cri_in` tails every container's log that the kubelet lays out under `/var/log/pods`, in the CRI
-format containerd and CRI-O write, on the same driver as `tail_in`
-([ADR `cri-container-logs`](adr/cri-container-logs.md)). It joins each line the runtime split into
+format containerd and CRI-O write, or as cri-dockerd's Docker json-file, on the same driver as
+`tail_in` ([ADR `cri-container-logs`](adr/cri-container-logs.md)). It joins each line the runtime split into
 `P` pieces back into one event, per file and per stream, stamps the event with the line's own CRI
 timestamp and `log.iostream` (`stdout` or `stderr`), and writes `k8s.namespace.name`,
 `k8s.pod.name`, `k8s.pod.uid`, `k8s.container.name`, and `k8s.container.restart_count` from the
-path onto the resource. It reads no API server and no runtime socket.
+path onto the resource, and `container.id` from the name of the kubelet's symlink to the file. It
+reads no API server and no runtime socket.
 
 ```yaml
 components:
@@ -2553,20 +2577,39 @@ or as a user in the files' group. Mount `/var/log/pods` from a `hostPath`, with 
 container directory, file name) are read for its identity, so another mount point works with
 `root:` set to it.
 
+**Mount `/var/log/containers` read-only too, for `container.id`.** The kubelet links each container's
+log there as `<pod>_<namespace>_<container>-<container id>.log`. `cri_in` lists the directory and
+reads each link's name and target, never the file, and writes the 64-character id as the resource's
+`container.id`, bare, with no `containerd://` prefix. `containers_dir:` names the directory when it
+isn't at `/var/log/containers`. Without the mount, `cri_in` still runs and writes every other
+attribute, and no `container.id`: a missing directory is not an error. Mount it from a `hostPath`
+with `readOnly: true`, as the example does.
+
 **Put `checkpoint_path` on a `hostPath` too** (`/var/lib/logit`, say, `DirectoryOrCreate`). An
 `emptyDir` or the container's own filesystem goes away with the pod, so every rollout would
 re-apply `read_from`: under `end`, the default, the lines written while no pod ran are skipped, and
 under `beginning`, every file on the node is replayed. A run of `P` pieces still waiting for its
 `F` at a clean stop is kept unread when a checkpoint is configured, and read whole on the restart.
 
-**Roll a `cri_in` DaemonSet with `maxUnavailable: 1` and `maxSurge: 0`, not the surging rollout
-below.** Two pods on one node both read every file, so a surge delivers every line twice while it
-lasts, and two pods writing one `hostPath` checkpoint overwrite each other's offsets.
+**Roll a `cri_in` DaemonSet with `maxUnavailable: 1` and `maxSurge: 0`, not the
+[surging rollout](#kubernetes-a-surging-daemonset).** Two pods on one node both read every file,
+so a surge delivers every line twice while it lasts, and two pods writing one `hostPath`
+checkpoint overwrite each other's offsets.
 
 **`host.name`.** The path names no node, so `cri_in` writes no `host.name`. A sink that fills a
 missing host uses `logit`'s hostname, which in a pod is the pod's name unless the pod runs with
 `hostNetwork: true`. Set the top-level `hostname: !env NODE_NAME` from the downward API (see
 [Hostname](#hostname)), or stamp `host.name` or `k8s.node.name` with `set` from the same variable.
+
+**On a cri-dockerd node, mount Docker's container directory too, at its host path.** cri-dockerd
+makes each pods file a symlink to Docker's own `/var/lib/docker/containers/<id>/<id>-json.log`,
+and `cri_in` reads through the link, so the target has to be reachable at the path the link names:
+mount `/var/lib/docker/containers` from a `hostPath` at the same path, `readOnly: true`. Without
+it, every link dangles and no file is read. `cri_in` recognizes such a file by its first byte, `{`,
+and decodes it as `docker_in` decodes Docker's json-file lines, with the pods path's resource:
+fragments of a line over 16 KiB are joined per stream, the envelope's `time` is the event's time,
+`attrs` (from `--log-opt labels`, `env`, or `tag`) become event attributes, and `partial_timeout`
+delivers a fragment whose closing entry never comes.
 
 **Pick containers downstream.** `cri_in` follows every container under `root:`. Narrow the flow
 with `has_attributes` or `drop_attributes` on the resource's `k8s.namespace.name` or
@@ -2606,17 +2649,27 @@ file to close, which the kubelet does only when it removes the file.
 - **A static pod's `k8s.pod.uid` is the kubelet's own uid, not its mirror pod's** in the API,
   unless its manifest sets one. Join a static pod's lines to the API's pod objects by
   `k8s.namespace.name` and `k8s.pod.name`.
-- **No `container.id`, pod labels, annotations, or node name.** The path doesn't hold them. Add
-  what you need with `set` (a constant or `!env` value, such as the node name above), or with a
-  `lua` stage that maps a pod name to more.
+- **No pod labels, annotations, or node name.** The path doesn't hold them. Add what you need with
+  `set` (a constant or `!env` value, such as the node name above), or with a `lua` stage that maps a
+  pod name to more.
+- **A container can lack `container.id`.** The kubelet cuts a link's name to 251 bytes, so a pod
+  with a long name has a link without its id, and `cri_in` never guesses one. The kubelet makes the
+  link after the container starts, so the first lines can carry no id; the file's lines from the next
+  `poll_interval` scan on do. `cri_in` remembers an id only in memory, so if the kubelet removes a
+  link (when it collects the container) before `logit` starts, that container has none. Join to
+  `k8s.pod.uid`, `k8s.container.name`, and `k8s.container.restart_count`, which are always present.
+  A `containers_dir` that exists but can't be read raises the `container_id_error` diagnostic.
 - **CRI-O's own size rotation isn't followed across a restart.** Leave conmon's `log_size_max` at
   its default, off, so the kubelet rotates, by names `cri_in` matches. With it on, a file conmon
   replaced while `logit` was down has its unread rest counted
   `logit.input.bytes.dropped{reason="gone"}`.
-- **cri-dockerd's files aren't read yet.** Under cri-dockerd, the file under each pods name is
-  Docker's json-file log, which `cri_in` doesn't parse yet: every line counts
-  `frames.dropped{reason="malformed"}`. Tail Docker's container directory with `docker_in` on
-  such a node instead.
+- **Under cri-dockerd, a file Docker rotated while `logit` was down loses its unread rest.**
+  Docker renames `<id>-json.log` to `<id>-json.log.1` in its own directory, outside `root:`, so a
+  restart can't resume it, and its unread bytes count `logit.input.bytes.dropped{reason="gone"}`,
+  as under `docker_in`. Within a run nothing is lost: the renamed file is read to its end.
+- **Under cri-dockerd, a line can leave without its head** when the line splitter drops an
+  envelope over its bound, which needs an `attrs` object larger than the bound's 64 KiB slack (see
+  [The Docker splitter's bound](#the-docker-splitters-bound)).
 
 ### `read_from`, and why a checkpoint matters more here than for a plain UDP listener
 
@@ -2814,9 +2867,11 @@ see [ADR
   read is cached against that stat like a successful one; a torn read racing the daemon's rewrite is
   therefore picked up as soon as the rewrite lands. Either way, it fires once per failure, not once
   per tick while the failure persists.
-- `logit.input.files.identity_changed` / `.deselected` (count, `docker_in` only): a container's
-  identity (name, image, a watched label, or, under `host_name: container`, the hostname) changed,
-  or a tracked container was renamed out of `containers:` and stopped flowing. The matching `container_renamed`/`container_deselected`
+- `logit.input.files.identity_changed` / `.deselected` (count): under `docker_in`, a container's
+  identity (name, image, a watched label, or, under `host_name: container`, the hostname) changed
+  (`identity_changed`), or a tracked container was renamed out of `containers:` and stopped flowing
+  (`.deselected`). Under `cri_in`, `identity_changed` counts a file's `container.id` found after the
+  file was first read; `.deselected` is `docker_in` only. The matching `container_renamed`/`container_deselected`
   diagnostics name the container. **A deselection is process-local:** if `logit` restarts before the
   container is renamed back, the retained resume offset is lost.
 
