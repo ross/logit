@@ -13,7 +13,7 @@
 use ring::{digest, hmac};
 
 /// The algorithm every SigV4 string to sign and credential names.
-pub const ALGORITHM: &str = "AWS4-HMAC-SHA256";
+pub(crate) const ALGORITHM: &str = "AWS4-HMAC-SHA256";
 
 /// The SHA-256 of an empty payload, in hex: a presigned `GET`'s payload hash.
 pub const EMPTY_PAYLOAD_SHA256: &str =
@@ -119,7 +119,7 @@ impl Signer<'_> {
 
 /// The canonical request: method, path, query, headers, signed headers, and payload hash, one
 /// per line.
-pub fn canonical_request(request: &Request<'_>) -> String {
+pub(crate) fn canonical_request(request: &Request<'_>) -> String {
     let path: Vec<String> = request.path.split('/').map(uri_encode).collect();
     let mut query: Vec<(String, String)> =
         request.query.iter().map(|(k, v)| (uri_encode(k), uri_encode(v))).collect();
@@ -155,7 +155,7 @@ pub fn canonical_request(request: &Request<'_>) -> String {
 }
 
 /// The string to sign for `canonical` at `date` in `scope`.
-pub fn string_to_sign(date: &AmzDate, scope: &str, canonical: &str) -> String {
+pub(crate) fn string_to_sign(date: &AmzDate, scope: &str, canonical: &str) -> String {
     let hash = hex(digest::digest(&digest::SHA256, canonical.as_bytes()).as_ref());
     format!("{ALGORITHM}\n{}\n{scope}\n{hash}", date.datetime)
 }
@@ -171,7 +171,7 @@ fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> hmac::K
 }
 
 /// SigV4's URI encoding of one name, value, or path segment.
-pub fn uri_encode(value: &str) -> String {
+pub(crate) fn uri_encode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for b in value.bytes() {
         match b {
