@@ -363,36 +363,38 @@ Recorded per workstream as each lands.
   `max_batch_bytes` by Fetch's `i32` `max_bytes` field, not by the connection's 64 MiB response
   cap. A repeated header name can't come from `kafka-protocol`'s producer types, so the carrier
   tests hand-build a record batch.
-- **W4**: `logit_proto::msgpack::Reader` already read every format the grammar uses, so it
-  gained nothing; the bounds live in `logit_proto::msgpack_event`. `event_json` now parses a line
-  into a tree of its own (`event_tree::Node`) rather than `serde_json::Value`, so one walk reads
-  both formats and keeps a `bin` and a non-finite float apart. A MessagePack input's trees are
-  charged to the default 256 MiB `DecodeBudget`, which JSON has no equivalent of. `logit_proto::otlp`
-  has no decode budget to reuse: `otlp_in`'s one bound is its 4 MiB cap on an HTTP body, so an
-  OTLP record is bounded by `max_batch_bytes` alone. A request's batches needed no change to the
-  input: a record's batches always fall in one cut, which is marked after its last batch. A logs
-  request on the metrics topic is `undecodable` under both encodings. OTLP/JSON ignores a field it
-  doesn't know, so under `otlp_json` such a request decodes to no event, and the input reads its
-  top-level `resourceLogs`, `resourceMetrics`, or `resourceSpans` list, or the snake_case
-  `resource_logs`, `resource_metrics`, or `resource_spans` the decoder also reads, to tell it from
-  an empty request. A list with no entry carried nothing, and the request stays `empty`. `kafka_out` never writes a request of
-  several resources, so the test builds one by concatenating two protobuf requests. The OTLP
-  encoder stamps a log with no observed time with the clock, so the split round trip sets one.
-- **W5**: `kafka_out` under an OTLP format dropped an event with no log, span, or metric
-  uncounted; it now counts `logit.output.events.skipped{reason="no_payload"}`, as `otlp_out`
-  does. Its records carry the time it encoded them as their timestamp, as the Collector's
-  exporter's do, so item 13's record-timestamp normalization now says so, and the transit driver
-  restamps those timestamps with the run's clock to keep the expectations stable. The cases are
-  `kafka_out`'s records built from the other sources' events, in every format and codec, the
-  Java producer's and kcat's segments read in place under `format: text`, and a hand-written
-  OTLP case for the `otlp_out` normalizations no producer case reaches (a finite last histogram
-  bound, a `Timestamp` attribute, and a log with no trace beside a span). Series that share a
-  name across source cases pair wrongly in one case, so `statsd/sub-millisecond`,
-  `sub-millisecond-equal`, and `timestamped` are cases of their own. Under `format: text` the
-  class check skips metric records: the log and span rows' `beside` cells account for them.
-  The key-and-headers debt is the row `attributes/kafka_key_headers`, `lost` and uncounted at
-  `kafka_out`, the eleventh `UNCOUNTED_ALLOWED` entry. The `kafka_out` cells no flow reaches are
+- **W4**: `logit_proto::msgpack::Reader` already read every format the grammar uses, so it gained
+  nothing; the bounds live in `logit_proto::msgpack_event`. `event_json` now parses a line into a
+  tree of its own (`event_tree::Node`) rather than `serde_json::Value`, so one walk reads both
+  formats and keeps a `bin` and a non-finite float apart. A MessagePack input's trees are charged to
+  the default 256 MiB `DecodeBudget`, which JSON has no equivalent of. `logit_proto::otlp` has no
+  decode budget to reuse: `otlp_in`'s one bound is its 4 MiB cap on an HTTP body, so an OTLP record
+  is bounded by `max_batch_bytes` alone. A request's batches needed no change to the input: a
+  record's batches always fall in one cut, which is marked after its last batch. A logs request on
+  the metrics topic is `undecodable` under both encodings. OTLP/JSON ignores a field it doesn't
+  know, so under `otlp_json` such a request decodes to no event, and the input reads its top-level
+  `resourceLogs`, `resourceMetrics`, or `resourceSpans` list, or the snake_case `resource_logs`,
+  `resource_metrics`, or `resource_spans` the decoder also reads, to tell it from an empty request.
+  A list with no entry carried nothing, and the request stays `empty`. `kafka_out` never writes a
+  request of several resources, so the test builds one by concatenating two protobuf requests. The
+  OTLP encoder stamps a log with no observed time with the clock, so the split round trip sets one.
+- **W5**: `kafka_out` under an OTLP format dropped an event with no log, span, or metric uncounted;
+  it now counts `logit.output.events.skipped{reason="no_payload"}`, as `otlp_out` does. Its records
+  carry the time it encoded them as their timestamp, as the Collector's exporter's do, so item 13's
+  record-timestamp normalization now says so, and the transit driver restamps those timestamps with
+  the run's clock to keep the expectations stable. The cases are `kafka_out`'s records built from
+  the other sources' events, in every format and codec, the Java producer's and kcat's segments read
+  in place under `format: text`, and a hand-written OTLP case for the `otlp_out` normalizations no
+  producer case reaches (a finite last histogram bound, a `Timestamp` attribute, and a log with no
+  trace beside a span). Series that share a name across source cases pair wrongly in one case, so
+  `statsd/sub-millisecond`, `sub-millisecond-equal`, and `timestamped` are cases of their own. Under
+  `format: text` the class check skips metric records: the log and span rows' `beside` cells account
+  for them. The key-and-headers debt is the row `attributes/kafka_key_headers`, `lost` and uncounted
+  at `kafka_out`, the eleventh `UNCOUNTED_ALLOWED` entry. The `kafka_out` cells no flow reaches are
   mostly OTLP-format attribute rows for other protocols' carriers, listed in
-  `spec/transit/coverage.md`. The `kafka_batch` and `msgpack_event` fuzz targets ran 120 s each
-  with no finding: `kafka_batch` 1.93 million runs, `msgpack_event` 5.17 million over 14 jobs,
-  with no out-of-memory or timeout.
+  `spec/transit/coverage.md`. The `kafka_batch` and `msgpack_event` fuzz targets ran 120 s each with
+  no finding: `kafka_batch` 1.93 million runs, `msgpack_event` 5.17 million over 14 jobs, with no
+  out-of-memory or timeout. It also wrote a `u64` attribute above `i64::MAX` as a double uncounted,
+  which `otlp_out` counts as `logit.output.attributes.normalized{reason="u64_as_double"}`; it counts
+  it now. `logit_proto::kafka::decode` leaves a tail of fewer than 12 bytes unread without reporting
+  it, so the transit read-back fails unless the batch frames end where the bytes do.
