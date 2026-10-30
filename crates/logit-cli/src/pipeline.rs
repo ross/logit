@@ -19,6 +19,7 @@ use anyhow::Context;
 use logit_config::{BufferConfig, Config, StdioTarget};
 use logit_core::{Diagnostics, Registry, Telemetry};
 use logit_inputs::collectd::CollectdInput;
+use logit_inputs::cri::CriInput;
 use logit_inputs::datadog::DatadogInput;
 use logit_inputs::datadog_trace::DatadogTraceInput;
 use logit_inputs::docker::{ContainerFilter, DockerInput};
@@ -938,6 +939,19 @@ pub(crate) fn build_spec(
                 input_runtime_config(&component.receive),
             )
         }
+        CriIn { root, containers_dir, partial_timeout, tail } => NodeSpec::Input(
+            Box::new(
+                CriInput::new(
+                    base_dir.join(root),
+                    base_dir.join(containers_dir),
+                    *partial_timeout,
+                    tail_config(tail, &component.receive, base_dir),
+                )
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone()),
+            ),
+            input_runtime_config(&component.receive),
+        ),
         // `prepare` reads `span_sample_rate` to build the `Registry`, and `logs` decides whether
         // `run_pipelines` activates the `TelemetryLayer`.
         Internal { interval, span_sample_rate: _, logs: _ } => {

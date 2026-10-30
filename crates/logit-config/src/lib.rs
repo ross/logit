@@ -215,8 +215,8 @@ pub struct Component {
     pub buffer: BufferConfig,
     /// Per-listener receive queue and batch assembly. A datagram listener (`collectd_in`, and
     /// `statsd_in`/`syslog_in`/`graphite_in`/`lines_in` under `transport: udp`) accepts every
-    /// field; the same four under `transport: tcp`, `tail_in`, and `docker_in` accept only the
-    /// batch-assembly fields and `shutdown_grace`; a non-default block on any other kind
+    /// field; the same four under `transport: tcp`, `tail_in`, `docker_in`, and `cri_in` accept
+    /// only the batch-assembly fields and `shutdown_grace`; a non-default block on any other kind
     /// (`otlp_in`, `logit_in`, `prometheus_in`, `internal`, and `generate_in` included) is
     /// rejected.
     #[serde(default)]
@@ -2610,6 +2610,47 @@ pub enum ComponentKind {
         #[serde(flatten)]
         tail: TailOptions,
     },
+    /// Tails every Kubernetes container log under the kubelet's pod log directory
+    /// (`<root>/<namespace>_<pod>_<pod uid>/<container>/<restart count>.log`), in the CRI format
+    /// containerd and CRI-O write, or cri-dockerd's Docker json-file (told apart per file by its
+    /// first byte, `{`), and stamps each line's pod and container identity from its path as
+    /// `k8s.namespace.name`, `k8s.pod.name`, `k8s.pod.uid`, `k8s.container.name`, and
+    /// `k8s.container.restart_count` resource attributes. A line the runtime wrote in pieces is
+    /// put back together per stream, so each event is one line of the container's stdout or
+    /// stderr, with `log.iostream` naming which and the runtime's timestamp as the event's time.
+    /// Follows every container under `root`; narrow the flow downstream on the `k8s.*`
+    /// attributes. Also reads a rotated file the kubelet hasn't compressed yet
+    /// (`<n>.log.<YYYYMMDD-HHMMSS>`), never a `.gz` one. No API server and no runtime socket.
+    /// Takes the same tailing options as `tail_in`.
+    CriIn {
+        /// The kubelet's pod log directory. Defaults to `/var/log/pods`. Must be non-empty.
+        #[serde(default = "default_cri_root")]
+        root: String,
+        /// The kubelet's container symlink directory, read for each container's id. Defaults to
+        /// `/var/log/containers`. Must be non-empty. The kubelet links each container's log there
+        /// under a name ending in the container's 64-character id
+        /// (`<pod>_<namespace>_<container>-<id>.log`), and `cri_in` writes that id as the
+        /// `container.id` resource attribute. A container whose link is missing, was removed
+        /// before `cri_in` listed it, or has a name the kubelet cut short of a whole id gets no
+        /// `container.id`. A directory that doesn't exist is not an error: no container gets an
+        /// id. `logit` needs read access to this directory, and the links' targets need not be
+        /// reachable through it, since only the link text is read.
+        #[serde(default = "default_cri_containers_dir")]
+        containers_dir: String,
+        /// How long a stream's unfinished line waits for its next piece, once `logit` has read
+        /// to the end of its file, before it's sent as it stands. A container that exits or
+        /// prompts mid-line leaves such a line. Each one sent this way is counted as
+        /// `logit.input.frames.truncated{reason="partial_timeout"}`, and if the rest of the line
+        /// arrives later, it's sent as a second event. The wait is checked on the
+        /// `poll_interval` tick, so a line can wait up to one `poll_interval` longer. Defaults
+        /// to `5s`; `0s` turns the timer off, and an unfinished line then waits for its last
+        /// piece or for its file to close.
+        #[serde(default = "default_partial_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        partial_timeout: Duration,
+        #[serde(flatten)]
+        tail: TailOptions,
+    },
     /// The native `logit`-to-`logit` protocol: one TCP (optionally TLS) listener accepting many
     /// connections, each handshaking with `Hello`/`HelloAck` and acknowledging every frame.
     LogitIn {
@@ -4577,11 +4618,16 @@ pub enum ComponentKind {
     /// same form. Events keep the timestamps the file gives them. When every input has stopped,
     /// the process flushes its sinks and exits.
     ///
+    /// A file that starts with gzip's or zstd's magic bytes is decompressed as it's read, for
+    /// either format: every gzip member and every zstd frame. A compressed file that is cut short
+    /// or corrupt is read up to the fault, counted, and ends the replay.
+    ///
     /// A line or frame that can't be read is skipped and counted, and the rest of the file is
     /// still sent. There's no follow mode, no checkpoint, and no pacing: a restart reads the file
     /// from the start, and events go out as fast as the components downstream take them.
     ReplayIn {
-        /// The file to read, relative to the config file unless absolute. It's opened at startup,
+        /// The file to read, gzip- or zstd-compressed or not, relative to the config file unless
+        /// absolute. It's opened at startup,
         /// so a missing or unreadable file stops `logit run` before anything else starts.
         path: String,
         /// How the file is written: `json` (the default), one event per line as a `format: json`
@@ -4931,6 +4977,18 @@ fn default_docker_root() -> String {
     "/var/lib/docker/containers".to_string()
 }
 
+fn default_cri_root() -> String {
+    "/var/log/pods".to_string()
+}
+
+fn default_cri_containers_dir() -> String {
+    "/var/log/containers".to_string()
+}
+
+fn default_partial_timeout() -> Duration {
+    Duration::from_secs(5)
+}
+
 /// `internal`'s `logs` field: which of `logit`'s own self-log events are captured into the
 /// pipeline as ordinary log events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
@@ -4976,7 +5034,7 @@ pub enum WatchMode {
     Poll,
 }
 
-/// Options shared by `tail_in` and `docker_in`, written directly on the component rather than
+/// Options shared by `tail_in`, `docker_in`, and `cri_in`, written directly on the component rather than
 /// under a sub-block.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
@@ -4985,7 +5043,7 @@ pub struct TailOptions {
     /// Omitted (the default) means no checkpoint: every restart re-applies `read_from` to every
     /// file as if newly discovered. A relative path resolves against the config file's
     /// directory. Must be unique per component. Each write goes through `<checkpoint_path>.tmp`
-    /// beside it, so two `tail_in`/`docker_in` components sharing a path, or one whose path is
+    /// beside it, so two `tail_in`/`docker_in`/`cri_in` components sharing a path, or one whose path is
     /// another's `.tmp`, are rejected. A checkpoint that exists but can't be read replays every
     /// file from its beginning, whatever `read_from` says.
     #[serde(default)]
@@ -5010,8 +5068,9 @@ pub struct TailOptions {
     /// A line longer than this is dropped whole (not truncated) and diagnosed, so a downstream
     /// JSON parser never sees a value that looks well-formed but isn't the real line. The length
     /// counts a trailing `\r`, so a CRLF file has one byte less room per line. Under `docker_in`
-    /// it bounds the reassembled `log` message, not the json-file line that carries it. A
-    /// byte-count string. Defaults to `"1MiB"`; `0` is rejected.
+    /// it bounds the reassembled `log` message, not the json-file line that carries it, and under
+    /// `cri_in` the reassembled line, not the CRI record that carries a piece of it. A byte-count
+    /// string. Defaults to `"1MiB"`; `0` is rejected.
     #[serde(default = "default_max_line_bytes", with = "human_bytes")]
     #[schemars(with = "String")]
     pub max_line_bytes: u64,
@@ -6086,7 +6145,7 @@ pub enum DeliveryPosture {
 
 /// Per-listener receive queue and datagram-to-batch assembly. A datagram listener (`collectd_in`,
 /// and `statsd_in`/`syslog_in`/`graphite_in`/`lines_in` under `transport: udp`) accepts every
-/// field; the same four under `transport: tcp`, `tail_in`, and `docker_in` accept only the
+/// field; the same four under `transport: tcp`, `tail_in`, `docker_in`, and `cri_in` accept only the
 /// batch-assembly fields (`batch_max_events`, `batch_max_bytes`, `batch_flush_interval`) and
 /// `shutdown_grace`; a non-default block on any other kind is rejected. Every field defaults, so
 /// the block is never required. The defaults batch: `batch_max_events: 1000` and
@@ -6571,7 +6630,7 @@ pub fn json_schema() -> schemars::schema::RootSchema {
 /// variant and closes every variant with `additionalProperties: false`, matching what
 /// deserialization accepts. schemars closes each variant from `deny_unknown_fields`, but a closed
 /// variant can't see properties declared beside the `oneOf`, and a variant with a flattened field
-/// (`tail_in`, `docker_in`) is left open. Each variant lists a common key as `true`: its shape is
+/// (`tail_in`, `docker_in`, `cri_in`) is left open. Each variant lists a common key as `true`: its shape is
 /// still checked by `Component`'s own `properties`, so the schema carries one copy of it.
 fn close_component_variants(root: &mut schemars::schema::RootSchema) {
     use schemars::schema::SchemaObject;
@@ -11378,6 +11437,7 @@ mod tests {
             r#""type": "statsd_in", "bind": "127.0.0.1:8125""#,
             r#""type": "tail_in", "paths": ["/var/log/app.log"]"#,
             r#""type": "docker_in", "discover": true"#,
+            r#""type": "cri_in""#,
         ] {
             let component: Component = serde_json::from_str(&format!("{{{kind}, {common}}}"))
                 .unwrap_or_else(|err| panic!("{kind}: {err}"));
@@ -11386,13 +11446,14 @@ mod tests {
     }
 
     #[test]
-    fn tail_in_and_docker_in_reject_an_unknown_key_and_accept_every_tail_option() {
+    fn every_tail_kind_rejects_an_unknown_key_and_accepts_every_tail_option() {
         let options = r#""checkpoint_path": "/var/lib/logit/tail.ckpt", "read_from": "beginning",
             "watch": "poll", "poll_interval": "2s", "checkpoint_interval": "10s",
             "max_line_bytes": "64KiB""#;
         for kind in [
             r#""type": "tail_in", "paths": ["/var/log/app.log"]"#,
             r#""type": "docker_in", "containers": ["web"]"#,
+            r#""type": "cri_in", "partial_timeout": "0s""#,
         ] {
             let err = unknown_field_error(&format!(r#"{{{kind}, "read_form": "beginning"}}"#));
             assert!(err.contains("unknown field `read_form`"), "{kind}: {err}");
@@ -11400,7 +11461,9 @@ mod tests {
             let component: Component = serde_json::from_str(&format!("{{{kind}, {options}}}"))
                 .unwrap_or_else(|err| panic!("{kind}: {err}"));
             let tail = match component.kind {
-                ComponentKind::TailIn { tail, .. } | ComponentKind::DockerIn { tail, .. } => tail,
+                ComponentKind::TailIn { tail, .. }
+                | ComponentKind::DockerIn { tail, .. }
+                | ComponentKind::CriIn { tail, .. } => tail,
                 other => panic!("expected a tailing kind, got {other:?}"),
             };
             assert_eq!(tail.checkpoint_path.as_deref(), Some("/var/lib/logit/tail.ckpt"));
@@ -11409,6 +11472,20 @@ mod tests {
             assert_eq!(tail.poll_interval, Duration::from_secs(2));
             assert_eq!(tail.checkpoint_interval, Duration::from_secs(10));
             assert_eq!(tail.max_line_bytes, 64 * 1024);
+        }
+    }
+
+    #[test]
+    fn cri_in_defaults_its_directories_and_partial_timeout() {
+        let component: Component = serde_json::from_str(r#"{"type": "cri_in"}"#).unwrap();
+        match component.kind {
+            ComponentKind::CriIn { root, containers_dir, partial_timeout, tail } => {
+                assert_eq!(root, "/var/log/pods");
+                assert_eq!(containers_dir, "/var/log/containers");
+                assert_eq!(partial_timeout, Duration::from_secs(5));
+                assert_eq!(tail, TailOptions::default());
+            }
+            other => panic!("expected cri_in, got {other:?}"),
         }
     }
 

@@ -8,6 +8,7 @@ description = "Per-protocol sinks implementing logit-pipeline's Output trait (In
 
 [dependencies]
 logit-core.workspace = true
+logit-aws.workspace = true
 logit-pipeline.workspace = true
 logit-proto.workspace = true
 anyhow.workspace = true
@@ -53,6 +54,8 @@ tokio.workspace = true
 tokio-rustls.workspace = true
 
 [dev-dependencies]
+# `HttpStub`, the stand-in for STS, the container endpoint, and IMDS in `kafka_out`'s tests.
+logit-aws = { workspace = true, features = ["test-util"] }
 # Arms `logit_pipeline::fault` and compiles `logit_pipeline::test_util` in this crate's tests.
 # Dev-only, so the release binary never has either.
 logit-pipeline = { workspace = true, features = ["fault-injection", "test-util"] }

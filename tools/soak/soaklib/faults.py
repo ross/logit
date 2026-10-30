@@ -73,7 +73,8 @@ from .scenario import (BACKEND_ROLE, BROKER_ROLE, GENERATOR_ROLE, IDP_ROLE, NETN
 NETEM_LIMIT = "100000"
 # The timeline key recording, per `[[ledger.source]]` wire, whether a step can affect it.
 INGRESS_KEYS = {"udp": "affects_udp_ingress", "tcp": "affects_tcp_ingress",
-                "file": "affects_file_ingress", "http": "affects_http_ingress"}
+                "file": "affects_file_ingress", "http": "affects_http_ingress",
+                "cri": "affects_file_ingress"}
 # 128 + SIGKILL: the exit code Docker records for a container a `kill` ended.
 KILL_EXIT_CODE = 137
 CUE_TIMEOUT_S = 10
