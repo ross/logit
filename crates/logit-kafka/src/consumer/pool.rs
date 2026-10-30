@@ -24,7 +24,7 @@ use kafka_protocol::protocol::{Request, StrBytes};
 use tokio::time::Instant;
 
 use super::{ConsumerSettings, Counters};
-use crate::conn::{Conn, Dialer, CONSUMER_APIS};
+use crate::conn::{Conn, DialError, DialStage, Dialer, CONSUMER_APIS};
 
 /// Which connection of the consumer's a [`Link`] is, for counting redials.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -119,10 +119,13 @@ impl Pool {
 
     async fn dial(&self, slot: Slot, target: &Target, api: ApiKey) -> anyhow::Result<Conn> {
         let result = match target {
-            Target::Addr(host, port) => self.dialer.connect(host, *port).await,
+            Target::Addr(host, port) => self.dialer.connect_staged(host, *port).await,
             Target::Node(node) => match self.broker(*node) {
-                Some((host, port)) => self.dialer.connect(&host, port).await,
-                None => Err(anyhow!("no address for Kafka broker {node}")),
+                Some((host, port)) => self.dialer.connect_staged(&host, port).await,
+                None => Err(DialError {
+                    stage: DialStage::Connect,
+                    error: anyhow!("no address for Kafka broker {node}"),
+                }),
             },
             Target::Any => self.dial_any().await,
         };
@@ -134,20 +137,22 @@ impl Pool {
             }
             Err(err) => self.counters.dial_failed(api, err),
         }
-        result
+        result.map_err(|err| err.error)
     }
 
-    async fn dial_any(&self) -> anyhow::Result<Conn> {
+    async fn dial_any(&self) -> Result<Conn, DialError> {
         let mut targets: Vec<(String, u16)> = self.bootstrap.to_vec();
         let mut known: Vec<_> = self.brokers.lock().unwrap().clone().into_iter().collect();
         known.sort();
         targets.extend(known.into_iter().map(|(_, addr)| addr));
         let mut last = None;
         for (host, port) in targets {
-            match self.dialer.connect(&host, port).await {
+            match self.dialer.connect_staged(&host, port).await {
                 Ok(conn) => return Ok(conn),
                 // Every broker gives the same versions and SASL verdict.
-                Err(err) if logit_pipeline::classify(&err) == logit_pipeline::Fault::Refused => {
+                Err(err)
+                    if logit_pipeline::classify(&err.error) == logit_pipeline::Fault::Refused =>
+                {
                     return Err(err)
                 }
                 Err(err) => last = Some(err),

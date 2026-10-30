@@ -80,6 +80,7 @@ use kafka_protocol::messages::ApiKey;
 use kafka_protocol::ResponseError;
 use logit_core::{Diagnostics, Telemetry};
 
+use crate::conn::{DialError, DialStage};
 use crate::error::code;
 use crate::sasl::Authenticator;
 
@@ -353,21 +354,24 @@ impl Counters {
         self.diag.clone().warn_throttled(key, msg);
     }
 
-    /// Counts and reports a failed dial made for `api`: a TLS handshake is `tls`, a SASL
-    /// refusal `sasl` (diagnostic `auth_failed`), a broker without a required version
-    /// `unsupported_version` (diagnostic `unsupported_version`), anything else `transport`.
-    pub(crate) fn dial_failed(&self, api: ApiKey, err: &anyhow::Error) {
-        let text = format!("{err:#}");
-        let error = if text.contains("SASL") {
-            self.warn("auth_failed", format_args!("Kafka authentication failed: {text}"));
-            "sasl"
-        } else if text.contains("TLS") {
-            "tls"
-        } else if logit_pipeline::classify(err) == logit_pipeline::Fault::Refused {
-            self.warn("unsupported_version", format_args!("Kafka broker refused: {text}"));
-            "unsupported_version"
-        } else {
-            "transport"
+    /// Counts and reports a failed dial made for `api` by the stage it failed in: `tls`, `sasl`
+    /// (diagnostic `auth_failed` when refused), `unsupported_version` (diagnostic
+    /// `unsupported_version`), or `transport` for a connect or `ApiVersions` failure.
+    pub(crate) fn dial_failed(&self, api: ApiKey, err: &DialError) {
+        let refused = logit_pipeline::classify(&err.error) == logit_pipeline::Fault::Refused;
+        let error = match err.stage {
+            DialStage::Connect | DialStage::ApiVersions => "transport",
+            DialStage::Tls => "tls",
+            DialStage::Negotiate => {
+                self.warn("unsupported_version", format_args!("Kafka broker refused: {err}"));
+                "unsupported_version"
+            }
+            DialStage::Sasl => {
+                if refused {
+                    self.warn("auth_failed", format_args!("Kafka authentication failed: {err}"));
+                }
+                "sasl"
+            }
         };
         self.broker_error(api, error);
     }
@@ -427,6 +431,41 @@ mod unit {
         assert_eq!(code_tag(9999), "unknown_9999");
         assert_eq!(api_tag(ApiKey::ListOffsets), "list_offsets");
         assert_eq!(api_tag(ApiKey::Fetch), "fetch");
+    }
+
+    /// The stage decides the tag, whatever the text says.
+    #[test]
+    fn a_dial_failure_is_tagged_by_its_stage_not_its_text() {
+        use anyhow::Context as _;
+        use logit_pipeline::test_util::TelemetryProbe;
+        use logit_pipeline::Fault;
+
+        let mut probe = TelemetryProbe::new();
+        let telemetry = probe.telemetry("in", "kafka_in", "listener");
+        let counters = Counters {
+            telemetry: telemetry.clone(),
+            diag: Diagnostics::new("in").with_telemetry(telemetry),
+        };
+        let failed = |stage, text: &'static str, fault: Fault| DialError {
+            stage,
+            error: Err::<(), _>(anyhow::anyhow!(text)).context(fault).unwrap_err(),
+        };
+        counters.dial_failed(ApiKey::Fetch, &failed(DialStage::Sasl, "refused", Fault::Refused));
+        counters.dial_failed(ApiKey::Fetch, &failed(DialStage::Tls, "SASL", Fault::Clean));
+        counters.dial_failed(ApiKey::Fetch, &failed(DialStage::Connect, "TLS", Fault::Clean));
+        counters.dial_failed(ApiKey::Fetch, &failed(DialStage::Negotiate, "x", Fault::Refused));
+        let errors = |probe: &mut TelemetryProbe, error| {
+            probe.sum("logit.input.broker.errors", &[("api", "fetch"), ("error", error)])
+        };
+        assert_eq!(errors(&mut probe, "sasl"), 1.0);
+        assert_eq!(errors(&mut probe, "tls"), 1.0);
+        assert_eq!(errors(&mut probe, "transport"), 1.0);
+        assert_eq!(errors(&mut probe, "unsupported_version"), 1.0);
+        let diag = |probe: &mut TelemetryProbe, key| {
+            probe.sum("logit.component.diagnostics", &[("key", key)])
+        };
+        assert_eq!(diag(&mut probe, "auth_failed"), 1.0);
+        assert_eq!(diag(&mut probe, "unsupported_version"), 1.0);
     }
 
     #[test]

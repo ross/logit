@@ -111,7 +111,47 @@ pub const PRODUCE_ZSTD_MIN: i16 = 7;
 pub const PRODUCE_RECORD_ERRORS_MIN: i16 = 8;
 /// A response size no broker answer to these four requests comes near; a larger length prefix
 /// is a framing error, not an allocation to make.
-const MAX_RESPONSE_BYTES: usize = 64 << 20;
+pub const MAX_RESPONSE_BYTES: usize = 64 << 20;
+
+/// The step of [`Dialer::connect_staged`] a dial failed in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialStage {
+    /// The TCP connect.
+    Connect,
+    /// The TLS handshake, or a host that isn't a TLS server name.
+    Tls,
+    /// The `ApiVersions` request.
+    ApiVersions,
+    /// The broker offers no version of a required API in range: `Refused`.
+    Negotiate,
+    /// The SASL handshake and authentication: `Refused` when the broker or the token endpoint
+    /// refused it, `Clean` on a transport failure.
+    Sasl,
+}
+
+/// A failed dial: the error [`Dialer::connect`] returns, with its `Fault` context and text, and
+/// the stage it failed in.
+#[derive(Debug)]
+pub struct DialError {
+    pub stage: DialStage,
+    pub error: anyhow::Error,
+}
+
+impl std::fmt::Display for DialError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.error)
+    }
+}
+
+trait Stage<T> {
+    fn stage(self, stage: DialStage) -> Result<T, DialError>;
+}
+
+impl<T> Stage<T> for anyhow::Result<T> {
+    fn stage(self, stage: DialStage) -> Result<T, DialError> {
+        self.map_err(|error| DialError { stage, error })
+    }
+}
 
 /// What every connection of one client shares.
 #[derive(Clone)]
@@ -200,6 +240,12 @@ impl Dialer {
     /// caller's goes out before this returns, except a broker without a version of a required API
     /// and a SASL refusal, which are `Refused` ([`crate::sasl`]).
     pub async fn connect(&self, host: &str, port: u16) -> anyhow::Result<Conn> {
+        self.connect_staged(host, port).await.map_err(|err| err.error)
+    }
+
+    /// [`Dialer::connect`], with the stage a failure happened in.
+    pub async fn connect_staged(&self, host: &str, port: u16) -> Result<Conn, DialError> {
+        use DialStage::*;
         let tcp = timeout(self.timeout, TcpStream::connect((host, port)))
             .await
             .map_err(|_elapsed| {
@@ -209,7 +255,8 @@ impl Dialer {
                 )
             })
             .and_then(|r| r.with_context(|| format!("connecting to Kafka broker {host}:{port}")))
-            .context(Fault::Clean)?;
+            .context(Fault::Clean)
+            .stage(Connect)?;
         // A produce request waits on its response; Nagle's algorithm would hold its tail.
         let _ = tcp.set_nodelay(true);
         let stream: Box<dyn AsyncStream> = match &self.tls {
@@ -219,7 +266,8 @@ impl Dialer {
                     .map_err(|err| {
                         anyhow!("Kafka broker host {host:?} isn't a TLS server name: {err}")
                     })
-                    .context(Fault::Clean)?;
+                    .context(Fault::Clean)
+                    .stage(Tls)?;
                 let tls =
                     timeout(self.timeout, TlsConnector::from(config.clone()).connect(name, tcp))
                         .await
@@ -234,7 +282,8 @@ impl Dialer {
                                 format!("TLS handshake with Kafka broker {host}:{port}")
                             })
                         })
-                        .context(Fault::Clean)?;
+                        .context(Fault::Clean)
+                        .stage(Tls)?;
                 Box::new(tls)
             }
         };
@@ -255,10 +304,12 @@ impl Dialer {
             .await
             .map_err(|err| err.error)
             .with_context(|| format!("ApiVersions with Kafka broker {host}:{port}"))
-            .context(Fault::Clean)?;
+            .context(Fault::Clean)
+            .stage(ApiVersions)?;
         conn.versions = negotiate(&response, self.required)
             .with_context(|| format!("Kafka broker {host}:{port}"))
-            .context(Fault::Refused)?;
+            .context(Fault::Refused)
+            .stage(Negotiate)?;
         if let Some(auth) = &self.sasl {
             let Some(version) = conn.versions.sasl_authenticate() else {
                 return Err(anyhow!(
@@ -267,9 +318,12 @@ impl Dialer {
                     auth.mechanism(),
                     auth.principal()
                 ))
-                .context(Fault::Refused);
+                .context(Fault::Refused)
+                .stage(Sasl);
             };
-            let end = sasl::authenticate(&mut conn, auth.as_ref(), version, host, port).await?;
+            let end = sasl::authenticate(&mut conn, auth.as_ref(), version, host, port)
+                .await
+                .stage(Sasl)?;
             conn.deadline = end.map(|(end, lifetime)| reauth_deadline(end, lifetime, self.timeout));
         }
         Ok(conn)
