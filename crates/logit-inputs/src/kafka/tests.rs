@@ -17,6 +17,7 @@ use logit_outputs::kafka::{KafkaEncoder, RecordFormat, RecordKey, RecordMeta, Re
 use logit_pipeline::test_util::{
     fanout_channel, recv_batch, recv_events, spawn_input, wait_until, TelemetryProbe, RECV_TIMEOUT,
 };
+use logit_pipeline::{Edge, Fanout};
 use logit_proto::kafka::batch::ProducerRecord;
 use logit_proto::{FramedEncoder, MessageBuf};
 use tokio::time::Instant;
@@ -463,7 +464,10 @@ async fn shutdown_commits_and_leaves_within_shutdown_grace() {
     wait_until("a member", || members(&cluster) == 1).await;
     let began = Instant::now();
     running.stop().await;
-    assert!(began.elapsed() < Duration::from_secs(2), "{:?}", began.elapsed());
+    // `b` waits half the 2 s grace, 1 s, then the commit and LeaveGroup on loopback take
+    // milliseconds: the 3 s bound leaves 2 s of slack for a loaded runner, and still fails a
+    // drain that took `drain_timeout`'s 5 s.
+    assert!(began.elapsed() < Duration::from_secs(3), "{:?}", began.elapsed());
     // `b` waited half the grace, then was deferred; `a` is committed and the group left.
     assert_eq!(probe.sum("logit.input.batches.deferred", &[]), 1.0);
     assert_eq!(committed(&cluster), Some(1));
@@ -483,7 +487,90 @@ async fn the_periodic_commit_lands_within_commit_interval() {
     recv_batch(&mut rx).await;
     let delivered = Instant::now();
     wait_until("the periodic commit", || committed(&cluster) == Some(1)).await;
-    // One interval, plus a fetch's `max_wait` before `next` runs again, plus scheduling slack.
-    assert!(delivered.elapsed() < Duration::from_secs(1), "{:?}", delivered.elapsed());
+    // The commit is due one 300 ms interval after the last, so at most that after delivery,
+    // plus a fetch's 50 ms `max_wait` before `next` runs again: 350 ms. The 2 s bound leaves over
+    // 1.6 s for scheduling on a loaded runner and still fails a commit left to shutdown, which
+    // `running.stop()` below would make only after the wait gave up at 5 s.
+    assert!(delivered.elapsed() < Duration::from_secs(2), "{:?}", delivered.elapsed());
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn shutdown_during_a_revoke_drain_caps_it_at_half_the_grace() {
+    let cluster = cluster().await;
+    append(&cluster, &[Some(b"a"), Some(b"b")]);
+    let mut probe = TelemetryProbe::new();
+    let mut s = settings(&cluster, KafkaInFormat::Text { batch: false });
+    s.batch_max_events = 1;
+    s.drain_timeout = Duration::from_secs(4);
+    s.shutdown_grace = Duration::from_secs(1);
+    // A channel of one: `a` fills it, and `b` waits for room the test doesn't give.
+    let (sink, rx) = fanout_channel(1);
+    let running = spawn_input(input(&probe, s), sink).await;
+    wait_until("a delivered", || rx.len() == 1).await;
+    wait_until("a member", || members(&cluster) == 1).await;
+    cluster.script(Step::api(ApiKey::Heartbeat, Action::Error(code::REBALANCE_IN_PROGRESS)));
+    probe
+        .wait_for("the revoke raised", |t| {
+            t.sum(
+                "logit.input.broker.errors",
+                &[("api", "heartbeat"), ("error", "rebalance_in_progress")],
+            ) >= 1.0
+        })
+        .await;
+    // Three of the input's 250 ms send slices, so `b`'s next attempt sees the revoke and starts
+    // its 4 s drain before the shutdown below. Too short a wait only lets shutdown be seen
+    // first, which this test then passes without covering the revoke-first order.
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    let began = Instant::now();
+    running.stop().await;
+    // Shutdown is seen within one 250 ms slice and caps the drain at half the 1 s grace, then
+    // the commit and LeaveGroup on loopback take milliseconds: 750 ms of timers. The 2 s bound
+    // leaves 1.25 s of slack and fails the revoke's uncapped 4 s drain.
+    assert!(began.elapsed() < Duration::from_secs(2), "{:?}", began.elapsed());
+    assert_eq!(probe.sum("logit.input.batches.deferred", &[]), 1.0);
+    assert_eq!(committed(&cluster), Some(1));
+    assert_eq!(members(&cluster), 0, "the input left the group");
+    drop(rx);
+}
+
+#[tokio::test]
+async fn a_blocked_batch_keeps_its_place_ahead_of_a_later_sender() {
+    let cluster = cluster().await;
+    append(&cluster, &[Some(b"a")]);
+    let mut probe = TelemetryProbe::new();
+    // One inbox of one slot, fed by `kafka_in` and by a second producer. Each producer's edge
+    // records `inbox.full` under its own handle, so the test can tell whose wait began.
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let edge =
+        |id: &str| Edge::new(tx.clone()).with_telemetry(probe.telemetry(id, "stdio_out", "sink"));
+    let kafka_edge = Fanout::from_edges(vec![edge("out_kafka")]);
+    let other = Fanout::from_edges(vec![edge("out_other")]);
+    let full = |t: &logit_pipeline::test_util::Totals, id: &str| {
+        t.sum("logit.component.inbox.full", &[("component", id)])
+    };
+    let filler = || EventBatch {
+        resource: Arc::new(Resource::default()),
+        scope: None,
+        events: vec![log("other", &[])],
+    };
+    assert!(other.send(filler()).await, "the filler takes the one slot");
+    let running = spawn_input(
+        input(&probe, settings(&cluster, KafkaInFormat::Text { batch: false })),
+        kafka_edge,
+    )
+    .await;
+    probe.wait_for("kafka_in parked", |t| full(t, "out_kafka") >= 1.0).await;
+    let later = tokio::spawn(async move { other.send(filler()).await });
+    probe.wait_for("the later sender parked", |t| full(t, "out_other") >= 1.0).await;
+    // A negative window: three of `kafka_in`'s 250 ms send slices, in which it must not leave
+    // the line and queue again (which would count another `inbox.full`).
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    assert_eq!(probe.sum("logit.component.inbox.full", &[("component", "out_kafka")]), 1.0);
+    // Freeing the slot hands it to the oldest waiter, `kafka_in`.
+    assert_eq!(message(&recv_batch(&mut rx).await.events[0]), "other");
+    assert_eq!(message(&recv_batch(&mut rx).await.events[0]), "a");
+    assert_eq!(message(&recv_batch(&mut rx).await.events[0]), "other");
+    assert!(later.await.unwrap());
     running.stop().await;
 }
