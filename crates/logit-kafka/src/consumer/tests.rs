@@ -585,10 +585,12 @@ async fn a_second_crc_mismatch_skips_the_batch_as_corrupt() {
 }
 
 /// A batch of `values` whose `last_offset_delta` reads `delta`, its CRC left stale.
+/// Its record count reads 50 too, so neither header field matches the offsets the batch holds.
 fn bad_delta(values_: &[&str], delta: i32) -> Bytes {
     use logit_proto::kafka::batch::{encode, Stamp};
     let mut raw = encode(&values(values_), Stamp::NONE, Compression::None).unwrap().to_vec();
     raw[23..27].copy_from_slice(&delta.to_be_bytes());
+    raw[57..61].copy_from_slice(&50i32.to_be_bytes());
     Bytes::from(raw)
 }
 
@@ -645,6 +647,28 @@ async fn a_corrupt_last_batch_skips_to_the_high_watermark() {
     assert_eq!(reading.await.unwrap(), ["d"]);
     assert_eq!(probe.sum("logit.input.records.dropped", &[("reason", "corrupt")]), 3.0);
     assert_eq!(probe.sum("logit.input.offsets.reset", &[("reason", "out_of_range")]), 0.0);
+}
+
+/// A failed batch returned alone, past `max_partition_bytes`, has nothing verified after it:
+/// the partition is refetched once with `max_batch_bytes` of room, which brings the next batch
+/// whole beside it, and the skip lands on that batch's base rather than the high watermark.
+#[tokio::test]
+async fn a_lone_corrupt_batch_is_refetched_widened_and_skips_to_the_next_batch() {
+    let cluster = cluster(1, &[0]).await;
+    cluster.state().append_raw("t", 0, bad_delta(&["a", "b", "c"], 1_000), 3);
+    cluster.state().append("t", 0, &values(&["d"]), Compression::None);
+    let mut probe = TelemetryProbe::new();
+    let mut s = settings(&cluster, &["t"]);
+    s.fetch.max_partition_bytes = 1;
+    let mut c = consumer(&probe, "in", s);
+    assert_eq!(take(&mut c, 1).await, ["d"]);
+    assert_eq!(probe.sum("logit.input.records.dropped", &[("reason", "corrupt")]), 3.0);
+    let widened = cluster
+        .state()
+        .fetches
+        .iter()
+        .any(|f| f.partitions.iter().any(|p| p.2 == 0 && p.3 > 1) && f.max_bytes > 1 << 20);
+    assert!(widened, "a fetch at 0 with max_batch_bytes of room");
 }
 
 #[tokio::test]
@@ -1093,6 +1117,29 @@ async fn unstable_offset_commit_on_offset_fetch_backs_off() {
 }
 
 // --- Item 9: commit outcomes ---
+
+/// A caller that drops `next` while the offset fetch after SyncGroup retries leaves no
+/// membership behind: the next call joins again and reads, rather than holding partitions it
+/// never fetches.
+#[tokio::test]
+async fn a_join_dropped_during_the_offset_fetch_joins_again() {
+    let cluster = cluster(1, &[0]).await;
+    cluster.script(Step::api(ApiKey::OffsetFetch, Action::Error(code::UNSTABLE_OFFSET_COMMIT)));
+    cluster.state().append("t", 0, &values(&["a"]), Compression::None);
+    let mut probe = TelemetryProbe::new();
+    let mut c = consumer(&probe, "in", settings(&cluster, &["t"]));
+    {
+        let pending = c.next();
+        tokio::pin!(pending);
+        tokio::select! {
+            _ = &mut pending => panic!("records before the offset fetch was answered"),
+            () = wait_until("the refused offset fetch", || {
+                errors(&mut probe, "offset_fetch", "unstable_offset_commit") == 1.0
+            }) => {}
+        }
+    }
+    assert_eq!(take(&mut c, 1).await, ["a"]);
+}
 
 #[tokio::test]
 async fn a_failed_commit_keeps_the_positions_for_the_next_one() {
