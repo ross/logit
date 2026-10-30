@@ -6,8 +6,9 @@
 //!
 //! The sink collects through the window protocol (`docs/adr/collecting-sink-window.md`): it
 //! reports a [`Output::window`] of `usize::MAX` while the object takes batches, and
-//! [`Output::collecting`] returns the open object's `max_age` deadline until the object is full. Every batch of an open or uploading
-//! object stays reserved in the sink's store, uncommitted, until the object is stored.
+//! [`Output::collecting`] returns the open object's `max_age` deadline until the object is full.
+//! Every batch of an open or uploading object stays reserved in the sink's store, uncommitted,
+//! until the object is stored.
 //!
 //! - **`submit` stages.** The first batch submitted into an empty object opens it and names its
 //!   key; each batch is encoded, compressed, and hashed into the body as it arrives
@@ -116,8 +117,8 @@
 //!
 //! **Retries are the loop's.** Every retryable class restarts the object from its head through
 //! the window protocol, holding no more than the head's pinned count (the "Full" bound above);
-//! the sink retries no request of its own. **Posture:** the default, `at_least_once`, because a retry rewrites the same key.
-//! Under `at_most_once` an `Ambiguous` `PutObject` drops every batch of its object, which may be
+//! the sink retries no request of its own. **Posture:** the default, `at_least_once`, because a
+//! retry rewrites the same key. Under `at_most_once` an `Ambiguous` `PutObject` drops every batch of its object, which may be
 //! stored.
 //!
 //! ## Telemetry
