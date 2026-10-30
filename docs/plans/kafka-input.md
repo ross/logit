@@ -192,7 +192,7 @@ The protocol client, with no `Input` and no config: everything W3 drives.
   third-party producers, mixed groups with Java consumers, and no topic auto-creation.
   `fixtures/kafka-in.yaml` against the dev stack's broker, reading `fixtures/kafka-out.yaml`'s
   topic. AGENTS.md's inputs table gains `kafka_in`; its `kafka_out` row and the transit
-  paragraph's "since there's no `kafka_in`" wait for W5.
+  paragraph's "since there's no `kafka_in`" follow in W5.
 - **Known gaps** in [docs/known-gaps/kafka.md](../known-gaps/kafka.md), its index row widened to
   "`kafka_out` and `kafka_in`":
   - no KIP-848, and no cooperative rebalancing: every rebalance stops the group;
@@ -200,8 +200,8 @@ The protocol client, with no `Input` and no config: everything W3 drives.
   - no fetch sessions;
   - no rack-aware fetch;
   - no regular-expression topics;
-  - a relayed record's key and headers aren't restored (until W5 this is also the pair's open
-    lossless debt);
+  - a relayed record's key and headers aren't restored, which is also the pair's open lossless
+    debt;
   - full fetches only, unmeasured against a member with many partitions.
 
 ### W4: `msgpack` and the OTLP formats

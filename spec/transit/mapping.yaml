@@ -6342,13 +6342,13 @@ rows:
           class: normalized
           reason: observed_timestamp
           text: >-
-            As at otlp_out: otlp_out stamps a log that has no observed time with the time it encodes
+            As at otlp_out: the sink stamps a log that has no observed time with the time it encodes
             the request, as `logs.proto` defines the field.
         - when: {format: otlp_json}
           class: normalized
           reason: observed_timestamp
           text: >-
-            As at otlp_out: otlp_out stamps a log that has no observed time with the time it encodes
+            As at otlp_out: the sink stamps a log that has no observed time with the time it encodes
             the request, as `logs.proto` defines the field.
         - class: exact
           text: >-
