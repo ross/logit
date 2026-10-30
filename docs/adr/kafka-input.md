@@ -267,7 +267,7 @@ partition's offset only once every record before it is in a batch `Fanout` accep
 downstream inbox, and at least one. It never waits for a sink, and never commits before
 acceptance, with one exception.
 
-**The exception.** Committing past a record dropped under item 10 (`undecodable`, `corrupt`,
+**The exception.** Committing past a record dropped under item 9 or 10 (`undecodable`, `corrupt`,
 `oversize`, `legacy_format`, `retention`) is an exception to item 3 of the same kind as the
 native hop's rejected `Ack` ([ADR `delivery-semantics`](delivery-semantics.md), "Amendment: a
 rejected `Ack`"): the loss is counted `*.dropped` and acknowledged to the broker so the partition
@@ -278,7 +278,7 @@ wire asked for the outcome.
 
 - **The committed offset is the highest contiguous accepted offset**, plus one, per partition,
   Redpanda Connect's rule. A record that needs no delivery counts as done once it's read: a record
-  skipped or dropped by item 10, a control record, and an aborted transaction's record under
+  skipped or dropped by item 9 or 10, a control record, and an aborted transaction's record under
   `read_committed`. A batch not accepted never lets the position pass it.
 - **When commits go out:** on `commit_interval` (5 s) for each partition whose position moved, on
   every revoke before the rejoin (item 8), and at shutdown before LeaveGroup. A commit carries the
