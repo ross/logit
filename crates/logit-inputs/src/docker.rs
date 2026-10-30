@@ -182,7 +182,8 @@ const ENVELOPE_SLACK_BYTES: usize = 64 * 1024;
 /// plus [`ENVELOPE_SLACK_BYTES`].
 ///
 /// The canonical copy of these numbers: `docs/adr/file-tailing-and-docker-json-logs.md`'s
-/// 2026-09-28 amendment and `docs/known-gaps/tailing.md` state the property and point here.
+/// 2026-09-28 amendment and `docs/adr/cri-container-logs.md`, section 9, state the property and
+/// point here, and `docs/deploying.md`'s "The Docker splitter's bound" gives the operator's remedy.
 pub(crate) const fn envelope_cap(max_line_bytes: usize) -> usize {
     let m = if max_line_bytes > DOCKERD_FRAGMENT_BYTES {
         max_line_bytes
@@ -1310,6 +1311,22 @@ mod tests {
         d.line_dropped(b"", 0, &mut out);
         assert_eq!(dropped(&mut probe, "oversize"), 3.0, "the new drop, then the held fragment");
         assert!(!d.holds_entry());
+    }
+
+    /// Several fragments of one line dropped in a row count once each: the first drop ends both
+    /// streams' reassembly, so the next finds nothing held and counts itself. The over-count is
+    /// the decided limit in `docs/adr/cri-container-logs.md`, section 9; folding it would
+    /// undercount whole entries dropped back to back.
+    #[test]
+    fn consecutive_splitter_drops_count_one_each() {
+        let mut probe = TelemetryProbe::new();
+        let mut d = probed(1024, &mut probe);
+        let mut out = Vec::new();
+        d.line_dropped(b"", 0, &mut out);
+        d.line_dropped(b"", 0, &mut out);
+        d.decode_line(entry("stdout", "end\n"), 0, &mut out).unwrap();
+        assert_eq!(message_streams(&out), pairs(&[("end", "stdout")]));
+        assert_eq!(dropped(&mut probe, "oversize"), 2.0);
     }
 
     /// `reset` counts one `frames.dropped{reason="truncated"}` per stream holding a reassembly,
