@@ -6,10 +6,10 @@ updated: 2026-10-30
 # `cri_in`: Kubernetes container logs from `/var/log/pods`, on `tail_in`'s driver
 
 ## Status
-Accepted. Partly built: `cri_in` reads CRI-format files under `root:` and stamps `container.id` as
-sections 1 to 8, 10, and 11 describe. cri-dockerd's Docker-format files (section 9) are the
-[`cri` plan](../plans/cri-container-logs.md)'s next workstream, so that section describes `cri_in`
-as it will behave.
+Accepted. Built: `cri_in` reads CRI-format files and cri-dockerd's Docker-format files under
+`root:` and stamps `container.id`, as every section describes. The
+[`cri` plan](../plans/cri-container-logs.md) holds the workstreams still to come, which add recorded
+fixtures and a soak scenario.
 
 ## Context
 
@@ -225,8 +225,8 @@ streams inside a run. The state and its rules follow `DockerDecoder`'s:
 - **Malformed record:** both streams' held runs are flushed, stdout first, then the record is
   reported. It's counted `logit.input.frames.dropped{reason="malformed"}` beside the driver's
   `bad_line` diagnostic, since a record's loss reported only by a diagnostic needs a counter
-  ([ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)). `docker_in` counts its rejected
-  json-file entry nowhere today; section 9 closes that for both kinds.
+  ([ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)). The shared Docker decoder
+  counts a rejected json-file entry the same way, under both kinds (section 9).
 
 A run split across a rotation leaves as two lines: containerd writes the head as a `P` at the
 end of the renamed file, and the continuation starts the new file, a different inode with its own
@@ -351,25 +351,94 @@ through `containers_dir`'s mount.
 
 ### 9. cri-dockerd's files are recognized and decoded as Docker JSON
 
-`cri_in` will latch each file identity's format from its first byte: `{` is Docker json-file, and
-anything else is CRI. A Docker-format file will go through `docker_in`'s envelope decoder and its 16
-KiB partial-line reassembly, under `cri_in`'s path resource, and the splitter bound
-`envelope_cap(max_line_bytes)` (section 4) is the one `docker_in` gives it. The file under the pods
-name is a symlink there, and the driver stats and opens through it, so the identity is the target's
-inode, and a Docker rotation (a rename of the target) reads as a rotation. An empty file stays
-undecided until its first byte.
+`cri_in` latches each file's format from the file's first byte: `{` is Docker json-file, and
+anything else is CRI. A Docker-format file goes through `docker_in`'s decoder, `DockerDecoder`,
+shared rather than copied, under `cri_in`'s path resource and `container.id` (sections 7 and 8).
 
-The Docker decoder can't use the splitter-drop hook the way `CriDecoder` does: json-file writes
-`stream` after `log`, so a dropped envelope's leading bytes can't name its stream. W2 leaves it on
-the hook's default, so the driver keeps counting the drop, and `docs/known-gaps/tailing.md`'s "An
-envelope over the cap is dropped by the splitter without the decoder seeing it" stays open. W4
-decides and builds a remedy that doesn't need the stream, under `cri_in` and `docker_in` alike.
+**The latch reads byte 0, wherever reading starts.** The driver already reads a file's first bytes
+when it opens one, to skip a compressed file and to check a checkpoint's head, and it hands them to
+the decoder through a `TailDecoder::file_head` hook once they show the file is text, before any line
+reaches the decoder. So a restart that resumes a file past its first line still latches from offset
+0: a line of the other format after the checkpoint is malformed, as it would be in a first read,
+rather than decoded in a format the file doesn't hold.
+
+- **An empty file stays undecided** until its first byte is written. The driver splits no line of a
+  file before its first bytes are sniffed, so no line is decoded in a guessed format.
+- **A file whose first byte is gone is decided again by its new one.** A file keeps its identity
+  and loses byte 0 only through an in-place truncation; a rename rotation moves the whole file. After
+  a truncation the driver resets the decoder (counting what it held, section 4) and sniffs the new
+  content from offset 0, and `file_head` latches from its first byte. A resume whose checkpoint the
+  file no longer matches restarts at offset 0, which is the same case.
+
+**The pods entry is a symlink, and the driver follows it.** cri-dockerd makes
+`/var/log/pods/.../<n>.log` a symlink to Docker's `/var/lib/docker/containers/<id>/<id>-json.log`.
+Discovery matches the link's name (section 2), and the driver's `stat` and `open` of a matched path
+follow a symlink, so the file's identity, its checkpoint entry, and its watch are the target's
+inode. Docker rotates by renaming `<id>-json.log` to `<id>-json.log.1` in its own directory and
+writing a new `<id>-json.log`; the link keeps naming the path, so the next scan finds a new inode
+under the pods name and reads the rotation as one: the renamed inode drains to its end and closes,
+and the new one is read from its start. A scan between the rename and the new file finds the link
+dangling, which retires the old inode the same way, with no loss; as for logrotate's `create`, that
+rotation then misses `logit.input.files.rotated`. The rotated name is outside `root:`, so its unread
+tail at a restart counts `gone` (a documented limit below). No driver change was needed for any of
+this: the tests read a pods-tree symlink through a Docker rotation.
+
+**What the Docker branch keeps from `docker_in`:** the 16 KiB fragment reassembly per stream, the
+envelope's `time` with the `bad_time` fallback, `max_line_bytes` over the reassembled message, and the
+splitter bound `envelope_cap(max_line_bytes)` that `cri_in` already uses (section 4). The envelope's
+`attrs` become event attributes, as under `docker_in`: one decoder reads one format one way, and an
+`attrs` object is there only because the node's Docker daemon was configured with `--log-opt labels`,
+`env`, or `tag`, which asked for it.
+
+**What it takes from `cri_in`:**
+
+- **`partial_timeout`** flushes a dangling fragment as section 5 flushes a dangling run, counted
+  `frames.truncated{reason="partial_timeout"}`. Whether dockerd itself ever leaves a fragment
+  without its closing entry isn't verified, but a writer that stops mid-line can, and the kubelet
+  keeps an exited container's file until it collects the container, so section 5's reason holds
+  for any file `cri_in` reads. The timer costs nothing until a fragment dangles. `docker_in` has no
+  such key, and its decoder's timer is off.
+- **Raw bytes.** `cri_in` turns off the driver's UTF-8 conversion and `\r` strip (section 3), so the
+  Docker branch converts each envelope itself, with the driver's `invalid_utf8` diagnostic, before
+  parsing it. A `\r` after an envelope's `}` is JSON whitespace, so keeping it changes nothing.
+
+**A rejected json-file entry is counted.** An entry that isn't JSON or names an unknown stream counts
+`logit.input.frames.dropped{reason="malformed"}` beside the driver's `bad_line`, under `docker_in`
+and `cri_in` alike, as section 4 counts a CRI record. `docker_in` counted it nowhere before, though a
+record's loss reported only by a diagnostic needs a counter
+([ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)).
+
+**A splitter drop ends both streams' reassembly, under `docker_in` and `cri_in` alike.** The splitter
+drops an envelope over `envelope_cap` before the decoder sees it, and json-file writes `stream` after
+`log`, so the dropped envelope's leading bytes can't name its stream. `DockerDecoder` takes the drop
+through the splitter-drop hook (Implementation notes for W2) and, not knowing the stream:
+
+- discards each stream's held fragment, counting it `frames.dropped{reason="oversize"}`, one line
+  each;
+- ends each stream's drop in progress, already counted when it began;
+- counts the drop itself as one `oversize` line only when neither stream held a fragment or was
+  dropping a line, and otherwise folds it into the line it most likely continues, so no line is
+  counted twice;
+- reports one `long_line` whenever it counts.
+
+What that closes, and what it can't:
+
+- **No splice.** A dropped closing fragment no longer leaves its line's head held, to be joined to
+  the stream's next line: the head is discarded and counted.
+- **No missing middle.** A held head is never joined to fragments after a dropped one, so no event
+  is delivered with a gap inside it.
+- **A headless tail remains.** The fragments after a dropped first or middle fragment, through
+  their closing entry, arrive on a stream holding nothing and leave as one line without its head.
+  The decoder can't tell them from a new line without the dropped envelope's stream. Their line's loss
+  is counted, as the discarded head or as the drop, except in the case below.
+- **The count can be one short.** When the dropped envelope starts a line on a stream holding
+  nothing while the other stream holds a fragment or is dropping, the drop is folded into the other
+  stream's line, and the dropped line's head goes uncounted. Counting it would count the drop twice
+  in the common case, where the dropped envelope continues the held line.
+
 Under `envelope_cap`, only an `attrs` object past the bound's slack or a writer other than dockerd
-produces such an envelope.
-
-The shared decoder will count a rejected json-file entry as
-`logit.input.frames.dropped{reason="malformed"}`, as section 4 counts a CRI record, so `docker_in`
-will gain the counter its `bad_line` diagnostic lacked.
+writes an envelope the splitter drops, and the operator's remedy for either is in
+[`docs/deploying.md`](../deploying.md)'s "Tailing files and Docker logs".
 
 ### 10. What `cri_in` doesn't read
 
@@ -428,6 +497,18 @@ empty-path checks, rather than under a rule number of its own.
   needed: one parser takes both forms, and conmon's `+00:00` and containerd on a non-UTC node look
   alike anyway.
 
+- **Latching a file's format from the first line read.** Rejected: a restart that resumes past the
+  first line would latch from whatever line follows the checkpoint, so a stray line of the other
+  format could flip a file's decoder for the rest of the run. The driver reads byte 0 anyway.
+- **Under a splitter drop in a Docker file, dropping each held stream's line through its closing
+  entry.** It would also discard the tail after a dropped middle fragment, but when the dropped
+  envelope was a closing fragment, the stream's next line would be discarded with it, uncounted,
+  since nothing tells that line from the rest of the dropped one. A headless tail is delivered and
+  its line's loss is counted; a silently discarded line is neither.
+- **No idle flush for a Docker-format file under `cri_in`**, as under `docker_in`. Rejected: a
+  dangling fragment would wait for the kubelet's garbage collection with the checkpoint pinned, the
+  case section 5 exists for, and `partial_timeout` is `cri_in`'s key for every file it reads.
+
 ## Consequences
 
 - `ComponentKind::CriIn` has `root`, `containers_dir`, `partial_timeout`, and flattened
@@ -444,10 +525,12 @@ empty-path checks, rather than under a rule number of its own.
   and one the decoder would have folded into a drop it already counted is counted twice.
 - A file's splitter can hold up to `envelope_cap(max_line_bytes)` of an unterminated record, about 6
   MiB at the default, as `docker_in`'s can.
-- `DockerDecoder`'s envelope decoding and reassembly will become reachable from `cri_in`, and the
-  shared decoder will count a rejected entry (section 9, not yet built).
+- `DockerDecoder`'s envelope decoding and reassembly are reachable from `cri_in`. `docker_in` gains
+  the `malformed` counter and the splitter-drop remedy with it (section 9).
+- `TailDecoder` gains `file_head`, called with a file's first bytes before any of its lines and
+  again after a truncation. Its default does nothing, so `tail_in` and `docker_in` ignore it.
 - New counter uses: `logit.input.frames.truncated{reason="partial_timeout"}`, and
-  `frames.dropped{reason="malformed"}` on `cri_in` (and on `docker_in` with section 9). New
+  `frames.dropped{reason="malformed"}` on `cri_in` and `docker_in`. New
   diagnostic key, from section 8: `container_id_error`.
 - Reading needs what `docker_in` needs: the runtimes create each log file `0640` as root, so
   `logit` runs as root or with a group grant, with `/var/log/pods` and
@@ -475,6 +558,8 @@ empty-path checks, rather than under a rule number of its own.
   tail counts `gone`.
 - **Under cri-dockerd, a Docker-rotated file (`-json.log.1`) is outside `root:`**, so its unread
   tail at a restart counts `gone`, the same as `docker_in` counts it.
+- **Under cri-dockerd and `docker_in`, the fragments after an envelope the splitter dropped can leave
+  as a line without its head**, and the drop's count can be one short (section 9).
 
 ## Implementation notes for W2
 
@@ -488,8 +573,8 @@ The driver changes `cri_in` needs, as W2 built them:
   it with its `long_line`, or absorbed it into a line it already counted), so the driver counts
   neither, and `false` when the head doesn't parse, so the driver counts as it does for the other
   kinds. The driver then updates `held_from` from `holds_entry`, as after `decode_line`, so a
-  checkpoint during the drop stays at the line's first record. `CriDecoder` implements it (section 4); `DockerDecoder`
-  and `LineDecoder` keep the default (section 9).
+  checkpoint during the drop stays at the line's first record. `CriDecoder` implements it (section 4),
+  `DockerDecoder` implements it without the head (section 9), and `LineDecoder` keeps the default.
 - **The head parse** reads the timestamp, the stream, and the first byte or bytes of the tag, enough
   to tell `P` from any other first tag. It doesn't require the space after the tag within the
   128-byte head, since a long tag field can push that space past it.

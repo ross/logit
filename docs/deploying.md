@@ -2523,11 +2523,32 @@ time to trust; put a `timestamp` stage after the parser to resolve one from a pa
 [ADR `file-tailing-and-docker-json-logs`](adr/file-tailing-and-docker-json-logs.md)'s
 "`docker_in` timestamps" section.
 
+### Lines `docker_in` can't read whole
+
+The same rules hold for a cri-dockerd file under `cri_in`.
+
+**A rejected entry** (not JSON, or a `stream` that's neither `stdout` nor `stderr`) is counted
+`logit.input.frames.dropped{reason="malformed"}` with a `bad_line` diagnostic, after both streams'
+waiting fragments are delivered as they stand.
+
+#### The Docker splitter's bound
+
+The line splitter reads each json-file line before the decoder does, bounded at about six times
+`max_line_bytes` plus 64 KiB of room for the envelope's `attrs` (about 6 MiB at the default). An
+envelope over that is dropped before the decoder sees it, and since json-file writes `stream` after
+`log`, nothing says which stream it was on. So every fragment either stream was holding is dropped
+with it, counted `logit.input.frames.dropped{reason="oversize"}` once per line, with a `long_line`
+diagnostic. No delivered line is joined across the dropped entry, but the fragments after it, up to
+its line's last entry, leave as a line without its head, and when the dropped entry starts a line
+while the other stream holds one, the count is one short. An envelope dockerd writes fits the bound
+unless its `attrs` object outgrows the 64 KiB room; a writer other than dockerd can exceed it too.
+Keep `attrs` small, or raise `max_line_bytes`, which raises the bound six bytes for each byte.
+
 ### Kubernetes container logs: `cri_in`
 
 `cri_in` tails every container's log that the kubelet lays out under `/var/log/pods`, in the CRI
-format containerd and CRI-O write, on the same driver as `tail_in`
-([ADR `cri-container-logs`](adr/cri-container-logs.md)). It joins each line the runtime split into
+format containerd and CRI-O write, or as cri-dockerd's Docker json-file, on the same driver as
+`tail_in` ([ADR `cri-container-logs`](adr/cri-container-logs.md)). It joins each line the runtime split into
 `P` pieces back into one event, per file and per stream, stamps the event with the line's own CRI
 timestamp and `log.iostream` (`stdout` or `stderr`), and writes `k8s.namespace.name`,
 `k8s.pod.name`, `k8s.pod.uid`, `k8s.container.name`, and `k8s.container.restart_count` from the
@@ -2577,6 +2598,16 @@ checkpoint overwrite each other's offsets.
 missing host uses `logit`'s hostname, which in a pod is the pod's name unless the pod runs with
 `hostNetwork: true`. Set the top-level `hostname: !env NODE_NAME` from the downward API (see
 [Hostname](#hostname)), or stamp `host.name` or `k8s.node.name` with `set` from the same variable.
+
+**On a cri-dockerd node, mount Docker's container directory too, at its host path.** cri-dockerd
+makes each pods file a symlink to Docker's own `/var/lib/docker/containers/<id>/<id>-json.log`,
+and `cri_in` reads through the link, so the target has to be reachable at the path the link names:
+mount `/var/lib/docker/containers` from a `hostPath` at the same path, `readOnly: true`. Without
+it, every link dangles and no file is read. `cri_in` recognizes such a file by its first byte, `{`,
+and decodes it as `docker_in` decodes Docker's json-file lines, with the pods path's resource:
+fragments of a line over 16 KiB are joined per stream, the envelope's `time` is the event's time,
+`attrs` (from `--log-opt labels`, `env`, or `tag`) become event attributes, and `partial_timeout`
+delivers a fragment whose closing entry never comes.
 
 **Pick containers downstream.** `cri_in` follows every container under `root:`. Narrow the flow
 with `has_attributes` or `drop_attributes` on the resource's `k8s.namespace.name` or
@@ -2630,10 +2661,13 @@ file to close, which the kubelet does only when it removes the file.
   its default, off, so the kubelet rotates, by names `cri_in` matches. With it on, a file conmon
   replaced while `logit` was down has its unread rest counted
   `logit.input.bytes.dropped{reason="gone"}`.
-- **cri-dockerd's files aren't read yet.** Under cri-dockerd, the file under each pods name is
-  Docker's json-file log, which `cri_in` doesn't parse yet: every line counts
-  `frames.dropped{reason="malformed"}`. Tail Docker's container directory with `docker_in` on
-  such a node instead.
+- **Under cri-dockerd, a file Docker rotated while `logit` was down loses its unread rest.**
+  Docker renames `<id>-json.log` to `<id>-json.log.1` in its own directory, outside `root:`, so a
+  restart can't resume it, and its unread bytes count `logit.input.bytes.dropped{reason="gone"}`,
+  as under `docker_in`. Within a run nothing is lost: the renamed file is read to its end.
+- **Under cri-dockerd, a line can leave without its head** when the line splitter drops an
+  envelope over its bound, which needs an `attrs` object larger than the bound's 64 KiB slack (see
+  [The Docker splitter's bound](#the-docker-splitters-bound)).
 
 ### `read_from`, and why a checkpoint matters more here than for a plain UDP listener
 

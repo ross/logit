@@ -1,7 +1,7 @@
 # Kubernetes container logs
 
 [`logit.yaml`](logit.yaml) reads every container's log on a node from `/var/log/pods`, takes each
-container's id from the kubelet's links in `/var/log/containers`, and sends it to Loki over OTLP. It works with containerd and CRI-O. Run one `logit` per node as a DaemonSet:
+container's id from the kubelet's links in `/var/log/containers`, and sends it to Loki over OTLP. It works with containerd, CRI-O, and cri-dockerd. On a cri-dockerd node, also mount `/var/lib/docker/containers` read-only at the same path: each file under `/var/log/pods` is a link to Docker's log there. Run one `logit` per node as a DaemonSet:
 
 ```yaml
 apiVersion: apps/v1

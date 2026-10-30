@@ -2,7 +2,7 @@
 # /var/log/pods and sent to Loki over OTLP. Run one logit per node as a DaemonSet; README.md has
 # the manifest.
 #
-#   containerd / CRI-O log files -> pods (cri_in) -> not_system -> node -> loki_out
+#   containerd / CRI-O / cri-dockerd log files -> pods (cri_in) -> not_system -> node -> loki_out
 #
 # Each event is one line a container wrote, with its own timestamp, `log.iostream` (stdout or
 # stderr), and the pod and container it came from as resource attributes: k8s.namespace.name,
@@ -21,7 +21,8 @@ admin:
 
 components:
   # Reads /var/log/pods, mounted read-only from the node, and takes container.id from the links in
-  # /var/log/containers, also mounted read-only. Lines a container wrote in pieces (a long line,
+  # /var/log/containers, also mounted read-only. On a cri-dockerd node, each file there links to
+  # Docker's log, so /var/lib/docker/containers is mounted read-only at the same path too. Lines a container wrote in pieces (a long line,
   # or a write the runtime read in two) arrive as one event.
   #
   # The checkpoint must be on a hostPath, not in the pod: a new pod then resumes where the old
