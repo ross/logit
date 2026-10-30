@@ -3,7 +3,7 @@
 # Runs `logit validate` over every shipped config: demo/logit.yaml, examples/*/*.yaml,
 # fixtures/*.yaml, perf/scenarios/*.yaml, tools/shape-survey/configs/*.yaml,
 # tools/victoria-interop/logit-*.yaml, tools/splunk-interop/logit-*.yaml,
-# tools/kafka-interop/logit-*.yaml, tools/soak/scenarios/*/logit-*.yaml (those directories'
+# tools/kafka-interop/logit-*.yaml, tools/s3-interop/logit-*.yaml, tools/soak/scenarios/*/logit-*.yaml (those directories'
 # other files are compose, broker, vmagent, and scenario config), and spec/transit/flows/*.yaml.
 # Not part of script/cibuild; script/test's `every_shipped_config_loads_and_validates` covers the
 # same set.
@@ -38,6 +38,21 @@ export SPLUNK_INTEROP_HEC_INSECURE="${SPLUNK_INTEROP_HEC_INSECURE:-false}"
 # tools/kafka-interop/logit-oauth-*.yaml's fixed OAUTHBEARER token, which script/kafka-interop
 # fetches from its token server.
 export KAFKA_INTEROP_OAUTH_TOKEN="${KAFKA_INTEROP_OAUTH_TOKEN:-logit-dev-token}"
+# tools/s3-interop/logit-*.yaml's store, credentials, and paths, which script/s3-interop sets per
+# store and leg.
+export S3_INTEROP_ENDPOINT="${S3_INTEROP_ENDPOINT:-http://minio:9000}"
+export S3_INTEROP_VHOST_ENDPOINT="${S3_INTEROP_VHOST_ENDPOINT:-http://vhminio:9000}"
+export S3_INTEROP_BUCKET="${S3_INTEROP_BUCKET:-logit-test}"
+export S3_INTEROP_LATE_BUCKET="${S3_INTEROP_LATE_BUCKET:-logit-test-late}"
+export S3_INTEROP_REGION="${S3_INTEROP_REGION:-us-east-1}"
+export S3_INTEROP_PATH_STYLE="${S3_INTEROP_PATH_STYLE:-true}"
+export S3_INTEROP_PREFIX="${S3_INTEROP_PREFIX:-leg/}"
+export S3_INTEROP_ACCESS_KEY="${S3_INTEROP_ACCESS_KEY:-logit-dev-key}"
+export S3_INTEROP_SECRET_KEY="${S3_INTEROP_SECRET_KEY:-logit-dev-key}"
+export S3_INTEROP_RUN="${S3_INTEROP_RUN:-run1}"
+export S3_INTEROP_TELEMETRY="${S3_INTEROP_TELEMETRY:-/out/leg.log}"
+export S3_INTEROP_REPLAY_PATH="${S3_INTEROP_REPLAY_PATH:-/in/leg.logit}"
+export S3_INTEROP_REPLAY_OUT="${S3_INTEROP_REPLAY_OUT:-/out/leg.log}"
 # tools/soak/scenarios/rolling-overlap/logit-sut.yaml's instance name, which each overlap
 # instance's compose service sets to its own name.
 export SOAK_INSTANCE="${SOAK_INSTANCE:-logit}"
@@ -52,7 +67,7 @@ LOGIT_BIN="${CARGO_TARGET_DIR:-${ROOT}/target}/debug/logit"
 
 for config in demo/logit.yaml examples/*/*.yaml fixtures/*.yaml perf/scenarios/*.yaml \
     tools/shape-survey/configs/*.yaml tools/victoria-interop/logit-*.yaml \
-    tools/splunk-interop/logit-*.yaml tools/kafka-interop/logit-*.yaml \
+    tools/splunk-interop/logit-*.yaml tools/kafka-interop/logit-*.yaml tools/s3-interop/logit-*.yaml \
     tools/soak/scenarios/*/logit-*.yaml spec/transit/flows/*.yaml; do
     echo "-- ${config}"
     "${LOGIT_BIN}" validate "${config}"

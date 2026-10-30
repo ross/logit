@@ -1,0 +1,59 @@
+# The stores `script/s3-interop` runs its legs against in local mode: MinIO and a single-container
+# Ceph RGW. The `logit` legs are not services here: the script starts each with `docker run` on
+# this network, because each leg runs once per store with its own environment. See README.md,
+# "What it runs".
+#
+# Every credential is a fixed throwaway for a container that publishes no host port.
+#
+#   access key  logitaccess
+#   secret key  logitsecret1
+#
+# MinIO's `MINIO_DOMAIN` (`vhminio`) and Ceph's `rgw dns name` (`ceph`) make each store answer
+# virtual-hosted requests for `logit-test.vhminio` and `logit-test.ceph`. The network aliases
+# resolve exactly those two names to the store, so `vhminio` and `ceph` alone resolve to nothing:
+# a virtual-hosted leg with `endpoint: http://vhminio:9000` only connects if the sink prefixes the
+# bucket to the host, and a sink that sent a path-style request would fail to dial. The
+# path-style legs dial `minio` and Ceph's address. `MINIO_KMS_SECRET_KEY` turns on MinIO's
+# built-in KMS, which SSE-S3 needs.
+#
+# No `container_name`, and the network is named, so cleanup can't touch anything else on a shared
+# daemon.
+
+name: s3-interop
+
+networks:
+  default:
+    name: s3-interop-net
+
+services:
+  minio:
+    image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z@sha256:b6bfe7239bfc83fb90d31612d9704d86039dd714f7904b3f1ad68f211e602372
+    hostname: minio
+    command: ["server", "/data", "--address", ":9000"]
+    environment:
+      MINIO_ROOT_USER: logitaccess
+      MINIO_ROOT_PASSWORD: logitsecret1
+      MINIO_DOMAIN: vhminio
+      MINIO_KMS_SECRET_KEY: logit-key:bG9naXQtczMtaW50ZXJvcC1rbXMta2V5LTMyYnl0ZXM=
+    networks:
+      default:
+        aliases: [logit-test.vhminio]
+
+  rgw:
+    image: quay.io/ceph/demo:latest@sha256:522483cf07cfce6386b8e18a3edfa88a1b32c688dee231d0a6962b1513557723
+    hostname: ceph
+    # RGW_NAME sets `rgw dns name`, so the service's own name (`rgw`) is not a virtual-host suffix.
+    environment:
+      CEPH_DAEMON: demo
+      DEMO_DAEMONS: mon,mgr,osd,rgw
+      RGW_NAME: ceph
+      RGW_FRONTEND_PORT: "8080"
+      MON_IP: 127.0.0.1
+      CEPH_PUBLIC_NETWORK: 0.0.0.0/0
+      OSD_COUNT: "1"
+      CEPH_DEMO_UID: logit
+      CEPH_DEMO_ACCESS_KEY: logitaccess
+      CEPH_DEMO_SECRET_KEY: logitsecret1
+    networks:
+      default:
+        aliases: [logit-test.ceph]

@@ -291,9 +291,9 @@ mod tests {
             configs.extend(found);
         }
         // `perf/scenarios/`, `script/shape-survey`'s capture configs, `script/victoria-interop`'s,
-        // `script/splunk-interop`'s, and `script/kafka-interop`'s leg configs, and `script/soak`'s
-        // scenario configs run only out of CI, so a field rename must fail here, not on their next
-        // run.
+        // `script/splunk-interop`'s, `script/kafka-interop`'s, and `script/s3-interop`'s leg
+        // configs, and `script/soak`'s scenario configs run only out of CI, so a field rename
+        // must fail here, not on their next run.
         let perf_scenarios_dir = root.join("perf/scenarios");
         configs.extend(
             std::fs::read_dir(&perf_scenarios_dir)
@@ -317,7 +317,7 @@ mod tests {
                 .map(|entry| entry.unwrap().path())
                 .filter(|path| path.extension().is_some_and(|extension| extension == "yaml")),
         );
-        // The three interop harnesses' per-leg configs and each `script/soak` scenario's
+        // The four interop harnesses' per-leg configs and each `script/soak` scenario's
         // per-service configs; those directories' other files are compose, vmagent, and scenario
         // config, so only `logit-*.yaml`.
         let soak_scenarios_dir = root.join("tools/soak/scenarios");
@@ -326,11 +326,15 @@ mod tests {
             .map(|entry| entry.unwrap().path())
             .filter(|path| path.is_dir())
             .collect();
-        let harness_dirs =
-            ["tools/victoria-interop", "tools/splunk-interop", "tools/kafka-interop"]
-                .into_iter()
-                .map(|harness| root.join(harness))
-                .chain(soak_scenarios);
+        let harness_dirs = [
+            "tools/victoria-interop",
+            "tools/splunk-interop",
+            "tools/kafka-interop",
+            "tools/s3-interop",
+        ]
+        .into_iter()
+        .map(|harness| root.join(harness))
+        .chain(soak_scenarios);
         for dir in harness_dirs {
             configs.extend(
                 std::fs::read_dir(&dir)
@@ -365,6 +369,22 @@ mod tests {
                 "SPLUNK_INTEROP_HEC_INSECURE" => Some("false".to_string()),
                 // `script/kafka-interop`'s fixed OAUTHBEARER token, fetched at run time.
                 "KAFKA_INTEROP_OAUTH_TOKEN" => Some("logit-test-token".to_string()),
+                // `script/s3-interop`'s legs, which take their store, credentials, and paths from
+                // the environment so one config serves MinIO, Ceph RGW, and AWS.
+                "S3_INTEROP_ENDPOINT" => Some("http://minio:9000".to_string()),
+                "S3_INTEROP_VHOST_ENDPOINT" => Some("http://vhminio:9000".to_string()),
+                "S3_INTEROP_BUCKET" | "S3_INTEROP_LATE_BUCKET" => Some("logit-test".to_string()),
+                "S3_INTEROP_REGION" => Some("us-east-1".to_string()),
+                "S3_INTEROP_PATH_STYLE" => Some("true".to_string()),
+                "S3_INTEROP_PREFIX" => Some("leg/".to_string()),
+                "S3_INTEROP_ACCESS_KEY" | "S3_INTEROP_SECRET_KEY" => {
+                    Some("logit-test-key".to_string())
+                }
+                "S3_INTEROP_RUN" => Some("run1".to_string()),
+                "S3_INTEROP_TELEMETRY" | "S3_INTEROP_REPLAY_OUT" => {
+                    Some("/out/leg.log".to_string())
+                }
+                "S3_INTEROP_REPLAY_PATH" => Some("/in/leg.logit".to_string()),
                 // The whole header value, `Bearer ` included: `!env` substitutes a field, it
                 // doesn't interpolate into one.
                 "PROMETHEUS_REMOTE_WRITE_AUTHORIZATION" => {
