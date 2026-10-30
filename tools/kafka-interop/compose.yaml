@@ -230,6 +230,175 @@ services:
       - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
 
 
+  # The consumer legs: one `kafka_in` process per `logit-in-*` config. The script starts
+  # `logit-in-group-join-b-*` late, kills `logit-in-group-kill-b-*`, and runs `logit-in-restart-*`
+  # in a phase of its own, around a broker restart.
+  logit-in-console-kafka:
+    <<: *logit
+    volumes:
+      - ./logit-in-console-kafka.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
+  logit-in-console-redpanda:
+    <<: *logit
+    volumes:
+      - ./logit-in-console-redpanda.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
+  logit-in-relay-kafka:
+    <<: *logit
+    volumes:
+      - ./logit-in-relay-kafka.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
+  logit-in-relay-redpanda:
+    <<: *logit
+    volumes:
+      - ./logit-in-relay-redpanda.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
+  logit-in-collector-kafka:
+    <<: *logit
+    volumes:
+      - ./logit-in-collector-kafka.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
+  logit-in-collector-redpanda:
+    <<: *logit
+    volumes:
+      - ./logit-in-collector-redpanda.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
+  logit-in-auth-kafka:
+    <<: *logit
+    volumes:
+      - ./logit-in-auth-kafka.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
+  logit-in-auth-redpanda:
+    <<: *logit
+    volumes:
+      - ./logit-in-auth-redpanda.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
+  logit-in-txn-kafka:
+    <<: *logit
+    volumes:
+      - ./logit-in-txn-kafka.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
+  logit-in-txn-redpanda:
+    <<: *logit
+    volumes:
+      - ./logit-in-txn-redpanda.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
+  logit-in-group-join-a-kafka:
+    <<: *logit
+    volumes:
+      - ./logit-in-group-join-a-kafka.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
+  logit-in-group-join-a-redpanda:
+    <<: *logit
+    volumes:
+      - ./logit-in-group-join-a-redpanda.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
+  logit-in-group-join-b-kafka:
+    <<: *logit
+    volumes:
+      - ./logit-in-group-join-b-kafka.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
+  logit-in-group-join-b-redpanda:
+    <<: *logit
+    volumes:
+      - ./logit-in-group-join-b-redpanda.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
+  logit-in-group-kill-a-kafka:
+    <<: *logit
+    volumes:
+      - ./logit-in-group-kill-a-kafka.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
+  logit-in-group-kill-a-redpanda:
+    <<: *logit
+    volumes:
+      - ./logit-in-group-kill-a-redpanda.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
+  logit-in-group-kill-b-kafka:
+    <<: *logit
+    volumes:
+      - ./logit-in-group-kill-b-kafka.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
+  logit-in-group-kill-b-redpanda:
+    <<: *logit
+    volumes:
+      - ./logit-in-group-kill-b-redpanda.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
+  logit-in-group-mixed-kafka:
+    <<: *logit
+    volumes:
+      - ./logit-in-group-mixed-kafka.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
+  logit-in-group-mixed-redpanda:
+    <<: *logit
+    volumes:
+      - ./logit-in-group-mixed-redpanda.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
+  logit-in-restart-kafka:
+    <<: *logit
+    volumes:
+      - ./logit-in-restart-kafka.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
+
+  logit-in-restart-produce-kafka:
+    <<: *logit
+    volumes:
+      - ./logit-in-restart-produce-kafka.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
+  logit-in-restart-redpanda:
+    <<: *logit
+    volumes:
+      - ./logit-in-restart-redpanda.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
+
+  logit-in-restart-produce-redpanda:
+    <<: *logit
+    volumes:
+      - ./logit-in-restart-produce-redpanda.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}/tls:/tls:ro,z
+  logit-in-oauth-kafka:
+    <<: *logit
+    network_mode: service:oauth
+    depends_on:
+      oauth: { condition: service_started }
+      kafka: { condition: service_healthy }
+    volumes:
+      - ./logit-in-oauth-kafka.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+  logit-in-oauth-redpanda:
+    <<: *logit
+    network_mode: service:oauth
+    depends_on:
+      oauth: { condition: service_started }
+      redpanda: { condition: service_healthy }
+    volumes:
+      - ./logit-in-oauth-redpanda.yaml:/config.yaml:ro,z
+      - ${KAFKA_INTEROP_OUT:?set by script/kafka-interop}:/out:z
+
+
   # One Collector per broker, reading the topics `logit-otlp-*` writes. It writes what it decoded
   # to the run directory's `collector/<broker>/` and, for the `keyed` traces, re-keys them into
   # `exporter-*` topics with its own `kafka` exporter. The image has no shell, so there's no

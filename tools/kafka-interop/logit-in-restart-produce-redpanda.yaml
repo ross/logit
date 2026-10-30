@@ -1,0 +1,21 @@
+# The producer of the broker-restart leg of `script/kafka-interop` against Redpanda: 300 records
+# keyed by `seq`, 5 a second, into the 3-partition `restart` topic, holding its queue while the
+# broker restarts. `logit-in-restart-redpanda.yaml` describes the leg.
+admin: { bind: 127.0.0.1:9600 }
+
+components:
+  load:
+    type: generate_in
+    count: 300
+    rate: 5
+    batch: 5
+    event:
+      log: "restart {seq}"
+      attributes: { seq: "{seq}" }
+
+  produce:
+    type: kafka_out
+    sources: [load]
+    brokers: ["redpanda:9092"]
+    topic: restart
+    key: { attribute: seq }

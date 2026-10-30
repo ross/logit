@@ -1,0 +1,28 @@
+# The console leg of `script/kafka-interop` against Apache Kafka 4.2.0: before the legs start, the
+# script writes 50 lines to the 3-partition `console` topic with `kafka-console-producer.sh`, each
+# with a key and three headers (`seq`, `rep` twice, and `nil` with a null value). A `kafka_in`
+# member reads them as `format: text` and writes each event, with its `_logit.kafka.*` carriers, to
+# /out for check.py.
+admin: { bind: 127.0.0.1:9600 }
+
+components:
+  console:
+    type: kafka_in
+    brokers: ["kafka:9092"]
+    topics: [console]
+    group: consume-console
+    format: text
+    start: earliest
+
+  read:
+    type: stdio_out
+    sources: [console]
+    target: /out/consume-console-kafka.jsonl
+    format: json
+
+  self: { type: internal, interval: 1s, span_sample_rate: 0.0, logs: off }
+  telemetry:
+    type: stdio_out
+    sources: [self]
+    target: /out/in-console-kafka-telemetry.log
+    format: json

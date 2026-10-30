@@ -1,0 +1,39 @@
+# The consumer OAUTHBEARER leg of `script/kafka-interop` against Redpanda: a `kafka_in` member on
+# its SASL listener on :9096 reads the `oauth-cc` topic the `oauth_cc` sink writes
+# (logit-oauth-redpanda.yaml) through the client-credentials grant. The run reads for 75 s of 45 s
+# tokens, and the script's `kafka_sasl_max_reauth_ms` of 40 s ends each session, so the member
+# redials with a new token; its `scope` names the leg, so check.py can count its token requests in
+# the `oauth` service's log.
+#
+# This process shares the `oauth` service's network namespace (compose.yaml), so the token endpoint
+# is plain HTTP to 127.0.0.1, which `token_endpoint` allows. Every process in that namespace binds
+# its own admin port.
+admin: { bind: 127.0.0.1:9603 }
+
+components:
+  oauth_cc:
+    type: kafka_in
+    brokers: ["redpanda:9096"]
+    topics: [oauth-cc]
+    group: consume-oauth-cc
+    format: json
+    start: earliest
+    sasl:
+      mechanism: oauthbearer
+      token_endpoint: http://127.0.0.1/default/token
+      client_id: logit
+      client_secret: logit-secret
+      scope: redpanda-consume-oauth-cc
+
+  read:
+    type: stdio_out
+    sources: [oauth_cc]
+    target: /out/consume-oauth-redpanda.jsonl
+    format: json
+
+  self: { type: internal, interval: 1s, span_sample_rate: 0.0, logs: off }
+  telemetry:
+    type: stdio_out
+    sources: [self]
+    target: /out/in-oauth-redpanda-telemetry.log
+    format: json

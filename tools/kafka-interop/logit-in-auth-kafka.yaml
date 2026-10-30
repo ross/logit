@@ -1,0 +1,64 @@
+# The consumer TLS and SASL legs of `script/kafka-interop` against Apache Kafka 4.2.0: four
+# `kafka_in` members, each in its own group, read the topics the `tls` and `sasl` legs write
+# (logit-tls-kafka.yaml, logit-sasl-kafka.yaml) from the start, over the listener and credentials
+# the producing sink used, and write what they read to /out for check.py. The SASL_SSL and TLS
+# members trust the private CA the script generates into the run directory (mounted at /tls). The
+# passwords are throwaways for this stack.
+#
+#   tls            :9093, server TLS only
+#   mtls           :9094, presenting the run's client certificate
+#   sasl_plain     PLAIN over SASL_SSL
+#   sasl_scram512  SCRAM-SHA-512 over SASL_SSL
+admin: { bind: 127.0.0.1:9600 }
+
+components:
+  tls:
+    type: kafka_in
+    brokers: ["kafka:9093"]
+    topics: [tls]
+    group: consume-tls
+    format: json
+    start: earliest
+    tls: { ca_file: /tls/ca.pem }
+
+  mtls:
+    type: kafka_in
+    brokers: ["kafka:9094"]
+    topics: [mtls]
+    group: consume-mtls
+    format: json
+    start: earliest
+    tls: { ca_file: /tls/ca.pem, cert_file: /tls/client.crt, key_file: /tls/client.key }
+
+  sasl_plain:
+    type: kafka_in
+    brokers: ["kafka:9097"]
+    topics: [sasl-plain]
+    group: consume-sasl-plain
+    format: json
+    start: earliest
+    tls: { ca_file: /tls/ca.pem }
+    sasl: { mechanism: plain, username: logit, password: logit-secret }
+
+  sasl_scram512:
+    type: kafka_in
+    brokers: ["kafka:9097"]
+    topics: [sasl-scram512]
+    group: consume-sasl-scram512
+    format: json
+    start: earliest
+    tls: { ca_file: /tls/ca.pem }
+    sasl: { mechanism: scram_sha_512, username: logit, password: logit-secret }
+
+  read:
+    type: stdio_out
+    sources: [tls, mtls, sasl_plain, sasl_scram512]
+    target: /out/consume-auth-kafka.jsonl
+    format: json
+
+  self: { type: internal, interval: 1s, span_sample_rate: 0.0, logs: off }
+  telemetry:
+    type: stdio_out
+    sources: [self]
+    target: /out/in-auth-kafka-telemetry.log
+    format: json

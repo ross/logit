@@ -1,0 +1,28 @@
+# Member `b` of the group-kill leg of `script/kafka-interop` against Apache Kafka 4.2.0; member
+# `a`'s file, `logit-in-group-kill-a-kafka.yaml`, describes the leg.
+admin: { bind: 127.0.0.1:9600 }
+
+components:
+  member:
+    type: kafka_in
+    brokers: ["kafka:9092"]
+    topics: [group-kill]
+    group: consume-group-kill
+    format: json
+    start: earliest
+    session_timeout: 10s
+    heartbeat_interval: 1s
+    rebalance_timeout: 20s
+
+  read:
+    type: stdio_out
+    sources: [member]
+    target: /out/consume-group-kill-b-kafka.jsonl
+    format: json
+
+  self: { type: internal, interval: 1s, span_sample_rate: 0.0, logs: off }
+  telemetry:
+    type: stdio_out
+    sources: [self]
+    target: /out/in-group-kill-b-kafka-telemetry.log
+    format: json

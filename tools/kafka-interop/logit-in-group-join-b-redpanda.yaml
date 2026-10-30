@@ -1,0 +1,28 @@
+# Member `b` of the group-join leg of `script/kafka-interop` against Redpanda; member `a`'s file,
+# `logit-in-group-join-a-redpanda.yaml`, describes the leg.
+admin: { bind: 127.0.0.1:9600 }
+
+components:
+  member:
+    type: kafka_in
+    brokers: ["redpanda:9092"]
+    topics: [group-join]
+    group: consume-group-join
+    format: json
+    start: earliest
+    session_timeout: 10s
+    heartbeat_interval: 1s
+    rebalance_timeout: 20s
+
+  read:
+    type: stdio_out
+    sources: [member]
+    target: /out/consume-group-join-b-redpanda.jsonl
+    format: json
+
+  self: { type: internal, interval: 1s, span_sample_rate: 0.0, logs: off }
+  telemetry:
+    type: stdio_out
+    sources: [self]
+    target: /out/in-group-join-b-redpanda-telemetry.log
+    format: json

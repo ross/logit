@@ -1,0 +1,36 @@
+# The Collector legs of `script/kafka-interop` against Redpanda: the Collector's `kafka` exporters
+# (collector.yaml) write what its receivers decoded from the `otlp-proto` and `otlp-json` legs'
+# topics to `collector-proto-*` as `otlp_proto` and to `collector-json-*` as `otlp_json`, one topic
+# per signal. A `kafka_in` member per format reads them back and writes each event to /out, where
+# check.py compares every field with what the tick number implies.
+admin: { bind: 127.0.0.1:9600 }
+
+components:
+  proto:
+    type: kafka_in
+    brokers: ["redpanda:9092"]
+    topics: { logs: collector-proto-logs, metrics: collector-proto-metrics, traces: collector-proto-spans }
+    group: consume-collector-proto
+    format: otlp_proto
+    start: earliest
+
+  json:
+    type: kafka_in
+    brokers: ["redpanda:9092"]
+    topics: { logs: collector-json-logs, metrics: collector-json-metrics, traces: collector-json-spans }
+    group: consume-collector-json
+    format: otlp_json
+    start: earliest
+
+  read:
+    type: stdio_out
+    sources: [proto, json]
+    target: /out/consume-collector-redpanda.jsonl
+    format: json
+
+  self: { type: internal, interval: 1s, span_sample_rate: 0.0, logs: off }
+  telemetry:
+    type: stdio_out
+    sources: [self]
+    target: /out/in-collector-redpanda-telemetry.log
+    format: json
