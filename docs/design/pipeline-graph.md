@@ -989,7 +989,9 @@ below the impl crates, and a listener or transform wraps one
 
 Not drawn above: `logit-transforms` also depends on `logit-config` directly, for `route`'s
 `RouteBy` type (`docs/adr/target-components.md`). An impl crate reading a config type it needs is
-unremarkable; only `logit-pipeline` is barred from depending on the impl crates.
+unremarkable; only `logit-pipeline` is barred from depending on the impl crates. `logit-aws` (the SigV4 signer and AWS
+credential chain) is a further impl-side crate: `logit-outputs` depends on it, and it depends on
+`logit-core` and on `logit-pipeline` (for `Fault`).
 
 `logit-pipeline`:
 - Defines the `Input`, `Output`, and `Transform` traits discussed above (and `Router`), so

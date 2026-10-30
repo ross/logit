@@ -402,13 +402,22 @@ The reference behavior, read from source:
   seconds later".
 - franz-go and sarama keep no token cache; the application's token provider owns it.
 
-## Amendment: the AWS code moved to `logit-aws`
+## Amendment: the AWS code moved to `logit-aws` (2026-10-30)
 
 The SigV4 signer and the AWS credential chain moved from `crates/logit-outputs/src/kafka/sasl/`
-(`sigv4.rs`, `aws_creds.rs`) to `crates/logit-aws/src/` (`sigv4.rs`, `creds.rs`), so other AWS
-sinks can use them. The behavior, the tests, and the decisions above are unchanged; a path or a
-test name above that says `sasl::aws_creds` or `sasl::sigv4` now reads `logit_aws::creds` or
-`logit_aws::sigv4`. The MSK-specific glue (`msk_iam.rs`) stays in `kafka/sasl/`.
+to `crates/logit-aws/src/` (`sigv4.rs`, `creds.rs`), so other AWS sinks can use them. The
+behavior, the tests, and the decisions above are unchanged. Two things follow:
+
+- The earlier amendments' descriptions of the signer and the credential chain ("Amendment: what
+  W3 settled") now describe code in `crates/logit-aws`. The MSK-specific glue (`msk_iam.rs`) stays
+  in `kafka/sasl/`.
+- The HTTP stub those tests use moved to `logit_aws::test_stub`, behind the `test-util` feature.
+
+`logit-aws` can't depend on `logit-outputs`, so four helpers the chain used from it are copies in
+`logit-aws`'s private `http` module: the client builder, the connect and idle timeout defaults,
+and the bounded body read from its `http` module, and the form URL encoder from
+`kafka/sasl/oauth.rs`. A change to a default in
+`logit-outputs` doesn't move the copies.
 
 ## Amendment: the connection and SASL moved to `logit-kafka`
 

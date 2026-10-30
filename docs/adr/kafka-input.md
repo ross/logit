@@ -118,7 +118,8 @@ before it is in a batch `Fanout` accepted, and decodes every format `kafka_out` 
     re-export of the `logit-outputs` originals would drag the sinks' TLS path into
     `logit-kafka`, and a public `logit_aws::http` would put a generic HTTP client in a crate
     named for AWS. So `logit-kafka` holds its own TLS-less copy of those five helpers for
-    `oauth.rs`, `logit-outputs::http` is unchanged, and `logit-aws` keeps #926's copy. Three
+    `oauth.rs`, `logit-outputs::http` keeps its TLS-taking `build_client` and `client_builder` and loses
+    `try_read_body_bytes`, whose only caller moved, and `logit-aws` keeps #926's copy. Three
     small copies is a cost this ADR accepts; neither `logit-core` nor `logit-pipeline` depends
     on `reqwest`, so a shared home is a small crate of its own, the fix when a fourth user
     appears, and the `logit-kafka` module doc says so.

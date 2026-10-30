@@ -81,7 +81,7 @@ const UNSUPPORTED_PROFILE_KEYS: &[&str] = &[
 pub type Env = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
 /// The process environment.
-pub fn process_env() -> Env {
+pub(crate) fn process_env() -> Env {
     Arc::new(|name| std::env::var(name).ok())
 }
 
@@ -564,7 +564,7 @@ const COMMERCIAL_PREFIXES: &[&str] = &["us", "eu", "ap", "sa", "ca", "me", "af",
 /// `amazonaws.com.cn` for `aws-cn` (`cn-`), `amazonaws.com` for `aws-us-gov` (`us-gov-`) and
 /// `aws`. Any other region, such as an ISO partition's (`us-iso-east-1`) or the European
 /// Sovereign Cloud's (`eusc-de-east-1`, under `amazonaws.eu`), is `Refused`.
-pub fn partition_domain(region: &str) -> anyhow::Result<&'static str> {
+pub(crate) fn partition_domain(region: &str) -> anyhow::Result<&'static str> {
     // ISO regions share the `us` and `eu` prefixes.
     let iso = region.split('-').any(|label| label.starts_with("iso"));
     match region.split('-').next().unwrap_or_default() {
@@ -674,7 +674,11 @@ async fn read_optional(path: &Path) -> anyhow::Result<Option<String>> {
 /// `[<name>]`. The parser follows the Java SDK's: a line starting with `#` or `;` is a comment,
 /// a property's ` #` or ` ;` starts one, an indented line continues a property and is skipped
 /// here, a later key wins, and keys are case-sensitive.
-pub fn profile_keys(text: &str, config: bool, name: &str) -> Option<HashMap<String, String>> {
+pub(crate) fn profile_keys(
+    text: &str,
+    config: bool,
+    name: &str,
+) -> Option<HashMap<String, String>> {
     // Each matching section's keys by rank: 1 for `[default]` in the config file, 2 for every
     // other match. The highest rank present wins, and its sections merge in file order.
     let mut sections: Vec<(u8, HashMap<String, String>)> = Vec::new();
@@ -728,7 +732,7 @@ pub fn profile_keys(text: &str, config: bool, name: &str) -> Option<HashMap<Stri
 
 /// The text of the first `<tag>` element in an XML `body`, entity references decoded. Enough
 /// for STS's answers, whose fields are leaf elements with no attributes.
-pub fn xml_text(body: &[u8], tag: &str) -> Option<String> {
+pub(crate) fn xml_text(body: &[u8], tag: &str) -> Option<String> {
     let text = std::str::from_utf8(body).ok()?;
     let open = format!("<{tag}>");
     let start = text.find(&open)? + open.len();
