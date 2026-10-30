@@ -197,7 +197,7 @@ A run writes `perf/results/kafka-interop/<timestamp>/` (gitignored, or under
 ### 2026-10-30: the consumer legs
 
 Against `apache/kafka:4.2.0` and `redpandadata/redpanda:v26.2.3`
-(`perf/results/kafka-interop/20261030T184824Z/`), from `kin/w6a` on `kin/w4`: 133 of 134 rows
+(`perf/results/kafka-interop/20261030T190239Z/`), from `kin/w6a` with `kin/w5` merged: 133 of 134 rows
 `PASS`, the one `GAP` Redpanda's `timestamp` row the run below records, no `FAIL`, and no
 `kafka_in` bug. The consumer legs' rows:
 
@@ -206,10 +206,10 @@ Against `apache/kafka:4.2.0` and `redpandadata/redpanda:v26.2.3`
 | `consume-console` | `PASS`: 50 lines on 3 partitions, each once, with its key, its headers (`rep`'s two values as an array in order, `nil` null), and the record timestamp as the event's | `PASS`, the same |
 | `consume-relay-<format>-<codec>`, 30 rows | `PASS` each: `json`, `msgpack`, and `native`, 120 events under `record: event` (120 records) and `batch` (4), each equal to what was sent; `text`, 40 bodies under each mode, each at its record's timestamp; `otlp_proto` and `otlp_json`, 40 logs, 200 points, and 40 spans, equal but for the OTLP normalizations | `PASS` each, the same |
 | `consume-collector-proto`, `consume-collector-json` | `PASS` each: 160 logs, 160 spans, and 800 data points, none read twice, every field as sent | `PASS`, the same |
-| `consume-group-join` | `PASS`: 400 records read by `a` 337 and `b` 63, none twice, three partitions moving once | `PASS`: `a` 328, `b` 72, none twice |
-| `consume-group-kill` | `PASS`: 25 offsets read twice, inside the 60 a commit interval allows; three partitions moved to `b` and back | `PASS`: 8 offsets read twice; every partition changed member once |
-| `consume-group-mixed` | `PASS`: two members under `range` while both were in; `kafka_in` 237 and the console consumer 163 records, none twice | `PASS`: `kafka_in` 242, the console consumer 158 |
-| `consume-broker-restart` | `PASS`: 300 records, none twice, `offsets.reset{reason="no_commit"}` 3 over two lives, 10 broker errors counted | `PASS`, 3 broker errors |
+| `consume-group-join` | `PASS`: 400 records read by `a` 321 and `b` 79, none twice, three partitions moving once | `PASS`: `a` 320, `b` 80, none twice |
+| `consume-group-kill` | `PASS`: 11 offsets read twice, inside the 60 a commit interval allows; every partition changed member once | `PASS`: 14 offsets read twice; five partitions changed member once |
+| `consume-group-mixed` | `PASS`: two members under `range` while both were in; `kafka_in` 237 and the console consumer 163 records, none twice | `PASS`: `kafka_in` 230, the console consumer 170 |
+| `consume-broker-restart` | `PASS`: 300 records, none twice, `offsets.reset{reason="no_commit"}` 3 over two lives, 11 broker errors and 2 failed commits counted, their positions sent with the next commit | `PASS`, 3 broker errors and no failed commit |
 | `consume-tls`, `consume-mtls`, `consume-sasl-plain`, `consume-sasl-scram512` | `PASS` each: 50 records, each once | `PASS` each, the same |
 | `consume-oauth-cc` | `PASS`: 60 records over 75 s, 3 tokens fetched | `PASS`, the same |
 | `consume-read-committed` | `PASS`: 50 records under `read_committed`, 50 counted `aborted`; 100 under `read_uncommitted` | `PASS`, the same |
