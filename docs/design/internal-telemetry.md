@@ -1446,7 +1446,7 @@ own read-side counters:
 | `.watch.wakes{source="inotify"\|"poll"}` | count | which wake source fired |
 | `.watch.overflows` | count | the `inotify` queue overflowing into a full rescan |
 | `.watch.watches` | gauge | sampled alongside `.files.open`. See below. |
-| `.files.identity_changed` | count | `docker_in` only: `config.v2.json`'s own stat changed and the rebuilt resource differs in value, so the decoder's `Arc` was swapped |
+| `.files.identity_changed` | count | `docker_in`: `config.v2.json`'s own stat changed and the rebuilt resource differs in value, so the decoder's `Arc` was swapped. `cri_in`: a file's `container.id` found after the file was first read |
 | `.files.deselected` | count | `docker_in` only: a tracked container renamed out of `containers:`, closed rather than kept flowing |
 
 `.watch.watches` counts the watched directory plus one entry per currently-open file. It reports

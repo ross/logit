@@ -23,7 +23,8 @@
 //!   [`DecoderFactory::refresh`], so no batch mixes the two.
 //! - **Counters** of its own: `logit.input.frames.dropped{reason="oversize"|"truncated"|"malformed"}`
 //!   and `logit.input.frames.truncated{reason="partial_timeout"}` ([`CriDecoder`]). **Diagnostics**
-//!   of its own: `bad_time` and `long_line`, beside the driver's `bad_line` and `invalid_utf8`.
+//!   of its own: `bad_time`, `long_line`, and `container_id_error`, beside the driver's `bad_line`
+//!   and `invalid_utf8`.
 
 use crate::docker::envelope_cap;
 use crate::tail::{

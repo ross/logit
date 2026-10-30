@@ -373,7 +373,7 @@ a black hole counts what it discards as `events.discarded`.
 25. A `trace_context` `span:` with an empty `name` or a `0s` `max_skew`.
 26. A `tail_in` `paths` entry that is empty or has a `*` outside the final path component.
 27. A `docker_in` with an empty or duplicate entry or an empty `root`, or a `cri_in` with an empty
-    `root`.
+    `root` or `containers_dir`.
 28. A `tail_in`/`docker_in`/`cri_in` `poll_interval`, `checkpoint_interval`, or `max_line_bytes`
     of `0`.
 29. A `file_out` `rotate.max_bytes`/`max_files` of `0`, or a `max_files` above 1000
