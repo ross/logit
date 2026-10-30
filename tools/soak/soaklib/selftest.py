@@ -7558,6 +7558,251 @@ def _file_ledger():
                f"count_lines counts newlines across every file, got {counted}")
 
 
+# A Kafka wire's consumer, `in`: 5 s commits and 64 KiB fetches, so one fetch at 100 value bytes
+# a record holds 656 records.
+KAFKA_SUT_CONFIG = ("components:\n"
+                    "  in:\n"
+                    "    type: kafka_in\n"
+                    "    topics: [soak-in]\n"
+                    "    start: earliest\n"
+                    "    commit_interval: 5s\n"
+                    "    fetch: { max_partition_bytes: 64KiB }\n"
+                    "  window:\n"
+                    "    type: aggregate\n"
+                    "    interval: 10s   # every window\n")
+
+
+def _as_kafka_wire(run_dir, w_minus_g=0, record_bytes=100, lost=None, deferred=None,
+                   caught=True):
+    """Turns a ledger fixture into a Kafka-wire run in place: the listener's datagrams become
+    `logit.input.records`, each with `record_bytes` value bytes, the generator's
+    `output.messages` its `kafka_out`'s `logit.output.records`, set so the run's W − G is
+    `w_minus_g`, the SUT config is `KAFKA_SUT_CONFIG`, and the source names `wire = "kafka"`.
+    `lost` and `deferred` are `{offset: n}` of the listener's membership losses and deferred
+    batches. `caught` records the end sequence's `kafka_caught_up` phase, reached when True, short
+    when False, and none when None."""
+    stdout = run_dir / "logs" / "logit.stdout"
+    out, w = [], 0
+    for line in stdout.read_text().splitlines():
+        record = json.loads(line)
+        if record["metrics"][0]["name"] == "logit.input.datagrams":
+            record["metrics"][0]["name"] = "logit.input.records"
+            value = record["metrics"][0]["value"]
+            w += value
+            out.append(_line(record["timestamp"], "logit.input.record.bytes", "sum",
+                             value * record_bytes, component="in"))
+        out.append(json.dumps(record))
+    for offset, n in (lost or {}).items():
+        out.append(_line(_stamp(T0 + offset), "logit.input.rebalances", "sum", n,
+                         component="in", attrs={"reason": "membership_lost"}))
+    for offset, n in (deferred or {}).items():
+        out.append(_line(_stamp(T0 + offset), "logit.input.batches.deferred", "sum", n,
+                         component="in"))
+    stdout.write_text("\n".join(out) + "\n")
+    g = w - w_minus_g
+    gen_path = run_dir / "logs" / "generator.stdout"
+    gen, first = [], True
+    for line in gen_path.read_text().splitlines():
+        record = json.loads(line)
+        name = record["metrics"][0]["name"]
+        if name == "logit.output.datagrams":
+            continue
+        if name == "logit.output.messages":
+            record["metrics"][0]["name"] = "logit.output.records"
+            record["metrics"][0]["value"] = g if first else 0
+            first = False
+        gen.append(json.dumps(record))
+    gen_path.write_text("\n".join(gen) + "\n")
+    (run_dir / "configs").mkdir(exist_ok=True)
+    (run_dir / "configs" / "logit-sut.yaml").write_text(KAFKA_SUT_CONFIG)
+    if caught is not None:
+        lags = {"in soak-in/0": 0 if caught else 12, "in soak-in/1": 0}
+        with open(run_dir / "timeline.jsonl", "a") as timeline:
+            timeline.write(json.dumps(_phase("kafka_caught_up", 302, reached=caught, polls=2,
+                                             lags=lags)) + "\n")
+    resolved_path = run_dir / "scenario.resolved.json"
+    resolved = json.loads(resolved_path.read_text())
+    resolved["ledger"]["source"] = [{**resolved["ledger"]["source"][0], "wire": "kafka"}]
+    resolved["configs"] = {**resolved.get("configs", {}), "sut": "logit-sut.yaml"}
+    resolved_path.write_text(json.dumps(resolved))
+    return run_dir
+
+
+def _kafka_wire_ledger():
+    """The ledger on a Kafka source: W from `input.records` and G from the writer's
+    `output.records`; the run's W − G judged against the replay band, a killed life's records
+    after its last commit plus one fetch above and its unexported counts below, a lost
+    membership's replay and a deferred batch's records above; the end wait for lag 0 required;
+    and `ledger.summary`'s end-to-end bound widened by the band's upper edge."""
+    with tempfile.TemporaryDirectory() as tmp:
+        # Life 1 is killed at 200 records/s over 5 s drains, with 5 s commits and one fetch of
+        # 656 records: below, 1,000 counts never exported; above, 1,000 records after the last
+        # commit plus the fetch. Life 0's stop commits and adds nothing.
+        def killed(name, w_minus_g, no_drains=None, **kwargs):
+            run_dir = _kill_run(tmp, name, every_window=False, no_drains=no_drains)
+            return {r.id: r for r in checks.run_all(_as_kafka_wire(run_dir,
+                                                                   w_minus_g=w_minus_g,
+                                                                   **kwargs))}
+
+        edge = killed("kafka-kill-high", 1_656)
+        wire = edge["ledger.wire"]
+        lines = "\n".join(wire.lines)
+        expect(wire.status == checks.PASS
+               and "W − G 1,656 against the replay band [-1,000, 1,656]" in wire.detail
+               and "read every partition to its end" in wire.detail
+               and "life 1: [-1,000, +1,656]: killed: 200 records/s x a 5s drain interval "
+               "below; x a 5s commit_interval plus one fetch of 656 above" in lines
+               and "one fetch: 656 records (65,536 bytes over 100 value bytes a record)"
+               in lines,
+               f"a killed life's replay band on a Kafka wire, got {wire} {wire.lines}")
+        for row in ("ledger.intake", "ledger.edge", "ledger.summary"):
+            expect(edge[row].status == checks.PASS,
+                   f"{row} PASSes the Kafka-wire kill fixture, got {edge[row]}")
+        expect("plus the replay band's 1,656" in edge["ledger.summary"].detail,
+               f"the end-to-end bound adds the Kafka band's upper edge, got "
+               f"{edge['ledger.summary'].detail}")
+        past = killed("kafka-kill-over", 1_657)["ledger.wire"]
+        expect(past.status == checks.FAIL
+               and past.detail.startswith("W − G 1,657 is surplus, outside the replay band "
+                                          "[-1,000, 1,656]"),
+               f"a replay past the band FAILs, got {past}")
+        short = killed("kafka-kill-low", -1_000)["ledger.wire"]
+        expect(short.status == checks.PASS,
+               f"a killed life's unexported counts inside the band pass, got {short}")
+        lost = killed("kafka-kill-lost", -1_001)["ledger.wire"]
+        expect(lost.status == checks.FAIL
+               and lost.detail.startswith("W − G -1,001 is uncounted loss, outside the replay "
+                                          "band [-1,000, 1,656]"),
+               f"a deficit past the band FAILs, got {lost}")
+
+        # A killed life with one drain, at +200: all of its 1,000 records can replay, plus the
+        # fetch.
+        young = killed("kafka-kill-one-drain", 1_656, no_drains=(134, 200))["ledger.wire"]
+        expect(young.status == checks.PASS
+               and any("life 1: [-1,000, +1,656]: killed with one drain, so its W of 1,000 "
+                       "records can all replay" in line for line in young.lines),
+               f"a killed life with one drain may replay all of its W, got {young} "
+               f"{young.lines}")
+
+        # A membership life 2 lost replays its peak rate x the commit interval plus a fetch.
+        member = killed("kafka-membership", 3_312, lost={250: 1})["ledger.wire"]
+        expect(member.status == checks.PASS
+               and "[-1,000, 3,312]" in member.detail
+               and any("life 2: [0, +1,656]: 1 membership(s) lost, each 200 records/s at the "
+                       "life's peak x a 5s commit_interval plus one fetch of 656, above"
+                       in line for line in member.lines),
+               f"a lost membership widens the band above, got {member} {member.lines}")
+        member_over = killed("kafka-membership-over", 3_313, lost={250: 1})["ledger.wire"]
+        expect(member_over.status == checks.FAIL,
+               f"a replay past a lost membership's allowance FAILs, got {member_over}")
+
+        # Two batches life 0 deferred at its stop are read again, up to 1,000 records each.
+        held = killed("kafka-deferred", 3_656, deferred={100: 2})["ledger.wire"]
+        expect(held.status == checks.PASS and "[-1,000, 3,656]" in held.detail
+               and any("life 0: [0, +2,000]: Q 2 deferred batch(es), up to 2,000 records "
+                       "read again, above" in line for line in held.lines),
+               f"a deferred batch widens the band above, got {held} {held.lines}")
+
+        # The end wait: a consumer whose lag never read 0, or no record of the wait, FAILs.
+        behind = killed("kafka-behind", 0, caught=False)["ledger.wire"]
+        expect(behind.status == checks.FAIL
+               and behind.detail.startswith("the consumer's lag never read 0 on every "
+                                            "partition at the end"),
+               f"a consumer that never caught up FAILs, got {behind}")
+        unknown = killed("kafka-no-wait", 0, caught=None)["ledger.wire"]
+        expect(unknown.status == checks.FAIL
+               and "precondition: no kafka_caught_up phase" in unknown.detail,
+               f"a run with no end wait FAILs, got {unknown}")
+
+
+def _kafka_wire_rules(root):
+    """A Kafka wire's scenario: its listener a `kafka_in` reading the writer's topic and format
+    from `earliest`, its writer a `kafka_out`, and only a Kafka wire's writer one; the stack runs
+    the broker beside the backends; and the driver's end wait reads every partition's lag."""
+    path = root / "scenarios" / "kafka-consume-broker-restart" / "scenario.toml"
+    loaded = scenario.load(path)
+    roles = scenario.base_roles(loaded)
+    expect([source["wire"] for source in loaded.kafka_sources] == ["kafka"]
+           and loaded.runs_broker and not loaded.kafka and loaded.has_vm
+           and roles.get("kafka") == "broker" and roles.get("victoria-metrics") == "backend"
+           and driver.profiles_for(loaded) == ["local", "kafka"],
+           f"kafka-consume-broker-restart runs the broker beside VictoriaMetrics, got "
+           f"{loaded.kafka_sources} {roles} {driver.profiles_for(loaded)}")
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp) / "kafka-consume"
+        shutil.copytree(path.parent, base)
+
+        def refused(edits, needle, what):
+            work = Path(tmp) / f"edit-{abs(hash(what))}"
+            shutil.copytree(base, work)
+            for name, old, new in edits:
+                one = work / name
+                text = one.read_text()
+                expect(old in text, f"{what}: the fixture holds {old!r}")
+                one.write_text(text.replace(old, new))
+            try:
+                scenario.load(work / "scenario.toml")
+                expect(False, f"{what}: accepted")
+            except scenario.ScenarioError as err:
+                expect(any(needle in problem for problem in err.problems),
+                       f"{what}: expected a problem containing {needle!r}, got {err.problems}")
+
+        refused([("logit-generator.yaml", "type: kafka_out", "type: stdio_out")],
+                "a kafka wire's `generator_sink` must be a kafka_out, and 'produce' is a "
+                "stdio_out", "a Kafka wire's writer must be a kafka_out")
+        refused([("scenario.toml", 'wire = "kafka" ', 'wire = "tcp" ')],
+                "`generator_sink` 'produce' is a kafka_out, which only a kafka wire reads",
+                "a kafka_out writer needs a Kafka wire")
+        refused([("logit-sut.yaml", "type: kafka_in", "type: tail_in")],
+                "`wire` is kafka, but `sut_listener` 'consume' is a tail_in",
+                "a Kafka wire's listener must be a kafka_in")
+        refused([("logit-generator.yaml", "topic: soak-in", "topic: elsewhere")],
+                "`generator_sink` 'produce' writes the topic 'elsewhere', which `sut_listener` "
+                "'consume' doesn't read (soak-in)", "the writer's topic must be read")
+        refused([("logit-generator.yaml", "format: json", "format: msgpack")],
+                "`generator_sink` 'produce' writes format msgpack, and `sut_listener` 'consume' "
+                "reads json", "the two formats must agree")
+        refused([("logit-sut.yaml", "start: earliest", "start: latest")],
+                "`sut_listener` 'consume' must set `start: earliest`",
+                "the consumer must start at the earliest offset")
+
+        # The end wait: lag 0 on every partition in a point exported after the wait began.
+        run = driver.Run(root, loaded, loaded.duration, None, False, tmp, [], "logit:soak",
+                         roles=_override_roles(loaded))
+        run.prepare()
+        run.ids = {"logit": "sut-id"}
+        polls = []
+
+        class Tail:
+            def __init__(self, lags):
+                self.lags = list(lags)
+
+            def logs_tail(self, container, lines, timeout=None):
+                lag = self.lags.pop(0) if self.lags else self.lags_last
+                self.lags_last = lag
+                stamp = _stamp(time.time() + 1)
+                text = "\n".join(
+                    _line(stamp, "logit.input.lag", "gauge", value, component="consume",
+                          attrs={"topic": "soak-in", "partition": str(index)})
+                    for index, value in enumerate(lag))
+                polls.append(lag)
+                return docker.Result(0, text + "\n", "")
+
+        original = driver.KAFKA_CATCHUP_EVERY_S
+        driver.KAFKA_CATCHUP_EVERY_S = 0
+        try:
+            run.docker = Tail([(40, 3), (0, 3), (0, 0)])
+            run.wait_consumed()
+        finally:
+            driver.KAFKA_CATCHUP_EVERY_S = original
+        phases = [json.loads(line) for line in
+                  (run.run_dir / "timeline.jsonl").read_text().splitlines()]
+        caught = [one for one in phases if one.get("phase") == "kafka_caught_up"]
+        expect(len(caught) == 1 and caught[0]["reached"] and caught[0]["polls"] == 3
+               and caught[0]["lags"] == {"consume soak-in/0": 0, "consume soak-in/1": 0},
+               f"the end wait ends once every partition's lag reads 0, got {caught} {polls}")
+
+
 def _file_rules(root):
     """A file wire's writer must be a `file_out`, and only a file wire's may be; the driver's
     shared directory and its compose variable; and its wait for the tailers, which ends when W
@@ -13861,6 +14106,7 @@ def run(root, quiet=False):
                      _script_ledger, _sink_ledger, _target_ledger, _roles, _sink_rules, _driver_roles,
                      _sources_ledger, _source_rules, _fanin_driver, _tcp_ledger, _tcp_rules,
                      _http_ledger, _http_rules, _file_ledger, _file_rules,
+                     _kafka_wire_ledger, _kafka_wire_rules,
                      _file_ops, _file_action_rules, _copytruncate_ledger, _two_sut_rules,
                      _two_sut_driver, _two_sut_checks, _relay_rules, _relay_driver,
                      _relay_checks, _per_service, _slope_edges,
@@ -13887,7 +14133,8 @@ def run(root, quiet=False):
                               _target_rules, _sink_drain, _kafka_rules, _otlp_walker,
                               _expected_event_rules,
                               _shipped, _roles, _sink_rules, _driver_roles, _source_rules,
-                              _fanin_driver, _tcp_rules, _http_rules, _file_rules, _two_sut_rules,
+                              _fanin_driver, _tcp_rules, _http_rules, _file_rules, _kafka_wire_rules,
+                              _two_sut_rules,
                               _two_sut_driver, _file_action_rules, _relay_rules, _relay_driver,
                               _rss_settle_rules, _expected_rules, _standin_codec, _standin_server,
                               _respond_rules, _standin_count, _standin_idle_timeout,
