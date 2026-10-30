@@ -1,6 +1,8 @@
 //! The reader for `stdio_out`/`file_out` `format: json`: one JSON object per line back into the
 //! [`Event`], [`Resource`], and [`Scope`] that wrote it. `crates/logit-outputs/src/ndjson.rs`'s
-//! module doc is the grammar; this doc is the reader's half of it.
+//! module doc is the grammar; this doc is the reader's half of it. A line parses into
+//! `crate::event_tree`'s tree first, which `crate::msgpack_event` also builds from MessagePack,
+//! so both formats share the walk below.
 //!
 //! What a line's spelling means:
 //!

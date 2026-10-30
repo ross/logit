@@ -940,3 +940,19 @@ async fn an_otlp_request_with_no_records_is_skipped_empty() {
         assert_eq!(committed_on(&cluster, "logs"), Some(offset), "json: {json}");
     }
 }
+
+/// OTLP/JSON ignores a field it doesn't know, so a logs request read as metrics is an empty
+/// request, not an undecodable one.
+#[test]
+fn an_otlp_json_request_on_another_signals_topic_reads_empty() {
+    let records = encode_records(
+        &host_batch("a"),
+        &RecordKey::None,
+        RecordFormat::OtlpJson,
+        RecordMode::Request,
+        usize::MAX,
+    );
+    let mut decoder = RecordDecoder::new(otlp_format(true));
+    let (decoded, _) = decoder.decode("metrics", 0, &kafka_record(0, records[0].0.clone()), 0);
+    assert!(matches!(decoded, Decoded::Skipped("empty")), "{decoded:?}");
+}
