@@ -187,10 +187,11 @@ and in an amendment to the sink's own record:
   server failure stays `Ambiguous` where the OTLP specification says not to retry it
   (`crates/logit-outputs/src/otlp.rs`, "Response classes"; "Amendment: `otlp_out` departs from the
   OTLP specification's non-retryable list (2026-10-04)", below).
-
-[2026-10-30: `s3_out`, not yet built, will depart as "Amendment: `s3_out`'s departures from the
-status-only default (2026-10-30)", below, summarizes; its table is [ADR
-`s3-object-archive`](s3-object-archive.md)'s decision 6 until its module doc carries it.]
+- `s3_out`: a `3xx`, a size limit, `411`, and the `400` codes that name configuration are
+  `Refused`, since no S3 answer names one batch; a body that didn't arrive whole, an expired
+  token, `409` `OperationAborted`, `429`, and a `503` carrying an S3 code are `Clean`
+  (`crates/logit-outputs/src/s3/mod.rs`, "Response classes"; "Amendment: `s3_out`'s departures
+  from the status-only default (2026-10-30)", below).
 
 Sinks with no application response (`syslog_out`, `statsd_out`, `graphite_out`, `collectd_out`,
 `file_out`, `stdio_out`) classify by I/O error alone: a connect failure is `Clean`, a mid-write
@@ -529,9 +530,8 @@ already covers.
 ## Amendment: `s3_out`'s departures from the status-only default (2026-10-30)
 
 [ADR `s3-object-archive`](s3-object-archive.md) decides `s3_out`, which stores many batches as
-one object and counts them delivered only once the object is complete. Its decision 6 is the
-sink's response-class table, the one copy, until W3 moves it into
-`crates/logit-outputs/src/s3/`'s module doc. It departs from this record's status-only default
+one object and counts them delivered only once the object is complete. Its response-class table
+is `crates/logit-outputs/src/s3/mod.rs`'s module doc, "Response classes". It departs from this record's status-only default
 in four directions:
 
 - **`Refused` where the default drops.** A `3xx` (the sink follows no redirect, and a wrong
@@ -554,5 +554,4 @@ attribute; the s3 ADR states what that costs.
 **Consequence.** A destination that answers a redirect, a size limit, or a configuration code
 holds the sink's queue, announced by `logit.component.retrying`, where the default would have
 dropped a batch per attempt; the operator fixes `region:`, `endpoint:`, `part_size`, or the
-bucket, and the held objects go through. The departures list under "Each sink attributes from
-everything its destination gives it" gains an `s3_out` bullet when the sink lands.
+bucket, and the held objects go through.

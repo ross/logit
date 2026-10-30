@@ -2521,6 +2521,27 @@ the broker's error code name and message. The broker settles a
 partition batch once per `logit` batch, and a retry never resends a settled one, so every count
 but `requests` and `reconnects` is met once per batch.
 
+##### `s3_out`
+
+`crates/logit-outputs/src/s3/`, [ADR `s3-object-archive`](../adr/s3-object-archive.md),
+decision 8. Every count is per request or per object: the json and native encoders count nothing,
+so the sink holds no `BatchAccounting` gate, and loss is the runtime's to count.
+
+| Name | Kind | Meaning |
+|---|---|---|
+| `logit.output.requests{op, class}` | count | one per request; `op` is `put_object`, and `class` the status class (`status_class`), `connect_error` for a failed dial (a dial `connect_timeout:` ended included), or `network_error` for any other transport error or a timeout |
+| `logit.output.request.duration{op}` | timer | one sample per request that returned, answered or failed; a request the shutdown grace cancels records none |
+| `logit.output.objects` | count | one per object stored |
+| `logit.output.bytes` | count | the compressed bytes of every request body sent, resends included |
+
+The window's own `logit.component.window.closed{cause}`, and `send.duration` measured from an
+object's close to its answer, are layer 2's
+([ADR `collecting-sink-window`](../adr/collecting-sink-window.md), decision 4). The multipart path
+adds the `create_upload`, `upload_part`, `complete_upload`, and `abort_upload` ops,
+`logit.output.parts`, and `logit.output.uploads.abandoned{aborted}` (the plan's W3b). No
+`Diagnostics` key: a failed request's error carries the bucket, the key, the status, and S3's
+`<Code>` and `<Message>`, never a credential.
+
 ##### `logit_out`
 
 `crates/logit-outputs/src/logit.rs`,

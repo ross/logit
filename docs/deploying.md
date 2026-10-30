@@ -4165,6 +4165,90 @@ accepted, `logit.output.records.dropped{reason}`, `logit.output.records.unkeyed`
 `logit.output.metrics.degraded` for metrics OTLP can't carry as they are.
 `docs/design/internal-telemetry.md`'s `kafka_out` section has every counter.
 
+## `s3_out`: archiving to S3
+
+`s3_out` writes batches to an S3 bucket, or an S3-compatible store such as MinIO or Ceph RGW, as
+compressed objects of `stdio_out`'s `format: json` lines or of native frames, which `replay_in`
+reads back. An object collects batches until `max_bytes` of encoded data, `max_age` after its
+first batch, or the sink's buffer closes it, and every batch in it counts as delivered only once
+the object is stored. [`examples/s3/`](../examples/s3/logit.yaml) archives syslog into a bucket.
+
+```yaml
+components:
+  archive:
+    type: s3_out
+    sources: [syslog]
+    bucket: my-log-archive
+    region: us-east-1
+    prefix: syslog/
+    # partition: "dt=%Y-%m-%d/hour=%H/"   # the default
+    # format: json                         # the default; native
+    # compression: gzip                    # the default; zstd | none
+    # max_bytes: 32MiB                     # encoded bytes per object
+    # max_age: 5m
+    # endpoint: https://minio.internal:9000
+    # sse: {algorithm: aws_kms, kms_key_id: alias/logs}
+    # storage_class: STANDARD_IA
+    buffer:
+      max_bytes: 128MiB
+      disk: {path: /var/lib/logit/archive}
+      shutdown_grace: 60s
+```
+
+A key is `{prefix}{partition}{time}-{store id}-{first seq}.{ext}`, such as
+`syslog/dt=2026-10-30/hour=14/20261030T142501.123Z-6f1c…e09a-00000000000000000042.ndjson.gz`.
+Each object is written with one `PutObject` today, so an object also closes once its compressed
+bytes reach `part_size` (8 MiB by default; [known gaps](known-gaps/sinks.md)).
+
+**Partitions are ingest time.** `partition:` is formatted in UTC at the moment the object's first
+batch was staged, never from an event's own timestamp. A backlog replayed tomorrow lands under
+tomorrow's partition, and a query engine that prunes on `dt=` must allow for the lag between an
+event and its archive.
+
+**Give the bucket a lifecycle rule** that aborts incomplete multipart uploads after a day or so
+(`AbortIncompleteMultipartUpload`). A multipart upload `logit` abandons, at a crash or a restart,
+holds its parts, and S3 bills them until the rule removes them.
+
+**IAM permissions.** The sink needs `s3:PutObject` on `arn:aws:s3:::BUCKET/PREFIX*` and
+`s3:AbortMultipartUpload` on the same resource. Under `sse: {algorithm: aws_kms}` it also needs
+`kms:GenerateDataKey` and `kms:Decrypt` on the key. It never lists, reads, or deletes. With no
+`credentials:` block, credentials come from the AWS default chain: the environment, a web
+identity token (EKS IRSA), the shared credentials and config files (static keys only), the
+container credentials endpoint (ECS, EKS Pod Identity), and the instance metadata service, in
+that order. Static `credentials:` take each value best given with
+`!env`.
+
+**A bucket name containing `.`** needs `path_style: true` on AWS over TLS, because AWS's wildcard
+certificate covers one label of the host name, and `my.bucket.s3.us-east-1.amazonaws.com` fails
+verification. With `endpoint:` set, path-style is the default.
+
+**Use `buffer.disk:`.** An open object's batches stay in the sink's buffer, uncommitted, until the
+object is stored. Under the default memory buffer a crash loses them all, and a shutdown whose
+`buffer.shutdown_grace` (default `5s`) ends before the upload does counts them
+`batches.dropped{reason="shutdown"}`. With `buffer.disk:`, the next process replays them into a
+new object. Set `buffer.shutdown_grace` long enough to upload one object (`max_bytes`, compressed,
+at your link's rate) so a clean shutdown stores the last object instead of leaving it to replay.
+
+**Size `buffer.max_bytes` above `max_bytes`.** It bounds the decoded batches an open object holds
+on either buffer (the one case where `buffer.max_bytes` sits beside `disk:`), and it's measured in
+decoded event bytes, which run several times an object's encoded bytes. When the buffer fills
+first, the object closes early, counted `logit.component.window.closed{cause="memory"}`, or
+`cause="pressure"` when a new batch found no room. Many objects closed by either cause mean the
+buffer is too small for the object size; raise `buffer.max_bytes` (or `disk.max_bytes`) or lower
+`max_bytes`.
+
+**Faults hold the queue.** S3 never judges an object's content, so a wrong region, endpoint,
+bucket, credential, or KMS key holds every object, retried with backoff and announced by
+`logit.component.retrying`; a `3xx` names the bucket's region in the error. Only an S3 `4xx` the
+sink doesn't recognize drops the object's first batch, counted
+`batches.dropped{reason="rejected"}`. The sink's module doc, `crates/logit-outputs/src/s3/mod.rs`,
+lists every answer.
+
+**Duplicates.** A retry writes the same key with the same batches, so an upload that landed
+before its answer was lost is overwritten, not doubled. A replay after a restart writes its
+batches under a new key, so an object the old process stored and couldn't commit is stored
+twice; deduplicate downstream if that matters.
+
 ## Prometheus remote-write: receiving, sending, and picking a version
 
 `prometheus_in` and `prometheus_out` each have two modes, chosen by which field is set:

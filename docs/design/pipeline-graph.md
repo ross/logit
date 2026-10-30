@@ -383,7 +383,8 @@ a black hole counts what it discards as `events.discarded`.
 35. A `buffer.disk:` beside a non-default `buffer.max_batches`, or beside a non-default
     `buffer.max_bytes` on a sink that doesn't collect windows; a bad disk bound; or a shared
     `disk.path`. On a collecting sink, `buffer.max_bytes` bounds the window's decoded batches
-    ([ADR `collecting-sink-window`](../adr/collecting-sink-window.md)); no kind collects today.
+    ([ADR `collecting-sink-window`](../adr/collecting-sink-window.md)); `s3_out` is the one kind
+    that collects.
 36. A `has_attributes`/`drop_attributes` with an empty key, a non-finite value, or a presence key
     repeated or also named in the same side's map.
 37. A `has_provenance`/`drop_provenance` with an empty or repeated entry. An id isn't checked
@@ -509,6 +510,14 @@ a black hole counts what it discards as `events.discarded`.
 99. An `otlp_in` `auth`, or a `prometheus_in` or `prometheus_out` `bind_auth`, with an empty bearer
     token, username, or password, a bearer token with leading or trailing whitespace, or a basic
     username containing `:`.
+100. An `s3_out` with an empty `bucket`, `region`, or `storage_class`; an `endpoint` that isn't
+     an `http://` or `https://` URL with a host and no path, query, fragment, or user info; a
+     `partition` `jiff` can't format, or a `prefix` and `partition` whose longest key passes
+     S3's 1,024 bytes; a `max_bytes` of `0` or above 9,000 times `part_size`; a `part_size`
+     outside 5 MiB to 5 GiB; a `max_age`, `timeout`, or `connect_timeout` of `0s`; an `sse`
+     `kms_key_id` or `bucket_key` outside `aws_kms`, or an empty `kms_key_id`; `credentials`
+     with an empty value; or a `tls` failing rule 24's checks, including a block under an
+     `http://` `endpoint` ([ADR `s3-object-archive`](../adr/s3-object-archive.md), decision 7).
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.

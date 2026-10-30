@@ -6,7 +6,9 @@ updated: 2026-10-30
 # `s3_out`: one object per time and size window, delivered at completion, under a key its first batch names
 
 ## Status
-Accepted. Nothing is built yet; [the plan](../plans/s3-object-archive.md) sequences it. The
+Accepted. The single-`PutObject` path is built (W3a of [the plan](../plans/s3-object-archive.md));
+the multipart path is W3b. "Implementation notes (2026-10-30)", below, records what W3a decided
+that this record left open. The
 window mechanics are [ADR `collecting-sink-window`](collecting-sink-window.md), and the response
 classes that depart from the shared default are recorded in [ADR
 `sink-fault-classes`](sink-fault-classes.md)'s "Amendment: `s3_out`'s departures from the
@@ -272,9 +274,9 @@ an object's size is set by the sink's configuration, not by a batch: every body 
 stands, so every S3 answer the sink distinguishes is listed. An answer that reaches the "any other
 `4xx`" row costs one batch per object attempt: the runtime drops the head alone, counted
 `batches.dropped{reason="rejected"}`, and the next attempt uploads the rest of the object again.
-That is why every configuration code the sink knows of is read `Refused`. This table is the canonical copy
-until `crates/logit-outputs/src/s3/`'s module doc carries it in W3, each row backed by a test;
-after that the module doc is canonical and this table isn't updated.
+That is why every configuration code the sink knows of is read `Refused`. The canonical copy is
+`crates/logit-outputs/src/s3/mod.rs`'s module doc, each row backed by a test; this table was its
+first copy and isn't updated.
 
 | Answer | Class | Why |
 |---|---|---|
@@ -397,6 +399,43 @@ The maintainer set both.
   - Object Lock buckets, which require `Content-MD5` or an SDK checksum header on every
     `PutObject` (such a bucket answers `400` `InvalidRequest`, `Refused`);
   - following redirects, ACLs, and object tags.
+
+
+## Implementation notes (2026-10-30)
+
+W3a built the single-`PutObject` path and decided these points the record left open.
+
+- **An object closes at `part_size` until W3b.** With no multipart path, an object closes once
+  its compressed body reaches `part_size`, so an object is at most about `part_size` plus one
+  batch's compressed bytes, whatever `max_bytes` says (`docs/known-gaps/sinks.md`).
+- **An encode that fails past the head doesn't poison the object.** The failed batch was never
+  staged, so the loop's unclassified stop completes the object without it, and the batch fails
+  again at the head of the next object, where it's dropped alone as `Rejected`. Poisoning the
+  object would drop the healthy head batches ahead of it one per attempt.
+- **AWS addressing without `endpoint:`** is `<bucket>.s3.<region>.amazonaws.com`, or
+  `.amazonaws.com.cn` for a `cn-` region. GovCloud's `us-gov-` regions share `amazonaws.com`;
+  any other partition needs `endpoint:`.
+- **What's signed.** `host`, `content-type`, and every `x-amz-*` header the sink sends;
+  `Content-Length` isn't, as AWS's own examples don't sign it.
+- **Static credentials and `ExpiredToken`.** With `credentials:` set there's nothing to forget,
+  so the answer stays `Clean` and the retry signs with the same token until the operator replaces
+  it, announced by `logit.component.retrying`.
+- **`partition` validation** formats the pattern at 23:59:59.999 on each month's 20th to 26th
+  day in year 9999 (every weekday and month name), and takes the longest result with the longest
+  key tail. `endpoint:` may end in one `/`.
+- **`logit.output.parts`** counts `UploadPart` requests only, so a `PutObject` counts none.
+- **The cost of zstd's per-batch frames.** Fifty 100-event nginx batches, staged into one object
+  by `StagedObject` with `ruzstd` at its fastest level, beside one frame over the whole object:
+
+  | Encoding | `none` | `gzip` | `zstd`, a frame per batch | `zstd`, one frame |
+  |---|---|---|---|---|
+  | `json` | 5,415,000 | 29,398 | 33,300 | 27,540 |
+  | `native` | 1,857,800 | 13,382 | 26,100 | 7,892 |
+
+  The fixture repeats one batch, so the single frame's gain from cross-batch matches is an upper
+  bound. At 10 events per batch the per-batch frames are about ten times the single frame. A
+  frame per batch is always larger than gzip's one member here, so `gzip` stays the default and
+  `zstd` is worth choosing only for large batches, until `ruzstd` gains a streaming encoder.
 
 ## Alternatives considered
 

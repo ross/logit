@@ -63,7 +63,8 @@ The ADRs are the design; this section doesn't restate their tables. In short:
 | W0 | `s3/w0` | `s3/w0: ADRs and plan for an S3 object-archive sink` | S | — | open |
 | W1 | `s3/w1` | `s3/w1: move SigV4 and the AWS credential chain into logit-aws` | S | — | open (#926) |
 | W2 | `s3/w2` | `s3/w2: collecting sink window in the write loop` | M | W0 | open |
-| W3 | `s3/w3` | `s3/w3: s3_out` | L | W1, W2 | not started |
+| W3a | `s3/w3a` | `s3/w3a: s3_out sink, single-PutObject path` | L | W1, W2 | open |
+| W3b | `s3/w3b` | `s3/w3b: s3_out multipart upload` | M | W3a | not started |
 | W4 | `s3/w4` | `s3/w4: replay_in reads gzip and zstd files` | S | — | not started |
 | W5 | `s3/w5` | `s3/w5: an S3 interop harness` | M | W3, W4 | not started |
 
@@ -279,3 +280,16 @@ These came out of writing the ADRs; a reviewer may push on any of them:
 ## Findings
 
 Recorded per workstream as each lands.
+
+### W3a
+
+- The single-`PutObject` path closes an object at `part_size` until W3b lands
+  (`docs/known-gaps/sinks.md`).
+- `zstd`'s frame per batch costs ratio: on fifty 100-event nginx batches it's 13% larger than one
+  frame for `json` and 3.3 times for `native`, and larger than `gzip` in both
+  ([ADR `s3-object-archive`](../adr/s3-object-archive.md)'s "Implementation notes (2026-10-30)").
+- W4 isn't on W3a's base, so the round-trip test decompresses with `flate2` and `ruzstd` before
+  `replay_in`'s decoders read the object.
+- W3b owes the multipart rows' tests (`InvalidPart`, `InvalidPartOrder`, `EntityTooSmall`,
+  `NoSuchUpload`, and a `200` `CompleteMultipartUpload` with an `<Error>` body), the abort of an
+  abandoned upload, and the late-Complete test.

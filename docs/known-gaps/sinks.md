@@ -1,4 +1,4 @@
-# Known gaps: File and stdio sinks
+# Known gaps: File, stdio, and other sinks
 
 Entry format and the other areas: [the known-gaps index](README.md).
 
@@ -143,3 +143,13 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Not pursued:** resending a write that failed on a reused connection with no byte received,
     as Chromium does, which decision 7 rejects: `reqwest` doesn't say whether a failed request's
     connection was reused.
+
+- **`s3_out` closes an object once its compressed body reaches `part_size`.** The multipart path
+  isn't built yet, so every object is one `PutObject`, and `max_bytes` above `part_size` never
+  takes effect: an object holds at most about `part_size` (8 MiB by default) plus one batch's
+  compressed bytes, and a busy sink writes more, smaller objects than its `max_bytes` asks for
+  ([ADR `s3-object-archive`](../adr/s3-object-archive.md)'s "Implementation notes (2026-10-30)").
+  - **Workaround:** raise `part_size`, up to 5 GiB, for larger objects. One request then carries
+    the whole body, so keep `timeout:` long enough to send `part_size` bytes.
+  - **Closes with:** the multipart upload, W3b of
+    [the plan](../plans/s3-object-archive.md).
