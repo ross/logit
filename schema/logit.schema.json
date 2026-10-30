@@ -1212,7 +1212,7 @@
               "type": "string"
             },
             "checkpoint_path": {
-              "description": "Where read offsets are persisted, so a restart resumes instead of replaying or skipping. Omitted (the default) means no checkpoint: every restart re-applies `read_from` to every file as if newly discovered. A relative path resolves against the config file's directory. Must be unique per component. Each write goes through `<checkpoint_path>.tmp` beside it, so two `tail_in`/`docker_in` components sharing a path, or one whose path is another's `.tmp`, are rejected. A checkpoint that exists but can't be read replays every file from its beginning, whatever `read_from` says.",
+              "description": "Where read offsets are persisted, so a restart resumes instead of replaying or skipping. Omitted (the default) means no checkpoint: every restart re-applies `read_from` to every file as if newly discovered. A relative path resolves against the config file's directory. Must be unique per component. Each write goes through `<checkpoint_path>.tmp` beside it, so two `tail_in`/`docker_in`/`cri_in` components sharing a path, or one whose path is another's `.tmp`, are rejected. A checkpoint that exists but can't be read replays every file from its beginning, whatever `read_from` says.",
               "default": null,
               "type": [
                 "string",
@@ -1220,7 +1220,7 @@
               ]
             },
             "max_line_bytes": {
-              "description": "A line longer than this is dropped whole (not truncated) and diagnosed, so a downstream JSON parser never sees a value that looks well-formed but isn't the real line. The length counts a trailing `\\r`, so a CRLF file has one byte less room per line. Under `docker_in` it bounds the reassembled `log` message, not the json-file line that carries it. A byte-count string. Defaults to `\"1MiB\"`; `0` is rejected.",
+              "description": "A line longer than this is dropped whole (not truncated) and diagnosed, so a downstream JSON parser never sees a value that looks well-formed but isn't the real line. The length counts a trailing `\\r`, so a CRLF file has one byte less room per line. Under `docker_in` it bounds the reassembled `log` message, not the json-file line that carries it, and under `cri_in` the reassembled line, not the CRI record that carries a piece of it. A byte-count string. Defaults to `\"1MiB\"`; `0` is rejected.",
               "default": "1048576",
               "type": "string"
             },
@@ -1277,7 +1277,7 @@
               "type": "string"
             },
             "checkpoint_path": {
-              "description": "Where read offsets are persisted, so a restart resumes instead of replaying or skipping. Omitted (the default) means no checkpoint: every restart re-applies `read_from` to every file as if newly discovered. A relative path resolves against the config file's directory. Must be unique per component. Each write goes through `<checkpoint_path>.tmp` beside it, so two `tail_in`/`docker_in` components sharing a path, or one whose path is another's `.tmp`, are rejected. A checkpoint that exists but can't be read replays every file from its beginning, whatever `read_from` says.",
+              "description": "Where read offsets are persisted, so a restart resumes instead of replaying or skipping. Omitted (the default) means no checkpoint: every restart re-applies `read_from` to every file as if newly discovered. A relative path resolves against the config file's directory. Must be unique per component. Each write goes through `<checkpoint_path>.tmp` beside it, so two `tail_in`/`docker_in`/`cri_in` components sharing a path, or one whose path is another's `.tmp`, are rejected. A checkpoint that exists but can't be read replays every file from its beginning, whatever `read_from` says.",
               "default": null,
               "type": [
                 "string",
@@ -1318,7 +1318,7 @@
               }
             },
             "max_line_bytes": {
-              "description": "A line longer than this is dropped whole (not truncated) and diagnosed, so a downstream JSON parser never sees a value that looks well-formed but isn't the real line. The length counts a trailing `\\r`, so a CRLF file has one byte less room per line. Under `docker_in` it bounds the reassembled `log` message, not the json-file line that carries it. A byte-count string. Defaults to `\"1MiB\"`; `0` is rejected.",
+              "description": "A line longer than this is dropped whole (not truncated) and diagnosed, so a downstream JSON parser never sees a value that looks well-formed but isn't the real line. The length counts a trailing `\\r`, so a CRLF file has one byte less room per line. Under `docker_in` it bounds the reassembled `log` message, not the json-file line that carries it, and under `cri_in` the reassembled line, not the CRI record that carries a piece of it. A byte-count string. Defaults to `\"1MiB\"`; `0` is rejected.",
               "default": "1048576",
               "type": "string"
             },
@@ -1347,6 +1347,80 @@
               "type": "string",
               "enum": [
                 "docker_in"
+              ]
+            },
+            "watch": {
+              "default": "auto",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/WatchMode"
+                }
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Tails every Kubernetes container log under the kubelet's pod log directory (`<root>/<namespace>_<pod>_<pod uid>/<container>/<restart count>.log`), in the CRI format containerd and CRI-O write, or cri-dockerd's Docker json-file (told apart per file by its first byte, `{`), and stamps each line's pod and container identity from its path as `k8s.namespace.name`, `k8s.pod.name`, `k8s.pod.uid`, `k8s.container.name`, and `k8s.container.restart_count` resource attributes. A line the runtime wrote in pieces is put back together per stream, so each event is one line of the container's stdout or stderr, with `log.iostream` naming which and the runtime's timestamp as the event's time. Follows every container under `root`; narrow the flow downstream on the `k8s.*` attributes. Also reads a rotated file the kubelet hasn't compressed yet (`<n>.log.<YYYYMMDD-HHMMSS>`), never a `.gz` one. No API server and no runtime socket. Takes the same tailing options as `tail_in`.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "buffer": true,
+            "checkpoint_interval": {
+              "description": "How long a dirty checkpoint may sit before being flushed to disk, in addition to a flush on every file close and at shutdown. Not \"every line\": a checkpoint only bounds how much a crash can replay, and replay is safe for an at-least-once pipeline. Defaults to `5s`; `0s` is rejected.",
+              "default": "5s",
+              "type": "string"
+            },
+            "checkpoint_path": {
+              "description": "Where read offsets are persisted, so a restart resumes instead of replaying or skipping. Omitted (the default) means no checkpoint: every restart re-applies `read_from` to every file as if newly discovered. A relative path resolves against the config file's directory. Must be unique per component. Each write goes through `<checkpoint_path>.tmp` beside it, so two `tail_in`/`docker_in`/`cri_in` components sharing a path, or one whose path is another's `.tmp`, are rejected. A checkpoint that exists but can't be read replays every file from its beginning, whatever `read_from` says.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "containers_dir": {
+              "description": "The kubelet's container symlink directory, read for each container's id. Defaults to `/var/log/containers`. Must be non-empty. The kubelet links each container's log there under a name ending in the container's 64-character id (`<pod>_<namespace>_<container>-<id>.log`), and `cri_in` writes that id as the `container.id` resource attribute. A container whose link is missing, was removed before `cri_in` listed it, or has a name the kubelet cut short of a whole id gets no `container.id`. A directory that doesn't exist is not an error: no container gets an id. `logit` needs read access to this directory, and the links' targets need not be reachable through it, since only the link text is read.",
+              "default": "/var/log/containers",
+              "type": "string"
+            },
+            "max_line_bytes": {
+              "description": "A line longer than this is dropped whole (not truncated) and diagnosed, so a downstream JSON parser never sees a value that looks well-formed but isn't the real line. The length counts a trailing `\\r`, so a CRLF file has one byte less room per line. Under `docker_in` it bounds the reassembled `log` message, not the json-file line that carries it, and under `cri_in` the reassembled line, not the CRI record that carries a piece of it. A byte-count string. Defaults to `\"1MiB\"`; `0` is rejected.",
+              "default": "1048576",
+              "type": "string"
+            },
+            "partial_timeout": {
+              "description": "How long a stream's unfinished line waits for its next piece, once `logit` has read to the end of its file, before it's sent as it stands. A container that exits or prompts mid-line leaves such a line. Each one sent this way is counted as `logit.input.frames.truncated{reason=\"partial_timeout\"}`, and if the rest of the line arrives later, it's sent as a second event. The wait is checked on the `poll_interval` tick, so a line can wait up to one `poll_interval` longer. Defaults to `5s`; `0s` turns the timer off, and an unfinished line then waits for its last piece or for its file to close.",
+              "default": "5s",
+              "type": "string"
+            },
+            "poll_interval": {
+              "description": "The read/rescan cadence, used as-is under `watch: poll` and as a reconciliation pass under `watch: inotify`/`auto` (catching a rename, a rotation, or an event `inotify` missed). Never disabled. Defaults to `1s`; `0s` is rejected.",
+              "default": "1s",
+              "type": "string"
+            },
+            "read_from": {
+              "default": "end",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ReadFrom"
+                }
+              ]
+            },
+            "receive": true,
+            "root": {
+              "description": "The kubelet's pod log directory. Defaults to `/var/log/pods`. Must be non-empty.",
+              "default": "/var/log/pods",
+              "type": "string"
+            },
+            "sources": true,
+            "targets": true,
+            "type": {
+              "type": "string",
+              "enum": [
+                "cri_in"
               ]
             },
             "watch": {
@@ -4259,7 +4333,7 @@
           "additionalProperties": false
         },
         {
-          "description": "Reads a file once, from start to end, and sends its events downstream, then stops. The file is an archive a `stdio_out` or `file_out` wrote, or events written by hand in the same form. Events keep the timestamps the file gives them. When every input has stopped, the process flushes its sinks and exits.\n\nA line or frame that can't be read is skipped and counted, and the rest of the file is still sent. There's no follow mode, no checkpoint, and no pacing: a restart reads the file from the start, and events go out as fast as the components downstream take them.",
+          "description": "Reads a file once, from start to end, and sends its events downstream, then stops. The file is an archive a `stdio_out` or `file_out` wrote, or events written by hand in the same form. Events keep the timestamps the file gives them. When every input has stopped, the process flushes its sinks and exits.\n\nA file that starts with gzip's or zstd's magic bytes is decompressed as it's read, for either format: every gzip member and every zstd frame. A compressed file that is cut short or corrupt is read up to the fault, counted, and ends the replay.\n\nA line or frame that can't be read is skipped and counted, and the rest of the file is still sent. There's no follow mode, no checkpoint, and no pacing: a restart reads the file from the start, and events go out as fast as the components downstream take them.",
           "type": "object",
           "required": [
             "path",
@@ -4284,7 +4358,7 @@
               ]
             },
             "path": {
-              "description": "The file to read, relative to the config file unless absolute. It's opened at startup, so a missing or unreadable file stops `logit run` before anything else starts.",
+              "description": "The file to read, gzip- or zstd-compressed or not, relative to the config file unless absolute. It's opened at startup, so a missing or unreadable file stops `logit run` before anything else starts.",
               "type": "string"
             },
             "receive": true,
@@ -4503,7 +4577,7 @@
           ]
         },
         "receive": {
-          "description": "Per-listener receive queue and batch assembly. A datagram listener (`collectd_in`, and `statsd_in`/`syslog_in`/`graphite_in`/`lines_in` under `transport: udp`) accepts every field; the same four under `transport: tcp`, `tail_in`, and `docker_in` accept only the batch-assembly fields and `shutdown_grace`; a non-default block on any other kind (`otlp_in`, `logit_in`, `prometheus_in`, `internal`, and `generate_in` included) is rejected.",
+          "description": "Per-listener receive queue and batch assembly. A datagram listener (`collectd_in`, and `statsd_in`/`syslog_in`/`graphite_in`/`lines_in` under `transport: udp`) accepts every field; the same four under `transport: tcp`, `tail_in`, `docker_in`, and `cri_in` accept only the batch-assembly fields and `shutdown_grace`; a non-default block on any other kind (`otlp_in`, `logit_in`, `prometheus_in`, `internal`, and `generate_in` included) is rejected.",
           "default": {
             "batch_flush_interval": "100ms",
             "batch_max_bytes": "1048576",
@@ -5738,7 +5812,7 @@
       ]
     },
     "ReceiveConfig": {
-      "description": "Per-listener receive queue and datagram-to-batch assembly. A datagram listener (`collectd_in`, and `statsd_in`/`syslog_in`/`graphite_in`/`lines_in` under `transport: udp`) accepts every field; the same four under `transport: tcp`, `tail_in`, and `docker_in` accept only the batch-assembly fields (`batch_max_events`, `batch_max_bytes`, `batch_flush_interval`) and `shutdown_grace`; a non-default block on any other kind is rejected. Every field defaults, so the block is never required. The defaults batch: `batch_max_events: 1000` and `batch_flush_interval: 100ms` mean a default-configured listener amortizes datagrams into batches (up to 1000 events, or up to 100ms of added latency before a send). For one send per datagram with no added latency, set `batch_max_events: 1`.",
+      "description": "Per-listener receive queue and datagram-to-batch assembly. A datagram listener (`collectd_in`, and `statsd_in`/`syslog_in`/`graphite_in`/`lines_in` under `transport: udp`) accepts every field; the same four under `transport: tcp`, `tail_in`, `docker_in`, and `cri_in` accept only the batch-assembly fields (`batch_max_events`, `batch_max_bytes`, `batch_flush_interval`) and `shutdown_grace`; a non-default block on any other kind is rejected. Every field defaults, so the block is never required. The defaults batch: `batch_max_events: 1000` and `batch_flush_interval: 100ms` mean a default-configured listener amortizes datagrams into batches (up to 1000 events, or up to 100ms of added latency before a send). For one send per datagram with no added latency, set `batch_max_events: 1`.",
       "type": "object",
       "properties": {
         "batch_flush_interval": {

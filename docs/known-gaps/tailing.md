@@ -103,22 +103,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
   different container whose id begins `deadbeefcafe`.
   - **Workaround:** don't give a container a name shaped like an id prefix. See [ADR
     `docker-container-identity-and-minimal-watches`](../adr/docker-container-identity-and-minimal-watches.md).
-- **An envelope over the cap is dropped by the splitter without the decoder seeing it, so a dropped
-  *closing* fragment lets the next line on that stream splice onto the held partial.**
-  `docker_in`'s `LineSplitter` drops a json-file line longer than its envelope bound
-  (`envelope_cap` in `crates/logit-inputs/src/docker.rs`) whole and counts it (`long_line` and
-  `logit.input.frames.dropped{reason="oversize"}`), and
-  `DockerDecoder` never learns a line went missing. If the dropped line was a message's closing
-  fragment, the held partial stays open and the next same-stream line joins it.
-  - **To close:** the splitter must report drops in sequence, and a `TailDecoder` hook must
-    receive them. See [ADR
-    `file-tailing-and-docker-json-logs`](../adr/file-tailing-and-docker-json-logs.md)'s 2026-09-28
-    amendment.
-- **An `attrs` object larger than the envelope bound's slack can drop entries as `long_line`.**
-  The bound leaves fixed room for `attrs` beside a worst-case-escaped fragment. An envelope whose
-  `attrs` outgrows that room can exceed the bound, and the splitter drops it unseen. `attrs` comes
-  from `--log-opt labels`, `env`, and `tag`. The slack and the bound are `envelope_cap` in
-  `crates/logit-inputs/src/docker.rs`.
 - **A truncation counts at most one of a held entry and the unterminated line behind it.**
   When `docker_in`'s file is truncated in place, the decoder counts each stream's held reassembly
   `logit.input.frames.dropped{reason="truncated"}` (a drop in progress was counted `oversize`
@@ -142,7 +126,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   can't detect in advance.
   - **Workaround:** for a config on such a mount, set `watch: poll` explicitly. `poll_interval`
     is the only mechanism proven to work everywhere.
-- **`tail_in`/`docker_in`'s `inotify` wake source is Linux-only.** Every other platform runs
+- **The tail listeners' `inotify` wake source is Linux-only.** Every other platform runs
   `watch: poll` regardless of config, and an explicit `watch: inotify` is a startup error, not a
   silent downgrade.
 - **A *file* watch that fails to register is never retried for that file.** `Watcher::watch_file`
@@ -208,15 +192,13 @@ Entry format and the other areas: [the known-gaps index](README.md).
     per file, and put the restart decision in whatever starts `logit`.
   - **Revisit trigger:** an operator replaying archives too large to resend after a failure, or a
     flow that needs pacing.
-- **Neither side of the archive pair handles a compressed JSON file.** `file_out` compresses only
-  `format: native`, as lz4 inside each frame, and never compresses a `format: json` file, rotated
-  or not. `replay_in` reads no compressed file: no `.gz`, and no lz4-framed JSON. A
-  `format: native` archive written with `compression: lz4` replays, since its compression is per
-  frame.
-  - **Consequence:** a JSON archive takes its full size on disk, and one an external tool gzipped
-    after rotation has to be decompressed before `replay_in` can read it.
-  - **Workaround:** archive as `format: native` with `compression: lz4`, or decompress to a file
-    (or a named pipe) before replaying.
-  - **Remedy:** one follow-up that adds both sides together, gzip on `file_out`'s `format: json`
-    rotation and `replay_in` reading a `.gz` file by its extension, so archiving and replaying
-    stay one story.
+- **`file_out` doesn't compress a `format: json` file.** It compresses only `format: native`, as
+  lz4 inside each frame, and never compresses a JSON file, rotated or not. `replay_in` reads a
+  gzip or zstd file of either format, detected by its magic bytes, but reads no lz4-framed JSON.
+  - **Consequence:** a JSON archive takes its full size on disk until an external tool compresses
+    it.
+  - **Workaround:** archive as `format: native` with `compression: lz4`, or compress the rotated
+    file with `gzip` or `zstd`, which `replay_in` reads as it is. For a compression it doesn't
+    read (xz, bzip2, lz4-framed JSON), decompress to a file or a named pipe before replaying.
+  - **Remedy:** gzip on `file_out`'s `format: json` rotation, so archiving and replaying stay one
+    story.

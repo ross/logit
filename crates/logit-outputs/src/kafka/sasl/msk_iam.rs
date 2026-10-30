@@ -3,7 +3,7 @@
 //!
 //! The object is the query of a SigV4 presigned `GET https://<broker host>/?Action=
 //! kafka-cluster:Connect` for service `kafka-cluster`, valid 900 seconds, with `host` the one
-//! signed header and an empty payload ([`super::sigv4::Signer::presign`]). Each query parameter
+//! signed header and an empty payload ([`logit_aws::sigv4::Signer::presign`]). Each query parameter
 //! becomes a key in lowercase with its value as it is, not percent-encoded, beside `version`
 //! (`2020_10_22`), `host` (the broker's host, as the connection names it), and `user-agent`:
 //!
@@ -26,16 +26,16 @@
 //! `boot-x.c1.kafka-serverless.us-west-2.amazonaws.com`, `.amazonaws.com.cn`, `.api.aws`), which
 //! are the `aws`, `aws-cn`, and `aws-us-gov` partitions' domains only
 //! (`docs/known-gaps/kafka.md`), else `AWS_REGION` or `AWS_DEFAULT_REGION`. With none, the
-//! exchange is `Refused`. Credentials come from [`super::aws_creds::Chain`].
+//! exchange is `Refused`. Credentials come from [`logit_aws::creds::Chain`].
 
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context};
 use logit_pipeline::Fault;
 
-use super::aws_creds::{Chain, Credentials};
-use super::sigv4::{AmzDate, Signer};
 use super::{Authenticator, Session, Step};
+use logit_aws::creds::{Chain, Credentials};
+use logit_aws::sigv4::{AmzDate, Signer};
 
 /// The payload version `aws-msk-iam-auth` sends.
 pub(crate) const VERSION: &str = "2020_10_22";
@@ -277,7 +277,7 @@ mod tests {
             credentials: Arc::new(credentials(None)),
             chain: Arc::new(Chain::with(
                 Arc::new(|_| None),
-                super::super::aws_creds::Endpoints::default(),
+                logit_aws::creds::Endpoints::default(),
                 std::time::Duration::from_secs(1),
             )),
         };
