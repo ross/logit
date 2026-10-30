@@ -1,6 +1,7 @@
-//! AWS credentials for `AWS_MSK_IAM`: a hand-rolled subset of the AWS SDK for Java v2's default
+//! AWS credentials: a hand-rolled subset of the AWS SDK for Java v2's default
 //! chain, in the order `aws-msk-iam-auth`'s `MSKCredentialProvider` builds it
-//! (`docs/adr/kafka-sasl.md`, "Amendment: what W3 settled"):
+//! (`docs/adr/kafka-sasl.md`, "Amendment: what W3 settled"). `kafka_out`'s `AWS_MSK_IAM` is
+//! the first caller:
 //!
 //! 1. The environment: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN`.
 //! 2. Web identity: `AWS_WEB_IDENTITY_TOKEN_FILE` and `AWS_ROLE_ARN`, exchanged through an
@@ -27,7 +28,8 @@
 //! and concurrent dials wait on one lookup. Credentials without one (the environment, the files)
 //! are read again on every dial, which costs a variable lookup or a file read.
 //!
-//! A fault's class follows `super::super`'s response-class table: an endpoint unreachable, timed
+//! A fault's class follows the calling sink's response-class table (`kafka_out`'s is in
+//! `logit-outputs`' `kafka` module doc): an endpoint unreachable, timed
 //! out, or answering `429` or `5xx`, and STS's `Throttling` and `IDPCommunicationError`, are
 //! `Clean`; any other answer from an endpoint, and a source misconfigured on this host, are
 //! `Refused`. Every HTTP request is bounded by the sink's `timeout`, and its connection by a fixed
@@ -76,23 +78,23 @@ const UNSUPPORTED_PROFILE_KEYS: &[&str] = &[
 
 /// Reads an environment variable. The process environment in production; a map in tests, so
 /// no test changes the environment another test reads.
-pub(crate) type Env = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+pub type Env = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
 /// The process environment.
-pub(crate) fn process_env() -> Env {
+pub fn process_env() -> Env {
     Arc::new(|name| std::env::var(name).ok())
 }
 
 /// Where the chain's HTTP sources are. Only tests point them anywhere else; no variable moves
 /// them.
 #[derive(Debug, Clone)]
-pub(crate) struct Endpoints {
+pub struct Endpoints {
     /// IMDS, `http://169.254.169.254`.
-    pub(crate) imds: String,
+    pub imds: String,
     /// What `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` is relative to, `http://169.254.170.2`.
-    pub(crate) container: String,
+    pub container: String,
     /// STS's base URL; `None` for the region's own, `https://sts.<region>.amazonaws.com`.
-    pub(crate) sts: Option<String>,
+    pub sts: Option<String>,
 }
 
 impl Default for Endpoints {
@@ -106,13 +108,13 @@ impl Default for Endpoints {
 }
 
 /// One set of AWS credentials and where they came from. Its `Debug` shows the source only.
-pub(crate) struct Credentials {
-    pub(crate) access_key_id: String,
-    pub(crate) secret_access_key: String,
-    pub(crate) session_token: Option<String>,
-    pub(crate) expires: Option<SystemTime>,
+pub struct Credentials {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub session_token: Option<String>,
+    pub expires: Option<SystemTime>,
     /// Where they came from, for messages, such as `the environment`.
-    pub(crate) source: String,
+    pub source: String,
 }
 
 impl std::fmt::Debug for Credentials {
@@ -125,7 +127,7 @@ impl std::fmt::Debug for Credentials {
 }
 
 /// The credential chain, shared by every connection of one sink.
-pub(crate) struct Chain {
+pub struct Chain {
     env: Env,
     endpoints: Endpoints,
     /// STS's client, which honors `HTTPS_PROXY` and the other proxy variables.
@@ -146,17 +148,16 @@ struct Cached {
 impl Chain {
     /// The chain over the process environment and AWS's own endpoints, with every request
     /// bounded by `timeout`.
-    pub(crate) fn new(timeout: Duration) -> Self {
+    pub fn new(timeout: Duration) -> Self {
         Self::with(process_env(), Endpoints::default(), timeout)
     }
 
-    pub(crate) fn with(env: Env, endpoints: Endpoints, timeout: Duration) -> Self {
+    pub fn with(env: Env, endpoints: Endpoints, timeout: Duration) -> Self {
         Self::with_clients(env, endpoints, timeout, || {
             crate::http::client_builder(
                 timeout,
                 crate::http::DEFAULT_CONNECT_TIMEOUT,
                 crate::http::DEFAULT_IDLE_TIMEOUT,
-                None,
             )
         })
     }
@@ -186,13 +187,13 @@ impl Chain {
     }
 
     /// The variable `name`, unless it's unset or blank.
-    pub(crate) fn var(&self, name: &str) -> Option<String> {
+    pub fn var(&self, name: &str) -> Option<String> {
         (self.env)(name).filter(|value| !value.trim().is_empty())
     }
 
     /// Cached credentials, or the chain's answer once they're due for refresh. `region` is the
     /// broker's, where STS is asked.
-    pub(crate) async fn credentials(&self, region: &str) -> anyhow::Result<Arc<Credentials>> {
+    pub async fn credentials(&self, region: &str) -> anyhow::Result<Arc<Credentials>> {
         let _fetching = self.fetching.lock().await;
         if let Some(cached) = self.cache.lock().unwrap().as_ref() {
             if Instant::now() < cached.refresh_at {
@@ -211,7 +212,7 @@ impl Chain {
     }
 
     /// Drops `credentials` from the cache, unless another connection has replaced them already.
-    pub(crate) fn forget(&self, credentials: &Arc<Credentials>) {
+    pub fn forget(&self, credentials: &Arc<Credentials>) {
         let mut cache = self.cache.lock().unwrap();
         if cache.as_ref().is_some_and(|cached| Arc::ptr_eq(&cached.credentials, credentials)) {
             *cache = None;
@@ -303,7 +304,7 @@ impl Chain {
             None => format!("https://sts.{region}.{}", partition_domain(region)?),
         };
         let url = format!("{}/", base.trim_end_matches('/'));
-        let form = |k: &str, v: &str| format!("{k}={}", super::oauth::form_urlencode(v));
+        let form = |k: &str, v: &str| format!("{k}={}", crate::http::form_urlencode(v));
         let body = [
             form("Action", "AssumeRoleWithWebIdentity"),
             form("Version", "2011-06-15"),
@@ -563,7 +564,7 @@ const COMMERCIAL_PREFIXES: &[&str] = &["us", "eu", "ap", "sa", "ca", "me", "af",
 /// `amazonaws.com.cn` for `aws-cn` (`cn-`), `amazonaws.com` for `aws-us-gov` (`us-gov-`) and
 /// `aws`. Any other region, such as an ISO partition's (`us-iso-east-1`) or the European
 /// Sovereign Cloud's (`eusc-de-east-1`, under `amazonaws.eu`), is `Refused`.
-pub(crate) fn partition_domain(region: &str) -> anyhow::Result<&'static str> {
+pub fn partition_domain(region: &str) -> anyhow::Result<&'static str> {
     // ISO regions share the `us` and `eu` prefixes.
     let iso = region.split('-').any(|label| label.starts_with("iso"));
     match region.split('-').next().unwrap_or_default() {
@@ -673,11 +674,7 @@ async fn read_optional(path: &Path) -> anyhow::Result<Option<String>> {
 /// `[<name>]`. The parser follows the Java SDK's: a line starting with `#` or `;` is a comment,
 /// a property's ` #` or ` ;` starts one, an indented line continues a property and is skipped
 /// here, a later key wins, and keys are case-sensitive.
-pub(crate) fn profile_keys(
-    text: &str,
-    config: bool,
-    name: &str,
-) -> Option<HashMap<String, String>> {
+pub fn profile_keys(text: &str, config: bool, name: &str) -> Option<HashMap<String, String>> {
     // Each matching section's keys by rank: 1 for `[default]` in the config file, 2 for every
     // other match. The highest rank present wins, and its sections merge in file order.
     let mut sections: Vec<(u8, HashMap<String, String>)> = Vec::new();
@@ -731,7 +728,7 @@ pub(crate) fn profile_keys(
 
 /// The text of the first `<tag>` element in an XML `body`, entity references decoded. Enough
 /// for STS's answers, whose fields are leaf elements with no attributes.
-pub(crate) fn xml_text(body: &[u8], tag: &str) -> Option<String> {
+pub fn xml_text(body: &[u8], tag: &str) -> Option<String> {
     let text = std::str::from_utf8(body).ok()?;
     let open = format!("<{tag}>");
     let start = text.find(&open)? + open.len();
@@ -784,7 +781,7 @@ mod tests {
     use logit_pipeline::test_util::{scratch_dir, RECV_TIMEOUT};
 
     use super::*;
-    use crate::kafka::fake_broker::{HttpRequest, HttpStub};
+    use crate::test_stub::{HttpRequest, HttpStub};
 
     const SECRET: &str = "secret-key-never-printed";
     const SESSION: &str = "session-token-never-printed";
@@ -1208,7 +1205,6 @@ mod tests {
                     RECV_TIMEOUT,
                     crate::http::DEFAULT_CONNECT_TIMEOUT,
                     crate::http::DEFAULT_IDLE_TIMEOUT,
-                    None,
                 )
                 .proxy(reqwest::Proxy::all(&url).unwrap())
             })

@@ -59,7 +59,8 @@ mechanism, and the username, and nothing else from the block (AGENTS.md's config
 `Dialer` gains `sasl: Option<Arc<dyn Authenticator>>`. With one set, `Dialer::connect` sends
 `SaslHandshake` v1 naming the mechanism, then one or more `SaslAuthenticate` requests at the
 highest version both sides support, up to v2, until the mechanism finishes. A `kafka/sasl/`
-module holds the trait, the exchange loop, and one file per mechanism. The authenticator is async,
+module holds the trait, the exchange loop, and one file per mechanism (the SigV4 signer and the
+AWS credential chain are in `crates/logit-aws`, see the amendment at the end). The authenticator is async,
 because OAUTHBEARER and AWS MSK IAM fetch tokens and credentials over HTTP, and it caches what it
 fetches across connections.
 
@@ -400,3 +401,11 @@ The reference behavior, read from source:
   "Leave any existing token because it may have some life left, schedule a refresh for 10
   seconds later".
 - franz-go and sarama keep no token cache; the application's token provider owns it.
+
+## Amendment: the AWS code moved to `logit-aws`
+
+The SigV4 signer and the AWS credential chain moved from `crates/logit-outputs/src/kafka/sasl/`
+(`sigv4.rs`, `aws_creds.rs`) to `crates/logit-aws/src/` (`sigv4.rs`, `creds.rs`), so other AWS
+sinks can use them. The behavior, the tests, and the decisions above are unchanged; a path or a
+test name above that says `sasl::aws_creds` or `sasl::sigv4` now reads `logit_aws::creds` or
+`logit_aws::sigv4`. The MSK-specific glue (`msk_iam.rs`) stays in `kafka/sasl/`.
