@@ -624,11 +624,12 @@ struct AfterCorrupt {
 
 impl AfterCorrupt {
     /// Skips the batch, or asks for one widened refetch: `None` when `out` is to be returned as
-    /// it stands, else whether the skip landed on the verified base. The skip lands on the verified base, else on the partial base, each only within
-    /// `(base, end]`; with neither, and offsets past `base + 1` that a batch could hold, the
-    /// partition is fetched once more with `max_batch_bytes` of room so the next batch arrives
-    /// whole beside this one; after that, the skip lands on `end`. It never passes `end` when the
-    /// answer has one, and always moves past the position.
+    /// it stands, else whether the skip landed on the verified base. The skip lands on the
+    /// verified base, else on the partial base, each only within `(base, end]`; with neither, and
+    /// offsets past `base + 1` that a batch could hold, the partition is fetched once more with
+    /// `max_batch_bytes` of room so the next batch arrives whole beside this one; after that, the
+    /// skip lands on `end`. It never passes `end` when the answer has one, and always moves past
+    /// the position.
     fn skip(self, out: &mut Read, end: i64) -> Option<bool> {
         let Self { base, verified, partial, widened } = self;
         let within = |b: &i64| *b > base && (end < 0 || *b <= end);
@@ -893,6 +894,24 @@ mod tests {
             let read = read_final([bad.clone(), cut].concat(), 10);
             assert_eq!(read.position, landing, "partial base {partial}");
             assert_eq!(read.dropped, vec![("corrupt", landing, 0)], "partial base {partial}");
+        }
+    }
+
+    /// A verified entry past `end` is no landing: the skip lands on a cut batch's base within the
+    /// range, else on `end`.
+    #[test]
+    fn a_verified_base_past_end_is_no_landing() {
+        let mut bad = batch_at(0, 3);
+        bad[17] ^= 1;
+        let cut = batch_at(5, 1)[..20].to_vec();
+        for (blob, landing) in [
+            ([bad.clone(), batch_at(20, 1), cut].concat(), 5),
+            ([bad.clone(), batch_at(20, 1)].concat(), 10),
+        ] {
+            let read = read_final(blob, 10);
+            assert_eq!(read.position, landing);
+            assert_eq!(read.dropped, vec![("corrupt", landing, 0)]);
+            assert!(read.records.is_empty(), "{:?}", read.records);
         }
     }
 
