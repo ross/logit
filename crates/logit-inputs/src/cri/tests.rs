@@ -1166,3 +1166,54 @@ async fn a_checkpoint_during_a_splitter_drop_stays_at_the_dropped_records_start(
     running.stop().await;
     std::fs::remove_dir_all(&root).ok();
 }
+
+fn id_factory(links: &Path) -> CriDecoderFactory {
+    CriDecoderFactory {
+        container_ids: ContainerIds::new(links.to_path_buf()),
+        max_line_bytes: 1024,
+        partial_timeout: Duration::ZERO,
+        diag: Diagnostics::default(),
+        telemetry: Telemetry::default(),
+    }
+}
+
+/// Opens `0.log` while its link exists, removes the link, runs two scans in which `scan` is the
+/// only thing keeping the file's key in use, then opens a rotated name of the same file.
+fn rotated_open_after_link_removal(scan: impl Fn(&mut CriDecoderFactory, &Path, &mut CriDecoder)) {
+    let links = scratch_dir("cri-id-keep");
+    let dir = Path::new("/p/default_web-0_0123-abcd/nginx");
+    let live = dir.join("0.log");
+    let name = link_name("nginx", ID_A);
+    link(&links, &name, &live);
+    let mut factory = id_factory(&links);
+    let mut decoder = factory.open(&live).unwrap();
+    assert_eq!(decoder.resource.attributes.get("container.id"), Some(&Value::str(ID_A)));
+    factory.end_scan();
+
+    unlink(&links, &name);
+    for _ in 0..2 {
+        scan(&mut factory, &live, &mut decoder);
+        factory.end_scan();
+    }
+    let rotated = factory.open(&dir.join("0.log.20261030-120000")).unwrap();
+    assert_eq!(
+        rotated.resource.attributes.get("container.id"),
+        Some(&Value::str(ID_A)),
+        "the cached id outlived the link"
+    );
+    std::fs::remove_dir_all(&links).ok();
+}
+
+/// `refresh` keeps the key of a tracked file that already has its id.
+#[test]
+fn refresh_keeps_an_id_in_use_past_its_links_removal() {
+    rotated_open_after_link_removal(|factory, path, decoder| {
+        assert_eq!(factory.refresh(path, decoder), Refresh::Unchanged);
+    });
+}
+
+/// `retain` keeps the key of a tracked file the scan did not offer to `refresh`.
+#[test]
+fn retain_keeps_an_id_in_use_past_its_links_removal() {
+    rotated_open_after_link_removal(|factory, path, _| factory.retain(path));
+}
