@@ -22,6 +22,12 @@
 //! ([`SendLimit`]): the round trip, not the destination's refusal, is what bounds the sink, and
 //! raising `concurrency:` is the remedy (`docs/adr/sink-request-concurrency.md`, decision 2).
 //!
+//! The watch also keeps the store-pressure signal a collecting sink's window closes on
+//! (`docs/adr/collecting-sink-window.md`, decision 3). It's raised from the moment a push finds no
+//! room, as an episode opens, and also by a push accepted over the bound with nothing evictable,
+//! which opens no episode. It clears once a change leaves utilization below 1 with no push
+//! waiting, not at `recover_below`.
+//!
 //! None of them increments `logit.component.diagnostics`: like `write_loop`'s `retrying`, they
 //! are paced by time, never suppressed by count. The `*.dropped` counters stay the record of
 //! loss; these lines sit beside them.
@@ -102,7 +108,7 @@ impl SendLimit {
     }
 
     /// The `buffer_full` line's suffix when every batch the limit allows is in flight.
-    fn cause(&self) -> Option<String> {
+    pub(crate) fn cause(&self) -> Option<String> {
         let limit = self.limit.load(Ordering::Relaxed);
         if limit == 0 || self.in_flight.load(Ordering::Relaxed) < limit {
             return None;
@@ -175,6 +181,10 @@ pub(crate) struct FullWatch {
     waiters: AtomicUsize,
     state: Mutex<State>,
     send_limit: SendLimit,
+    /// The store-pressure signal (the module doc).
+    pressure: AtomicBool,
+    /// Woken, every waiter, when `pressure` goes from clear to raised.
+    pressure_raised: tokio::sync::Notify,
 }
 
 /// Held by a push for as long as it waits for room. Dropping it, on room, close, or the push
@@ -223,12 +233,48 @@ impl FullWatch {
             waiters: AtomicUsize::new(0),
             state: Mutex::new(State::default()),
             send_limit: SendLimit::default(),
+            pressure: AtomicBool::new(false),
+            pressure_raised: tokio::sync::Notify::new(),
         }
     }
 
     /// The write loop's side of the `buffer_full` line's cause.
     pub(crate) fn send_limit(&self) -> &SendLimit {
         &self.send_limit
+    }
+
+    /// Whether the store-pressure signal is raised.
+    pub(crate) fn under_pressure(&self) -> bool {
+        self.pressure.load(Ordering::Acquire)
+    }
+
+    /// Resolves once the store-pressure signal is next raised. Created before a check of
+    /// [`FullWatch::under_pressure`], it can't miss a raise that lands after that check.
+    pub(crate) fn pressure_raised(&self) -> Notified<'_> {
+        self.pressure_raised.notified()
+    }
+
+    /// Records a push accepted over a bound with nothing evictable: it raises the pressure signal
+    /// and opens no episode.
+    pub(crate) fn over_bound(&self) {
+        self.raise_pressure();
+    }
+
+    /// Clears the pressure signal once `ratio`, the queue's utilization after a change, is below 1
+    /// with no push waiting.
+    pub(crate) fn ease_pressure(&self, ratio: f64) {
+        if ratio < 1.0
+            && self.waiters.load(Ordering::Acquire) == 0
+            && self.pressure.load(Ordering::Acquire)
+        {
+            self.pressure.store(false, Ordering::Release);
+        }
+    }
+
+    fn raise_pressure(&self) {
+        if !self.pressure.swap(true, Ordering::AcqRel) {
+            self.pressure_raised.notify_waiters();
+        }
     }
 
     pub(crate) fn set_diagnostics(&mut self, diag: Diagnostics) {
@@ -242,6 +288,7 @@ impl FullWatch {
     /// Records one item an overflow policy shed, `reason` being `overflow_oldest` or
     /// `overflow_newest`. Opens an episode if none is open.
     pub(crate) fn dropped(&self, reason: &'static str, units: u64, bound: Bound) {
+        self.raise_pressure();
         let now = Instant::now();
         let line = {
             let mut state = self.lock();
@@ -260,6 +307,7 @@ impl FullWatch {
         if self.waiters.fetch_add(1, Ordering::AcqRel) == 0 {
             self.telemetry.gauge(self.blocked_gauge, 1.0, &[]);
         }
+        self.raise_pressure();
         let now = Instant::now();
         let line = {
             let mut state = self.lock();
@@ -295,9 +343,11 @@ impl FullWatch {
     }
 
     /// Checks the consumer side's new utilization, `max(items ratio, bytes ratio)`, and closes
-    /// the episode once it is below `recover_below` with no push waiting. One atomic load while no
-    /// episode is open.
+    /// the episode once it is below `recover_below` with no push waiting. Clears the pressure
+    /// signal below 1 ([`FullWatch::ease_pressure`]). Two atomic loads while no episode is open
+    /// and no pressure is raised.
     pub(crate) fn utilization(&self, ratio: f64) {
+        self.ease_pressure(ratio);
         if !self.open.load(Ordering::Acquire)
             || ratio >= self.config.recover_below
             || self.waiters.load(Ordering::Acquire) > 0

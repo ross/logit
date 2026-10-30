@@ -578,8 +578,9 @@ receive and processing side from their own loops, which already see every batch 
 | `logit.component.events.copied` | count | `run_router` (`route_batch`) and `run_route_signals` (`route_signals_batch`): one per delivery past an event's first, for an event a `route` list sends to several destinations, or a `route_signals` sends whole (`strip: false`) or splits into parts (`strip: true`, one per part past the first). Counted on the shared-`Arc` path too, so it counts deliveries, not deep clones. Untagged, and recorded only when nonzero |
 | `logit.component.events.dropped{reason="script_error"}` | count | `run_lua`, one per event whose `process()` call raised an error: that event is lost. Counted beside `errors{reason="process"}` |
 | `logit.component.flush.events` / `.flush.duration` | count / timing | a flush-bearing node's `flush()` |
-| `logit.component.send.duration` | timing | one delivery attempt, `deliver_with_retry` (`write_loop`); for a sink with a send window above 1, one windowed round (the fill and the head's acknowledgment wait), `deliver_window`, except on a sink that times each batch (`Output::send_duration_per_batch`: every sink on the HTTP slot helper, which is `influxdb_out`, `prometheus_out`'s remote-write sender, `otlp_out`, `datadog_out`, `datadog_trace_out`, and `splunk_hec_out`), where it's one sample per answer to the oldest batch: that batch's requests, from the first one's send to the last one's response (`Output::answered_send_duration`) |
+| `logit.component.send.duration` | timing | one delivery attempt, `deliver_with_retry` (`write_loop`); for a sink with a send window above 1, one windowed round (the fill and the head's acknowledgment wait), `deliver_window`, except on a sink that times each batch (`Output::send_duration_per_batch`: `s3_out`, and every sink on the HTTP slot helper, which is `influxdb_out`, `prometheus_out`'s remote-write sender, `otlp_out`, `datadog_out`, `datadog_trace_out`, and `splunk_hec_out`), where it's one sample per answer to the oldest batch: that batch's requests, from the first one's send to the last one's response (`Output::answered_send_duration`); for `s3_out`, from its object's close to the answer, and none for the batches behind the head, whose answers its object's answer settled |
 | `logit.component.retries` | count | a retried delivery attempt or windowed round, `deliver_with_retry` or `deliver_window` (`write_loop`) |
+| `logit.component.window.closed{cause}` | count | `window_round` (`write_loop`), once per window a collecting sink keeps open across arrivals ([ADR `collecting-sink-window`](../adr/collecting-sink-window.md)), by what closed it: `full` (the sink takes no more, or the window reached a memory store's `max_batches`), `deadline`, `pressure` (a push found no room in the sink's buffer), `memory` (the staged batches reached `buffer.max_bytes`), `closed` (the buffer closed), or `shutdown`. A window a submit failure ends isn't counted: it's reopened from its head. Closes on `pressure` mean the buffer is too small for the window. `s3_out` is the one sink that collects |
 | `logit.component.errors` | count | `Output::send` failed (any attempt), or a Lua script error |
 | `logit.component.diagnostics{key=...}` | count | every `Diagnostics::warn_throttled` occurrence, throttled or not |
 | `logit.script.vm.memory` | gauge | `run_lua`, once per batch — the strongest signal a stateful script is leaking Lua-side state |
@@ -1577,11 +1578,11 @@ those values as *fields*, not as a rendered message.
 |---|---|---|
 | `logit.input.lines` / `.line.bytes` | count | every non-blank `format: json` line read, a refused one included |
 | `logit.input.frames` / `.frame.bytes` | count | every `format: native` frame that passes its CRC, before it's decoded |
-| `logit.input.frames.dropped{reason}` | count | a skipped line or frame: `undecodable` for a JSON line, and `magic`, `version`, `too_large`, `crc`, `codec`, `decode_budget`, `malformed`, or `truncated` for a frame. The module doc's table says what each covers |
+| `logit.input.frames.dropped{reason}` | count | a skipped line or frame: `undecodable` for a JSON line, and `magic`, `version`, `too_large`, `crc`, `codec`, `decode_budget`, `malformed`, or `truncated` for a frame, and `decompress` for a compressed file the decoder could not finish. The module doc's table says what each covers |
 | `logit.input.batches.dropped{reason="closed_consumer"}` | count | a batch no consumer took, after which the read stops |
 
 `Diagnostics` keys: `bad_line` (a refused JSON line, with its line number), `bad_frame` (a skipped
-frame, with its byte offset), `truncated` (the file ends inside a frame), and `closed_consumer`.
+frame, with its byte offset), `truncated` (the file ends inside a frame), `bad_compression` (a gzip or zstd stream that could not be finished), and `closed_consumer`.
 
 #### Transforms
 
@@ -2524,6 +2525,27 @@ spans, or metrics it holds.
 the broker's error code name and message. The broker settles a
 partition batch once per `logit` batch, and a retry never resends a settled one, so every count
 but `requests` and `reconnects` is met once per batch.
+
+##### `s3_out`
+
+`crates/logit-outputs/src/s3/`, [ADR `s3-object-archive`](../adr/s3-object-archive.md),
+decision 8. Every count is per request or per object: the json and native encoders count nothing,
+so the sink holds no `BatchAccounting` gate, and loss is the runtime's to count.
+
+| Name | Kind | Meaning |
+|---|---|---|
+| `logit.output.requests{op, class}` | count | one per request; `op` is `put_object`, `create_upload`, `upload_part`, `complete_upload`, or `abort_upload`, and `class` the status class (`status_class`), `connect_error` for a failed dial (a dial `connect_timeout:` ended included), or `network_error` for any other transport error or a timeout |
+| `logit.output.request.duration{op}` | timer | one sample per request that returned, answered or failed; a request the shutdown grace cancels records none |
+| `logit.output.objects` | count | one per object stored |
+| `logit.output.parts` | count | one per `UploadPart` request, answered or not; a `PutObject` counts none |
+| `logit.output.bytes` | count | the compressed bytes of every `PutObject` and `UploadPart` body sent, resends included; a failed dial sent none |
+| `logit.output.uploads.abandoned{aborted}` | count | one per multipart upload the sink gave up while running, after a failed part or completion, or one a cancelled call left: `aborted="true"` when its `AbortMultipartUpload` succeeded or found the upload gone, `"false"` when it failed and the bucket's lifecycle rule must remove the parts. An upload open at a crash or a cut shutdown isn't counted |
+
+The window's own `logit.component.window.closed{cause}`, and `send.duration` measured from an
+object's close to its answer, are layer 2's
+([ADR `collecting-sink-window`](../adr/collecting-sink-window.md), decision 4). No
+`Diagnostics` key: a failed request's error carries the bucket, the key, the status, and S3's
+`<Code>` and `<Message>`, never a credential.
 
 ##### `logit_out`
 

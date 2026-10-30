@@ -396,7 +396,15 @@ impl<T: Queued> BoundedQueue<T> {
         // Lowers the blocked gauge and records a timer sample, only if this push waited.
         drop(waiting);
         self.not_empty.notify_one();
-        self.update_gauges(len, total_weight);
+        let utilization = self.update_gauges(len, total_weight);
+        // `DropOldest` with every item reserved evicts nothing and accepts over the bound, which
+        // opens no episode but is store pressure (`docs/adr/collecting-sink-window.md`, decision
+        // 3). A shed raised it in `count_dropped`.
+        if len > self.max_items || total_weight > self.max_weight {
+            self.watch.over_bound();
+        } else if evicted.is_empty() && rejected.is_none() {
+            self.watch.ease_pressure(utilization);
+        }
     }
 
     /// [`BoundedQueue::push`] over a whole batch. Each item gets the same admission control
@@ -732,6 +740,42 @@ impl<T: Queued + Clone> BoundedQueue<T> {
         }
     }
 
+    /// Waits for the `n`-th item from the head, as [`BoundedQueue::peek_at`] returns it, until
+    /// `deadline`. Returns the item once one is there, else [`StoreWait::Pressure`] while the
+    /// store-pressure signal is raised, else [`StoreWait::Closed`] once the queue is closed, else
+    /// [`StoreWait::Deadline`] at `deadline`. Pressure ends the wait, never the intake of an item
+    /// the queue already holds. Reserves items `0..=n` only when it
+    /// returns the item. Cancellation-safe: a dropped wait leaves the queue as it found it.
+    /// [`BoundedQueue::peek`]'s one-consumer rule applies.
+    pub async fn wait_at(&self, n: usize, deadline: tokio::time::Instant) -> StoreWait<T> {
+        loop {
+            // Both registered before the checks they guard, so a push, a close, or a raise that
+            // lands after a check still wakes this wait.
+            let notified = self.not_empty.notified();
+            let raised = self.watch.pressure_raised();
+            {
+                let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(item) = inner.peek_at(n) {
+                    return StoreWait::Item(item.clone());
+                }
+            }
+            if self.watch.under_pressure() {
+                return StoreWait::Pressure;
+            }
+            if self.closed.load(Ordering::Acquire) {
+                return StoreWait::Closed;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return StoreWait::Deadline;
+            }
+            tokio::select! {
+                () = notified => {}
+                () = raised => {}
+                () = tokio::time::sleep_until(deadline) => return StoreWait::Deadline,
+            }
+        }
+    }
+
     /// A clone of the `n`-th item from the head (`0` is the head), or `None` when fewer than
     /// `n + 1` items are queued. Never waits. Reserves items `0..=n` against `DropOldest`
     /// eviction (see `logit_proto::buffer::Buffer::peek_at`), so a consumer with several items in
@@ -741,6 +785,20 @@ impl<T: Queued + Clone> BoundedQueue<T> {
         let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.peek_at(n).cloned()
     }
+}
+
+/// What a store's wait for its `n`-th item ended on (`SinkStore::wait_at`).
+#[derive(Debug)]
+pub enum StoreWait<T> {
+    /// The item, reserved with every item before it, as `peek_at` reserves them.
+    Item(T),
+    /// The store closed with fewer than `n + 1` items readable.
+    Closed,
+    /// The deadline passed first.
+    Deadline,
+    /// The store-pressure signal is raised: a push found no room
+    /// (`docs/adr/collecting-sink-window.md`, decision 3).
+    Pressure,
 }
 
 /// What a [`SinkStore`] hands its consumer: a batch, the [`BatchContext`] it arrived with, and
@@ -810,6 +868,11 @@ impl SinkQueue {
     /// See [`BoundedQueue::peek_at`].
     pub fn peek_at(&self, n: usize) -> Option<StoreItem> {
         self.queue.peek_at(n)
+    }
+
+    /// See [`BoundedQueue::wait_at`].
+    pub async fn wait_at(&self, n: usize, deadline: tokio::time::Instant) -> StoreWait<StoreItem> {
+        self.queue.wait_at(n, deadline).await
     }
 
     /// How many batches a consumer may hold reserved with `peek_at` at once: `max_batches`, or
@@ -898,6 +961,27 @@ impl SinkStore {
         match self {
             SinkStore::Memory(q) => q.peek_at(n),
             SinkStore::Disk(q) => q.peek_at(n).await,
+        }
+    }
+
+    /// Waits for the `n`-th batch from the head until `deadline`, for a collecting sink's window
+    /// (`docs/adr/collecting-sink-window.md`, decision 2); see [`BoundedQueue::wait_at`] and
+    /// `DiskQueue::wait_at`. Unlike `peek_at`, it waits for a push.
+    pub async fn wait_at(&self, n: usize, deadline: tokio::time::Instant) -> StoreWait<StoreItem> {
+        match self {
+            SinkStore::Memory(q) => q.wait_at(n, deadline).await,
+            SinkStore::Disk(q) => q.wait_at(n, deadline).await,
+        }
+    }
+
+    /// Whether the store-pressure signal is raised: a push found no room and the store isn't back
+    /// under its bounds with no push waiting (`docs/adr/collecting-sink-window.md`, decision 3).
+    /// The memory store raises it against `max_batches` and `max_bytes`, the disk store against
+    /// `disk.max_bytes`.
+    pub fn under_pressure(&self) -> bool {
+        match self {
+            SinkStore::Memory(q) => q.queue.watch.under_pressure(),
+            SinkStore::Disk(q) => q.under_pressure(),
         }
     }
 
@@ -1478,6 +1562,110 @@ mod tests {
         assert!(push.as_mut().poll(&mut cx).is_ready(), "room for one: the push never waits");
         assert!(Arc::ptr_eq(&poll_now(0, &mut cx).expect("the pushed batch"), &sent));
         assert!(poll_now(1, &mut cx).is_none(), "one past the last item");
+    }
+
+    // A collecting sink's wait and store pressure (`docs/adr/collecting-sink-window.md`).
+
+    fn far() -> tokio::time::Instant {
+        tokio::time::Instant::now() + Duration::from_secs(3600)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_at_resolves_with_an_item_pushed_while_it_waits() {
+        let store = SinkStore::Memory(queue(10, u64::MAX, OverflowPolicy::Block));
+        store.push((tiny_batch(), ctx())).await;
+        let sent = tiny_batch();
+        let (waited, ()) = tokio::join!(store.wait_at(1, far()), async {
+            tokio::task::yield_now().await;
+            store.push((Arc::clone(&sent), ctx())).await;
+        });
+        match waited {
+            StoreWait::Item((batch, ..)) => assert!(Arc::ptr_eq(&batch, &sent)),
+            other => panic!("expected the pushed batch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_at_ends_at_its_deadline_and_at_close() {
+        let store = SinkStore::Memory(queue(10, u64::MAX, OverflowPolicy::Block));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        assert!(matches!(store.wait_at(0, deadline).await, StoreWait::Deadline));
+        assert_eq!(tokio::time::Instant::now(), deadline);
+        let (waited, ()) = tokio::join!(store.wait_at(0, far()), async {
+            tokio::task::yield_now().await;
+            store.close();
+        });
+        assert!(matches!(waited, StoreWait::Closed), "{waited:?}");
+    }
+
+    /// A wait dropped after the push it waited for, before it ran again, reserved nothing: a
+    /// `drop_oldest` push evicts that batch.
+    #[tokio::test]
+    async fn a_dropped_wait_at_reserves_nothing() {
+        let SinkStore::Memory(q) =
+            SinkStore::Memory(queue(2, u64::MAX, OverflowPolicy::DropOldest))
+        else {
+            unreachable!()
+        };
+        let head = tiny_batch();
+        q.push((Arc::clone(&head), ctx())).await;
+        q.peek().await.expect("the head, reserved");
+        {
+            let mut cx = Context::from_waker(Waker::noop());
+            let mut wait = std::pin::pin!(q.wait_at(1, far()));
+            assert!(wait.as_mut().poll(&mut cx).is_pending(), "nothing at position 1 yet");
+            q.push((tiny_batch(), ctx())).await;
+        }
+        let last = tiny_batch();
+        q.push((Arc::clone(&last), ctx())).await;
+        let (first, ..) = q.commit().expect("the head");
+        assert!(Arc::ptr_eq(&first, &head));
+        let (next, ..) = q.commit().expect("the last push");
+        assert!(Arc::ptr_eq(&next, &last), "the batch the wait was woken for was evicted");
+    }
+
+    /// Under `drop_oldest` with every batch reserved, a push is accepted over the bound: no drop
+    /// is counted, but the pressure signal is raised. A wait past the accepted batch ends on it,
+    /// while the batch itself is returned like any the queue holds. A commit back under the bound
+    /// clears the signal.
+    #[tokio::test(start_paused = true)]
+    async fn a_drop_oldest_push_accepted_over_the_bound_raises_pressure_until_a_commit() {
+        let store = SinkStore::Memory(queue(2, u64::MAX, OverflowPolicy::DropOldest));
+        for _ in 0..2 {
+            store.push((tiny_batch(), ctx())).await;
+        }
+        assert!(store.peek_at(1).await.is_some(), "both reserved");
+        assert!(!store.under_pressure());
+        let (waited, ()) = tokio::join!(store.wait_at(3, far()), async {
+            tokio::task::yield_now().await;
+            store.push((tiny_batch(), ctx())).await;
+        });
+        assert!(matches!(waited, StoreWait::Pressure), "{waited:?}");
+        assert_eq!(store.queued(), 3, "accepted over the bound");
+        let held = store.wait_at(2, far()).await;
+        assert!(matches!(held, StoreWait::Item(_)), "a batch it holds isn't withheld: {held:?}");
+        store.commit();
+        assert!(store.under_pressure(), "still at the bound");
+        store.commit();
+        assert!(!store.under_pressure(), "back under it");
+    }
+
+    /// A `block` push waiting for room raises the signal. It stays raised while the push that got
+    /// room leaves the store at its bound, and the next commit clears it.
+    #[tokio::test(start_paused = true)]
+    async fn a_waiting_block_push_raises_pressure_until_the_store_is_back_under_its_bound() {
+        let store = SinkStore::Memory(queue(1, u64::MAX, OverflowPolicy::Block));
+        store.push((tiny_batch(), ctx())).await;
+        store.peek().await.expect("the head");
+        let ((), ()) = tokio::join!(store.push((tiny_batch(), ctx())), async {
+            crate::test_util::wait_until("the push waits", || store.under_pressure()).await;
+            store.commit();
+        });
+        assert_eq!(store.queued(), 1);
+        assert!(store.under_pressure(), "the push fit, and the store is at its bound");
+        store.peek().await.expect("the pushed batch");
+        store.commit();
+        assert!(!store.under_pressure(), "back under it");
     }
 
     #[tokio::test]

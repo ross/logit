@@ -58,6 +58,9 @@ use logit_outputs::otlp::{
     SignalPaths,
 };
 use logit_outputs::prometheus::{ExposeOutput, PrometheusOutput, RemoteWriteOutput};
+use logit_outputs::s3::{
+    ObjectCompression, ObjectFormat, S3Output, S3Settings, Sse, StaticCredentials,
+};
 use logit_outputs::splunk::{
     SplunkCompression as SplunkOutCompression, SplunkHecOutput,
     DEFAULT_ACK_TIMEOUT as SPLUNK_DEFAULT_ACK_TIMEOUT,
@@ -1282,6 +1285,17 @@ pub(crate) fn build_spec(
                 write_config(&component.buffer),
             )
         }
+        S3Out { tls, .. } => {
+            let output = S3Output::new(s3_settings(&component.kind)?)?
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone())
+                .with_tls(&to_tls_client_settings(tls), base_dir, tls_reloader)?;
+            NodeSpec::Output(
+                Box::new(output),
+                queue_config(&component.buffer, base_dir),
+                write_config(&component.buffer),
+            )
+        }
         OtlpOut {
             endpoint,
             protocol,
@@ -1938,6 +1952,66 @@ fn statsd_encoder(
         .with_multi_value(statsd_multi_value(multi_value))
 }
 
+/// `s3_out`'s settings from its config.
+fn s3_settings(kind: &logit_config::ComponentKind) -> anyhow::Result<S3Settings> {
+    let logit_config::ComponentKind::S3Out {
+        bucket,
+        region,
+        endpoint,
+        path_style,
+        prefix,
+        partition,
+        format,
+        compression,
+        max_bytes,
+        max_age,
+        part_size,
+        storage_class,
+        sse,
+        credentials,
+        timeout,
+        connect_timeout,
+        idle_timeout,
+        tls: _,
+    } = kind
+    else {
+        anyhow::bail!("{} isn't s3_out", graph::kind_name(kind));
+    };
+    let mut settings = S3Settings::new(bucket.clone(), region.clone());
+    settings.endpoint = endpoint.clone();
+    settings.path_style = *path_style;
+    settings.prefix = prefix.clone();
+    settings.partition = partition.clone();
+    settings.format = match format {
+        logit_config::S3Format::Json => ObjectFormat::Json,
+        logit_config::S3Format::Native => ObjectFormat::Native,
+    };
+    settings.compression = match compression {
+        logit_config::S3Compression::Gzip => ObjectCompression::Gzip,
+        logit_config::S3Compression::Zstd => ObjectCompression::Zstd,
+        logit_config::S3Compression::None => ObjectCompression::None,
+    };
+    settings.max_bytes = *max_bytes;
+    settings.max_age = *max_age;
+    settings.part_size = *part_size;
+    settings.storage_class = storage_class.clone();
+    settings.sse = sse.as_ref().map(|sse| match sse.algorithm {
+        logit_config::S3SseAlgorithm::Aes256 => Sse::Aes256,
+        logit_config::S3SseAlgorithm::AwsKms => {
+            Sse::AwsKms { kms_key_id: sse.kms_key_id.clone(), bucket_key: sse.bucket_key }
+        }
+    });
+    settings.credentials = credentials.as_ref().map(|c| StaticCredentials {
+        access_key_id: c.access_key_id.clone(),
+        secret_access_key: c.secret_access_key.clone(),
+        session_token: c.session_token.clone(),
+    });
+    settings.timeout = *timeout;
+    settings.connect_timeout = *connect_timeout;
+    settings.idle_timeout = *idle_timeout;
+    Ok(settings)
+}
+
 /// The settings of `kind`, a `kafka_out`, for a sink named `id`, as both [`build_spec`] and
 /// [`sink_encoder`] read them.
 fn kafka_settings(id: &str, kind: &logit_config::ComponentKind) -> anyhow::Result<KafkaSettings> {
@@ -2090,6 +2164,7 @@ fn write_config(buffer: &BufferConfig) -> WriteLoopConfig {
         },
         shutdown_grace: buffer.shutdown_grace,
         delivery_override: buffer.delivery.map(delivery_posture),
+        window_max_bytes: buffer.max_bytes,
         ..WriteLoopConfig::default()
     }
 }

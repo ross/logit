@@ -14,6 +14,7 @@ backend later is an edit to `logit.yaml`, not a change to every application and 
 | forwarding: [edge](forwarding/edge.yaml) ([graph](forwarding/edge.svg)) and [central](forwarding/central.yaml) ([graph](forwarding/central.svg)) | statsd and syslog at each edge, forwarded to the central node over the native transport | VictoriaMetrics, Loki, Tempo, from the central node |
 | [kubernetes](kubernetes/logit.yaml) ([graph](kubernetes/graph.svg), [README](kubernetes/README.md)) | Every container's log on a Kubernetes node, from `/var/log/pods`, run as a DaemonSet | Loki, with each line's pod and container |
 | [prusa](prusa/logit.yaml) ([graph](prusa/graph.svg), [script](prusa/prusa.lua), [README](prusa/README.md)) | Prusa printer metrics, InfluxDB line protocol inside syslog datagrams, processed by a Lua script | InfluxDB 2.x, one point per metric |
+| [s3](s3/logit.yaml) ([graph](s3/graph.svg)) | syslog and OTLP/HTTP logs | An S3 bucket, as gzipped JSON lines, one object per five minutes or 32 MiB |
 
 ![canonical graph](canonical/graph.svg)
 
@@ -29,6 +30,7 @@ logit validate examples/forwarding/edge.yaml
 logit validate examples/forwarding/central.yaml
 NODE_NAME=node-1 logit validate examples/kubernetes/logit.yaml
 INFLUXDB_TOKEN=... logit validate examples/prusa/logit.yaml
+logit validate examples/s3/logit.yaml
 ```
 
 `logit validate` checks the graph but doesn't load a `lua_file` script. `logit run` loads it and

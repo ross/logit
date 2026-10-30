@@ -217,7 +217,7 @@
           ]
         },
         "disk": {
-          "description": "Disk-backed durable buffering, opt-in. Omitted (the default) keeps the in-memory queue. Present, it replaces that queue with a disk spool at `disk.path`; `max_batches`/`max_bytes` are rejected at anything but their defaults alongside it, since the disk bound replaces the in-memory one.",
+          "description": "Disk-backed durable buffering, opt-in. Omitted (the default) keeps the in-memory queue. Present, it replaces that queue with a disk spool at `disk.path`. `max_batches` is rejected at anything but its default alongside it, since the disk bound replaces the in-memory one, and so is `max_bytes`, except on a sink that collects batches into one upload: there `max_bytes` still bounds the memory the batches of one upload take.",
           "default": null,
           "anyOf": [
             {
@@ -3634,6 +3634,157 @@
           "additionalProperties": false
         },
         {
+          "description": "Archives batches to an S3 bucket, or an S3-compatible store, as objects: each object collects batches until `max_bytes`, `max_age`, or the buffer's bounds close it, then is written whole. A batch counts as delivered only once its object is stored, so every batch of an open object stays in this sink's buffer until then; `buffer.disk:` keeps them across a restart. The bucket needs a lifecycle rule that aborts incomplete multipart uploads.",
+          "type": "object",
+          "required": [
+            "bucket",
+            "region",
+            "type"
+          ],
+          "properties": {
+            "bucket": {
+              "description": "The bucket objects are written to. Must not be empty.",
+              "type": "string"
+            },
+            "buffer": true,
+            "compression": {
+              "description": "How each object is compressed: `gzip` (the default), `zstd`, or `none`. The object is stored compressed, with no `Content-Encoding`, so a client downloads the bytes its name says.",
+              "default": "gzip",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/S3Compression"
+                }
+              ]
+            },
+            "connect_timeout": {
+              "description": "How long this sink waits for a new connection to open: the DNS lookup, the TCP dial, and the TLS handshake together. A connection that doesn't open in time sent nothing, so the upload is retried under either `buffer.delivery`. Defaults to `5s`; `0s` is rejected.",
+              "default": "5s",
+              "type": "string"
+            },
+            "credentials": {
+              "description": "Static credentials: `access_key_id` and `secret_access_key`, with an optional `session_token`. Write each with `!env` to keep it out of the config file. Unset, credentials come from the environment, a web identity token file (EKS IRSA), the shared credentials and config files, the ECS or EKS Pod Identity container endpoint, or the EC2 instance metadata service, in that order.",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/S3Credentials"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "endpoint": {
+              "description": "The store's base URL, `http://` or `https://`, with no path, query, or user info, such as `https://minio.internal:9000`. Unset, the sink writes to AWS's regional endpoint for `region`.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "format": {
+              "description": "How each object is written: `json` (the default), one JSON object per event per line as `stdio_out`'s `format: json` writes them, or `native`, `logit`'s own binary frames. `replay_in` reads both.",
+              "default": "json",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/S3Format"
+                }
+              ]
+            },
+            "idle_timeout": {
+              "description": "How long a pooled connection may sit idle before this sink closes it instead of reusing it. Keep it below the store's keep-alive idle timeout. Defaults to `30s`. `0s` never reuses an idle connection: every request opens its own.",
+              "default": "30s",
+              "type": "string"
+            },
+            "max_age": {
+              "description": "Closes an object this long after its first batch was staged. Defaults to `5m`; `0s` is rejected.",
+              "default": "5m",
+              "type": "string"
+            },
+            "max_bytes": {
+              "description": "Closes an object once its batches' encoded, uncompressed bytes reach this. A byte-count string. Defaults to `\"32MiB\"`. Must be above `0` and at most 9,000 times `part_size`. Keep `buffer.max_bytes` above it: the batches of an open object stay in the buffer, and an object closes early once they fill it.",
+              "default": "33554432",
+              "type": "string"
+            },
+            "part_size": {
+              "description": "The size of each part of a multipart upload, in compressed bytes. A byte-count string. Defaults to `\"8MiB\"`; must be between `\"5MiB\"` and `\"5GiB\"`, S3's part bounds. An object whose compressed bytes pass it is uploaded in parts of this size as it fills; a smaller one is written with one request. No request body is larger, so keep `timeout` long enough to send one part.",
+              "default": "8388608",
+              "type": "string"
+            },
+            "partition": {
+              "description": "A strftime pattern formatted in UTC at the time the object's first batch was staged, placed after `prefix`. It's the time `logit` wrote the object, not any event's own time. Defaults to `dt=%Y-%m-%d/hour=%H/`, the Hive-style layout query engines read as partitions. The longest key `prefix` and `partition` can produce must fit S3's 1,024-byte limit.",
+              "default": "dt=%Y-%m-%d/hour=%H/",
+              "type": "string"
+            },
+            "path_style": {
+              "description": "Puts the bucket in the request path (`<endpoint>/<bucket>/<key>`) rather than in the host name (`<bucket>.<endpoint host>`). Defaults to `true` with `endpoint` and `false` without it. On AWS, a bucket name containing `.` needs `true` over TLS, because AWS's certificate covers one label of the host name.",
+              "default": null,
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "prefix": {
+              "description": "Prepended to every object key, as written: end it with `/` to make it a folder, such as `logs/`. Empty by default. Neither it nor `partition` may make a `.` or `..` folder, which a URL would remove.",
+              "default": "",
+              "type": "string"
+            },
+            "receive": true,
+            "region": {
+              "description": "The bucket's AWS region, such as `us-east-1`: part of every request's signature, and of the endpoint when `endpoint` is unset. An S3-compatible store takes the region it was configured with, often `us-east-1`. Must not be empty.",
+              "type": "string"
+            },
+            "sources": true,
+            "sse": {
+              "description": "Server-side encryption for each object: `{algorithm: aes256}`, or `{algorithm: aws_kms}` with an optional `kms_key_id` and `bucket_key`. Unset, the bucket's default applies.",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/S3Sse"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "storage_class": {
+              "description": "The storage class objects are written in, such as `STANDARD_IA` or `GLACIER_IR`, sent as `x-amz-storage-class`. Unset, the bucket's default applies. Must not be empty.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "targets": true,
+            "timeout": {
+              "description": "Bounds every request, the upload of a whole object or part included, and each credential lookup. Defaults to `60s`; `0s` is rejected.",
+              "default": "1m",
+              "type": "string"
+            },
+            "tls": {
+              "description": "Tunes TLS to an `https://` store: a private CA, a client certificate, or no verification. A non-default block with an `http://` endpoint is rejected.",
+              "default": {
+                "ca_file": null,
+                "cert_file": null,
+                "insecure_skip_verify": false,
+                "key_file": null,
+                "server_name": null
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TlsClientConfig"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "s3_out"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
           "description": "The native `logit`-to-`logit` protocol, the mirror of `logit_in`: one TCP (optionally TLS) connection, one native frame per batch, one `Ack` before that batch counts as delivered.",
           "type": "object",
           "required": [
@@ -4333,7 +4484,7 @@
           "additionalProperties": false
         },
         {
-          "description": "Reads a file once, from start to end, and sends its events downstream, then stops. The file is an archive a `stdio_out` or `file_out` wrote, or events written by hand in the same form. Events keep the timestamps the file gives them. When every input has stopped, the process flushes its sinks and exits.\n\nA line or frame that can't be read is skipped and counted, and the rest of the file is still sent. There's no follow mode, no checkpoint, and no pacing: a restart reads the file from the start, and events go out as fast as the components downstream take them.",
+          "description": "Reads a file once, from start to end, and sends its events downstream, then stops. The file is an archive a `stdio_out` or `file_out` wrote, or events written by hand in the same form. Events keep the timestamps the file gives them. When every input has stopped, the process flushes its sinks and exits.\n\nA file that starts with gzip's or zstd's magic bytes is decompressed as it's read, for either format: every gzip member and every zstd frame. A compressed file that is cut short or corrupt is read up to the fault, counted, and ends the replay.\n\nA line or frame that can't be read is skipped and counted, and the rest of the file is still sent. There's no follow mode, no checkpoint, and no pacing: a restart reads the file from the start, and events go out as fast as the components downstream take them.",
           "type": "object",
           "required": [
             "path",
@@ -4358,7 +4509,7 @@
               ]
             },
             "path": {
-              "description": "The file to read, relative to the config file unless absolute. It's opened at startup, so a missing or unreadable file stops `logit run` before anything else starts.",
+              "description": "The file to read, gzip- or zstd-compressed or not, relative to the config file unless absolute. It's opened at startup, so a missing or unreadable file stops `logit run` before anything else starts.",
               "type": "string"
             },
             "receive": true,
@@ -4797,7 +4948,7 @@
           ]
         },
         "max_bytes": {
-          "description": "Bound on the sum of on-disk segment sizes; replaces `buffer.max_bytes`'s role. A byte-count string. Defaults to `\"1GiB\"`; `0` is rejected.",
+          "description": "Bound on the sum of on-disk segment sizes; replaces `buffer.max_bytes` as the buffer's bound. A byte-count string. Defaults to `\"1GiB\"`; `0` is rejected.",
           "default": "1073741824",
           "type": "string"
         },
@@ -6022,6 +6173,131 @@
         }
       },
       "additionalProperties": false
+    },
+    "S3Compression": {
+      "description": "How `s3_out` compresses an object.",
+      "oneOf": [
+        {
+          "description": "One gzip member per object. The key ends `.gz`.",
+          "type": "string",
+          "enum": [
+            "gzip"
+          ]
+        },
+        {
+          "description": "One zstd frame per mebibyte of uncompressed data, which a zstd reader reads as one stream. The key ends `.zst`.",
+          "type": "string",
+          "enum": [
+            "zstd"
+          ]
+        },
+        {
+          "description": "No compression.",
+          "type": "string",
+          "enum": [
+            "none"
+          ]
+        }
+      ]
+    },
+    "S3Credentials": {
+      "description": "`s3_out`'s static credentials. Give each value with `!env` so it stays out of the config file.",
+      "type": "object",
+      "required": [
+        "access_key_id",
+        "secret_access_key"
+      ],
+      "properties": {
+        "access_key_id": {
+          "description": "The access key id. Must not be empty.",
+          "type": "string"
+        },
+        "secret_access_key": {
+          "description": "The secret access key. Must not be empty.",
+          "type": "string"
+        },
+        "session_token": {
+          "description": "A session token, for temporary credentials. Must not be empty when set.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "S3Format": {
+      "description": "How `s3_out` writes an object.",
+      "oneOf": [
+        {
+          "description": "One JSON object per event per line, as `stdio_out`'s `format: json` writes them. The key ends `.ndjson`.",
+          "type": "string",
+          "enum": [
+            "json"
+          ]
+        },
+        {
+          "description": "`logit`'s own binary frames, one per batch, as `file_out`'s `format: native` writes them. The key ends `.logit`.",
+          "type": "string",
+          "enum": [
+            "native"
+          ]
+        }
+      ]
+    },
+    "S3Sse": {
+      "description": "`s3_out`'s server-side encryption.",
+      "type": "object",
+      "required": [
+        "algorithm"
+      ],
+      "properties": {
+        "algorithm": {
+          "description": "`aes256`, S3-managed keys, or `aws_kms`, a KMS key.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/S3SseAlgorithm"
+            }
+          ]
+        },
+        "bucket_key": {
+          "description": "Under `aws_kms`, turns the S3 Bucket Key on or off for each object, overriding the bucket's setting. Unset, the bucket's setting applies.",
+          "default": null,
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "kms_key_id": {
+          "description": "Under `aws_kms`, the KMS key's id or ARN. Unset, the account's AWS-managed key for S3 is used. Must not be empty.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "S3SseAlgorithm": {
+      "description": "The algorithm `s3_out`'s `sse:` names.",
+      "oneOf": [
+        {
+          "description": "`AES256`: keys S3 manages.",
+          "type": "string",
+          "enum": [
+            "aes256"
+          ]
+        },
+        {
+          "description": "`aws:kms`: a key in AWS KMS.",
+          "type": "string",
+          "enum": [
+            "aws_kms"
+          ]
+        }
+      ]
     },
     "SampleKey": {
       "description": "What `sample` hashes to reach its keep/drop verdict. Written `key: trace_id`, `key: {attribute: request_id}`, or `key: {resource: service.name}`.",
