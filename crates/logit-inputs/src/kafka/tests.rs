@@ -1028,10 +1028,36 @@ async fn an_otlp_request_with_no_records_is_skipped_empty() {
     }
 }
 
-/// OTLP/JSON ignores a field it doesn't know, so a logs request read as metrics is an empty
-/// request, not an undecodable one.
+/// The OTLP codec's own counts reach `kafka_in`'s telemetry: a metric with no data is skipped
+/// and counted, as on `otlp_in`, and its request, left with no event, is `empty`.
+#[tokio::test]
+async fn the_otlp_codecs_skips_are_counted_through_the_input() {
+    let cluster = otlp_cluster().await;
+    let value = br#"{"resourceMetrics":[{"scopeMetrics":[{"metrics":[{"name":"m"}]}]}]}"#;
+    let record = ProducerRecord {
+        key: None,
+        value: Some(Bytes::from_static(value)),
+        headers: Default::default(),
+        timestamp: 1_000,
+    };
+    cluster.state().append("metrics", 0, &[record], Compression::None);
+    let mut probe = TelemetryProbe::new();
+    let (sink, _rx) = fanout_channel(16);
+    let running = spawn_input(input(&probe, otlp_settings(&cluster, true)), sink).await;
+    probe
+        .wait_for("the request skipped", |t| {
+            t.sum("logit.input.records.skipped", &[("reason", "empty")]) >= 1.0
+        })
+        .await;
+    running.stop().await;
+    let no_data = [("metric_kind", "unknown"), ("reason", "no_data")];
+    assert_eq!(probe.sum("logit.input.metrics.skipped", &no_data), 1.0);
+}
+
+/// OTLP/JSON ignores a field it doesn't know, so a logs request read as metrics decodes to no
+/// event; its top-level key makes it undecodable, as `otlp_proto` reads it, not `empty`.
 #[test]
-fn an_otlp_json_request_on_another_signals_topic_reads_empty() {
+fn an_otlp_json_request_on_another_signals_topic_is_undecodable() {
     let records = encode_records(
         &host_batch("a"),
         &RecordKey::None,
@@ -1041,5 +1067,8 @@ fn an_otlp_json_request_on_another_signals_topic_reads_empty() {
     );
     let mut decoder = RecordDecoder::new(otlp_format(true));
     let (decoded, _) = decoder.decode("metrics", 0, &kafka_record(0, records[0].0.clone()), 0);
-    assert!(matches!(decoded, Decoded::Skipped("empty")), "{decoded:?}");
+    let Decoded::Undecodable(why) = decoded else { panic!("{decoded:?}") };
+    assert!(why.contains("logs request on topic \"metrics\", mapped to metrics"), "{why}");
+    let (decoded, _) = decoder.decode("logs", 0, &kafka_record(1, records[0].0.clone()), 0);
+    assert!(matches!(decoded, Decoded::Batches(_)), "{decoded:?}");
 }

@@ -133,7 +133,18 @@ impl RecordDecoder {
                     self.otlp.decode_signal(signal, value.clone())
                 };
                 match decoded {
-                    Ok(batches) => batches,
+                    Ok(batches) => {
+                        if *json && batches.iter().all(|b| b.events.is_empty()) {
+                            if let Some(found) = other_otlp_json_signal(value, signal) {
+                                let why = format!(
+                                    "an OTLP/JSON {found} request on topic {topic:?}, mapped to {}",
+                                    signal_name(signal),
+                                );
+                                return (Decoded::Undecodable(why), OmittedHeaders(0));
+                            }
+                        }
+                        batches
+                    }
                     Err(e) => return (Decoded::Undecodable(e.to_string()), OmittedHeaders(0)),
                 }
             }
@@ -311,4 +322,29 @@ pub fn decode_record_batches(
         }
     }
     Ok(out)
+}
+
+fn signal_name(signal: Signal) -> &'static str {
+    match signal {
+        Signal::Logs => "logs",
+        Signal::Metrics => "metrics",
+        Signal::Traces => "traces",
+    }
+}
+
+/// The signal of an OTLP/JSON request whose top-level key names another signal than `mapped`.
+/// OTLP/JSON ignores a field it doesn't know, so such a request decodes to nothing under the
+/// topic's signal; read as `empty` it would be committed past with no loss counted. Called only
+/// for a request that decoded to no event.
+fn other_otlp_json_signal(value: &Bytes, mapped: Signal) -> Option<&'static str> {
+    let keys: std::collections::HashMap<String, serde::de::IgnoredAny> =
+        serde_json::from_slice(value).ok()?;
+    [
+        ("resourceLogs", Signal::Logs),
+        ("resourceMetrics", Signal::Metrics),
+        ("resourceSpans", Signal::Traces),
+    ]
+    .into_iter()
+    .find(|&(key, signal)| signal != mapped && keys.contains_key(key))
+    .map(|(_, signal)| signal_name(signal))
 }
