@@ -10,6 +10,8 @@
 //!
 //! Version negotiation (`docs/adr/kafka-output.md`, item 8): [`API_RANGES`] has a row per API
 //! `logit` sends, and each API takes the highest version both sides support within its row.
+//! The [`Dialer`]'s `required` list names what one client can't run without: the producer's
+//! `Produce`, `Metadata`, and `InitProducerId`, the consumer's [`CONSUMER_APIS`].
 //! `Produce` reads the broker's advertised minimum as no constraint, because a 4.x broker
 //! advertises v0 and rejects anything below v3. A broker without a version of an API the
 //! [`Dialer`] requires is `Refused`; any other API it lacks is `None` in [`Versions`]. With
@@ -58,8 +60,10 @@ pub struct ApiRange {
     pub broker_min_counts: bool,
 }
 
-/// Every API `logit` sends after `ApiVersions`, one row each.
-pub const API_RANGES: [ApiRange; 5] = [
+/// Every API `logit` sends after `ApiVersions`, one row each. The consumer's rows are
+/// `docs/adr/kafka-input.md`'s item 3: each minimum is Kafka 4.0's floor or the first version with
+/// a field the consumer needs, each maximum the last that names a topic by name.
+pub const API_RANGES: [ApiRange; 14] = [
     ApiRange { key: ApiKey::Produce, versions: 3..=12, broker_min_counts: false },
     // v4 is the first with `allow_auto_topic_creation`.
     ApiRange { key: ApiKey::Metadata, versions: 4..=12, broker_min_counts: true },
@@ -70,6 +74,34 @@ pub const API_RANGES: [ApiRange; 5] = [
         broker_min_counts: true,
     },
     ApiRange { key: ApiKey::SaslAuthenticate, versions: 0..=2, broker_min_counts: true },
+    // v4 adds `isolation_level`; v13 names topics by id.
+    ApiRange { key: ApiKey::Fetch, versions: 4..=12, broker_min_counts: true },
+    // v2 adds `isolation_level`.
+    ApiRange { key: ApiKey::ListOffsets, versions: 2..=10, broker_min_counts: true },
+    ApiRange { key: ApiKey::OffsetCommit, versions: 2..=9, broker_min_counts: true },
+    // v7 adds `require_stable`; v8 moves the group into a `groups` array.
+    ApiRange { key: ApiKey::OffsetFetch, versions: 1..=9, broker_min_counts: true },
+    // v4 batches its keys into `coordinator_keys`.
+    ApiRange { key: ApiKey::FindCoordinator, versions: 0..=6, broker_min_counts: true },
+    // From v4 a first join is answered `MEMBER_ID_REQUIRED` with the id to join under.
+    ApiRange { key: ApiKey::JoinGroup, versions: 2..=9, broker_min_counts: true },
+    ApiRange { key: ApiKey::SyncGroup, versions: 0..=5, broker_min_counts: true },
+    ApiRange { key: ApiKey::Heartbeat, versions: 0..=4, broker_min_counts: true },
+    // v3 addresses members by list.
+    ApiRange { key: ApiKey::LeaveGroup, versions: 0..=5, broker_min_counts: true },
+];
+/// The APIs a consumer's [`Dialer`] requires: every consumer API in [`API_RANGES`].
+pub const CONSUMER_APIS: &[ApiKey] = &[
+    ApiKey::Metadata,
+    ApiKey::Fetch,
+    ApiKey::ListOffsets,
+    ApiKey::OffsetCommit,
+    ApiKey::OffsetFetch,
+    ApiKey::FindCoordinator,
+    ApiKey::JoinGroup,
+    ApiKey::SyncGroup,
+    ApiKey::Heartbeat,
+    ApiKey::LeaveGroup,
 ];
 /// The first flexible `ApiVersions` version, which every 2.4 or later broker answers.
 const API_VERSIONS_VERSION: i16 = 3;
@@ -335,8 +367,20 @@ impl Conn {
         request: &R,
         version: i16,
     ) -> Result<R::Response, RequestError> {
+        self.request_within(request, version, self.timeout).await
+    }
+
+    /// [`Conn::request`] with `wait` bounding the response wait in place of the timeout: a
+    /// `JoinGroup` the coordinator holds until the group rejoins, or a `Fetch` the broker holds
+    /// up to its `max_wait_ms`.
+    pub async fn request_within<R: Request>(
+        &mut self,
+        request: &R,
+        version: i16,
+        wait: Duration,
+    ) -> Result<R::Response, RequestError> {
         let correlation = self.write(request, version).await?;
-        self.read::<R>(version, correlation).await
+        self.read::<R>(version, correlation, wait).await
     }
 
     /// Sends `request` at `version` without waiting: a `Produce` with `acks: none`, which the
@@ -402,11 +446,12 @@ impl Conn {
         }
     }
 
-    /// Reads the response to the request numbered `correlation`, under the timeout.
+    /// Reads the response to the request numbered `correlation`, waiting at most `wait`.
     async fn read<R: Request>(
         &mut self,
         version: i16,
         correlation: i32,
+        wait: Duration,
     ) -> Result<R::Response, RequestError> {
         let key = ApiKey::try_from(R::KEY).expect("every request type has an API key");
         let body = async {
@@ -419,11 +464,9 @@ impl Conn {
             self.stream.read_exact(&mut body).await?;
             anyhow::Ok(Bytes::from(body))
         };
-        let mut body = timeout(self.timeout, body)
+        let mut body = timeout(wait, body)
             .await
-            .map_err(|_elapsed| {
-                anyhow!("waiting for a {key:?} response timed out after {:?}", self.timeout)
-            })
+            .map_err(|_elapsed| anyhow!("waiting for a {key:?} response timed out after {wait:?}"))
             .and_then(|r| r.with_context(|| format!("reading a {key:?} response")))
             .map_err(RequestError::sent)?;
         let header = ResponseHeader::decode(&mut body, key.response_header_version(version))
