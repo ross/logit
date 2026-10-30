@@ -660,15 +660,20 @@ async fn a_lone_corrupt_batch_is_refetched_widened_and_skips_to_the_next_batch()
     let mut probe = TelemetryProbe::new();
     let mut s = settings(&cluster, &["t"]);
     s.fetch.max_partition_bytes = 1;
+    let (max_bytes, room) = (s.fetch.max_bytes, s.max_batch_bytes as i32);
     let mut c = consumer(&probe, "in", s);
     assert_eq!(take(&mut c, 1).await, ["d"]);
     assert_eq!(probe.sum("logit.input.records.dropped", &[("reason", "corrupt")]), 3.0);
-    let widened = cluster
-        .state()
-        .fetches
-        .iter()
-        .any(|f| f.partitions.iter().any(|p| p.2 == 0 && p.3 > 1) && f.max_bytes > 1 << 20);
+    let widened = cluster.state().fetches.iter().any(|f| {
+        f.partitions.iter().any(|p| p.2 == 0 && p.3 == room) && f.max_bytes == max_bytes + room
+    });
     assert!(widened, "a fetch at 0 with max_batch_bytes of room");
+    // The room is for one refetch: the fetch after `d` asks for the configured bounds again.
+    wait_until("a fetch past d", || fetches_at(&cluster, 4) > 0).await;
+    for f in cluster.state().fetches.iter().filter(|f| f.partitions.iter().any(|p| p.2 == 4)) {
+        assert_eq!(f.max_bytes, max_bytes);
+        assert!(f.partitions.iter().all(|p| p.3 == 1), "{:?}", f.partitions);
+    }
 }
 
 #[tokio::test]

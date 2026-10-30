@@ -32,8 +32,8 @@
 //! | Outcome | Counted | Committed | Test |
 //! |---|---|---|---|
 //! | A record with a null value (a tombstone) | `logit.input.records.skipped{reason="tombstone"}` | yes | `a_tombstone_an_empty_value_and_an_undecodable_one_are_counted_and_committed_past` |
-//! | A `json`, `msgpack`, or `native` value, or an OTLP request, that decodes to no event | `logit.input.records.skipped{reason="empty"}` | yes | same, `an_otlp_request_with_no_records_is_skipped_empty`, and `an_otlp_json_request_on_another_signals_topic_reads_empty` |
-//! | A value that doesn't decode in `format:`, an `otlp_proto` request of another signal than its topic's included (an `otlp_json` one reads as empty: OTLP/JSON ignores a field it doesn't know) | `logit.input.records.dropped{reason="undecodable"}`, diagnostic `records_dropped` naming topic, partition, and offset | yes | same, `a_msgpack_value_that_does_not_decode_is_dropped_and_committed_past`, and `an_otlp_request_on_another_signals_topic_is_undecodable` |
+//! | A `json`, `msgpack`, or `native` value, or an OTLP request, that decodes to no event | `logit.input.records.skipped{reason="empty"}` | yes | same, and `an_otlp_request_with_no_records_is_skipped_empty` |
+//! | A value that doesn't decode in `format:`, an OTLP request of another signal than its topic's included (an `otlp_json` one decodes to no event, since OTLP/JSON ignores a field it doesn't know, and is found by its top-level `resourceLogs`, `resourceMetrics`, or `resourceSpans` key) | `logit.input.records.dropped{reason="undecodable"}`, diagnostic `records_dropped` naming topic, partition, and offset | yes | same, `a_msgpack_value_that_does_not_decode_is_dropped_and_committed_past`, `an_otlp_request_on_another_signals_topic_is_undecodable`, and `an_otlp_json_request_on_another_signals_topic_is_undecodable` |
 //! | A header whose name isn't UTF-8 | `logit.input.headers.omitted{reason="invalid_name"}`; the record is delivered without it | with the record | `a_header_name_that_is_not_utf8_is_omitted_and_counted` |
 //! | A batch not accepted by the drain deadline of a revoke or shutdown | `logit.input.batches.deferred`, with every batch behind it | no | `a_revoke_whose_drain_deadline_passes_defers_and_commits_nothing_past_it` |
 //! | A batch no consumer took | `logit.input.batches.dropped{reason="closed_consumer"}`, the batches behind it `batches.deferred`, diagnostic `closed_consumer`; the input commits, leaves the group, and ends | no | `a_closed_consumer_stops_commits_the_batch_before_and_leaves` |
@@ -72,6 +72,17 @@
 //!
 //! `kafka_out` leaves them out of what it writes, its own family's carriers
 //! ([ADR `protocol-knowledge-stays-in-family`](../../../../docs/adr/protocol-knowledge-stays-in-family.md)).
+//!
+//! # The `kafka_in -> kafka_out` pair
+//!
+//! The pair relays losslessly under `json`, `msgpack`, `native`, and the two OTLP formats, and
+//! under `text` for a log whose body is a string and that carries nothing else. Its permitted
+//! normalizations are record boundaries, partition and offset, these carriers, the record
+//! timestamp, compression, a native frame's attribute order, an aborted transaction's records,
+//! and `otlp_in -> otlp_out`'s own; [ADR `kafka-input`](../../../../docs/adr/kafka-input.md),
+//! item 13, is the canonical list. A record's key and headers don't relay: `kafka_out` writes its
+//! own, which `docs/known-gaps/kafka.md` keeps as debt. [`decode_record_batches`] is the decoding
+//! the transit spec reads `kafka_out`'s records back through.
 
 mod decode;
 mod input;
@@ -79,5 +90,5 @@ mod input;
 #[cfg(test)]
 mod tests;
 
-pub use decode::KafkaInFormat;
+pub use decode::{decode_record_batches, KafkaInFormat};
 pub use input::{KafkaInSettings, KafkaInput};

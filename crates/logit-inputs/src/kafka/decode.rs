@@ -133,7 +133,18 @@ impl RecordDecoder {
                     self.otlp.decode_signal(signal, value.clone())
                 };
                 match decoded {
-                    Ok(batches) => batches,
+                    Ok(batches) => {
+                        if *json && batches.iter().all(|b| b.events.is_empty()) {
+                            if let Some(found) = other_otlp_json_signal(value, signal) {
+                                let why = format!(
+                                    "an OTLP/JSON {found} request on topic {topic:?}, mapped to {}",
+                                    signal_name(signal),
+                                );
+                                return (Decoded::Undecodable(why), OmittedHeaders(0));
+                            }
+                        }
+                        batches
+                    }
                     Err(e) => return (Decoded::Undecodable(e.to_string()), OmittedHeaders(0)),
                 }
             }
@@ -265,4 +276,75 @@ fn native(value: &Bytes) -> Result<EventBatch, String> {
         return Err(format!("{} bytes after the frame", bytes.len()));
     }
     decode_batch(&mut payload, &DecodeBudget::default()).map_err(|e| e.to_string())
+}
+
+/// Decodes `bytes`, one partition's record batches as a Fetch answer carries them, as `kafka_in`
+/// reads them: `logit_proto::kafka::decode`, each batch's records decompressed to at most
+/// `max_batch_bytes`, then each record through `format:`'s decoder with its carriers stamped.
+/// Every event of `topic`'s `partition` comes back in offset order. A batch that doesn't decode,
+/// a record the input would skip or drop, and a header name the input would omit each fail,
+/// naming the offset: the transit spec reads a sink's own bytes through this, where any of them
+/// is a finding.
+pub fn decode_record_batches(
+    format: KafkaInFormat,
+    topic: &str,
+    partition: i32,
+    bytes: &Bytes,
+    max_batch_bytes: usize,
+    now: i64,
+    telemetry: Telemetry,
+) -> anyhow::Result<Vec<EventBatch>> {
+    let mut decoder = RecordDecoder::new(format);
+    decoder.set_telemetry(telemetry);
+    let decoded = logit_proto::kafka::decode(bytes, max_batch_bytes);
+    anyhow::ensure!(
+        decoded.partial_base.is_none(),
+        "the bytes end inside the record batch at offset {}",
+        decoded.partial_base.unwrap_or_default()
+    );
+    let mut out = Vec::new();
+    for entry in decoded.entries {
+        let batch = entry.map_err(|e| anyhow::anyhow!("{e}"))?;
+        for record in &batch.records {
+            let offset = record.offset;
+            match decoder.decode(topic, partition, record, now) {
+                (Decoded::Batches(batches), OmittedHeaders(0)) => out.extend(batches),
+                (Decoded::Batches(_), OmittedHeaders(n)) => {
+                    anyhow::bail!("the record at offset {offset} has {n} header name(s) not UTF-8")
+                }
+                (Decoded::Skipped(reason), _) => {
+                    anyhow::bail!("the record at offset {offset} is skipped as {reason}")
+                }
+                (Decoded::Undecodable(why), _) => {
+                    anyhow::bail!("the record at offset {offset} doesn't decode: {why}")
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn signal_name(signal: Signal) -> &'static str {
+    match signal {
+        Signal::Logs => "logs",
+        Signal::Metrics => "metrics",
+        Signal::Traces => "traces",
+    }
+}
+
+/// The signal of an OTLP/JSON request whose top-level key names another signal than `mapped`.
+/// OTLP/JSON ignores a field it doesn't know, so such a request decodes to nothing under the
+/// topic's signal; read as `empty` it would be committed past with no loss counted. Called only
+/// for a request that decoded to no event.
+fn other_otlp_json_signal(value: &Bytes, mapped: Signal) -> Option<&'static str> {
+    let keys: std::collections::HashMap<String, serde::de::IgnoredAny> =
+        serde_json::from_slice(value).ok()?;
+    [
+        ("resourceLogs", Signal::Logs),
+        ("resourceMetrics", Signal::Metrics),
+        ("resourceSpans", Signal::Traces),
+    ]
+    .into_iter()
+    .find(|&(key, signal)| signal != mapped && keys.contains_key(key))
+    .map(|(_, signal)| signal_name(signal))
 }

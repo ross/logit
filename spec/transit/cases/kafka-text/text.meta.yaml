@@ -1,0 +1,5 @@
+# kafka_out's records under format: text, record: event, compression: none: the body of each log
+# in cases/otlp-logs/bodies.json, one record each, in one record batch.
+wire: text.segment
+kafka: {format: text}
+exercises: [format_text, bytes_message, carriers, compression_none]

@@ -476,9 +476,12 @@ name = "logit-fuzz-seedgen"
 version = "0.0.0"
 dependencies = [
  "bytes",
+ "crc32c",
  "flate2",
+ "kafka-protocol",
  "logit-core",
  "logit-proto",
+ "serde_json",
 ]
 
 [[package]]

@@ -320,7 +320,7 @@ soak harness share no file, and neither changes `kafka_in`.
 | W2 | `kin/w2` | `kin/w2: the consumer core: group membership, assignors, offsets, and fetch` | L | W1 | open |
 | W3 | `kin/w3` | `kin/w3: kafka_in, with json, text, and native, and kafka_out's text batch escape` | L | W2 | open |
 | W4 | `kin/w4` | `kin/w4: kafka_in's msgpack and OTLP formats` | M | W3 | open |
-| W5 | `kin/w5` | `kin/w5: kafka_in in the transit spec, the eleventh lossless pair, and fuzz targets` | M | W4 | not started |
+| W5 | `kin/w5` | `kin/w5: kafka_in in the transit spec, the eleventh lossless pair, and fuzz targets` | M | W4 | open |
 | W6a | `kin/w6a` | `kin/w6a: kafka_in interop legs on Apache Kafka and Redpanda` | M | W5 | not started |
 | W6b | `kin/w6b` | `kin/w6b: the kafka-consume-broker-restart soak scenario` | M | W5 | open |
 
@@ -371,10 +371,30 @@ Recorded per workstream as each lands.
   has no decode budget to reuse: `otlp_in`'s one bound is its 4 MiB cap on an HTTP body, so an
   OTLP record is bounded by `max_batch_bytes` alone. A request's batches needed no change to the
   input: a record's batches always fall in one cut, which is marked after its last batch. A logs
-  request on the metrics topic is `undecodable` under `otlp_proto` but reads as an empty request
-  under `otlp_json`, which ignores fields it doesn't know. `kafka_out` never writes a request of
+  request on the metrics topic is `undecodable` under both encodings. OTLP/JSON ignores a field it
+  doesn't know, so under `otlp_json` such a request decodes to no event, and the input reads its
+  top-level `resourceLogs`, `resourceMetrics`, or `resourceSpans` key to tell it from an empty
+  request. `kafka_out` never writes a request of
   several resources, so the test builds one by concatenating two protobuf requests. The OTLP
   encoder stamps a log with no observed time with the clock, so the split round trip sets one.
+- **W5**: `kafka_out` under an OTLP format dropped an event with no log, span, or metric
+  uncounted; it now counts `logit.output.events.skipped{reason="no_payload"}`, as `otlp_out`
+  does. Its records carry the time it encoded them as their timestamp, as the Collector's
+  exporter's do, so item 13's record-timestamp normalization now says so, and the transit driver
+  restamps those timestamps with the run's clock to keep the expectations stable. The cases are
+  `kafka_out`'s records built from the other sources' events, in every format and codec, the
+  Java producer's and kcat's segments read in place under `format: text`, and a hand-written
+  OTLP case for the `otlp_out` normalizations no producer case reaches (a finite last histogram
+  bound, a `Timestamp` attribute, and a log with no trace beside a span). Series that share a
+  name across source cases pair wrongly in one case, so `statsd/sub-millisecond`,
+  `sub-millisecond-equal`, and `timestamped` are cases of their own. Under `format: text` the
+  class check skips metric records: the log and span rows' `beside` cells account for them.
+  The key-and-headers debt is the row `attributes/kafka_key_headers`, `lost` and uncounted at
+  `kafka_out`, the eleventh `UNCOUNTED_ALLOWED` entry. The `kafka_out` cells no flow reaches are
+  mostly OTLP-format attribute rows for other protocols' carriers, listed in
+  `spec/transit/coverage.md`. The `kafka_batch` and `msgpack_event` fuzz targets ran 120 s each
+  with no finding: `kafka_batch` 1.93 million runs, `msgpack_event` 5.17 million over 14 jobs,
+  with no out-of-memory or timeout.
 - **W6b**: A 10-minute run passed every row (`perf/results/soak/20261030T183229Z`, not
   committed): 605,800 records accepted, 610,400 read, and 605,400 stored. The kill replayed
   4,354 records, about 4.4 s at 1,000 a second, inside one `commit_interval`. The 40 s broker

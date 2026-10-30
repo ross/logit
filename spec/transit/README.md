@@ -26,27 +26,31 @@ plaintext and pickle, `syslog_in`, RFC 3164 and RFC 5424 over UDP and as a TCP s
 `splunk_hec_in`'s `/event` and `/raw` routes (`cases/splunk/`: the four recorded HEC clients'
 captures and hand-written bodies, a span object it keeps as a log among them), with no metric
 cases, and its span objects (`cases/splunk-traces/`: the OpenTelemetry Collector exporter's
-capture and hand-written bodies). A
+capture and hand-written bodies), and `kafka_in`'s record batches (`cases/kafka/`: `kafka_out`'s
+records in every format, built from the other sources' events, and hand-written OTLP events;
+`cases/kafka-text/`: `format: text` records, among them the Java producer's and kcat's recorded
+segments under `testdata/interop/kafka/batches/`, read in place). A
 source directory's name before its first `-` names its system, so
 `datadog-logs` cases decode through `datadog_in`. The sink columns are `statsd_out`,
 `prometheus_out` (exposition and remote-write), `influxdb_out`, `otlp_out`, `datadog_out`,
 `datadog_trace_out` (`version: v0.4` and `v0.7`), `graphite_out`, `syslog_out`, `splunk_hec_out`,
-and `kafka_out` (`format: json` and `text`); the last three have cells on the log, span, event,
-and attribute rows and none on a metric kind's. `datadog_trace_out` sends spans alone, so beside
+and `kafka_out` (every `format:`); `syslog_out` and `splunk_hec_out` have cells on the log, span,
+event, and attribute rows and none on a metric kind's, and `kafka_out` has none on a metric kind's
+under `format: text`, which writes a log's body alone. `datadog_trace_out` sends spans alone, so beside
 its span and attribute cells it has only the `skipped` cells of the log and gauge rows a span
 reaches beside it, and the driver reads its requests back through `datadog_trace_in`'s own
 decoding with the headers the sink sent. A
 log record's rows have cells at `otlp_out`, `datadog_out`, `syslog_out`, `splunk_hec_out`,
-`kafka_out`, and, for a DogStatsD event, `statsd_out`. `kafka_out` has no pair input, so the
-driver reads its records back by convention: a `format: json` record through the event JSON
-reader, and a `format: text` record as one log holding the record's value, at the record's
-millisecond timestamp (`crates/logit-cli/src/transit/wire.rs`). Each flow's name says which
+`kafka_out`, and, for a DogStatsD event, `statsd_out`. The driver writes `kafka_out`'s records
+into one record batch per topic and reads them back through `kafka_in`'s decoding in the same
+format, so every event read back carries `kafka_in`'s `_logit.kafka.*` carriers
+(`crates/logit-cli/src/transit/wire.rs`). Each flow's name says which
 source meets which sink: `statsd-relay`, `statsd-logs-relay`, `influxdb-relay`, `datadog-relay`,
 `datadog-logs-relay`, `datadog-traces-relay`, `ddtrace-relay`, `ddtrace-relay-v07`,
 `otlp-relay`, `otlp-logs-relay`,
 `otlp-traces-relay`, `graphite-relay`, `syslog-relay`,
-`splunk-relay`, `splunk-traces-relay`, `prometheus-to-prometheus`, and `prometheus-to-prometheus-remote-write` are like
-pairs, and `influxdb-to-prometheus` a cross-protocol one.
+`splunk-relay`, `splunk-traces-relay`, `prometheus-to-prometheus`, `prometheus-to-prometheus-remote-write`, and one
+`kafka-relay-<format>` per `kafka_out` format are like pairs, and `influxdb-to-prometheus` a cross-protocol one.
 
 `datadog_out` makes two drops above its encoders that the driver leaves out: `stale` and
 `too_many_tags`, which read the wall clock or apply an intake limit. It also cuts a route's events
@@ -72,9 +76,9 @@ key, a stale document, and a key no case has each fail naming the flow and the c
 |---|---|
 | `mapping.yaml` | The table: the class vocabulary, the sinks, and one row per kind and feature |
 | `features/<system>.yaml` | The wire features a source's cases can exercise, one `{name, text}` each |
-| `cases/<system>/<case>.meta.yaml` | What the case exercises, and its wire file, a collectd case's `types_db:` file, a graphite case's `protocol:`, a syslog case's `framing:`, and tolerances if any |
+| `cases/<system>/<case>.meta.yaml` | What the case exercises, and its wire file, a collectd case's `types_db:` file, a graphite case's `protocol:`, a syslog case's `framing:`, a Kafka case's `kafka:` format, and tolerances if any |
 | `cases/<system>/<case>.json` | The case's events, one `format: json` line each |
-| `cases/<system>/<case>.<wire>` | The wire bytes a generated case decodes from, recorded, written as text, or hand-built ("Adding a case"): `.statsd` lines, InfluxDB line protocol in `.lp`, a Prometheus scrape body in `.prom`, a Datadog or OTLP/HTTP request body, compressed as sent, in `.bin`, one collectd datagram in `.raw`, carbon plaintext lines in `.graphite`, or one pickle payload with no length prefix in `.pkl` |
+| `cases/<system>/<case>.<wire>` | The wire bytes a generated case decodes from, recorded, written as text, or hand-built ("Adding a case"): `.statsd` lines, InfluxDB line protocol in `.lp`, a Prometheus scrape body in `.prom`, a Datadog or OTLP/HTTP request body, compressed as sent, in `.bin`, one collectd datagram in `.raw`, carbon plaintext lines in `.graphite`, one pickle payload with no length prefix in `.pkl`, or Kafka record batches in `.segment` |
 | `cases/<system>/<case>.headers` | The request beside an HTTP wire file, one `name: value` per line as `testdata/interop/` records it: `path:` with an InfluxDB write's `org`, `orgID`, `bucket`, and `precision`, a scrape's `content-type:` choosing its dialect, or a Datadog or OTLP/HTTP request's `path:`, `content-type:`, and `content-encoding:` |
 | `flows/<flow>.yaml` | A runnable config: `replay_in -> [stages] -> <sink>` |
 | `expected/<flow>.json` | Each case's run through the flow, keyed by case name: the events read back and the counters moved (generated) |
@@ -204,11 +208,14 @@ counter would add anything
 "structural loss has no counter"). A loss that depends on the value, such as `false` or a
 rewritten name, is counted. The table's schema accepts `reason: uncounted` only on the cells
 `crates/logit-cli/src/transit/mapping.rs`'s `UNCOUNTED_ALLOWED` names, whose doc says which rule
-each follows. It has eight entries. Five follow the same ADR's amendment "an ignored signal, and
+each follows. It has eleven entries. Five follow the same ADR's amendment "an ignored signal, and
 a format the config selects": a sink ignores a signal it has no wire for, such as a log beside
 metrics, uncounted, at any sink, and `datadog_trace_out`, whose one signal is spans, ignores a
-log or a gauge beside a span. Two are a sink finding: `otlp_out` writes a span name or a span
-event name that isn't a `Str` as `""` (`span/name_structured`, `span/event_name_structured`).
+log or a gauge beside a span. Four are a sink finding: `otlp_out` writes a span name or a span
+event name that isn't a `Str` as `""` (`span/name_structured`, `span/event_name_structured`),
+and so does `kafka_out` under an OTLP format, through the same mapping. One is the pair's
+residual debt: `kafka_out` writes a record's key and headers from its config, never from the
+`_logit.kafka.key` and `_logit.kafka.headers` carriers `kafka_in` read (`attributes/kafka_key_headers`).
 One is a `_logit.datadog.*` carrier `datadog_out`'s log, event, service-check, and trace routes
 have no field for. Under that amendment too, `syslog_out`'s leave-off of every attribute
 outside its header fields, under RFC 3164 and under RFC 5424 with no `structured_data:`, is
@@ -382,7 +389,12 @@ and a protocol name in `docs.rs`'s `PROTOCOLS`, or the check fails.
    `testdata/differential/graphite-pickle/` holds them. A syslog case is one UDP datagram, read
    one message per line as `syslog_in` reads UDP, unless `framing: stream` says it's a TCP
    connection's bytes, split by RFC 6587's framer as `testdata/interop/syslog/rsyslog-tcp-000.raw`
-   records them. Run `script/transit gen` to write `<case>.json`.
+   records them. A `kafka` or `kafka-text` case's wire file is a run of Kafka record batches, as a
+   fetch response's records field carries them, read on topic `transit` partition 0 in the format
+   its meta's `kafka:` map names (`format:`, and `record:` and `topic:` where `kafka_out` set
+   them); under an OTLP format, `topic:` names the signal's default topic (`otlp_metrics`,
+   `otlp_logs`, or `otlp_spans`), which picks the signal. Run
+   `script/transit gen` to write `<case>.json`.
 3. For an edge case no producer sends, write `<case>.json` by hand and leave `wire:` out. The check
    requires it to read back to itself through `format: json`, and prints the form to use when it
    doesn't.

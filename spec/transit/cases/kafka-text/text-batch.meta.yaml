@@ -1,0 +1,5 @@
+# kafka_out's records under format: text, record: batch, compression: gzip: the bodies of the
+# logs in cases/otlp-logs/bodies.json as escaped lines packed into records, in one record batch.
+wire: text-batch.segment
+kafka: {format: text, record: batch}
+exercises: [format_text_batch, bytes_message, carriers, compression_gzip]

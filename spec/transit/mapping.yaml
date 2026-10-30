@@ -69,6 +69,17 @@ rows:
         text: >-
           The bare value as a datapoint, its temporality and monotonicity dropped, which
           graphite_in reads back as a gauge.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: An OTLP `Sum` with delta temporality and the monotonic flag.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: An OTLP `Sum` with delta temporality and the monotonic flag.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: sum
     feature: delta_nonmonotonic
     cells:
@@ -105,6 +116,17 @@ rows:
         class: degraded
         counter: logit.output.metrics.degraded{metric_kind=non_monotonic_delta_sum}
         text: The bare value, read back as a gauge, as for a monotonic delta sum.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: An OTLP `Sum` with delta temporality, not monotonic.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: An OTLP `Sum` with delta temporality, not monotonic.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: sum
     feature: cumulative_monotonic
     cells:
@@ -144,6 +166,17 @@ rows:
         class: degraded
         counter: logit.output.metrics.degraded{metric_kind=cumulative_sum}
         text: The running total as a bare value, read back as a gauge.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: An OTLP `Sum` with cumulative temporality and the monotonic flag.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: An OTLP `Sum` with cumulative temporality and the monotonic flag.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: sum
     feature: cumulative_nonmonotonic
     cells:
@@ -179,6 +212,17 @@ rows:
         class: degraded
         counter: logit.output.metrics.degraded{metric_kind=cumulative_sum}
         text: The running total as a bare value, read back as a gauge.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: An OTLP `Sum` with cumulative temporality, not monotonic.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: An OTLP `Sum` with cumulative temporality, not monotonic.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
 
   # --- sum: scalar type ------------------------------------------------------------------------
   - kind: sum
@@ -203,6 +247,17 @@ rows:
       graphite_out:
         class: exact
         text: The value is written as the shortest float that reads back to the same bits.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: The data point''s `as_double`.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: The data point''s `as_double`.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: sum
     feature: i64
     cells:
@@ -235,6 +290,17 @@ rows:
         text: >-
           Plaintext writes every digit and pickle the nearest `f64`, and graphite_in reads either
           back as a float, rounded beyond 2^53.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: The data point''s `as_int`.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: The data point''s `as_int`.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: sum
     feature: u64
     cells:
@@ -271,6 +337,27 @@ rows:
         text: >-
           Plaintext writes every digit and pickle the nearest `f64`, and graphite_in reads either
           back as a float, rounded beyond 2^53.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: normalized
+          reason: u64_as_int
+          counter: logit.output.metrics.normalized{reason=u64_as_double}
+          text: >-
+            As at otlp_out: OTLP has one signed integer, so a `u64` that fits an `int64` is `as_int`
+            and reads back as an `i64`; one above `i64::MAX` is `as_double`, counted, and reads back
+            as an `f64`.
+        - when: {format: otlp_json}
+          class: normalized
+          reason: u64_as_int
+          counter: logit.output.metrics.normalized{reason=u64_as_double}
+          text: >-
+            As at otlp_out: OTLP has one signed integer, so a `u64` that fits an `int64` is `as_int`
+            and reads back as an `i64`; one above `i64::MAX` is `as_double`, counted, and reads back
+            as an `f64`.
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: sum
     feature: bool
     cells:
@@ -303,6 +390,21 @@ rows:
         reason: bool_value
         counter: logit.output.metrics.normalized{reason=bool_value}
         text: A boolean is written as `1` or `0` and reads back as that number.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: normalized
+          reason: bool_value
+          counter: logit.output.metrics.normalized{reason=bool_value}
+          text: 'As at otlp_out: A boolean is `as_int` `1` or `0` and reads back as that integer.'
+        - when: {format: otlp_json}
+          class: normalized
+          reason: bool_value
+          counter: logit.output.metrics.normalized{reason=bool_value}
+          text: 'As at otlp_out: A boolean is `as_int` `1` or `0` and reads back as that integer.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
 
   # --- gauge -----------------------------------------------------------------------------------
   - kind: gauge
@@ -340,6 +442,17 @@ rows:
       graphite_out:
         class: exact
         text: A `path value timestamp` line, or a pickled datapoint.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: An OTLP `Gauge`, `as_double`.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: An OTLP `Gauge`, `as_double`.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: gauge
     feature: i64
     cells:
@@ -379,6 +492,17 @@ rows:
         text: >-
           Plaintext writes every digit and pickle the nearest `f64`, and graphite_in reads either
           back as a float, rounded beyond 2^53.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: An OTLP `Gauge`, `as_int`.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: An OTLP `Gauge`, `as_int`.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: gauge
     feature: u64
     cells:
@@ -416,6 +540,25 @@ rows:
         text: >-
           Plaintext writes every digit and pickle the nearest `f64`, and graphite_in reads either
           back as a float, rounded beyond 2^53.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: normalized
+          reason: u64_as_int
+          counter: logit.output.metrics.normalized{reason=u64_as_double}
+          text: >-
+            As at otlp_out: A `u64` that fits an `int64` is `as_int` and reads back as an `i64`; one
+            above `i64::MAX` is `as_double`, counted, and reads back as an `f64`.
+        - when: {format: otlp_json}
+          class: normalized
+          reason: u64_as_int
+          counter: logit.output.metrics.normalized{reason=u64_as_double}
+          text: >-
+            As at otlp_out: A `u64` that fits an `int64` is `as_int` and reads back as an `i64`; one
+            above `i64::MAX` is `as_double`, counted, and reads back as an `f64`.
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: gauge
     feature: bool
     cells:
@@ -449,6 +592,21 @@ rows:
         reason: bool_value
         counter: logit.output.metrics.normalized{reason=bool_value}
         text: A boolean is written as `1` or `0` and reads back as that number.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: normalized
+          reason: bool_value
+          counter: logit.output.metrics.normalized{reason=bool_value}
+          text: 'As at otlp_out: A boolean is `as_int` `1` or `0` and reads back as that integer.'
+        - when: {format: otlp_json}
+          class: normalized
+          reason: bool_value
+          counter: logit.output.metrics.normalized{reason=bool_value}
+          text: 'As at otlp_out: A boolean is `as_int` `1` or `0` and reads back as that integer.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: gauge
     feature: negative
     cells:
@@ -476,6 +634,17 @@ rows:
       graphite_out:
         class: exact
         text: A negative value, written as is.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: A negative data point, written as is.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: A negative data point, written as is.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
 
   # A gauge flagged `_logit.metrics.type: info` or `stateset`, as prometheus_in decodes an
   # OpenMetrics `info` or `stateset` family. A sink's other outcomes for the gauge are its scalar
@@ -504,6 +673,25 @@ rows:
       graphite_out:
         class: exact
         text: As any other gauge; the type flag isn't written.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: normalized
+          reason: prometheus_info_sum
+          text: >-
+            As at otlp_out: A cumulative non-monotonic OTLP `Sum` named `<name>_info`, as the OTel
+            Prometheus compatibility spec's Info section (marked Development) has it, read back as
+            that sum.
+        - when: {format: otlp_json}
+          class: normalized
+          reason: prometheus_info_sum
+          text: >-
+            As at otlp_out: A cumulative non-monotonic OTLP `Sum` named `<name>_info`, as the OTel
+            Prometheus compatibility spec's Info section (marked Development) has it, read back as
+            that sum.
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: gauge
     feature: prometheus_stateset
     cells:
@@ -528,6 +716,25 @@ rows:
       graphite_out:
         class: exact
         text: As any other gauge; the type flag isn't written.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: normalized
+          reason: prometheus_stateset_sum
+          text: >-
+            As at otlp_out: A cumulative non-monotonic OTLP `Sum`, as the OTel Prometheus
+            compatibility spec's StateSet section (marked Development) has it, read back as that
+            sum.
+        - when: {format: otlp_json}
+          class: normalized
+          reason: prometheus_stateset_sum
+          text: >-
+            As at otlp_out: A cumulative non-monotonic OTLP `Sum`, as the OTel Prometheus
+            compatibility spec's StateSet section (marked Development) has it, read back as that
+            sum.
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
 
   # --- gauge_delta -----------------------------------------------------------------------------
   - kind: gauge_delta
@@ -574,6 +781,23 @@ rows:
         text: >-
           Carbon has no relative gauge, so an unresolved adjustment is dropped, with a throttled
           `gauge_delta_unresolved` warning; an `aggregate` upstream resolves it into a gauge.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: dropped
+          counter: logit.output.metrics.dropped{reason=unresolved_gauge_delta}
+          text: >-
+            As at otlp_out: An unresolved relative adjustment is dropped, with a throttled
+            `gauge_delta_unresolved` warning; an `aggregate` upstream resolves it into a gauge.
+        - when: {format: otlp_json}
+          class: dropped
+          counter: logit.output.metrics.dropped{reason=unresolved_gauge_delta}
+          text: >-
+            As at otlp_out: An unresolved relative adjustment is dropped, with a throttled
+            `gauge_delta_unresolved` warning; an `aggregate` upstream resolves it into a gauge.
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: gauge_delta
     feature: i64
     cells:
@@ -607,6 +831,19 @@ rows:
         class: dropped
         counter: logit.output.metrics.dropped{reason=unresolved_gauge_delta}
         text: Dropped, as for a float adjustment.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: dropped
+          counter: logit.output.metrics.dropped{reason=unresolved_gauge_delta}
+          text: 'As at otlp_out: Dropped, as for a float adjustment.'
+        - when: {format: otlp_json}
+          class: dropped
+          counter: logit.output.metrics.dropped{reason=unresolved_gauge_delta}
+          text: 'As at otlp_out: Dropped, as for a float adjustment.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: gauge_delta
     feature: u64
     cells:
@@ -640,6 +877,19 @@ rows:
         class: dropped
         counter: logit.output.metrics.dropped{reason=unresolved_gauge_delta}
         text: Dropped, as for a float adjustment.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: dropped
+          counter: logit.output.metrics.dropped{reason=unresolved_gauge_delta}
+          text: 'As at otlp_out: Dropped, as for a float adjustment.'
+        - when: {format: otlp_json}
+          class: dropped
+          counter: logit.output.metrics.dropped{reason=unresolved_gauge_delta}
+          text: 'As at otlp_out: Dropped, as for a float adjustment.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: gauge_delta
     feature: bool
     cells:
@@ -674,6 +924,19 @@ rows:
         class: dropped
         counter: logit.output.metrics.dropped{reason=unresolved_gauge_delta}
         text: Dropped, as for a float adjustment.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: dropped
+          counter: logit.output.metrics.dropped{reason=unresolved_gauge_delta}
+          text: 'As at otlp_out: Dropped, as for a float adjustment.'
+        - when: {format: otlp_json}
+          class: dropped
+          counter: logit.output.metrics.dropped{reason=unresolved_gauge_delta}
+          text: 'As at otlp_out: Dropped, as for a float adjustment.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
 
   # --- raw multi-value kinds -------------------------------------------------------------------
   - kind: samples
@@ -726,6 +989,23 @@ rows:
           counter: logit.output.metrics.skipped{metric_kind=samples}
           text: >-
             Under `multi_value: skip`, the default, no datapoint is written.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=samples}
+          text: >-
+            As at otlp_out: Sketched, each value weighted by its inverse sample rate, then written
+            as the `distribution` row describes.
+        - when: {format: otlp_json}
+          class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=samples}
+          text: >-
+            As at otlp_out: Sketched, each value weighted by its inverse sample rate, then written
+            as the `distribution` row describes.
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: set_members
     cells:
       statsd_out:
@@ -769,6 +1049,23 @@ rows:
           counter: logit.output.metrics.skipped{metric_kind=set_members}
           text: >-
             Under `multi_value: skip`, the default, no datapoint is written.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: skipped
+          counter: logit.output.metrics.skipped{metric_kind=set_members}
+          text: >-
+            As at otlp_out: OTLP has no cardinality type, so set members aren't written, with a
+            throttled `otlp_set_members_metric_skipped` warning.
+        - when: {format: otlp_json}
+          class: skipped
+          counter: logit.output.metrics.skipped{metric_kind=set_members}
+          text: >-
+            As at otlp_out: OTLP has no cardinality type, so set members aren't written, with a
+            throttled `otlp_set_members_metric_skipped` warning.
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
 
   # --- summarized kinds ------------------------------------------------------------------------
   - kind: distribution
@@ -823,6 +1120,25 @@ rows:
           counter: logit.output.metrics.skipped{metric_kind=distribution}
           text: >-
             Under `multi_value: skip`, the default, no datapoint is written.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=distribution}
+          text: >-
+            As at otlp_out: An OTLP `Summary` of the sketch's `0` (its minimum), `0.5`, `0.75`,
+            `0.9`, `0.95`, `0.99`, and `1` (its maximum) quantiles with its own count and sum; OTLP
+            has no mergeable sketch.
+        - when: {format: otlp_json}
+          class: degraded
+          counter: logit.output.metrics.degraded{metric_kind=distribution}
+          text: >-
+            As at otlp_out: An OTLP `Summary` of the sketch's `0` (its minimum), `0.5`, `0.75`,
+            `0.9`, `0.95`, `0.99`, and `1` (its maximum) quantiles with its own count and sum; OTLP
+            has no mergeable sketch.
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: set
     cells:
       statsd_out:
@@ -867,6 +1183,23 @@ rows:
           counter: logit.output.metrics.skipped{metric_kind=set}
           text: >-
             Under `multi_value: skip`, the default, no datapoint is written.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: skipped
+          counter: logit.output.metrics.skipped{metric_kind=set}
+          text: >-
+            As at otlp_out: OTLP has no cardinality type, so a set estimate isn't written, with a
+            throttled `otlp_set_metric_skipped` warning.
+        - when: {format: otlp_json}
+          class: skipped
+          counter: logit.output.metrics.skipped{metric_kind=set}
+          text: >-
+            As at otlp_out: OTLP has no cardinality type, so a set estimate isn't written, with a
+            throttled `otlp_set_metric_skipped` warning.
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: histogram
     feature: delta
     cells:
@@ -937,6 +1270,25 @@ rows:
           counter: logit.output.metrics.skipped{metric_kind=histogram}
           text: >-
             Under `multi_value: skip`, the default, no datapoint is written.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: normalized
+          reason: inf_bucket
+          text: >-
+            As at otlp_out: An OTLP `Histogram` with delta temporality. OTLP requires an overflow
+            count above the highest bound, so a histogram whose last bound is finite reads back with
+            an empty `+Inf` bucket.
+        - when: {format: otlp_json}
+          class: normalized
+          reason: inf_bucket
+          text: >-
+            As at otlp_out: An OTLP `Histogram` with delta temporality. OTLP requires an overflow
+            count above the highest bound, so a histogram whose last bound is finite reads back with
+            an empty `+Inf` bucket.
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: histogram
     feature: cumulative
     cells:
@@ -991,6 +1343,25 @@ rows:
           counter: logit.output.metrics.skipped{metric_kind=histogram}
           text: >-
             Under `multi_value: skip`, the default, no datapoint is written.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: normalized
+          reason: inf_bucket
+          text: >-
+            As at otlp_out: An OTLP `Histogram` with cumulative temporality. OTLP requires an
+            overflow count above the highest bound, so a histogram whose last bound is finite reads
+            back with an empty `+Inf` bucket.
+        - when: {format: otlp_json}
+          class: normalized
+          reason: inf_bucket
+          text: >-
+            As at otlp_out: An OTLP `Histogram` with cumulative temporality. OTLP requires an
+            overflow count above the highest bound, so a histogram whose last bound is finite reads
+            back with an empty `+Inf` bucket.
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   # A histogram with a `NaN` bucket bound, in any order. A record holding both a `NaN` and a
   # `-Inf` bound reaches this row and `neg_inf_bound`. A sink's other histogram outcomes are its
   # temporality row's.
@@ -1057,6 +1428,23 @@ rows:
           counter: logit.output.metrics.skipped{metric_kind=histogram}
           text: >-
             Under `multi_value: skip`, the default, no datapoint is written.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: degraded
+          counter: logit.output.metrics.degraded{reason=non_finite_component}
+          text: >-
+            As at otlp_out: OTLP bounds are finite, so a `NaN` bound's count joins the overflow
+            bucket. `count` and every cumulative count are kept.
+        - when: {format: otlp_json}
+          class: degraded
+          counter: logit.output.metrics.degraded{reason=non_finite_component}
+          text: >-
+            As at otlp_out: OTLP bounds are finite, so a `NaN` bound's count joins the overflow
+            bucket. `count` and every cumulative count are kept.
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   # A histogram with a `-Inf` bucket bound.
   - kind: histogram
     feature: neg_inf_bound
@@ -1117,6 +1505,23 @@ rows:
           counter: logit.output.metrics.skipped{metric_kind=histogram}
           text: >-
             Under `multi_value: skip`, the default, no datapoint is written.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: degraded
+          counter: logit.output.metrics.degraded{reason=non_finite_component}
+          text: >-
+            As at otlp_out: OTLP bounds are finite, so a `-Inf` bound's count joins the first
+            bucket. `count` and every cumulative count are kept.
+        - when: {format: otlp_json}
+          class: degraded
+          counter: logit.output.metrics.degraded{reason=non_finite_component}
+          text: >-
+            As at otlp_out: OTLP bounds are finite, so a `-Inf` bound's count joins the first
+            bucket. `count` and every cumulative count are kept.
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   # A histogram flagged `_logit.metrics.type: gaugehistogram`, as prometheus_in decodes an
   # OpenMetrics `gaugehistogram` family. A sink's other outcomes are its temporality row's, and the
   # flag's are the `family_type` row's.
@@ -1145,6 +1550,25 @@ rows:
       graphite_out:
         class: exact
         text: As `histogram/cumulative`; the type flag isn't written.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: skipped
+          counter: logit.output.metrics.skipped{metric_kind=gauge_histogram}
+          text: >-
+            As at otlp_out: The OTel Prometheus compatibility spec drops a GaugeHistogram, since
+            OTLP has no histogram that isn't a running count, so it isn't written, with a throttled
+            `otlp_gauge_histogram_skipped` warning.
+        - when: {format: otlp_json}
+          class: skipped
+          counter: logit.output.metrics.skipped{metric_kind=gauge_histogram}
+          text: >-
+            As at otlp_out: The OTel Prometheus compatibility spec drops a GaugeHistogram, since
+            OTLP has no histogram that isn't a running count, so it isn't written, with a throttled
+            `otlp_gauge_histogram_skipped` warning.
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: exponential_histogram
     feature: delta
     cells:
@@ -1196,6 +1620,17 @@ rows:
           counter: logit.output.metrics.skipped{metric_kind=exponential_histogram}
           text: >-
             Under `multi_value: skip`, the default, no datapoint is written.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: An OTLP `ExponentialHistogram`, field for field.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: An OTLP `ExponentialHistogram`, field for field.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: exponential_histogram
     feature: cumulative
     cells:
@@ -1242,6 +1677,17 @@ rows:
           counter: logit.output.metrics.skipped{metric_kind=exponential_histogram}
           text: >-
             Under `multi_value: skip`, the default, no datapoint is written.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: An OTLP `ExponentialHistogram`, field for field.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: An OTLP `ExponentialHistogram`, field for field.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: summary
     feature: delta
     cells:
@@ -1295,6 +1741,23 @@ rows:
           counter: logit.output.metrics.skipped{metric_kind=summary}
           text: >-
             Under `multi_value: skip`, the default, no datapoint is written.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: dropped
+          counter: logit.output.metrics.dropped{reason=unresolved_delta}
+          text: >-
+            As at otlp_out: OTLP defines every summary as cumulative, so a delta one is dropped,
+            with a throttled `delta_summary_unresolved` warning.
+        - when: {format: otlp_json}
+          class: dropped
+          counter: logit.output.metrics.dropped{reason=unresolved_delta}
+          text: >-
+            As at otlp_out: OTLP defines every summary as cumulative, so a delta one is dropped,
+            with a throttled `delta_summary_unresolved` warning.
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: summary
     feature: cumulative
     cells:
@@ -1339,6 +1802,17 @@ rows:
           counter: logit.output.metrics.skipped{metric_kind=summary}
           text: >-
             Under `multi_value: skip`, the default, no datapoint is written.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: An OTLP `Summary`.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: An OTLP `Summary`.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
 
   # --- record fields ---------------------------------------------------------------------------
   - kind: record
@@ -1377,6 +1851,17 @@ rows:
         class: lost
         reason: structural
         text: Carbon has no unit, so none is written.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: The `Metric`''s `unit`.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: The `Metric`''s `unit`.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: record
     feature: description
     cells:
@@ -1402,6 +1887,17 @@ rows:
         class: lost
         reason: structural
         text: Carbon has no description, so none is written.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: The `Metric`''s `description`.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: The `Metric`''s `description`.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: record
     feature: start_timestamp
     cells:
@@ -1432,6 +1928,17 @@ rows:
         class: lost
         reason: structural
         text: Carbon has no start time, so none is written.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: The data point''s `start_time_unix_nano`.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: The data point''s `start_time_unix_nano`.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: record
     feature: exemplars
     cells:
@@ -1464,6 +1971,17 @@ rows:
         class: lost
         reason: structural
         text: Carbon has no exemplars, so none are written.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: The data point''s exemplars.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: The data point''s exemplars.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   # influxdb_out, otlp_out, and graphite_out write a `samples` or `distribution` record only in a
   # lesser form, so its fields are never compared there and none of them has a cell.
   # prometheus_out's summary is a lesser form too, but its cell names the counter its exposition
@@ -1506,6 +2024,23 @@ rows:
         text: >-
           A summary has no `_total` or bucket line for an exemplar to sit on, so its exemplars are
           left off, counted.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: lost
+          reason: structural
+          text: >-
+            As at otlp_out: A `SummaryDataPoint` has no exemplars field, so a summary's exemplars
+            are left off.
+        - when: {format: otlp_json}
+          class: lost
+          reason: structural
+          text: >-
+            As at otlp_out: A `SummaryDataPoint` has no exemplars field, so a summary's exemplars
+            are left off.
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   # statsd_out, influxdb_out, and graphite_out write a histogram only as dotted series or fields, a
   # lesser kind, and datadog_out skips it, so its fields are never compared there and none of them
   # has a cell.
@@ -1520,6 +2055,17 @@ rows:
       otlp_out:
         class: exact
         text: The data point's `min` and `max`.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: The data point''s `min` and `max`.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: The data point''s `min` and `max`.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: record
     feature: no_recorded_value
     cells:
@@ -1557,6 +2103,21 @@ rows:
         text: >-
           Carbon has no marker for a point with no recorded value, so it isn't written, with a
           throttled `no_recorded_value` warning.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: exact
+          text: >-
+            As at otlp_out: The data point's `flags` carry `NO_RECORDED_VALUE`, and the point is
+            kept.
+        - when: {format: otlp_json}
+          class: exact
+          text: >-
+            As at otlp_out: The data point's `flags` carry `NO_RECORDED_VALUE`, and the point is
+            kept.
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: record
     feature: no_recorded_value_delta_sum
     cells:
@@ -1598,6 +2159,21 @@ rows:
         text: >-
           Carbon has no marker for a point with no recorded value, so it isn't written, with a
           throttled `no_recorded_value` warning.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: exact
+          text: >-
+            As at otlp_out: The data point's `flags` carry `NO_RECORDED_VALUE`, and the point is
+            kept.
+        - when: {format: otlp_json}
+          class: exact
+          text: >-
+            As at otlp_out: The data point's `flags` carry `NO_RECORDED_VALUE`, and the point is
+            kept.
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: record
     feature: no_recorded_value_other_kind
     cells:
@@ -1632,6 +2208,21 @@ rows:
         text: >-
           Carbon has no marker for a point with no recorded value, so it isn't written, with a
           throttled `no_recorded_value` warning.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: exact
+          text: >-
+            As at otlp_out: The data point's `flags` carry `NO_RECORDED_VALUE`, and the point is
+            kept.
+        - when: {format: otlp_json}
+          class: exact
+          text: >-
+            As at otlp_out: The data point's `flags` carry `NO_RECORDED_VALUE`, and the point is
+            kept.
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: record
     feature: service_check
     cells:
@@ -1662,6 +2253,17 @@ rows:
       graphite_out:
         class: exact
         text: The status gauge; the check's carriers aren't tags.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: The status gauge; the check''s carriers aren''t attributes.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: The status gauge; the check''s carriers aren''t attributes.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   # influxdb_out escapes any name, and otlp_out and datadog_out write it as is, so no record reaches
   # this row there and none of them has a cell.
   - kind: record
@@ -1747,6 +2349,21 @@ rows:
         text: >-
           Under `multi_value: expand`, each value is weighted by its inverse rate in the sketch the
           `samples` row describes.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: exact
+          text: >-
+            As at otlp_out: Each value is weighted by its inverse rate in the sketch the `samples`
+            row describes.
+        - when: {format: otlp_json}
+          class: exact
+          text: >-
+            As at otlp_out: Each value is weighted by its inverse rate in the sketch the `samples`
+            row describes.
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   # A sink that writes a `samples` record only in a lesser form, as prometheus_out, influxdb_out,
   # otlp_out, and graphite_out do, never compares its fields, so none of them has a cell.
   - kind: record
@@ -1793,6 +2410,17 @@ rows:
         text: >-
           Each record is its own datapoint at its own second. A whisper store keeps one point per
           path and second, so there a later point in the same second replaces an earlier one.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: Each record is its own data point.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: Each record is its own data point.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: record
     feature: same_instant
     cells:
@@ -1840,6 +2468,17 @@ rows:
         text: >-
           Each record is its own datapoint; a whisper store keeps the later of two points at one
           second.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: Each record is its own data point.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: Each record is its own data point.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: record
     feature: same_instant_equal
     cells:
@@ -1882,6 +2521,17 @@ rows:
         text: >-
           Each record is its own datapoint; a whisper store keeps the later of two points at one
           second.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: Each record is its own data point.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: Each record is its own data point.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: record
     feature: same_millisecond
     cells:
@@ -1921,6 +2571,17 @@ rows:
         text: >-
           Each record is its own datapoint, its timestamp floored to the second; a whisper store
           keeps the later of two points in one second.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: Each record is its own data point, at its own nanosecond.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: Each record is its own data point, at its own nanosecond.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: record
     feature: same_millisecond_equal
     cells:
@@ -1959,6 +2620,17 @@ rows:
         text: >-
           Each record is its own datapoint, its timestamp floored to the second; a whisper store
           keeps the later of two points in one second.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: Each record is its own data point, at its own nanosecond.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: Each record is its own data point, at its own nanosecond.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: record
     feature: non_finite
     cells:
@@ -1987,6 +2659,17 @@ rows:
         text: >-
           Carbon has no non-finite value, so the datapoint isn't written, with a throttled
           `unencodable_value` warning.
+      kafka_out:
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: The non-finite `as_double`.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: The non-finite `as_double`.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
 
   # --- attributes ------------------------------------------------------------------------------
   - kind: attributes
@@ -2077,10 +2760,18 @@ rows:
           class: lost
           reason: structural
           text: >-
-            A `format: text` record holds the log body alone, so the attribute is left off, as
-            every attribute is.
+            A `format: text` record holds the log body alone, so the attribute is left off, as every
+            attribute is.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: A string attribute.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: A string attribute.'
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: attributes
     feature: host_beside_host_name
     cells:
@@ -2151,10 +2842,18 @@ rows:
           class: lost
           reason: structural
           text: >-
-            A `format: text` record holds the log body alone, so the attribute is left off, as
-            every attribute is.
+            A `format: text` record holds the log body alone, so the attribute is left off, as every
+            attribute is.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: A string attribute.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: A string attribute.'
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   # statsd_out, prometheus_out, influxdb_out, and graphite_out don't write a log on an event with
   # no metrics, so its fields are never compared there and none of them has a cell.
   - kind: attributes
@@ -2197,10 +2896,18 @@ rows:
           class: lost
           reason: structural
           text: >-
-            A `format: text` record holds the log body alone, so the attribute is left off, as
-            every attribute is.
+            A `format: text` record holds the log body alone, so the attribute is left off, as every
+            attribute is.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: A log attribute.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: A log attribute.'
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: attributes
     feature: log_service
     cells:
@@ -2241,10 +2948,18 @@ rows:
           class: lost
           reason: structural
           text: >-
-            A `format: text` record holds the log body alone, so the attribute is left off, as
-            every attribute is.
+            A `format: text` record holds the log body alone, so the attribute is left off, as every
+            attribute is.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: A log attribute.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: A log attribute.'
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: attributes
     feature: log_service_field
     cells:
@@ -2285,10 +3000,18 @@ rows:
           class: lost
           reason: structural
           text: >-
-            A `format: text` record holds the log body alone, so the attribute is left off, as
-            every attribute is.
+            A `format: text` record holds the log body alone, so the attribute is left off, as every
+            attribute is.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: A log attribute.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: A log attribute.'
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: attributes
     feature: container_id
     cells:
@@ -2371,10 +3094,18 @@ rows:
           class: lost
           reason: structural
           text: >-
-            A `format: text` record holds the log body alone, so the attribute is left off, as
-            every attribute is.
+            A `format: text` record holds the log body alone, so the attribute is left off, as every
+            attribute is.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: A string attribute.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: A string attribute.'
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: attributes
     feature: service_identity
     cells:
@@ -2446,10 +3177,18 @@ rows:
           class: lost
           reason: structural
           text: >-
-            A `format: text` record holds the log body alone, so the attribute is left off, as
-            every attribute is.
+            A `format: text` record holds the log body alone, so the attribute is left off, as every
+            attribute is.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: A string attribute.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: A string attribute.'
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: attributes
     feature: service_tag
     cells:
@@ -2515,10 +3254,18 @@ rows:
           class: lost
           reason: structural
           text: >-
-            A `format: text` record holds the log body alone, so the attribute is left off, as
-            every attribute is.
+            A `format: text` record holds the log body alone, so the attribute is left off, as every
+            attribute is.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: A string attribute.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: A string attribute.'
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: attributes
     feature: service_tag_beside_key
     cells:
@@ -2585,10 +3332,18 @@ rows:
           class: lost
           reason: structural
           text: >-
-            A `format: text` record holds the log body alone, so the attribute is left off, as
-            every attribute is.
+            A `format: text` record holds the log body alone, so the attribute is left off, as every
+            attribute is.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: A string attribute.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: A string attribute.'
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: attributes
     feature: bool_value
     cells:
@@ -2667,10 +3422,18 @@ rows:
           class: lost
           reason: structural
           text: >-
-            A `format: text` record holds the log body alone, so the attribute is left off, as
-            every attribute is.
+            A `format: text` record holds the log body alone, so the attribute is left off, as every
+            attribute is.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: A boolean attribute.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: A boolean attribute.'
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: attributes
     feature: number_value
     cells:
@@ -2747,10 +3510,26 @@ rows:
           class: lost
           reason: structural
           text: >-
-            A `format: text` record holds the log body alone, so the attribute is left off, as
-            every attribute is.
+            A `format: text` record holds the log body alone, so the attribute is left off, as every
+            attribute is.
+        - when: {format: otlp_proto}
+          class: normalized
+          reason: u64_as_int
+          counter: logit.output.attributes.normalized{reason=u64_as_double}
+          text: >-
+            As at otlp_out: An integer or double attribute. A `u64` reads back as an `i64`, or,
+            above `i64::MAX`, as a double, approximate beyond 2^53, counted once per such value.
+        - when: {format: otlp_json}
+          class: normalized
+          reason: u64_as_int
+          counter: logit.output.attributes.normalized{reason=u64_as_double}
+          text: >-
+            As at otlp_out: An integer or double attribute. A `u64` reads back as an `i64`, or,
+            above `i64::MAX`, as a double, approximate beyond 2^53, counted once per such value.
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: attributes
     feature: array_value
     cells:
@@ -2832,10 +3611,18 @@ rows:
           class: lost
           reason: structural
           text: >-
-            A `format: text` record holds the log body alone, so the attribute is left off, as
-            every attribute is.
+            A `format: text` record holds the log body alone, so the attribute is left off, as every
+            attribute is.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: An array attribute.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: An array attribute.'
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: attributes
     feature: map_value
     cells:
@@ -2911,10 +3698,18 @@ rows:
           class: lost
           reason: structural
           text: >-
-            A `format: text` record holds the log body alone, so the attribute is left off, as
-            every attribute is.
+            A `format: text` record holds the log body alone, so the attribute is left off, as every
+            attribute is.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: A key-value list attribute.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: A key-value list attribute.'
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: attributes
     feature: bytes_value
     cells:
@@ -2983,10 +3778,18 @@ rows:
           class: lost
           reason: structural
           text: >-
-            A `format: text` record holds the log body alone, so the attribute is left off, as
-            every attribute is.
+            A `format: text` record holds the log body alone, so the attribute is left off, as every
+            attribute is.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: A bytes attribute.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: A bytes attribute.'
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: attributes
     feature: timestamp_value
     cells:
@@ -3058,10 +3861,22 @@ rows:
           class: lost
           reason: structural
           text: >-
-            A `format: text` record holds the log body alone, so the attribute is left off, as
-            every attribute is.
+            A `format: text` record holds the log body alone, so the attribute is left off, as every
+            attribute is.
+        - when: {format: otlp_proto}
+          class: normalized
+          reason: timestamp_as_int
+          text: >-
+            As at otlp_out: OTLP has no timestamp value, so it's an integer of Unix nanoseconds.
+        - when: {format: otlp_json}
+          class: normalized
+          reason: timestamp_as_int
+          text: >-
+            As at otlp_out: OTLP has no timestamp value, so it's an integer of Unix nanoseconds.
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   # datadog_in decodes a JSON null attribute on a log, and otlp_in an `AnyValue` with no value
   # set on any signal, but no case puts a null on a metric's attributes, so only the log sinks
   # have a cell.
@@ -3110,10 +3925,18 @@ rows:
           class: lost
           reason: structural
           text: >-
-            A `format: text` record holds the log body alone, so the attribute is left off, as
-            every attribute is.
+            A `format: text` record holds the log body alone, so the attribute is left off, as every
+            attribute is.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: An `AnyValue` with no value set, read back as null.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: An `AnyValue` with no value set, read back as null.'
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   # graphite_in stamps no `_logit.graphite.` carrier, so no record reaches this row at
   # graphite_out and it has no cell. Nor at datadog_trace_out: the class check takes a sink's own
   # prefix from its name less `_out`, so that sink's is `_logit.datadog_trace.`, which no decoder
@@ -3163,14 +3986,22 @@ rows:
         reason: structural
         text: A `_logit.` carrier or flag is private and isn't a HEC field, so it's left off.
       kafka_out:
-        - when: {format: text}
-          class: lost
-          reason: structural
-          text: >-
-            A `format: text` record holds the log body alone, so the attribute is left off, as
-            every attribute is.
-        - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+        class: normalized
+        reason: restamped
+        text: >-
+          kafka_out leaves `_logit.kafka.*` out of every record, and kafka_in stamps the relay's own
+          record: its topic, its partition and offset where the relay's producer puts it, and the
+          timestamp kafka_out gives it, the event's or under an OTLP format the time it encodes the
+          request. A carrier reads back changed wherever the relay re-packs records.
+  - kind: attributes
+    feature: kafka_key_headers
+    cells:
+      kafka_out:
+        class: lost
+        reason: uncounted
+        text: >-
+          `_logit.kafka.key` and `_logit.kafka.headers`, a record's key and headers, aren't written
+          back: kafka_out takes a record's key and headers from its `key:` and `headers:` config.
   - kind: attributes
     feature: prometheus_target
     cells:
@@ -3217,10 +4048,24 @@ rows:
           class: lost
           reason: structural
           text: >-
-            A `format: text` record holds the log body alone, so the attribute is left off, as
-            every attribute is.
+            A `format: text` record holds the log body alone, so the attribute is left off, as every
+            attribute is.
+        - when: {format: otlp_proto}
+          class: lost
+          reason: structural
+          text: >-
+            As at otlp_out: The scrape target is private and isn't an OTLP attribute, so it's left
+            off.
+        - when: {format: otlp_json}
+          class: lost
+          reason: structural
+          text: >-
+            As at otlp_out: The scrape target is private and isn't an OTLP attribute, so it's left
+            off.
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: attributes
     feature: foreign_carrier
     cells:
@@ -3289,10 +4134,26 @@ rows:
           class: lost
           reason: structural
           text: >-
-            A `format: text` record holds the log body alone, so the attribute is left off, as
-            every attribute is.
+            A `format: text` record holds the log body alone, so the attribute is left off, as every
+            attribute is.
+        - when: {format: otlp_proto}
+          class: lost
+          reason: structural
+          text: >-
+            As at otlp_out: A `_logit.` carrier is private and isn't an OTLP attribute, so it's left
+            off. The `_logit.prometheus.type` carrier changes nothing; the `family_type` row has the
+            `_logit.metrics.type` values the sink reads.
+        - when: {format: otlp_json}
+          class: lost
+          reason: structural
+          text: >-
+            As at otlp_out: A `_logit.` carrier is private and isn't an OTLP attribute, so it's left
+            off. The `_logit.prometheus.type` carrier changes nothing; the `family_type` row has the
+            `_logit.metrics.type` values the sink reads.
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   # `_logit.metrics.closed: timestamped`, the neutral flag that says the event's timestamp is its
   # source's own. statsd_in and prometheus_in's scrape set it, and statsd_out and prometheus_out
   # read it, whichever decoder set it.
@@ -3360,10 +4221,24 @@ rows:
           class: lost
           reason: structural
           text: >-
-            A `format: text` record holds the log body alone, so the attribute is left off, as
-            every attribute is.
+            A `format: text` record holds the log body alone, so the attribute is left off, as every
+            attribute is.
+        - when: {format: otlp_proto}
+          class: lost
+          reason: structural
+          text: >-
+            As at otlp_out: The flag is private and isn't an OTLP attribute, so it's left off. The
+            point's time carries the timestamp.
+        - when: {format: otlp_json}
+          class: lost
+          reason: structural
+          text: >-
+            As at otlp_out: The flag is private and isn't an OTLP attribute, so it's left off. The
+            point's time carries the timestamp.
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   # `_logit.metrics.type: rate` and `_logit.metrics.interval`, the neutral flags that say a gauge
   # is a per-second rate over an interval. datadog_in sets them, and datadog_out reads them,
   # whichever producer set them.
@@ -3411,10 +4286,22 @@ rows:
           class: lost
           reason: structural
           text: >-
-            A `format: text` record holds the log body alone, so the attribute is left off, as
-            every attribute is.
+            A `format: text` record holds the log body alone, so the attribute is left off, as every
+            attribute is.
+        - when: {format: otlp_proto}
+          class: lost
+          reason: structural
+          text: >-
+            As at otlp_out: The flag is private and isn't an OTLP attribute, so it's left off.
+        - when: {format: otlp_json}
+          class: lost
+          reason: structural
+          text: >-
+            As at otlp_out: The flag is private and isn't an OTLP attribute, so it's left off.
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: attributes
     feature: interval
     cells:
@@ -3457,10 +4344,22 @@ rows:
           class: lost
           reason: structural
           text: >-
-            A `format: text` record holds the log body alone, so the attribute is left off, as
-            every attribute is.
+            A `format: text` record holds the log body alone, so the attribute is left off, as every
+            attribute is.
+        - when: {format: otlp_proto}
+          class: lost
+          reason: structural
+          text: >-
+            As at otlp_out: The flag is private and isn't an OTLP attribute, so it's left off.
+        - when: {format: otlp_json}
+          class: lost
+          reason: structural
+          text: >-
+            As at otlp_out: The flag is private and isn't an OTLP attribute, so it's left off.
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   # `_logit.metrics.type: rate` on a record that isn't a gauge: the flag applies to gauges only.
   - kind: attributes
     feature: rate_on_non_gauge
@@ -3505,10 +4404,22 @@ rows:
           class: lost
           reason: structural
           text: >-
-            A `format: text` record holds the log body alone, so the attribute is left off, as
-            every attribute is.
+            A `format: text` record holds the log body alone, so the attribute is left off, as every
+            attribute is.
+        - when: {format: otlp_proto}
+          class: lost
+          reason: structural
+          text: >-
+            As at otlp_out: The flag is private and isn't an OTLP attribute, so it's left off.
+        - when: {format: otlp_json}
+          class: lost
+          reason: structural
+          text: >-
+            As at otlp_out: The flag is private and isn't an OTLP attribute, so it's left off.
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   # `_logit.metrics.type: info` or `stateset` on a gauge, or `gaugehistogram` on a histogram, the
   # neutral flag that names an OpenMetrics family type the model has no kind for. prometheus_in
   # sets it, and prometheus_out and otlp_out read it, whichever producer set it.
@@ -3557,10 +4468,28 @@ rows:
           class: lost
           reason: structural
           text: >-
-            A `format: text` record holds the log body alone, so the attribute is left off, as
-            every attribute is.
+            A `format: text` record holds the log body alone, so the attribute is left off, as every
+            attribute is.
+        - when: {format: otlp_proto}
+          class: lost
+          reason: structural
+          text: >-
+            As at otlp_out: The flag is private and isn't an OTLP attribute, so it's left off. The
+            sink reads it, writing an info or stateset gauge as a non-monotonic `Sum` and skipping a
+            gauge histogram, by the `prometheus_info`, `prometheus_stateset`, and `gauge_histogram`
+            rows.
+        - when: {format: otlp_json}
+          class: lost
+          reason: structural
+          text: >-
+            As at otlp_out: The flag is private and isn't an OTLP attribute, so it's left off. The
+            sink reads it, writing an info or stateset gauge as a non-monotonic `Sum` and skipping a
+            gauge histogram, by the `prometheus_info`, `prometheus_stateset`, and `gauge_histogram`
+            rows.
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   # `_logit.metrics.type: info`, `stateset`, or `gaugehistogram` on a record of a kind the value
   # doesn't name: each reader ignores it.
   - kind: attributes
@@ -3608,10 +4537,24 @@ rows:
           class: lost
           reason: structural
           text: >-
-            A `format: text` record holds the log body alone, so the attribute is left off, as
-            every attribute is.
+            A `format: text` record holds the log body alone, so the attribute is left off, as every
+            attribute is.
+        - when: {format: otlp_proto}
+          class: lost
+          reason: structural
+          text: >-
+            As at otlp_out: The value names another kind, so it's ignored: the record keeps its own
+            kind's OTLP type, and the flag is private and isn't an OTLP attribute.
+        - when: {format: otlp_json}
+          class: lost
+          reason: structural
+          text: >-
+            As at otlp_out: The value names another kind, so it's ignored: the record keeps its own
+            kind's OTLP type, and the flag is private and isn't an OTLP attribute.
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   # `_logit.metrics.interval` on a record that takes datadog_out's distribution-points or
   # sketches route, neither of which has an interval field: a `samples`, `distribution`, or delta
   # `exponential_histogram` record.
@@ -3658,10 +4601,22 @@ rows:
           class: lost
           reason: structural
           text: >-
-            A `format: text` record holds the log body alone, so the attribute is left off, as
-            every attribute is.
+            A `format: text` record holds the log body alone, so the attribute is left off, as every
+            attribute is.
+        - when: {format: otlp_proto}
+          class: lost
+          reason: structural
+          text: >-
+            As at otlp_out: The flag is private and isn't an OTLP attribute, so it's left off.
+        - when: {format: otlp_json}
+          class: lost
+          reason: structural
+          text: >-
+            As at otlp_out: The flag is private and isn't an OTLP attribute, so it's left off.
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   # `_logit.metrics.interval` on a delta `histogram`, which datadog_out sends as a sketch under
   # the default `histograms.mode: distributions` and as series under the other modes.
   - kind: attributes
@@ -3722,10 +4677,22 @@ rows:
           class: lost
           reason: structural
           text: >-
-            A `format: text` record holds the log body alone, so the attribute is left off, as
-            every attribute is.
+            A `format: text` record holds the log body alone, so the attribute is left off, as every
+            attribute is.
+        - when: {format: otlp_proto}
+          class: lost
+          reason: structural
+          text: >-
+            As at otlp_out: The flag is private and isn't an OTLP attribute, so it's left off.
+        - when: {format: otlp_json}
+          class: lost
+          reason: structural
+          text: >-
+            As at otlp_out: The flag is private and isn't an OTLP attribute, so it's left off.
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: attributes
     feature: resource_attribute
     cells:
@@ -3802,10 +4769,17 @@ rows:
         - when: {format: text}
           class: lost
           reason: structural
-          text: >-
-            A `format: text` record holds the log body alone, so the resource is left off.
+          text: 'A `format: text` record holds the log body alone, so the resource is left off.'
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: A resource attribute.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: A resource attribute.'
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: attributes
     feature: scope
     cells:
@@ -3848,10 +4822,17 @@ rows:
         - when: {format: text}
           class: lost
           reason: structural
-          text: >-
-            A `format: text` record holds the log body alone, so the scope is left off.
+          text: 'A `format: text` record holds the log body alone, so the scope is left off.'
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: The `InstrumentationScope` of the batch.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: The `InstrumentationScope` of the batch.'
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
 
   - kind: attributes
     feature: datadog_carrier_log
@@ -3903,10 +4884,24 @@ rows:
           class: lost
           reason: structural
           text: >-
-            A `format: text` record holds the log body alone, so the attribute is left off, as
-            every attribute is.
+            A `format: text` record holds the log body alone, so the attribute is left off, as every
+            attribute is.
+        - when: {format: otlp_proto}
+          class: lost
+          reason: structural
+          text: >-
+            As at otlp_out: A `_logit.` carrier is private and isn't an OTLP attribute, so it's left
+            off.
+        - when: {format: otlp_json}
+          class: lost
+          reason: structural
+          text: >-
+            As at otlp_out: A `_logit.` carrier is private and isn't an OTLP attribute, so it's left
+            off.
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
 
   # OTLP's raw severity carriers. `_logit.syslog.severity` gets its own row,
   # `severity_carrier_syslog`, with the syslog source, since otlp_out keeps one carrier and not the
@@ -3944,10 +4939,22 @@ rows:
           class: lost
           reason: structural
           text: >-
-            A `format: text` record holds the log body alone, so the attribute is left off, as
-            every attribute is.
+            A `format: text` record holds the log body alone, so the attribute is left off, as every
+            attribute is.
+        - when: {format: otlp_proto}
+          class: exact
+          text: >-
+            As at otlp_out: The raw `severity_number` and `severity_text` the carriers hold, which
+            otlp_in reads back into the same carriers beside the band's severity.
+        - when: {format: otlp_json}
+          class: exact
+          text: >-
+            As at otlp_out: The raw `severity_number` and `severity_text` the carriers hold, which
+            otlp_in reads back into the same carriers beside the band's severity.
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: attributes
     feature: severity_carrier_syslog
     cells:
@@ -3977,10 +4984,24 @@ rows:
           class: lost
           reason: structural
           text: >-
-            A `format: text` record holds the log body alone, so the attribute is left off, as
-            every attribute is.
+            A `format: text` record holds the log body alone, so the attribute is left off, as every
+            attribute is.
+        - when: {format: otlp_proto}
+          class: lost
+          reason: structural
+          text: >-
+            As at otlp_out: A `_logit.` carrier is private and isn't an OTLP attribute, so it's left
+            off and the severity reads back at band resolution.
+        - when: {format: otlp_json}
+          class: lost
+          reason: structural
+          text: >-
+            As at otlp_out: A `_logit.` carrier is private and isn't an OTLP attribute, so it's left
+            off and the severity reads back at band resolution.
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
 
   # --- a log's attributes syslog_out writes as header fields -------------------------------------
   # A log's own `syslog.*`, `process.pid`, and `host.name` attributes. statsd_out writes a log only
@@ -4019,10 +5040,25 @@ rows:
           A JSON number in the span's `attributes`, read back as the same integer or double; a `u64`
           above `i64::MAX` stays a `u64`.
       kafka_out:
-        class: exact
-        text: >-
-          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
-          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+        - when: {format: otlp_proto}
+          class: normalized
+          reason: u64_as_int
+          counter: logit.output.attributes.normalized{reason=u64_as_double}
+          text: >-
+            As at otlp_out: An integer or double span attribute. A `u64` reads back as an `i64`, or,
+            above `i64::MAX`, as a double, counted once per such value.
+        - when: {format: otlp_json}
+          class: normalized
+          reason: u64_as_int
+          counter: logit.output.attributes.normalized{reason=u64_as_double}
+          text: >-
+            As at otlp_out: An integer or double span attribute. A `u64` reads back as an `i64`, or,
+            above `i64::MAX`, as a double, counted once per such value.
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text`
+            record writes no span (`span/alone`), so no field of one is compared.
   # `service.name`, `resource.name`, or `span.type` on a span's event: a Datadog span's typed
   # fields.
   - kind: attributes
@@ -4044,10 +5080,17 @@ rows:
         text: >-
           A string in the span's `attributes`.
       kafka_out:
-        class: exact
-        text: >-
-          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
-          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: A string span attribute.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: A string span attribute.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text`
+            record writes no span (`span/alone`), so no field of one is compared.
   # `_top_level`, `_sampling_priority_v1`, a `_dd.` key, or `span.kind` on a span's event: the
   # tracer's and the Agent's marks.
   - kind: attributes
@@ -4073,10 +5116,21 @@ rows:
           An ordinary entry of the span's `attributes`: Datadog's internal mark leaves as an OTel
           attribute.
       kafka_out:
-        class: exact
-        text: >-
-          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
-          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+        - when: {format: otlp_proto}
+          class: exact
+          text: >-
+            As at otlp_out: An ordinary span attribute: Datadog's internal mark leaves as an OTel
+            attribute.
+        - when: {format: otlp_json}
+          class: exact
+          text: >-
+            As at otlp_out: An ordinary span attribute: Datadog's internal mark leaves as an OTel
+            attribute.
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text`
+            record writes no span (`span/alone`), so no field of one is compared.
   # A span's `_logit.datadog.chunk.*` or `_logit.datadog.span.error` carrier.
   - kind: attributes
     feature: datadog_carrier_span
@@ -4111,10 +5165,23 @@ rows:
           The exporter's span object has no field for a Datadog trace chunk's fields or a span's raw
           `error`, and a `_logit.` carrier is private, so it's left off.
       kafka_out:
-        class: exact
-        text: >-
-          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
-          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+        - when: {format: otlp_proto}
+          class: lost
+          reason: structural
+          text: >-
+            As at otlp_out: OTLP has no field for a Datadog trace chunk's fields or a span's raw
+            `error`, and a `_logit.` carrier is private, so it's left off.
+        - when: {format: otlp_json}
+          class: lost
+          reason: structural
+          text: >-
+            As at otlp_out: OTLP has no field for a Datadog trace chunk's fields or a span's raw
+            `error`, and a `_logit.` carrier is private, so it's left off.
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text`
+            record writes no span (`span/alone`), so no field of one is compared.
   # A `_logit.datadog.tracer.*` or `_logit.datadog.agent.*` resource attribute of a span's batch:
   # `datadog_tracer_resource` for a tracer carrier a `TracerPayload` field carries,
   # `datadog_tracer_headers` for one only a tracer request header carries (the interpreter and its
@@ -4149,10 +5216,23 @@ rows:
           HEC has no field for a `TracerPayload`'s fields, and a `_logit.` carrier is private, so
           it's left off.
       kafka_out:
-        class: exact
-        text: >-
-          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
-          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+        - when: {format: otlp_proto}
+          class: lost
+          reason: structural
+          text: >-
+            As at otlp_out: OTLP has no field for a `TracerPayload`'s fields, and a `_logit.`
+            carrier is private, so it's left off.
+        - when: {format: otlp_json}
+          class: lost
+          reason: structural
+          text: >-
+            As at otlp_out: OTLP has no field for a `TracerPayload`'s fields, and a `_logit.`
+            carrier is private, so it's left off.
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text`
+            record writes no span (`span/alone`), so no field of one is compared.
   - kind: attributes
     feature: datadog_tracer_headers
     cells:
@@ -4180,10 +5260,23 @@ rows:
           HEC has no field for a tracer request header, and a `_logit.` carrier is private, so
           it's left off.
       kafka_out:
-        class: exact
-        text: >-
-          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
-          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+        - when: {format: otlp_proto}
+          class: lost
+          reason: structural
+          text: >-
+            As at otlp_out: OTLP has no field for a tracer request header, and a `_logit.` carrier
+            is private, so it's left off.
+        - when: {format: otlp_json}
+          class: lost
+          reason: structural
+          text: >-
+            As at otlp_out: OTLP has no field for a tracer request header, and a `_logit.` carrier
+            is private, so it's left off.
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text`
+            record writes no span (`span/alone`), so no field of one is compared.
   - kind: attributes
     feature: datadog_agent_resource
     cells:
@@ -4209,10 +5302,23 @@ rows:
           HEC has no field for an `AgentPayload`'s fields, and a `_logit.` carrier is private, so
           it's left off.
       kafka_out:
-        class: exact
-        text: >-
-          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
-          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+        - when: {format: otlp_proto}
+          class: lost
+          reason: structural
+          text: >-
+            As at otlp_out: OTLP has no field for an `AgentPayload`'s fields, and a `_logit.`
+            carrier is private, so it's left off.
+        - when: {format: otlp_json}
+          class: lost
+          reason: structural
+          text: >-
+            As at otlp_out: OTLP has no field for an `AgentPayload`'s fields, and a `_logit.`
+            carrier is private, so it's left off.
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text`
+            record writes no span (`span/alone`), so no field of one is compared.
   - kind: attributes
     feature: syslog_header
     cells:
@@ -4250,10 +5356,24 @@ rows:
           class: lost
           reason: structural
           text: >-
-            A `format: text` record holds the log body alone, so the attribute is left off, as
-            every attribute is.
+            A `format: text` record holds the log body alone, so the attribute is left off, as every
+            attribute is.
+        - when: {format: otlp_proto}
+          class: normalized
+          reason: u64_as_int
+          text: >-
+            As at otlp_out: A string or integer attribute; `intValue` is signed, so a `u64`
+            `syslog.facility` or `process.pid` reads back as an `i64`.
+        - when: {format: otlp_json}
+          class: normalized
+          reason: u64_as_int
+          text: >-
+            As at otlp_out: A string or integer attribute; `intValue` is signed, so a `u64`
+            `syslog.facility` or `process.pid` reads back as an `i64`.
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: attributes
     feature: syslog_msgid
     cells:
@@ -4278,10 +5398,18 @@ rows:
           class: lost
           reason: structural
           text: >-
-            A `format: text` record holds the log body alone, so the attribute is left off, as
-            every attribute is.
+            A `format: text` record holds the log body alone, so the attribute is left off, as every
+            attribute is.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: A string attribute.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: A string attribute.'
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: attributes
     feature: syslog_sd
     cells:
@@ -4316,10 +5444,18 @@ rows:
           class: lost
           reason: structural
           text: >-
-            A `format: text` record holds the log body alone, so the attribute is left off, as
-            every attribute is.
+            A `format: text` record holds the log body alone, so the attribute is left off, as every
+            attribute is.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: A key-value list attribute.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: A key-value list attribute.'
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: attributes
     feature: syslog_timestamp
     cells:
@@ -4361,10 +5497,24 @@ rows:
           class: lost
           reason: structural
           text: >-
-            A `format: text` record holds the log body alone, so the attribute is left off, as
-            every attribute is.
+            A `format: text` record holds the log body alone, so the attribute is left off, as every
+            attribute is.
+        - when: {format: otlp_proto}
+          class: normalized
+          reason: timestamp_as_int
+          text: >-
+            As at otlp_out: An RFC 3164 timestamp is a string attribute; OTLP has no timestamp
+            value, so an RFC 5424 one is an integer of Unix nanoseconds.
+        - when: {format: otlp_json}
+          class: normalized
+          reason: timestamp_as_int
+          text: >-
+            As at otlp_out: An RFC 3164 timestamp is a string attribute; OTLP has no timestamp
+            value, so an RFC 5424 one is an integer of Unix nanoseconds.
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: attributes
     feature: sd_id_collision
     cells:
@@ -4422,10 +5572,18 @@ rows:
           class: lost
           reason: structural
           text: >-
-            A `format: text` record holds the log body alone, so the attribute is left off, as
-            every attribute is.
+            A `format: text` record holds the log body alone, so the attribute is left off, as every
+            attribute is.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: A string attribute.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: A string attribute.'
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: attributes
     feature: splunk_envelope
     cells:
@@ -4458,10 +5616,18 @@ rows:
           class: lost
           reason: structural
           text: >-
-            A `format: text` record holds the log body alone, so the attribute is left off, as
-            every attribute is.
+            A `format: text` record holds the log body alone, so the attribute is left off, as every
+            attribute is.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: A resource attribute.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: A resource attribute.'
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: attributes
     feature: syslog_facility
     cells:
@@ -4485,8 +5651,7 @@ rows:
         text: A log with no `syslog.facility` leaves with none.
       kafka_out:
         class: exact
-        text: >-
-          `kafka_out` writes no attribute from a record's own fields or its config.
+        text: '`kafka_out` writes no attribute from a record''s own fields or its config.'
 
   # --- attributes datadog_out writes from a record's own fields ----------------------------------
   # Every sink reaches these rows; only datadog_out writes the attribute, which its pair decoder
@@ -4535,8 +5700,7 @@ rows:
           splunk_hec_in reads back as the resource's `host.name`.
       kafka_out:
         class: exact
-        text: >-
-          `kafka_out` writes no attribute from a record's own fields or its config.
+        text: '`kafka_out` writes no attribute from a record''s own fields or its config.'
   # syslog_out's RFC 3164 TAG on a log with no `syslog.tag`. Every sink that compares a log reaches
   # it; only syslog_out writes one.
   - kind: attributes
@@ -4568,8 +5732,7 @@ rows:
         text: A log with no `syslog.tag` leaves with none.
       kafka_out:
         class: exact
-        text: >-
-          `kafka_out` writes no attribute from a record's own fields or its config.
+        text: '`kafka_out` writes no attribute from a record''s own fields or its config.'
   # statsd_out, prometheus_out, influxdb_out, and graphite_out don't write a log on an event with
   # no metrics, so its fields are never compared there and none of them has a cell.
   - kind: attributes
@@ -4592,8 +5755,7 @@ rows:
         text: No `status` attribute is written.
       kafka_out:
         class: exact
-        text: >-
-          `kafka_out` writes no attribute from a record's own fields or its config.
+        text: '`kafka_out` writes no attribute from a record''s own fields or its config.'
   - kind: attributes
     feature: log_severity_fields
     cells:
@@ -4618,8 +5780,7 @@ rows:
           beside the severity.
       kafka_out:
         class: exact
-        text: >-
-          `kafka_out` writes no attribute from a record's own fields or its config.
+        text: '`kafka_out` writes no attribute from a record''s own fields or its config.'
   # statsd_out, prometheus_out, influxdb_out, and graphite_out don't write a span, so its fields
   # are never compared there and none of them has a cell.
   - kind: attributes
@@ -4650,8 +5811,7 @@ rows:
         text: The kind is the span object's `kind`; no `span.kind` attribute is written.
       kafka_out:
         class: exact
-        text: >-
-          `kafka_out` writes no attribute from a record's own fields or its config.
+        text: '`kafka_out` writes no attribute from a record''s own fields or its config.'
   # statsd_out, prometheus_out, influxdb_out, and graphite_out don't write a span, so its fields
   # are never compared there and none of them has a cell.
   - kind: attributes
@@ -4682,8 +5842,7 @@ rows:
         text: The 128-bit trace id is the span object's `trace_id`; no `_dd.p.tid` attribute is written.
       kafka_out:
         class: exact
-        text: >-
-          `kafka_out` writes no attribute from a record's own fields or its config.
+        text: '`kafka_out` writes no attribute from a record''s own fields or its config.'
 
   # --- logs ------------------------------------------------------------------------------------
   - kind: log
@@ -4735,8 +5894,20 @@ rows:
           text: >-
             The event's text as the record's value; its title and the other `_logit.statsd.event.*`
             carriers are attributes, left off.
+        - when: {format: otlp_proto}
+          class: exact
+          text: >-
+            As at otlp_out: An OTLP log record. Its `_logit.statsd.event.*` carriers aren't
+            attributes; the `log` field rows have its fields.
+        - when: {format: otlp_json}
+          class: exact
+          text: >-
+            As at otlp_out: An OTLP log record. Its `_logit.statsd.event.*` carriers aren't
+            attributes; the `log` field rows have its fields.
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: log
     feature: plain
     cells:
@@ -4781,8 +5952,16 @@ rows:
         - when: {format: text}
           class: exact
           text: The log's message as the record's value, read back as one log per record.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: An OTLP log record; the `log` field rows have its fields.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: An OTLP log record; the `log` field rows have its fields.'
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   # A log's own record-level rows, beside `log/plain` or `log/dogstatsd_event`. statsd_out writes a
   # log only as a DogStatsD event, and this row has no statsd_out cell; prometheus_out,
   # influxdb_out, and graphite_out don't write a log on an event with no metrics, so none of them
@@ -4842,8 +6021,16 @@ rows:
           class: normalized
           reason: message_as_text
           text: A `Map` or `Array` message leaves as its JSON text, which reads back as a string.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: A `kvlistValue` or `arrayValue` body.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: A `kvlistValue` or `arrayValue` body.'
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: log
     feature: bytes_message
     cells:
@@ -4870,10 +6057,18 @@ rows:
           class: normalized
           reason: message_as_text
           text: >-
-            A `Bytes` message leaves as its raw bytes, the record's value, which carries no type,
-            so a consumer that reads values as text sees a UTF-8 one as a string.
+            A `Bytes` message leaves as its raw bytes, the record's value, which carries no type, so
+            a consumer that reads values as text sees a UTF-8 one as a string.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: A `bytesValue` body.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: A `bytesValue` body.'
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: log
     feature: blank_message
     cells:
@@ -4903,8 +6098,16 @@ rows:
           text: >-
             An empty message leaves an empty record, and a log with no message one too, which reads
             back as the empty string.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: An empty string body, or a log record with no body.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: An empty string body, or a log record with no body.'
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   # A log's fields, compared on a log on an event with no metrics. statsd_out writes a log only as
   # a DogStatsD event, so it has a cell in each row such an event reaches.
   - kind: log
@@ -4943,8 +6146,20 @@ rows:
           reason: structural
           text: >-
             A `format: text` record holds the log body alone, so the log's severity is left off.
+        - when: {format: otlp_proto}
+          class: exact
+          text: >-
+            As at otlp_out: The band's `severity_number` and text, or the raw ones the
+            `_logit.otel.severity_*` carriers hold, read back at band resolution.
+        - when: {format: otlp_json}
+          class: exact
+          text: >-
+            As at otlp_out: The band's `severity_number` and text, or the raw ones the
+            `_logit.otel.severity_*` carriers hold, read back at band resolution.
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: log
     feature: severity_unset
     cells:
@@ -4970,8 +6185,18 @@ rows:
         - when: {format: text}
           class: exact
           text: Nothing is written, and nothing reads back.
+        - when: {format: otlp_proto}
+          class: exact
+          text: >-
+            As at otlp_out: `SEVERITY_NUMBER_UNSPECIFIED` and no text, read back as no severity.
+        - when: {format: otlp_json}
+          class: exact
+          text: >-
+            As at otlp_out: `SEVERITY_NUMBER_UNSPECIFIED` and no text, read back as no severity.
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: log
     feature: body_format
     cells:
@@ -5006,8 +6231,20 @@ rows:
           reason: structural
           text: >-
             A `format: text` record holds the log body alone, so the log's body format is left off.
+        - when: {format: otlp_proto}
+          class: exact
+          text: >-
+            As at otlp_out: OTLP has no body format, so it leaves as the `logit.body_format`
+            attribute, which otlp_in reads back into the format.
+        - when: {format: otlp_json}
+          class: exact
+          text: >-
+            As at otlp_out: OTLP has no body format, so it leaves as the `logit.body_format`
+            attribute, which otlp_in reads back into the format.
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: log
     feature: event_name
     cells:
@@ -5031,8 +6268,16 @@ rows:
           reason: structural
           text: >-
             A `format: text` record holds the log body alone, so the log's event name is left off.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: The `LogRecord`''s `event_name`.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: The `LogRecord`''s `event_name`.'
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: log
     feature: observed_timestamp
     cells:
@@ -5058,8 +6303,16 @@ rows:
           text: >-
             A `format: text` record holds the log body alone, so the log's observed time is left
             off.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: The `LogRecord`''s `observed_time_unix_nano`.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: The `LogRecord`''s `observed_time_unix_nano`.'
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: log
     feature: observed_timestamp_unset
     cells:
@@ -5085,8 +6338,22 @@ rows:
         - when: {format: text}
           class: exact
           text: Nothing is written, and nothing reads back.
+        - when: {format: otlp_proto}
+          class: normalized
+          reason: observed_timestamp
+          text: >-
+            As at otlp_out: otlp_out stamps a log that has no observed time with the time it encodes
+            the request, as `logs.proto` defines the field.
+        - when: {format: otlp_json}
+          class: normalized
+          reason: observed_timestamp
+          text: >-
+            As at otlp_out: otlp_out stamps a log that has no observed time with the time it encodes
+            the request, as `logs.proto` defines the field.
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: log
     feature: trace
     cells:
@@ -5115,8 +6382,16 @@ rows:
           text: >-
             A `format: text` record holds the log body alone, so the log's trace and span ids are
             left off.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: The `LogRecord`''s `trace_id` and `span_id`.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: The `LogRecord`''s `trace_id` and `span_id`.'
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: log
     feature: trace_unset
     cells:
@@ -5146,8 +6421,22 @@ rows:
         - when: {format: text}
           class: exact
           text: Nothing is written, and nothing reads back.
+        - when: {format: otlp_proto}
+          class: normalized
+          reason: trace_from_span
+          text: >-
+            As at otlp_out: A log with no trace on an event that carries a span leaves with the
+            span's ids and flags `0`; without a span, the log leaves with no trace.
+        - when: {format: otlp_json}
+          class: normalized
+          reason: trace_from_span
+          text: >-
+            As at otlp_out: A log with no trace on an event that carries a span leaves with the
+            span's ids and flags `0`; without a span, the log leaves with no trace.
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: log
     feature: trace_flags
     cells:
@@ -5172,8 +6461,16 @@ rows:
           reason: structural
           text: >-
             A `format: text` record holds the log body alone, so the log's trace flags are left off.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: The low 8 bits of the `LogRecord`''s `flags`.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: The low 8 bits of the `LogRecord`''s `flags`.'
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: log
     feature: trace_beside_id_attribute
     cells:
@@ -5205,8 +6502,20 @@ rows:
           text: >-
             A `format: text` record holds the log body alone, so the log's trace is left off, as
             `log/trace` has.
+        - when: {format: otlp_proto}
+          class: exact
+          text: >-
+            As at otlp_out: The `LogRecord`'s trace, span ids, and flags, beside the attributes, as
+            `log/trace` has.
+        - when: {format: otlp_json}
+          class: exact
+          text: >-
+            As at otlp_out: The `LogRecord`'s trace, span ids, and flags, beside the attributes, as
+            `log/trace` has.
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: log
     feature: dropped_attributes_count
     cells:
@@ -5232,8 +6541,16 @@ rows:
           text: >-
             A `format: text` record holds the log body alone, so the log's dropped-attribute count
             is left off.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: The `LogRecord`''s `dropped_attributes_count`.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: The `LogRecord`''s `dropped_attributes_count`.'
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: log
     feature: timestamp
     cells:
@@ -5272,8 +6589,16 @@ rows:
           class: normalized
           reason: timestamp_precision
           text: The record's timestamp, in whole milliseconds.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: The `LogRecord`''s `time_unix_nano`.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: The `LogRecord`''s `time_unix_nano`.'
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: log
     feature: receipt_timestamp
     cells:
@@ -5300,8 +6625,18 @@ rows:
           text: >-
             The record's timestamp, the receipt time in whole milliseconds; the `syslog.timestamp`
             beside it is an attribute, left off.
+        - when: {format: otlp_proto}
+          class: exact
+          text: >-
+            As at otlp_out: The `LogRecord`'s `time_unix_nano`, the time the log was received.
+        - when: {format: otlp_json}
+          class: exact
+          text: >-
+            As at otlp_out: The `LogRecord`'s `time_unix_nano`, the time the log was received.
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: log
     feature: beside_metrics
     cells:
@@ -5349,8 +6684,18 @@ rows:
           class: exact
           counter: logit.output.metrics.omitted{reason=format}
           text: The log's body as the record; the event's metrics are left off, counted.
+        - when: {format: otlp_proto}
+          class: exact
+          text: >-
+            As at otlp_out: An OTLP log record in the logs request, beside the metrics in theirs.
+        - when: {format: otlp_json}
+          class: exact
+          text: >-
+            As at otlp_out: An OTLP log record in the logs request, beside the metrics in theirs.
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
 
   # --- spans ---------------------------------------------------------------------------------
   # A span's record-level rows are `alone` and the two readiness rows `datadog_out`'s trace gate
@@ -5406,10 +6751,17 @@ rows:
         - when: {format: text}
           class: skipped
           counter: logit.output.events.skipped{reason=no_log}
-          text: >-
-            An event with no log has no `format: text` record.
+          text: 'An event with no log has no `format: text` record.'
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: An OTLP span.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: An OTLP span.'
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: span
     feature: not_datadog_origin
     cells:
@@ -5540,10 +6892,17 @@ rows:
         text: >-
           The span object's `name`.
       kafka_out:
-        class: exact
-        text: >-
-          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
-          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: The span''s `name`.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: The span''s `name`.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text`
+            record writes no span (`span/alone`), so no field of one is compared.
   - kind: span
     feature: name_structured
     cells:
@@ -5573,10 +6932,23 @@ rows:
           A name that isn't a `Str` leaves as its text, JSON for a map or an array, read back as a
           string.
       kafka_out:
-        class: exact
-        text: >-
-          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
-          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+        - when: {format: otlp_proto}
+          class: lost
+          reason: uncounted
+          text: >-
+            As at otlp_out: OTLP's span `name` is a string, and a name that isn't a `Str` leaves as
+            `""`, uncounted.
+        - when: {format: otlp_json}
+          class: lost
+          reason: uncounted
+          text: >-
+            As at otlp_out: OTLP's span `name` is a string, and a name that isn't a `Str` leaves as
+            `""`, uncounted.
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text`
+            record writes no span (`span/alone`), so no field of one is compared.
   - kind: span
     feature: trace_id
     cells:
@@ -5599,10 +6971,17 @@ rows:
         text: >-
           32 lowercase hex digits.
       kafka_out:
-        class: exact
-        text: >-
-          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
-          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: The 16-byte `trace_id`.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: The 16-byte `trace_id`.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text`
+            record writes no span (`span/alone`), so no field of one is compared.
   - kind: span
     feature: parent_span_id
     cells:
@@ -5622,10 +7001,17 @@ rows:
         text: >-
           16 lowercase hex digits.
       kafka_out:
-        class: exact
-        text: >-
-          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
-          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: The 8-byte `parent_span_id`.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: The 8-byte `parent_span_id`.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text`
+            record writes no span (`span/alone`), so no field of one is compared.
   - kind: span
     feature: parent_unset
     cells:
@@ -5646,10 +7032,17 @@ rows:
         text: >-
           An empty `parent_span_id`, read back as no parent.
       kafka_out:
-        class: exact
-        text: >-
-          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
-          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: An empty `parent_span_id`, read back as no parent.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: An empty `parent_span_id`, read back as no parent.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text`
+            record writes no span (`span/alone`), so no field of one is compared.
   - kind: span
     feature: kind
     cells:
@@ -5672,10 +7065,17 @@ rows:
         text: >-
           The exporter's `SPAN_KIND_*` name.
       kafka_out:
-        class: exact
-        text: >-
-          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
-          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: The `SpanKind`.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: The `SpanKind`.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text`
+            record writes no span (`span/alone`), so no field of one is compared.
   - kind: span
     feature: status_error
     cells:
@@ -5696,10 +7096,17 @@ rows:
         text: >-
           `status.code` `STATUS_CODE_ERROR`.
       kafka_out:
-        class: exact
-        text: >-
-          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
-          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: `Status.code` `STATUS_CODE_ERROR`.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: `Status.code` `STATUS_CODE_ERROR`.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text`
+            record writes no span (`span/alone`), so no field of one is compared.
   - kind: span
     feature: status_ok
     cells:
@@ -5724,10 +7131,17 @@ rows:
         text: >-
           `status.code` `STATUS_CODE_OK`.
       kafka_out:
-        class: exact
-        text: >-
-          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
-          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: `Status.code` `STATUS_CODE_OK`.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: `Status.code` `STATUS_CODE_OK`.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text`
+            record writes no span (`span/alone`), so no field of one is compared.
   - kind: span
     feature: status_unset
     cells:
@@ -5748,10 +7162,17 @@ rows:
         text: >-
           `status.code` `STATUS_CODE_UNSET`, read back as unset.
       kafka_out:
-        class: exact
-        text: >-
-          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
-          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: `Status.code` `STATUS_CODE_UNSET`, read back as unset.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: `Status.code` `STATUS_CODE_UNSET`, read back as unset.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text`
+            record writes no span (`span/alone`), so no field of one is compared.
   - kind: span
     feature: status_message
     cells:
@@ -5774,10 +7195,17 @@ rows:
         text: >-
           `status.message`.
       kafka_out:
-        class: exact
-        text: >-
-          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
-          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: `Status.message`.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: `Status.message`.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text`
+            record writes no span (`span/alone`), so no field of one is compared.
   - kind: span
     feature: timestamp
     cells:
@@ -5797,10 +7225,17 @@ rows:
         text: >-
           `start_time`, in Unix nanoseconds.
       kafka_out:
-        class: exact
-        text: >-
-          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
-          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: `start_time_unix_nano`.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: `start_time_unix_nano`.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text`
+            record writes no span (`span/alone`), so no field of one is compared.
   - kind: span
     feature: end_timestamp
     cells:
@@ -5820,10 +7255,17 @@ rows:
         text: >-
           `end_time`, in Unix nanoseconds.
       kafka_out:
-        class: exact
-        text: >-
-          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
-          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: `end_time_unix_nano`.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: `end_time_unix_nano`.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text`
+            record writes no span (`span/alone`), so no field of one is compared.
   - kind: span
     feature: end_before_start
     cells:
@@ -5845,10 +7287,17 @@ rows:
         text: >-
           `end_time` as it is, earlier than `start_time`.
       kafka_out:
-        class: exact
-        text: >-
-          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
-          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: `end_time_unix_nano` as it is, earlier than the start.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: `end_time_unix_nano` as it is, earlier than the start.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text`
+            record writes no span (`span/alone`), so no field of one is compared.
   - kind: span
     feature: flags
     cells:
@@ -5872,10 +7321,17 @@ rows:
           The exporter's span object has no member for span flags, so it's left off, counted once
           per span.
       kafka_out:
-        class: exact
-        text: >-
-          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
-          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: The span''s `flags`.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: The span''s `flags`.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text`
+            record writes no span (`span/alone`), so no field of one is compared.
   - kind: span
     feature: trace_state
     cells:
@@ -5901,10 +7357,17 @@ rows:
           The exporter's span object has no member for a span's `trace_state`, so it's left off,
           counted once per span.
       kafka_out:
-        class: exact
-        text: >-
-          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
-          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: The span''s `trace_state`.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: The span''s `trace_state`.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text`
+            record writes no span (`span/alone`), so no field of one is compared.
   - kind: span
     feature: dropped_attributes_count
     cells:
@@ -5931,10 +7394,17 @@ rows:
           The exporter's span object has no member for a dropped-attribute count, so it's left off,
           counted once per span.
       kafka_out:
-        class: exact
-        text: >-
-          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
-          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: The span''s `dropped_attributes_count`.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: The span''s `dropped_attributes_count`.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text`
+            record writes no span (`span/alone`), so no field of one is compared.
   - kind: span
     feature: dropped_events_count
     cells:
@@ -5960,10 +7430,17 @@ rows:
           The exporter's span object has no member for a dropped-event count, so it's left off,
           counted once per span.
       kafka_out:
-        class: exact
-        text: >-
-          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
-          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: The span''s `dropped_events_count`.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: The span''s `dropped_events_count`.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text`
+            record writes no span (`span/alone`), so no field of one is compared.
   - kind: span
     feature: dropped_links_count
     cells:
@@ -5989,10 +7466,17 @@ rows:
           The exporter's span object has no member for a dropped-link count, so it's left off,
           counted once per span.
       kafka_out:
-        class: exact
-        text: >-
-          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
-          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: The span''s `dropped_links_count`.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: The span''s `dropped_links_count`.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text`
+            record writes no span (`span/alone`), so no field of one is compared.
   - kind: span
     feature: events
     cells:
@@ -6012,10 +7496,17 @@ rows:
         text: >-
           Each span event's `name`, `timestamp`, and `attributes`.
       kafka_out:
-        class: exact
-        text: >-
-          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
-          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: Each span event''s time, name, and attributes.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: Each span event''s time, name, and attributes.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text`
+            record writes no span (`span/alone`), so no field of one is compared.
   - kind: span
     feature: event_nested_attribute
     cells:
@@ -6045,10 +7536,21 @@ rows:
         text: >-
           A map, array, or null attribute of a span event, nesting kept.
       kafka_out:
-        class: exact
-        text: >-
-          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
-          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+        - when: {format: otlp_proto}
+          class: exact
+          text: >-
+            As at otlp_out: A key-value list, array, or empty attribute of a span event, as OTLP
+            writes any attribute.
+        - when: {format: otlp_json}
+          class: exact
+          text: >-
+            As at otlp_out: A key-value list, array, or empty attribute of a span event, as OTLP
+            writes any attribute.
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text`
+            record writes no span (`span/alone`), so no field of one is compared.
   - kind: span
     feature: event_name_structured
     cells:
@@ -6079,10 +7581,23 @@ rows:
           A name that isn't a `Str` leaves as its text, JSON for a map or an array, read back as a
           string.
       kafka_out:
-        class: exact
-        text: >-
-          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
-          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+        - when: {format: otlp_proto}
+          class: lost
+          reason: uncounted
+          text: >-
+            As at otlp_out: OTLP's span event `name` is a string, and a name that isn't a `Str`
+            leaves as `""`, uncounted.
+        - when: {format: otlp_json}
+          class: lost
+          reason: uncounted
+          text: >-
+            As at otlp_out: OTLP's span event `name` is a string, and a name that isn't a `Str`
+            leaves as `""`, uncounted.
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text`
+            record writes no span (`span/alone`), so no field of one is compared.
   - kind: span
     feature: nested_bytes_attribute
     cells:
@@ -6108,10 +7623,17 @@ rows:
           A `Bytes` attribute of a span event or link leaves as a base64 string, read back as the
           string.
       kafka_out:
-        class: exact
-        text: >-
-          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
-          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: A `bytesValue` attribute of a span event or link.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: A `bytesValue` attribute of a span event or link.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text`
+            record writes no span (`span/alone`), so no field of one is compared.
   - kind: span
     feature: nested_u64_attribute
     cells:
@@ -6142,10 +7664,23 @@ rows:
           A JSON number in the span event's or link's `attributes`, read back as an `i64`, or,
           above `i64::MAX`, as the `u64` itself.
       kafka_out:
-        class: exact
-        text: >-
-          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
-          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+        - when: {format: otlp_proto}
+          class: normalized
+          reason: u64_as_int
+          text: >-
+            As at otlp_out: A `u64` attribute of a span event or link reads back as an `i64`, or,
+            above `i64::MAX`, as a double, approximate beyond 2^53 and uncounted.
+        - when: {format: otlp_json}
+          class: normalized
+          reason: u64_as_int
+          text: >-
+            As at otlp_out: A `u64` attribute of a span event or link reads back as an `i64`, or,
+            above `i64::MAX`, as a double, approximate beyond 2^53 and uncounted.
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text`
+            record writes no span (`span/alone`), so no field of one is compared.
   - kind: span
     feature: nested_timestamp_attribute
     cells:
@@ -6174,10 +7709,23 @@ rows:
           A timestamp attribute of a span event or link leaves as an RFC 3339 string, read back
           as the string.
       kafka_out:
-        class: exact
-        text: >-
-          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
-          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+        - when: {format: otlp_proto}
+          class: normalized
+          reason: timestamp_as_int
+          text: >-
+            As at otlp_out: A timestamp attribute of a span event or link leaves as an `intValue` of
+            Unix nanoseconds, read back as an `i64`.
+        - when: {format: otlp_json}
+          class: normalized
+          reason: timestamp_as_int
+          text: >-
+            As at otlp_out: A timestamp attribute of a span event or link leaves as an `intValue` of
+            Unix nanoseconds, read back as an `i64`.
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text`
+            record writes no span (`span/alone`), so no field of one is compared.
   - kind: span
     feature: event_dropped_count
     cells:
@@ -6204,10 +7752,17 @@ rows:
           The exporter's span object has no member for a span event's dropped-attribute count, so
           it's left off, counted once per span.
       kafka_out:
-        class: exact
-        text: >-
-          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
-          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: A span event''s `dropped_attributes_count`.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: A span event''s `dropped_attributes_count`.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text`
+            record writes no span (`span/alone`), so no field of one is compared.
   - kind: span
     feature: links
     cells:
@@ -6236,10 +7791,17 @@ rows:
         text: >-
           Each link's `trace_id`, `span_id`, and `attributes`.
       kafka_out:
-        class: exact
-        text: >-
-          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
-          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: Each link''s ids and attributes.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: Each link''s ids and attributes.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text`
+            record writes no span (`span/alone`), so no field of one is compared.
   - kind: span
     feature: link_flags
     cells:
@@ -6261,10 +7823,17 @@ rows:
           The exporter's span object has no member for a link's flags, so it's left off, counted
           once per span.
       kafka_out:
-        class: exact
-        text: >-
-          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
-          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: A link''s `flags`.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: A link''s `flags`.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text`
+            record writes no span (`span/alone`), so no field of one is compared.
   - kind: span
     feature: link_trace_state
     cells:
@@ -6284,10 +7853,17 @@ rows:
         text: >-
           A link's `trace_state`, an absent one written as `""` and read back as none.
       kafka_out:
-        class: exact
-        text: >-
-          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
-          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: A link''s `trace_state`.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: A link''s `trace_state`.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text`
+            record writes no span (`span/alone`), so no field of one is compared.
   - kind: span
     feature: link_dropped_count
     cells:
@@ -6314,10 +7890,17 @@ rows:
           The exporter's span object has no member for a link's dropped-attribute count, so it's
           left off, counted once per span.
       kafka_out:
-        class: exact
-        text: >-
-          The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A
-          `format: text` record writes no span (`span/alone`), so no field of one is compared.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: A link''s `dropped_attributes_count`.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: A link''s `dropped_attributes_count`.'
+        - class: exact
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text`
+            record writes no span (`span/alone`), so no field of one is compared.
   - kind: span
     feature: beside_log
     cells:
@@ -6371,11 +7954,21 @@ rows:
         - when: {format: text}
           class: lost
           counter: logit.output.spans.omitted{reason=format}
+          text: The record holds the log body alone, so the span beside it is left off, counted.
+        - when: {format: otlp_proto}
+          class: exact
           text: >-
-            The record holds the log body alone, so the span beside it is left off, counted.
+            As at otlp_out: The span in the traces request and the log in the logs request, each
+            read back as an event of its own.
+        - when: {format: otlp_json}
+          class: exact
+          text: >-
+            As at otlp_out: The span in the traces request and the log in the logs request, each
+            read back as an event of its own.
         - class: exact
           text: >-
-            The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: span
     feature: beside_metrics
     cells:
@@ -6428,8 +8021,16 @@ rows:
           text: >-
             An event with no log has no `format: text` record, so the span and its metrics are left
             off, counted once for the event.
+        - when: {format: otlp_proto}
+          class: exact
+          text: 'As at otlp_out: An OTLP span in the traces request, beside the metrics in theirs.'
+        - when: {format: otlp_json}
+          class: exact
+          text: 'As at otlp_out: An OTLP span in the traces request, beside the metrics in theirs.'
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
 
   # --- events with no metric, log, or span ------------------------------------------------------
   # `string_only` is an InfluxDB point whose fields are all strings, its measurement carrier
@@ -6481,10 +8082,21 @@ rows:
         - when: {format: text}
           class: skipped
           counter: logit.output.events.skipped{reason=no_log}
+          text: 'An event with no log has no `format: text` record.'
+        - when: {format: otlp_proto}
+          class: skipped
+          counter: logit.output.events.skipped{reason=no_payload}
           text: >-
-            An event with no log has no `format: text` record.
+            As at otlp_out: An event with no metric, log, or span has no OTLP signal and isn't sent.
+        - when: {format: otlp_json}
+          class: skipped
+          counter: logit.output.events.skipped{reason=no_payload}
+          text: >-
+            As at otlp_out: An event with no metric, log, or span has no OTLP signal and isn't sent.
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.
   - kind: event
     feature: string_only
     cells:
@@ -6542,5 +8154,19 @@ rows:
           text: >-
             An InfluxDB point whose fields are all strings has no log, so it has no `format: text`
             record.
+        - when: {format: otlp_proto}
+          class: skipped
+          counter: logit.output.events.skipped{reason=no_payload}
+          text: >-
+            As at otlp_out: An InfluxDB point whose fields are all strings has no OTLP signal and
+            isn't sent, so its fields are lost.
+        - when: {format: otlp_json}
+          class: skipped
+          counter: logit.output.events.skipped{reason=no_payload}
+          text: >-
+            As at otlp_out: An InfluxDB point whose fields are all strings has no OTLP signal and
+            isn't sent, so its fields are lost.
         - class: exact
-          text: The event as `stdio_out`'s JSON object, read back whole by the event JSON reader.
+          text: >-
+            Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object,
+            its MessagePack map, or a native frame, read back whole by kafka_in.

@@ -4239,11 +4239,10 @@ components:
 Give each signal its own topic. A protobuf request doesn't name its signal, and the exporter
 writes no `otelcol.signal` header by default, so the topic is the only signal there is: two
 signals on one topic fail `logit validate`. A request read as the wrong signal, such as a logs
-request on the topic mapped to `metrics`, is dropped as `undecodable` under `otlp_proto`. Under
-`otlp_json` it usually reads as an empty request, since OTLP/JSON ignores fields it doesn't
-know, and counts `logit.input.records.skipped{reason="empty"}`. A signal left out of the map
-isn't read. A request holding several resources is delivered as one batch per resource, and its
-record is committed once every one of them is accepted.
+request on the topic mapped to `metrics`, is dropped and counted
+`logit.input.records.dropped{reason="undecodable"}`. A signal left out of the map isn't read. A
+request holding several resources is delivered as one batch per resource, and its record is
+committed once every one of them is accepted.
 [`fixtures/kafka-in-otlp.yaml`](../fixtures/kafka-in-otlp.yaml) reads what
 [`fixtures/kafka-otlp.yaml`](../fixtures/kafka-otlp.yaml) produces.
 

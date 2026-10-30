@@ -1,0 +1,9 @@
+# kafka_out's records under format: json, record: event, compression: none: the events of
+# cases/statsd/cross-kinds.json, gauge-delta.json, summarized-kinds.json, typed-scalars.json,
+# timer-sample-rate.json, service-check.json, set.json, and unit-on-samples.json,
+# cases/prometheus/mixed.json and nan-inf.json, cases/datadog/rate-same-instant.json,
+# series-v2-json.json, and agent-sketches.json, and cases/otlp/non-finite.json, one record each, in one record batch: every
+# metric kind and flag the other sources decode, unflagged by a no-recorded-value mark.
+wire: json-kinds.segment
+kafka: {format: json}
+exercises: [format_json, carriers, compression_none]

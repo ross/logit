@@ -1,0 +1,13 @@
+# kafka_in's cases relayed to kafka_out under format: json, the like pair with nothing between:
+# one record per event, read back by kafka_in.
+# `path:` names one case so `logit run` can run this by hand; the transit spec runs every case in
+# that file's directory (spec/transit/README.md).
+components:
+  case:
+    type: replay_in
+    path: ../cases/kafka/json.json
+  out:
+    type: kafka_out
+    sources: [case]
+    brokers: ["127.0.0.1:9092"]
+    topic: transit

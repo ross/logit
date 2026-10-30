@@ -1,6 +1,6 @@
 ---
 created: 2026-09-10
-updated: 2026-10-23
+updated: 2026-10-30
 ---
 
 # Lossless like-protocol transit: the internal model is a superset of every supported wire protocol
@@ -415,3 +415,18 @@ Adding a `count` field to `Histogram` would carry both cases unchanged, but it t
 constructor, the native wire record, `event_json`, Lua's `Event.new` and `to_table`, and every
 encoder, for a mismatch only a nonconforming producer sends. `docs/known-gaps/otlp.md` keeps the
 mismatch as residual debt.
+
+## Amendment: an eleventh like pair (2026-10-30)
+
+`kafka_in -> kafka_out` (Kafka records) is the eleventh like-protocol pair in scope under this
+ADR, lossless under `format: json`, `msgpack`, `native`, `otlp_proto`, and `otlp_json`, and under
+`text` for a log whose body is `Str` or `Bytes` and that carries nothing else. Its permitted
+normalizations are listed in [ADR `kafka-input`](kafka-input.md), item 13: record boundaries,
+partition and offset, the `_logit.kafka.*` carriers, the record timestamp, compression, a native
+frame's attribute order, an aborted transaction's records, and, under the OTLP formats,
+`otlp_in -> otlp_out`'s own list. A record's key and headers aren't a normalization:
+`kafka_out` doesn't write them back from the carriers, which `docs/known-gaps/kafka.md` keeps as
+the pair's residual debt.
+
+The transit spec checks the pair as one `kafka-relay-<format>` flow per format, reading
+`kafka_out`'s records back through `kafka_in`'s decoding.

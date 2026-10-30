@@ -1,6 +1,6 @@
 ---
 created: 2026-09-25
-updated: 2026-10-18
+updated: 2026-10-30
 ---
 
 # Out-of-CI fuzzing: a `cargo-fuzz` workspace in the unsafe-check image, with every crash landed as a stable test
@@ -92,11 +92,11 @@ MiB, because a legitimate 64 MiB lz4 frame allocates its full `uncompressed_len`
 
 The fourth `FUZZ_TARGETS` column holds extra libFuzzer arguments for one target, passed by `fuzz`
 and never by `fuzz-tmin`. The two native batch targets, `statsd`, `syslog`, the two graphite
-targets, `collectd`, `influxdb_line`, the two Prometheus decode targets, and `message_json`,
-`message_logfmt`, and `message_kv` use it to run in fork mode (`-fork=1 -ignore_ooms=0`). The process-wide
+targets, `collectd`, `influxdb_line`, the two Prometheus decode targets, `message_json`,
+`message_logfmt`, `message_kv`, and `msgpack_event` use it to run in fork mode (`-fork=1 -ignore_ooms=0`). The process-wide
 interner never evicts, so a long-lived fuzz process accumulates every dictionary string, metric
 name, tag key, SD-ID, PARAM-NAME, carbon path, Prometheus exemplar label name and family name,
-and log-message key it decodes until the arena outgrows the malloc limit, and fork mode restarts
+log-message key, and MessagePack event attribute key it decodes until the arena outgrows the malloc limit, and fork mode restarts
 the process. A key in `message_logfmt` or `message_kv` can run the whole 64 KiB message, and
 long distinct keys grow the never-evicting arena past the 16 MiB limit within one fork child, so
 those two targets skip an input that could hold a key over 32 bytes; a key's length changes
@@ -417,12 +417,29 @@ Listener authentication adds one more:
   survives a flipped scheme case and surrounding whitespace and that a client's own spelling of
   each configured credential is accepted.
 
+The `kafka_in` consumer adds two more:
+
+- `kafka_batch`: a Fetch response's records blob through `logit_proto::kafka::decode`, every
+  record batch in it, with each records section decompressing to at most 64 KiB, then the walk
+  `kafka_in` makes over each record's key, value, and header names. The bound sits far under
+  `kafka_in`'s 64 MiB `max_batch_bytes`, so a section that expands past it is an `Oversize`
+  error, not a buffer. Its seeds are the ten recorded segments under
+  `testdata/interop/kafka/batches/`, those segments back to back and cut inside the last one, and
+  `logit_proto::kafka::batch::encode`'s batch under each of the five codecs, plus an uncompressed
+  batch with a repeated header name and one with a header name that isn't UTF-8, rewritten in
+  place with the CRC-32C recomputed because the encoder can't write either.
+- `msgpack_event`: a `format: msgpack` record value, one or more event maps back to back,
+  through `MsgpackEventDecoder::decode_batches_with_budget` under a 1 MiB decode budget, which an
+  input under its 64 KiB `max_len` can exhaust. Its seeds are `format: json` lines (logs,
+  gauges, a sum, a histogram, a summary, and a span) written as MessagePack in `kafka_out`'s
+  value forms, each alone and all back to back.
+
 `prom_remote_write` also gains a structured mode, which builds a request from its input so the
 symbol-table rules are reachable, and a fixed-point oracle on every input.
 
 ### Seeds and differential corpora
 
-`seedgen` also reads `testdata/interop/{statsd,syslog,graphite,collectd,datadog,prometheus-scrape}/`,
+`seedgen` also reads `testdata/interop/{statsd,syslog,graphite,collectd,datadog,prometheus-scrape,kafka}/`,
 the `graphite-pickle` and `prometheus-text` corpora under `testdata/differential/` (the
 `datadog-sketch` corpus holds no decoder input), every `*.in` exposition body under
 `crates/logit-cli/tests/fixtures/prometheus/`, and
