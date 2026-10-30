@@ -433,7 +433,7 @@ class Run:
                 return 2
         images = ([self.image, NETEM_IMAGE] + ([VM_IMAGE] if self.has_vm else [])
                   + ([KAFKA_IMAGE] if self.kafka else [])
-                  + ([STANDIN_IMAGE] if self.standin else [])
+                  + ([STANDIN_IMAGE] if self.standin or self.scenario.cri_sources else [])
                   + ([faults.FILEOPS_IMAGE] if file_steps and not self.standin else []))
         collect.provenance(self.run_dir, self.root.parent.parent, self.docker,
                            images, self.scenario.name,
@@ -900,8 +900,9 @@ class Run:
 
     def wait_tailed(self):
         """For a file wire: counts the lines the writer left in `<run>/shared`
-        (`collect.count_lines`, phase `shared_counted`), reads G, the writers' `file_out`
-        `logit.component.events.delivered` summed over every life, then waits, bounded at
+        (`collect.count_lines`, or on a `cri` wire `collect.count_cri_lines`, phase
+        `shared_counted`), reads G, the writers' `logit.component.events.delivered` summed over
+        every life, then waits, bounded at
         `TAIL_CATCHUP_BOUND_S`, until the tailing listeners' W summed over every life reaches G
         or holds for `TAIL_STALL_READS` reads (phase `tail_caught_up`). It waits for G, not the
         count, because a writer that deleted a file left fewer lines than it wrote, and W
@@ -913,7 +914,9 @@ class Run:
         sources = self.scenario.file_sources
         if not sources:
             return
-        counted = collect.count_lines(self.run_dir / scenario_mod.SHARED_DIR)
+        count = (collect.count_cri_lines if self.scenario.cri_sources
+                 else collect.count_lines)
+        counted = count(self.run_dir / scenario_mod.SHARED_DIR)
         self.phase("shared_counted", **counted)
         time.sleep(collect.LOG_LAG_NS / 1e9 + 1)
         g = 0
@@ -924,7 +927,7 @@ class Run:
                                              component=sink).values())
                      for source in sources if source["service"] == writer
                      for sink in scenario_mod.source_ids(source, "generator_sink"))
-        listeners = [source["sut_listener"] for source in sources]
+        wires = {source["sut_listener"]: checks.WIRES[source["wire"]] for source in sources}
         service = scenario_mod.SUT_SERVICE
         deadline = _now() + TAIL_CATCHUP_BOUND_S
         last, unchanged, reads, w = None, 0, 0, None
@@ -933,8 +936,8 @@ class Run:
             reads += 1
             self.capture.chunk({service: self.ids[service]})
             tel = telemetry.read_ndjson(self.run_dir / "logs" / f"{service}.stdout")
-            w = sum(sum(tel.counter_by_life("logit.input.lines", component=listener).values())
-                    for listener in listeners)
+            w = sum(sum(checks.read_counter(tel, wire, listener).values())
+                    for listener, wire in wires.items())
             if w >= g:
                 self.phase("tail_caught_up", reached=True, w=w, reads=reads, **caught)
                 return
