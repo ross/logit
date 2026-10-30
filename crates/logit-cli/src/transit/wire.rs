@@ -13,10 +13,10 @@
 //! | `syslog_out` | each `MessageBuf` entry: one message, capped as the sink's transport caps it | `SyslogDecoder`, one entry at a time: a UDP datagram with line splitting on, `syslog_in`'s default `framing: lines`, or under `transport: tcp` one octet-counted frame's payload with line splitting off |
 //! | `splunk_hec_out` | each `MessageBuf` entry: one HEC object (`encode_objects`), an object over `max_body_bytes` dropped and counted as the sink drops it, the rest joined into one `/event` body per batch | `SplunkDecoder::decode_events` |
 //! | `datadog_trace_out` | one uncompressed trace request per batch at `version:`'s path (`/v0.4/traces` or `/v0.7/traces`), with the tracer headers the sink restores from the batch resource and `X-Datadog-Trace-Count`, and one `/v0.6/stats` request for the batch's APM stats events (`encode_requests`), with none of the sink's size cuts | `datadog_trace_in`'s `decode_request`, by the request's path, with its headers |
-//! | `kafka_out` | each `MessageBuf` entry: one record's value, with none of the producer's batching, compression, or per-record size check | a convention, not a pair's decoder, until the spec gains a `kafka_in` source: under `format: json`, `EventJsonDecoder::decode_batches` per record; under `format: text`, one log per record, its message the value (a `Str`, or `Bytes` where it isn't UTF-8) with no severity, a `raw` body format, and no other field, at the record's millisecond timestamp, under an empty resource. Any other `format:` fails the run |
+//! | `kafka_out` | each `MessageBuf` entry: one record's value, key, and timestamp, written with the sink's headers into one record batch per topic under its `compression:` (`logit_outputs::kafka::record_batches`), with none of the producer's partitioning, request packing, or per-record size check; under an OTLP format, a record and a log with no observed time are stamped with the wall clock, which the driver reads back as the run's clock | `kafka_in`'s `decode_record_batches`, on partition 0 of each topic, in the sink's `format:` (under `record: batch`, `text`'s escaped lines; under an OTLP format, each topic's signal from `topics:`), which stamps each event's `_logit.kafka.*` carriers |
 //!
 //! The statsd, InfluxDB, syslog, and Kafka encoders return their counts, so this counts them through the
-//! sink's own reporting functions; the OTLP, Prometheus, Datadog, Datadog trace, Graphite, and
+//! sink's own reporting functions, and the Kafka encoder's OTLP mapping through the handle it holds; the OTLP, Prometheus, Datadog, Datadog trace, Graphite, and
 //! Splunk encoders count through the handle they hold.
 //! A decode error fails the run: the pair's decoder refusing its own sink's bytes is a finding.
 
@@ -24,13 +24,11 @@ use crate::pipeline::SinkEncoder;
 use anyhow::Context;
 use bytes::Bytes;
 use http::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
-use logit_core::{
-    BodyFormat, Diagnostics, Event, EventBatch, LogRecord, Resource, Telemetry, Value,
-};
-use logit_outputs::kafka::RecordFormat;
+use logit_core::{Diagnostics, EventBatch, Resource, Telemetry};
+use logit_inputs::kafka::KafkaInFormat;
+use logit_outputs::kafka::{KafkaSettings, RecordFormat, RecordMode};
 use logit_pipeline::test_util::TelemetryProbe;
 use logit_proto::datadog::DatadogDecoder;
-use logit_proto::event_json::EventJsonDecoder;
 use logit_proto::graphite::pickle::LENGTH_PREFIX_BYTES;
 use logit_proto::graphite::{GraphiteDecoder, Protocol as GraphiteProtocol};
 use logit_proto::influxdb::{write_resource, InfluxDecoder, Precision};
@@ -40,7 +38,9 @@ use logit_proto::prometheus::{families_to_events, remote_write, text, Dialect, P
 use logit_proto::splunk::SplunkDecoder;
 use logit_proto::statsd::StatsdDecoder;
 use logit_proto::syslog::SyslogDecoder;
-use logit_proto::{Decoder, Encoder, FramedEncoder, MessageBuf, SignalDecoder, SignalEncoder};
+use logit_proto::{
+    Decoder, Encoder, FramedEncoder, MessageBuf, Signal, SignalDecoder, SignalEncoder,
+};
 use std::sync::Arc;
 
 /// The decoder's telemetry id.
@@ -48,6 +48,9 @@ const DECODE_ID: &str = "transit.decode";
 
 /// The most bytes a remote-write body decompresses to, as a receiver bounds it.
 const MAX_BODY_BYTES: usize = 1 << 30;
+
+/// The most bytes a record batch's records decompress to: `kafka_in`'s default `max_batch_bytes`.
+pub(super) const MAX_RECORDS_BYTES: usize = 64 << 20;
 
 /// How the pair's decoder reads.
 pub(super) struct Decode<'a> {
@@ -325,35 +328,50 @@ pub(super) fn round_trip(
                 out.extend(decoded);
             }
         }
-        SinkEncoder::Kafka { mut encoder, format } => {
-            let mut decoder = EventJsonDecoder::new();
+        SinkEncoder::Kafka { mut encoder, settings } => {
             let mut records = MessageBuf::default();
+            let mut all = MessageBuf::default();
+            let otlp = settings.format.is_otlp();
+            let before = wall_clock();
             for batch in batches {
                 let stats = encoder.encode_into(batch, &mut records);
                 logit_outputs::kafka::report_encode_stats(sink, &stats);
-                match format {
-                    RecordFormat::Json => {
-                        for record in records.iter() {
-                            let decoded = decoder.decode_batches(record).with_context(|| {
-                                format!(
-                                    "the event JSON reader refused {:?}",
-                                    String::from_utf8_lossy(record)
-                                )
-                            })?;
-                            out.extend(decoded);
-                        }
+                let after = wall_clock() / 1_000_000;
+                for (value, meta) in records.iter_with() {
+                    let mut meta = meta.clone();
+                    // An OTLP format's record is stamped with the wall clock, as the Collector's
+                    // exporter stamps it; the run's clock stands in for it.
+                    if otlp && (before / 1_000_000..=after).contains(&meta.timestamp) {
+                        meta.timestamp = decode.received_at / 1_000_000;
                     }
-                    RecordFormat::Text => {
-                        let events: Vec<Event> = records
-                            .iter_with()
-                            .map(|(value, meta)| text_record(value, meta.timestamp))
-                            .collect();
-                        if !events.is_empty() {
-                            out.push(EventBatch { resource: empty(), scope: None, events });
-                        }
-                    }
-                    other => anyhow::bail!("kafka_out's {other:?} format has no read-back here"),
+                    all.push_with(value, meta);
                 }
+            }
+            let after = wall_clock();
+            for (topic, bytes) in logit_outputs::kafka::record_batches(&settings, &all)? {
+                let (telemetry, _) = decode.handles("kafka_in");
+                let mut decoded = logit_inputs::kafka::decode_record_batches(
+                    kafka_in_format(&settings, &topic)?,
+                    &topic,
+                    0,
+                    &bytes,
+                    MAX_RECORDS_BYTES,
+                    decode.received_at,
+                    telemetry,
+                )
+                .with_context(|| format!("kafka_in refused the records of topic {topic:?}"))?;
+                // The OTLP encoder stamps a log with no observed time with the wall clock
+                // (`crates/logit-proto/src/otlp/logs.rs`); the run's clock stands in for it.
+                if otlp {
+                    for event in decoded.iter_mut().flat_map(|b| b.events.iter_mut()) {
+                        if let Some(log) = event.log.as_mut() {
+                            if (before..=after).contains(&log.observed_timestamp) {
+                                log.observed_timestamp = decode.received_at;
+                            }
+                        }
+                    }
+                }
+                out.extend(decoded);
             }
         }
         SinkEncoder::PrometheusRemoteWrite { mut encoder, version, compression } => {
@@ -388,21 +406,26 @@ pub(super) fn round_trip(
     Ok(out)
 }
 
-/// A `format: text` record read back by the driver's convention (module doc): one log whose
-/// message is `value`, stamped at `millis`.
-fn text_record(value: &[u8], millis: i64) -> Event {
-    let message = match std::str::from_utf8(value) {
-        Ok(text) => Value::str(text),
-        Err(_) => Value::Bytes(Bytes::copy_from_slice(value)),
-    };
-    let record = LogRecord {
-        message,
-        severity: None,
-        body_format: BodyFormat::Raw,
-        trace: None,
-        event_name: None,
-        observed_timestamp: 0,
-        dropped_attributes_count: 0,
-    };
-    Event::log(millis.saturating_mul(1_000_000), logit_core::AttrMap::new(), record)
+/// The `kafka_in` format that reads `settings`' records on `topic`: the sink's own `format:`, a
+/// `text` batch record's lines under `record: batch`, and under an OTLP format the signal each
+/// topic of `topics:` carries.
+fn kafka_in_format(settings: &KafkaSettings, topic: &str) -> anyhow::Result<KafkaInFormat> {
+    let batch = settings.record == Some(RecordMode::Batch);
+    Ok(match settings.format {
+        RecordFormat::Json => KafkaInFormat::Json,
+        RecordFormat::Msgpack => KafkaInFormat::Msgpack,
+        RecordFormat::Native => KafkaInFormat::Native,
+        RecordFormat::Text => KafkaInFormat::Text { batch },
+        RecordFormat::OtlpProto | RecordFormat::OtlpJson => {
+            let topics = settings.topics.as_ref().with_context(|| {
+                format!("kafka_out's topic {topic:?} carries every signal, which no reader can tell apart")
+            })?;
+            let topics = vec![
+                (topics.logs.clone(), Signal::Logs),
+                (topics.metrics.clone(), Signal::Metrics),
+                (topics.traces.clone(), Signal::Traces),
+            ];
+            KafkaInFormat::Otlp { json: settings.format == RecordFormat::OtlpJson, topics }
+        }
+    })
 }

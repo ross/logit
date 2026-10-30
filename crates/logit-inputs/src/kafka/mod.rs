@@ -72,6 +72,17 @@
 //!
 //! `kafka_out` leaves them out of what it writes, its own family's carriers
 //! ([ADR `protocol-knowledge-stays-in-family`](../../../../docs/adr/protocol-knowledge-stays-in-family.md)).
+//!
+//! # The `kafka_in -> kafka_out` pair
+//!
+//! The pair relays losslessly under `json`, `msgpack`, `native`, and the two OTLP formats, and
+//! under `text` for a log whose body is a string and that carries nothing else. Its permitted
+//! normalizations are record boundaries, partition and offset, these carriers, the record
+//! timestamp, compression, a native frame's attribute order, an aborted transaction's records,
+//! and `otlp_in -> otlp_out`'s own; [ADR `kafka-input`](../../../../docs/adr/kafka-input.md),
+//! item 13, is the canonical list. A record's key and headers don't relay: `kafka_out` writes its
+//! own, which `docs/known-gaps/kafka.md` keeps as debt. [`decode_record_batches`] is the decoding
+//! the transit spec reads `kafka_out`'s records back through.
 
 mod decode;
 mod input;
@@ -79,5 +90,5 @@ mod input;
 #[cfg(test)]
 mod tests;
 
-pub use decode::KafkaInFormat;
+pub use decode::{decode_record_batches, KafkaInFormat};
 pub use input::{KafkaInSettings, KafkaInput};

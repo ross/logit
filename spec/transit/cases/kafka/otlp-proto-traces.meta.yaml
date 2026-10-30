@@ -1,0 +1,5 @@
+# kafka_out's records under format: otlp_proto, compression: snappy, on its default traces topic:
+# one export request per batch of cases/otlp-traces/fields.json and kinds.json.
+wire: otlp-proto-traces.segment
+kafka: {format: otlp_proto, topic: otlp_spans}
+exercises: [format_otlp_proto, carriers, compression_snappy]

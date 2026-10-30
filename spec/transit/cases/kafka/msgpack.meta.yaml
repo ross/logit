@@ -1,0 +1,7 @@
+# kafka_out's records under format: msgpack, record: event, compression: lz4: the events of
+# cases/otlp/sums.json, gauges.json, histograms.json, exponential-histograms.json, and
+# summary.json, cases/otlp-logs/bodies.json and fields.json, cases/otlp-traces/fields.json, and
+# cases/statsd-logs/event.json and payload-less.json, one record each, in one record batch.
+wire: msgpack.segment
+kafka: {format: msgpack}
+exercises: [format_msgpack, carriers, compression_lz4]

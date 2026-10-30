@@ -161,7 +161,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Revisit trigger:** an operator whose topics come and go by a naming pattern.
 - **A record relayed through `kafka_in` and `kafka_out` loses its key and headers.** `kafka_in`
   keeps them as the `_logit.kafka.key` and `_logit.kafka.headers` carriers, and `kafka_out` leaves
-  every `_logit.kafka.*` carrier out and writes neither back ([ADR `kafka-input`](../adr/kafka-input.md), item 11).
+  every `_logit.kafka.*` carrier out and writes neither back ([ADR `kafka-input`](../adr/kafka-input.md), item 11). The transit spec reads it as `attributes/kafka_key_headers`, `lost` and uncounted at `kafka_out`.
   - **Consequence:** the relayed record goes to the partition `kafka_out`'s own `key:` picks, with
     its own `headers:`, so a consumer that partitions or routes on the source key or a header
     sees neither.

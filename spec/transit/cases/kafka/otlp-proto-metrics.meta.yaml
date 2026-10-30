@@ -1,0 +1,6 @@
+# kafka_out's records under format: otlp_proto, compression: snappy, on its default metrics topic:
+# one export request per batch of cases/otlp/sums.json, gauges.json, histograms.json,
+# exponential-histograms.json, and summary.json.
+wire: otlp-proto-metrics.segment
+kafka: {format: otlp_proto, topic: otlp_metrics}
+exercises: [format_otlp_proto, carriers, compression_snappy]

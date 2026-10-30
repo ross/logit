@@ -494,8 +494,9 @@ Under [ADR `lossless-transit`](lossless-transit.md), `kafka_in -> kafka_out` rel
 - Partition and offset: a relayed record lands where the relay's partitioner puts it.
 - The carriers of item 12, added on the way in and never written into a payload.
 - The record timestamp: a relay stamps a record with its event's timestamp, or its first event's,
-  as `CreateTime`, so a source record's `LogAppendTime`, or a `CreateTime` that differed from its
-  payload's timestamp, isn't kept.
+  as `CreateTime`, or under an OTLP format with the time it encoded the record, as the Collector's
+  exporter does, so a source record's `LogAppendTime`, or a `CreateTime` that differed from that,
+  isn't kept.
 - Compression: a relay writes its own `compression:`, and a xerial-framed snappy batch leaves as
   raw snappy.
 - A native frame's attribute order, which is process-local interning order
@@ -508,8 +509,8 @@ Under [ADR `lossless-transit`](lossless-transit.md), `kafka_in -> kafka_out` rel
 that the relay doesn't write until `kafka_out` restores them from the carriers; until then they're
 residual debt in `docs/known-gaps/kafka.md`, not a normalization.
 
-The transit spec gains `kafka_in` as a source, and its `kafka_out` read-back convention becomes the
-pair's decoder.
+The transit spec reads `kafka_out`'s records back through `kafka_in`'s decoding, in every format,
+and checks the pair as one `kafka-relay-<format>` flow per format.
 
 ### 14. Config
 

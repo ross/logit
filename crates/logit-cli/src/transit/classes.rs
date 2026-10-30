@@ -38,7 +38,8 @@
 //! to weight 1 the field row `record/sample_rate_unweighted` for its rate, left out the same way.
 //! It reaches an
 //! `attributes` row for each attribute, event or resource: a `_logit.<protocol>.` carrier of the
-//! sink's own protocol is `private_carrier`, `_logit.prometheus.target` `prometheus_target` and
+//! sink's own protocol is `private_carrier` (at `kafka_out`, `_logit.kafka.key` and
+//! `_logit.kafka.headers` are `kafka_key_headers` instead), `_logit.prometheus.target` `prometheus_target` and
 //! `_logit.metrics.closed: "timestamped"` `timestamped` at every sink, on a metric record
 //! `_logit.metrics.type: "rate"` `rate` on a `gauge` and `rate_on_non_gauge` on any other kind,
 //! `_logit.metrics.type: "info"` or `"stateset"` on a `gauge` and `"gaugehistogram"` on a
@@ -255,6 +256,10 @@ use logit_proto::prometheus::{sanitize_label_name, sanitize_metric_name, ATTR_TA
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
+
+/// The `_logit.kafka.*` carriers of a record's key and headers, the row `kafka_key_headers`.
+const KAFKA_KEY: &str = "_logit.kafka.key";
+const KAFKA_HEADERS: &str = "_logit.kafka.headers";
 
 /// Body keys checked by `record` field rows, not by the record's own comparison.
 const FIELD_KEYS: [&str; 6] =
@@ -508,7 +513,8 @@ enum Spelling {
     Splunk,
     /// `kafka_out` under `format: text`: a log's message as `text_body` writes it, read back as a
     /// `Str`, or `Bytes` where it isn't UTF-8; no attribute, resource, or other log field at all.
-    /// Under `format: json`, `kafka_out` is [`Spelling::Verbatim`].
+    /// Under `format: json`, `msgpack`, and `native`, `kafka_out` is [`Spelling::Verbatim`], and
+    /// under `otlp_proto` and `otlp_json` [`Spelling::Otlp`].
     KafkaText,
     /// Any other sink: names, keys, and values as written.
     Verbatim,
@@ -537,6 +543,11 @@ impl Spelling {
             },
             "splunk_hec_out" => Spelling::Splunk,
             "kafka_out" if config["format"] == "text" => Spelling::KafkaText,
+            "kafka_out"
+                if matches!(config["format"].as_str(), Some("otlp_proto" | "otlp_json")) =>
+            {
+                Spelling::Otlp
+            }
             _ => Spelling::Verbatim,
         }
     }
@@ -643,8 +654,8 @@ impl Spelling {
     /// message as an `AnyValue`. `syslog_out` writes [`logit_outputs::syslog::wire_message`],
     /// which `syslog_in` reads back as a `Str`, or as `Bytes` where it isn't UTF-8, and under RFC
     /// 3164 with any header token it doesn't read as a header ([`syslog::read`]). `kafka_out`'s
-    /// `format: text` writes [`logit_outputs::kafka::text_body`], read back by the driver's
-    /// convention as a `Str`, or as `Bytes` where it isn't UTF-8.
+    /// `format: text` writes [`logit_outputs::kafka::text_body`], which `kafka_in` reads back as
+    /// a `Str`, or as `Bytes` where it isn't UTF-8.
     fn log_message(self, rec: &Rec) -> Option<String> {
         if rec.kind != "log" {
             return None;
@@ -3074,6 +3085,9 @@ fn field_rows_under(
             Some("severity_carrier_syslog")
         } else if key.starts_with("_logit.datadog.") && json_route {
             Some("datadog_carrier_log")
+        } else if protocol == "kafka" && (key == KAFKA_KEY || key == KAFKA_HEADERS) {
+            // The record's key and headers, which `kafka_out` writes from its config alone.
+            Some("kafka_key_headers")
         } else if key.starts_with(&own) || (protocol == "influxdb" && is_field(key)) {
             // The field namespace isn't protocol-owned, so the own-prefix test misses it, and
             // `influxdb_out` is the one sink that writes it.
@@ -3905,6 +3919,13 @@ pub(super) fn check(
             }
             seen
         } else {
+            // A `format: text` record holds a log body alone, so `kafka_out` writes no metric
+            // record: the rows of the log or span beside it, or of the event, account for its
+            // metrics (`log/beside_metrics`, `span/beside_metrics`), and a metric row has no
+            // `format: text` cell.
+            if spelling == Spelling::KafkaText && input.is_metric() {
+                continue;
+            }
             // Record level.
             let mut rows: Vec<(String, Option<String>)> =
                 kind_features(input).into_iter().map(|f| (input.kind.clone(), f)).collect();

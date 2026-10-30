@@ -1,0 +1,31 @@
+# The Kafka wire features a case under cases/kafka/ can exercise: record batch v2 as
+# crates/logit-proto/src/kafka/record.rs decodes it, each record's value in a `kafka_in` format
+# (crates/logit-inputs/src/kafka/decode.rs), and the `_logit.kafka.*` carriers every event gets.
+# `format: text` cases are cases/kafka-text/'s (features/kafka-text.yaml). A case names the ones
+# it exercises in its `.meta.yaml`.
+- name: format_json
+  text: '`format: json`: one event JSON object per record.'
+- name: format_json_batch
+  text: '`format: json` under `record: batch`: several event JSON objects as NDJSON lines in one record.'
+- name: format_msgpack
+  text: '`format: msgpack`: one event as a MessagePack map per record.'
+- name: format_native
+  text: '`format: native`: one `CODEC_BATCH` frame per record.'
+- name: format_otlp_proto
+  text: '`format: otlp_proto`: one protobuf OTLP export request per record, its signal its topic''s.'
+- name: format_otlp_json
+  text: '`format: otlp_json`: one OTLP/JSON export request per record, its signal its topic''s.'
+- name: compression_none
+  text: An uncompressed record batch.
+- name: compression_gzip
+  text: A gzip-compressed record batch.
+- name: compression_snappy
+  text: A raw Snappy block, as `kafka_out` and librdkafka write one.
+- name: compression_lz4
+  text: An LZ4 frame.
+- name: compression_zstd
+  text: A zstd frame.
+- name: carriers
+  text: >-
+    Each event's `_logit.kafka.topic`, `partition`, `offset`, `timestamp`, and `timestamp_type`
+    carriers.

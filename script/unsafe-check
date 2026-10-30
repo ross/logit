@@ -115,13 +115,21 @@ TARGET_VOLUME="${UNSAFE_CHECK_TARGET_VOLUME:-logit_unsafe_check_target}"
 # by doubling, measured in the robustness suite's log-message section under 16: `message_json`'s
 # `{"a":[0,0,…]}` at 1.25 MiB, `message_csv`'s 65,537 empty fields at 3 MiB, `message_logfmt`'s
 # one-byte barewords at 1.5 MiB, and `message_kv`'s at 2 MiB. `message_csv` needs no fork mode
-# because the split interns nothing. `extra args` go to `fuzz` only, never to `fuzz-tmin`.
+# because the split interns nothing. `kafka_batch`'s `max_len` is twice its 64 KiB decompression
+# bound, so an uncompressed records section reaches the bound too. Its largest allocation is the
+# LZ4 frame decoder's output buffer, which an LZ4 frame header declaring linked 4 MiB blocks
+# sizes at twice that plus a 64 KiB window, whatever the payload holds; the records and headers
+# `Vec`s sized from a section at the bound stay near 2 MiB. It needs no fork mode because the
+# record decoder interns nothing. `msgpack_event`'s worst input, the smallest event map
+# (`timestamp` alone, about 40 bytes) repeated, is under 2,048 864-byte `Event`s in one batch's
+# `Vec`, under 2 MiB. `extra args` go to `fuzz` only, never to `fuzz-tmin`.
 #
 # `native_batch`, `native_hop_batch`, `statsd`, `syslog`, `graphite_plaintext`,
 # `graphite_pickle`, `collectd`, `influxdb_line`, `prom_text`, `prom_remote_write`, `message_json`,
-# `message_logfmt`, and `message_kv` run in fork mode: the process-wide interner never evicts, so
-# a long-lived fuzz process accumulates every dictionary string, metric name, tag key, SD-ID,
-# PARAM-NAME, carbon path, InfluxDB metric name, Prometheus exemplar label name and family name, and log-message key it
+# `message_logfmt`, `message_kv`, and `msgpack_event` run in fork mode: the process-wide interner
+# never evicts, so a long-lived fuzz process accumulates every dictionary string, metric name, tag
+# key, SD-ID, PARAM-NAME, carbon path, InfluxDB metric name, Prometheus exemplar label name and
+# family name, log-message key, and MessagePack event attribute key it
 # decodes until the arena outgrows the malloc limit, and fork mode restarts the process. `-ignore_ooms=0` keeps an out-of-memory in a child fatal, as it
 # is outside fork mode.
 FUZZ_TARGETS=(
@@ -152,6 +160,8 @@ FUZZ_TARGETS=(
     "message_csv|65537|16|"
     "message_logfmt|65537|16|-fork=1 -ignore_ooms=0"
     "message_kv|65537|16|-fork=1 -ignore_ooms=0"
+    "kafka_batch|131072|16|"
+    "msgpack_event|65536|16|-fork=1 -ignore_ooms=0"
 )
 
 # The sanitizer builds' RUSTFLAGS differ from miri's and careful's, so they get their own volume

@@ -212,3 +212,17 @@ path = "fuzz_targets/message_kv.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "kafka_batch"
+path = "fuzz_targets/kafka_batch.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "msgpack_event"
+path = "fuzz_targets/msgpack_event.rs"
+test = false
+doc = false
+bench = false

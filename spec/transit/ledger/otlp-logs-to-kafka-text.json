@@ -41,7 +41,5 @@
     {"sink":"kafka_out","row":"span/beside_log","cell":0,"observed":["lost"]},
     {"sink":"kafka_out","row":"span/not_datadog_origin","cell":0,"observed":[]}
   ],
-  "unspecified": [
-    {"sink":"kafka_out","row":"gauge/i64","reached_by":["otlp-logs-to-kafka-text × beside-metrics"]}
-  ]
+  "unspecified": []
 }

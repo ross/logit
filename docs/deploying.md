@@ -4156,7 +4156,10 @@ accepted, `logit.output.records.dropped{reason}`, `logit.output.records.unkeyed`
 `format: text`, `logit.output.events.skipped{reason="no_log"}` and the `metrics.omitted` and
 `spans.omitted` counts, and under `format: otlp_proto` or `otlp_json`,
 `logit.output.metrics.skipped`, `logit.output.metrics.dropped`, and
-`logit.output.metrics.degraded` for metrics OTLP can't carry as they are.
+`logit.output.metrics.degraded` for metrics OTLP can't carry as they are,
+`logit.output.events.skipped{reason="no_payload"}` for events with no log, span, or metric, and
+`logit.output.attributes.normalized{reason="u64_as_double"}` for `u64` attribute values written as
+a double, each once per batch.
 `docs/design/internal-telemetry.md`'s `kafka_out` section has every counter.
 
 ## `kafka_in`: consuming from Kafka
