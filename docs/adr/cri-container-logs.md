@@ -1,6 +1,6 @@
 ---
 created: 2026-10-29
-updated: 2026-10-29
+updated: 2026-10-30
 ---
 
 # `cri_in`: Kubernetes container logs from `/var/log/pods`, on `tail_in`'s driver
@@ -37,15 +37,16 @@ reader (`staging/src/k8s.io/cri-client/pkg/logs/logs.go`, `parseCRILog`):
 <timestamp> SP <stdout|stderr> SP <tag>[:<tag>...] SP <content> LF
 ```
 
-The first tag is `P` (a piece of a longer line) or `F` (a full line, or the last piece of one). The
-kubelet reads only the first tag and ignores the rest. Content holds no LF, may hold `\r` and bytes
-that aren't UTF-8, and may be empty.
+The runtimes write a first tag of `P` (a piece of a longer line) or `F` (a full line, or the last
+piece of one). The kubelet reads only the first tag: `P` is partial, and any other value, empty
+included, is a full line ("Keep this forward compatible"). It ignores further tags. Content holds no
+LF, may hold `\r` and bytes that aren't UTF-8, and may be empty.
 
 **The two runtimes differ in ways a reader sees:**
 
 | | containerd (`internal/cri/io/logger.go`) | CRI-O (conmon, `src/ctr_logging.c`) |
 |---|---|---|
-| Timestamp | RFC 3339 with 0 to 9 fraction digits (trailing zeros trimmed), node-local zone, `Z` when the node runs in UTC | 9 fraction digits, node-local zone, always a numeric offset (`+00:00`, never `Z`) |
+| Timestamp | RFC 3339 with 0 to 9 fraction digits (trailing zeros trimmed), node-local zone, `Z` whenever the local offset is zero (Go's `time.RFC3339Nano` writes `Z` for a zero offset, not only for UTC) | 9 fraction digits, node-local zone, always a numeric offset (`+00:00`, never `Z`) |
 | When it writes `P` | a line over `max_container_log_line_size` (16 KiB by default; `-1` or `0` means no limit) in pieces of that size; the unterminated rest of a stream at EOF | each `read(2)` of at most 8 KiB that didn't end in a newline, so a short line can arrive as `P` then `F` |
 | A cut inside a UTF-8 sequence | yes: the size cut counts bytes | yes: a `read(2)` boundary |
 | CRLF | strips the `\r` before the `\n` | keeps it in content |
@@ -53,7 +54,7 @@ that aren't UTF-8, and may be empty.
 
 A third runtime path, cri-dockerd, makes `/var/log/pods/.../<n>.log` a symlink to Docker's own
 json-file log, so the file under that name holds Docker JSON lines, not CRI lines (cri-dockerd's
-`core/container_start.go`, `createContainerLogSymlink`).
+`createContainerLogSymlink`, defined in `core/logs.go` and called from `core/container_start.go`).
 
 **Rotation.** The kubelet's `ContainerLogManager` (`pkg/kubelet/logs/container_log_manager.go`)
 checks each running container's file every `containerLogMonitorInterval` (10 s by default). Over
@@ -152,9 +153,10 @@ other decoders of untrusted bytes and get a fuzz target, a seed set, and a `FUZZ
 - **Timestamp:** `logit_core::parse_rfc3339_to_nanos`, which takes 0 to 9 fraction digits and `Z` or
   a numeric offset, both runtimes' forms.
 - **Stream:** `stdout` or `stderr`; anything else is malformed, as the kubelet rejects it.
-- **Tag:** the field up to the next space, split on `:`; the first tag must be `P` or `F`, and any
-  further tags are ignored, as the kubelet ignores them. An empty first tag, or any other value, is
-  malformed.
+- **Tag:** the field up to the next space, split on `:`. A first tag of `P` is partial, and any
+  other first tag, empty included, is a full line, the kubelet's rule; further tags are ignored. A
+  record is malformed only when its fields aren't there or its stream is unknown, never for its tag,
+  so `cri_in` delivers every record `kubectl logs` shows.
 - **Content:** every byte after the tag's space. The space must be there, even for empty content.
 
 **A trailing `\r` will stay in the content.** For an `F` record it's a CRLF line's `\r`, which CRI-O
@@ -180,15 +182,30 @@ the two streams inside a run. The state and its rules will follow `DockerDecoder
 - **Bound:** `max_line_bytes` (1 MiB by default) bounds the reassembled content, checked before each
   append, so a held run never exceeds it. A line over it is dropped whole, counted
   `logit.input.frames.dropped{reason="oversize"}` once with a `long_line` diagnostic, and its later
-  pieces are discarded until its `F`. The line splitter's own bound is `max_line_bytes` plus room
-  for one record's header, so a record whose content fits is never dropped by the splitter.
+  pieces are discarded until its `F`.
+- **The splitter's bound and its drops:** the line splitter is bounded by
+  `envelope_cap(max_line_bytes)`, the bound `docker_in` uses (`6 × max(max_line_bytes, 16 KiB)` plus
+  64 KiB), so a Docker-format file (section 9) gets `docker_in`'s bound, and every containerd piece
+  at its default 16 KiB and every CRI-O piece reaches the decoder whatever `max_line_bytes` is. A
+  record over that bound (a containerd piece under a raised or unlimited
+  `max_container_log_line_size`) is dropped by the splitter before the decoder sees it, so the
+  splitter hands the decoder the dropped record's leading bytes through a new `TailDecoder` hook
+  (Implementation notes for W2). From them the decoder reads the record's stream and tag, drops that
+  stream's held run, discards every later piece of the stream through its `F` (none when the dropped
+  record is itself the `F`), and counts the whole line once as `frames.dropped{reason="oversize"}`,
+  with one `long_line`. A stream already dropping its line isn't counted again. When the leading
+  bytes don't parse, the decoder flushes both streams' held runs, as before a malformed record, and
+  the driver counts the drop as it does today. Without the hook, the tail of a line whose middle the
+  splitter dropped would leave as a line of its own, and each dropped piece would count once.
 - **Checkpoint:** while a run is held, `holds_entry` pins the checkpoint at the run's first record,
   so a crash replays the whole line. As for `docker_in`, the pin is the oldest held record across
   both streams.
-- **Clean stop:** `hold_at_shutdown` is true. With a checkpoint configured, an `Active` file's held
-  runs and unterminated last record aren't emitted at a clean stop; the restart reads them whole
-  (the file-tailing ADR's "Amendment: `docker_in` holds its unterminated tail and held fragments at
-  a clean stop (2026-10-08)").
+- **Clean stop:** `hold_at_shutdown` is true, so an `Active` file's unterminated last record is
+  never decoded at a clean stop; the checkpoint, when there is one, stays at its start. Its held
+  runs are kept unemitted only when a checkpoint is configured, so the restart reads them whole;
+  with no checkpoint, nothing would re-read them, so they're emitted as they stand (the file-tailing
+  ADR's "Amendment: `docker_in` holds its unterminated tail and held fragments at a clean stop
+  (2026-10-08)", and `close_all_for_shutdown` in `tail/driver.rs`).
 - **Flush:** a held run is emitted as it stands when its file closes, when its idle timer fires
   (section 5), and before a malformed record is reported.
 - **Truncation:** `reset` drops held runs, counted `frames.dropped{reason="truncated"}` once per
@@ -206,16 +223,21 @@ treats as two files, for a case that occurs once per rotation per stream with a 
 
 ### 5. A dangling run flushes after an idle `partial_timeout`
 
-A held run whose stream has had no new record for `partial_timeout` (default `5s`) will be emitted
-as it stands. A `P` with no `F` is normal: containerd writes one when a container exits mid-line and
-at a reopen, and CRI-O writes one whenever a write was split across reads. Holding it until the file
-closes would hold it until the kubelet's container garbage collection removes the file, minutes or
-never, with the checkpoint pinned the whole time.
+A held run will be emitted as it stands once its file has had nothing new to read for
+`partial_timeout` (default `5s`). A `P` with no `F` is normal: containerd writes one when a
+container exits mid-line and at a reopen, and CRI-O writes one whenever a write was split across
+reads. Holding it until the file closes would hold it until the kubelet's container garbage
+collection removes the file, minutes or never, with the checkpoint pinned the whole time.
 
-- The timer measures read time since the run's last record, not the CRI timestamps, which are the
-  node's local clock and are written per record or per read.
-- The driver checks timers on its `poll_interval` tick, so a dangling run waits between
-  `partial_timeout` and `partial_timeout` plus one `poll_interval`.
+- The timer arms only when a read of the file reaches its end with a run held, and any read that
+  returns bytes disarms it. So a reader that is behind (a backlog after a restart, or a send blocked
+  by back-pressure) never fires it while the run's `F` is already in the file.
+- The driver checks armed timers on its `poll_interval` tick, and before it flushes, confirms
+  through the open handle's length that the file has no unread bytes; a file with unread bytes is
+  read instead. A dangling run waits between `partial_timeout` and `partial_timeout` plus one
+  `poll_interval`.
+- The timer runs on the process's monotonic clock, not the CRI timestamps, which are the node's
+  local clock and are written per record or per read.
 - A flush also ends an oversize drop in progress, so the stream's next record starts a new line.
 - `partial_timeout: 0s` turns the timer off: a run waits for its `F` or for the file to close.
 - A timer flush counts `logit.input.frames.truncated{reason="partial_timeout"}`. It isn't loss, so
@@ -225,8 +247,9 @@ never, with the checkpoint pinned the whole time.
   their writers. A flush at a file's close or before a malformed record isn't counted, as
   `docker_in` counts neither.
 
-A writer that stalls mid-line for longer than `partial_timeout` has its line split in two at the
-stall. That's the price of not holding every exited container's last line until its file is removed.
+The one case left that splits a line is a writer that stalls mid-line for longer than
+`partial_timeout`: its line leaves as two events, split at the stall. That's the price of not
+holding every exited container's last line until its file is removed.
 
 ### 6. Event time is the first record's timestamp
 
@@ -259,10 +282,12 @@ common keys (2026-10-23)"). `k8s.container.restart_count` is an integer, the sem
 type, although the OpenTelemetry Collector's `container` operator writes the directory text as a
 string; `i64` rather than `u64` keeps it an OTLP integer at `otlp_out`.
 
-**A static pod's `k8s.pod.uid` isn't its API uid.** For a pod from a manifest file, the kubelet sets
-the uid to a hash of the manifest (`pkg/kubelet/config/common.go`, `applyDefaults`), and the API
-server's mirror pod gets a uid of its own. The path's uid is the one `cri_in` will write. A consumer
-joining to the API's pod objects matches a static pod by namespace and name.
+**A static pod's `k8s.pod.uid` isn't its API uid.** For a static pod whose manifest sets no uid, the
+kubelet sets one: an FNV-128a hash of the decoded pod object, then the node name and the manifest's
+file path for a file source, or its URL for a URL source (`pkg/kubelet/config/common.go`,
+`applyDefaults`). The API server's mirror pod gets a uid of its own. The path's uid is the one
+`cri_in` will write. A consumer joining to the API's pod objects matches a static pod by namespace
+and name.
 
 ### 8. `container.id` from the `/var/log/containers` symlinks, best effort
 
@@ -287,10 +312,18 @@ target lets a `root:` mounted at another path still match.
 
 `cri_in` will latch each file identity's format from its first byte: `{` is Docker json-file, and
 anything else is CRI. A Docker-format file will go through `docker_in`'s envelope decoder and its 16
-KiB partial-line reassembly, under `cri_in`'s path resource. The file under the pods name is a
-symlink there, and the driver stats and opens through it, so the identity is the target's inode, and
-a Docker rotation (a rename of the target) reads as a rotation. An empty file stays undecided until
-its first byte.
+KiB partial-line reassembly, under `cri_in`'s path resource, and the splitter bound
+`envelope_cap(max_line_bytes)` (section 4) is the one `docker_in` gives it. The file under the pods
+name is a symlink there, and the driver stats and opens through it, so the identity is the target's
+inode, and a Docker rotation (a rename of the target) reads as a rotation. An empty file stays
+undecided until its first byte.
+
+The Docker decoder will ignore the splitter-drop hook, under `cri_in` and `docker_in` alike, so the
+driver keeps counting the drop and `docs/known-gaps/tailing.md`'s "An envelope over the cap is
+dropped by the splitter without the decoder seeing it" stays open. Using the hook the same way isn't
+possible: json-file writes `stream` after `log`, so a dropped envelope's leading bytes can't name
+its stream. Under `envelope_cap`, only an `attrs` object past the bound's slack or a writer other
+than dockerd produces such an envelope.
 
 The shared decoder will count a rejected json-file entry as
 `logit.input.frames.dropped{reason="malformed"}`, as section 4 counts a CRI record, so `docker_in`
@@ -325,8 +358,8 @@ will gain the counter its `bad_line` diagnostic lacked.
 
 It will flatten `TailOptions` as `tail_in` and `docker_in` do: `checkpoint_path`, `read_from`,
 `watch`, `poll_interval`, `checkpoint_interval`, and `max_line_bytes`, the last bounding the
-reassembled line as under `docker_in`. Its `receive:` block will take the tail listeners' four
-batch-assembly fields.
+reassembled line as under `docker_in`. Its `receive:` block will take the tail listeners' three
+batch-assembly fields and `shutdown_grace`.
 
 ## Alternatives considered
 
@@ -353,11 +386,15 @@ batch-assembly fields.
 ## Consequences
 
 - New `ComponentKind::CriIn` with `root`, `containers_dir`, `partial_timeout`, and flattened
-  `TailOptions`; a graph shape rule beside `docker_in`'s; `cri_in` in `is_tail_listener`, so the
-  `receive:` and nonzero-bound rules apply to it.
-- The driver will gain two per-decoder choices, the `\r` strip and the per-line UTF-8 conversion,
-  and a timer hook a decoder uses to flush an idle run on the poll tick. `tail_in` and `docker_in`
-  will keep today's behavior.
+  `TailOptions`, and a graph shape rule beside `docker_in`'s. `cri_in` joins `is_tail_listener`,
+  which feeds the `receive:` rules (17 and 18), and joins rule 28 (positive `poll_interval`,
+  `checkpoint_interval`, and `max_line_bytes`) and rule 62 (a unique `checkpoint_path`) beside
+  `tail_in` and `docker_in`, which those two rules name by kind. Without rule 62, a `cri_in` sharing
+  a `checkpoint_path` with another tail listener would overwrite its offsets.
+- The driver will gain the hooks and choices in "Implementation notes for W2". `tail_in` and
+  `docker_in` will keep today's behavior.
+- A file's splitter can hold up to `envelope_cap(max_line_bytes)` of an unterminated record, about 6
+  MiB at the default, as `docker_in`'s can.
 - `DockerDecoder`'s envelope decoding and reassembly will become reachable from `cri_in`, and the
   shared decoder will count a rejected entry (section 9).
 - New counter uses: `logit.input.frames.truncated{reason="partial_timeout"}`, and
@@ -373,8 +410,10 @@ batch-assembly fields.
 `cri_in` lands:
 
 - **A line split across a rotation leaves as two events** (section 4).
-- **A line stalled longer than `partial_timeout` leaves as two events** (section 5).
-- **A static pod's `k8s.pod.uid` is the manifest hash, not the mirror pod's uid** (section 7).
+- **A line whose writer stalls mid-line longer than `partial_timeout` leaves as two events**
+  (section 5). A reader that is behind doesn't split one: the timer arms only at the file's end.
+- **A static pod's `k8s.pod.uid` is the kubelet's hash, not the mirror pod's uid**, unless its
+  manifest sets a uid (section 7).
 - **A symlink name the kubelet cut short writes no `container.id`**, and neither does a container
   whose link isn't there yet or was removed before `cri_in` listed it (section 8).
 - **No pod labels or annotations, and no node name** (section 10). An enrichment stage or `set` adds
@@ -385,3 +424,27 @@ batch-assembly fields.
   tail counts `gone`.
 - **Under cri-dockerd, a Docker-rotated file (`-json.log.1`) is outside `root:`**, so its unread
   tail at a restart counts `gone`, the same as `docker_in` counts it.
+
+## Implementation notes for W2
+
+The driver changes `cri_in` needs, named here so W2 builds what this record decided:
+
+- **A splitter-drop hook on `TailDecoder`:** `fn line_dropped(&mut self, head: &[u8], start: u64,
+  out: &mut Vec<Event>) -> bool`, with a default that returns `false`. `LineSplitter` keeps the
+  first bytes of each line it drops (enough for a record's timestamp, stream, and first tag; 128
+  bytes) and reports each drop in sequence with the line's start offset, between the lines it emits.
+  The driver calls the hook for each drop. It returns `true` when the decoder counted the drop and
+  sent `long_line` itself, so the driver counts neither, and `false` when the driver counts as it
+  does today. The driver then updates `held_from` from `holds_entry`, as after `decode_line`, so a
+  checkpoint during the drop stays at the line's first record. `CriDecoder` implements it (section
+  4); `DockerDecoder` and `LineDecoder` keep the default (section 9).
+- **An idle-flush hook on `TailDecoder`:** `fn flush_idle(&mut self, out: &mut Vec<Event>)`, default
+  a no-op, which the driver calls on the poll tick for a file whose idle timer has expired (section
+  5). The driver owns the timer: armed when a read reaches the file's end while `holds_entry` is
+  true, disarmed by any read that returns bytes, and checked against the open handle's length before
+  the call.
+- **Per-decoder choices:** whether the splitter strips one trailing `\r`, and whether the driver
+  lossily converts each line to UTF-8 before `decode_line` (section 3). Both default to today's
+  behavior.
+- **The splitter bound** comes from the kind, as `docker_in`'s does: `envelope_cap(max_line_bytes)`
+  for `cri_in`.
