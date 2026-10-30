@@ -520,6 +520,75 @@ mod tests {
         got.remove(0)
     }
 
+    /// The reason a one-record batch over `body` (one record's fields, unframed) fails with.
+    fn record_failure(body: &[u8], count: i32) -> String {
+        let mut section = Vec::new();
+        varint(&mut section, body.len() as i64);
+        section.extend_from_slice(body);
+        one(batch(0, count, &section)).unwrap_err().reason
+    }
+
+    /// A record's fields up to its header count: attributes, timestamp and offset deltas, and a
+    /// null key and value.
+    fn fields(header_count: i64) -> Vec<u8> {
+        let mut body = vec![0u8];
+        varint(&mut body, 0);
+        varint(&mut body, 0);
+        field(&mut body, None);
+        field(&mut body, None);
+        varint(&mut body, header_count);
+        body
+    }
+
+    /// The bound keeps `Vec::with_capacity` from sizing itself by the header's count.
+    #[test]
+    fn a_record_count_the_section_cant_hold_is_refused_before_reading() {
+        let reason = record_failure(&fields(0), 1_000);
+        assert!(reason.contains("record count exceeds the records section"), "{reason}");
+    }
+
+    #[test]
+    fn a_header_count_the_record_cant_hold_is_refused_before_reading() {
+        let reason = record_failure(&fields(50), 1);
+        assert!(reason.contains("header count exceeds the record"), "{reason}");
+    }
+
+    /// Java refuses a record whose fields end before its declared length.
+    #[test]
+    fn a_record_with_bytes_left_inside_its_length_is_refused() {
+        let mut body = fields(0);
+        body.push(0);
+        let reason = record_failure(&body, 1);
+        assert!(reason.contains("record shorter than its declared length"), "{reason}");
+    }
+
+    /// Six bytes encoding 0 for the offset delta, one past an `int32` varint's five.
+    #[test]
+    fn a_varint_over_five_bytes_is_refused() {
+        let mut body = vec![0u8];
+        varint(&mut body, 0);
+        body.extend_from_slice(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x00]);
+        field(&mut body, None);
+        field(&mut body, None);
+        varint(&mut body, 0);
+        let reason = record_failure(&body, 1);
+        assert!(reason.contains("varint too long"), "{reason}");
+    }
+
+    /// A timestamp delta whose tenth byte carries more than the 64th bit.
+    #[test]
+    fn a_varlong_past_64_bits_is_refused() {
+        let mut body = vec![0u8];
+        body.extend_from_slice(&[0xff; 9]);
+        body.push(0x02);
+        varint(&mut body, 0);
+        field(&mut body, None);
+        field(&mut body, None);
+        varint(&mut body, 0);
+        let reason = record_failure(&body, 1);
+        assert!(reason.contains("varint overflows 64 bits"), "{reason}");
+    }
+
     fn kind(b: Vec<u8>) -> BatchErrorKind {
         one(b).unwrap_err().kind
     }
