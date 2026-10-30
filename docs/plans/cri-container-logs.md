@@ -16,9 +16,9 @@ plan says which workstream landed each one and how it's tested.
 
 Goals:
 
-- `cri_in` reads every container's log under `root:`, reassemble `P` runs per file and stream,
-  and stamp the path's pod and container identity, with `container.id` where the kubelet's symlink
-  names it.
+- `cri_in` reads every container's log under `root:`, reassembles `P` runs per file and stream,
+  and stamps the path's pod and container identity, with `container.id` where the kubelet's
+  symlink names it.
 - A node using cri-dockerd works with the same config.
 - The parser is fuzzed, the decoder is checked against files a real kubelet and runtime wrote, and
   a soak run rotates files the way the kubelet does while lines are in flight.
@@ -87,9 +87,9 @@ running service. Each regression test was run once with its fix reverted, and th
   `crates/logit-inputs/tests/cri_interop.rs` replays each tree through `cri_in` and checks the
   reassembled lines against what the pods wrote (`tools/record-fixtures/cri/pods.yaml`).
 - **W6, soak.** `cri-rotate` runs on the `cri` wire, which reads like the `file` wire but from a CRI
-  writer: the writer produces CRI records into a pods tree shared with the SUT, and the scenario's steps rename the live file to the kubelet's rotated
-  name, reopen the writer, and gzip the previous rotated file, while the SUT runs, is stopped, and
-  is killed. The ledger judges `cri_in`'s lines against the writer's, with a dangling run
+  writer: the writer produces CRI records into a pods tree shared with the SUT, and rotates the
+  live file the kubelet's way on its own timer, while the scenario's steps pause, stop, restart,
+  and kill the SUT. The ledger judges `cri_in`'s lines against the writer's, with a dangling run
   flushed by `partial_timeout` and a run split at a rotation each counted as the ADR says. The
   writer is a small one of its own, `tools/soak/soaklib/criwriter.py`, since `file_out` can't
   write CRI records, split a line into pieces, or rotate the kubelet's way. It reports its
