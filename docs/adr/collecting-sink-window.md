@@ -6,7 +6,9 @@ updated: 2026-10-30
 # Collecting sink window: a windowed sink keeps its window open across arrivals until its own bound, a deadline, store pressure, or shutdown closes it
 
 ## Status
-Accepted. Nothing is built yet; [the plan](../plans/s3-object-archive.md)'s W2 builds it.
+Accepted. Built in W2 of [the plan](../plans/s3-object-archive.md); no sink collects until
+`s3_out` (W3). "Implementation notes (2026-10-30)", below, records what W2 decided that this
+ADR left open.
 
 Extends [ADR `native-hop-send-window`](native-hop-send-window.md)'s decision 4, where the fill
 ends once `peek_at` returns `None`, for a sink that says it's still collecting. A sink that
@@ -256,3 +258,35 @@ them.
   [`docs/design/memory.md`](../design/memory.md) records a collecting sink's cost once W3
   measures it. Graph rule 35's text in [`docs/design/pipeline-graph.md`](../design/pipeline-graph.md)
   changes with W2.
+
+## Implementation notes (2026-10-30)
+
+W2 settled these, which the decisions above leave open:
+
+- **What makes a window a collecting one.** The loop reads `collecting()` after the head's
+  submit. A `Some` there opens a collecting window; a `None` leaves the ordinary fill, which ends
+  at the first empty `peek_at`, so a sink that closes its window at its first batch gets no wait.
+- **The order of the checks before each submit past the head:** `collecting()` reading `None`
+  (`full`), the deadline passed, the memory bound, then pressure. The deadline is checked even
+  when the store has a batch ready, so a store that never empties can't hold a window open past
+  its deadline. Only then does an empty `peek_at` wait (decision 2), and after the shutdown signal
+  it closes the window instead (`shutdown`).
+- **A window a submit failure ends isn't counted** in `logit.component.window.closed`: it never
+  completes, and the loop reopens it from the head (decision 2's poisoned window), whose close is
+  counted.
+- **An owed-count round** is one that starts after a collecting window closed, with some of its
+  batches still outstanding, and with `window()` reading other than `usize::MAX`. The loop keeps
+  the first fact in `InFlight` and samples `window()` before each round's `select!`.
+- **When pressure clears.** A change on either side, a commit or a push that sheds nothing and
+  leaves the store within its bounds, clears the signal once utilization is below 1 with no push
+  waiting. A store at its bound stays under pressure, so a `block` push that gets room keeps the
+  signal raised until the next commit. The memory store raises it for any push it accepts over a
+  bound, the batch that can never fit included.
+- **`buffer.max_bytes` reaches the loop** as `WriteLoopConfig::window_max_bytes`, set for every
+  sink and read only by a collecting window, so neither store carries a bound it doesn't
+  enforce.
+- **`Output::reached_destination`** takes the count the loop would have cut off, and every grace
+  cut passes through it: the `send` path's, the windowed round's, and the cut between rounds.
+  Its default returns that count, so a sink that keeps it counts what it counted before.
+- **`Output::collecting` returns a `tokio::time::Instant`**, so a test under paused time reaches
+  the deadline.

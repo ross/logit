@@ -217,7 +217,7 @@
           ]
         },
         "disk": {
-          "description": "Disk-backed durable buffering, opt-in. Omitted (the default) keeps the in-memory queue. Present, it replaces that queue with a disk spool at `disk.path`; `max_batches`/`max_bytes` are rejected at anything but their defaults alongside it, since the disk bound replaces the in-memory one.",
+          "description": "Disk-backed durable buffering, opt-in. Omitted (the default) keeps the in-memory queue. Present, it replaces that queue with a disk spool at `disk.path`. `max_batches` is rejected at anything but its default alongside it, since the disk bound replaces the in-memory one, and so is `max_bytes`, except on a sink that collects batches into one upload: there `max_bytes` still bounds the memory the batches of one upload take.",
           "default": null,
           "anyOf": [
             {
@@ -4723,7 +4723,7 @@
           ]
         },
         "max_bytes": {
-          "description": "Bound on the sum of on-disk segment sizes; replaces `buffer.max_bytes`'s role. A byte-count string. Defaults to `\"1GiB\"`; `0` is rejected.",
+          "description": "Bound on the sum of on-disk segment sizes; replaces `buffer.max_bytes` as the buffer's bound. A byte-count string. Defaults to `\"1GiB\"`; `0` is rejected.",
           "default": "1073741824",
           "type": "string"
         },

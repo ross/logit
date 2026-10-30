@@ -97,9 +97,11 @@
 //! 34. A `logit_out` `tls:` failing 24's two consistency checks (no scheme check: the endpoint is a
 //!     bare `host:port`); a `logit_in` `max_frame_bytes` of `0` or above
 //!     `MAX_SANE_UNCOMPRESSED_LEN`, which the frame reader enforces regardless.
-//! 35. A `buffer.disk:` alongside a non-default `buffer.max_batches`/`max_bytes` (disk replaces
-//!     them), a disk bound of `0` or with `segment_bytes > max_bytes`, or two sinks sharing a
-//!     literal `disk.path` (`docs/adr/disk-backed-sink-buffer.md`).
+//! 35. A `buffer.disk:` alongside a non-default `buffer.max_batches`, or a non-default
+//!     `buffer.max_bytes` on a sink that doesn't collect windows (disk replaces them; on a
+//!     collecting sink `max_bytes` bounds the window's decoded batches, and `collects_windows`
+//!     names no kind), a disk bound of `0` or with `segment_bytes > max_bytes`, or two sinks sharing a
+//!     literal `disk.path` (`docs/adr/disk-backed-sink-buffer.md` and its 2026-10-30 amendment).
 //! 36. A `has_attributes`/`drop_attributes` with an empty key, a non-finite value, or a presence
 //!     key repeated or also named in the same side's map. Nothing configured is legal: zero pairs
 //!     match vacuously, so `has_*` forwards every event and `drop_*` discards every one
@@ -1799,15 +1801,24 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
 
     // Rule 35: `buffer.disk:` (`docs/adr/disk-backed-sink-buffer.md`). Disk replaces the in-memory
     // bound rather than sizing alongside it, so a non-default `max_batches`/`max_bytes` beside it
-    // would be ignored. Zero disk bounds are impossible. Two sinks sharing a literal `disk.path`
+    // would be ignored, except `max_bytes` on a sink that collects windows, where it bounds the
+    // window's decoded batches (`collects_windows`). Zero disk bounds are impossible. Two sinks sharing a literal `disk.path`
     // would corrupt each other's spool; `DiskQueue::open`'s exclusive lock catches an aliased path
     // (`./spool` vs `spool`), since this function never resolves paths. Sorted as `(path, id)` so
     // entries sharing a path are adjacent.
     let mut disk_paths: Vec<(&str, &str)> = Vec::new();
     for (id, component) in &components {
         let Some(disk) = &component.buffer.disk else { continue };
-        if component.buffer.max_batches != BufferConfig::default().max_batches
-            || component.buffer.max_bytes != BufferConfig::default().max_bytes
+        let max_bytes_set = component.buffer.max_bytes != BufferConfig::default().max_bytes;
+        if collects_windows(&component.kind) {
+            if component.buffer.max_batches != BufferConfig::default().max_batches {
+                anyhow::bail!(
+                    "component '{id}': 'buffer.max_batches' is ignored once 'buffer.disk' is set \
+                     -- disk replaces the in-memory bound; tune 'buffer.disk.max_bytes' instead"
+                );
+            }
+        } else if component.buffer.max_batches != BufferConfig::default().max_batches
+            || max_bytes_set
         {
             anyhow::bail!(
                 "component '{id}': 'buffer.max_batches'/'buffer.max_bytes' are ignored once \
@@ -4850,6 +4861,14 @@ fn check_recover_below(id: &str, block: &str, value: f64) -> anyhow::Result<()> 
 /// (`logit-inputs::udp::UdpListener`, `docs/adr/decoupled-listener-io.md`), a Unix datagram
 /// `statsd_in` or `lines_in` included. An explicit list, not
 /// [`Role`], so a new listener kind rejects `receive:` until it is wired to a driver.
+/// Whether a sink of `kind` keeps a window open across arrivals through `Output::collecting`
+/// (`docs/adr/collecting-sink-window.md`). Rule 35 reads it: beside `buffer.disk:`, such a sink's
+/// `buffer.max_bytes` bounds its window's decoded batches. No kind does.
+fn collects_windows(kind: &ComponentKind) -> bool {
+    let _ = kind;
+    false
+}
+
 fn is_datagram_listener(kind: &ComponentKind) -> bool {
     matches!(
         kind,

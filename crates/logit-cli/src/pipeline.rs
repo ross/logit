@@ -2076,6 +2076,7 @@ fn write_config(buffer: &BufferConfig) -> WriteLoopConfig {
         },
         shutdown_grace: buffer.shutdown_grace,
         delivery_override: buffer.delivery.map(delivery_posture),
+        window_max_bytes: buffer.max_bytes,
         ..WriteLoopConfig::default()
     }
 }

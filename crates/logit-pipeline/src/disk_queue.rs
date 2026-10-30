@@ -71,7 +71,7 @@ use crate::buffer_full::{Bound, FullLabels, FullWatch, Waiting, WatchConfig};
 use crate::fanout::{BatchContext, TraceContext};
 use crate::fault::{sites, Op, Point};
 use crate::fault_io;
-use crate::queue::{Numbering, OverflowPolicy, StoreItem, SINK_QUEUE_METRICS};
+use crate::queue::{Numbering, OverflowPolicy, StoreItem, StoreWait, SINK_QUEUE_METRICS};
 use logit_core::{Diagnostics, EventBatch, Telemetry};
 use logit_proto::frame::{self, Compression};
 use logit_proto::native::{self, SeqId};
@@ -955,6 +955,11 @@ impl DiskQueue {
         self.watch.finish();
     }
 
+    /// See `SinkStore::under_pressure`.
+    pub fn under_pressure(&self) -> bool {
+        self.watch.under_pressure()
+    }
+
     /// See `SinkStore::send_limit`.
     pub(crate) fn send_limit(&self) -> &crate::buffer_full::SendLimit {
         self.watch.send_limit()
@@ -1135,7 +1140,8 @@ impl DiskQueue {
             return;
         }
         self.not_empty.notify_one();
-        self.after_change();
+        let utilization = self.after_change();
+        self.watch.ease_pressure(utilization);
     }
 
     /// Takes the active segment's write handle out of the state until the guard drops.
@@ -1783,6 +1789,38 @@ impl DiskQueue {
                 None
             }
             ReadOutcome::Unavailable => None,
+        }
+    }
+
+    /// Waits for the `n`-th record from the head, as [`DiskQueue::peek_at`] reads it, until
+    /// `deadline`: [`StoreWait::Pressure`] while the store-pressure signal is raised, checked
+    /// first, else the record once one is readable, else [`StoreWait::Closed`] once the queue is
+    /// closed, else [`StoreWait::Deadline`] at `deadline`. Reserves records `0..=n` only when it
+    /// returns the record. Cancellation-safe, as `peek_at` is: a read dropped mid-way caches
+    /// nothing.
+    pub async fn wait_at(&self, n: usize, deadline: tokio::time::Instant) -> StoreWait<StoreItem> {
+        loop {
+            // Both registered before the checks they guard, so a push, a close, or a raise that
+            // lands after a check still wakes this wait.
+            let notified = self.not_empty.notified();
+            let raised = self.watch.pressure_raised();
+            if self.watch.under_pressure() {
+                return StoreWait::Pressure;
+            }
+            if let Some(item) = self.peek_at(n).await {
+                return StoreWait::Item(item);
+            }
+            if self.closed() {
+                return StoreWait::Closed;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return StoreWait::Deadline;
+            }
+            tokio::select! {
+                () = notified => {}
+                () = raised => {}
+                () = tokio::time::sleep_until(deadline) => return StoreWait::Deadline,
+            }
         }
     }
 

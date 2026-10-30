@@ -5989,9 +5989,10 @@ pub struct BufferConfig {
     #[schemars(with = "String")]
     pub shutdown_grace: Duration,
     /// Disk-backed durable buffering, opt-in. Omitted (the default) keeps the in-memory queue.
-    /// Present, it replaces that queue with a disk spool at `disk.path`; `max_batches`/`max_bytes`
-    /// are rejected at anything but their defaults alongside it, since the disk bound replaces
-    /// the in-memory one.
+    /// Present, it replaces that queue with a disk spool at `disk.path`. `max_batches` is
+    /// rejected at anything but its default alongside it, since the disk bound replaces the
+    /// in-memory one, and so is `max_bytes`, except on a sink that collects batches into one
+    /// upload: there `max_bytes` still bounds the memory the batches of one upload take.
     #[serde(default)]
     pub disk: Option<DiskBufferConfig>,
 }
@@ -6022,8 +6023,8 @@ pub struct DiskBufferConfig {
     /// The spool directory. A relative path resolves against the config file's directory. Two
     /// sinks may not share one.
     pub path: String,
-    /// Bound on the sum of on-disk segment sizes; replaces `buffer.max_bytes`'s role. A
-    /// byte-count string. Defaults to `"1GiB"`; `0` is rejected.
+    /// Bound on the sum of on-disk segment sizes; replaces `buffer.max_bytes` as the buffer's
+    /// bound. A byte-count string. Defaults to `"1GiB"`; `0` is rejected.
     #[serde(default = "default_disk_max_bytes")]
     #[serde(with = "human_bytes")]
     #[schemars(with = "String")]

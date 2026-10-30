@@ -1017,6 +1017,12 @@ backpressure all the way back to intake instead of silently losing data. `drop_o
 `drop_newest` trade data loss for keeping intake unblocked. For a destination you know is
 unreliable, pick a policy deliberately instead of leaving the default.
 
+On a sink that collects batches into one upload, every batch in the open or uploading upload is
+held in the buffer. `drop_oldest` never sheds those, so it sheds the oldest batch behind them,
+which arrived after the upload closed: in effect the newest. A full buffer under any policy closes
+the open upload early, and `logit.component.window.closed{cause="pressure"}` counts each one. If
+that count climbs, raise the buffer's bounds.
+
 ### What to watch for sink buffering
 
 Every component exposes its delivery metrics once the config has an `internal` component
@@ -1188,7 +1194,9 @@ Use it for a sink whose destination has outages long enough, or restarts frequen
 in-memory queue's loss window is a real cost. Don't enable it on every sink by default: it costs a
 real `write` per batch (a `logit_proto::native` encode plus one file append) that an in-memory
 queue never pays. Validation rejects a non-default `buffer.max_batches`/`buffer.max_bytes`
-alongside `disk:`, because disk replaces the in-memory bound instead of sizing beside it.
+alongside `disk:`, because disk replaces the in-memory bound instead of sizing beside it. The one
+exception is `buffer.max_bytes` on a sink that collects batches into one upload, where it bounds
+the memory one upload's batches take, read back from the spool.
 
 **Under `overflow: drop_oldest`, keep `segment_bytes` well under `max_bytes`,** as the defaults
 (64MiB and 1GiB) do. The spool frees space only by deleting a whole consumed segment, so one push

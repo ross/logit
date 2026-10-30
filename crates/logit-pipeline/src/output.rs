@@ -17,6 +17,8 @@ use std::time::Duration;
 /// whose [`Output::window`] is above 1 has several batches in flight at once through
 /// [`Output::submit`] and [`Output::await_ack`] (`docs/adr/native-hop-send-window.md`, decision
 /// 4).
+/// A windowed sink whose [`Output::collecting`] returns a deadline keeps its window open across
+/// arrivals until that deadline or another bound closes it (`docs/adr/collecting-sink-window.md`).
 ///
 /// `send` takes `&EventBatch` so `run_output` can hand a `Delivered::Shared` branch through by
 /// reference, with no `Arc::try_unwrap` or clone however many sibling branches share it
@@ -112,6 +114,45 @@ pub trait Output {
     /// peer holds the sink until shutdown.
     fn window(&self) -> usize {
         1
+    }
+
+    /// `Some(deadline)` while the sink's open window takes more batches until `deadline`; `None`
+    /// once it takes no more (`docs/adr/collecting-sink-window.md`). The default, `None`, keeps
+    /// the window filling only from what the store holds now, as every sink but a collecting one
+    /// does. `write_loop` reads it after each submit.
+    ///
+    /// While a window collects, the fill waits for the store's next batch instead of stopping at
+    /// an empty store, and closes at the first of: this returning `None`, `deadline`, the store's
+    /// `max_in_flight`, store pressure, the staged batches' `estimated_heap_bytes` reaching
+    /// `buffer.max_bytes`, the store closing, or the shutdown signal. The loop then calls
+    /// [`Output::await_ack`] for the head, which the sink reads as "close and complete".
+    ///
+    /// A collecting sink reports a [`Output::window`] of `usize::MAX` while a window collects or
+    /// none is open. From the close until it has answered every batch of the closed window, its
+    /// `window()` reads the answers it still owes and this reads `None`, so the loop opens no
+    /// new window and reads each owed answer with no fill between them. It answers each owed one
+    /// `Ok` at once: the shutdown grace doesn't cut a round that starts with an owed count. A
+    /// collecting sink also says `true` from [`Output::send_duration_per_batch`] and reports the
+    /// head's close-to-answer time from [`Output::answered_send_duration`].
+    ///
+    /// A type that implements `Output` by delegating to another must forward this.
+    fn collecting(&self) -> Option<tokio::time::Instant> {
+        None
+    }
+
+    /// How many of the batches a shutdown grace cut left with an unknown outcome may have
+    /// reached the destination, out of `left_the_process`: the batches submitted and
+    /// unacknowledged, plus one whose submit or `send` was cut off. Under at-most-once,
+    /// `write_loop` commits and counts only these as shutdown drops; the rest stay in the store,
+    /// counted as still queued by a memory store's `finish` and replayed by a disk store.
+    ///
+    /// The default returns `left_the_process`. A collecting sink returns 0 until it sends the
+    /// request that makes its window visible at the destination, and `left_the_process` after
+    /// (`docs/adr/collecting-sink-window.md`, decision 5). The loop reads it after dropping the
+    /// cut call, so the sink keeps its answer across that cancellation. A type that implements
+    /// `Output` by delegating to another must forward this.
+    fn reached_destination(&self, left_the_process: usize) -> usize {
+        left_the_process
     }
 
     /// Whether `write_loop` records one `logit.component.send.duration` sample per answered

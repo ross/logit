@@ -62,7 +62,7 @@ The ADRs are the design; this section doesn't restate their tables. In short:
 |---|---|---|---|---|---|
 | W0 | `s3/w0` | `s3/w0: ADRs and plan for an S3 object-archive sink` | S | — | open |
 | W1 | `s3/w1` | `s3/w1: move SigV4 and the AWS credential chain into logit-aws` | S | — | open (#926) |
-| W2 | `s3/w2` | `s3/w2: a collecting sink window` | M | W0 | not started |
+| W2 | `s3/w2` | `s3/w2: collecting sink window in the write loop` | M | W0 | open |
 | W3 | `s3/w3` | `s3/w3: s3_out` | L | W1, W2 | not started |
 | W4 | `s3/w4` | `s3/w4: replay_in reads gzip and zstd files` | S | — | not started |
 | W5 | `s3/w5` | `s3/w5: an S3 interop harness` | M | W3, W4 | not started |
