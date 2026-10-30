@@ -237,7 +237,7 @@ impl KafkaInput {
                     }
                 }
             }
-            consumer.mark_accepted(&fetched.tp, cut.range);
+            consumer.mark_accepted(&fetched.tp, fetched.epoch, cut.range);
         }
         if *shutdown.borrow() {
             Delivery::Shutdown

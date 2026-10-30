@@ -117,8 +117,10 @@ The protocol client, with no `Input` and no config: everything W3 drives.
   - `fetch.rs`: one loop per leader broker, full fetches only (session id 0, epoch -1), a
     partition left out while its buffer holds records, `aborted_transactions` filtering under
     `read_committed`, `throttle_time_ms`, and the out-of-range rule.
-  - `consumer.rs`: the API W3 drives: assignment changes, buffered records per partition,
+  - `client.rs`: the API W3 drives: assignment changes, buffered records per partition,
     `mark_accepted`, `commit`, and the revoke and shutdown sequence of the ADR's item 8.
+  - `pool.rs`: one connection per role (metadata, the coordinator, heartbeats, each leader's
+    fetch loop), dialed on demand, with throttle muting and a per-request answer cap.
 - **Fake broker.** Gains FindCoordinator, JoinGroup, SyncGroup, Heartbeat, LeaveGroup,
   OffsetCommit, OffsetFetch, ListOffsets, and Fetch, served from the batches its Produce path
   stores. A group coordinator model: generations, eager rebalance on a join or a leave, session
@@ -141,8 +143,8 @@ The protocol client, with no `Input` and no config: everything W3 drives.
 - **Graph rules.** Rules 100, 101, and 102 in `crates/logit-pipeline/src/graph.rs` (its module
   doc's "Validation rules" is the canonical list), reusing rule 85's broker, topic, TLS, and SASL
   helpers, and rule 17's predicates extended to `kafka_in`. Rule 100 also rejects a
-  `fetch.max_bytes` over the connection's 64 MiB response cap (`MAX_RESPONSE_BYTES` in
-  `crates/logit-kafka/src/conn.rs`), which a larger Fetch answer would fail.
+  `fetch.max_bytes` plus `max_batch_bytes` that doesn't fit Fetch's i32 `max_bytes` field: the
+  consumer reads a Fetch answer under that sum plus 1 MiB.
   [docs/design/pipeline-graph.md](../design/pipeline-graph.md)'s "Validation" mirrors them. A test
   per rejection.
 - **Registry.** `crates/logit-cli/src/pipeline.rs` builds `KafkaInSettings`.

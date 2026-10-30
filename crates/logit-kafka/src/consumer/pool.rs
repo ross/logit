@@ -24,7 +24,9 @@ use kafka_protocol::protocol::{Request, StrBytes};
 use tokio::time::Instant;
 
 use super::{ConsumerSettings, Counters};
-use crate::conn::{Conn, DialError, DialStage, Dialer, CONSUMER_APIS};
+use crate::conn::{
+    Conn, DialError, DialStage, Dialer, ResponseTooLarge, CONSUMER_APIS, MAX_RESPONSE_BYTES,
+};
 
 /// Which connection of the consumer's a [`Link`] is, for counting redials.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -55,12 +57,15 @@ pub(crate) enum CallError {
     Dial(anyhow::Error),
     /// The request failed on an open connection, which is dropped.
     Transport(anyhow::Error),
+    /// The answer's length is over the link's cap; the connection is dropped.
+    TooLarge(ResponseTooLarge),
 }
 
 impl std::fmt::Display for CallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CallError::Dial(err) | CallError::Transport(err) => write!(f, "{err:#}"),
+            CallError::TooLarge(err) => write!(f, "{err}"),
         }
     }
 }
@@ -196,11 +201,19 @@ pub(crate) struct Link {
     pub(crate) target: Target,
     conn: Option<Conn>,
     muted_until: Option<Instant>,
+    /// The largest response length this link reads.
+    max_response: usize,
 }
 
 impl Link {
     pub(crate) fn new(slot: Slot, target: Target) -> Self {
-        Self { slot, target, conn: None, muted_until: None }
+        Self { slot, target, conn: None, muted_until: None, max_response: MAX_RESPONSE_BYTES }
+    }
+
+    /// The same link reading responses up to `max_response` bytes: a fetch loop's.
+    pub(crate) fn with_max_response(mut self, max_response: usize) -> Self {
+        self.max_response = max_response;
+        self
     }
 
     /// Points the link at `target`, dropping a connection to anywhere else.
@@ -244,7 +257,8 @@ impl Link {
             .for_key(api)
             .expect("the dialer requires a version of every consumer API");
         let request = build(version);
-        match conn.request_within(&request, version, wait.unwrap_or(pool.timeout())).await {
+        let wait = wait.unwrap_or(pool.timeout());
+        match conn.request_capped(&request, version, wait, self.max_response).await {
             Ok(response) => {
                 let throttle = response.throttle_ms();
                 if throttle > 0 {
@@ -252,6 +266,11 @@ impl Link {
                         Some(Instant::now() + Duration::from_millis(throttle as u64));
                 }
                 Ok((version, response))
+            }
+            Err(err) if err.too_large().is_some() => {
+                self.conn = None;
+                pool.counters.broker_error(api, "response_too_large");
+                Err(CallError::TooLarge(*err.too_large().expect("checked")))
             }
             Err(err) => {
                 self.conn = None;

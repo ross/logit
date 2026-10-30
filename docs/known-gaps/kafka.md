@@ -168,3 +168,15 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Workaround:** a `set` or `lua` stage copies `_logit.kafka.key` to a public attribute that
     `key: {attribute: ..}` names.
   - **Revisit trigger:** `kafka_out` restoring both from the carriers.
+- **`kafka_in` can't skip a record batch larger than its Fetch cap.** The consumer reads a Fetch
+  answer of at most `fetch.max_bytes` plus `max_batch_bytes` plus 1 MiB. An answer over that is
+  refused before any of it is read, so no batch header in it is seen and there is no offset to
+  skip to; the next fetch from the same offset draws the same answer
+  ([ADR `kafka-input`](../adr/kafka-input.md), item 9). Any batch whose stored bytes pass the
+  cap does this, compressed or not.
+  - **Consequence:** the partition holds at that offset, counting
+    `logit.input.broker.errors{api="fetch", error="response_too_large"}` with a throttled
+    `response_too_large` diagnostic on every fetch, and its records after the batch aren't read.
+  - **Workaround:** raise `max_batch_bytes` above the batch's size.
+  - **Revisit trigger:** a reader that skips a frame by its batch header alone, without holding
+    the whole answer.
