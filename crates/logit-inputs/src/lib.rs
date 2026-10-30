@@ -14,6 +14,7 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 pub mod collectd;
+pub mod cri;
 pub mod datadog;
 pub mod datadog_trace;
 pub mod docker;

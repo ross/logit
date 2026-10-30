@@ -8,10 +8,10 @@
 //! Field offsets are `u32`, so [`split_row`] refuses a row longer than `u32::MAX` bytes with
 //! [`RowError::RowTooLong`] before it computes any offset, rather than wrap one. Default bounds
 //! keep every row far below that: a UDP datagram carries at most 65,507 bytes, a stream line stops
-//! at `framing::MAX_FRAME_BYTES` (64 KiB) or the listener's `max_line_bytes`, `tail_in` and
-//! `docker_in` drop a line past `max_line_bytes` (1 MiB by default), and the HTTP listeners cap a
-//! request body at a few MiB. A row past 4 GiB arrives only when an operator raises
-//! `max_line_bytes` (`tail_in`, `docker_in`, `lines_in`, `graphite_in`) or `splunk_hec_in`'s
+//! at `framing::MAX_FRAME_BYTES` (64 KiB) or the listener's `max_line_bytes`, the tail listeners
+//! drop a line past `max_line_bytes` (1 MiB by default), and the HTTP listeners cap a request body
+//! at a few MiB. A row past 4 GiB arrives only when an operator raises `max_line_bytes`
+//! (`tail_in`, `docker_in`, `cri_in`, `lines_in`, `graphite_in`) or `splunk_hec_in`'s
 //! `max_request_bytes` that far, neither of which has an upper bound.
 //!
 //! Every field of a valid UTF-8 row is valid UTF-8, which is why the transform checks the

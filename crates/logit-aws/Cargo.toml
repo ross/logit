@@ -1,0 +1,34 @@
+[package]
+name = "logit-aws"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "AWS Signature Version 4 signing and the AWS default credential chain, on ring and reqwest."
+
+[dependencies]
+logit-core.workspace = true
+logit-pipeline.workspace = true
+anyhow.workspace = true
+reqwest.workspace = true
+ring.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+bytes = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
+
+# The credential endpoint stand-in (`test_stub`), shared with `logit-outputs`' tests.
+[features]
+test-util = ["dep:bytes", "dep:http", "dep:http-body-util", "dep:hyper", "dep:hyper-util"]
+
+[dev-dependencies]
+logit-pipeline = { workspace = true, features = ["fault-injection", "test-util"] }
+bytes.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
