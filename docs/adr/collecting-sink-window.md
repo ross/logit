@@ -45,13 +45,23 @@ stands in the way:
   all the time. The store's `FullWatch` (`crates/logit-pipeline/src/buffer_full.rs`) learns of a
   push that waits or sheds, but not of the memory store's push accepted over its bound with
   nothing evictable: `SinkQueue::push` counts no drop for it and opens no `buffer_full` episode.
+- **A round fills before it waits.** `window_round` always runs its fill before its
+  `await_ack`, and after the head is answered `write_loop` commits the head alone, so the next
+  round fills again before it reads the next answer. A sink whose fill can wait would open a new
+  window while the answers for a closed one are still owed.
+- **A submit failure past the head is unclassified.** `window_round` stops the fill on it and
+  reads the answers already owed (`Output::submit`'s doc), so the sink itself has to carry that
+  failure to the head's answer.
+- **A disk store holds read-ahead decoded.** `DiskQueue::peek_at` caches each record it reads
+  ahead, decoded, until it's committed, and a disk store's `max_in_flight` is `usize::MAX`, so a
+  window bounded by nothing else holds every staged batch on the heap.
 - **Telemetry would measure collection.** `deliver_window` times each round into
   `logit.component.send.duration`, and `SendLimit` names "sending at its concurrency" in the
   `buffer_full` line when `outstanding` reaches the window. A round that collects for minutes would
   record minutes and read as a sink saturated by its round trip.
 - **Shutdown would wait for the object's age.** Nothing tells a collecting sink that shutdown
   started, and `buffer.shutdown_grace` (default `5s`) starts at the signal.
-  `drop_cut_off_at_shutdown` counts every outstanding batch as "cut off mid-send", which is wrong
+  `drop_cut_off_at_shutdown` counts every batch that left the process as "cut off mid-send", which is wrong
   for a batch staged into an object whose upload never completed: the destination can't have it.
 
 ## Decision
@@ -59,7 +69,8 @@ stands in the way:
 A sink may say it is still collecting, with a deadline. While it does, the fill waits for the
 store's next item instead of ending at an empty store, and the window closes, and the head's
 `await_ack` runs, at the first of: the sink's own bound, the deadline, store pressure, the store
-closing, or the shutdown signal.
+closing, the staged batches' memory, or the shutdown signal. A closed window's answers are all
+read before the next window opens.
 
 ### 1. The sink's "still collecting" signal and deadline
 
@@ -68,15 +79,22 @@ closing, or the shutdown signal.
   `deadline`; `None` means it takes no more and its head's `await_ack` may be called. `s3_out`
   returns its object's `max_age` deadline while the object is under `max_bytes`, and `None` once
   a staged batch takes it past.
-- **`window()` keeps its meaning.** It stays the in-flight limit, which `SendLimit` and the
-  `buffer_full` cause read. A collecting sink reports a window of `usize::MAX`, so its bound comes
-  from `collecting` and the store's `max_in_flight` alone. The design notes floated
-  `window()` returning `staged + 1` while open instead; a separate method keeps the two readings of
-  `window()` from diverging and makes the deadline part of the signal.
+- **`window()` keeps its meaning: the in-flight limit.** While a window collects, or none is
+  open, a collecting sink reports `usize::MAX`, so the bound comes from `collecting`, the store's
+  `max_in_flight`, and the memory bound (decision 2). The design notes floated `window()`
+  returning `staged + 1` while open instead; a separate method makes the deadline part of the
+  signal.
 - **`await_ack` on the head closes the window.** The sink needs no separate close call: the loop
   calls `await_ack` only once it stops filling, and a collecting sink reads that call as "close
-  and complete". The sink answers the head once the object completes, then answers the `N - 1`
-  batches behind it `Ok` at once, as `logit_out`'s cumulative acknowledgment does.
+  and complete". The sink answers the head once its window completes.
+- **No new window while answers are owed.** From the close until the last batch of the closed
+  window is answered, the sink's `window()` reads the number of answers it still owes, and
+  `collecting()` reads `None`. After each head is committed, `outstanding` equals that number, so
+  `window_round`'s check `outstanding >= window` stops the fill before it peeks or waits, and the
+  round goes straight to `await_ack`, which the sink answers `Ok` at once. Once the last answer
+  is read, `window()` returns to `usize::MAX` and the next round opens a new window. The loop
+  needs no new branch for this, and a batch that arrives during an upload waits in the store
+  until every answer is read.
 - **A sink that never returns `Some` changes nothing.** `logit_out` and the HTTP slot sinks keep
   the default, so their fill, `await_ack`, telemetry, and grace handling run as today.
 
@@ -93,6 +111,12 @@ closing, or the shutdown signal.
   reads `collecting()` again after each submit and stops on `None`. It also stops at
   `min(window, store.max_in_flight())`, so a memory store still caps an open window at
   `buffer.max_batches`.
+- **A memory bound, in both stores.** The fill also stops once the staged batches'
+  `EventBatch::estimated_heap_bytes` reach `buffer.max_bytes`, the operator's memory budget for
+  the sink. Under the memory store the store's own bound already enforces it; under a disk store
+  it bounds the decoded read-ahead the window holds, and graph rule 35 will accept a non-default
+  `buffer.max_bytes` beside `disk:` on a collecting sink for that one use. A window's size is
+  bounded by that budget on either store, and a larger window means raising `buffer.max_bytes`.
 - **Every stop goes to `await_ack`**, as a stop does today. The loop records why the window
   closed (decision 4).
 - **A fault doesn't change.** A non-`HeadOnly` fault covers every staged batch and the loop
@@ -101,6 +125,10 @@ closing, or the shutdown signal.
   `sink-request-concurrency`](sink-request-concurrency.md)'s decision 2 says. A fault resubmits
   without observing again, so `CountGate` keeps a sink's encode-side counts once per batch ([ADR
   `sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md), decision 2).
+- **A submit failure past the head poisons the window.** The loop stops the fill and leaves the
+  failure unclassified, as today. A collecting sink records it, never completes that window, and
+  fails the head's next `await_ack` without `HeadOnly`, with that failure's class. The loop then
+  resubmits from the head, failed batch included, into a new window.
 
 ### 3. Store pressure closes a collecting window, in both stores
 
@@ -132,13 +160,15 @@ closing, or the shutdown signal.
   `true` from `Output::send_duration_per_batch`, and `Output::answered_send_duration` reports, for
   the head, the time from the window's close to the head's answer, and `None` for each batch
   answered behind it. A round's own timer is never recorded for it.
-- **The `buffer_full` cause.** While a window collects, the loop sets `SendLimit` to a limit of 1
-  with 0 in flight, which adds no cause to the line. From the close to the head's answer it sets 1
-  in flight, so a `buffer_full` line written during an upload reads "sending at its concurrency
+- **The `buffer_full` cause.** The loop remembers whether the current window collected (a
+  `collecting()` read returned `Some`). While such a window collects, it sets `SendLimit` to a
+  limit of 1 with 0 in flight, which adds no cause to the line. From the close to the last answer
+  it sets 1 in flight, not the owed count `window()` reads, so a `buffer_full` line written during an upload reads "sending at its concurrency
   of 1" with the last upload's duration, which is the true bound.
 - **One new count.** `logit.component.window.closed{cause}` counts each closed collecting window
   by what closed it: `full` (the sink's `collecting()` returned `None`, or `max_in_flight` was
-  reached), `deadline`, `pressure`, `closed` (the store closed), or `shutdown`. A sink whose
+  reached), `deadline`, `pressure`, `memory` (the memory bound), `closed` (the store closed), or
+  `shutdown`. A sink whose
   windows close on `pressure` needs a larger buffer or a smaller window, and this count is where
   an operator sees it. [`docs/design/internal-telemetry.md`](../design/internal-telemetry.md)
   records it in W2.
@@ -148,8 +178,9 @@ closing, or the shutdown signal.
 - **The shutdown signal closes the window.** The fill's wait ends at the signal, not at the grace
   expiry, so the upload starts with the whole grace ahead of it. After the signal, the loop
   doesn't wait to collect: each later window closes at the first empty `peek_at`.
-- **The grace counts only what may have reached the destination.** A new `Output` method, with
-  a default of every outstanding batch, tells the loop how many of the outstanding batches may
+- **The grace counts only what may have reached the destination.** A new `Output` method, whose
+  default returns what `InFlight::left_the_process()` returns today (`outstanding`, plus one while
+  a submit is in progress), tells the loop how many of the outstanding batches may
   have reached the destination. A collecting sink answers 0 until it sends the request that
   makes its window visible (`s3_out`'s `PutObject` or `CompleteMultipartUpload`), and every staged
   batch after. Under `at_most_once`, `drop_cut_off_at_shutdown` commits and counts only those; the
@@ -164,7 +195,7 @@ closing, or the shutdown signal.
 ### 6. One window at a time
 
 A collecting sink has one window open or uploading at a time: the next window opens only once
-the head's `await_ack` has answered. Several objects in flight, or several parts of one object
+every batch of the last one is answered (decision 1). Several objects in flight, or several parts of one object
 in flight, are a follow-up, measured first; the window protocol's in-flight prefix would carry
 them.
 
@@ -178,13 +209,21 @@ them.
   upload would lose it uncounted. That's the ack-on-staging model [ADR
   `s3-object-archive`](s3-object-archive.md) rejects.
 - **`window()` returns `staged + 1` while collecting.** The notes' first form. Rejected for a
-  separate method: `window()` is also the limit `SendLimit` reports, and the deadline needs a
-  home anyway.
+  separate method: the deadline needs a home, and `window()` then departs from `usize::MAX` in one
+  place only, the owed count after a close.
 - **Let pressure backpressure instead of closing.** Rejected: under `block` it stalls every
   source for up to the window's deadline, and under `drop_oldest` the memory store would hold a
   window past its bounds.
 - **Close the window at the grace expiry instead of the signal.** Rejected: the upload would
   start with no grace left.
+- **Drop each read-ahead batch once it's staged, and read it again on a fault.** This would
+  bound a disk store's heap by one batch instead of the window, so an object could outgrow
+  memory. Rejected for now: it needs the disk store to forget and re-read a reserved record, and
+  the memory store can't re-read at all, while the memory bound covers every object `s3_out`'s
+  defaults make. It stays open if objects need to outgrow memory.
+- **Open the next window while answers are owed.** Rejected: delivered batches would stay
+  reserved for another window, a crash would replay them, and a fault or an `at_most_once` drop
+  in the next window would count them again.
 
 ## Consequences
 
@@ -201,7 +240,8 @@ them.
 - **No change for existing windowed sinks.** `logit_out` and the six HTTP slot sinks return the
   default `collecting()`, so their fill, acknowledgment, telemetry, and grace counts are as today;
   their existing window tests pin it.
-- **A memory store bounds an object.** With `buffer.max_batches` and `buffer.max_bytes` as its
-  bounds, an object can't hold more than the memory store does; a large object wants
-  `buffer.disk:`. [`docs/design/memory.md`](../design/memory.md) records a collecting sink's cost
-  once W3 measures it.
+- **`buffer.max_bytes` bounds a window on both stores.** A larger object means a larger
+  `buffer.max_bytes`; `buffer.disk:` buys durability across a restart, not size.
+  [`docs/design/memory.md`](../design/memory.md) records a collecting sink's cost once W3
+  measures it. Graph rule 35's text in [`docs/design/pipeline-graph.md`](../design/pipeline-graph.md)
+  changes with W2.

@@ -95,9 +95,11 @@ The maintainer chose the Kafka Connect model.
   object becomes a multipart upload; an object that closes under one `part_size` goes up as one
   `PutObject`.
 - **What closes it.** `max_bytes` of encoded, uncompressed bytes; `max_age` since its first batch
-  was staged; store pressure; the store closing; or the shutdown signal, not the grace expiry
-  ([ADR `collecting-sink-window`](collecting-sink-window.md), decisions 3 and 5). A memory store
-  also closes it at `buffer.max_batches`.
+  was staged; store pressure; the staged batches' memory reaching `buffer.max_bytes`; the store
+  closing; or the shutdown signal, not the grace expiry ([ADR
+  `collecting-sink-window`](collecting-sink-window.md), decisions 2, 3, and 5). A memory store
+  also closes it at `buffer.max_batches`. A retry of an object closes at its pinned batch count at
+  the latest (decision 3).
 - **Delivered means complete.** Every batch in the object stays in the sink's memory queue or
   `buffer.disk:` spool, uncommitted, until `PutObject` answers `200` or
   `CompleteMultipartUpload` answers `200` without an `<Error>` body. No batch counts delivered
@@ -107,6 +109,12 @@ The maintainer chose the Kafka Connect model.
   require that rule on the bucket. The upload id isn't persisted. A disk spool replays the
   object's batches into a new object; a memory store loses them with the process, as it loses
   everything else it holds.
+- **A failed part poisons the object.** A part upload that fails inside `submit`, past the head,
+  is left unclassified by the loop, which stops the fill and reads the answers owed. The sink
+  records the failure, never completes that upload, and fails the head's next `await_ack` without
+  `HeadOnly`, with the failure's class, so the loop resubmits from the head into a new upload.
+  The batch whose submit failed is in that resubmit, though its bytes were already in the
+  abandoned compressor stream.
 - **An upload abandoned in the process is aborted.** When a fault restarts an object that has
   parts, the sink sends `AbortMultipartUpload` for the old upload id once, bounded by `timeout`,
   and counts a failed abort without retrying it; the lifecycle rule is the backstop.
@@ -114,16 +122,20 @@ The maintainer chose the Kafka Connect model.
   remainder carried into the next part, because Cloudflare R2 requires every non-final part to be
   the same size and S3 requires each to be at least 5 MiB. An object holds at most 10,000 parts, S3's limit, which
   the configuration bounds (decision 7).
-- **Memory.** Per sink: the store's own bound, about one part of compressed body plus one
-  batch's compressed overshoot, and the compressor's state. Under the memory store an object
-  can't hold more than the store does, so a large object wants `buffer.disk:`.
+- **Memory.** Per sink: the staged batches, bounded by `buffer.max_bytes` on either store (a disk
+  store holds the batches it has read ahead decoded until they're committed), about one part of
+  compressed body plus one batch's compressed overshoot, and the compressor's state. An object
+  never holds more than `buffer.max_bytes` of decoded batches, so a larger object means raising
+  `buffer.max_bytes`; `buffer.disk:` buys durability across a restart, not size.
   [`docs/design/memory.md`](../design/memory.md) records the measured cost when W3 lands.
 
 ### 2. Realized through the collecting window
 
 `s3_out` reports a window of `usize::MAX` and returns its object's `max_age` deadline from
-`Output::collecting` while the object is under `max_bytes` ([ADR
-`collecting-sink-window`](collecting-sink-window.md), decision 1):
+`Output::collecting` while the object is open and under `max_bytes` ([ADR
+`collecting-sink-window`](collecting-sink-window.md), decision 1). From the close until every
+batch of the object is answered, its `window()` reads the answers it still owes and
+`collecting()` reads `None`:
 
 - **`observe_batch`** saves the batch's `SeqId`. The first batch staged into an object fixes the
   object's key.
@@ -134,13 +146,16 @@ The maintainer chose the Kafka Connect model.
   `timeout`.
 - **`await_ack` on the head completes the object**: it flushes the compressor, uploads the last
   part or the single `PutObject`, and sends `CompleteMultipartUpload`. It answers the head with
-  the object's outcome and then answers each batch behind it `Ok` at once.
+  the object's outcome, and each later `await_ack` answers the next batch of the object `Ok` at
+  once; the owed count in `window()` keeps the loop from submitting or waiting in between.
 - **A fault covers the object.** A failed request returns a fault without `HeadOnly`, so the loop
-  resubmits from the head and the sink starts the object again under the same key (decision 3).
+  resubmits from the head and the sink starts the object again under the same key, holding no
+  more batches than its pinned count (decision 3).
   A `Rejected` answer drops the head batch alone, as the runtime drops it for any windowed sink,
   and the rest are staged again into a new object.
-- **One object at a time.** The next object opens once the head's `await_ack` has answered. Parts
-  of one object upload one at a time, too.
+- **One object at a time.** The next object opens only once every batch of the last one is
+  answered, so a batch that arrives during an upload waits in the store. Parts of one object
+  upload one at a time, too.
 
 ### 3. The key is the first batch's identity, with no conditional write
 
@@ -148,31 +163,56 @@ The maintainer chose this key and ruled out conditional writes.
 
 ```text
 {prefix}{partition formatted at object_time}{object_time}-{store id}-{first seq}.{ext}
-logs/dt=2026-10-30/hour=14/20261030T142501Z-6f1c...e09a-00000000000000000042.ndjson.gz
+logs/dt=2026-10-30/hour=14/20261030T142501.123Z-6f1c...e09a-00000000000000000042.ndjson.gz
 ```
 
 - **The pieces.** `prefix` and `partition` come from config; `object_time` is the wall clock in
-  UTC, compact ISO 8601 (`20261030T142501Z`), when the object's first batch was staged; the store
-  id is the first batch's 16-byte sender id in lowercase hex; the first seq is its sequence
-  number, zero-padded to 20 digits so keys sort by sequence within a second.
-- **`object_time` is pinned by the head.** The sink remembers it against the head's `SeqId`, so
-  a retry or a re-stage of the same head in the same process writes the same key. A restart
-  stamps a new time.
+  UTC, compact ISO 8601 to the millisecond (`20261030T142501.123Z`), when the object's first batch
+  was staged; the store id is the first batch's 16-byte sender id in lowercase hex; the first seq
+  is its sequence number, zero-padded to 20 digits so keys sort by sequence within a millisecond.
+- **The head pins `object_time` and the batch count.** The sink remembers, against the head's
+  `SeqId`, the object's `object_time` and, from the object's first close, its batch count. Every
+  retry of that head in the same process, whatever the fault's class, writes the same key and
+  closes at that count at the latest. A retry that closes earlier (store pressure, the memory
+  bound, shutdown) lowers the pin to its own count, so the pin only falls. The pinned batches are
+  uncommitted, so the store still holds every one of them, reserved, when a retry stages them,
+  under store pressure too. A restart stamps a new `object_time`; milliseconds keep it from
+  repeating the dead process's stamp, since a restart takes longer than that, unless the wall
+  clock steps back across the restart.
 - **The default partition** is Hive-style, `dt=%Y-%m-%d/hour=%H/` in UTC. It is the time the
   object was staged, not any event's own time, and the operator doc will say so. Partitioning by
   an attribute isn't in v1; a `route` into several `s3_out`s, each with its own `prefix`, does it.
-- **Why an overwrite never loses data.** The sink writes an object at key K, whose first batch
-  is s, only while s is uncommitted. The store commits in order, so every batch from s onward is
-  uncommitted too, and any earlier object at K, which held only batches from s onward, holds
-  nothing the store has let go. Those batches are staged again, into this object or a later one,
-  before any of them is committed. So replacing the earlier object at K drops nothing that isn't
-  written again. A replay that groups or stamps differently writes a different key, and that is a
-  duplicate, which at-least-once allows. The argument doesn't need a deterministic encoding,
-  though the `json` and native encoders are deterministic.
+- **Why an overwrite never loses data.** Two cases.
+  - *A request the sink starts.* The sink writes an object at key K, whose first batch is s, only
+    while s is uncommitted. The store commits in order, so every batch from s onward is
+    uncommitted too, and any earlier object at K, which held only batches from s onward, holds
+    nothing the store has let go. Those batches are staged again, into this object or a later
+    one, before any of them is committed. So replacing the earlier object at K drops nothing that
+    isn't written again.
+  - *A request still in flight at the store.* An `Ambiguous` `PutObject` or
+    `CompleteMultipartUpload` can land after its retry has completed and committed its batches.
+    AWS orders concurrent uploads to one key only on a versioned bucket; otherwise "any other
+    request received between the time when the multipart upload is initiated and when it
+    completes ... might take precedence" ([Concurrent multipart upload
+    operations](https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html#distributedmpupload)),
+    and MinIO and Ceph RGW state nothing. The pin makes the late write harmless: every attempt at
+    K holds a prefix s..s+n of the store, and no retry holds more batches than any attempt before
+    it, so a late earlier attempt holds every batch the retry committed, and the batches past the
+    retry's are uncommitted and staged again. After a restart the replay's `object_time`, and so
+    its key, differs from any request the dead process left in flight, and the late write is a
+    duplicate.
+
+  A different key comes only from a different first batch (the head changed, by a `Rejected`
+  drop or a commit) or a new `object_time` (a restart); regrouping behind the same head writes the
+  same key. A different key is a duplicate, which at-least-once allows. The argument doesn't need
+  a deterministic encoding, though the `json` and native encoders are deterministic.
 - **What an overwrite looks like.** It is the at-least-once duplicate in S3's terms: a second
   `ObjectCreated` event notification for the key, and a second version on a versioned bucket.
-- **No `If-None-Match: *`.** A replayed object can hold more batches than the one already at its
-  key, so a `412` would drop the extra batches; the maintainer ruled it out.
+- **No `If-None-Match: *`.** The maintainer ruled it out because a retry could hold more batches
+  than the object already at its key, and a `412` would drop the extra ones. The pin now keeps a
+  retry from holding more, so that case no longer arises; the decision stands because an
+  overwrite is already loss-free, and a conditional write would add an answer to classify for no
+  gain.
 - **No secret in a key, and none in a message.** The key holds no config value but `prefix` and
   `partition`. Messages name the bucket and print `endpoint:` only through
   `logit_core::redact::url`.
@@ -228,7 +268,10 @@ S3 never interprets an object's content, so no S3 answer is about one batch exce
 an object's size is set by the sink's configuration, not by a batch: every body is at most
 `part_size`, since a batch larger than a part is split across parts. [ADR
 `sink-fault-classes`](sink-fault-classes.md)'s rule that an unattributable `4xx` is `Rejected`
-stands, so every S3 answer the sink distinguishes is listed. This table is the canonical copy
+stands, so every S3 answer the sink distinguishes is listed. An answer that reaches the "any other
+`4xx`" row costs one batch per object attempt: the runtime drops the head alone, counted
+`batches.dropped{reason="rejected"}`, and the next attempt uploads the rest of the object again.
+That is why every configuration code the sink knows of is read `Refused`. This table is the canonical copy
 until `crates/logit-outputs/src/s3/`'s module doc carries it in W3, each row backed by a test;
 after that the module doc is canonical and this table isn't updated.
 
@@ -240,16 +283,17 @@ after that the module doc is canonical and this table isn't updated.
 | `400` `RequestTimeout`, `IncompleteBody`, `BadDigest`, `XAmzContentSHA256Mismatch` | `Clean` | the body didn't arrive whole, so nothing was stored |
 | `400` `ExpiredToken`, `TokenRefreshRequired` | `Clean`, after `Chain::forget` | the credentials expired; fresh ones will sign the retry |
 | `400` `EntityTooLarge`, `413` | `Refused` | a body is at most `part_size`, so the destination's limit is below it: configuration, not a batch |
-| `400` `InvalidArgument`, `InvalidToken`, `AuthorizationHeaderMalformed`, any `KMS.*`, `InvalidStorageClass`, `AccessControlListNotSupported`, `KeyTooLongError`, `InvalidRequest` | `Refused` | configuration: the same answer for every object |
+| `400` `InvalidArgument`, `InvalidToken`, `AuthorizationHeaderMalformed`, `InvalidBucketName`, `InvalidEncryptionAlgorithmError`, any `KMS.*`, `InvalidStorageClass`, `AccessControlListNotSupported`, `KeyTooLongError`, `InvalidRequest` | `Refused` | configuration: the same answer for every object |
+| `400` `InvalidPart`, `InvalidPartOrder`, `EntityTooSmall` | `Clean` | the sink built a bad upload; nothing is visible yet, so the object starts again |
 | `403`, any code | `Refused` | credentials or policy |
 | `404` `NoSuchBucket`, and any other `404` | `Refused` | the bucket or endpoint is wrong |
 | `404` `NoSuchUpload` | `Clean` | the upload was aborted underneath the sink; the object starts again |
 | `408` | `Ambiguous` | the shared default ([ADR `sink-fault-classes`](sink-fault-classes.md)'s "Amendment: 408 is `Ambiguous`") |
 | `409` `OperationAborted` | `Clean` | a conflicting operation was in progress; nothing was stored |
 | `411` `MissingContentLength` | `Refused` | a proxy or store that won't take the request's framing |
-| `429`; `503` `SlowDown` or `ServiceUnavailable` with an S3 XML `<Code>` | `Clean` | S3 refused the request before processing it; `PutObject` and `UploadPart` are atomic |
-| `502` or `503` with no S3 `<Code>` | `Ambiguous` | a load balancer's answer, which says nothing about the store: the shared default |
-| `500` `InternalError`, `502`, `504` | `Ambiguous` | the request may have been applied; a retry rewrites the same key |
+| `429`; any `503` with an S3 XML `<Code>` (`SlowDown`, `ServiceUnavailable`, MinIO's `SlowDownWrite` and `SlowDownRead`) | `Clean` | the store refused the request before processing it; `PutObject` and `UploadPart` are atomic |
+| `503` with no S3 `<Code>` | `Ambiguous` | a load balancer's answer, which says nothing about the store: the shared default |
+| `500` (`InternalError` or any other code), `502`, `504`, and any other `5xx` | `Ambiguous` | the request may have been applied; a retry rewrites the same key; the shared default |
 | `501` `NotImplemented` | `Refused` | the store lacks a feature the sink uses |
 | any other `4xx` | `Rejected` | [ADR `sink-fault-classes`](sink-fault-classes.md)'s rule for an answer the sink can't attribute |
 | connect failure; a dial `connect_timeout:` ended | `Clean` | the shared HTTP driver's default |
@@ -260,9 +304,20 @@ after that the module doc is canonical and this table isn't updated.
   visible at the key until `CompleteMultipartUpload` succeeds, so the request couldn't have
   stored a batch. Only `PutObject` and `CompleteMultipartUpload` can be `Ambiguous`, which keeps
   `at_most_once` from dropping an object that was never stored.
+- **A bad upload holds, it doesn't drop.** `InvalidPart`, `InvalidPartOrder`, and `EntityTooSmall`
+  mean the sink assembled the upload wrong, a defect in `logit`, not in a batch or in the
+  configuration. Read `Clean`, they restart the object; if the defect repeats, the sink holds,
+  `logit.component.retrying` reads `1`, and `logit.component.errors` climbs, so the defect is
+  seen with no data lost. Read `Rejected`, they would drop a batch per object attempt, counted as
+  loss, for a fault no batch caused.
+- **No bucket-name syntax check.** `bucket` is validated as not empty and nothing more: S3's
+  naming rules and those of S3-compatible stores differ, and validation never rejects a name a
+  store might accept. A name the store refuses answers `InvalidBucketName`, which holds as
+  `Refused`.
 - **Posture.** The default, `at_least_once`, because a retry rewrites the same key.
 - **Retries are the loop's.** Every retryable class restarts the object from its head through
-  the window protocol; the sink retries no request of its own.
+  the window protocol, holding no more than the head's pinned batch count (decision 3); the sink
+  retries no request of its own.
 
 ### 7. Configuration
 
@@ -295,9 +350,12 @@ Every field but `bucket:` and `region:` will default. The fields:
   8MiB` is above S3's 5 MiB minimum and keeps one part's buffer small.
 - **No `concurrency:`.** One object uploads at a time (decision 2); the field is absent rather
   than fixed at 1.
-- **`buffer:`** is the ordinary block. The operator doc will recommend `buffer.disk:` and a
+- **`buffer:`** is the ordinary block. `buffer.max_bytes` bounds an open object's decoded
+  batches on either store, so graph rule 35 will accept a non-default `buffer.max_bytes` beside
+  `disk:` on `s3_out` ([ADR `collecting-sink-window`](collecting-sink-window.md), decision 2).
+  The operator doc will recommend `buffer.disk:` for durability across a restart, a
   `buffer.shutdown_grace` long enough for one object's upload, and a `buffer.max_bytes` above
-  `max_bytes`, so store pressure is the exception.
+  `max_bytes`, so the memory bound and store pressure are the exception.
 - **Graph rules** for the bounds above join [`docs/design/pipeline-graph.md`](../design/pipeline-graph.md)'s
   rule table in W3.
 
@@ -356,8 +414,11 @@ The maintainer set both.
   be chosen when the upload starts.
 - **A random key per object** (the OTel exporter). Rejected: every retry is a new object, a
   duplicate even when the first attempt failed.
-- **Conditional writes (`If-None-Match: *`).** Rejected: a replayed object at an existing key can
-  hold more batches than the old one, and a `412` would drop them.
+- **Conditional writes (`If-None-Match: *`).** Rejected, as decision 3 says: an overwrite is
+  loss-free, and a `412` would be one more answer to classify.
+- **Retry `CompleteMultipartUpload` on the same upload id before starting over.** It would let a
+  late Complete and its retry be the same request. Rejected for the pinned count, which covers a
+  late `PutObject` as well and keeps every retry on the loop's one path.
 - **Persist the upload id and part ETags, and resume** (Fluent Bit). Rejected: resuming needs the
   same bytes in the same parts after a restart, which the spool's regrouping doesn't promise, and
   the lifecycle rule already removes an abandoned upload.
@@ -374,11 +435,13 @@ The maintainer set both.
   `crates/logit-cli/src/pipeline.rs`; `logit-outputs` depends on `logit-aws`. The plan's W3.
 - **Docs.** A `docs/deploying.md` section with the lifecycle rule, the IAM permissions
   (`s3:PutObject`, `s3:AbortMultipartUpload`, and the KMS key's under `sse: aws_kms`), the
-  dotted-bucket note, the shutdown-grace and
-  disk-buffer advice, and the ingest-time partition note; `AGENTS.md`'s outputs table; an example
+  dotted-bucket note, the shutdown-grace, `buffer.max_bytes`, and disk-buffer advice, and the
+  ingest-time partition note; `AGENTS.md`'s outputs table; an example
   under `examples/`; `docs/design/internal-telemetry.md`; `docs/design/memory.md`.
-- **Duplicates.** A replay after a restart, or after an ambiguous `CompleteMultipartUpload`,
-  writes the same batches again, under a new key when the grouping or time changed. An operator
+- **Duplicates.** A replay after a restart writes its batches again under a new key, since its
+  `object_time` is new; a late `CompleteMultipartUpload` or `PutObject` after its retry rewrites the
+  same key with the same batches or more; and a `Rejected` drop moves the head, so when an earlier
+  attempt at the old key landed, the rest of that object is stored twice. An operator
   who needs none deduplicates downstream, as for every other at-least-once sink.
 - **Billing.** An abandoned multipart upload is billed until the lifecycle rule removes it.
 - **Follow-ups:** the items "Not in v1" lists, and an `s3_out` soak stand-in shape.

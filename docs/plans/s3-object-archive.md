@@ -44,10 +44,14 @@ The ADRs are the design; this section doesn't restate their tables. In short:
 - **The window** ([ADR `collecting-sink-window`](../adr/collecting-sink-window.md)): a sink
   returns a deadline from `Output::collecting` while it takes more batches, the fill waits on a
   new store primitive, and the window closes at the sink's bound, the deadline, store pressure,
-  the store closing, or the shutdown signal. Nothing changes for a sink that keeps the default.
+  the staged batches' memory reaching `buffer.max_bytes`, the store closing, or the shutdown
+  signal. Until every batch of a closed window is answered, `window()` reads the answers owed, so
+  no new window opens. Nothing changes for a sink that keeps the default.
 - **The sink** ([ADR `s3-object-archive`](../adr/s3-object-archive.md)): `submit` stages a batch
   into the open object and uploads a part when one fills; `await_ack` on the head completes the
-  object; the key is `{prefix}{partition}{object_time}-{store id}-{first seq}.{ext}`; SigV4 and
+  object, and a failed part poisons it; the key is
+  `{prefix}{partition}{object_time}-{store id}-{first seq}.{ext}`, and the head pins its
+  `object_time` and batch count so no retry holds more than an attempt that may still land; SigV4 and
   credentials come from `logit-aws`; decision 6 is the response-class table until W3 moves it
   into the module doc.
 
@@ -85,14 +89,16 @@ plan, against `main`.
 ### W2: the collecting window
 
 **Scope.** Everything in [ADR `collecting-sink-window`](../adr/collecting-sink-window.md):
-`Output::collecting` and the reached-the-destination count, both with defaults; the store's wait
-primitive and its pressure signal, on the memory queue and the disk spool; the fill's wait and
-its close causes in `window_round` and `deliver_window`; `SendLimit` during collection and
-upload; the shutdown signal closing the window; and the grace count. No sink uses it yet.
+`Output::collecting` and the reached-the-destination count, both with defaults (the count's is
+today's `InFlight::left_the_process()`); the store's wait primitive and its pressure signal, on
+the memory queue and the disk spool; the fill's wait, its memory bound, and its close causes in
+`window_round` and `deliver_window`; `SendLimit` during collection and upload; the shutdown signal
+closing the window; the grace count; and graph rule 35 accepting a non-default
+`buffer.max_bytes` beside `disk:` on a collecting sink. No sink uses it yet.
 
 **Files.** `crates/logit-pipeline/src/output.rs`, `runtime.rs`, `queue.rs`, `disk_queue.rs`,
-`buffer_full.rs`, and `crates/logit-proto/src/buffer.rs` if the memory buffer needs a pressure
-read.
+`buffer_full.rs`, and `graph.rs` (rule 35), and `crates/logit-proto/src/buffer.rs` if the memory
+buffer needs a pressure read.
 
 **Tests**, on a collecting variant of the `WindowedOutput` fake in `runtime.rs`'s window tests,
 each waiting on an observable through `logit_pipeline::test_util`:
@@ -100,13 +106,20 @@ each waiting on an observable through `logit_pipeline::test_util`:
 - a push into an empty store during collection is submitted into the same window, and the head
   is acknowledged once, after the deadline;
 - the window closes at the deadline, at `collecting()` returning `None`, at `max_in_flight`, at
-  the store closing, and at the shutdown signal before the grace expires, each counted under its
-  `cause`;
+  the staged batches' `estimated_heap_bytes` reaching `buffer.max_bytes` on a memory and on a disk
+  store, at the store closing, and at the shutdown signal before the grace expires, each counted
+  under its `cause`;
+- a batch that arrives while a closed window uploads isn't submitted until all N of that
+  window's answers are read, and the N - 1 answers behind the head come with no fill or wait
+  between them;
+- a submit failure past the head makes the head's next `await_ack` fail without `HeadOnly`, and
+  the loop resubmits from the head, the failed batch included;
 - pressure closes it in a memory store under `block` and under `drop_oldest`, and in a disk store
   at `disk.max_bytes`; under `block` the waiting push completes once the window's batches commit;
 - a fault without `HeadOnly` reopens the window from the head without observing any batch again;
 - under `at_most_once`, a grace cut commits only the batches the sink says may have reached the
-  destination, and the rest stay reserved;
+  destination, and the rest stay reserved; a sink keeping the default counts what
+  `left_the_process()` counts today, a submit in progress included;
 - `send.duration` records one sample per window, from close to answer, and the `buffer_full`
   cause names no limit while collecting;
 - the store's wait is cancellation-safe and reserves nothing when dropped.
@@ -115,7 +128,7 @@ The existing window tests for `logit_out` and the HTTP slot sinks pass unchanged
 "nothing changes for existing windowed sinks".
 
 **Docs.** `docs/design/internal-telemetry.md` (`logit.component.window.closed`),
-`docs/design/pipeline-graph.md`'s "Cancellation points", `docs/deploying.md`'s sink buffering
+`docs/design/pipeline-graph.md`'s "Cancellation points" and rule 35, `docs/deploying.md`'s sink buffering
 section (the `drop_oldest` note), and the `Output` trait's doc.
 
 ### W3: `s3_out`
@@ -135,9 +148,15 @@ part) and `s3/w3b` (multipart), stacked.
 **Tests**, against an in-process HTTP stand-in, never a running service:
 
 - one test per row of the response-class table, which moves into the module doc with each row
-  naming its test;
+  naming its test, `InvalidPart`, `InvalidPartOrder`, `EntityTooSmall`, `InvalidBucketName`, and
+  MinIO's `SlowDownWrite` among them;
 - a key formats as the template, and a re-staged head keeps its `object_time`;
-- a replay that regroups writes the same key and the earlier object's batches all reappear;
+- a retry of the same head, after any fault class, writes the same key and closes at the pinned
+  batch count though more batches wait in the store; a retry that closes earlier lowers the pin;
+- a late `CompleteMultipartUpload` from an earlier attempt, landing after its retry committed,
+  leaves every committed batch at the key;
+- a part upload that fails inside `submit` is never completed: the upload is aborted once, the
+  head's `await_ack` fails without `HeadOnly`, and the object starts again in a new upload;
 - non-final parts are `part_size` bytes, and `x-amz-content-sha256` matches each body;
 - a `200` `CompleteMultipartUpload` with an `<Error>` body isn't delivered;
 - `ExpiredToken` calls `Chain::forget` before the retry, and `NoSuchUpload` starts the object
@@ -226,10 +245,25 @@ These came out of writing the ADRs; a reviewer may push on any of them:
 - `400` `EntityTooLarge` and `413` are `Refused`, not `Rejected`, since every body is at most
   `part_size` ([ADR `s3-object-archive`](../adr/s3-object-archive.md), decision 6).
 - An `Ambiguous` answer to `CreateMultipartUpload` or `UploadPart` is `Clean` (decision 6).
-- An upload abandoned in the process is aborted once, best effort (decision 1).
-- zstd writes one frame per staged batch, since `ruzstd` 0.9 has no streaming encoder (decision 4).
-- A hand-rolled XML extractor, not an XML crate, and a `Content-Type` per format (decisions 4 and 5).
-- `timeout` defaults to `60s` (decision 7).
+- An upload abandoned in the process is aborted once, best effort, and a failed part poisons its
+  object (decision 1).
+- The head pins its batch count, which only falls, and `object_time` carries milliseconds, so a
+  restart can't repeat a dead process's key (decision 3). With the pin, the maintainer's reason
+  against `If-None-Match` no longer arises; the ADR keeps the decision on other grounds.
+- `InvalidPart`, `InvalidPartOrder`, and `EntityTooSmall` are `Clean`, holding on a sink defect
+  rather than dropping a batch per attempt, and every `503` with an S3 code is `Clean`
+  (`s3-object-archive`, decision 6).
+- `bucket` is validated as not empty only, since stores' naming rules differ (`s3-object-archive`,
+  decision 6).
+- A window closes when its decoded batches reach `buffer.max_bytes` on either store, and rule 35
+  accepts `buffer.max_bytes` beside `disk:` on a collecting sink ([ADR
+  `collecting-sink-window`](../adr/collecting-sink-window.md), decision 2). Dropping read-ahead
+  and re-reading on a fault is rejected for now.
+- A closed window's answers are all read before the next window opens, through `window()`
+  reading the answers owed (decision 1 of that ADR).
+- zstd writes one frame per staged batch, since `ruzstd` 0.9 has no streaming encoder (`s3-object-archive`, decision 4).
+- A hand-rolled XML extractor, not an XML crate, and a `Content-Type` per format (`s3-object-archive`, decisions 4 and 5).
+- `timeout` defaults to `60s` (`s3-object-archive`, decision 7).
 
 ## Findings
 
