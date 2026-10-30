@@ -491,7 +491,10 @@ impl S3Output {
         self.visible = true;
         let started = std::time::Instant::now();
         let result = request.body(object.body).send().await;
-        self.telemetry.count("logit.output.bytes", bytes as f64, &[]);
+        // A failed dial sent nothing.
+        if !result.as_ref().is_err_and(reqwest::Error::is_connect) {
+            self.telemetry.count("logit.output.bytes", bytes as f64, &[]);
+        }
         let op = [("op", "put_object")];
         let response = match result {
             Ok(response) => response,

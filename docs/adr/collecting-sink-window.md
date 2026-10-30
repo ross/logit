@@ -6,8 +6,8 @@ updated: 2026-10-30
 # Collecting sink window: a windowed sink keeps its window open across arrivals until its own bound, a deadline, store pressure, or shutdown closes it
 
 ## Status
-Accepted. Built in W2 of [the plan](../plans/s3-object-archive.md); no sink collects until
-`s3_out` (W3). "Implementation notes (2026-10-30)", below, records what W2 decided that this
+Accepted. Built in W2 of [the plan](../plans/s3-object-archive.md); `s3_out` (W3a) is the one
+sink that collects. "Implementation notes (2026-10-30)", below, records what W2 decided that this
 ADR left open.
 
 Extends [ADR `native-hop-send-window`](native-hop-send-window.md)'s decision 4, where the fill

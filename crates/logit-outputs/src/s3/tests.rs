@@ -537,6 +537,7 @@ async fn a_refused_or_stalled_dial_is_clean() {
             .sum("logit.output.requests", &[("op", "put_object"), ("class", "connect_error")]),
         2.0
     );
+    assert_eq!(probe.poll().sum("logit.output.bytes", &[]), 0.0, "a failed dial sent nothing");
 }
 
 #[tokio::test]
