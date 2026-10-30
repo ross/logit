@@ -7,9 +7,9 @@ updated: 2026-10-30
 
 ## Status
 Accepted. Built: `cri_in` reads CRI-format files and cri-dockerd's Docker-format files under
-`root:` and stamps `container.id`, as every section describes. The
-[`cri` plan](../plans/cri-container-logs.md) holds the workstreams still to come, which add recorded
-fixtures and a soak scenario.
+`root:` and stamps `container.id`, as every section describes. Recorded
+fixtures from a real `kind` node and a soak scenario, `cri-rotate`, check it. The
+[`cri` plan](../plans/cri-container-logs.md) lists the workstreams.
 
 ## Context
 

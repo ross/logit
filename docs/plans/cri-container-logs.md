@@ -32,19 +32,19 @@ Non-goals:
 
 ## Workstreams
 
-Each workstream will be one PR on branch `cri/w<N>`, stacked on the one before it.
+Each workstream is one PR on branch `cri/w<N>`, stacked on the one before it.
 
-| WS | Branch | Scope | Depends on |
-|---|---|---|---|
-| W0 | `cri/w0` | the ADR and this plan; `docs/design/data-model.md`'s stale line on `docker_in`'s metadata refresh | — |
-| W1 | `cri/w1`, #925 | `logit_proto::cri`: the record parser and its timestamp (ADR section 3), the `cri` fuzz target, its seeds, and a `FUZZ_TARGETS` row in `script/unsafe-check` | W0 |
-| W2 | `cri/w2` | the `cri_in` kind: config and schema (section 11), the `Matcher` arm (section 2), `CriDecoder` and its factory with per-stream reassembly (section 4), the idle flush (section 5), event time (section 6), the path resource (section 7); the driver changes in the ADR's "Implementation notes for W2" (the splitter-drop and idle-flush hooks, the per-decoder `\r` and UTF-8 choices, and the `envelope_cap` bound); graph rules (`is_tail_listener`, rules 28 and 62, and a shape rule) and the registry arm; `AGENTS.md`, `docs/deploying.md` (mounts, privileges, and the ADR's documented limits with their workarounds), `docs/design/internal-telemetry.md`, `docs/design/data-model.md`; an example config | W1 |
-| W3 | `cri/w3` | `container.id` from `containers_dir:` (section 8): the key, the id test, the per-scan listing, the cache, and the `refresh` that installs a later-found id; the config key, its schema, and rule 27's empty check; `deploying.md`, `data-model.md`, the DaemonSet example | W2 |
-| W4 | `cri/w4` | cri-dockerd: the per-file format latch and the shared Docker decoder (section 9), with its `malformed` counter on `docker_in` too; decide and implement docker's splitter-drop remedy (known-gaps tailing entry) | W2 |
-| W5 | `cri/w5` | recorded fixtures from a real `kind` node (containerd), and from CRI-O where practical, through a new `script/record-fixtures cri` recipe, committed under `testdata/interop/cri/` and replayed by a test | W2 |
-| W6 | `cri/w6` | soak scenario `cri-rotate`: kubelet-style rename, reopen, and gzip rotation, with interleaved `P` and `F` runs on both streams, from a stdlib writer (`tools/soak/soaklib/criwriter.py`) the ledger reads through a `cri` wire | W2 |
+| WS | Branch | Scope | Depends on | State |
+|---|---|---|---|---|
+| W0 | `cri/w0`, #928 | the ADR and this plan; `docs/design/data-model.md`'s stale line on `docker_in`'s metadata refresh | — | Built |
+| W1 | `cri/w1`, #925 | `logit_proto::cri`: the record parser and its timestamp (ADR section 3), the `cri` fuzz target, its seeds, and a `FUZZ_TARGETS` row in `script/unsafe-check` | W0 | Built |
+| W2 | `cri/w2`, #930 | the `cri_in` kind: config and schema (section 11), the `Matcher` arm (section 2), `CriDecoder` and its factory with per-stream reassembly (section 4), the idle flush (section 5), event time (section 6), the path resource (section 7); the driver changes in the ADR's "Implementation notes for W2" (the splitter-drop and idle-flush hooks, the per-decoder `\r` and UTF-8 choices, and the `envelope_cap` bound); graph rules (`is_tail_listener`, rules 28 and 62, and a shape rule) and the registry arm; `AGENTS.md`, `docs/deploying.md` (mounts, privileges, and the ADR's documented limits with their workarounds), `docs/design/internal-telemetry.md`, `docs/design/data-model.md`; an example config | W1 | Built |
+| W3 | `cri/w3`, #936 | `container.id` from `containers_dir:` (section 8): the key, the id test, the per-scan listing, the cache, and the `refresh` that installs a later-found id; the config key, its schema, and rule 27's empty check; `deploying.md`, `data-model.md`, the DaemonSet example | W2 | Built |
+| W4 | `cri/w4`, #937 | cri-dockerd: the per-file format latch and the shared Docker decoder (section 9), with its `malformed` counter on `docker_in` too; decide and implement docker's splitter-drop remedy (known-gaps tailing entry) | W2 | Built |
+| W5 | `cri/w5`, #935 | recorded fixtures from a real `kind` node (containerd), and from CRI-O where practical, through a new `script/record-fixtures cri` recipe, committed under `testdata/interop/cri/` and replayed by a test | W2 | Built |
+| W6 | `cri/w6`, #940 | soak scenario `cri-rotate`: kubelet-style rename, reopen, and gzip rotation, with interleaved `P` and `F` runs on both streams, from a stdlib writer (`tools/soak/soaklib/criwriter.py`) the ledger reads through a `cri` wire | W2 | Built |
 
-W3 to W6 depend only on W2, but they'll stack in order, so each rebases on one parent.
+W3 to W6 depend only on W2, but they are stacked in order, each on one parent.
 
 ## Test coverage
 
