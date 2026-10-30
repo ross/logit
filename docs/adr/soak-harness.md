@@ -449,6 +449,31 @@ in a pause, which keeps them open. Reading the loss from that counter instead wo
 file gained after its last checkpoint, so `tail-rotate-delete` expects it at 0 beside the guard.
 [`docs/plans/soak-harness.md`](../plans/soak-harness.md), "6. The checks", has the rules.
 
+## Amendment: a copytruncate's step records its lost lines, and a running one may re-read its copy (2026-10-29)
+
+A file wire's writer can be rotated from outside by `copytruncate`, `gzip`, and `replace` steps,
+which do to the shared directory what logrotate and a restore do, so the content claim, gone
+counting, and compressed skip of [ADR `tail-content-identity`](tail-content-identity.md) run
+under soak. The writer's files belong to its container's `logit` user, so each step runs a
+stdlib script in a one-shot container as root rather than on the host, and `file_out` holds its
+file `O_APPEND`, so a truncate behind it leaves no hole. A `copytruncate` reads the bytes the
+writer appended after the copy's last read on its way to the truncate and records their lines:
+they're in neither file, so the shared directory's count is held to G less them, with at most
+one writer batch a step lost unrecorded between that read and the truncate. The replay band
+takes each step's terms from that ADR's residuals rather than from what a run shows: below, the
+lost lines, which a tailer reads only if a read lands between the copy and the truncate; above,
+for a step while the tailer runs whose record shows bytes appended after the copy's last read
+(or every such step, when the count shows a loss no record holds), the copy's lines and its cut
+line, since a read of those bytes leaves the copy shorter than what the tailer read and it's
+read from 0. Any other step adds nothing above: a copy with nothing appended after it, or made
+while the SUT is down, claims, so a read from 0 FAILs the row. The measurement is the harness's
+own, taken by the step, never the SUT's. The alternatives were freezing the writer around the
+truncate, which would remove the window the ADR's residual names, and judging each step by
+whether the SUT's own `files.claimed` rose, which would take the claim's outcome from the code
+under test. The scenario's `[[expect]]` rows anchor the down-path claims to their steps as
+well: one after the stop, two after the kill (its copy's and the replace's).
+[`docs/plans/soak-harness.md`](../plans/soak-harness.md), "6. The checks", has the rules.
+
 ## Amendment: a fan-out node's events are carried through its chain, and adjacent judged windows net at their boundary (2026-10-18)
 
 A source's `fan_out` names a `line_protocol` node and the k events it emits per event. Every

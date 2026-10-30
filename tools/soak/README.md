@@ -296,30 +296,6 @@ then never reaches the generator. Its expectations assert the generator's overfl
 ambiguous drops around the SUT's pause, an idle close around the generator's, and none under
 the netem delay.
 
-`syslog-tcp-ingress` (14 minutes) sends 2,000 RFC 5424 messages a second with `syslog_out` over
-one TCP connection, octet-counted, 100 to a frame, into `syslog_in` with `transport: tcp`,
-where `kv`, `keep`, `kv_metrics`, and `keep_signals` turn each `id=N` message into one
-`soak_lines` increment, its source declared `wire = "tcp"`. The generator runs `syslog_out`'s
-default posture, `at_least_once`: an ambiguous attempt is resent, never dropped, so a judged
-window allows one batch of surplus per attempt the generator counted
-`logit.output.requests{class="ambiguous"}`. Its 11-minute cycle drops 30% of the SUT's
-segments, then pauses, stops, kills, and partitions the SUT, then stops the generator. Its
-override caps each end's TCP buffers as `tcp-ingress`'s does. `syslog-tls-ingress` (14 minutes)
-is the same stream over TLS
-from the run's private CA, with no client certificate, and its cycle adds a rotation of the
-SUT's server certificate, a SIGHUP, and a probe before the pause; the stop after it makes the
-generator handshake against the rotated certificate. A TLS first write that fails is ambiguous,
-not clean as over plaintext, and the same allowance covers it. Both expect the generator's
-overflow and ambiguous attempts around the pause and no `ambiguous_at_most_once` drop, and
-both hold the listener's `logit.input.connections.closed{reason="reset"}` at 0 under the pause,
-the partition, the generator's stop, and the whole run: the listener never writes to a
-plaintext peer, so a closing generator sends a FIN, and over TLS no fault in the recorded runs
-reset a connection either. A stop or kill of the SUT loses what sat in the two socket buffers,
-which neither side counts: a stream hop with no acknowledgment is best-effort
-([ADR `delivery-semantics`](../../docs/adr/delivery-semantics.md), item 6), and counting the
-sender's part is a [known gap](../../docs/known-gaps/sinks.md). So `ledger.wire` reports those
-windows.
-
 `http-ingress` (18 minutes) sends 2,000 InfluxDB points a second with `influxdb_out`, 100 to a
 request, into `influxdb_in`, its source declared `wire = "http"`. Each point carries only a
 string field, so the SUT decodes no gauge, and a `kv_metrics` counts one per point ahead of a
@@ -421,6 +397,24 @@ rotations, so the writer deleted files, and assert no checkpoint error and no go
 (`no-gone-bytes`, `logit.input.bytes.dropped` at 0). It has no `no-resume-rejected` expectation: an
 inode a deletion freed while the SUT was down can be reused by the writer's next file, and the
 restart then rejects the checkpoint entry whose head no longer matches.
+
+`tail-copytruncate` (15 minutes) runs `tail-rotate`'s pipeline against a writer that never
+rotates its file: `copytruncate` steps rotate it as logrotate's `copytruncate` does, to dated
+names (`app.log-01`, as `dateext` names them) that the SUT's `app.log*` pattern matches, four
+while the SUT runs, one inside a 60 s stop, and one inside a 90 s kill. Two `gzip` steps
+compress a copy the tailer has finished, as `delaycompress` does, and a `replace` inside the
+kill puts one finished copy's bytes back under a new inode, as a restore does. Each exercises a
+path of [ADR `tail-content-identity`](../../docs/adr/tail-content-identity.md): a copy claims
+the original's position, a rejected entry a copy claims isn't counted gone, and a compressed
+file is skipped. `ledger.wire` holds the shared directory's count, which reads a gzip file
+decompressed, to G less the lines the copytruncates lost, and widens the replay band below by
+those lines. It widens the band above by a copy's lines and its cut line only for a
+copytruncate while the SUT runs whose record shows bytes appended after the copy's last read,
+the ADR's residual for a copy shorter than what the tailer read, which is read from 0; any
+other copy must claim, so a read from 0 FAILs the row. Its expectations assert a claim after
+the stop and two after the kill (its copy's and the replace's), two rejected resumes, four
+truncations seen, two compressed files skipped, and none of a gone entry's bytes, an ambiguous
+claim, an invalid UTF-8 line, or a checkpoint error.
 
 `otlp-fan-out` (16 minutes) sends 500 OTLP log records a second with `otlp_out` over HTTP, 50
 to a request, into `otlp_in`, its source declared `wire = "http"`. Each record's body is four
@@ -699,15 +693,21 @@ requires one completes the handshake and logs no `connection_error`.
 | `respond` | on a stand-in only: POSTs the step's cue to its control port, so it answers `status` (with an optional `body`) or `answer = "reset"`, storing the write when `apply` says to or, by default, when the status is `2xx`. With `count = N` the cue answers the next N writes and is then spent, and the stand-in answers its default again, so with several requests in flight a cue lands on one of them. Under the `datadog` shape a `2xx` can carry `series_errors = N`, a body naming the request's first N series dropped. `headers`, a table of header names to strings, replaces the response headers the stand-in adds itself | an empty cue, which restores the default answer |
 | `signal` | `docker kill -s HUP`, on a service that runs `logit`, with `signal = "HUP"`, the one signal it takes: the process reopens its file targets and reloads its TLS material | none |
 | `rename` | on the host, moves `path` to `to` inside `<run>/shared`, both bare names, refusing a `to` that exists. `path` is a `stdio_out` target in `/shared` in the config of the service the step is `on`, and a `signal` step on that service must start inside the rename's `for` | none |
+| `copytruncate` | on a file source's writer, does what logrotate's `copytruncate` does to `path` in `<run>/shared`: copies it to `to`, created empty and filled, and truncates `path` in place, so an `O_APPEND` writer goes on at offset 0. It records the lines copied and the lines written after the copy and before the truncate, which are in neither file (`lost_lines`). It runs in a one-shot container of the stand-in's Python image, as root, because the writer's files belong to its container's `logit` user | none |
+| `gzip` | on a file source's writer, compresses `path` into `to` and removes `path`, as `gzip` does, in the same container | none |
+| `replace` | on a file source's writer, writes `path`'s bytes to a dot-prefixed temporary name and renames it over `path`: the same content under a new inode, as a restore or a migration leaves it, in the same container | none |
 | `rotate` | issues `cert`'s next generation into `<run>/tls`, valid `days`, with a mismatched key under `broken = true`, and repoints its `live` link; records the new serial and `notAfter`. See [TLS certificates](#tls-certificates) | none |
 | `probe` | from the network namespace of the service it's `on`, handshakes with `127.0.0.1:<port>`, presenting the probe certificate, and records the served serial and `notAfter` and whether they verify against the CA for `cert`'s first DNS name | none |
 
 A `mark`, `exit`, or `respond` window is a fault window like any other, so the checks excuse
-what happens inside it. A `signal`, `rename`, `rotate`, or `probe` window excuses nothing: none
-can lose data, so every row judges straight through it, and only `[[expect]]`, `file.reopen`,
-`tls.served`, and `self_log`'s excusal of a broken rotation's failed reload read it. A `signal`
-or `probe` may start inside a `rename` or `rotate` on its own service, and no other step may
-overlap one of these on its service. None of these seven can go in a `[random]` schedule. A `respond` or a `stop` of
+what happens inside it. A `signal`, `rename`, `rotate`, `probe`, `copytruncate`, `gzip`, or
+`replace` window excuses nothing, so every row judges straight through it, and only `[[expect]]`,
+`file.reopen`, `tls.served`, and `self_log`'s excusal of a broken rotation's failed reload read
+it; `ledger.wire` takes a `copytruncate`'s lost and duplicated lines from its record instead (see
+[The checks](#the-checks)). A `signal` or `probe` may start inside a `rename` or `rotate` on its
+own service, and no other step may overlap one of these on its service. A `copytruncate` or a
+`gzip` runs once per run, since a second cycle's would find its `to` taken. None of these ten
+can go in a `[random]` schedule. A `respond` or a `stop` of
 a stand-in may name the `class` the sink must read its answers as (`clean`, `ambiguous`,
 `rejected`, or `refused`), which `ledger.standin` judges. Under the `datadog` and `influxdb`
 shapes every `respond` other than a `2xx` must name one, because its class is the only statement
@@ -1018,9 +1018,9 @@ The loader refuses `sut_delta` beside `sut_aggregate`, `sut_script`, a hop, a `s
    `logit-soak-netem:local` from `netem/` (set `SOAK_SKIP_IMAGE=1` to reuse both), and validates
    the scenario's configs in `logit:soak`. `SOAK_SKIP_IMAGE=1` reuses whatever `logit:soak` is on
    the daemon, whichever tree built it; `provenance.txt` records the image id, so check it before
-   reading a run as evidence about a changed binary. `SOAK_IMAGE=<tag>` builds and runs that tag
-   in place of `logit:soak`, so a branch's build doesn't replace the image other runs on the
-   same daemon share.
+   reading a run as evidence about a changed binary. `SOAK_IMAGE=<tag>` builds and runs another
+   tag, so a run from one checkout can't pick up an image another checkout's build tagged
+   `logit:soak` in the meantime.
 2. The driver refuses to start if the compose project already has containers, then brings the
    stack up with `docker compose up --wait`, which waits on each `logit` service's `logit ready`
    health check. For an external target it brings up no backend.
@@ -1127,7 +1127,12 @@ checkpoint and its unexported last drain interval, and a stopped life's split li
 file. While the writer deleted no file, G is held to the lines the driver counts in the shared
 directory at the end; once it deleted one, the count must not exceed G, the directory must hold
 the files the writer keeps, and no SUT fault may last long enough for the writer to delete a
-file the tailer hadn't read.
+file the tailer hadn't read. A `copytruncate` step's lost lines leave the count short of G by
+that many, plus at most one writer batch a step written between its last read and its
+truncate, and widen the band below; one while the SUT runs whose record shows bytes appended
+after the copy's last read widens it above by its copy's lines and its cut line, since a read of
+those bytes leaves the copy unable to claim, and it's read from 0. Every other copy adds nothing
+above.
 
 A scrape wire is a pull of running totals, so it's judged in value, not in lines. G is the
 increments the generator's `generate_in` sent per generator life, less what the
@@ -1280,7 +1285,7 @@ vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'    # local only: the se
 | `progress` | a SUT sink delivers nothing in a `progress_window` outside fault windows with work queued (a hang), a `logit` container's telemetry goes quiet, or a sink's newest stored sample is 30 s old (a local target only); a sink still retrying past `recovery_bound` `WARN`s, and so do windows covering under 5% of the run after warmup |
 | `rss_slope` | a `logit` service's resident memory grows faster than `rss_growth_mib_per_hour` in steady state, which here also excludes a scenario's `rss_settle` (default `0s`) past each fault window; a run shorter than an hour `WARN`s instead, and so do slopes covering under 5% of the run after warmup, a service whose every sample sat in a window included. Each service is judged on its own line, and `[expected]` can set its verdict (see [Expected verdicts](#expected-verdicts)) |
 | `fd_slope` | a `logit` service's open file descriptors end, or sit after a recovery, more than `fd_growth` above the warmup median. Each service is judged on its own line, and `[expected]` can set its verdict |
-| `ledger.wire` | for a UDP or TCP source, its generator's lines minus what its listener read, what the kernel dropped, and what its framer dropped, counted (G − (W + K + F)), exceeds `wire_loss_outside_faults` outside the reported fault windows that affect its wire, with one generator batch of tolerance per window edge, each judged run counting at 0 or more; or, on UDP, its generator's sink counts messages and datagrams apart, and on TCP it counts any datagram. On UDP that loss is by design and every affecting window is reported: netem on a generator, and a lifecycle fault or partition of the SUT or of a generator. On TCP only a stop, kill, restart, or `exit`, and a partition that moved the container's address, are reported; every other TCP-affecting window (netem on the SUT, a pause, a partition that kept the address) is judged, and a surplus in it beyond one generator batch per ambiguous attempt the generator's stream sink counted there, `logit.output.requests{class="ambiguous"}`, plus one per edge, FAILs: a write that failed partway, or a TLS first write that failed, left whole lines the SUT read, and the sink then resends the batch under `at_least_once` or drops it `ambiguous_at_most_once` under `at_most_once`. Netem on a TCP generator affects nothing and is judged as steady state. On HTTP, G − (W − X), only a kill or an `exit` of the SUT is reported, since either can lose its unexported counts; every other HTTP-affecting window (netem on either end, a pause, a stop, a restart, a partition) is judged, and a surplus in it beyond one generator batch per attempt the generator counted `logit.output.requests{class="network_error"}`, and per id it counted `logit.output.acks{result="timeout"}`, plus one per edge, or at a judged run's trailing edge the batches the generator's `logit.output.in_flight` read at the two generator drains straddling it when more, FAILs: the writer sends one batch per request and resends it after a timeout, a reset, or an acknowledgment wait that timed out, when the SUT may have taken it. A failed `/ack` poll sends no data and allows none. A failed dial, `class="connect_error"`, a dial the generator's `connect_timeout:` ended included, sent nothing and allows none; a generator whose request timeout is below its `connect_timeout:` counts a stalled dial `network_error`, and its allowance is an upper bound ([ADR `sink-send-path-and-attempt-accounting`](../../docs/adr/sink-send-path-and-attempt-accounting.md)'s "Amendment: a failed dial counts `connect_error`"). A backend stop doesn't affect the wire: a busy `503` takes nothing. On TCP and HTTP, at a boundary that touches a judged window, judged or steady on its other side, G's interpolation errs by up to the G that moved in the generator interval straddling it, many batches when acknowledgments bunch under one request in flight or a restart flushes its backlog, and the error shows as an opposite-signed pair in the two runs that touch. So the pair nets in full, up to that G, before the surplus run's allowance applies to what's left, and the detail line shows each transfer; the cap keeps a surplus from hiding more loss next door than interpolation explains, and runs that don't touch never net. On every wire the end run nets the same way with the run before it, before the end allowance applies, since its boundary is a SUT drain like any other. On every wire, and in `ledger.overlap`, G is anchored at every generator drain, a drain with no G point at the running total, since a counter exports no point for a drain it didn't move in. A file source is judged otherwise: its run's W + F − G against a replay band per SUT life, and G against the lines counted in the shared directory when the writer deleted no file; once it deleted one, the count at or below G, the file count at the writer's retention, and a FAIL for any SUT stop, kill, restart, or `exit` during which the writer rotated `max_files − 2` times or more, or pause during which it rotated `max_files` times, since a paused tailer keeps its open files (the plan's §6 `ledger.wire` row). The detail lists the gap per source and per run of drain intervals, and the generator's own counted loss beside it. A scrape source is judged per generator life: its increments minus the stored counters' reset-aware total in that life (G − V) falls outside the life's end band, above it increments lost past the life's last scrape, below it a surplus; no fault window excuses anything, since a failed scrape loses only intermediate values (see the scrape paragraph above). |
+| `ledger.wire` | for a UDP or TCP source, its generator's lines minus what its listener read, what the kernel dropped, and what its framer dropped, counted (G − (W + K + F)), exceeds `wire_loss_outside_faults` outside the reported fault windows that affect its wire, with one generator batch of tolerance per window edge, each judged run counting at 0 or more; or, on UDP, its generator's sink counts messages and datagrams apart, and on TCP it counts any datagram. On UDP that loss is by design and every affecting window is reported: netem on a generator, and a lifecycle fault or partition of the SUT or of a generator. On TCP only a stop, kill, restart, or `exit`, and a partition that moved the container's address, are reported; every other TCP-affecting window (netem on the SUT, a pause, a partition that kept the address) is judged, and a surplus in it beyond one generator batch per `ambiguous_at_most_once` drop the generator counted there, plus one per edge, FAILs. Netem on a TCP generator affects nothing and is judged as steady state. On HTTP, G − (W − X), only a kill or an `exit` of the SUT is reported, since either can lose its unexported counts; every other HTTP-affecting window (netem on either end, a pause, a stop, a restart, a partition) is judged, and a surplus in it beyond one generator batch per attempt the generator counted `logit.output.requests{class="network_error"}`, and per id it counted `logit.output.acks{result="timeout"}`, plus one per edge, or at a judged run's trailing edge the batches the generator's `logit.output.in_flight` read at the two generator drains straddling it when more, FAILs: the writer sends one batch per request and resends it after a timeout, a reset, or an acknowledgment wait that timed out, when the SUT may have taken it. A failed `/ack` poll sends no data and allows none. A failed dial, `class="connect_error"`, a dial the generator's `connect_timeout:` ended included, sent nothing and allows none; a generator whose request timeout is below its `connect_timeout:` counts a stalled dial `network_error`, and its allowance is an upper bound ([ADR `sink-send-path-and-attempt-accounting`](../../docs/adr/sink-send-path-and-attempt-accounting.md)'s "Amendment: a failed dial counts `connect_error`"). A backend stop doesn't affect the wire: a busy `503` takes nothing. On TCP and HTTP, at a boundary that touches a judged window, judged or steady on its other side, G's interpolation errs by up to the G that moved in the generator interval straddling it, many batches when acknowledgments bunch under one request in flight or a restart flushes its backlog, and the error shows as an opposite-signed pair in the two runs that touch. So the pair nets in full, up to that G, before the surplus run's allowance applies to what's left, and the detail line shows each transfer; the cap keeps a surplus from hiding more loss next door than interpolation explains, and runs that don't touch never net. On every wire, and in `ledger.overlap`, G is anchored at every generator drain, a drain with no G point at the running total, since a counter exports no point for a drain it didn't move in. A file source is judged otherwise: its run's W + F − G against a replay band per SUT life, and G against the lines counted in the shared directory when the writer deleted no file; once it deleted one, the count at or below G, the file count at the writer's retention, and a FAIL for any SUT stop, kill, restart, or `exit` during which the writer rotated `max_files − 2` times or more, or pause during which it rotated `max_files` times, since a paused tailer keeps its open files (the plan's §6 `ledger.wire` row). The detail lists the gap per source and per run of drain intervals, and the generator's own counted loss beside it. A scrape source is judged per generator life: its increments minus the stored counters' reset-aware total in that life (G − V) falls outside the life's end band, above it increments lost past the life's last scrape, below it a surplus; no fault window excuses anything, since a failed scrape loses only intermediate values (see the scrape paragraph above). |
 | `ledger.overlap` | under `[overlap]` only, else no row: over the run, the generators' lines minus what every instance read or counted dropped (G − Σ(W + K + F)) exceeds, for each stop or restart of an instance, `ceil(used / 512) + 1` datagrams, `used` being the closing life's last `logit.input.receive_buffer.used.bytes`; or falls below 0 past the generators' end allowance. Each close's own gap is reported, not judged. A kill or `exit` of an instance, which leaves no final sample, or another fault that can lose UDP on its way in makes the row report its numbers and SKIP. See [Rolling overlap](#rolling-overlap) |
 | `ledger.intake` | for any listener, the final SUT life's lines read minus dropped differ from the events sent plus bad lines (B: `messages.dropped{reason="malformed"}`, `frames.dropped{reason="undecodable"}`, and on UDP `lines_in`'s oversize lines); or an earlier life's read-but-unabsorbed residual summed over the listeners (W − D − B − X − Ab, X being the listeners' own counted event drops, less a script's or the `sut_transforms` nodes' counted discards; with a `fan_out`, W′ − Ab, W′ being each listener's W − D − B − X carried through its chain) falls outside [0, R], R being each UDP listener's receive queue plus 2 batches per listener, 65 more batches for each node between it and `aggregate`, and 65 for `aggregate`, each listener's share times its chain's product of k with a `fan_out`; or, for an `influxdb_in`, `splunk_hec_in`, or `datadog_in` on an HTTP wire, in any SUT life a kill didn't end, its `ok` and `closed_consumer` requests on its write route don't sum to its `batches.sent`, or its `busy` ones differ from its `batches.deferred`, or for `prometheus_in`'s receiver its `ok` and `closed_consumer` `logit.input.writes` don't sum to its `batches.sent`. Under `split = "target"` the residual ends at the router (W − D − B − X − R_in), and a stopped earlier life's must be 0: its final drain runs after every data node has exited, and each sink's egress starts at its target, so nothing else judges it. On a scrape wire E also counts Y, three synthetic samples per scrape, so the identity is W + Y − D == E + B. |
 | `ledger.edge`, `ledger.aggregate` | in the final SUT life, the listeners' summed events sent (or, with `sut_script`, the script's) differ from those `aggregate` received; a node in a source's `sut_transforms` received a different number from those sent to it, or sent a different number from those it received less those it discarded (T_in − T_disc ≠ T_out), or a `fan_out` node's children, T_out − (T_in − T_disc), differ from k × those it received less the lines it dropped, or a `merge` node's discards differ from the records it merged (T_disc ≠ M) or it superseded a reading (T_ab > 0, judged in every life a kill didn't end); a sink received a different number of events from those sent to it (under `copy` `aggregate`'s events sent, which a fan-out counts once per batch, and under `route` its target's); or `aggregate` received a different number from those it absorbed. Under `split = "target"` the path runs into the router instead of `aggregate`; the router's R_in + R_copied − R_disc differs from R_fwd + ΣT_sent, a target's T_sent exceeds R_in − R_disc, or R_fwd exceeds R_in, in the final life or any stopped earlier one; and per sink, its target's sends less its closed-consumer drops (T_sent − T_x) differ from those its first branch transform or its `aggregate` received, a branch transform breaks T_in − T_disc = T_out, its `aggregate` sends a different number from those the sink received, or, in `ledger.aggregate`, absorbs a different number from those it received, each on a line naming it. On a scrape wire, which has no `aggregate`, `ledger.edge` holds the listener's E − X to the sink's events received, and `ledger.aggregate` SKIPs. |
@@ -1422,7 +1427,8 @@ for = { min = "60s", max = "3m" }
 ## Long runs
 
 A scenario that sets `max_duration` refuses a longer `--duration`, because its thresholds or
-configs hold only that long; `tail-rotate`'s is 25 minutes. `tail-rotate-delete` has none:
+configs hold only that long; `tail-rotate`'s is 25 minutes, and `tail-copytruncate`'s is its
+own 15, since its steps run once per run. `tail-rotate-delete` has none:
 its writer's retention bounds both the shared directory and the tailer's descriptors.
 
 To run for hours, keep the driver alive when the terminal closes: a closed terminal sends
