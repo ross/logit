@@ -24,6 +24,7 @@ script/soak run random-faults --seed 7           # the same scenario, another sc
 script/soak run random-faults --duration 8h --retry-stalled 2   # rerun if the host sleeps
 script/soak run statsd-datadog                   # an external target; needs a key, see "External targets"
 script/soak run kafka-broker-restart             # a Kafka target; see "Kafka targets"
+script/soak run kafka-consume-broker-restart     # a Kafka wire into kafka_in, out to VictoriaMetrics
 script/soak run standin-remote-write             # a stand-in target; see "Stand-in targets"
 script/soak run standin-datadog                  # a Datadog-shaped stand-in, no key needed
 script/soak run standin-influxdb                 # an InfluxDB-shaped stand-in, no token needed
@@ -260,6 +261,20 @@ diagnostic inside the stop, `clean` attempts and `retrying` inside both endpoint
 `retrying` clearing after each. The reconnect rate is bounded to 25 to 220 an hour and the
 `ambiguous` rate to 20 an hour, both derived in its `scenario.toml`. No attempt is `refused`:
 the sink never sends a token it knows has expired.
+
+`kafka-consume-broker-restart` (10 minutes) turns the Kafka scenarios around: the SUT reads
+the topic. The generator is `generate_in -> kafka_out` (`format: json`, one record per event)
+into the stack's broker, and the SUT is `kafka_in -> keep -> aggregate -> prometheus_out` into
+VictoriaMetrics, a group member with a 10 s `session_timeout` reading `start: earliest`. Its
+compose override creates the two-partition topic in the broker's healthcheck, so the SUT starts
+against a topic that exists: `kafka_in` rechecks a missing topic only every 5 minutes. Its
+source is `wire = "kafka"` (see [The checks](#the-checks)): the run's W − G is judged
+against a replay band, and the end sequence waits for the SUT's lag to read 0 on both
+partitions. The cycle restarts the broker, pauses it for 40 s (past the session timeout, so
+the group loses the member and its next commit is fenced), kills the SUT, and stops it.
+Its expectations assert that no record is dropped, a rebalance after the kill and through
+the pause, a fenced commit in the pause, and each partition's lag back at 0 after every
+step.
 
 Eleven scenarios run a sink against a scripted stand-in in place of VictoriaMetrics (see
 [Stand-in targets](#stand-in-targets)):
@@ -851,7 +866,9 @@ resent series point overwrites the stored one, and a resent log is stored again
 
 ## Kafka targets
 
-A scenario whose sink is `kafka_out` declares the stack's own broker as its target:
+A scenario whose sink is `kafka_out` declares the stack's own broker as its target. A scenario
+with a `kafka` wire runs the same broker beside VictoriaMetrics with no `[target]` table; see
+[The checks](#the-checks).
 
 ```toml
 [target]
@@ -1156,13 +1173,16 @@ on one connection; `file`, lines the SUT tails from a file the generator writes;
 requests to `influxdb_in`, `otlp_in`, `splunk_hec_in`, `datadog_in`, or `prometheus_in`'s
 remote-write receiver from `influxdb_out`, `otlp_out`, `splunk_hec_out`, `datadog_out`, or
 `prometheus_out`; or `scrape`, `prometheus_in` scraping a generator's `prometheus_out`
-exposition. The loader checks the wire against the listener's `type:` and `transport:` in
+exposition; or `kafka`, a generator's `kafka_out` producing to the stack's broker and the SUT's
+`kafka_in` consuming the topic. The loader checks the wire against the listener's `type:` and `transport:` in
 the SUT config, or for `prometheus_in`, which has no `transport:`, against its mode: `bind:` is
 the receiver, an HTTP listener, and `scrape_targets:` a scrape listener. On a file, HTTP, or
 scrape wire it also checks the generator sink's kind, on a scrape wire a `prometheus_out` with
-`bind:`. Each wire has its own symbols: G is the generator sink's
-`output.messages` (its `events.delivered` on a file or HTTP wire), W the listener's
-`input.datagrams`, `input.frames`, `input.lines`, or on HTTP `events.sent`, and on TCP F
+`bind:`, and on a Kafka wire a `kafka_out` writing one of the `kafka_in`'s `topics:` in its
+`format:`, read from `start: earliest`. Each wire has its own symbols: G is the generator sink's
+`output.messages` (its `events.delivered` on a file or HTTP wire, its `output.records` on a
+Kafka wire), W the listener's `input.datagrams`, `input.frames`, `input.lines`,
+`input.records` on Kafka, or on HTTP `events.sent`, and on TCP F
 counts the lines the listener's framer dropped before W counted them (`frames.dropped`),
 counted wire loss. On HTTP G counts only the points the listener answered with a success, so
 the row compares it with W less X, the events of a batch refused with `503` because no
@@ -1192,6 +1212,26 @@ truncate, and widen the band below; one while the SUT runs whose record shows by
 after the copy's last read widens it above by its copy's lines and its cut line, since a read of
 those bytes leaves the copy unable to claim, and it's read from 0. Every other copy adds nothing
 above.
+
+A Kafka wire is judged as a file wire is, because the broker keeps every record until the
+consumer reads it: a replay is surplus, and only a deficit is loss. The row judges the run's
+W − G against a replay band summed over the SUT's lives (`Ledger.kafka_band`):
+
+- A killed life replays the records it read after its last commit, its rate over its last
+  drain interval times `commit_interval`, plus one fetch, above, and loses the counts of its
+  last drain interval below. One fetch is a partition's `fetch.max_partition_bytes` over the
+  run's mean record value bytes, which overstates the records it holds.
+- Each membership a life lost, `logit.input.rebalances{reason="membership_lost"}`, replays
+  the same at the life's peak rate, above: a fenced commit's records are read again.
+- Each batch a life deferred at a revoke or at shutdown, `logit.input.batches.deferred` (Q),
+  is read again, up to `batch_max_events` records each, above.
+
+B on a Kafka wire is the records the listener dropped or skipped, every reason. A deferred
+batch is in W and never sent, so `ledger.intake` and `ledger.egress` accept a positive gap up
+to Q's records in a life that deferred one. The end sequence waits, once the generators stop,
+until the SUT's `logit.input.lag` reads 0 on every partition (`kafka_caught_up` in
+`timeline.jsonl`), and the row FAILs a wait that ended short. `ledger.summary`'s end-to-end
+bound adds the band's upper edge, since a replayed record reaches VictoriaMetrics again.
 
 A scrape wire is a pull of running totals, so it's judged in value, not in lines. G is the
 increments the generator's `generate_in` sent per generator life, less what the
@@ -1273,7 +1313,7 @@ service = "generator-lines"                     # a service with soak.role gener
 generator_input = "load"                        # its generate_in
 generator_sink = "syslog"                       # its sink, G's source; see "Rolling overlap" for lists
 sut_listener = "lines"                          # the SUT listener it reaches
-wire = "udp"                                    # optional: udp (the default), tcp, file, or http
+wire = "udp"                                    # optional: udp (the default), tcp, file, http, scrape, or kafka
 sut_transforms = ["parse", "labels", "count", "metrics_only"]   # optional: nodes to aggregate
 # fan_out = { points = 4 }                      # optional: a line_protocol node's events per event
 # merge = ["dedup"]                             # optional: dedup_timestamps nodes whose discards are merges

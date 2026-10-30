@@ -322,7 +322,7 @@ soak harness share no file, and neither changes `kafka_in`.
 | W4 | `kin/w4` | `kin/w4: kafka_in's msgpack and OTLP formats` | M | W3 | open |
 | W5 | `kin/w5` | `kin/w5: kafka_in in the transit spec, the eleventh lossless pair, and fuzz targets` | M | W4 | not started |
 | W6a | `kin/w6a` | `kin/w6a: kafka_in interop legs on Apache Kafka and Redpanda` | M | W5 | not started |
-| W6b | `kin/w6b` | `kin/w6b: the kafka-consume-broker-restart soak scenario` | M | W5 | not started |
+| W6b | `kin/w6b` | `kin/w6b: the kafka-consume-broker-restart soak scenario` | M | W5 | open |
 
 ## Findings
 
@@ -375,3 +375,15 @@ Recorded per workstream as each lands.
   under `otlp_json`, which ignores fields it doesn't know. `kafka_out` never writes a request of
   several resources, so the test builds one by concatenating two protobuf requests. The OTLP
   encoder stamps a log with no observed time with the clock, so the split round trip sets one.
+- **W6b**: A 10-minute run passed every row (`perf/results/soak/20261030T183229Z`, not
+  committed): 605,800 records accepted, 610,400 read, and 605,400 stored. The kill replayed
+  4,354 records, about 4.4 s at 1,000 a second, inside one `commit_interval`. The 40 s broker
+  pause lost the membership once and fenced one commit, and the rejoined member replayed almost
+  nothing, because the paused broker served no records past the last good commit. The broker
+  restart caused no rebalance: the member reconnected inside its 10 s session, counting 13
+  `logit.input.broker.errors`. A stop left the group cleanly, so the next life joined with
+  `reason="start"` and no batch was deferred. The topic must exist before the SUT starts, since
+  `kafka_in` rechecks a missing topic every 5 minutes, so the scenario's compose override
+  creates it in the broker's healthcheck. A membership loss's allowance uses the life's peak
+  read rate, which after a pause is the catch-up rate (8,921 a second here), so the band's upper
+  edge, 63,972, is loose; the deficit side is what catches loss.

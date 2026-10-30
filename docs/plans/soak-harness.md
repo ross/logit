@@ -591,20 +591,25 @@ sut_transforms = ["parse", "labels", "count", "metrics_only"]   # optional, in o
   config path into `compose.env` under `scenario.config_env(service)`:
   `SOAK_GENERATOR_CONFIG` for `generator`, `SOAK_GENERATOR_LINES_CONFIG` for
   `generator-lines`. An override's generator mounts its own variable at `/config.yaml`.
-- `wire`, optional (W11a), is `udp` (the default), `tcp`, `file`, or `http` (W14): what the
+- `wire`, optional (W11a), is `udp` (the default), `tcp`, `file`, `http` (W14), `scrape`
+  (W25), or `kafka` (the kafka-input plan's W6b): what the
   source's lines cross into the SUT, which picks the ledger's symbols for it (§6). `load()`
   reads the SUT config and checks the source's `sut_listener` against it: a component of a kind
   and `transport:` the ledger has a wire for (`scenario.LISTENER_WIRES`: `statsd_in` and
   `syslog_in` UDP unless `transport: tcp`, `lines_in` and `graphite_in` TCP unless
   `transport: udp`, `collectd_in` UDP, `tail_in` and `docker_in` file, `influxdb_in`,
-  `otlp_in`, `splunk_hec_in`, and `datadog_in` HTTP), or of a kind and mode
+  `otlp_in`, `splunk_hec_in`, and `datadog_in` HTTP, `kafka_in` Kafka), or of a kind and mode
   (`scenario.LISTENER_MODES`: `prometheus_in` HTTP on `bind:`, and scrape on
   `scrape_targets:`), whose wire is the source's. A listener the config lacks, a kind,
   transport, or mode with no wire (a Unix socket), and a mismatch are refused. It also reads
   the generator's config: a file wire's `generator_sink` must be a `file_out`, an HTTP wire's
   one of `scenario.HTTP_WRITER_KINDS` (`influxdb_out`, `otlp_out`, `splunk_hec_out`,
-  `datadog_out`, or `prometheus_out`), a scrape wire's a `prometheus_out` with `bind:`, and any
-  other wire's neither. A scrape wire (W25) is the one source, into one SUT service with one
+  `datadog_out`, or `prometheus_out`), a scrape wire's a `prometheus_out` with `bind:`, a
+  Kafka wire's a `kafka_out`, and any other wire's none of these. On a Kafka wire the writer's
+  `topic:` must be one of the listener's `topics:`, the two `format:`s must agree, and the
+  listener must set `start: earliest`, else records written before the group's first join are
+  never read (`scenario._kafka_wire_problems`). A Kafka wire runs the `kafka` profile's broker
+  beside the local target's backends. A scrape wire (W25) is the one source, into one SUT service with one
   sink on the local target and no `sut_transforms`, and `load()` refuses `sut_aggregate`,
   `sut_delta`, `sut_script`, `split`, `hop`, `vm_every_window`, and `[overlap]` beside it
   (`scenario._scrape_problems`), and a listener scrape `timeout` not below the generator's
@@ -889,7 +894,10 @@ ticket with `${DOCKER} version` first.
    chunk's 5 s lag, and wait, up to 180 s, until the tailers' W, read from a log chunk the
    driver captures every 5 s, reaches G or holds for four reads (phase `tail_caught_up`, which
    records G and the count); G, not the count, since a writer that deleted a file (W18) left
-   fewer lines than it wrote, and W reaches that count before the tailers read to the end; wait until every sink's stored
+   fewer lines than it wrote, and W reaches that count before the tailers read to the end; with a
+   `kafka` wire, wait, up to 180 s, until the newest `logit.input.lag` point of every listener
+   partition, read from a log chunk every 5 s and exported after the wait began, reads 0 (phase
+   `kafka_caught_up`, which records the lags); wait until every sink's stored
    total holds across two aggregate windows (90 s bound); `docker stop -t 60` the SUT, expecting
    exit 0; call each backend's `/internal/force_flush`; write each sink's
    `vm-export/<sink>.jsonl` from its backend's `/api/v1/export` with `match[]=<vm_selector>`
@@ -1375,6 +1383,29 @@ The rows:
   is absorbed and stored again. From W13a it counts the path's discards with the counted loss:
   a replayed line a node discards is counted again as its read counts in W again, so the band
   still bounds the surplus.
+
+  On a Kafka wire (the kafka-input plan's W6b) G is the writer's `logit.output.records`, the
+  records the broker accepted, W the listener's `logit.input.records`, and B its
+  `logit.input.records.dropped` and `.skipped` under every reason. A lifecycle fault or netem on
+  the generator, the broker, or the ingress SUT affects the wire, and every run is reported:
+  the broker keeps every record, so the row judges the run's W − G against a replay band
+  (`Ledger.kafka_band`), a deficit below it uncounted loss:
+  - a killed life: above, its rate over its last drain interval × `commit_interval` plus one
+    fetch, a partition's `fetch.max_partition_bytes` over the run's mean record value bytes;
+    below, the rate × its drain interval, the counts the SIGKILL never exported. A killed life
+    with one drain allows that drain's W both ways, plus the fetch above;
+  - each lost membership, `logit.input.rebalances{reason="membership_lost"}`: the same above,
+    at the life's peak rate, since a fenced commit's records are read again;
+  - each deferred batch, Q, `logit.input.batches.deferred`: up to `batch_max_events` records
+    above. A deferred batch is in W and never sent, so `ledger.intake`'s balance and an earlier
+    life's residual, and `ledger.egress`'s gap, accept a positive difference up to Q's records
+    in a life that deferred one;
+  - a stop commits before it leaves the group and adds nothing else.
+
+  The end sequence waits, once the generators stop, until the listener's `logit.input.lag`
+  reads 0 on every partition in a point exported after the wait began (`kafka_caught_up`, §5),
+  and the row FAILs a wait that ended short or never ran. `ledger.summary`'s end-to-end bound
+  adds the band's upper edge.
 - `ledger.intake`: W − D == E + B, for the final life, per listener from W8b, one detail line
   each, a listener off its balance first. A TCP listener's F never reached W, so it's
   `ledger.wire`'s, and `drops` leaves it out. On an HTTP wire (W14) W − D == E + B holds by
