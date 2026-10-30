@@ -56,12 +56,15 @@ use tokio::time::Instant;
 use tokio_rustls::TlsAcceptor;
 
 use super::fault::code;
-use super::producer::next_sequence;
 use super::sasl::{escape_username, AmzDate, ScramHash, Signer};
+use logit_proto::kafka::next_sequence;
 
 /// How many appended batches per producer per partition the broker remembers for dedup
 /// (`ProducerStateEntry.NUM_BATCHES_TO_RETAIN`).
 const DEDUP_WINDOW: usize = 5;
+
+/// The bound on one batch's decompressed records section: far above any batch a test sends.
+const MAX_RECORDS_BYTES: usize = 64 << 20;
 
 /// What a scripted request gets instead of the broker's own answer.
 #[derive(Debug, Clone)]
@@ -954,7 +957,7 @@ fn produce(
             let infos = RecordBatchDecoder::decode_batch_info(&mut info_buf).unwrap();
             assert_eq!(infos.len(), 1, "a producer sends one batch per partition per request");
             let info = &infos[0];
-            let sets = super::batch::decode(records).expect("the batch decodes");
+            let sets = super::batch::decode(records, MAX_RECORDS_BYTES).expect("the batch decodes");
             let decoded: Vec<Record> = sets.into_iter().flat_map(|s| s.records).collect();
 
             let (code, base_offset, record_errors) = match &step {
@@ -1181,7 +1184,7 @@ mod tests {
     use super::*;
 
     fn info(producer_epoch: i16, base_sequence: i32) -> kafka_protocol::records::BatchDecodeInfo {
-        use super::super::batch::{encode, ProducerRecord, Stamp};
+        use logit_proto::kafka::batch::{encode, ProducerRecord, Stamp};
         let record =
             ProducerRecord { key: None, value: None, headers: Default::default(), timestamp: 0 };
         let stamp = Stamp { producer_id: 7, producer_epoch, base_sequence };

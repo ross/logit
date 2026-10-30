@@ -14,8 +14,8 @@
 //! - [`sasl`] authenticates a connection: the exchange loop and the `PLAIN`, `SCRAM-SHA-256`,
 //!   `SCRAM-SHA-512`, `OAUTHBEARER`, and `AWS_MSK_IAM` mechanisms, with `OAUTHBEARER`'s token
 //!   endpoint, and SigV4 and the AWS credential chain for `AWS_MSK_IAM`.
-//! - [`batch`] and [`compression`] write record batch v2 with all five codecs through the
-//!   crate's compression hook, so none of its C codecs is built.
+//! - `logit_proto::kafka` writes record batch v2 with all five codecs through the crate's
+//!   compression hook, so none of its C codecs is built.
 //! - [`partitioner`] is the Java client's murmur2 keyed partitioner and the per-send sticky
 //!   choice for unkeyed records.
 //! - [`fault`] maps a partition's error code to what the producer does with it.
@@ -84,8 +84,6 @@
 //! the broker can't have appended, and the send still returns `Refused` for those
 //! (`sink::tests::at_most_once_drops_an_ambiguous_partition_when_another_is_refused`).
 
-mod batch;
-mod compression;
 mod conn;
 mod encode;
 #[cfg(test)]
@@ -98,6 +96,8 @@ mod sasl;
 mod sink;
 #[cfg(test)]
 mod tests;
+
+use logit_proto::kafka::batch;
 
 pub use encode::{
     text_body, EncodeStats, KafkaEncoder, RecordFormat, RecordKey, RecordMeta, RecordMode,

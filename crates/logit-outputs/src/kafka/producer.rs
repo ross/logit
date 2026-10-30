@@ -48,6 +48,7 @@ use kafka_protocol::protocol::StrBytes;
 use kafka_protocol::records::Compression;
 use logit_core::Telemetry;
 use logit_pipeline::Fault;
+use logit_proto::kafka::next_sequence;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
@@ -286,16 +287,6 @@ pub(crate) struct Producer {
     next_sequence: HashMap<i32, i32>,
     /// Every node a dial has succeeded to, so a later dial to one counts as a reconnect.
     dialed: HashSet<Node>,
-}
-
-/// `seq + count` on the broker's sequence ring, which wraps from `i32::MAX` to 0
-/// (`DefaultRecordBatch.incrementSequence`).
-pub(crate) fn next_sequence(seq: i32, count: i32) -> i32 {
-    if i32::MAX - seq < count {
-        count - (i32::MAX - seq) - 1
-    } else {
-        seq + count
-    }
 }
 
 /// Splits a bootstrap `host:port`; a bracketed IPv6 literal loses its brackets.
@@ -1173,15 +1164,6 @@ fn pack(parts: Vec<(usize, i32, Bytes)>, cap: usize) -> Vec<Vec<(usize, i32, Byt
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn sequences_wrap_from_i32_max_to_zero() {
-        assert_eq!(next_sequence(0, 3), 3);
-        assert_eq!(next_sequence(i32::MAX - 3, 3), i32::MAX);
-        assert_eq!(next_sequence(i32::MAX - 2, 3), 0);
-        assert_eq!(next_sequence(i32::MAX, 1), 0);
-        assert_eq!(next_sequence(i32::MAX - 1, 5), 3);
-    }
 
     #[test]
     fn metadata_is_stale_after_five_minutes() {

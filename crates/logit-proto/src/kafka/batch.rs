@@ -1,5 +1,6 @@
 //! A partition batch's records, and their encoding as one record batch v2 (magic 2) through
-//! `kafka-protocol`'s encoder with [`super::compression`] as its compression hook.
+//! `kafka-protocol`'s encoder with [`super::compression`] as its compression hook, and the decode
+//! that reads it back.
 //!
 //! `kafka-protocol`'s encoder starts a new batch whenever a record's producer fields differ from
 //! the first record's or `offset - sequence` changes, and writes the first record's `sequence`,
@@ -17,7 +18,7 @@ use kafka_protocol::records::{
 
 /// The record batch v2 header, which Java's size estimate adds to every record's
 /// (`AbstractRecords.estimateSizeInBytesUpperBound`).
-pub(crate) const BATCH_OVERHEAD: usize = 61;
+pub const BATCH_OVERHEAD: usize = 61;
 
 /// The most a record's own framing adds to its key, value, and headers: a 5-byte length varint,
 /// the attributes byte, a 10-byte timestamp delta, and a 5-byte offset delta
@@ -26,20 +27,20 @@ const MAX_RECORD_OVERHEAD: usize = 21;
 
 /// One record to produce.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ProducerRecord {
-    pub(crate) key: Option<Bytes>,
-    pub(crate) value: Option<Bytes>,
+pub struct ProducerRecord {
+    pub key: Option<Bytes>,
+    pub value: Option<Bytes>,
     /// In order; `kafka-protocol`'s `Record` can't carry a repeated key.
-    pub(crate) headers: IndexMap<StrBytes, Option<Bytes>>,
+    pub headers: IndexMap<StrBytes, Option<Bytes>>,
     /// `CreateTime`, in milliseconds since the Unix epoch.
-    pub(crate) timestamp: i64,
+    pub timestamp: i64,
 }
 
 impl ProducerRecord {
     /// An upper bound on the record's encoded size, uncompressed and without the batch header, as
     /// Java's `DefaultRecord.recordSizeUpperBound` computes it: each length is counted as a
     /// 5-byte varint.
-    pub(crate) fn size_upper_bound(&self) -> usize {
+    pub fn size_upper_bound(&self) -> usize {
         let field = |b: &Option<Bytes>| 5 + b.as_ref().map_or(0, Bytes::len);
         let headers: usize =
             self.headers.iter().map(|(k, v)| 5 + k.len() + field(v)).sum::<usize>() + 5;
@@ -50,7 +51,7 @@ impl ProducerRecord {
 /// The most bytes an unkeyed record's value may hold under `headers` and still pass the
 /// producer's `cap` check (`BATCH_OVERHEAD` plus [`ProducerRecord::size_upper_bound`]): that
 /// check solved for the value's length, which it counts byte for byte.
-pub(crate) fn value_budget(cap: usize, headers: &IndexMap<StrBytes, Option<Bytes>>) -> usize {
+pub fn value_budget(cap: usize, headers: &IndexMap<StrBytes, Option<Bytes>>) -> usize {
     let empty = ProducerRecord {
         key: None,
         value: Some(Bytes::new()),
@@ -63,14 +64,14 @@ pub(crate) fn value_budget(cap: usize, headers: &IndexMap<StrBytes, Option<Bytes
 /// The idempotent producer's fields a batch carries, or [`Stamp::NONE`] for a producer without
 /// idempotence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Stamp {
-    pub(crate) producer_id: i64,
-    pub(crate) producer_epoch: i16,
-    pub(crate) base_sequence: i32,
+pub struct Stamp {
+    pub producer_id: i64,
+    pub producer_epoch: i16,
+    pub base_sequence: i32,
 }
 
 impl Stamp {
-    pub(crate) const NONE: Stamp = Stamp {
+    pub const NONE: Stamp = Stamp {
         producer_id: NO_PRODUCER_ID,
         producer_epoch: NO_PRODUCER_EPOCH,
         base_sequence: NO_SEQUENCE,
@@ -79,7 +80,7 @@ impl Stamp {
 
 /// Encodes `records` as one record batch v2 under `stamp`, compressed with `codec`. Errors on an
 /// empty slice, which has no batch to write.
-pub(crate) fn encode(
+pub fn encode(
     records: &[ProducerRecord],
     stamp: Stamp,
     codec: Compression,
@@ -118,9 +119,12 @@ pub(crate) fn encode(
 }
 
 /// Decodes every record batch in `bytes` through `kafka-protocol`'s decoder, with
-/// [`super::compression::decompress`] as its decompression hook.
-#[cfg(test)]
-pub(crate) fn decode(mut bytes: Bytes) -> anyhow::Result<Vec<kafka_protocol::records::RecordSet>> {
+/// [`super::compression::decompress`] as its decompression hook, bounding each batch's
+/// decompressed records section at `max_records_bytes`.
+pub fn decode(
+    mut bytes: Bytes,
+    max_records_bytes: usize,
+) -> anyhow::Result<Vec<kafka_protocol::records::RecordSet>> {
     use bytes::Buf;
     use kafka_protocol::records::RecordBatchDecoder;
 
@@ -129,7 +133,7 @@ pub(crate) fn decode(mut bytes: Bytes) -> anyhow::Result<Vec<kafka_protocol::rec
         sets.push(RecordBatchDecoder::decode_with_custom_compression(
             &mut bytes,
             Some(|payload: &mut Bytes, codec| {
-                super::compression::decompress(codec, payload).map(Bytes::from)
+                super::compression::decompress(codec, payload, max_records_bytes).map(Bytes::from)
             }),
         )?);
     }
@@ -151,6 +155,9 @@ mod tests {
         ("lz4", Compression::Lz4),
         ("zstd", Compression::Zstd),
     ];
+
+    /// Far above any batch these tests decode.
+    const MAX: usize = 1 << 20;
 
     fn corpus(name: &str) -> Bytes {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -198,14 +205,14 @@ mod tests {
     #[test]
     fn every_recorded_batch_decodes_to_its_producers_uncompressed_records() {
         for producer in ["java", "kcat"] {
-            let plain = decode(corpus(&format!("{producer}-none.segment"))).unwrap();
+            let plain = decode(corpus(&format!("{producer}-none.segment")), MAX).unwrap();
             assert_eq!(plain.len(), 1);
             let want = content(&plain[0].records);
             assert_eq!(want.len(), 3);
             assert_eq!(want[0].0.as_deref(), Some(&b"key-1"[..]));
             for (name, codec) in CODECS {
                 let file = format!("{producer}-{name}.segment");
-                let sets = decode(corpus(&file)).unwrap_or_else(|e| panic!("{file}: {e:#}"));
+                let sets = decode(corpus(&file), MAX).unwrap_or_else(|e| panic!("{file}: {e:#}"));
                 assert_eq!(sets.len(), 1, "{file}");
                 assert_eq!(sets[0].compression, codec, "{file}");
                 assert_eq!(content(&sets[0].records), want, "{file}");
@@ -226,9 +233,9 @@ mod tests {
     fn the_corpus_has_xerial_snappy_from_java_and_raw_snappy_from_kcat() {
         let records_at = |bytes: &Bytes| bytes.slice(BATCH_OVERHEAD..);
         assert!(records_at(&corpus("java-snappy.segment"))
-            .starts_with(&super::super::compression::XERIAL_MAGIC));
+            .starts_with(&crate::kafka::compression::XERIAL_MAGIC));
         assert!(!records_at(&corpus("kcat-snappy.segment"))
-            .starts_with(&super::super::compression::XERIAL_MAGIC));
+            .starts_with(&crate::kafka::compression::XERIAL_MAGIC));
     }
 
     #[test]
@@ -236,7 +243,7 @@ mod tests {
         let records = sample(5);
         let stamp = Stamp { producer_id: 7, producer_epoch: 3, base_sequence: 40 };
         for (name, codec) in CODECS {
-            let sets = decode(encode(&records, stamp, codec).unwrap()).unwrap();
+            let sets = decode(encode(&records, stamp, codec).unwrap(), MAX).unwrap();
             assert_eq!(sets.len(), 1, "{name}: one batch");
             assert_eq!(sets[0].compression, codec, "{name}");
             let got = &sets[0].records;
