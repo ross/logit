@@ -1572,11 +1572,11 @@ those values as *fields*, not as a rendered message.
 |---|---|---|
 | `logit.input.lines` / `.line.bytes` | count | every non-blank `format: json` line read, a refused one included |
 | `logit.input.frames` / `.frame.bytes` | count | every `format: native` frame that passes its CRC, before it's decoded |
-| `logit.input.frames.dropped{reason}` | count | a skipped line or frame: `undecodable` for a JSON line, and `magic`, `version`, `too_large`, `crc`, `codec`, `decode_budget`, `malformed`, or `truncated` for a frame. The module doc's table says what each covers |
+| `logit.input.frames.dropped{reason}` | count | a skipped line or frame: `undecodable` for a JSON line, and `magic`, `version`, `too_large`, `crc`, `codec`, `decode_budget`, `malformed`, or `truncated` for a frame, and `decompress` for a compressed file the decoder could not finish. The module doc's table says what each covers |
 | `logit.input.batches.dropped{reason="closed_consumer"}` | count | a batch no consumer took, after which the read stops |
 
 `Diagnostics` keys: `bad_line` (a refused JSON line, with its line number), `bad_frame` (a skipped
-frame, with its byte offset), `truncated` (the file ends inside a frame), and `closed_consumer`.
+frame, with its byte offset), `truncated` (the file ends inside a frame), `bad_compression` (a gzip or zstd stream that could not be finished), and `closed_consumer`.
 
 #### Transforms
 

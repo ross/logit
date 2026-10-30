@@ -4577,11 +4577,16 @@ pub enum ComponentKind {
     /// same form. Events keep the timestamps the file gives them. When every input has stopped,
     /// the process flushes its sinks and exits.
     ///
+    /// A file that starts with gzip's or zstd's magic bytes is decompressed as it's read, for
+    /// either format: every gzip member and every zstd frame. A compressed file that is cut short
+    /// or corrupt is read up to the fault, counted, and ends the replay.
+    ///
     /// A line or frame that can't be read is skipped and counted, and the rest of the file is
     /// still sent. There's no follow mode, no checkpoint, and no pacing: a restart reads the file
     /// from the start, and events go out as fast as the components downstream take them.
     ReplayIn {
-        /// The file to read, relative to the config file unless absolute. It's opened at startup,
+        /// The file to read, gzip- or zstd-compressed or not, relative to the config file unless
+        /// absolute. It's opened at startup,
         /// so a missing or unreadable file stops `logit run` before anything else starts.
         path: String,
         /// How the file is written: `json` (the default), one event per line as a `format: json`

@@ -208,15 +208,12 @@ Entry format and the other areas: [the known-gaps index](README.md).
     per file, and put the restart decision in whatever starts `logit`.
   - **Revisit trigger:** an operator replaying archives too large to resend after a failure, or a
     flow that needs pacing.
-- **Neither side of the archive pair handles a compressed JSON file.** `file_out` compresses only
-  `format: native`, as lz4 inside each frame, and never compresses a `format: json` file, rotated
-  or not. `replay_in` reads no compressed file: no `.gz`, and no lz4-framed JSON. A
-  `format: native` archive written with `compression: lz4` replays, since its compression is per
-  frame.
-  - **Consequence:** a JSON archive takes its full size on disk, and one an external tool gzipped
-    after rotation has to be decompressed before `replay_in` can read it.
-  - **Workaround:** archive as `format: native` with `compression: lz4`, or decompress to a file
-    (or a named pipe) before replaying.
-  - **Remedy:** one follow-up that adds both sides together, gzip on `file_out`'s `format: json`
-    rotation and `replay_in` reading a `.gz` file by its extension, so archiving and replaying
-    stay one story.
+- **`file_out` doesn't compress a `format: json` file.** It compresses only `format: native`, as
+  lz4 inside each frame, and never compresses a JSON file, rotated or not. `replay_in` reads a
+  gzip or zstd file of either format, detected by its magic bytes, but reads no lz4-framed JSON.
+  - **Consequence:** a JSON archive takes its full size on disk until an external tool compresses
+    it.
+  - **Workaround:** archive as `format: native` with `compression: lz4`, or compress the rotated
+    file with `gzip` or `zstd`, which `replay_in` reads as it is.
+  - **Remedy:** gzip on `file_out`'s `format: json` rotation, so archiving and replaying stay one
+    story.

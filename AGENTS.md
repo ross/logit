@@ -117,7 +117,7 @@ Listeners live in `crates/logit-inputs`, codecs in `crates/logit-proto`.
 | `docker_in` | `crates/logit-inputs/src/docker.rs` | Docker json-file container logs, enriched from a sibling `config.v2.json`; no docker socket | same ADR as `tail_in` |
 | `logit_in` | `crates/logit-inputs/src/logit.rs` | the native `logit`-to-`logit` transport | [ADR `native-transport-handshake-and-ack`](docs/adr/native-transport-handshake-and-ack.md), [ADR `native-hop-identity-and-sequence`](docs/adr/native-hop-identity-and-sequence.md), [ADR `native-hop-named-acks`](docs/adr/native-hop-named-acks.md) |
 | `internal` | `crates/logit-inputs/src/internal.rs` | `logit` observing itself: its own telemetry as ordinary events | [ADR `internal-telemetry-as-pipeline-events`](docs/adr/internal-telemetry-as-pipeline-events.md) |
-| `replay_in` | `crates/logit-inputs/src/replay.rs` | reads one file a `format: json` or `format: native` stream sink wrote (or hand-written `format: json` lines) once, with the file's timestamps, then ends like `generate_in` under `count`; an unreadable line or frame is skipped and counted | [ADR `replay-input`](docs/adr/replay-input.md) |
+| `replay_in` | `crates/logit-inputs/src/replay.rs` | reads one file a `format: json` or `format: native` stream sink wrote (or hand-written `format: json` lines) once, with the file's timestamps, then ends like `generate_in` under `count`; a gzip or zstd file is detected by its magic and decompressed as it reads; an unreadable line or frame is skipped and counted | [ADR `replay-input`](docs/adr/replay-input.md) |
 | `generate_in` | `crates/logit-inputs/src/generate.rs` | declarative event generator for load tests | [ADR `load-test-harness`](docs/adr/load-test-harness.md) |
 
 ### Outputs

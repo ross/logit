@@ -1,6 +1,6 @@
 ---
 created: 2026-10-19
-updated: 2026-10-19
+updated: 2026-10-30
 ---
 
 # `replay_in`: a finite input that reads a `format: json` or `format: native` file once and ends
@@ -120,10 +120,43 @@ replay:
 - An archive `file_out` writes in `format: json` or `format: native` can be replayed, and the
   transit spec's flows have a source.
 - A `format: native` archive written with `compression: lz4` is read, since the compression is
-  inside each frame. No other compressed file is: a gzipped rotation and lz4-framed JSON aren't
-  read, and `file_out` writes neither ([known gaps](../known-gaps/tailing.md)).
+  inside each frame. A gzip or zstd file is read too (see the 2026-10-30 amendment); lz4-framed
+  JSON isn't, and `file_out` writes none of these ([known gaps](../known-gaps/tailing.md)).
 - There's no follow mode, no directory or glob, no rate pacing, and no checkpoint. A restart reads
   the file from the start, and events go out as fast as downstream takes them. Each is an entry in
   `docs/known-gaps/tailing.md`.
 - Replayed events carry the file's timestamps, so an `aggregate` downstream windows them by wall
   clock, not by their timestamps, and a `drop_stale` drops an old archive's events.
+
+## Amendment: gzip and zstd files (2026-10-30)
+
+**`replay_in` reads a gzip or zstd file of either format, detected from its leading bytes.** An
+object that an archiving sink writes compressed, and an operator downloads, replays with no
+separate decompress step.
+
+1. **Detection is by magic, with no config field.** `1f 8b` is gzip and `28 b5 2f fd` is zstd. A
+   file starting with neither, or shorter than the magic, is plain, as before. The file's name is
+   never consulted, so a renamed or extensionless download works. A plain file whose first bytes
+   are a magic isn't a valid `json` or `native` file anyway: `json` starts with `{` or white
+   space, and `native` with `LGIT` frame magic.
+2. **Every member and frame is read.** A gzip file may hold several members, because a writer may
+   append them. A zstd file may hold several frames, because a writer may emit one per staged
+   batch, and skippable frames between them are stepped over.
+3. **Decompression streams.** The decoders (`flate2`'s `MultiGzDecoder` and `ruzstd`'s
+   `StreamingDecoder`) are blocking, so a blocking thread decodes into a 256 KiB in-memory pipe
+   that the unchanged async line reader and frame scanner consume. Neither the file nor its
+   decompressed form is held whole. No new dependency is added. The decoder stops when the pipe's
+   reader goes away, so a closed consumer ends it.
+4. **The bounds are the format's.** A zstd frame declaring a window over 64 MiB is refused,
+   because `ruzstd` reserves the declared window before decoding, and a content checksum that
+   doesn't match is refused. Decompressed size has no cap, because the line reader and the frame
+   scanner already bound a line or a frame, and a file is an operator's own.
+5. **A stream that can't be finished is a loss.** A cut or corrupt stream, a checksum mismatch, or
+   a window over the cap is counted `logit.input.frames.dropped{reason="decompress"}` with a
+   `bad_compression` diagnostic. What decompressed before the fault is read, and the replay ends,
+   as it does at a `truncated` frame with no magic behind it: a damaged stream has no resync
+   point. A line or frame the cut ends inside is counted under its own reason as well, so a cut
+   file counts twice.
+
+The remedy listed in [known gaps](../known-gaps/tailing.md) for reading a compressed archive is
+done. Compressing a `format: json` file on `file_out`'s side remains open.

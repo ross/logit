@@ -24,7 +24,7 @@ the same date, write the record, then add a row here.
 | [`datadog_out` maps OTLP metric kinds as Datadog's OTel exporter does, statelessly](datadog-otlp-metric-mapping.md) | 2026-10-20 | 2026-10-23 |
 | [`cumulative_to_delta`: a stateful transform that turns cumulative sums, histograms, and summaries into deltas](cumulative-to-delta-transform.md) | 2026-10-20 | 2026-10-25 |
 | [`influxdb_out` writes histograms and summaries in Telegraf's `prometheus-v1` shape](influxdb-histogram-summary-shape.md) | 2026-10-20 | 2026-10-21 |
-| [`replay_in`: a finite input that reads a `format: json` or `format: native` file once and ends](replay-input.md) | 2026-10-19 | 2026-10-19 |
+| [`replay_in`: a finite input that reads a `format: json` or `format: native` file once and ends](replay-input.md) | 2026-10-19 | 2026-10-30 |
 | [Transit spec: a mapping table under `spec/transit/` is the canonical statement of every cross-protocol transition, checked by flows and rendered into the docs](transit-spec.md) | 2026-10-19 | 2026-10-28 |
 | [`route_signals`: a native signal router that splits a mixed event into one part per target](route-signals.md) | 2026-10-16 | 2026-10-23 |
 | [LuaJIT's trace compiler is off by default, and `jit: true` turns it on per component](lua-jit-opt-in.md) | 2026-10-16 | 2026-10-25 |

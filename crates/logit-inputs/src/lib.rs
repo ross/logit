@@ -32,6 +32,7 @@ pub mod peer;
 mod procstat;
 pub mod prometheus;
 pub mod replay;
+mod replay_decompress;
 pub mod splunk;
 pub mod statsd;
 pub mod syslog;
