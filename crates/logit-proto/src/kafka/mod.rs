@@ -9,10 +9,12 @@
 //!   headers kept in wire order and keys, values, and header fields sliced out of the buffer.
 //! - [`compression`] runs the five codecs through `kafka-protocol`'s custom-compression hook,
 //!   with every decompressor bounded.
+//! - [`text`] escapes and splits the bodies of a `format: text` batch record.
 
 pub mod batch;
 pub mod compression;
 pub mod record;
+pub mod text;
 
 pub use record::{decode, BatchError, BatchErrorKind, Header, Record, RecordBatch, TimestampType};
 

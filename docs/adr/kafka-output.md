@@ -1,6 +1,6 @@
 ---
 created: 2026-10-11
-updated: 2026-10-25
+updated: 2026-10-30
 ---
 
 # `kafka_out`: a pure-Rust producer on `kafka-protocol`, with the Java producer's semantics and named divergences
@@ -541,7 +541,8 @@ module doc (`crates/logit-outputs/src/kafka/encode.rs`) has the per-format table
    the bodies joined by `\n` for `text`, with no newline after the last, so a body that holds a
    newline can't be told from two bodies; the MessagePack maps back
    to back for `msgpack`, which a MessagePack reader takes as a stream of values; one
-   `CODEC_BATCH` frame for `native`.
+   `CODEC_BATCH` frame for `native`. The `text` clause is superseded by "Amendment: `text` batch
+   records escape newlines (2026-10-30)".
 6. **`text` writes the log body by type.** A `Str` or `Bytes` body goes as its bytes, a `Map` or
    `Array` as `ndjson.rs`'s JSON value, a timestamp as RFC 3339, another scalar as its decimal or
    `true`/`false` text, and `Null` as an empty value. This is the OTel `kafkaexporter`'s `raw`
@@ -595,3 +596,26 @@ record the producer drops as oversize, or one the broker rejects or names, has s
 omitted pieces beside its `records.dropped`.
 `record: batch` counts the same, except for an event over the budget alone, which is counted
 `records.dropped{reason="oversize"}` and nothing more.
+
+## Amendment: `text` batch records escape newlines (2026-10-30)
+
+Under `record: batch`, `format: text` escapes each body before joining: `\` becomes `\\` and
+LF (0x0A) becomes `\n`, the backslash and the letter `n`. The bodies are joined by LF with none
+after the last, so a body that holds a newline stays one line, and a consumer reads a record back
+by splitting on LF and unescaping each line. This supersedes the `text` clause of point 5 of
+"Amendment: what W3 settled", under which a body holding a newline read as two.
+
+- **The escape works on bytes.** Every other byte passes through, so a `Bytes` body that isn't
+  UTF-8 stays bytes, and a UTF-8 body stays valid UTF-8.
+- **One line per body.** A console consumer still sees each body on its own line, which a length
+  prefix wouldn't give.
+- **The budget measures the escaped form.** A body that fits as it is but not escaped is dropped
+  as `records.dropped{reason="oversize"}`.
+- **`record: event` is unchanged:** each record holds one body as it is, the OTel
+  `kafkaexporter`'s `raw` encoding.
+
+`logit_proto::kafka::text` holds the escape and its inverse, so `kafka_in` reads the form with
+the same code `kafka_out` writes it with
+([ADR `kafka-input`](kafka-input.md), "11. Formats"). On reading, a `\` before any byte but `\`
+or `n`, and a `\` that ends a line, are kept as they are. An empty value is one empty body.
+`logit` is pre-release, so the encoder changed rather than the pair listing a normalization.

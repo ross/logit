@@ -85,6 +85,11 @@
 //! the broker can't have appended, and the send still returns `Refused` for those
 //! (`sink::tests::at_most_once_drops_an_ambiguous_partition_when_another_is_refused`).
 
+/// The key prefix of the record metadata `kafka_in` carries, which `kafka_out` leaves out of
+/// every payload it writes (`docs/adr/kafka-input.md`, "12. Record metadata rides as private
+/// carriers").
+pub(crate) const CARRIER_PREFIX: &str = "_logit.kafka.";
+
 mod encode;
 mod fault;
 mod multi;

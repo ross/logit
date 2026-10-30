@@ -32,15 +32,17 @@ use logit_proto::msgpack::{MapStart, Writer};
 use crate::ndjson::{push_pointer_seg, Path, TreeWriter};
 
 /// Appends one event's map to `out`. `scratch` holds a timestamp's or an id's text before it's
-/// written as a str; it's reused across calls.
+/// written as a str; it's reused across calls. `omit` leaves out the event's top-level
+/// attributes whose keys start with it, as `crate::ndjson::render_event`'s does.
 pub(crate) fn render_event(
     out: &mut Writer,
     scratch: &mut String,
     resource: &Resource,
     scope: Option<&Scope>,
     event: &Event,
+    omit: Option<&str>,
 ) {
-    crate::ndjson::walk_event(&mut Msgpack { out, scratch }, resource, scope, event);
+    crate::ndjson::walk_event(&mut Msgpack { out, scratch }, resource, scope, event, omit);
 }
 
 /// The MessagePack writer for [`crate::ndjson`]'s walker.
@@ -477,9 +479,10 @@ pub(crate) mod tests {
         let mut scratch = String::new();
         for event in &batch.events {
             let mut line = String::new();
-            crate::ndjson::render_event(&mut line, &batch.resource, batch.scope.as_deref(), event);
+            let scope = batch.scope.as_deref();
+            crate::ndjson::render_event(&mut line, &batch.resource, scope, event, None);
             out.clear();
-            render_event(&mut out, &mut scratch, &batch.resource, batch.scope.as_deref(), event);
+            render_event(&mut out, &mut scratch, &batch.resource, scope, event, None);
             let mut r = Reader::new(out.as_slice());
             let mp = read_tree(&mut r);
             assert!(r.is_empty(), "one map, nothing after it");
@@ -494,7 +497,7 @@ pub(crate) mod tests {
         let batch = every_field_batch();
         let mut out = Writer::new();
         let mut scratch = String::new();
-        render_event(&mut out, &mut scratch, &batch.resource, None, &batch.events[0]);
+        render_event(&mut out, &mut scratch, &batch.resource, None, &batch.events[0], None);
         let Tree::Map(top) = read_tree(&mut Reader::new(out.as_slice())) else { panic!() };
         let attributes = &top.iter().find(|(k, _)| k == "attributes").unwrap().1;
         let Tree::Map(attributes) = attributes else { panic!() };
