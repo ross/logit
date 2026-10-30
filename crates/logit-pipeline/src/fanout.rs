@@ -178,9 +178,10 @@ impl Delivered {
 }
 
 /// [`Fanout::send_with_deadline`]'s deadline passed before every consumer had room for the
-/// batch, so no consumer received it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SendTimeout;
+/// batch, so no consumer received it. It hands the batch back, for a caller that offers it again
+/// (`kafka_in`).
+#[derive(Debug, PartialEq)]
+pub struct SendTimeout(pub EventBatch);
 
 impl std::fmt::Display for SendTimeout {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -446,7 +447,7 @@ impl Fanout {
         };
         let Ok(permits) = tokio::time::timeout_at(deadline, reserve_all).await else {
             // Dropping the partial `permits` inside the cancelled future releases every held slot.
-            return Err(SendTimeout);
+            return Err(SendTimeout(batch));
         };
         let (span, timer) = unsent.0.take().expect("taken only here, once every slot is held");
         let n = batch.events.len();
@@ -844,7 +845,8 @@ mod tests {
 
         let result = fanout.send_with_deadline(batch(3), in_ms(100)).await;
 
-        assert_eq!(result, Err(SendTimeout));
+        let Err(SendTimeout(back)) = result else { panic!("the deadline passes first") };
+        assert_eq!(back.events.len(), 3, "the timed-out batch comes back whole");
         let prefilled = rx.recv().await.expect("the prefilled batch");
         assert_eq!(prefilled.batch_context(), BatchContext::default(), "only the prefill arrived");
         assert!(rx.try_recv().is_err(), "the timed-out batch must never be enqueued");
@@ -865,7 +867,7 @@ mod tests {
 
         let result = fanout.send_with_deadline(batch(2), in_ms(100)).await;
 
-        assert_eq!(result, Err(SendTimeout));
+        assert!(matches!(result, Err(SendTimeout(_))));
         assert!(rx_a.try_recv().is_err(), "a must not hold a batch the request was refused for");
         assert_eq!(probe_a.capacity(), 1, "a's reserved slot must be released, not leaked");
         rx_b.recv().await.expect("b's prefill");
@@ -1121,7 +1123,10 @@ mod tests {
         let (mut probe, fanout, mut inboxes) = probed_fanout(&["out"]);
         prefill(&fanout, 0);
 
-        assert_eq!(fanout.send_with_deadline(batch(1), in_ms(100)).await, Err(SendTimeout));
+        assert!(matches!(
+            fanout.send_with_deadline(batch(1), in_ms(100)).await,
+            Err(SendTimeout(_))
+        ));
         inboxes[0].recv().await.expect("the prefill");
         assert!(inboxes[0].try_recv().is_err(), "the timed-out batch is never enqueued");
 
