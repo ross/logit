@@ -2531,7 +2531,8 @@ format containerd and CRI-O write, on the same driver as `tail_in`
 `P` pieces back into one event, per file and per stream, stamps the event with the line's own CRI
 timestamp and `log.iostream` (`stdout` or `stderr`), and writes `k8s.namespace.name`,
 `k8s.pod.name`, `k8s.pod.uid`, `k8s.container.name`, and `k8s.container.restart_count` from the
-path onto the resource. It reads no API server and no runtime socket.
+path onto the resource, and `container.id` from the name of the kubelet's symlink to the file. It
+reads no API server and no runtime socket.
 
 ```yaml
 components:
@@ -2552,6 +2553,14 @@ or as a user in the files' group. Mount `/var/log/pods` from a `hostPath`, with 
 `root:` defaults to that path, and only the last three parts of a file's path (pod directory,
 container directory, file name) are read for its identity, so another mount point works with
 `root:` set to it.
+
+**Mount `/var/log/containers` read-only too, for `container.id`.** The kubelet links each container's
+log there as `<pod>_<namespace>_<container>-<container id>.log`. `cri_in` lists the directory and
+reads each link's name and target, never the file, and writes the 64-character id as the resource's
+`container.id`, bare, with no `containerd://` prefix. `containers_dir:` names the directory when it
+isn't at `/var/log/containers`. Without the mount, `cri_in` still runs and writes every other
+attribute, and no `container.id`: a missing directory is not an error. Mount it from a `hostPath`
+with `readOnly: true`, as the example does.
 
 **Put `checkpoint_path` on a `hostPath` too** (`/var/lib/logit`, say, `DirectoryOrCreate`). An
 `emptyDir` or the container's own filesystem goes away with the pod, so every rollout would
@@ -2606,9 +2615,16 @@ file to close, which the kubelet does only when it removes the file.
 - **A static pod's `k8s.pod.uid` is the kubelet's own uid, not its mirror pod's** in the API,
   unless its manifest sets one. Join a static pod's lines to the API's pod objects by
   `k8s.namespace.name` and `k8s.pod.name`.
-- **No `container.id`, pod labels, annotations, or node name.** The path doesn't hold them. Add
-  what you need with `set` (a constant or `!env` value, such as the node name above), or with a
-  `lua` stage that maps a pod name to more.
+- **No pod labels, annotations, or node name.** The path doesn't hold them. Add what you need with
+  `set` (a constant or `!env` value, such as the node name above), or with a `lua` stage that maps a
+  pod name to more.
+- **A container can lack `container.id`.** The kubelet cuts a link's name to 251 bytes, so a pod
+  with a long name has a link without its id, and `cri_in` never guesses one. The kubelet makes the
+  link after the container starts, so the first lines can carry no id; the file's lines from the next
+  `poll_interval` scan on do. `cri_in` remembers an id only in memory, so if the kubelet removes a
+  link (when it collects the container) before `logit` starts, that container has none. Join to
+  `k8s.pod.uid`, `k8s.container.name`, and `k8s.container.restart_count`, which are always present.
+  A `containers_dir` that exists but can't be read raises the `container_id_error` diagnostic.
 - **CRI-O's own size rotation isn't followed across a restart.** Leave conmon's `log_size_max` at
   its default, off, so the kubelet rotates, by names `cri_in` matches. With it on, a file conmon
   replaced while `logit` was down has its unread rest counted

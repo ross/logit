@@ -470,7 +470,7 @@ fn input(
     probe: &mut TelemetryProbe,
 ) -> CriInput {
     let telemetry = probe.telemetry("pods", "cri_in", "listener");
-    CriInput::new(root.to_path_buf(), partial_timeout, config)
+    CriInput::new(root.to_path_buf(), root.join("no-links"), partial_timeout, config)
         .with_diagnostics(Diagnostics::new("pods").with_telemetry(telemetry.clone()))
         .with_telemetry(telemetry)
 }
@@ -728,6 +728,7 @@ async fn a_restart_resumes_a_rotated_file_from_its_checkpoint() {
 fn the_splitter_bound_is_envelope_cap_of_max_line_bytes() {
     let input = CriInput::new(
         PathBuf::from("/var/log/pods"),
+        PathBuf::from("/var/log/containers"),
         Duration::ZERO,
         TailConfig { max_line_bytes: 1024, ..TailConfig::default() },
     );
@@ -774,5 +775,322 @@ async fn a_character_cut_between_pieces_is_whole_through_the_driver() {
     assert_eq!(lines(&recv_events(&mut rx, 1).await), pairs(&[("café", "stdout")]));
     assert_eq!(diagnosed(&mut probe, "invalid_utf8"), 0.0);
     running.stop().await;
+    std::fs::remove_dir_all(&root).ok();
+}
+
+// -- container.id ----------------------------------------------------------------------------
+
+const ID_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const ID_B: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+/// The kubelet's link name for `container`'s attempt with `id`.
+fn link_name(container: &str, id: &str) -> String {
+    format!("web-0_default_{container}-{id}.log")
+}
+
+/// Links `links/<name>` to `target`, as the kubelet does.
+fn link(links: &Path, name: &str, target: &Path) {
+    std::fs::create_dir_all(links).unwrap();
+    std::os::unix::fs::symlink(target, links.join(name)).unwrap();
+}
+
+fn unlink(links: &Path, name: &str) {
+    std::fs::remove_file(links.join(name)).unwrap();
+}
+
+fn linked_input(
+    root: &Path,
+    links: &Path,
+    config: TailConfig,
+    probe: &mut TelemetryProbe,
+) -> CriInput {
+    let telemetry = probe.telemetry("pods", "cri_in", "listener");
+    CriInput::new(root.to_path_buf(), links.to_path_buf(), Duration::ZERO, config)
+        .with_diagnostics(Diagnostics::new("pods").with_telemetry(telemetry.clone()))
+        .with_telemetry(telemetry)
+}
+
+fn container_id(batch: &logit_core::EventBatch) -> Option<String> {
+    batch.resource.attributes.get("container.id").and_then(|v| v.as_str()).map(String::from)
+}
+
+async fn next_batch(
+    rx: &mut tokio::sync::mpsc::Receiver<logit_pipeline::Delivered>,
+) -> logit_core::EventBatch {
+    logit_pipeline::test_util::recv_batch(rx).await
+}
+
+fn ids_with_diag(dir: PathBuf, probe: &mut TelemetryProbe) -> ContainerIds {
+    let mut ids = ContainerIds::new(dir);
+    ids.diag = Diagnostics::new("pods").with_telemetry(probe.telemetry("pods", "cri_in", "x"));
+    ids
+}
+
+#[test]
+fn a_link_name_yields_an_id_only_for_64_lowercase_hex_after_its_last_dash() {
+    assert_eq!(link_id(&link_name("nginx", ID_A)), Some(ID_A));
+    // A container name holds dashes of its own.
+    assert_eq!(link_id(&format!("a-b_ns_my-app-{ID_B}.log")), Some(ID_B));
+    // Truncated by the kubelet: the id is partial.
+    assert_eq!(link_id(&format!("web-0_default_nginx-{}.log", &ID_A[..40])), None);
+    // Truncated before the id began: the last segment is part of a name.
+    assert_eq!(link_id("web-0_default_nginx-and-a-long-name.log"), None);
+    // A non-hex character, an uppercase one, 63 and 65 characters, and no `.log`.
+    assert_eq!(link_id(&format!("w_d_n-{}g.log", &ID_A[..63])), None);
+    assert_eq!(link_id(&format!("w_d_n-{}.log", ID_A.to_uppercase())), None);
+    assert_eq!(link_id(&format!("w_d_n-{}.log", &ID_A[..63])), None);
+    assert_eq!(link_id(&format!("w_d_n-a{ID_A}.log")), None);
+    assert_eq!(link_id(&format!("w_d_n-{ID_A}")), None);
+}
+
+#[test]
+fn the_key_is_the_last_three_components_and_a_rotated_file_shares_its_live_files() {
+    let live = id_key(Path::new("/var/log/pods/default_web-0_0123-abcd/nginx/1.log")).unwrap();
+    assert_eq!(live, "default_web-0_0123-abcd/nginx/1");
+    let elsewhere = Path::new("/mnt/host/pods/default_web-0_0123-abcd/nginx/1.log");
+    assert_eq!(id_key(elsewhere), Some(live.clone()));
+    let rotated = Path::new("/p/default_web-0_0123-abcd/nginx/1.log.20261030-120000");
+    assert_eq!(id_key(rotated), Some(live));
+    assert_eq!(id_key(Path::new("/p/default_web-0_0123-abcd/nginx/1.log.gz")), None);
+    assert_eq!(id_key(Path::new("1.log")), None);
+}
+
+#[test]
+fn ids_are_read_from_links_whose_targets_sit_under_another_mount() {
+    let links = scratch_dir("cri-ids-links");
+    let mut probe = TelemetryProbe::new();
+    let mut ids = ids_with_diag(links.clone(), &mut probe);
+    let elsewhere = Path::new("/host/var/log/pods/default_web-0_0123-abcd/nginx");
+    link(&links, &link_name("nginx", ID_A), &elsewhere.join("0.log"));
+    // Cut short of a whole id, and a non-hex suffix: neither is read.
+    link(&links, &format!("web-0_default_nginx-{}.log", &ID_B[..40]), &elsewhere.join("1.log"));
+    link(&links, &format!("web-0_default_nginx-{}g.log", &ID_B[..63]), &elsewhere.join("2.log"));
+
+    let root = Path::new("/var/log/pods/default_web-0_0123-abcd/nginx");
+    assert_eq!(ids.id_for(&root.join("0.log")).as_deref(), Some(ID_A));
+    assert_eq!(ids.id_for(&root.join("0.log.20261030-120000")).as_deref(), Some(ID_A));
+    assert_eq!(ids.id_for(&root.join("1.log")), None);
+    assert_eq!(ids.id_for(&root.join("2.log")), None);
+    assert_eq!(diagnosed(&mut probe, "container_id_error"), 0.0);
+    std::fs::remove_dir_all(&links).ok();
+}
+
+#[test]
+fn a_missing_directory_is_an_empty_listing_and_any_other_failure_is_diagnosed() {
+    let scratch = scratch_dir("cri-ids-missing");
+    let log = Path::new("/p/default_web-0_0123-abcd/nginx/0.log");
+    let mut probe = TelemetryProbe::new();
+    let mut missing = ids_with_diag(scratch.join("absent"), &mut probe);
+    assert_eq!(missing.id_for(log), None);
+    assert_eq!(diagnosed(&mut probe, "container_id_error"), 0.0);
+
+    let file = scratch.join("a-file");
+    std::fs::write(&file, b"").unwrap();
+    let mut broken = ids_with_diag(file, &mut probe);
+    assert_eq!(broken.id_for(log), None);
+    assert_eq!(diagnosed(&mut probe, "container_id_error"), 1.0);
+    assert_eq!(probe.sum("logit.input.scan.errors", &[]), 0.0, "not a discovery failure");
+    std::fs::remove_dir_all(&scratch).ok();
+}
+
+/// A scan lists the directory once, so a link made after that listing waits for the next scan.
+#[test]
+fn the_directory_is_listed_once_per_scan_and_a_miss_relists_on_the_next() {
+    let links = scratch_dir("cri-ids-once");
+    let mut probe = TelemetryProbe::new();
+    let mut ids = ids_with_diag(links.clone(), &mut probe);
+    let dir = Path::new("/p/default_web-0_0123-abcd/nginx");
+    link(&links, &link_name("nginx", ID_A), &dir.join("0.log"));
+    assert_eq!(ids.id_for(&dir.join("0.log")).as_deref(), Some(ID_A));
+    link(&links, &link_name("nginx", ID_B), &dir.join("1.log"));
+    assert_eq!(ids.id_for(&dir.join("1.log")), None, "already listed this scan");
+    ids.end_scan();
+    assert_eq!(ids.id_for(&dir.join("1.log")).as_deref(), Some(ID_B));
+    std::fs::remove_dir_all(&links).ok();
+}
+
+/// A removed link leaves the id with its file while the file is discovered, and the id goes when
+/// no file maps to it.
+#[test]
+fn an_id_outlives_its_link_while_a_file_uses_it() {
+    let links = scratch_dir("cri-ids-removed");
+    let mut probe = TelemetryProbe::new();
+    let mut ids = ids_with_diag(links.clone(), &mut probe);
+    let path = Path::new("/p/default_web-0_0123-abcd/nginx/0.log");
+    let name = link_name("nginx", ID_A);
+    link(&links, &name, path);
+    assert_eq!(ids.id_for(path).as_deref(), Some(ID_A));
+    ids.end_scan();
+
+    unlink(&links, &name);
+    ids.touch(path);
+    ids.end_scan();
+    assert_eq!(ids.id_for(path).as_deref(), Some(ID_A), "kept past the link");
+
+    ids.end_scan();
+    ids.end_scan();
+    assert_eq!(ids.id_for(path), None, "no file used it last scan");
+    std::fs::remove_dir_all(&links).ok();
+}
+
+#[tokio::test]
+async fn an_id_found_is_on_the_resource_beside_the_path_keys() {
+    let root = scratch_dir("cri-id-found");
+    let links = scratch_dir("cri-id-found-links");
+    let log = container_dir(&root).join("0.log");
+    append(&log, &record("stdout", "F", "one"));
+    link(&links, &link_name("nginx", ID_A), &log);
+    // Cut short, beside it: ignored.
+    link(&links, &format!("web-0_default_nginx-{}.log", &ID_B[..40]), &log);
+
+    let (fanout, mut rx) = fanout_channel(8);
+    let mut probe = TelemetryProbe::new();
+    let running = spawn_input(linked_input(&root, &links, fast_config(), &mut probe), fanout).await;
+    let batch = next_batch(&mut rx).await;
+    assert_eq!(container_id(&batch).as_deref(), Some(ID_A));
+    assert_eq!(batch.resource.attributes.len(), 6);
+    assert_eq!(probe.sum("logit.input.files.identity_changed", &[]), 0.0, "known at open");
+    running.stop().await;
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&links).ok();
+}
+
+/// The kubelet makes the link after the container starts: lines read before it carry no id, the
+/// id shows up on a later batch, and no batch holds both resources.
+#[tokio::test]
+async fn a_link_made_after_the_file_was_read_adds_the_id_to_later_batches() {
+    let root = scratch_dir("cri-id-late");
+    let links = scratch_dir("cri-id-late-links");
+    let log = container_dir(&root).join("0.log");
+    append(&log, &record("stdout", "F", "before"));
+
+    let (fanout, mut rx) = fanout_channel(8);
+    let mut probe = TelemetryProbe::new();
+    let running = spawn_input(linked_input(&root, &links, fast_config(), &mut probe), fanout).await;
+    let first = next_batch(&mut rx).await;
+    assert_eq!(lines(&first.events), pairs(&[("before", "stdout")]));
+    assert_eq!(container_id(&first), None);
+
+    link(&links, &link_name("nginx", ID_A), &log);
+    probe
+        .wait_for("a scan to install the id", |t| {
+            t.sum("logit.input.files.identity_changed", &[]) >= 1.0
+        })
+        .await;
+    append(&log, &record("stdout", "F", "after"));
+    let second = next_batch(&mut rx).await;
+    assert_eq!(lines(&second.events), pairs(&[("after", "stdout")]));
+    assert_eq!(container_id(&second).as_deref(), Some(ID_A));
+    running.stop().await;
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&links).ok();
+}
+
+/// The kubelet removes the link when it collects the container, but the file may still be read.
+#[tokio::test]
+async fn a_removed_link_keeps_its_id_on_the_files_later_batches() {
+    let root = scratch_dir("cri-id-removed");
+    let links = scratch_dir("cri-id-removed-links");
+    let log = container_dir(&root).join("0.log");
+    append(&log, &record("stdout", "F", "one"));
+    let name = link_name("nginx", ID_A);
+    link(&links, &name, &log);
+
+    let (fanout, mut rx) = fanout_channel(8);
+    let mut probe = TelemetryProbe::new();
+    let running = spawn_input(linked_input(&root, &links, fast_config(), &mut probe), fanout).await;
+    assert_eq!(container_id(&next_batch(&mut rx).await).as_deref(), Some(ID_A));
+
+    unlink(&links, &name);
+    append(&log, &record("stdout", "F", "two"));
+    let batch = next_batch(&mut rx).await;
+    assert_eq!(lines(&batch.events), pairs(&[("two", "stdout")]));
+    assert_eq!(container_id(&batch).as_deref(), Some(ID_A));
+    running.stop().await;
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&links).ok();
+}
+
+/// A restart is a new container: `1.log` has its own link and id, and `0.log` keeps its own.
+#[tokio::test]
+async fn a_restarted_container_has_its_own_id() {
+    let root = scratch_dir("cri-id-restart");
+    let links = scratch_dir("cri-id-restart-links");
+    let dir = container_dir(&root);
+    append(&dir.join("0.log"), &record("stdout", "F", "first life"));
+    append(&dir.join("1.log"), &record("stdout", "F", "second life"));
+    link(&links, &link_name("nginx", ID_A), &dir.join("0.log"));
+    link(&links, &link_name("nginx", ID_B), &dir.join("1.log"));
+
+    let (fanout, mut rx) = fanout_channel(8);
+    let mut probe = TelemetryProbe::new();
+    let running = spawn_input(linked_input(&root, &links, fast_config(), &mut probe), fanout).await;
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let batch = next_batch(&mut rx).await;
+        seen.push((lines(&batch.events)[0].0.clone(), container_id(&batch)));
+    }
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec![
+            ("first life".to_string(), Some(ID_A.to_string())),
+            ("second life".to_string(), Some(ID_B.to_string())),
+        ]
+    );
+    running.stop().await;
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&links).ok();
+}
+
+/// The kubelet renames a full file to `<n>.log.<stamp>` while the link still names `<n>.log`: the
+/// renamed inode keeps its id, and so does a file first opened under the rotated name.
+#[tokio::test]
+async fn a_rotated_file_keeps_its_live_files_id() {
+    let root = scratch_dir("cri-id-rotated");
+    let links = scratch_dir("cri-id-rotated-links");
+    let dir = container_dir(&root);
+    let live = dir.join("0.log");
+    append(&live, &record("stdout", "F", "one"));
+    link(&links, &link_name("nginx", ID_A), &live);
+
+    let (fanout, mut rx) = fanout_channel(8);
+    let mut probe = TelemetryProbe::new();
+    let running = spawn_input(linked_input(&root, &links, fast_config(), &mut probe), fanout).await;
+    assert_eq!(container_id(&next_batch(&mut rx).await).as_deref(), Some(ID_A));
+
+    let rotated = dir.join("0.log.20261030-120000");
+    std::fs::rename(&live, &rotated).unwrap();
+    append(&rotated, &record("stdout", "F", "two"));
+    let batch = next_batch(&mut rx).await;
+    assert_eq!(lines(&batch.events), pairs(&[("two", "stdout")]));
+    assert_eq!(container_id(&batch).as_deref(), Some(ID_A));
+    running.stop().await;
+
+    let (fanout, mut rx) = fanout_channel(8);
+    let running = spawn_input(linked_input(&root, &links, fast_config(), &mut probe), fanout).await;
+    assert_eq!(container_id(&next_batch(&mut rx).await).as_deref(), Some(ID_A));
+    running.stop().await;
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&links).ok();
+}
+
+/// No `containers_dir` at all (the mount is absent) means no ids: not an error, not loss.
+#[tokio::test]
+async fn a_missing_containers_dir_gives_no_id_and_no_error() {
+    let root = scratch_dir("cri-id-nodir");
+    let links = root.join("absent");
+    append(&container_dir(&root).join("0.log"), &record("stdout", "F", "one"));
+
+    let (fanout, mut rx) = fanout_channel(8);
+    let mut probe = TelemetryProbe::new();
+    let running = spawn_input(linked_input(&root, &links, fast_config(), &mut probe), fanout).await;
+    let batch = next_batch(&mut rx).await;
+    assert_eq!(lines(&batch.events), pairs(&[("one", "stdout")]));
+    assert_eq!(container_id(&batch), None);
+    running.stop().await;
+    assert_eq!(diagnosed(&mut probe, "container_id_error"), 0.0);
+    assert_eq!(probe.sum("logit.input.scan.errors", &[]), 0.0);
+    assert_eq!(probe.sum("logit.input.bytes.dropped", &[]), 0.0);
     std::fs::remove_dir_all(&root).ok();
 }

@@ -6,10 +6,10 @@ updated: 2026-10-30
 # `cri_in`: Kubernetes container logs from `/var/log/pods`, on `tail_in`'s driver
 
 ## Status
-Accepted. Partly built: `cri_in` reads CRI-format files under `root:` as sections 1 to 7, 10, and
-11 describe. `container.id` (section 8) and cri-dockerd's Docker-format files (section 9) are the
-[`cri` plan](../plans/cri-container-logs.md)'s next workstreams, so those two sections describe
-`cri_in` as it will behave.
+Accepted. Partly built: `cri_in` reads CRI-format files under `root:` and stamps `container.id` as
+sections 1 to 8, 10, and 11 describe. cri-dockerd's Docker-format files (section 9) are the
+[`cri` plan](../plans/cri-container-logs.md)'s next workstream, so that section describes `cri_in`
+as it will behave.
 
 ## Context
 
@@ -152,7 +152,7 @@ no loss window for the tick to widen.
 
 **Discovery doesn't read `/var/log/containers`.** Its names put the pod before the namespace, carry no
 uid, and lose their container id past 251 bytes, and a symlink is made after the container starts,
-so lines can exist before the link does. Section 8 will read it for `container.id` alone.
+so lines can exist before the link does. Section 8 reads it for `container.id` alone.
 
 ### 3. The line parser lives in `logit-proto`, with a fuzz target
 
@@ -286,7 +286,7 @@ Each file's resource holds the semantic-convention keys its path names:
 | `k8s.pod.uid` | string | the rest, after its second `_` |
 | `k8s.container.name` | string | the container directory |
 | `k8s.container.restart_count` | `i64` | the file name's `<n>` |
-| `container.id` | string | section 8, when known (not yet built) |
+| `container.id` | string | section 8, when known |
 
 Each event carries `log.iostream` (`stdout` or `stderr`) and its line as an unparsed message
 (`body_format: Raw`, no severity), as `docker_in`'s does. A rotated file has its live file's
@@ -308,22 +308,46 @@ and name.
 
 ### 8. `container.id` from the `/var/log/containers` symlinks, best effort
 
-`cri_in` will list `containers_dir:` (default `/var/log/containers`), read each symlink's target,
-and index it by the target's last three path components (`<pod dir>/<container>/<n>.log`) to the id,
-when the link name's last `-`-separated part before `.log` is 64 lowercase hex characters, the form
-Fluent Bit's `kubernetes` filter reads. Keying on the last three components rather than the whole
-target lets a `root:` mounted at another path still match.
+`cri_in` lists `containers_dir:` (default `/var/log/containers`), reads each symlink's target, and
+indexes it by the target's last three path components (`<pod dir>/<container>/<n>.log`) to the id,
+the form Fluent Bit's `kubernetes` filter reads. Keying on the last three components rather than
+the whole target lets a `root:` mounted at another path still match. It reads only the link's name
+and target text, never the file the link names, so the links' targets need not be reachable
+through `containers_dir`'s mount.
 
-- The value is the bare hex id, never a `containerd://` prefix: semantic conventions' form, and the
-  one OpenTelemetry's `k8sattributes` processor and SDK resource detectors write, so a log joins to
-  a trace or metric from the same container.
-- It's cached per file identity, so the kubelet removing the link after the container exits doesn't
-  remove the id from that file's later lines, and a rotated file has its live file's id.
-- The listing runs on the `poll_interval` tick and on a miss, since the kubelet makes the link after
-  the container starts. An id found later replaces the file's resource, which starts a new batch, as
-  `docker_in`'s identity refresh does.
-- A missing link, or a name cut short of a whole id, writes no `container.id`. A failed listing
-  keeps the cache and is diagnosed (`container_id_error`), with no counter: no data is lost.
+- **Which names count.** The id is the text after the name's last `-` and before `.log`, and only
+  when that text is exactly 64 lowercase hex characters. The kubelet cuts a link's name to 251
+  bytes before it appends `.log`, so a long name loses its id; its last `-` part is then part of a
+  name or a partial id, fails the test, and yields no id.
+- **The value is the bare hex id**, never a `containerd://` prefix: semantic conventions' form, and
+  the one OpenTelemetry's `k8sattributes` processor and SDK resource detectors write, so a log
+  joins to a trace or metric from the same container.
+- **It's cached per file identity.** A file's identity here is its key, `<pod dir>/<container>/<n>`,
+  which a rotated file shares with its live file. An entry lives while any discovered file maps to
+  its key, so the kubelet removing the link after the container exits doesn't remove the id from
+  that file's later lines. The cache is in memory: a `logit` that starts after the kubelet removed
+  a link has no id for that container.
+- **The listing runs on a miss, at most once per scan.** The first lookup in a scan that the cache
+  can't answer lists the directory and reads the links it hasn't read before; a scan in which every
+  file has its id lists nothing. The kubelet makes the link after the container starts, so a file
+  can be read first: its next `poll_interval` scan finds the link. A file whose link never comes
+  (a cut name) costs one listing per scan, never one per line.
+- **An id found later replaces the file's resource** through the driver's `refresh` hook, which
+  returns `Identity` as `docker_in`'s does and is counted in `logit.input.files.identity_changed`.
+  The batch accumulator closes the open batch when the resource changes, so no batch holds a file's
+  lines from before and after, and none holds two containers'.
+- **A missing link or a cut name writes no `container.id`**, and the id is never guessed from
+  another source.
+- **A directory that doesn't exist is an empty listing.** It means no ids and is neither diagnosed
+  nor counted: a node that doesn't mount `/var/log/containers` gets `k8s.*` and no `container.id`,
+  as the operator's mounts say. Any other failure to list or read a link (a permission error, a
+  path that isn't a directory) keeps the cache and is diagnosed `container_id_error`, throttled.
+- **A failed listing isn't counted in `scan.errors`.** That counter's failures are discovery
+  listings, which can hide a tracked file and so are held to the rule that a failed listing retires
+  nothing ([ADR `tail-discovery-failure-and-resume-identity`](tail-discovery-failure-and-resume-identity.md),
+  decision 1). This listing decides one attribute and loses no data, so it gets no counter, and no
+  `*.dropped` ([ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)); the diagnostic is
+  the signal.
 
 ### 9. cri-dockerd's files are recognized and decoded as Docker JSON
 
@@ -371,7 +395,7 @@ will gain the counter its `bad_line` diagnostic lacked.
 | Key | Default | Meaning |
 |---|---|---|
 | `root` | `/var/log/pods` | the kubelet's pod log directory; an empty value is rejected |
-| `containers_dir` | `/var/log/containers` | where the kubelet's symlinks are, for `container.id`; an empty value is rejected, and a missing directory is an empty listing (not yet built) |
+| `containers_dir` | `/var/log/containers` | where the kubelet's symlinks are, for `container.id`; an empty value is rejected, and a missing directory is an empty listing |
 | `partial_timeout` | `5s` | section 5; `0s` turns the timer off |
 
 It flattens `TailOptions` as `tail_in` and `docker_in` do: `checkpoint_path`, `read_from`,
@@ -379,10 +403,8 @@ It flattens `TailOptions` as `tail_in` and `docker_in` do: `checkpoint_path`, `r
 reassembled line as under `docker_in`. Its `receive:` block takes the tail listeners' three
 batch-assembly fields and `shutdown_grace`.
 
-`containers_dir` arrives with section 8's lookup, not before it: a key that configures nothing would
-pass `logit validate` while reading nothing, and the config's `deny_unknown_fields` rejects it until
-then. An empty `root` is rejected under the graph's rule 27, beside the other empty-path checks,
-rather than under a rule number of its own.
+An empty `root` or `containers_dir` is rejected under the graph's rule 27, beside the other
+empty-path checks, rather than under a rule number of its own.
 
 ## Alternatives considered
 
@@ -408,8 +430,8 @@ rather than under a rule number of its own.
 
 ## Consequences
 
-- `ComponentKind::CriIn` has `root`, `partial_timeout`, and flattened `TailOptions`, with
-  `containers_dir` to come (section 11), and a graph shape rule beside `docker_in`'s. `cri_in` joins `is_tail_listener`,
+- `ComponentKind::CriIn` has `root`, `containers_dir`, `partial_timeout`, and flattened
+  `TailOptions`, and a graph shape rule beside `docker_in`'s. `cri_in` joins `is_tail_listener`,
   which feeds the `receive:` rules (17 and 18), and joins rule 28 (positive `poll_interval`,
   `checkpoint_interval`, and `max_line_bytes`) and rule 62 (a unique `checkpoint_path`) beside
   `tail_in` and `docker_in`, which those two rules name by kind. Without rule 62, a `cri_in` sharing
@@ -425,10 +447,10 @@ rather than under a rule number of its own.
   shared decoder will count a rejected entry (section 9, not yet built).
 - New counter uses: `logit.input.frames.truncated{reason="partial_timeout"}`, and
   `frames.dropped{reason="malformed"}` on `cri_in` (and on `docker_in` with section 9). New
-  diagnostic key, with section 8: `container_id_error`.
+  diagnostic key, from section 8: `container_id_error`.
 - Reading needs what `docker_in` needs: the runtimes create each log file `0640` as root, so
-  `logit` runs as root or with a group grant, with `/var/log/pods` (and, with section 8,
-  `/var/log/containers`) mounted read-only. Under cri-dockerd, the symlinks' targets, Docker's container directory, must be
+  `logit` runs as root or with a group grant, with `/var/log/pods` and
+  `/var/log/containers` mounted read-only. Under cri-dockerd, the symlinks' targets, Docker's container directory, must be
   mounted at their host path too.
 - One open descriptor and one file watch per rotated file the kubelet hasn't compressed, at most one
   per container in the kubelet's steady state.
@@ -443,7 +465,7 @@ rather than under a rule number of its own.
 - **A static pod's `k8s.pod.uid` is the kubelet's hash, not the mirror pod's uid**, unless its
   manifest sets a uid (section 7).
 - **A symlink name the kubelet cut short writes no `container.id`**, and neither does a container
-  whose link isn't there yet or was removed before `cri_in` listed it (section 8).
+  whose link is gone before `cri_in` starts, or whose link `cri_in` hasn't listed yet (section 8).
 - **No pod labels or annotations, and no node name** (section 10). An enrichment stage or `set` adds
   what a deployment needs.
 - **conmon's own size rotation isn't followed across a restart.** CRI-O's `log_size_max`, off by

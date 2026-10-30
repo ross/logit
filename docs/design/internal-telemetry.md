@@ -73,7 +73,8 @@ Inputs fall into three categories:
 - **Genuine self-claim.** `internal`.
 - **Discovered facts.** `docker_in` stamps `container.*` (id, name, image, opt-in labels), read
   locally off the container's own `config.v2.json`, and `cri_in` stamps `k8s.*` (namespace, pod
-  name and uid, container name, restart count), read off the kubelet's log path. These are facts about where the data came
+  name and uid, container name, restart count), read off the kubelet's log path, and `container.id`,
+  read off the name of the kubelet's symlink to the file. These are facts about where the data came
   from, with the same standing `syslog_in`'s parsed hostname has, not an assertion `logit` makes up.
   `internal`'s `host.name` is the same kind of fact, about where `logit` itself runs.
   `docker_in` still never claims `service.name`/`service.namespace` on the operator's behalf. That
@@ -1472,6 +1473,7 @@ the property the minimal-watch-set design is for.
 | `watch_error` | The one-shot cases: `auto` falling back to polling; a *file* watch that failed, which isn't retried (the file is still tailed, at `poll_interval`); or the `inotify` wake source itself becoming unusable, after which the listener runs poll-only. |
 | `watch_dir_error` | A directory watch that failed, carrying the errno. Its own key because it's retried, and so re-counted, on every later `scan` while the directory is missing, and `warn_throttled` logs a key only at powers of two of its count. Sharing a key would silence the one-shot cases above. |
 | `metadata_error` | `docker_in` only: `config.v2.json` missing or unparseable. Degrades to a `container.id`-only resource rather than refusing to tail. A missing file is retried on every poll tick; one that exists but won't parse is retried on its next stat change, because the stat cache caches a failed read the same way it caches a successful one. Diagnosed again only once it recovers or the stat changes, not once per tick. |
+| `container_id_error` | `cri_in` only: `containers_dir` couldn't be listed or one of its links read, for a reason other than the directory not existing. Keeps the ids already read and counts nothing: no data is lost, only an attribute. A missing `containers_dir` raises nothing. |
 | `bad_time` | `docker_in` and `cri_in`: the envelope's `time` field, or the CRI record's timestamp, didn't parse. Falls back to read time. |
 | `container_renamed` | `docker_in` only, `Diagnostics::info` rather than `warn_throttled`, because a rename is normal operation: the container's identity changed and the decoder's resource was swapped. |
 | `container_deselected` | `docker_in` only, `Diagnostics::info`: a tracked container renamed out of the configured selection stopped flowing. Its offset is retained in memory only, not across a restart. |

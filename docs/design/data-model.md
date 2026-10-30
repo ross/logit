@@ -409,9 +409,12 @@ source writes the keys its protocol defines:
 | `k8s.pod.uid` | `Value::Str` | the rest of the pod directory's name, which may hold `_` for a static pod whose manifest sets its uid |
 | `k8s.container.name` | `Value::Str` | the container directory |
 | `k8s.container.restart_count` | `Value::I64` | the file name's `<restart count>`, an integer as the semantic convention types it (signed, so it stays an OTLP integer) |
+| `container.id` | `Value::Str` | not the path: the 64-character lowercase hex id in the name of the kubelet's `/var/log/containers` symlink that points at the file, bare with no runtime prefix. Absent when no such link names a whole id; it appears on a file's later batches when the link is made after the file is first read |
 
-A rotated file (`<n>.log.<YYYYMMDD-HHMMSS>`) has its live file's resource. `cri_in` writes no
-`host.name` and no `container.id`.
+`container.id` is read from the symlink's name and target, and the target's last three path
+components pick the file, so a link whose target sits under another mount still matches. A rotated
+file (`<n>.log.<YYYYMMDD-HHMMSS>`) has its live file's resource, id included. `cri_in` writes no
+`host.name`.
 
 ### HTTP access-log names
 

@@ -2625,6 +2625,17 @@ pub enum ComponentKind {
         /// The kubelet's pod log directory. Defaults to `/var/log/pods`. Must be non-empty.
         #[serde(default = "default_cri_root")]
         root: String,
+        /// The kubelet's container symlink directory, read for each container's id. Defaults to
+        /// `/var/log/containers`. Must be non-empty. The kubelet links each container's log there
+        /// under a name ending in the container's 64-character id
+        /// (`<pod>_<namespace>_<container>-<id>.log`), and `cri_in` writes that id as the
+        /// `container.id` resource attribute. A container whose link is missing, was removed
+        /// before `cri_in` listed it, or has a name the kubelet cut short of a whole id gets no
+        /// `container.id`. A directory that doesn't exist is not an error: no container gets an
+        /// id. `logit` needs read access to this directory, and the links' targets need not be
+        /// reachable through it, since only the link text is read.
+        #[serde(default = "default_cri_containers_dir")]
+        containers_dir: String,
         /// How long a stream's unfinished line waits for its next piece, once `logit` has read
         /// to the end of its file, before it's sent as it stands. A container that exits or
         /// prompts mid-line leaves such a line. Each one sent this way is counted as
@@ -4962,6 +4973,10 @@ fn default_docker_root() -> String {
 
 fn default_cri_root() -> String {
     "/var/log/pods".to_string()
+}
+
+fn default_cri_containers_dir() -> String {
+    "/var/log/containers".to_string()
 }
 
 fn default_partial_timeout() -> Duration {
@@ -11454,11 +11469,12 @@ mod tests {
     }
 
     #[test]
-    fn cri_in_defaults_its_root_and_partial_timeout() {
+    fn cri_in_defaults_its_directories_and_partial_timeout() {
         let component: Component = serde_json::from_str(r#"{"type": "cri_in"}"#).unwrap();
         match component.kind {
-            ComponentKind::CriIn { root, partial_timeout, tail } => {
+            ComponentKind::CriIn { root, containers_dir, partial_timeout, tail } => {
                 assert_eq!(root, "/var/log/pods");
+                assert_eq!(containers_dir, "/var/log/containers");
                 assert_eq!(partial_timeout, Duration::from_secs(5));
                 assert_eq!(tail, TailOptions::default());
             }

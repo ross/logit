@@ -16,8 +16,11 @@
 //!   `F` of that stream closes it, so the two streams' runs interleave freely. The event's time is
 //!   the run's first record's (section 6).
 //! - **Resource** (section 7): `k8s.namespace.name`, `k8s.pod.name`, `k8s.pod.uid`,
-//!   `k8s.container.name`, and `k8s.container.restart_count` (an `i64`), from the path. Each event
-//!   carries `log.iostream`.
+//!   `k8s.container.name`, and `k8s.container.restart_count` (an `i64`), from the path, and
+//!   `container.id` when [`ContainerIds`] knows it. Each event carries `log.iostream`.
+//! - **`container.id`** (section 8): read from the kubelet's `containers_dir` symlinks by
+//!   [`ContainerIds`]. A file that gains its id swaps in a new resource through
+//!   [`DecoderFactory::refresh`], so no batch mixes the two.
 //! - **Counters** of its own: `logit.input.frames.dropped{reason="oversize"|"truncated"|"malformed"}`
 //!   and `logit.input.frames.truncated{reason="partial_timeout"}` ([`CriDecoder`]). **Diagnostics**
 //!   of its own: `bad_time` and `long_line`, beside the driver's `bad_line` and `invalid_utf8`.
@@ -25,12 +28,14 @@
 use crate::docker::envelope_cap;
 use crate::tail::{
     is_container_dir, log_restart_count, name_of, pod_dir_parts, DecoderFactory, PathPattern,
-    TailConfig, TailDecoder, Tailer,
+    Refresh, TailConfig, TailDecoder, Tailer,
 };
 use bytes::Bytes;
 use logit_core::{AttrMap, BodyFormat, Diagnostics, Event, LogRecord, Resource, Telemetry, Value};
 use logit_pipeline::Fanout;
 use logit_proto::cri::{self, Stream};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -373,9 +378,141 @@ pub(crate) fn path_resource(path: &Path) -> Option<Arc<Resource>> {
     Some(Arc::new(Resource { attributes: attrs, ..Default::default() }))
 }
 
+/// `resource` with `container.id` set to `id`.
+fn with_container_id(resource: &Resource, id: &str) -> Arc<Resource> {
+    let mut resource = resource.clone();
+    resource.attributes.insert("container.id", id);
+    Arc::new(resource)
+}
+
+/// The key a pod log path and a kubelet symlink's target share: `<pod dir>/<container>/<n>`, from
+/// their last three path components, so a `root:` mounted at another path still matches. A rotated
+/// file's key is its live file's.
+fn id_key(path: &Path) -> Option<String> {
+    let container_dir = path.parent();
+    let restart_count = name_of(Some(path)).and_then(log_restart_count)?;
+    let container = name_of(container_dir)?;
+    let pod = name_of(container_dir.and_then(Path::parent))?;
+    Some(format!("{pod}/{container}/{restart_count}"))
+}
+
+/// The container id in a kubelet symlink name (`<pod>_<namespace>_<container>-<id>.log`): the
+/// text after the last `-` and before `.log`, when it is 64 lowercase hex characters. A name the
+/// kubelet cut at 251 bytes has lost its id and yields `None`.
+fn link_id(name: &str) -> Option<&str> {
+    let (_, id) = name.strip_suffix(".log")?.rsplit_once('-')?;
+    let hex = id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    (id.len() == 64 && hex).then_some(id)
+}
+
+/// Container ids read from the kubelet's `containers_dir` symlinks (section 8), keyed by
+/// [`id_key`].
+///
+/// An id is cached until no discovered file maps to its key, so the kubelet removing a link
+/// after its container exits doesn't remove the id from that file's later lines, and a rotated
+/// file shares its live file's. The directory is listed at most once per scan, on the first
+/// lookup that misses, so a scan where every file has its id costs no `read_dir`. A name already
+/// read isn't read again while its id is cached.
+struct ContainerIds {
+    dir: PathBuf,
+    ids: BTreeMap<String, String>,
+    /// Link name to key, for the links in `ids`.
+    links: HashMap<OsString, String>,
+    /// The keys looked up or retained this scan: what `end_scan` keeps.
+    seen: BTreeSet<String>,
+    listed: bool,
+    diag: Diagnostics,
+}
+
+impl ContainerIds {
+    fn new(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            ids: BTreeMap::new(),
+            links: HashMap::new(),
+            seen: BTreeSet::new(),
+            listed: false,
+            diag: Diagnostics::default(),
+        }
+    }
+
+    /// Marks `path`'s key as in use this scan.
+    fn touch(&mut self, path: &Path) {
+        if let Some(key) = id_key(path) {
+            self.seen.insert(key);
+        }
+    }
+
+    /// The id for `path`, listing the directory first if the cache misses and this scan hasn't
+    /// listed it yet.
+    fn id_for(&mut self, path: &Path) -> Option<String> {
+        let key = id_key(path)?;
+        self.seen.insert(key.clone());
+        if !self.ids.contains_key(&key) && !self.listed {
+            self.listed = true;
+            self.list();
+        }
+        self.ids.get(&key).cloned()
+    }
+
+    /// Reads the links not yet read. A missing directory is an empty listing; any other failure
+    /// is diagnosed `container_id_error`, keeps the cache, and counts nothing: no data is lost,
+    /// only an attribute.
+    fn list(&mut self) {
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(err) => {
+                self.listing_failed(&err);
+                return;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    self.listing_failed(&err);
+                    continue;
+                }
+            };
+            let name = entry.file_name();
+            if self.links.contains_key(&name) {
+                continue;
+            }
+            let Some(id) = name.to_str().and_then(link_id) else { continue };
+            let target = match std::fs::read_link(entry.path()) {
+                Ok(target) => target,
+                Err(err) => {
+                    self.listing_failed(&err);
+                    continue;
+                }
+            };
+            let Some(key) = id_key(&target) else { continue };
+            self.ids.insert(key.clone(), id.to_string());
+            self.links.insert(name, key);
+        }
+    }
+
+    fn listing_failed(&mut self, err: &std::io::Error) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            self.diag
+                .warn_throttled("container_id_error", format!("{}: {err}", self.dir.display()));
+        }
+    }
+
+    /// Drops the ids no file used this scan, and opens the next scan's one listing.
+    fn end_scan(&mut self) {
+        let seen = std::mem::take(&mut self.seen);
+        self.ids.retain(|key, _| seen.contains(key));
+        let ids = &self.ids;
+        self.links.retain(|_, key| ids.contains_key(key));
+        self.listed = false;
+    }
+}
+
 /// Builds a [`CriDecoder`] for each path [`PathPattern::pod_logs`] matches. Every matched path is
 /// accepted: `cri_in` has no selection (section 10).
 struct CriDecoderFactory {
+    container_ids: ContainerIds,
     max_line_bytes: usize,
     partial_timeout: Duration,
     diag: Diagnostics,
@@ -390,11 +527,34 @@ impl DecoderFactory<CriDecoder> for CriDecoderFactory {
     // Each file is decoded as CRI. cri-dockerd's Docker-format files (section 9) need a per-file
     // format latch on the first byte, which belongs here and in `CriDecoder::decode_line`.
     fn open(&mut self, path: &Path) -> anyhow::Result<CriDecoder> {
-        let resource = path_resource(path)
+        let mut resource = path_resource(path)
             .ok_or_else(|| anyhow::anyhow!("{}: not a kubelet pod log path", path.display()))?;
+        if let Some(id) = self.container_ids.id_for(path) {
+            resource = with_container_id(&resource, &id);
+        }
         Ok(CriDecoder::new(resource, self.max_line_bytes, self.partial_timeout)
             .with_diagnostics(self.diag.clone())
             .with_telemetry(self.telemetry.clone()))
+    }
+
+    /// Installs `container.id` on a file that lacked it when its link has appeared. The kubelet
+    /// makes the link after the container starts, so the first lines can be read before it exists.
+    fn refresh(&mut self, path: &Path, decoder: &mut CriDecoder) -> Refresh {
+        if decoder.resource.attributes.get("container.id").is_some() {
+            self.container_ids.touch(path);
+            return Refresh::Unchanged;
+        }
+        let Some(id) = self.container_ids.id_for(path) else { return Refresh::Unchanged };
+        decoder.resource = with_container_id(&decoder.resource, &id);
+        Refresh::Identity
+    }
+
+    fn retain(&mut self, path: &Path) {
+        self.container_ids.touch(path);
+    }
+
+    fn end_scan(&mut self) {
+        self.container_ids.end_scan();
     }
 }
 
@@ -407,8 +567,14 @@ pub struct CriInput {
 impl CriInput {
     /// `config.max_line_bytes` is the operator's, bounding a reassembled line; the splitter gets
     /// `envelope_cap` of it (section 4), so every runtime's piece reaches the decoder.
-    pub fn new(root: PathBuf, partial_timeout: Duration, config: TailConfig) -> Self {
+    pub fn new(
+        root: PathBuf,
+        containers_dir: PathBuf,
+        partial_timeout: Duration,
+        config: TailConfig,
+    ) -> Self {
         let factory = CriDecoderFactory {
+            container_ids: ContainerIds::new(containers_dir),
             max_line_bytes: config.max_line_bytes,
             partial_timeout,
             diag: Diagnostics::default(),
@@ -420,6 +586,7 @@ impl CriInput {
 
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
         self.inner.factory_mut().diag = diag.clone();
+        self.inner.factory_mut().container_ids.diag = diag.clone();
         self.inner = self.inner.with_diagnostics(diag);
         self
     }
