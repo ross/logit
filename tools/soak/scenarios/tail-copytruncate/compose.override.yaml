@@ -1,0 +1,8 @@
+# Mounts the run's shared directory, `<run>/shared`, which the driver creates with mode 0777
+# and names in SOAK_SHARED_DIR, into the writer and the SUT at /shared. The writer's `file_out`
+# writes there and the SUT's `tail_in` reads there; `:z` relabels it for SELinux.
+services:
+  logit:
+    volumes: ["${SOAK_SHARED_DIR:?set by script/soak}:/shared:z"]
+  generator:
+    volumes: ["${SOAK_SHARED_DIR:?set by script/soak}:/shared:z"]

@@ -132,15 +132,17 @@ window = "run"
 reduce = "max"
 max = 10
 
-# Those files plus the process's other descriptors: `logit.process.fds` less `files.open` was 15
-# at nearly every drain of a 20-minute run, so 15 + files-open-bounded's 10 + 1 to spare.
+# Those files plus the process's other descriptors: `logit.process.fds` less `files.open` is 19
+# at nearly every drain and at most 20, so 20 + files-open-bounded's 10 + 1 to spare. The 19
+# include two tokio runtimes, the pipeline's and the signal handlers', each with two epoll
+# instances, an eventfd, and a signal socket.
 [[expect]]
 name = "fds-bounded"
 service = "logit"
 metric = "logit.process.fds"
 window = "run"
 reduce = "max"
-max = 26
+max = 31
 
 # The writer reaches its retention long before the end, so the tailer holds about its eight
 # files at the last drain.

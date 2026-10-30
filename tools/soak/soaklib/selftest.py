@@ -173,6 +173,15 @@ FAILing, a kill's count reported, neither step opening a fault window, a SIGHUP'
 leaving `self_log` alone, an `[[expect]]` through a signal step, and deleted files read
 from the run's recorded counts.
 
+For the file actions, it covers fileops.py's copytruncate (its lost-line count through an append
+between the copy and the truncate, and an `O_APPEND` writer going on at 0), gzip, and replace on
+a temporary directory, the action running the shipped source through a fake Docker, every
+validation rule (the keys each takes, a file source's writer, each `to` once, once per run, and
+none in a `[random]` schedule), `count_lines` reading a gzip file decompressed, and
+`ledger.wire` over copytruncate steps: the shared count held to G less their lost lines with one
+batch a step unrecorded allowed, and the replay band's terms for a step while the tailer runs and
+while the SUT is down.
+
 For `[tls]`, `rotate`, and `probe`, it covers every validation rule (the table's keys, names,
 DNS names, and usages; the keys each step takes; a rotate's certificate read by its service's
 config, outside a comment, its days rising, once per run; a probe of a server certificate inside
@@ -201,8 +210,10 @@ running a command. A part that passes `prefix=` names its own fake and is unaffe
 """
 
 import base64
+import contextlib
 import copy
 import gzip
+import io
 import json
 import os
 import re
@@ -10594,7 +10605,8 @@ def _signal_rules(root):
     cases = [
         (step(0, signal=None), "signal needs `signal`", "a signal with no signal"),
         (step(0, signal="TERM"), "`signal` must be one of HUP", "a signal other than HUP"),
-        (step(0, path="x"), "`path` is for rename only", "path on a signal"),
+        (step(0, path="x"), "`path` is for rename, copytruncate, gzip, and replace only",
+         "path on a signal"),
         (step(4, signal="HUP"), "`signal` is for signal only", "signal on a stop"),
         (step(2, path=None), "rename needs `path`", "a rename with no path"),
         (step(2, to="sub/archive.log.1"), "`to` must be a bare file name", "a to with a slash"),
@@ -12706,6 +12718,297 @@ def _shipped(root):
             expect(False, f"{path}: {err}")
 
 
+def _file_ops():
+    """fileops.py's three operations on a temporary directory: a copytruncate copies the file,
+    truncates it in place for an `O_APPEND` writer to go on at 0, and counts the lines written
+    after the copy and before the truncate as lost; a gzip compresses and removes; a replace
+    keeps the bytes under a new inode with no temporary left; and the command line refuses a
+    bad op and reports a missing file. The faults' action ships the same source to a
+    container: through a fake Docker that runs it with `-I -c` here, it records what the source
+    printed, and fails with no shared directory or no JSON object."""
+    fileops = faults.fileops
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        writer = open(directory / "app.log", "ab")
+        writer.write(b"one\ntwo\nthr")
+        writer.flush()
+        real_close = fileops.os.close
+        shim = type("OsShim", (), {})()
+        for name in dir(os):
+            if not name.startswith("__"):
+                setattr(shim, name, getattr(os, name))
+        appended = []
+
+        def close_then_append(fd):
+            # The copy's output closes once its read found the end: a write landing now is
+            # after the copy and before the truncate.
+            real_close(fd)
+            if not appended:
+                appended.append(True)
+                writer.write(b"ee\nfour\n")
+                writer.flush()
+
+        shim.close = close_then_append
+        fileops.os = shim
+        try:
+            result = fileops.copytruncate(str(directory), "app.log", "app.log-01")
+        finally:
+            fileops.os = os
+        expect(result["copied_bytes"] == 11 and result["copied_lines"] == 2
+               and result["lost_bytes"] == 8 and result["lost_lines"] == 2
+               and (directory / "app.log-01").read_bytes() == b"one\ntwo\nthr"
+               and result["ino"] != result["to_ino"],
+               f"a copytruncate copies to the end it read and counts the later lines lost, got "
+               f"{result}")
+        writer.write(b"five\n")
+        writer.close()
+        expect((directory / "app.log").read_bytes() == b"five\n",
+               "an O_APPEND writer goes on at offset 0 after the truncate, with no hole")
+        result = fileops.gzip_file(str(directory), "app.log-01", "app.log-01.gz")
+        expect(not (directory / "app.log-01").exists()
+               and gzip.decompress((directory / "app.log-01.gz").read_bytes())
+               == b"one\ntwo\nthr" and result["lines"] == 2 and result["bytes"] == 11,
+               f"a gzip compresses into `to` and removes `path`, got {result}")
+        before = (directory / "app.log").stat().st_ino
+        result = fileops.replace(str(directory), "app.log")
+        expect((directory / "app.log").read_bytes() == b"five\n"
+               and (directory / "app.log").stat().st_ino != before
+               and result["lines"] == 1 and sorted(p.name for p in directory.iterdir())
+               == ["app.log", "app.log-01.gz"],
+               f"a replace keeps the bytes under a new inode and leaves no temporary, got "
+               f"{result}")
+        counted = collect.count_lines(directory)
+        expect(counted == {"files": 2, "lines": 3, "bytes": 16},
+               f"count_lines counts a gzip file's lines decompressed, got {counted}")
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            refused = [fileops.main(["copytruncate", str(directory), "app.log"]),
+                       fileops.main(["shred", str(directory), "app.log"]),
+                       fileops.main(["gzip", str(directory), "missing", "missing.gz"])]
+        expect(refused == [1, 1, 1] and "No such file" in errors.getvalue(),
+               f"fileops refuses a short or unknown command line and reports a missing file, "
+               f"got {refused} {errors.getvalue()!r}")
+
+    compose = (Path(__file__).resolve().parent.parent / "compose.yaml").read_text()
+    expect(f"image: {faults.FILEOPS_IMAGE}" in compose
+           and faults.FILEOPS_IMAGE == driver.STANDIN_IMAGE,
+           "a file operation runs in the stand-in's image, so a run pulls one Python image")
+
+    class PullDocker:
+        """Answers `image inspect` with `present` and `pull` with `pulled`, recording calls."""
+
+        def __init__(self, present, pulled=0):
+            self.present, self.pulled, self.calls = present, pulled, []
+
+        def run(self, args, timeout=None):
+            self.calls.append((list(args), timeout))
+            if args[0] == "image":
+                return docker.Result(self.present, "", "")
+            return docker.Result(self.pulled, "", "" if self.pulled == 0 else "denied")
+
+    there = PullDocker(0)
+    expect(faults.ensure_fileops_image(there) is None and len(there.calls) == 1,
+           f"an image on the daemon isn't pulled again, got {there.calls}")
+    missing = PullDocker(1)
+    expect(faults.ensure_fileops_image(missing) is None
+           and missing.calls[1] == (["pull", faults.FILEOPS_IMAGE],
+                                    faults.FILEOPS_PULL_TIMEOUT_S),
+           f"a missing image is pulled before the schedule, got {missing.calls}")
+    refused = faults.ensure_fileops_image(PullDocker(1, pulled=1))
+    expect(refused is not None and "denied" in refused,
+           f"a failed pull is reported, got {refused}")
+
+    class SourceDocker:
+        """Runs the shipped source here, with the container's shared mount mapped back."""
+
+        def __init__(self, host, stdout=None):
+            self.host, self.stdout, self.calls = host, stdout, []
+
+        def run_oneshot(self, args, timeout=None):
+            self.calls.append(list(args))
+            at = args.index("-c")
+            argv = [str(self.host) if a == scenario.SHARED_MOUNT else a for a in args[at + 2:]]
+            proc = subprocess.run([sys.executable, "-I", "-c", args[at + 1], *argv],
+                                  capture_output=True, text=True, check=False)
+            return docker.Result(proc.returncode, self.stdout or proc.stdout, proc.stderr)
+
+    step = scenario.Step("c0s1", 0, 0, "copytruncate", "generator", "", 10.0, 15.0,
+                         path="app.log", to="app.log-01")
+    ctx = faults.Context(docker=SourceDocker(None), ids={}, netem_image="netem")
+    expect(faults.ACTIONS["copytruncate"].apply(ctx, step)["rc"] == 1,
+           "a file operation with no shared directory fails")
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "app.log").write_bytes(b"a\nb\n")
+        fake = SourceDocker(Path(tmp))
+        ctx = faults.Context(docker=fake, ids={}, netem_image="netem", shared_dir=Path(tmp))
+        record = faults.ACTIONS["copytruncate"].apply(ctx, step)
+        argv = fake.calls[0]
+        expect(record["rc"] == 0 and record["copied_lines"] == 2 and record["lost_lines"] == 0
+               and record["path"] == "app.log" and record["to"] == "app.log-01"
+               and argv[:4] == ["--network", "none", "--volume", f"{tmp}:/shared:z"]
+               and argv[4:8] == [faults.FILEOPS_IMAGE, "python", "-I", "-c"]
+               and argv[9:] == ["copytruncate", "/shared", "app.log", "app.log-01"]
+               and (Path(tmp) / "app.log").read_bytes() == b"",
+               f"a copytruncate runs the source in a container and records its counts, got "
+               f"{record} {argv}")
+        again = faults.ACTIONS["copytruncate"].apply(ctx, step)
+        expect(again["rc"] == 1 and "File exists" in again["stderr"],
+               f"a copytruncate never replaces its `to`, got {again}")
+        replace = scenario.Step("c0s2", 1, 0, "replace", "generator", "", 20.0, 25.0,
+                                path="app.log-01")
+        record = faults.ACTIONS["replace"].apply(ctx, replace)
+        expect(record["rc"] == 0 and record["lines"] == 2 and "to" not in record
+               and fake.calls[-1][9:] == ["replace", "/shared", "app.log-01"],
+               f"a replace passes no `to`, got {record} {fake.calls[-1]}")
+        ctx.docker = SourceDocker(Path(tmp), stdout="not json\n")
+        gz = scenario.Step("c0s3", 2, 0, "gzip", "generator", "", 30.0, 35.0,
+                           path="app.log-01", to="app.log-01.gz")
+        record = faults.ACTIONS["gzip"].apply(ctx, gz)
+        expect(record["rc"] == 1 and "no JSON object" in record["stderr"],
+               f"an operation that prints no JSON object fails, got {record}")
+        expect(faults.ACTIONS["gzip"].revert(ctx, gz) == {"rc": 0, "stderr": ""},
+               "a file operation's revert does nothing")
+
+
+def _file_action_rules(root):
+    """Every file action rule: `path` and `to` on a copytruncate and a gzip, `path` alone on a
+    replace, both bare names; on a file source's writer; each `to` once; once per run; and none
+    in a `[random]` schedule. tail-copytruncate loads with its eleven steps and a shared
+    directory."""
+    path = root / "scenarios" / "tail-copytruncate" / "scenario.toml"
+    base = tomllib.loads(path.read_text())
+    loaded = scenario.load(path)
+    expect(loaded.uses_shared_dir
+           and [spec.action for spec in loaded.steps] == [
+               "copytruncate", "stop", "copytruncate", "copytruncate", "gzip", "kill",
+               "copytruncate", "replace", "copytruncate", "gzip", "copytruncate"]
+           and scenario.service_problems(loaded, _override_roles(loaded)) == [],
+           f"tail-copytruncate loads its file actions and passes its service rules, got "
+           f"{[spec.action for spec in loaded.steps]}")
+
+    def mutate(index, **fields):
+        raw = copy.deepcopy(base)
+        raw["step"][index].update(fields)
+        for key in [k for k, v in fields.items() if v is None]:
+            del raw["step"][index][key]
+        return raw
+
+    cases = [
+        (mutate(0, to=None), "copytruncate needs `to`", "a copytruncate with no to"),
+        (mutate(4, path=None), "gzip needs `path`", "a gzip with no path"),
+        (mutate(7, to="x"), "`to` is for rename, copytruncate, and gzip only",
+         "a replace with a to"),
+        (mutate(1, path="app.log"), "`path` is for rename, copytruncate, gzip, and replace "
+         "only", "a path on a stop"),
+        (mutate(0, to="sub/app.log-01"), "`to` must be a bare file name", "a to with a slash"),
+        (mutate(0, to="app.log"), "`to` must differ from `path`", "a to equal to its path"),
+        (mutate(0, on="logit"), "copytruncate is for a file source's writer; the scenario's "
+         "are generator", "a copytruncate on the tailer"),
+        (mutate(2, to="app.log-01"), "repeats step 1's", "two copytruncates onto one name"),
+    ]
+    for raw, needle, what in cases:
+        _refused(path, raw, needle, what)
+    _refused(path, base, "runs 2 times", "a copytruncate in a second cycle",
+             duration=scenario.parse_duration("26m"))
+    random_path, random_raw = _random_base(root)
+    for action in scenario.FILE_ACTIONS:
+        raw = copy.deepcopy(random_raw)
+        raw["random"]["fault"].append({"weight": 1, "action": action, "on": "generator",
+                                       "for": {"min": "10s", "max": "20s"}})
+        _refused(random_path, raw, f"{action} opens no fault window",
+                 f"a {action} in a [random] schedule")
+
+
+def _copytruncate_ledger():
+    """`ledger.wire` over copytruncate steps: the shared directory's count held to G less their
+    lost lines, with one writer batch a step unrecorded allowed; the replay band widened below
+    by the lost lines, and above, for a step while the tailer runs, by the copy's lines and one
+    only when its record shows bytes appended after the copy's last read, or the count shows a
+    shortfall past the records; and nothing above for a step while the SUT is down. So a copy
+    read from 0 with nothing appended FAILs, whether made while the tailer ran or while it was
+    down."""
+    def ops_of(*steps):
+        records = []
+        for n, (offset, copied, lost, lost_bytes) in enumerate(steps, start=7):
+            records += [_action("apply", f"c0s{n}", "copytruncate", "generator", offset,
+                                offset + 1, path="app.log", to=f"app.log-{n:02d}",
+                                copied_lines=copied, lost_lines=lost, lost_bytes=lost_bytes),
+                        _action("revert", f"c0s{n}", "copytruncate", "generator", offset + 5,
+                                offset + 5)]
+        return records
+
+    # +50 and +70 while the tailer runs, the first with bytes appended after its copy, the
+    # second with none; +110 inside the stop over STOP; +140 failed and changes nothing.
+    mixed = ops_of((50, 5_000, 30, 2_850), (70, 3_000, 0, 0), (110, 4_000, 20, 1_900)) + [
+        _action("apply", "c0s20", "copytruncate", "generator", 140, 141, path="app.log",
+                to="app.log-20", rc=1)]
+    with tempfile.TemporaryDirectory() as tmp:
+        def run(name, w_minus_g, short=50, ops=mixed):
+            run_dir = _ledger_run(tmp, name, shutdown_drops=0, life0_extra=30,
+                                  timeline_extra=ops)
+            counted = lambda g: {"files": 3, "lines": g - short, "bytes": (g - short) * 95}
+            return {r.id: r for r in checks.run_all(_as_file_wire(
+                run_dir, w_minus_g=w_minus_g, counted=counted))}
+
+        low = run("ct-low", -50)["ledger.wire"]
+        lines = "\n".join(low.lines)
+        expect(low.status == checks.PASS
+               and "against the replay band [-50, 5,002]" in low.detail
+               and "copytruncate at +50s, a tailer running: [-30, +5,001]" in lines
+               and "copytruncate at +70s, a tailer running: [-0, +0]: its lost lines below; "
+               "nothing above" in lines
+               and "copytruncate at +110s, the SUT down (stop): [-20, +0]" in lines
+               and "copytruncate app.log -> app.log-07 at +50s: 5,000 line(s) copied, 30 "
+               "written after the copy and before the truncate" in lines
+               and "+140s" not in lines,
+               f"each copytruncate widens the band by its own terms, got {low} {low.lines}")
+        expect(run("ct-lower", -51)["ledger.wire"].status == checks.FAIL,
+               "a line short of the lost lines FAILs")
+        expect(run("ct-high", 5_002)["ledger.wire"].status == checks.PASS,
+               "a copy read again from 0 after bytes were appended to it passes")
+        expect(run("ct-higher", 5_003)["ledger.wire"].status == checks.FAIL,
+               "more than that copy's lines again FAILs")
+        # Regressions the band must catch: a copy read from 0 though nothing was appended
+        # after its copy, made while the tailer ran, and made while the SUT was down beside a
+        # running step whose copy is larger.
+        clean = ops_of((50, 3_000, 0, 0))
+        reread = run("ct-reread-running", 3_000, short=0, ops=clean)["ledger.wire"]
+        expect(reread.status == checks.FAIL
+               and reread.detail.startswith("W + F − G 3,000 is surplus, outside the replay "
+                                            "band [0, 1]"),
+               f"a running copy read from 0 with nothing appended FAILs, got {reread}")
+        down = ops_of((50, 5_000, 0, 0), (110, 4_000, 0, 0))
+        reread = run("ct-reread-down", 4_000, short=0, ops=down)["ledger.wire"]
+        expect(reread.status == checks.FAIL
+               and reread.detail.startswith("W + F − G 4,000 is surplus, outside the replay "
+                                            "band [0, 1]"),
+               f"a copy made while the SUT was down read from 0 FAILs, got {reread}")
+        # A shortfall past the records means a write landed unrecorded: every running step may
+        # then have read past its copy.
+        short = run("ct-shortfall", 8_003, short=150)["ledger.wire"]
+        expect(short.status == checks.PASS
+               and "against the replay band [-150, 8,003]" in short.detail
+               and "copytruncate at +70s, a tailer running: [-0, +3,001]" in
+               "\n".join(short.lines),
+               f"an unrecorded shortfall grants every running step its copy, got {short} "
+               f"{short.lines}")
+        above = run("ct-count-above", 0, short=49)["ledger.wire"]
+        expect(above.status == checks.FAIL
+               and "the shared directory holds 53,981 line(s) in 3 file(s), but the writer's "
+               "events.delivered 54,030 less the 50 its copytruncates lost is 53,980" in
+               above.detail,
+               f"a count above G less the lost lines FAILs, got {above}")
+        race = run("ct-race", -350, short=350)["ledger.wire"]
+        expect(race.status == checks.PASS
+               and any("copytruncates: [-300, 0]: lines in no file past the records" in line
+                       for line in race.lines),
+               f"a batch a step lost unrecorded widens the band below, got {race} "
+               f"{race.lines}")
+        past = run("ct-race-past", -350, short=351)["ledger.wire"]
+        expect(past.status == checks.FAIL and "with up to 300 more lost unrecorded" in past.detail,
+               f"more than a batch a step unrecorded FAILs, got {past}")
+
+
 def run(root, quiet=False):
     """Returns 0 when every expectation holds, else prints the failures and returns 1."""
     root = Path(root)
@@ -12726,7 +13029,7 @@ def run(root, quiet=False):
                      _script_ledger, _sink_ledger, _target_ledger, _roles, _sink_rules, _driver_roles,
                      _sources_ledger, _source_rules, _fanin_driver, _tcp_ledger, _tcp_rules,
                      _http_ledger, _http_rules, _file_ledger, _file_rules,
-                     _two_sut_rules,
+                     _file_ops, _file_action_rules, _copytruncate_ledger, _two_sut_rules,
                      _two_sut_driver, _two_sut_checks, _per_service, _slope_edges,
                      _rss_settle_rules, _rss_settle_checks,
                      _expected_rules, _slope_reducer, _standin_codec, _standin_record_parts,
@@ -12750,7 +13053,7 @@ def run(root, quiet=False):
                               _expected_event_rules,
                               _shipped, _roles, _sink_rules, _driver_roles, _source_rules,
                               _fanin_driver, _tcp_rules, _http_rules, _file_rules, _two_sut_rules,
-                              _two_sut_driver,
+                              _two_sut_driver, _file_action_rules,
                               _rss_settle_rules, _expected_rules, _standin_codec, _standin_server,
                               _respond_rules, _standin_count, _standin_idle_timeout,
                               _standin_driver, _written_counts, _datadog_codec,
