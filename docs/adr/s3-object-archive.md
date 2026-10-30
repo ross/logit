@@ -286,10 +286,9 @@ first copy and isn't updated.
 | `301` `PermanentRedirect`, `307` `TemporaryRedirect`, any other `3xx` | `Refused` | the wrong region or endpoint: the same answer for every object; the diagnostic carries `x-amz-bucket-region` |
 | `400` `RequestTimeout`, `IncompleteBody`, `BadDigest`, `XAmzContentSHA256Mismatch` | `Clean` | the body didn't arrive whole, so nothing was stored |
 | `400` `ExpiredToken`, `TokenRefreshRequired` | `Clean`, after `Chain::forget` | the credentials expired; fresh ones will sign the retry |
-| `400` `EntityTooLarge`, `413` | `Refused` | every body is at most `part_size`, so the destination's limit is below it: configuration, not a batch |
-| `400` `InvalidArgument`, `InvalidToken`, `AuthorizationHeaderMalformed`, `InvalidBucketName`, `InvalidEncryptionAlgorithmError`, `InvalidStorageClass`, `KeyTooLongError`, `InvalidRequest`; any `4xx` whose code starts `KMS.` | `Refused` | configuration: the same answer for every object |
+| `400` `EntityTooLarge`, `413` | `Refused` | a body is at most `part_size`, so the destination's limit is below it: configuration, not a batch |
+| `400` `InvalidArgument`, `InvalidToken`, `AuthorizationHeaderMalformed`, `InvalidBucketName`, `InvalidEncryptionAlgorithmError`, any `KMS.*`, `InvalidStorageClass`, `AccessControlListNotSupported`, `KeyTooLongError`, `InvalidRequest` | `Refused` | configuration: the same answer for every object |
 | `400` `InvalidPart`, `InvalidPartOrder`, `EntityTooSmall` | `Clean` | the sink built a bad upload; nothing is visible yet, so the object starts again |
-| `401`, `405`, `407`, any code | `Refused` | credentials, a method a proxy or store won't take, or a proxy's credentials: the shared HTTP default |
 | `403`, any code | `Refused` | credentials or policy |
 | `404` `NoSuchBucket`, and any other `404` | `Refused` | the bucket or endpoint is wrong |
 | `404` `NoSuchUpload` | `Clean` | the upload was aborted underneath the sink; the object starts again |
@@ -454,7 +453,8 @@ points the record left open.
   so the answer stays `Clean` and the retry signs with the same token until the operator replaces
   it, announced by `logit.component.retrying`.
 - **`partition` validation** formats the pattern at 23:59:59.999 on each month's 20th to 26th
-  day in year 9999 (every weekday and month name), and takes the longest result with the longest
+  day in year 9999 (every weekday and month name), at millisecond 999 and at millisecond 0
+  (where `%.f` writes nothing), and takes the longest result with the longest
   key tail. `endpoint:` may end in one `/`.
 - **`logit.output.parts`** counts `UploadPart` requests only, so a `PutObject` counts none.
 - **zstd writes a frame per 1 MiB of encoded input**, not per batch: the encoding collects in a
@@ -475,6 +475,13 @@ points the record left open.
   favors one long frame. The chunk not yet
   compressed lags the part cut by up to 1 MiB of encoded input, as gzip's deflate buffer
   does by less.
+- **The module doc's table is canonical, and these notes record each change to it.** The table
+  in decision 6 is as first written; the later rows are below and in
+  `crates/logit-outputs/src/s3/mod.rs`'s "Response classes".
+- **`400` `EntityTooLarge` and `413` rest on every body being at most `part_size`**, as decision
+  6's row says, once parts are cut at `part_size` ("The close picks the request", above). While
+  every object was one `PutObject`, closed once its body reached `part_size`, a body could be
+  `part_size` plus one batch.
 - **`401`, `405`, and `407` are `Refused`**, the shared HTTP default, and not decision 6's "any
   other `4xx`": each says the same thing about every object (credentials, a method the store or a
   proxy won't take, a proxy's credentials), and `Rejected` would drain the queue one head batch

@@ -6,8 +6,9 @@
 //!
 //! The sink collects through the window protocol (`docs/adr/collecting-sink-window.md`): it
 //! reports a [`Output::window`] of `usize::MAX` while the object takes batches, and
-//! [`Output::collecting`] returns the open object's `max_age` deadline until the object is full. Every batch of an open or uploading
-//! object stays reserved in the sink's store, uncommitted, until the object is stored.
+//! [`Output::collecting`] returns the open object's `max_age` deadline until the object is full.
+//! Every batch of an open or uploading object stays reserved in the sink's store, uncommitted,
+//! until the object is stored.
 //!
 //! - **`submit` stages.** The first batch submitted into an empty object opens it and names its
 //!   key; each batch is encoded, compressed, and cut into parts as it arrives ([`StagedObject`]),
@@ -20,9 +21,9 @@
 //!   ordinary fill would otherwise submit every batch the store holds.
 //! - **`await_ack` on the head completes the object**: it closes the body and sends one
 //!   `PutObject` when the body is one part and no part went up, else uploads the rest and sends
-//!   `CompleteMultipartUpload`, and answers the head with the object's outcome. From then until each batch
-//!   behind the head is answered, `window()` reads the answers owed, `collecting()` reads `None`,
-//!   and each later `await_ack` answers `Ok` at once.
+//!   `CompleteMultipartUpload`, and answers the head with the object's outcome. From then until
+//!   each batch behind the head is answered, `window()` reads the answers owed, `collecting()`
+//!   reads `None`, and each later `await_ack` answers `Ok` at once.
 //! - **A fault covers the object.** A failed request, or a credential lookup that failed before
 //!   it, returns its fault without `HeadOnly`, so the loop resubmits from the head and the object
 //!   is staged again under the same key, in a new upload.
@@ -146,9 +147,9 @@
 //!
 //! **Retries are the loop's.** Every retryable class restarts the object from its head through
 //! the window protocol, holding no more than the head's pinned count (the "Full" bound above);
-//! the sink retries no request of its own. **Posture:** the default, `at_least_once`, because a retry rewrites the same key.
-//! Under `at_most_once` an `Ambiguous` `PutObject` or `CompleteMultipartUpload` drops every batch
-//! of its object, which may be stored.
+//! the sink retries no request of its own. **Posture:** the default, `at_least_once`, because a
+//! retry rewrites the same key. Under `at_most_once` an `Ambiguous` `PutObject` or
+//! `CompleteMultipartUpload` drops every batch of its object, which may be stored.
 //!
 //! ## Telemetry
 //!

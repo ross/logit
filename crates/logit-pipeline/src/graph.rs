@@ -360,9 +360,9 @@
 //! 100. An `s3_out` with an empty `bucket`, `region`, or `storage_class`; an `endpoint` that
 //!      isn't an `http://` or `https://` URL with a host and no path, query, fragment, or user
 //!      info; a `partition` jiff can't format, or a `prefix` and `partition` whose longest key
-//!      passes S3's 1,024 bytes or that make a `.` or `..` segment; a `max_bytes` of `0` or above 9,000 times `part_size`, which
-//!      would pass S3's 10,000 parts; a `part_size` outside S3's 5 MiB to 5 GiB; a `max_age`,
-//!      `timeout`, or `connect_timeout` of `0s`; an `sse` `kms_key_id` or `bucket_key` outside
+//!      passes S3's 1,024 bytes or that make a `.` or `..` segment; a `max_bytes` of `0` or
+//!      above 9,000 times `part_size`, which would pass S3's 10,000 parts; a `part_size` outside
+//!      S3's 5 MiB to 5 GiB; a `max_age`, `timeout`, or `connect_timeout` of `0s`; an `sse` `kms_key_id` or `bucket_key` outside
 //!      `aws_kms`, or an empty `kms_key_id`; `credentials` with an empty value; or a `tls` failing
 //!      rule 24's checks, a block under an `http://` `endpoint` included
 //!      (`docs/adr/s3-object-archive.md`, decision 7).
@@ -5039,21 +5039,24 @@ struct PartitionProbe {
 
 /// Formats `partition` in UTC at one instant per month and weekday in year 9999, the longest
 /// year jiff formats, at the last millisecond of a day, so month and weekday names and every
-/// numeric field are at their widest. Each result follows `prefix` to find a dot segment: every
-/// `/`-ended segment, since the key's own tail follows the last one.
+/// numeric field are at their widest. It formats each day again at millisecond 0, where `%.f`
+/// writes nothing and can leave a bare `.`. Each result follows `prefix` to find a dot segment:
+/// every `/`-ended segment, since the key's own tail follows the last one.
 fn probe_partition(prefix: &str, partition: &str) -> Result<PartitionProbe, jiff::Error> {
     let mut probe = PartitionProbe { longest: 0, dot_segment: false };
     for month in 1..=12 {
         for day in 20..=26 {
-            let instant = jiff::civil::date(9999, month, day)
-                .at(23, 59, 59, 999_000_000)
-                .to_zoned(jiff::tz::TimeZone::UTC)?;
-            let formatted = jiff::fmt::strtime::format(partition, &instant)?;
-            probe.longest = probe.longest.max(formatted.len());
-            let path = format!("{prefix}{formatted}");
-            let mut segments: Vec<&str> = path.split('/').collect();
-            segments.pop();
-            probe.dot_segment |= segments.iter().any(|segment| matches!(*segment, "." | ".."));
+            for nanos in [999_000_000, 0] {
+                let instant = jiff::civil::date(9999, month, day)
+                    .at(23, 59, 59, nanos)
+                    .to_zoned(jiff::tz::TimeZone::UTC)?;
+                let formatted = jiff::fmt::strtime::format(partition, &instant)?;
+                probe.longest = probe.longest.max(formatted.len());
+                let path = format!("{prefix}{formatted}");
+                let mut segments: Vec<&str> = path.split('/').collect();
+                segments.pop();
+                probe.dot_segment |= segments.iter().any(|segment| matches!(*segment, "." | ".."));
+            }
         }
     }
     Ok(probe)
@@ -8964,6 +8967,8 @@ mod tests {
             (r#""prefix": "logs/../""#.into(), "'.' or '..' segment"),
             (r#""prefix": "logs/.", "partition": "./""#.into(), "'.' or '..' segment"),
             (r#""partition": "%Y/../""#.into(), "'.' or '..' segment"),
+            (r#""partition": ".%.f/""#.into(), "'.' or '..' segment"),
+            (r#""partition": "%Y/.%.f/""#.into(), "'.' or '..' segment"),
             (r#""part_size": "5242879""#.into(), "S3 takes parts from"),
             (r#""part_size": "5121MiB""#.into(), "S3 takes parts from"),
             (r#""max_bytes": "0""#.into(), "'max_bytes' is 0"),
