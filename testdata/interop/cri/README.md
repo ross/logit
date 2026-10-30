@@ -58,9 +58,10 @@ rotated file names, and symlink form. Observations the ADR doesn't state:
 - **Timestamps.** containerd writes `Z` and trims trailing zeros, so the fraction is 6 to 9
   digits wide (`.5260678Z`). conmon writes a fixed nine digits and `+00:00`, and every record
   from one `read(2)` of a stream carries the same time.
-- **Split size.** containerd cut at 16,384 bytes. conmon's pieces are one read's bytes, 4,096
-  or 8,192 in these recordings (`y` is 4,096 four times then 4,116; `x` is 8,192, 8,192, 1,000),
-  depending on how the writer's pipe delivered them. A line whose newline arrives in a later read ends in an
+- **Split size.** containerd cut at 16,384 bytes. conmon's pieces are one read's bytes. Reads in
+  these recordings were 4,096 or 8,192 bytes, or shorter where a write ended (`y` is 4,096 four
+  times then 4,116; `x` is 8,192, 8,192, 1,000; `a` is 8,192, 8,191, 2, and 100), depending on how
+  the writer's pipe delivered them. A line whose newline arrives in a later read ends in an
   empty `F` record.
 - **A late first piece.** In a trial recording, containerd held an unterminated 16,394-byte write
   on stdout until the kubelet's reopen flushed it as a 16,384-byte `P` and a 10-byte `P`. It
