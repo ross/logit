@@ -356,6 +356,8 @@ mod tests {
             let config = load_with(&path, &|name| match name {
                 "INFLUXDB_TOKEN" => Some("logit-test-token".to_string()),
                 "DD_API_KEY" => Some("logit-test-key".to_string()),
+                // `examples/kubernetes/`, which reads the node name from the downward API.
+                "NODE_NAME" => Some("node-1".to_string()),
                 "SPLUNK_OBSERVABILITY_TOKEN" => Some("logit-test-token".to_string()),
                 "SPLUNK_HEC_TOKEN" => Some("logit-test-token".to_string()),
                 // `script/splunk-interop`'s legs, which take their target from the environment

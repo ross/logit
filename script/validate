@@ -56,6 +56,8 @@ export S3_INTEROP_REPLAY_OUT="${S3_INTEROP_REPLAY_OUT:-/out/leg.log}"
 # tools/soak/scenarios/rolling-overlap/logit-sut.yaml's instance name, which each overlap
 # instance's compose service sets to its own name.
 export SOAK_INSTANCE="${SOAK_INSTANCE:-logit}"
+# examples/kubernetes/logit.yaml's `hostname:` and `k8s.node.name`, from the downward API.
+export NODE_NAME="${NODE_NAME:-node-1}"
 
 if ! in_project_environment; then
     run ./script/validate "$@"

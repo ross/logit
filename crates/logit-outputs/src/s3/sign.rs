@@ -9,7 +9,8 @@
 //!   and the canonical request encodes the decoded path the same way.
 //! - **SigV4 header auth.** Every header the sink sends but `Content-Length` and `Authorization`
 //!   is signed, `host` among them; `x-amz-content-sha256` is the body's hex SHA-256, signed as the
-//!   payload hash, and temporary credentials add `x-amz-security-token`.
+//!   payload hash, and temporary credentials add `x-amz-security-token`. The query is signed
+//!   decoded, a parameter with no value as `name=`, while the URL writes it as `?name`.
 
 use logit_aws::creds::Credentials;
 use logit_aws::sigv4::{uri_encode, AmzDate, Request, Signer};
@@ -73,22 +74,36 @@ impl Addressing {
         &self.host
     }
 
-    /// The URL of `key`, and its path decoded, as the canonical request takes it.
-    pub(crate) fn object(&self, key: &str) -> (String, String) {
+    /// The URL of a request on `key` with `query`, decoded pairs, and its path decoded, as the
+    /// canonical request takes it. A pair with an empty value is written as its name alone, as
+    /// `?uploads` is; SigV4 signs it as `uploads=` either way.
+    pub(crate) fn request(&self, key: &str, query: &[(&str, &str)]) -> (String, String) {
         let path = format!("{}/{key}", self.bucket_path);
         let encoded: Vec<String> = path.split('/').map(uri_encode).collect();
-        (format!("{}{}", self.origin, encoded.join("/")), path)
+        let mut url = format!("{}{}", self.origin, encoded.join("/"));
+        for (n, (name, value)) in query.iter().enumerate() {
+            url.push(if n == 0 { '?' } else { '&' });
+            url.push_str(&uri_encode(name));
+            if !value.is_empty() {
+                url.push('=');
+                url.push_str(&uri_encode(value));
+            }
+        }
+        (url, path)
     }
 }
 
-/// The `Authorization` header of a request whose decoded path is `path`, carrying `headers`,
-/// every one of them signed, with a body whose hex SHA-256 is `payload_hash`.
+/// The `Authorization` header of a request whose decoded path is `path` and decoded query is
+/// `query`, carrying `headers`, every one of them signed, with a body whose hex SHA-256 is
+/// `payload_hash`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn authorization(
     credentials: &Credentials,
     region: &str,
     date: &AmzDate,
     method: &str,
     path: &str,
+    query: &[(&str, &str)],
     headers: &[(String, String)],
     payload_hash: &str,
 ) -> String {
@@ -98,8 +113,8 @@ pub(crate) fn authorization(
         region,
         service: "s3",
     };
-    let request =
-        Request { method, path, query: Vec::new(), headers: headers.to_vec(), payload_hash };
+    let query = query.iter().map(|(name, value)| (name.to_string(), value.to_string())).collect();
+    let request = Request { method, path, query, headers: headers.to_vec(), payload_hash };
     let signature = signer.sign(&request, date);
     let mut names: Vec<String> =
         headers.iter().map(|(name, _)| name.to_ascii_lowercase()).collect();
@@ -138,7 +153,7 @@ mod tests {
         let date = AmzDate::from_unix_nanos(1_369_353_600 * 1_000_000_000);
         let addressing =
             Addressing { origin: String::new(), host: String::new(), bucket_path: String::new() };
-        let (url, path) = addressing.object("test$file.text");
+        let (url, path) = addressing.request("test$file.text", &[]);
         assert_eq!((url.as_str(), path.as_str()), ("/test%24file.text", "/test$file.text"));
         let headers: Vec<(String, String)> = [
             ("Host", "examplebucket.s3.amazonaws.com"),
@@ -162,6 +177,7 @@ mod tests {
             &date,
             "PUT",
             &path,
+            &[],
             &headers,
             &payload_hash,
         );
@@ -170,6 +186,40 @@ mod tests {
             "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request,\
              SignedHeaders=date;host;x-amz-content-sha256;x-amz-date;x-amz-storage-class,\
              Signature=98ad721746da40c64f1a55b78f14c238d841ea1380cd77a1b5971af0ece108bd"
+        );
+    }
+
+    /// "Example: GET Bucket Lifecycle" from the same AWS page: a query parameter with no value,
+    /// `?lifecycle`, signed as `lifecycle=`, the form `?uploads` takes.
+    #[test]
+    fn the_authorization_matches_aws_get_bucket_lifecycle_example() {
+        let date = AmzDate::from_unix_nanos(1_369_353_600 * 1_000_000_000);
+        let headers: Vec<(String, String)> = [
+            ("host", "examplebucket.s3.amazonaws.com"),
+            ("x-amz-date", "20130524T000000Z"),
+            (
+                "x-amz-content-sha256",
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
+        let authorization = authorization(
+            &credentials("AKIAIOSFODNN7EXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
+            "us-east-1",
+            &date,
+            "GET",
+            "/",
+            &[("lifecycle", "")],
+            &headers,
+            &headers[2].1,
+        );
+        assert_eq!(
+            authorization,
+            "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request,\
+             SignedHeaders=host;x-amz-content-sha256;x-amz-date,\
+             Signature=fea454ca298b7da1c68078a5d1bdbfbbe0d65c699e0f91ac7a200a0136783543"
         );
     }
 
@@ -220,7 +270,11 @@ mod tests {
         ];
         for (region, endpoint, path_style, url, host, path) in cases {
             let addressing = Addressing::new("b", region, endpoint, path_style).unwrap();
-            assert_eq!(addressing.object("k"), (url.to_string(), path.to_string()), "{endpoint:?}");
+            assert_eq!(
+                addressing.request("k", &[]),
+                (url.to_string(), path.to_string()),
+                "{endpoint:?}"
+            );
             assert_eq!(addressing.host(), host);
         }
         let err = Addressing::new("b", "r", Some("ftp://u:secret@x"), None).unwrap_err();
@@ -231,8 +285,17 @@ mod tests {
     fn a_key_is_encoded_once_per_segment_in_the_url() {
         let addressing =
             Addressing::new("my-bucket", "us-east-1", Some("http://s3:9000"), None).unwrap();
-        let (url, path) = addressing.object("logs/dt=2026-10-30/a b+c~é.ndjson");
+        let (url, path) = addressing.request("logs/dt=2026-10-30/a b+c~é.ndjson", &[]);
         assert_eq!(url, "http://s3:9000/my-bucket/logs/dt%3D2026-10-30/a%20b%2Bc~%C3%A9.ndjson");
         assert_eq!(path, "/my-bucket/logs/dt=2026-10-30/a b+c~é.ndjson");
+    }
+
+    #[test]
+    fn a_query_is_encoded_and_an_empty_value_written_as_its_name() {
+        let addressing = Addressing::new("b", "us-east-1", Some("http://s3:9000"), None).unwrap();
+        assert_eq!(addressing.request("k", &[("uploads", "")]).0, "http://s3:9000/b/k?uploads");
+        let (url, path) = addressing.request("k", &[("partNumber", "3"), ("uploadId", "a/b+c=")]);
+        assert_eq!(url, "http://s3:9000/b/k?partNumber=3&uploadId=a%2Fb%2Bc%3D");
+        assert_eq!(path, "/b/k");
     }
 }

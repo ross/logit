@@ -3349,7 +3349,7 @@ fn stdio_json_encode_100_events() {
 /// was opened and one batch staged before the measurement, so the reused encode buffer and the
 /// body have their capacity; what's left is each compressor's own per-batch cost.
 fn s3_stage(format: ObjectFormat, compression: ObjectCompression) -> Stats {
-    let mut object = StagedObject::new(format, compression);
+    let mut object = StagedObject::new(format, compression, 8 * 1024 * 1024);
     let batch = fixtures::nginx_batch(100);
     object.stage(&batch).expect("should stage");
     let ((), stats) = measure(|| object.stage(&batch).expect("should stage"));
@@ -3385,7 +3385,8 @@ fn s3_stage_json_zstd() {
 /// (108,300 bytes of lines each) stay under the 1 MiB chunk, and the tenth fills it.
 #[test]
 fn s3_stage_json_zstd_filling_a_chunk() {
-    let mut object = StagedObject::new(ObjectFormat::Json, ObjectCompression::Zstd);
+    let mut object =
+        StagedObject::new(ObjectFormat::Json, ObjectCompression::Zstd, 8 * 1024 * 1024);
     let batch = fixtures::nginx_batch(100);
     for _ in 0..9 {
         object.stage(&batch).expect("should stage");
@@ -3405,6 +3406,20 @@ fn s3_stage_json_none() {
         s3_stage(ObjectFormat::Json, ObjectCompression::None),
         0,
     );
+}
+
+/// `format: json`, `compression: none`, the stage that fills a part: 3. Parts of 150,000 bytes
+/// take one 100-event batch's 108,300 bytes of lines, so the second batch fills the first part:
+/// its hash's hex `String`, the first slot of the queue of cut parts, and the next part's buffer
+/// for the rest of the batch. Paid once per `part_size` of compressed body, not per batch.
+#[test]
+fn s3_stage_json_none_filling_a_part() {
+    let mut object = StagedObject::new(ObjectFormat::Json, ObjectCompression::None, 150_000);
+    let batch = fixtures::nginx_batch(100);
+    object.stage(&batch).expect("should stage");
+    let ((), stats) = measure(|| object.stage(&batch).expect("should stage"));
+    assert_eq!(object.cut_parts(), 1, "the second batch fills the first part");
+    expect_allocs("s3_out: stage json+none, filling a part", stats, 3);
 }
 
 /// `format: native`, `compression: gzip`: 2010, `NativeEncoder::encode`'s cost for a

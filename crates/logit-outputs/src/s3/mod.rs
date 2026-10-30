@@ -11,30 +11,43 @@
 //! until the object is stored.
 //!
 //! - **`submit` stages.** The first batch submitted into an empty object opens it and names its
-//!   key; each batch is encoded, compressed, and hashed into the body as it arrives
-//!   ([`StagedObject`]).
+//!   key; each batch is encoded, compressed, and cut into parts as it arrives ([`StagedObject`]),
+//!   and each full part is uploaded before `submit` returns, the first starting the multipart
+//!   upload.
 //! - **Full.** `collecting()` reads `None`, and `window()` reads the batches staged, once the
-//!   staged batches' encoded bytes reach `max_bytes`, the compressed body reaches `part_size`, or
-//!   the object holds the head's pinned batch count. The `window()` bound is what stops the fill
+//!   staged batches' encoded bytes reach `max_bytes` or the object holds the head's pinned batch
+//!   count. The `window()` bound is what stops the fill
 //!   when the head alone fills the object: no collecting window opens then, and the loop's
 //!   ordinary fill would otherwise submit every batch the store holds.
 //! - **`await_ack` on the head completes the object**: it closes the body and sends one
-//!   `PutObject`, and answers the head with the object's outcome. From then until each batch
-//!   behind the head is answered, `window()` reads the answers owed, `collecting()` reads `None`,
-//!   and each later `await_ack` answers `Ok` at once.
-//! - **A fault covers the object.** A failed `PutObject`, or a credential lookup that failed
-//!   before it, returns its fault without `HeadOnly`, so the loop resubmits from the head and
-//!   the object is staged again under the same key.
+//!   `PutObject` when the body is one part and no part went up, else uploads the rest and sends
+//!   `CompleteMultipartUpload`, and answers the head with the object's outcome. From then until
+//!   each batch behind the head is answered, `window()` reads the answers owed, `collecting()`
+//!   reads `None`, and each later `await_ack` answers `Ok` at once.
+//! - **A fault covers the object.** A failed request, or a credential lookup that failed before
+//!   it, returns its fault without `HeadOnly`, so the loop resubmits from the head and the object
+//!   is staged again under the same key, in a new upload.
+//! - **A failed part poisons the object.** A part that fails inside `submit` past the head is
+//!   left unclassified by the loop, which stops the fill and reads the answers owed. The sink
+//!   never completes that upload, and the head's `await_ack` fails with the part's class and
+//!   without `HeadOnly`. At the head, the failure is the head's own, which the loop classifies.
+//! - **An abandoned upload is aborted.** Whenever an object with an upload starts again, or a
+//!   cancelled call left one behind, the sink sends `AbortMultipartUpload` once, bounded by
+//!   `timeout`, and counts it in `logit.output.uploads.abandoned{aborted}`. A failed abort isn't
+//!   retried; the bucket's lifecycle rule removes the parts. One answered `NoSuchUpload` counts
+//!   as aborted: no parts are left.
 //! - **An encode that fails** is the batch's own `Rejected` fault at the head. Past the head the
 //!   failed batch was never staged, so the loop's unclassified stop completes the object without
 //!   it, and the batch fails again at the head of the next object, where it's dropped alone.
-//! - **The shutdown grace.** [`Output::reached_destination`] reads 0 until the `PutObject` is
-//!   sent, so an at-most-once grace cut commits none of an object that never left the process.
+//! - **The shutdown grace.** [`Output::reached_destination`] reads 0 until the `PutObject` or
+//!   `CompleteMultipartUpload` is sent, so an at-most-once grace cut commits none of an object
+//!   that never became visible.
 //!
-//! **One `PutObject` per object.** Multipart upload isn't built yet, so an object closes once its
-//! compressed body reaches `part_size`: an object is at most about `part_size` plus one batch's
-//! compressed bytes, and under `zstd` plus the uncompressed chunk not yet compressed, whatever
-//! `max_bytes` says (`docs/known-gaps/sinks.md`).
+//! **Memory.** Every part but the last is `part_size` bytes, and a part's buffer never grows past
+//! it, so an object holds one part of compressed body, plus the full parts one batch cut before
+//! `submit` uploads them, plus the compressor's state: deflate's window, or the 1 MiB `zstd`
+//! chunk (`docs/design/memory.md`). The staged batches themselves are the store's, bounded by
+//! `buffer.max_bytes`.
 //!
 //! ## The key
 //!
@@ -48,19 +61,27 @@
 //!
 //! ## Requests
 //!
-//! One `PutObject` per object, with a known `Content-Length`, the body's hex SHA-256 in
-//! `x-amz-content-sha256`, signed with SigV4 header auth ([`sign`]'s module doc), and
-//! `Content-Type` `application/gzip`, `application/zstd`, `application/x-ndjson`, or
-//! `application/octet-stream`. No `Content-Encoding`: a client fetching the object would
-//! decompress it in transit and hand on bytes whose name says they're compressed. `storage_class:`
-//! sets `x-amz-storage-class`, and `sse:` sets `x-amz-server-side-encryption` with
-//! `x-amz-server-side-encryption-aws-kms-key-id` and
-//! `x-amz-server-side-encryption-bucket-key-enabled` under `aws_kms`. Redirects are off
-//! ([`crate::http::build_client`]), and every request is bounded by `timeout`.
+//! An object that closes as one part is one `PutObject`. Any other is a multipart upload:
+//! `CreateMultipartUpload` (`POST ?uploads`) once the first part fills, `UploadPart`
+//! (`PUT ?partNumber=N&uploadId=…`) per part, one at a time, and `CompleteMultipartUpload`
+//! (`POST ?uploadId=…`) naming each part's `ETag`; `AbortMultipartUpload` (`DELETE ?uploadId=…`)
+//! gives one up. No request body is over `part_size`. `PutObject` and `UploadPart` carry a known
+//! `Content-Length` and the body's hex SHA-256 in `x-amz-content-sha256`; every request is signed
+//! with SigV4 header auth, its query included ([`sign`]'s module doc). The request that creates
+//! the object, `PutObject` or `CreateMultipartUpload`, carries its `Content-Type`
+//! (`application/gzip`, `application/zstd`, `application/x-ndjson`, or
+//! `application/octet-stream`), `storage_class:` as `x-amz-storage-class`, and `sse:` as
+//! `x-amz-server-side-encryption` with `x-amz-server-side-encryption-aws-kms-key-id` and
+//! `x-amz-server-side-encryption-bucket-key-enabled` under `aws_kms`. No `Content-Encoding`: a
+//! client fetching the object would decompress it in transit and hand on bytes whose name says
+//! they're compressed. Redirects are off ([`crate::http::build_client`]), and every request is
+//! bounded by `timeout`.
 //!
 //! Credentials come from `credentials:`, else `logit_aws::creds::Chain`. An error answer's body
 //! is read bounded, to [`xml::ERROR_BODY_BYTES`], for its `<Code>` and `<Message>`, which the
-//! error quotes with the bucket and the key, never a credential.
+//! error quotes with the bucket and the key, never a credential. `CompleteMultipartUpload` can
+//! answer `200` and then fail, so its body is read whole, up to 64 KiB, before the object counts
+//! as stored: a body cut by a transport error or over the bound is `Ambiguous`.
 //!
 //! **No encode-side counts.** The json and native encoders count nothing, so the sink holds no
 //! `BatchAccounting` gate; every count below is per request or per object.
@@ -73,33 +94,42 @@
 //! runtime drops the head alone, counted `batches.dropped{reason="rejected"}`, and the next
 //! attempt uploads the rest again. This table is canonical; [ADR
 //! `s3-object-archive`](../../../../docs/adr/s3-object-archive.md)'s decision 6 was its first copy.
-//! A row only the multipart path can receive has no test yet: multipart upload isn't built, and
-//! [`classify`] already reads its codes.
+//! Every row applies to every request but where it names one, and the rule below the table
+//! reads an `Ambiguous` row as `Clean` for a request that can't make an object visible.
 //!
 //! | Answer | Class | Why | Source | Evidence |
 //! |---|---|---|---|---|
-//! | `2xx` | delivered | the object is stored | [PutObject] | `a_2xx_delivers_the_object` |
-//! | `200` from `CompleteMultipartUpload` with an `<Error>` body | the class of its `<Code>` below | AWS documents the error-in-`200` case | [CompleteMultipartUpload] | multipart only |
+//! | `2xx`; `CompleteMultipartUpload` `200` with no `<Error>` body | delivered: the object is stored, or the request succeeded | | [PutObject]; [CompleteMultipartUpload] | `a_2xx_delivers_the_object`, `parts_are_part_size_and_each_is_signed_by_its_own_hash` |
+//! | `200` from `CompleteMultipartUpload` with an `<Error>` body | the class of its `<Code>` below, read at the status S3 answers that code with; a code with no row, or none, as `500` | AWS documents the error-in-`200` case | [CompleteMultipartUpload] | `a_200_complete_with_an_error_body_is_not_delivered` |
+//! | `200` from `CompleteMultipartUpload` whose answer is over 64 KiB or cut by a transport error | `Ambiguous` | the object may have been assembled | [CompleteMultipartUpload] | `a_complete_answer_over_64_kib_or_cut_short_is_ambiguous` |
+//! | `200` from `CreateMultipartUpload` with no `<UploadId>`, or from `UploadPart` with no `ETag` | `Clean` | nothing visible was stored; the object starts again | | `a_200_create_with_no_upload_id_or_part_with_no_etag_is_clean` |
 //! | `301` `PermanentRedirect`, `307` `TemporaryRedirect`, any other `3xx` | `Refused` | the wrong region or endpoint: the same answer for every object; the error carries `x-amz-bucket-region` | [S3 errors] | `a_3xx_is_refused_and_names_the_buckets_region` |
 //! | `400` `RequestTimeout`, `IncompleteBody`, `BadDigest`, `XAmzContentSHA256Mismatch` | `Clean` | the body didn't arrive whole, so nothing was stored | [S3 errors]; `XAmzContentSHA256Mismatch` from [MinIO's errors] and [Ceph RGW's errors] | `a_body_that_didnt_arrive_whole_is_clean` |
 //! | `400` `ExpiredToken`, `TokenRefreshRequired` | `Clean`, after `Chain::forget` | the credentials expired; fresh ones will sign the retry | [S3 errors] | `an_expired_token_is_clean_and_forgets_the_chains_credentials` |
-//! | `400` `EntityTooLarge`, `413` | `Refused` | a body is at most about `part_size` plus one batch, a size the configuration sets, so the destination's limit is below it: configuration, not a batch | [S3 errors]; [RFC 9110] | `a_body_too_large_is_refused` |
+//! | `400` `EntityTooLarge`, `413` | `Refused` | every body is at most `part_size`, a size the configuration sets, so the destination's limit is below it: configuration, not a batch | [S3 errors]; [RFC 9110] | `a_body_too_large_is_refused` |
 //! | `400` `InvalidArgument`, `InvalidToken`, `AuthorizationHeaderMalformed`, `InvalidBucketName`, `InvalidEncryptionAlgorithmError`, `InvalidStorageClass`, `KeyTooLongError`, `InvalidRequest`; any `4xx` whose code starts `KMS.` | `Refused` | configuration: the same answer for every object | [S3 errors]; `KMS.*` from [AWS KMS's errors] and [MinIO's errors] | `a_configuration_code_is_refused` |
-//! | `400` `InvalidPart`, `InvalidPartOrder`, `EntityTooSmall` | `Clean` | the sink built a bad upload; nothing is visible yet, so the object starts again | [CompleteMultipartUpload] | multipart only |
+//! | `400` `InvalidPart`, `InvalidPartOrder`, `EntityTooSmall` | `Clean` | the sink built a bad upload; nothing is visible yet, so the object starts again | [CompleteMultipartUpload] | `a_bad_upload_is_clean_and_starts_the_object_again` |
 //! | `401`, `405`, `407`, any code | `Refused` | credentials, a method a proxy or store won't take, or a proxy's credentials: the shared HTTP default ([`crate::http::classify_status`]) | [RFC 9110] | `a_401_405_or_407_is_refused` |
 //! | `403`, any code | `Refused` | credentials or policy | [S3 errors] | `a_403_is_refused` |
 //! | `404` `NoSuchBucket`, and any other `404` | `Refused` | the bucket or endpoint is wrong | [S3 errors] | `a_404_is_refused` |
-//! | `404` `NoSuchUpload` | `Clean` | the upload was aborted underneath the sink; the object starts again | [S3 errors] | multipart only |
+//! | `404` `NoSuchUpload` | `Clean` | the upload was aborted underneath the sink; the object starts again, and the sink sends an abort for the old upload; an abort answered so counts as aborted, since no parts are left | [S3 errors] | `no_such_upload_starts_the_object_again_and_aborts_the_old_upload`, `an_abort_answered_no_such_upload_counts_as_aborted` |
 //! | `408` | `Ambiguous` | the shared default ([ADR `sink-fault-classes`](../../../../docs/adr/sink-fault-classes.md)'s "Amendment: 408 is `Ambiguous`") | [RFC 9110] | `a_408_is_ambiguous` |
 //! | `409` `OperationAborted` | `Clean` | a conflicting operation was in progress; nothing was stored | [S3 errors] | `a_409_operation_aborted_is_clean` |
 //! | `411` `MissingContentLength` | `Refused` | a proxy or store that won't take the request's framing | [S3 errors] | `a_411_is_refused` |
-//! | `429`; any `503` with an S3 XML `<Code>` (`SlowDown`, `ServiceUnavailable`, MinIO's `SlowDownWrite` and `SlowDownRead`) | `Clean` | the store refused the request before processing it; `PutObject` is atomic | [S3 errors]; [MinIO's errors] | `a_429_or_a_503_with_a_code_is_clean` |
+//! | `429`; any `503` with an S3 XML `<Code>` (`SlowDown`, `ServiceUnavailable`, MinIO's `SlowDownWrite` and `SlowDownRead`) | `Clean` | the store refused the request before processing it; `PutObject` and `UploadPart` are atomic | [S3 errors]; [MinIO's errors] | `a_429_or_a_503_with_a_code_is_clean` |
 //! | `503` with no S3 `<Code>` | `Ambiguous` | a load balancer's answer, which says nothing about the store: the shared default | [RFC 9110] | `a_503_with_no_code_is_ambiguous` |
 //! | `500` (`InternalError` or any other code), `502`, `504`, and any other `5xx` | `Ambiguous` | the request may have been applied; a retry rewrites the same key; the shared default | [S3 errors] | `a_5xx_is_ambiguous` |
 //! | `501` `NotImplemented` | `Refused` | the store lacks a feature the sink uses | [S3 errors] | `a_501_is_refused` |
 //! | any other `4xx` | `Rejected` | [ADR `sink-fault-classes`](../../../../docs/adr/sink-fault-classes.md)'s rule for an answer the sink can't attribute | | `any_other_4xx_is_rejected` |
 //! | connect failure; a dial `connect_timeout:` ended | `Clean` | nothing left the process: the shared HTTP driver's default ([`crate::http::classify_reqwest_error`]) | | `a_refused_or_stalled_dial_is_clean` |
 //! | request timeout, or another transport error after the connection opened | `Ambiguous` | the request may have been applied: the shared HTTP driver's default | | `a_request_timeout_is_ambiguous` |
+//!
+//! **Nothing is visible before completion.** An answer the table reads `Ambiguous` to
+//! `CreateMultipartUpload` or `UploadPart`, a timeout or another transport error included, is
+//! `Clean`: no object is visible at the key until `CompleteMultipartUpload` succeeds, so the
+//! request couldn't have stored a batch. Only `PutObject` and `CompleteMultipartUpload` can be
+//! `Ambiguous`, which keeps `at_most_once` from dropping an object that was never stored
+//! (`an_ambiguous_part_is_clean_and_an_ambiguous_complete_stays_ambiguous`).
 //!
 //! `AccessControlListNotSupported` has no row: it answers a request carrying an ACL, and the sink
 //! sends none, so it falls to "any other `4xx`".
@@ -118,15 +148,18 @@
 //! **Retries are the loop's.** Every retryable class restarts the object from its head through
 //! the window protocol, holding no more than the head's pinned count (the "Full" bound above);
 //! the sink retries no request of its own. **Posture:** the default, `at_least_once`, because a
-//! retry rewrites the same key. Under `at_most_once` an `Ambiguous` `PutObject` drops every batch of its object, which may be
-//! stored.
+//! retry rewrites the same key. Under `at_most_once` an `Ambiguous` `PutObject` or
+//! `CompleteMultipartUpload` drops every batch of its object, which may be stored.
 //!
 //! ## Telemetry
 //!
-//! `logit.output.requests{op, class}` per request, `op` `put_object` and `class` the HTTP sinks'
-//! status bucket or `connect_error`/`network_error`; `logit.output.request.duration{op}`;
-//! `logit.output.objects` per object stored; and `logit.output.bytes` per compressed byte sent,
-//! resends included (`docs/design/internal-telemetry.md`). Loss is the runtime's to count.
+//! `logit.output.requests{op, class}` per request, `op` one of `put_object`, `create_upload`,
+//! `upload_part`, `complete_upload`, and `abort_upload`, and `class` the HTTP sinks' status bucket
+//! or `connect_error`/`network_error`; `logit.output.request.duration{op}`;
+//! `logit.output.objects` per object stored; `logit.output.parts` per `UploadPart` request;
+//! `logit.output.bytes` per compressed byte of a `PutObject` or `UploadPart` body sent, resends
+//! included; and `logit.output.uploads.abandoned{aborted}` per upload given up
+//! (`docs/design/internal-telemetry.md`). Loss is the runtime's to count.
 
 mod key;
 mod object;
@@ -136,7 +169,7 @@ mod tests;
 mod xml;
 
 pub use crate::tls::TlsClientSettings;
-pub use object::{FinishedObject, StagedObject};
+pub use object::{Part, StagedObject};
 
 use crate::Output;
 use anyhow::Context;
@@ -146,6 +179,7 @@ use logit_aws::sigv4::AmzDate;
 use logit_core::{Diagnostics, EventBatch, Telemetry};
 use logit_pipeline::{BatchContext, Fault, SeqId};
 use sign::Addressing;
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -244,10 +278,103 @@ enum CredentialSource {
     Chain(Chain),
 }
 
-/// The object being staged: its key and its `max_age` deadline.
+/// The object being staged: its key, its first batch, and its `max_age` deadline.
 struct OpenObject {
     key: String,
+    first: SeqId,
     deadline: tokio::time::Instant,
+}
+
+/// The multipart upload of the open or closing object: its key, its upload id, and the `ETag` of
+/// each part uploaded, in part order.
+struct Upload {
+    key: String,
+    id: String,
+    etags: Vec<String>,
+}
+
+/// A part upload that failed inside `submit` past the head: the head's next `await_ack` fails with
+/// it.
+struct Poison {
+    fault: Fault,
+    text: String,
+}
+
+/// The hex SHA-256 of an empty body.
+const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+/// How much of a `CompleteMultipartUpload` `200` the sink reads for an `<Error>`: S3 may send
+/// whitespace while it assembles the object, ahead of a result of a few hundred bytes.
+const COMPLETE_BODY_BYTES: usize = 64 * 1024;
+
+/// One kind of request the sink sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Op {
+    PutObject,
+    CreateUpload,
+    UploadPart,
+    CompleteUpload,
+    AbortUpload,
+}
+
+impl Op {
+    /// The `op` tag on `logit.output.requests`.
+    fn tag(self) -> &'static str {
+        match self {
+            Op::PutObject => "put_object",
+            Op::CreateUpload => "create_upload",
+            Op::UploadPart => "upload_part",
+            Op::CompleteUpload => "complete_upload",
+            Op::AbortUpload => "abort_upload",
+        }
+    }
+
+    /// The S3 API's name, for an error.
+    fn name(self) -> &'static str {
+        match self {
+            Op::PutObject => "PutObject",
+            Op::CreateUpload => "CreateMultipartUpload",
+            Op::UploadPart => "UploadPart",
+            Op::CompleteUpload => "CompleteMultipartUpload",
+            Op::AbortUpload => "AbortMultipartUpload",
+        }
+    }
+
+    fn method(self) -> reqwest::Method {
+        match self {
+            Op::PutObject | Op::UploadPart => reqwest::Method::PUT,
+            Op::CreateUpload | Op::CompleteUpload => reqwest::Method::POST,
+            Op::AbortUpload => reqwest::Method::DELETE,
+        }
+    }
+
+    /// Whether the request can make an object visible. Nothing is visible at the key before
+    /// `CompleteMultipartUpload` succeeds, so any other request's `Ambiguous` answer is `Clean`.
+    fn can_store(self) -> bool {
+        matches!(self, Op::PutObject | Op::CompleteUpload)
+    }
+
+    /// The class of a failed request whose answer reads `fault`.
+    fn class(self, fault: Fault) -> Fault {
+        if fault == Fault::Ambiguous && !self.can_store() {
+            Fault::Clean
+        } else {
+            fault
+        }
+    }
+}
+
+/// A request that failed: the error, carrying its class, and S3's `<Code>` when the answer named
+/// one.
+struct Failed {
+    error: anyhow::Error,
+    code: Option<String>,
+}
+
+impl From<Failed> for anyhow::Error {
+    fn from(failed: Failed) -> Self {
+        failed.error
+    }
 }
 
 /// The `s3_out` sink.
@@ -259,10 +386,14 @@ pub struct S3Output {
     credentials: CredentialSource,
     object: StagedObject,
     open: Option<OpenObject>,
+    /// The open object's multipart upload, from its first part until it's completed or
+    /// abandoned.
+    upload: Option<Upload>,
+    poisoned: Option<Poison>,
     pin: Option<Pin>,
     /// The answers owed to the batches behind a stored object's head.
     owed: usize,
-    /// The current object's `PutObject` was sent.
+    /// The current object's `PutObject` or `CompleteMultipartUpload` was sent.
     visible: bool,
     /// The last head's time from its object's close to its answer.
     answered: Option<Duration>,
@@ -314,14 +445,17 @@ impl S3Output {
             settings.idle_timeout,
             None,
         );
+        let part_size = usize::try_from(settings.part_size).unwrap_or(usize::MAX);
         Ok(Self {
-            object: StagedObject::new(settings.format, settings.compression),
+            object: StagedObject::new(settings.format, settings.compression, part_size),
             settings,
             addressing,
             client,
             tls: None,
             credentials,
             open: None,
+            upload: None,
+            poisoned: None,
             pin: None,
             owed: 0,
             visible: false,
@@ -392,8 +526,13 @@ impl S3Output {
         self
     }
 
-    /// Opens an object whose first batch is `head`, under the head's pin when it has one.
-    fn open(&mut self, head: SeqId) -> anyhow::Result<()> {
+    /// Opens an object whose first batch is `head`, under the head's pin when it has one. An
+    /// upload a cancelled call left behind is aborted first.
+    async fn open(&mut self, head: SeqId) -> anyhow::Result<()> {
+        self.abandon().await;
+        self.poisoned = None;
+        self.object.reset();
+        self.open = None;
         let now_ms = (self.clock)().div_euclid(1_000_000);
         let pin = match self.pin {
             Some(pin) if pin.head == head => pin,
@@ -410,9 +549,11 @@ impl S3Output {
         )
         .map_err(|err| anyhow::anyhow!("s3_out couldn't format an object key: {err}"))
         .context(Fault::Refused)?;
-        self.object.reset();
-        self.open =
-            Some(OpenObject { key, deadline: tokio::time::Instant::now() + self.settings.max_age });
+        self.open = Some(OpenObject {
+            key,
+            first: head,
+            deadline: tokio::time::Instant::now() + self.settings.max_age,
+        });
         self.owed = 0;
         self.visible = false;
         Ok(())
@@ -423,7 +564,6 @@ impl S3Output {
         let staged = self.object.batches();
         self.pin.is_some_and(|pin| pin.reached(staged))
             || self.object.encoded_bytes() >= self.settings.max_bytes
-            || self.object.compressed_bytes() as u64 >= self.settings.part_size
     }
 
     async fn credentials(&self) -> anyhow::Result<Arc<Credentials>> {
@@ -433,10 +573,12 @@ impl S3Output {
         }
     }
 
-    /// The headers a `PutObject` of a body hashing to `sha256` sends and signs, `host` among
-    /// them.
-    fn put_headers(
+    /// The headers an `op` request whose body hashes to `sha256` sends and signs, `host` among
+    /// them. The object's own headers (its type, storage class, and encryption) go on the request
+    /// that creates it, `PutObject` or `CreateMultipartUpload`.
+    fn headers(
         &self,
+        op: Op,
         credentials: &Credentials,
         date: &AmzDate,
         sha256: &str,
@@ -448,7 +590,6 @@ impl S3Output {
             (ObjectCompression::None, ObjectFormat::Native) => "application/octet-stream",
         };
         let mut headers: Vec<(&str, String)> = vec![
-            ("content-type", content_type.to_string()),
             ("host", self.addressing.host().to_string()),
             ("x-amz-content-sha256", sha256.to_string()),
             ("x-amz-date", date.datetime.clone()),
@@ -456,74 +597,105 @@ impl S3Output {
         if let Some(token) = &credentials.session_token {
             headers.push(("x-amz-security-token", token.clone()));
         }
-        if let Some(class) = &self.settings.storage_class {
-            headers.push(("x-amz-storage-class", class.clone()));
-        }
-        match &self.settings.sse {
-            None => {}
-            Some(Sse::Aes256) => headers.push(("x-amz-server-side-encryption", "AES256".into())),
-            Some(Sse::AwsKms { kms_key_id, bucket_key }) => {
-                headers.push(("x-amz-server-side-encryption", "aws:kms".into()));
-                if let Some(id) = kms_key_id {
-                    headers.push(("x-amz-server-side-encryption-aws-kms-key-id", id.clone()));
+        match op {
+            Op::UploadPart | Op::AbortUpload => {}
+            Op::CompleteUpload => headers.push(("content-type", "application/xml".into())),
+            Op::PutObject | Op::CreateUpload => {
+                headers.push(("content-type", content_type.to_string()));
+                if let Some(class) = &self.settings.storage_class {
+                    headers.push(("x-amz-storage-class", class.clone()));
                 }
-                if let Some(on) = bucket_key {
-                    headers
-                        .push(("x-amz-server-side-encryption-bucket-key-enabled", on.to_string()));
+                match &self.settings.sse {
+                    None => {}
+                    Some(Sse::Aes256) => {
+                        headers.push(("x-amz-server-side-encryption", "AES256".into()))
+                    }
+                    Some(Sse::AwsKms { kms_key_id, bucket_key }) => {
+                        headers.push(("x-amz-server-side-encryption", "aws:kms".into()));
+                        if let Some(id) = kms_key_id {
+                            headers
+                                .push(("x-amz-server-side-encryption-aws-kms-key-id", id.clone()));
+                        }
+                        if let Some(on) = bucket_key {
+                            headers.push((
+                                "x-amz-server-side-encryption-bucket-key-enabled",
+                                on.to_string(),
+                            ));
+                        }
+                    }
                 }
             }
         }
         headers.into_iter().map(|(name, value)| (name.to_string(), value)).collect()
     }
 
-    /// One `PutObject` of `object` at `key`, classified by the module doc's "Response classes".
-    async fn put_object(&mut self, key: &str, object: FinishedObject) -> anyhow::Result<()> {
-        let credentials = self.credentials().await?;
+    /// One `op` request on `key` with `query` and `body`, whose hex SHA-256 is `sha256`. A `2xx`
+    /// answer is returned with the credentials that signed it; any other answer, or a transport
+    /// error, is a [`Failed`] classified by the module doc's "Response classes".
+    async fn request(
+        &mut self,
+        op: Op,
+        key: &str,
+        query: &[(&str, &str)],
+        body: Vec<u8>,
+        sha256: &str,
+    ) -> Result<(reqwest::Response, Arc<Credentials>), Failed> {
+        let credentials = self.credentials().await.map_err(|error| Failed { error, code: None })?;
         let date = AmzDate::from_unix_nanos((self.clock)());
-        let (url, path) = self.addressing.object(key);
-        let headers = self.put_headers(&credentials, &date, &object.sha256);
+        let (url, path) = self.addressing.request(key, query);
+        let headers = self.headers(op, &credentials, &date, sha256);
+        let method = op.method();
         let authorization = sign::authorization(
             &credentials,
             &self.settings.region,
             &date,
-            "PUT",
+            method.as_str(),
             &path,
+            query,
             &headers,
-            &object.sha256,
+            sha256,
         );
         let mut request = self
             .client
-            .put(url)
+            .request(method, url)
             .timeout(self.settings.timeout)
             .header(reqwest::header::AUTHORIZATION, authorization);
         for (name, value) in headers.iter().filter(|(name, _)| name != "host") {
             request = request.header(name.as_str(), value.as_str());
         }
-        let bytes = object.body.len();
-        self.visible = true;
+        let bytes = body.len();
+        if op.can_store() {
+            self.visible = true;
+        }
+        if op == Op::UploadPart {
+            self.telemetry.count("logit.output.parts", 1.0, &[]);
+        }
         let started = std::time::Instant::now();
-        let result = request.body(object.body).send().await;
+        let result = request.body(body).send().await;
         // A failed dial sent nothing.
-        if !result.as_ref().is_err_and(reqwest::Error::is_connect) {
+        if matches!(op, Op::PutObject | Op::UploadPart)
+            && !result.as_ref().is_err_and(reqwest::Error::is_connect)
+        {
             self.telemetry.count("logit.output.bytes", bytes as f64, &[]);
         }
-        let op = [("op", "put_object")];
+        let tag = [("op", op.tag())];
         let response = match result {
             Ok(response) => response,
             Err(err) => {
                 let fault = crate::http::classify_reqwest_error(&err);
-                self.telemetry.timing("logit.output.request.duration", started.elapsed(), &op);
-                self.count_request(crate::http::transport_class(fault));
-                return Err(anyhow::Error::new(err))
-                    .with_context(|| self.failed("PutObject", key))
-                    .context(fault);
+                self.telemetry.timing("logit.output.request.duration", started.elapsed(), &tag);
+                self.count_request(op, crate::http::transport_class(fault));
+                let error = anyhow::Error::new(err)
+                    .context(self.failed(op.name(), key))
+                    .context(op.class(fault));
+                return Err(Failed { error, code: None });
             }
         };
         let status = response.status();
-        self.telemetry.timing("logit.output.request.duration", started.elapsed(), &op);
-        self.count_request(crate::http::status_class(status));
+        self.telemetry.timing("logit.output.request.duration", started.elapsed(), &tag);
+        self.count_request(op, crate::http::status_class(status));
         if status.is_success() {
-            return Ok(());
+            return Ok((response, credentials));
         }
         let region = response
             .headers()
@@ -532,50 +704,203 @@ impl S3Output {
             .map(|region| crate::http::body_snippet(region, 64));
         let body = crate::http::read_body_bytes(response, xml::ERROR_BODY_BYTES).await;
         let code = xml::element(&body, "Code");
-        let fault = classify(status.as_u16(), code.as_deref());
-        if matches!(code.as_deref(), Some("ExpiredToken" | "TokenRefreshRequired")) {
-            if let CredentialSource::Chain(chain) = &self.credentials {
-                chain.forget(&credentials);
-            }
-        }
-        let detail = match &code {
-            Some(code) => {
-                let message = xml::element(&body, "Message").unwrap_or_default();
-                format!(
-                    "{code}: {}",
-                    crate::http::body_snippet(&message, crate::http::ERROR_BODY_SNIPPET_BYTES)
-                )
-            }
-            None => crate::http::body_snippet(
-                &String::from_utf8_lossy(&body),
-                crate::http::ERROR_BODY_SNIPPET_BYTES,
-            ),
-        };
+        let fault = op.class(self.answer_class(status.as_u16(), code.as_deref(), &credentials));
         let redirect = match (status.is_redirection(), region) {
             (true, Some(region)) => {
                 format!(" -- the bucket is in region {region:?}; set 'region' to it")
             }
             _ => String::new(),
         };
-        Err(anyhow::anyhow!("{} ({status}) {detail}{redirect}", self.failed("PutObject", key)))
-            .context(fault)
+        let error = anyhow::anyhow!(
+            "{} ({status}) {}{redirect}",
+            self.failed(op.name(), key),
+            error_detail(&body, code.as_deref())
+        )
+        .context(fault);
+        Err(Failed { error, code })
+    }
+
+    /// The class of an S3 error answer, after dropping the chain's cached credentials when they
+    /// expired, so the retry signs with fresh ones.
+    fn answer_class(
+        &self,
+        status: u16,
+        code: Option<&str>,
+        credentials: &Arc<Credentials>,
+    ) -> Fault {
+        if matches!(code, Some("ExpiredToken" | "TokenRefreshRequired")) {
+            if let CredentialSource::Chain(chain) = &self.credentials {
+                chain.forget(credentials);
+            }
+        }
+        classify(status, code)
+    }
+
+    /// Starts the multipart upload of the object at `key`.
+    async fn create_upload(&mut self, key: &str) -> anyhow::Result<()> {
+        let (response, _) = self
+            .request(Op::CreateUpload, key, &[("uploads", "")], Vec::new(), EMPTY_SHA256)
+            .await?;
+        let body = crate::http::try_read_body_bytes(response, xml::ERROR_BODY_BYTES)
+            .await
+            .map_err(|err| {
+                anyhow::Error::new(err).context(self.failed(Op::CreateUpload.name(), key))
+            })
+            .context(Fault::Clean)?;
+        let id = xml::element(&body, "UploadId").filter(|id| !id.is_empty()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} (200 OK) with no <UploadId>",
+                self.failed(Op::CreateUpload.name(), key)
+            )
+            .context(Fault::Clean)
+        })?;
+        self.upload = Some(Upload { key: key.to_string(), id, etags: Vec::new() });
+        Ok(())
+    }
+
+    /// Uploads `part` as the open upload's next part, starting the upload at `key` first when
+    /// there's none.
+    async fn upload_part(&mut self, key: &str, part: Part) -> anyhow::Result<()> {
+        if self.upload.is_none() {
+            self.create_upload(key).await?;
+        }
+        let upload = self.upload.as_ref().expect("an upload was just started");
+        let (number, id) = ((upload.etags.len() + 1).to_string(), upload.id.clone());
+        let query = [("partNumber", number.as_str()), ("uploadId", id.as_str())];
+        let (response, _) =
+            self.request(Op::UploadPart, key, &query, part.body, &part.sha256).await?;
+        let etag = response
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .filter(|etag| !etag.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                anyhow::anyhow!("{} (200 OK) with no ETag", self.failed(Op::UploadPart.name(), key))
+                    .context(Fault::Clean)
+            })?;
+        if let Some(upload) = &mut self.upload {
+            upload.etags.push(etag);
+        }
+        Ok(())
+    }
+
+    /// Uploads every full part the staged body has cut.
+    async fn upload_cut_parts(&mut self, key: &str) -> anyhow::Result<()> {
+        while let Some(part) = self.object.take_part() {
+            self.upload_part(key, part).await?;
+        }
+        Ok(())
+    }
+
+    /// Stores the closed object at `key` from its `parts`: one `PutObject` for an object that
+    /// cut no part, else the remaining parts and `CompleteMultipartUpload`.
+    async fn store(&mut self, key: &str, mut parts: VecDeque<Part>) -> anyhow::Result<()> {
+        if self.upload.is_none() && parts.len() == 1 {
+            let part = parts.pop_front().expect("one part");
+            self.request(Op::PutObject, key, &[], part.body, &part.sha256).await?;
+            return Ok(());
+        }
+        for part in parts {
+            self.upload_part(key, part).await?;
+        }
+        let upload = self.upload.as_ref().expect("a multipart object has an upload");
+        let id = upload.id.clone();
+        let body = xml::complete_body(&upload.etags);
+        let sha256 = object::hex(ring::digest::digest(&ring::digest::SHA256, &body).as_ref());
+        let op = Op::CompleteUpload;
+        let (response, credentials) =
+            self.request(op, key, &[("uploadId", id.as_str())], body, &sha256).await?;
+        // A `200` is sent before the object is assembled, and the outcome follows in the body.
+        let body = crate::http::try_read_body_bytes(response, COMPLETE_BODY_BYTES + 1)
+            .await
+            .map_err(|err| anyhow::Error::new(err).context(self.failed(op.name(), key)))
+            .context(Fault::Ambiguous)?;
+        if body.len() > COMPLETE_BODY_BYTES {
+            return Err(anyhow::anyhow!(
+                "{} (200 OK) with an answer over {COMPLETE_BODY_BYTES} bytes",
+                self.failed(op.name(), key)
+            ))
+            .context(Fault::Ambiguous);
+        }
+        if xml::has_error(&body) {
+            let code = xml::element(&body, "Code");
+            let status = code_status(code.as_deref().unwrap_or_default());
+            let fault = self.answer_class(status, code.as_deref(), &credentials);
+            return Err(anyhow::anyhow!(
+                "{} (200 OK) {}",
+                self.failed(op.name(), key),
+                error_detail(&body, code.as_deref())
+            ))
+            .context(fault);
+        }
+        self.upload = None;
+        Ok(())
+    }
+
+    /// Aborts the upload the sink is giving up on, once and bounded by `timeout`, and counts it.
+    /// A failed abort isn't retried: the bucket's lifecycle rule removes the parts. An abort
+    /// answered `NoSuchUpload` counts as aborted, since no parts are left.
+    async fn abandon(&mut self) {
+        let Some(upload) = self.upload.take() else {
+            return;
+        };
+        let query = [("uploadId", upload.id.as_str())];
+        let aborted = match self
+            .request(Op::AbortUpload, &upload.key, &query, Vec::new(), EMPTY_SHA256)
+            .await
+        {
+            Ok(_) => true,
+            Err(failed) => failed.code.as_deref() == Some("NoSuchUpload"),
+        };
+        let aborted = if aborted { "true" } else { "false" };
+        self.telemetry.count("logit.output.uploads.abandoned", 1.0, &[("aborted", aborted)]);
     }
 
     fn failed(&self, op: &str, key: &str) -> String {
         format!("S3 {op} of {key:?} to bucket {:?} failed", self.settings.bucket)
     }
 
-    fn count_request(&self, class: &'static str) {
-        self.telemetry.count(
-            "logit.output.requests",
-            1.0,
-            &[("op", "put_object"), ("class", class)],
-        );
+    fn count_request(&self, op: Op, class: &'static str) {
+        self.telemetry.count("logit.output.requests", 1.0, &[("op", op.tag()), ("class", class)]);
+    }
+}
+
+/// An error answer's `<Code>: <Message>`, or a snippet of its body when it names no code.
+fn error_detail(body: &[u8], code: Option<&str>) -> String {
+    match code {
+        Some(code) => {
+            let message = xml::element(body, "Message").unwrap_or_default();
+            format!(
+                "{code}: {}",
+                crate::http::body_snippet(&message, crate::http::ERROR_BODY_SNIPPET_BYTES)
+            )
+        }
+        None => crate::http::body_snippet(
+            &String::from_utf8_lossy(body),
+            crate::http::ERROR_BODY_SNIPPET_BYTES,
+        ),
+    }
+}
+
+/// The status S3 answers `code` with, for an `<Error>` in a `CompleteMultipartUpload` `200`,
+/// which [`classify`] reads by status and code. A code the table doesn't know, or none, reads as
+/// `500` `InternalError`: the request may have been applied.
+fn code_status(code: &str) -> u16 {
+    match code {
+        "SlowDown" | "ServiceUnavailable" | "SlowDownWrite" | "SlowDownRead" => 503,
+        "NoSuchUpload" | "NoSuchBucket" => 404,
+        "OperationAborted" => 409,
+        "AccessDenied" => 403,
+        "NotImplemented" => 501,
+        _ if classify(400, Some(code)) != Fault::Rejected => 400,
+        _ => 500,
     }
 }
 
 /// The class of an S3 error answer: the module doc's "Response classes", by status and the
-/// body's `<Code>`. Every row is here, the multipart rows included.
+/// body's `<Code>`. A request that can't make an object visible reads an `Ambiguous` class as
+/// `Clean` on top of this ([`Op::class`]).
 pub(crate) fn classify(status: u16, code: Option<&str>) -> Fault {
     let code = code.unwrap_or_default();
     if code.starts_with("KMS.") && (400..=499).contains(&status) {
@@ -670,14 +995,41 @@ impl Output for S3Output {
         _ctx: BatchContext,
         seq: SeqId,
     ) -> anyhow::Result<()> {
+        // The loop resubmits the object's first batch only to start the object again, after a
+        // fault or a cancelled call.
+        let restart = self.open.as_ref().is_none_or(|open| open.first == seq);
+        if !restart {
+            if let Some(poison) = &self.poisoned {
+                return Err(anyhow::anyhow!("{}", poison.text)).context(poison.fault);
+            }
+        }
         // A closed object's body was taken, so a submit after a cancelled close opens a new one.
-        if self.open.is_none() || self.object.batches() == 0 {
-            self.open(seq)?;
+        if restart || self.object.batches() == 0 {
+            self.open(seq).await?;
         }
         self.object
             .stage(batch)
             .map_err(|err| anyhow::anyhow!("s3_out couldn't encode a batch: {err}"))
-            .context(Fault::Rejected)
+            .context(Fault::Rejected)?;
+        if self.object.cut_parts() == 0 {
+            return Ok(());
+        }
+        let key = self.open.as_ref().map(|open| open.key.clone()).unwrap_or_default();
+        let Err(err) = self.upload_cut_parts(&key).await else {
+            return Ok(());
+        };
+        // A failed part poisons the object: its upload is never completed. At the head the
+        // failure is the loop's to classify; past it, the loop doesn't, so the head's answer
+        // carries it.
+        self.abandon().await;
+        self.object.reset();
+        if restart {
+            self.open = None;
+        } else {
+            self.poisoned =
+                Some(Poison { fault: logit_pipeline::classify(&err), text: format!("{err:#}") });
+        }
+        Err(err)
     }
 
     async fn await_ack(&mut self) -> anyhow::Result<()> {
@@ -689,6 +1041,11 @@ impl Output for S3Output {
             }
             return Ok(());
         }
+        if let Some(poison) = self.poisoned.take() {
+            self.open = None;
+            self.answered = None;
+            return Err(anyhow::anyhow!("{}", poison.text)).context(poison.fault);
+        }
         let Some(open) = &self.open else {
             return Err(anyhow::anyhow!("s3_out has no object to complete")).context(Fault::Clean);
         };
@@ -698,9 +1055,8 @@ impl Output for S3Output {
         if let Some(pin) = &mut self.pin {
             pin.close_at(staged);
         }
-        let object = self.object.finish();
-        let result = self.put_object(&key, object).await;
-        match result {
+        let parts = self.object.finish();
+        match self.store(&key, parts).await {
             Ok(()) => {
                 self.telemetry.count("logit.output.objects", 1.0, &[]);
                 self.answered = Some(closed_at.elapsed());
@@ -711,6 +1067,7 @@ impl Output for S3Output {
                 Ok(())
             }
             Err(err) => {
+                self.abandon().await;
                 self.open = None;
                 self.answered = None;
                 Err(err)

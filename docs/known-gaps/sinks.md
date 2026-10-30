@@ -16,7 +16,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Retention and compression:** retention is a plain `max_files` count, with no age-based
     eviction. Compression is `format: native`'s `compression: lz4` or nothing: `format: human` and
     `format: json` have no compression option, and nothing compresses already-rotated files after
-    the fact. Both are left to an external tool. A gzipped JSON archive also has no reader
+    the fact. Both are left to an external tool. A gzip or zstd archive replays through `replay_in`
     ([`replay_in`'s gaps](tailing.md#replay_in)).
   - **Format:** `stdio_out` shares `format:` (`human`, ADR `human-render-block-format`; `json`,
     ADR `stream-json-format`; or `native`, ADR `file-output-native-format`) and `message:`. A
@@ -143,16 +143,3 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Not pursued:** resending a write that failed on a reused connection with no byte received,
     as Chromium does, which decision 7 rejects: `reqwest` doesn't say whether a failed request's
     connection was reused.
-
-- **`s3_out` closes an object once its compressed body reaches `part_size`.** Multipart upload
-  isn't built yet, so every object is one `PutObject`, and `max_bytes` above `part_size` never
-  takes effect: an object holds at most about `part_size` (8 MiB by default) plus one batch's
-  compressed bytes, and a busy sink writes more, smaller objects than its `max_bytes` asks for
-  ([ADR `s3-object-archive`](../adr/s3-object-archive.md)'s "Implementation notes (2026-10-30)").
-  - **Workaround:** raise `part_size` for larger objects, but keep it well below 5 GiB: S3 takes
-    at most 5 GB in one `PutObject`, and an object runs past `part_size` by up to one batch, plus
-    1 MiB of uncompressed input under `zstd`. A body over the limit answers `EntityTooLarge`,
-    which holds the sink, and every retry rebuilds the same body. A `part_size` of 4 GiB leaves
-    1 GiB for that batch. One request carries the whole body, so keep `timeout:` long enough to
-    send `part_size` bytes.
-  - **Closes with:** multipart upload ([the plan](../plans/s3-object-archive.md)).

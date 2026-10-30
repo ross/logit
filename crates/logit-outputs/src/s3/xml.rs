@@ -1,8 +1,9 @@
-//! The text of a leaf element in an S3 XML answer, with no XML crate
-//! (`docs/adr/s3-object-archive.md`, decision 5). S3's error body is
+//! The text of a leaf element in an S3 XML answer, and the one request body the sink writes,
+//! with no XML crate (`docs/adr/s3-object-archive.md`, decision 5). S3's error body is
 //! `<Error><Code>…</Code><Message>…</Message>…</Error>`, each field a leaf element with no
 //! attributes, and the sink reads its `<Code>` and `<Message>` over a bounded read
 //! ([`ERROR_BODY_BYTES`]), so a body cut by that bound yields only the fields that ended in it.
+//! `CreateMultipartUpload`'s answer is read the same way for its `<UploadId>`.
 
 /// How much of an error answer's body the sink reads: an S3 error names its `<Code>` first, and
 /// its `<Message>` is a sentence.
@@ -17,6 +18,31 @@ pub(crate) fn element(body: &[u8], tag: &str) -> Option<String> {
     let start = find(body, open.as_bytes())? + open.len();
     let len = find(&body[start..], close.as_bytes())?;
     Some(unescape(&String::from_utf8_lossy(&body[start..start + len])))
+}
+
+/// Whether `body` holds an `<Error>` element, as a `CompleteMultipartUpload` that failed after
+/// its `200` answers. A successful answer's text can't hold one: a key's `<` is escaped.
+pub(crate) fn has_error(body: &[u8]) -> bool {
+    find(body, b"<Error>").is_some()
+}
+
+/// `CompleteMultipartUpload`'s body naming each part's `ETag`, numbered from 1 in order.
+pub(crate) fn complete_body(etags: &[String]) -> Vec<u8> {
+    let mut body = String::from("<CompleteMultipartUpload>");
+    for (n, etag) in etags.iter().enumerate() {
+        body.push_str("<Part><ETag>");
+        body.push_str(&escape(etag));
+        body.push_str("</ETag><PartNumber>");
+        body.push_str(&(n + 1).to_string());
+        body.push_str("</PartNumber></Part>");
+    }
+    body.push_str("</CompleteMultipartUpload>");
+    body.into_bytes()
+}
+
+/// `text` with `&`, `<`, and `>` escaped, for an element's text.
+fn escape(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -91,6 +117,19 @@ mod tests {
             .as_deref(),
             Some(r#"a <b> & "c" AB &bogus; &"#)
         );
+    }
+
+    #[test]
+    fn the_complete_body_names_each_part_in_order() {
+        let body = complete_body(&["\"a1\"".to_string(), "b&<2>".to_string()]);
+        assert_eq!(
+            String::from_utf8(body).unwrap(),
+            "<CompleteMultipartUpload><Part><ETag>\"a1\"</ETag><PartNumber>1</PartNumber></Part>\
+             <Part><ETag>b&amp;&lt;2&gt;</ETag><PartNumber>2</PartNumber></Part>\
+             </CompleteMultipartUpload>"
+        );
+        assert!(has_error(AWS_ERROR));
+        assert!(!has_error(b"<CompleteMultipartUploadResult><Key>a&lt;Error&gt;</Key>"));
     }
 
     #[test]

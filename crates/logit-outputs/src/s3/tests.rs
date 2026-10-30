@@ -1,15 +1,16 @@
 //! `s3_out` against an in-process S3 stand-in: one test per row of the module doc's response
-//! table that a `PutObject` can receive, the key and the head's pin across retries, and objects
-//! read back as `replay_in` reads them.
+//! table, the key and the head's pin across retries, the multipart path's parts, poisoning, and
+//! aborts, and objects read back as `replay_in` reads them.
 
 use super::*;
 use logit_core::{AttrMap, BodyFormat, Event, LogRecord, Resource, Value};
 use logit_pipeline::test_util::{wait_until, TelemetryProbe};
 use logit_pipeline::{classify, SinkQueue, SinkQueueConfig, SinkStore};
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
@@ -51,7 +52,51 @@ enum Answer {
     Hang,
     /// Answers once the test notifies.
     After(Arc<Notify>, Box<Answer>),
+    /// Answers `status`, sends `body`, and drops the connection before the rest of the length it
+    /// announced.
+    Cut {
+        status: u16,
+        body: Vec<u8>,
+    },
 }
+
+/// A response body that sends its bytes, then fails, so the server drops the connection short of
+/// the length it announced. It yields once between the two, which lets the server flush the head
+/// and the bytes before the failure.
+struct CutBody {
+    bytes: Option<bytes::Bytes>,
+    yielded: bool,
+    announced: u64,
+}
+
+impl hyper::body::Body for CutBody {
+    type Data = bytes::Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<bytes::Bytes>, std::io::Error>>> {
+        if let Some(bytes) = self.bytes.take() {
+            return std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(bytes))));
+        }
+        if !self.yielded {
+            self.yielded = true;
+            cx.waker().wake_by_ref();
+            return std::task::Poll::Pending;
+        }
+        std::task::Poll::Ready(Some(Err(std::io::Error::other("the stand-in cut the body"))))
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        hyper::body::SizeHint::with_exact(self.announced)
+    }
+}
+
+type StandinBody = http_body_util::combinators::BoxBody<bytes::Bytes, std::io::Error>;
+
+/// A case's name and the answer it gets.
+type Named = (&'static str, fn() -> Answer);
 
 fn reply(status: u16, body: impl Into<Vec<u8>>) -> Answer {
     Answer::Reply { status, headers: Vec::new(), body: body.into() }
@@ -107,10 +152,23 @@ async fn standin(
                             log.len() - 1
                         };
                         let mut answer = respond(n, &seen);
-                        let (status, headers, body) = loop {
+                        let (status, headers, body): (_, _, StandinBody) = loop {
                             match answer {
                                 Answer::Reply { status, headers, body } => {
-                                    break (status, headers, body)
+                                    let body = http_body_util::Full::new(bytes::Bytes::from(body))
+                                        .map_err(|never| match never {})
+                                        .boxed();
+                                    break (status, headers, body);
+                                }
+                                Answer::Cut { status, body } => {
+                                    let announced = 2 * body.len() as u64 + 1;
+                                    let body = CutBody {
+                                        bytes: Some(body.into()),
+                                        yielded: false,
+                                        announced,
+                                    };
+                                    let body = body.boxed();
+                                    break (status, Vec::new(), body);
                                 }
                                 Answer::Hang => std::future::pending().await,
                                 Answer::After(notify, then) => {
@@ -123,11 +181,7 @@ async fn standin(
                         for (name, value) in headers {
                             response = response.header(name, value);
                         }
-                        Ok::<_, std::convert::Infallible>(
-                            response
-                                .body(http_body_util::Full::new(bytes::Bytes::from(body)))
-                                .unwrap(),
-                        )
+                        Ok::<_, std::convert::Infallible>(response.body(body).unwrap())
                     }
                 });
                 let _ = hyper::server::conn::http1::Builder::new()
@@ -275,6 +329,135 @@ fn names(n: usize) -> Vec<String> {
     (1..=n).map(|i| format!("m{i}")).collect()
 }
 
+/// The `format: json` bytes of `batch(message)`.
+fn line_len(message: &str) -> u64 {
+    let mut out = String::new();
+    crate::ndjson::render_ndjson(&mut out, &batch(message));
+    out.len() as u64
+}
+
+/// The multipart stand-in's settings: no compression, so part boundaries are byte counts, and
+/// parts of 32 bytes, so every batch cuts at least one.
+fn multipart(addr: SocketAddr) -> S3Settings {
+    let mut settings = settings(addr);
+    settings.compression = ObjectCompression::None;
+    settings.part_size = PART;
+    settings
+}
+
+const PART: u64 = 32;
+
+/// Which S3 operation `seen` is.
+fn op_of(seen: &Seen) -> &'static str {
+    match (seen.method.as_str(), param(seen, "uploads").is_some(), param(seen, "partNumber")) {
+        ("DELETE", ..) => "abort",
+        ("POST", true, _) => "create",
+        ("POST", false, _) => "complete",
+        ("PUT", _, Some(_)) => "part",
+        _ => "put",
+    }
+}
+
+/// The value of `name` in `seen`'s query, `Some("")` when it has none.
+fn param(seen: &Seen, name: &str) -> Option<String> {
+    let (_, query) = seen.path.split_once('?')?;
+    query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        (key == name).then(|| value.to_string())
+    })
+}
+
+/// `seen`'s path without its query: the bucket and the key.
+fn key_path(seen: &Seen) -> String {
+    seen.path.split_once('?').map_or(seen.path.as_str(), |(path, _)| path).to_string()
+}
+
+/// A working S3 store: it answers every request as S3 does and keeps what it stores, by path.
+#[derive(Default)]
+struct Model {
+    uploads: AtomicUsize,
+    /// Each upload's parts by number.
+    parts: Mutex<HashMap<String, BTreeMap<u32, Vec<u8>>>>,
+    objects: Mutex<HashMap<String, Vec<u8>>>,
+}
+
+impl Model {
+    fn answer(&self, seen: &Seen) -> Answer {
+        let upload = param(seen, "uploadId").unwrap_or_default();
+        match op_of(seen) {
+            "create" => {
+                let id = format!("upload-{}", self.uploads.fetch_add(1, Ordering::SeqCst));
+                self.parts.lock().unwrap().insert(id.clone(), BTreeMap::new());
+                reply(
+                    200,
+                    format!(
+                        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<InitiateMultipartUploadResult>\
+                         <Bucket>bucket</Bucket><Key>k</Key><UploadId>{id}</UploadId>\
+                         </InitiateMultipartUploadResult>"
+                    ),
+                )
+            }
+            "part" => {
+                let number: u32 = param(seen, "partNumber").unwrap().parse().unwrap();
+                let mut parts = self.parts.lock().unwrap();
+                let Some(upload_parts) = parts.get_mut(&upload) else {
+                    return reply(404, s3_error("NoSuchUpload"));
+                };
+                upload_parts.insert(number, seen.body.clone());
+                Answer::Reply {
+                    status: 200,
+                    headers: vec![("etag", format!("\"{upload}-{number}\""))],
+                    body: Vec::new(),
+                }
+            }
+            "complete" => match self.assembled(&upload) {
+                Some(body) => {
+                    self.objects.lock().unwrap().insert(key_path(seen), body);
+                    self.parts.lock().unwrap().remove(&upload);
+                    reply(
+                        200,
+                        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                         <CompleteMultipartUploadResult><Key>k</Key><ETag>\"x-2\"</ETag>\
+                         </CompleteMultipartUploadResult>",
+                    )
+                }
+                None => reply(404, s3_error("NoSuchUpload")),
+            },
+            "abort" => match self.parts.lock().unwrap().remove(&upload) {
+                Some(_) => reply(204, Vec::new()),
+                None => reply(404, s3_error("NoSuchUpload")),
+            },
+            _ => {
+                self.objects.lock().unwrap().insert(key_path(seen), seen.body.clone());
+                ok()
+            }
+        }
+    }
+
+    /// `upload`'s parts in number order, or `None` for an upload it doesn't hold.
+    fn assembled(&self, upload: &str) -> Option<Vec<u8>> {
+        let parts = self.parts.lock().unwrap();
+        Some(parts.get(upload)?.values().flatten().copied().collect())
+    }
+
+    /// The messages of every stored object, by key, read as uncompressed JSON lines.
+    fn stored(&self) -> BTreeMap<String, Vec<String>> {
+        let objects = self.objects.lock().unwrap();
+        objects.iter().map(|(key, body)| (key.clone(), json_messages(body))).collect()
+    }
+}
+
+/// A stand-in that answers as `model` does.
+async fn model_standin(model: &Arc<Model>) -> (SocketAddr, SeenLog) {
+    let model = Arc::clone(model);
+    standin(move |_, seen| model.answer(seen)).await
+}
+
+/// The operations of every request `log` holds, in order.
+fn ops(log: &SeenLog) -> Vec<&'static str> {
+    seen(log).iter().map(op_of).collect()
+}
+
 // ---------------------------------------------------------------------------------------------
 // Response classes, one test per row (the module doc's table)
 // ---------------------------------------------------------------------------------------------
@@ -323,6 +506,7 @@ async fn a_2xx_delivers_the_object() {
         &date,
         "PUT",
         &format!("/bucket/{key}"),
+        &[],
         &signed,
         &hash,
     );
@@ -574,34 +758,18 @@ async fn a_request_timeout_is_ambiguous() {
     );
 }
 
-/// The rows only the multipart path can receive, through the classifier its requests will use.
-#[test]
-fn the_multipart_rows_classify_as_the_table_says() {
-    for code in ["InvalidPart", "InvalidPartOrder", "EntityTooSmall"] {
-        assert_eq!(classify_answer(400, code), Fault::Clean, "{code}");
-    }
-    assert_eq!(classify_answer(404, "NoSuchUpload"), Fault::Clean);
-}
-
-fn classify_answer(status: u16, code: &str) -> Fault {
-    super::classify(status, Some(code))
-}
-
 // ---------------------------------------------------------------------------------------------
 // The window, the key, and the pin
 // ---------------------------------------------------------------------------------------------
 
-/// The object closes once its encoded bytes reach `max_bytes`, and, while multipart upload isn't
-/// built, once its compressed body reaches `part_size`.
+/// The object closes once its encoded bytes reach `max_bytes`; a compressed body past
+/// `part_size` cuts parts and leaves it open.
 #[tokio::test]
-async fn an_object_is_full_at_max_bytes_or_at_part_size() {
-    let (addr, _log) = standin(|_, _| ok()).await;
+async fn an_object_is_full_at_max_bytes_not_at_part_size() {
+    let model = Arc::new(Model::default());
+    let (addr, _log) = model_standin(&model).await;
+    let one = line_len("m1");
     let mut settings = settings(addr);
-    let one = {
-        let mut out = String::new();
-        crate::ndjson::render_ndjson(&mut out, &batch("m1"));
-        out.len() as u64
-    };
     settings.max_bytes = 2 * one;
     let mut out = sink_with(settings, &TelemetryProbe::new());
     out.submit(&batch("m1"), BatchContext::default(), seq(1)).await.unwrap();
@@ -609,14 +777,12 @@ async fn an_object_is_full_at_max_bytes_or_at_part_size() {
     out.submit(&batch("m2"), BatchContext::default(), seq(2)).await.unwrap();
     assert_eq!(out.collecting(), None, "max_bytes reached");
 
-    let mut settings = self::settings(addr);
-    settings.compression = ObjectCompression::None;
-    settings.part_size = 2 * one;
+    let mut settings = multipart(addr);
+    settings.part_size = one;
     let mut out = sink_with(settings, &TelemetryProbe::new());
     out.submit(&batch("m1"), BatchContext::default(), seq(1)).await.unwrap();
-    assert!(out.collecting().is_some());
     out.submit(&batch("m2"), BatchContext::default(), seq(2)).await.unwrap();
-    assert_eq!(out.collecting(), None, "part_size reached");
+    assert!(out.collecting().is_some(), "two parts cut, and the object still collects");
 }
 
 /// A retry of the head writes the same key, keeps its `object_time` though the clock moved, and
@@ -897,4 +1063,644 @@ async fn storage_class_sse_and_a_session_token_are_sent_and_signed() {
     let headers = &seen(&log)[0].headers;
     assert_eq!(headers["x-amz-server-side-encryption"], "AES256");
     assert!(!headers.contains_key("x-amz-server-side-encryption-aws-kms-key-id"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Multipart
+// ---------------------------------------------------------------------------------------------
+
+/// An object past `part_size` goes up as a multipart upload: `CreateMultipartUpload` once the
+/// first part fills, an `UploadPart` per full part inside `submit`, the last part and
+/// `CompleteMultipartUpload` from the head's `await_ack`. Every part but the last is `part_size`
+/// bytes, and each is signed with its own body's hash.
+#[tokio::test]
+async fn parts_are_part_size_and_each_is_signed_by_its_own_hash() {
+    let model = Arc::new(Model::default());
+    let (addr, log) = model_standin(&model).await;
+    let mut probe = TelemetryProbe::new();
+    let mut settings = multipart(addr);
+    settings.storage_class = Some("STANDARD_IA".to_string());
+    let mut out = sink_with(settings, &probe);
+    let batches: Vec<EventBatch> = names(5).iter().map(|m| batch(m)).collect();
+    out.submit(&batches[0], BatchContext::default(), seq(1)).await.unwrap();
+    assert_eq!(ops(&log)[..2], ["create", "part"], "the head's submit cut a part");
+    for (n, batch) in (2..).zip(&batches[1..]) {
+        out.submit(batch, BatchContext::default(), seq(n)).await.unwrap();
+    }
+    let before_close = seen(&log).len();
+    assert_eq!(out.reached_destination(5), 0, "no part makes the object visible");
+    out.await_ack().await.unwrap();
+
+    let requests = seen(&log);
+    let parts: Vec<&Seen> = requests.iter().filter(|r| op_of(r) == "part").collect();
+    let total: u64 = (1..=5).map(|n| line_len(&format!("m{n}"))).sum();
+    assert_eq!(parts.len() as u64, total.div_ceil(PART));
+    for (n, part) in parts.iter().enumerate() {
+        let size = part.body.len() as u64;
+        if n + 1 < parts.len() {
+            assert_eq!(size, PART, "part {} is part_size", n + 1);
+        } else {
+            assert!(0 < size && size <= PART, "the last part is {size} bytes");
+        }
+        assert_eq!(param(part, "partNumber").unwrap(), (n + 1).to_string());
+        assert_eq!(param(part, "uploadId").unwrap(), "upload-0");
+        let hash = object::hex(ring::digest::digest(&ring::digest::SHA256, &part.body).as_ref());
+        assert_eq!(part.headers["x-amz-content-sha256"], hash);
+        assert_eq!(part.headers["content-length"], part.body.len().to_string());
+        assert!(!part.headers.contains_key("content-type"));
+        assert!(!part.headers.contains_key("x-amz-storage-class"));
+    }
+    assert!(requests[..before_close].iter().filter(|r| op_of(r) == "part").count() >= 4);
+    assert_eq!(ops(&log).iter().filter(|op| **op == "create").count(), 1);
+    assert_eq!(*ops(&log).last().unwrap(), "complete");
+    assert_eq!(out.reached_destination(5), 5);
+
+    // The object's own headers go on `CreateMultipartUpload`, signed with its query.
+    let create = &requests[0];
+    assert_eq!(create.method, "POST");
+    assert!(create.path.ends_with(".ndjson?uploads"), "{}", create.path);
+    assert_eq!(create.headers["content-type"], "application/x-ndjson");
+    assert_eq!(create.headers["x-amz-storage-class"], "STANDARD_IA");
+    let signed: Vec<(String, String)> =
+        ["content-type", "host", "x-amz-content-sha256", "x-amz-date", "x-amz-storage-class"]
+            .iter()
+            .map(|name| (name.to_string(), create.headers[*name].clone()))
+            .collect();
+    let path = key_path(create).replace("%3D", "=");
+    let expected = sign::authorization(
+        &out.credentials().await.unwrap(),
+        "us-east-1",
+        &AmzDate::from_unix_nanos(T0),
+        "POST",
+        &path,
+        &[("uploads", "")],
+        &signed,
+        EMPTY_SHA256,
+    );
+    assert_eq!(create.headers["authorization"], expected);
+
+    // `CompleteMultipartUpload` names each part's ETag in order.
+    let complete = requests.last().unwrap();
+    let body = String::from_utf8(complete.body.clone()).unwrap();
+    for n in 1..=parts.len() {
+        assert!(
+            body.contains(&format!("<ETag>\"upload-0-{n}\"</ETag><PartNumber>{n}</PartNumber>"))
+        );
+    }
+    let hash = object::hex(ring::digest::digest(&ring::digest::SHA256, &complete.body).as_ref());
+    assert_eq!(complete.headers["x-amz-content-sha256"], hash);
+
+    let stored = model.stored();
+    assert_eq!(stored.into_values().collect::<Vec<_>>(), [names(5)]);
+    let totals = probe.poll();
+    assert_eq!(totals.sum("logit.output.parts", &[]), parts.len() as f64);
+    for (op, count) in [("create_upload", 1.0), ("upload_part", parts.len() as f64)] {
+        assert_eq!(
+            totals.sum("logit.output.requests", &[("op", op), ("class", "2xx")]),
+            count,
+            "{op}"
+        );
+    }
+    assert_eq!(
+        totals.sum("logit.output.requests", &[("op", "complete_upload"), ("class", "2xx")]),
+        1.0
+    );
+    assert_eq!(totals.sum("logit.output.objects", &[]), 1.0);
+    assert_eq!(totals.sum("logit.output.bytes", &[]), total as f64);
+}
+
+/// A gzip object cut into parts reads back whole once its parts are joined, and a zstd one too.
+#[tokio::test]
+async fn a_compressed_object_cut_into_parts_reads_back_whole() {
+    for compression in [ObjectCompression::Gzip, ObjectCompression::Zstd] {
+        let model = Arc::new(Model::default());
+        let (addr, log) = model_standin(&model).await;
+        let mut settings = multipart(addr);
+        settings.compression = compression;
+        let mut out = sink_with(settings, &TelemetryProbe::new());
+        let messages: Vec<String> = (0..200).map(|n| format!("message {n} {}", n * 7919)).collect();
+        let batches: Vec<EventBatch> = messages.iter().map(|m| batch(m)).collect();
+        put(&mut out, 1, &batches).await.unwrap();
+        assert!(ops(&log).iter().filter(|op| **op == "part").count() > 2, "{compression:?}");
+        let objects = model.objects.lock().unwrap();
+        let body = objects.values().next().unwrap();
+        let raw = match compression {
+            ObjectCompression::Gzip => gunzip(body),
+            _ => unzstd(body),
+        };
+        assert_eq!(json_messages(&raw), messages, "{compression:?}");
+    }
+}
+
+/// What the close leaves decides the request: one part is one `PutObject`, and a close that cut
+/// a second part, though staging cut none, is a multipart upload, so no request body is over
+/// `part_size`. Under `zstd`, two small batches stay in the uncompressed chunk until the close.
+#[tokio::test]
+async fn no_request_body_is_over_part_size() {
+    for (part_size, want) in [(64, "create"), (4096, "put")] {
+        let model = Arc::new(Model::default());
+        let (addr, log) = model_standin(&model).await;
+        let mut settings = multipart(addr);
+        settings.compression = ObjectCompression::Zstd;
+        settings.part_size = part_size;
+        let mut out = sink_with(settings, &TelemetryProbe::new());
+        out.submit(&batch("m1"), BatchContext::default(), seq(1)).await.unwrap();
+        out.submit(&batch("m2"), BatchContext::default(), seq(2)).await.unwrap();
+        assert!(seen(&log).is_empty(), "staging cut no part");
+        out.await_ack().await.unwrap();
+        assert_eq!(ops(&log)[0], want, "{part_size}: {:?}", ops(&log));
+        for request in seen(&log).iter().filter(|r| matches!(op_of(r), "put" | "part")) {
+            assert!(request.body.len() as u64 <= part_size, "{part_size}: {}", request.path);
+        }
+        let objects = model.objects.lock().unwrap();
+        assert_eq!(json_messages(&unzstd(objects.values().next().unwrap())), names(2));
+    }
+}
+
+/// A `200` `CompleteMultipartUpload` whose body is an `<Error>` isn't delivered: it takes its
+/// code's class, the upload is aborted, and no object is counted.
+#[tokio::test]
+async fn a_200_complete_with_an_error_body_is_not_delivered() {
+    for (code, want) in [
+        ("InternalError", Fault::Ambiguous),
+        ("SlowDown", Fault::Clean),
+        ("NoSuchUpload", Fault::Clean),
+        ("AccessDenied", Fault::Refused),
+        ("SomethingNew", Fault::Ambiguous),
+    ] {
+        let model = Arc::new(Model::default());
+        let answers = Arc::clone(&model);
+        let (addr, log) = standin(move |_, seen| match op_of(seen) {
+            "complete" => reply(200, s3_error(code)),
+            _ => answers.answer(seen),
+        })
+        .await;
+        let mut probe = TelemetryProbe::new();
+        let mut out = sink_with(multipart(addr), &probe);
+        let err = put(&mut out, 1, &[batch("m1"), batch("m2")]).await.unwrap_err();
+        assert_eq!(classify(&err), want, "{code}: {err:#}");
+        assert!(!logit_pipeline::is_head_only(&err));
+        assert!(
+            format!("{err:#}").contains(&format!("(200 OK) {code}: the store says")),
+            "{err:#}"
+        );
+        assert_eq!(*ops(&log).last().unwrap(), "abort", "{code}");
+        assert!(model.stored().is_empty());
+        let totals = probe.poll();
+        assert_eq!(totals.sum("logit.output.objects", &[]), 0.0, "{code}");
+        assert_eq!(
+            totals.sum("logit.output.uploads.abandoned", &[("aborted", "true")]),
+            1.0,
+            "{code}"
+        );
+    }
+}
+
+/// `NoSuchUpload` starts the object again in a new upload, and the old upload is aborted.
+#[tokio::test]
+async fn no_such_upload_starts_the_object_again_and_aborts_the_old_upload() {
+    let model = Arc::new(Model::default());
+    let answers = Arc::clone(&model);
+    let failed = Arc::new(AtomicUsize::new(0));
+    let fail = Arc::clone(&failed);
+    let (addr, log) = standin(move |_, seen| {
+        // The second part of the first upload finds the upload gone.
+        if op_of(seen) == "part"
+            && param(seen, "partNumber").as_deref() == Some("2")
+            && fail.fetch_add(1, Ordering::SeqCst) == 0
+        {
+            return reply(404, s3_error("NoSuchUpload"));
+        }
+        answers.answer(seen)
+    })
+    .await;
+    let mut probe = TelemetryProbe::new();
+    let mut out = sink_with(multipart(addr), &probe);
+    let err = put(&mut out, 1, &[batch("m1")]).await.unwrap_err();
+    assert_eq!(classify(&err), Fault::Clean, "{err:#}");
+    assert!(format!("{err:#}").contains("NoSuchUpload"), "{err:#}");
+    let aborts: Vec<Seen> = seen(&log).into_iter().filter(|r| op_of(r) == "abort").collect();
+    assert_eq!(aborts.len(), 1);
+    assert_eq!(param(&aborts[0], "uploadId").as_deref(), Some("upload-0"));
+
+    put(&mut out, 1, &[batch("m1")]).await.unwrap();
+    let completes: Vec<Seen> = seen(&log).into_iter().filter(|r| op_of(r) == "complete").collect();
+    assert_eq!(completes.len(), 1);
+    assert_eq!(param(&completes[0], "uploadId").as_deref(), Some("upload-1"), "a new upload");
+    assert_eq!(model.stored().into_values().collect::<Vec<_>>(), [names(1)]);
+    let totals = probe.poll();
+    assert_eq!(
+        totals.sum("logit.output.requests", &[("op", "upload_part"), ("class", "4xx")]),
+        1.0
+    );
+    assert_eq!(
+        totals.sum("logit.output.requests", &[("op", "abort_upload"), ("class", "2xx")]),
+        1.0
+    );
+}
+
+/// `InvalidPart`, `InvalidPartOrder`, and `EntityTooSmall` mean the sink built a bad upload:
+/// `Clean`, the upload aborted, and the object starts again.
+#[tokio::test]
+async fn a_bad_upload_is_clean_and_starts_the_object_again() {
+    for code in ["InvalidPart", "InvalidPartOrder", "EntityTooSmall"] {
+        let model = Arc::new(Model::default());
+        let answers = Arc::clone(&model);
+        let (addr, log) = standin(move |_, seen| {
+            if op_of(seen) == "complete" && param(seen, "uploadId").as_deref() == Some("upload-0") {
+                return reply(400, s3_error(code));
+            }
+            answers.answer(seen)
+        })
+        .await;
+        let mut out = sink_with(multipart(addr), &TelemetryProbe::new());
+        let err = put(&mut out, 1, &[batch("m1")]).await.unwrap_err();
+        assert_eq!(classify(&err), Fault::Clean, "{code}: {err:#}");
+        assert_eq!(*ops(&log).last().unwrap(), "abort", "{code}");
+        put(&mut out, 1, &[batch("m1")]).await.unwrap();
+        assert_eq!(model.stored().into_values().collect::<Vec<_>>(), [names(1)], "{code}");
+    }
+}
+
+/// An answer the table reads `Ambiguous` to `CreateMultipartUpload` or `UploadPart`, a timeout
+/// included, is `Clean`: nothing is visible before completion. `CompleteMultipartUpload`'s stays
+/// `Ambiguous`, and any other class passes through.
+#[tokio::test]
+async fn an_ambiguous_part_is_clean_and_an_ambiguous_complete_stays_ambiguous() {
+    type Case = (&'static str, fn() -> Answer, Fault);
+    let cases: [Case; 9] = [
+        ("create", || reply(500, s3_error("InternalError")), Fault::Clean),
+        ("create", || reply(503, "<html>busy</html>"), Fault::Clean),
+        ("part", || reply(500, s3_error("InternalError")), Fault::Clean),
+        ("part", || reply(408, ""), Fault::Clean),
+        ("part", || Answer::Hang, Fault::Clean),
+        ("part", || reply(403, s3_error("AccessDenied")), Fault::Refused),
+        ("complete", || reply(500, s3_error("InternalError")), Fault::Ambiguous),
+        ("complete", || reply(502, ""), Fault::Ambiguous),
+        ("complete", || Answer::Hang, Fault::Ambiguous),
+    ];
+    for (op, answer, want) in cases {
+        let model = Arc::new(Model::default());
+        let answers = Arc::clone(&model);
+        let (addr, _log) =
+            standin(move |_, seen| if op_of(seen) == op { answer() } else { answers.answer(seen) })
+                .await;
+        let mut settings = multipart(addr);
+        settings.timeout = Duration::from_millis(200);
+        let mut out = sink_with(settings, &TelemetryProbe::new());
+        let err = put(&mut out, 1, &[batch("m1")]).await.unwrap_err();
+        assert_eq!(classify(&err), want, "{op}: {err:#}");
+        assert_eq!(
+            out.reached_destination(1),
+            usize::from(op == "complete"),
+            "{op}: only a Complete makes the object visible"
+        );
+    }
+}
+
+/// A part that fails inside `submit` past the head poisons the object: the `submit` fails, the
+/// upload is aborted once and never completed, and the head's `await_ack` fails with the part's
+/// class and without `HeadOnly`, so the loop starts the object again from the head.
+#[tokio::test]
+async fn a_part_failure_past_the_head_fails_the_heads_answer() {
+    let model = Arc::new(Model::default());
+    let answers = Arc::clone(&model);
+    // The head's own parts go up; the next batch's first part is refused.
+    let head_parts = (line_len("m1") / PART) as usize;
+    let refused = (head_parts + 1).to_string();
+    let (addr, log) = standin(move |_, seen| {
+        if op_of(seen) == "part" && param(seen, "partNumber") == Some(refused.clone()) {
+            return reply(403, s3_error("AccessDenied"));
+        }
+        answers.answer(seen)
+    })
+    .await;
+    let mut want = vec!["create"];
+    want.extend(std::iter::repeat_n("part", head_parts + 1));
+    want.push("abort");
+    let mut probe = TelemetryProbe::new();
+    let mut out = sink_with(multipart(addr), &probe);
+    out.submit(&batch("m1"), BatchContext::default(), seq(1)).await.unwrap();
+    out.submit(&batch("m2"), BatchContext::default(), seq(2)).await.unwrap_err();
+    assert_eq!(ops(&log), want);
+    assert_eq!(out.window(), usize::MAX);
+    assert_eq!(out.collecting(), None);
+    assert_eq!(out.reached_destination(1), 0);
+    let err = out.await_ack().await.unwrap_err();
+    assert_eq!(classify(&err), Fault::Refused, "{err:#}");
+    assert!(!logit_pipeline::is_head_only(&err));
+    assert!(format!("{err:#}").contains("AccessDenied"), "{err:#}");
+    assert_eq!(ops(&log), want, "never completed");
+    let totals = probe.poll();
+    assert_eq!(totals.sum("logit.output.uploads.abandoned", &[("aborted", "true")]), 1.0);
+}
+
+/// A part that fails inside the head's own `submit` is the head's fault, which the loop
+/// classifies: the upload is aborted, and the head's next `submit` starts a new one.
+#[tokio::test]
+async fn a_part_failure_at_the_head_is_the_heads_own() {
+    let model = Arc::new(Model::default());
+    let answers = Arc::clone(&model);
+    let failed = Arc::new(AtomicUsize::new(0));
+    let fail = Arc::clone(&failed);
+    let (addr, log) = standin(move |_, seen| {
+        if op_of(seen) == "part" && fail.fetch_add(1, Ordering::SeqCst) == 0 {
+            return reply(503, s3_error("SlowDown"));
+        }
+        answers.answer(seen)
+    })
+    .await;
+    let mut out = sink_with(multipart(addr), &TelemetryProbe::new());
+    let err = out.submit(&batch("m1"), BatchContext::default(), seq(1)).await.unwrap_err();
+    assert_eq!(classify(&err), Fault::Clean, "{err:#}");
+    assert_eq!(ops(&log), ["create", "part", "abort"]);
+    put(&mut out, 1, &[batch("m1")]).await.unwrap();
+    assert_eq!(model.stored().into_values().collect::<Vec<_>>(), [names(1)]);
+    let completes: Vec<Seen> = seen(&log).into_iter().filter(|r| op_of(r) == "complete").collect();
+    assert_eq!(param(&completes[0], "uploadId").as_deref(), Some("upload-1"));
+
+    // A `Rejected` part at the head drops the head, and the next batch opens its own object.
+    let model = Arc::new(Model::default());
+    let answers = Arc::clone(&model);
+    let (addr, _log) = standin(move |_, seen| {
+        if op_of(seen) == "part" && param(seen, "uploadId").as_deref() == Some("upload-0") {
+            return reply(400, s3_error("SomethingNew"));
+        }
+        answers.answer(seen)
+    })
+    .await;
+    let mut out = sink_with(multipart(addr), &TelemetryProbe::new());
+    let err = out.submit(&batch("m1"), BatchContext::default(), seq(1)).await.unwrap_err();
+    assert_eq!(classify(&err), Fault::Rejected, "{err:#}");
+    put(&mut out, 2, &[batch("m2")]).await.unwrap();
+    assert_eq!(model.stored().into_values().collect::<Vec<_>>(), [["m2"]]);
+}
+
+/// Through the write loop: a part that fails past the head is never completed, its upload is
+/// aborted once, and every batch is stored, once, by the object the loop starts again from the
+/// head.
+#[tokio::test]
+async fn a_poisoned_object_starts_again_from_the_head_in_a_new_upload() {
+    let model = Arc::new(Model::default());
+    let answers = Arc::clone(&model);
+    let parts = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&parts);
+    // The first part request after the head's own parts is the second batch's: past the head.
+    let head_parts = (line_len("m1") / PART) as usize;
+    let (addr, log) = standin(move |_, seen| {
+        if op_of(seen) == "part" && counted.fetch_add(1, Ordering::SeqCst) == head_parts {
+            return reply(500, s3_error("InternalError"));
+        }
+        answers.answer(seen)
+    })
+    .await;
+    let mut settings = multipart(addr);
+    settings.max_age = Duration::from_millis(100);
+    let mut probe = TelemetryProbe::new();
+    let telemetry = probe.telemetry("out", "s3_out", "sink");
+    let mut out = sink_with(settings, &probe);
+    let store =
+        Arc::new(SinkStore::Memory(SinkQueue::new(SinkQueueConfig::default(), telemetry.clone())));
+    for message in names(4) {
+        store.push((Arc::new(batch(&message)), BatchContext::default())).await;
+    }
+    let producer = async {
+        wait_until("the object stored", || !model.stored().is_empty()).await;
+        store.close();
+    };
+    let config = crate::test_support::fast_retry();
+    logit_pipeline::test_util::drive_write_loop_over(
+        &mut out,
+        Arc::clone(&store),
+        config,
+        telemetry,
+        producer,
+    )
+    .await;
+    let requests = seen(&log);
+    let completes: Vec<&Seen> = requests.iter().filter(|r| op_of(r) == "complete").collect();
+    assert_eq!(completes.len(), 1);
+    assert_eq!(param(completes[0], "uploadId").as_deref(), Some("upload-1"));
+    let aborts: Vec<&Seen> = requests.iter().filter(|r| op_of(r) == "abort").collect();
+    assert_eq!(aborts.len(), 1, "aborted once");
+    assert_eq!(param(aborts[0], "uploadId").as_deref(), Some("upload-0"));
+    assert_eq!(model.stored().into_values().collect::<Vec<_>>(), [names(4)]);
+    let totals = probe.poll();
+    assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 4.0);
+    assert_eq!(totals.sum("logit.component.batches.dropped", &[]), 0.0);
+    assert_eq!(totals.sum("logit.output.uploads.abandoned", &[("aborted", "true")]), 1.0);
+}
+
+/// An abort that fails is counted `aborted="false"` and not retried; one answered `NoSuchUpload`
+/// left no parts, and counts `aborted="true"`.
+#[tokio::test]
+async fn a_failed_abort_is_counted_and_not_retried() {
+    let model = Arc::new(Model::default());
+    let answers = Arc::clone(&model);
+    let (addr, log) = standin(move |_, seen| match op_of(seen) {
+        "complete" => reply(400, s3_error("InvalidPart")),
+        "abort" => reply(500, s3_error("InternalError")),
+        _ => answers.answer(seen),
+    })
+    .await;
+    let mut probe = TelemetryProbe::new();
+    let mut out = sink_with(multipart(addr), &probe);
+    put(&mut out, 1, &[batch("m1")]).await.unwrap_err();
+    assert_eq!(ops(&log).iter().filter(|op| **op == "abort").count(), 1);
+    let totals = probe.poll();
+    assert_eq!(totals.sum("logit.output.uploads.abandoned", &[("aborted", "false")]), 1.0);
+    assert_eq!(
+        totals.sum("logit.output.requests", &[("op", "abort_upload"), ("class", "5xx")]),
+        1.0
+    );
+}
+
+/// A `200` that lacks what the sink needs from it stored nothing visible: a
+/// `CreateMultipartUpload` with no `<UploadId>`, and an `UploadPart` with no `ETag`.
+#[tokio::test]
+async fn a_200_create_with_no_upload_id_or_part_with_no_etag_is_clean() {
+    let cases: [Named; 2] = [
+        ("create", || reply(200, Vec::new())),
+        ("part", || Answer::Reply { status: 200, headers: Vec::new(), body: Vec::new() }),
+    ];
+    for (op, answer) in cases {
+        let model = Arc::new(Model::default());
+        let answers = Arc::clone(&model);
+        let (addr, log) =
+            standin(move |_, seen| if op_of(seen) == op { answer() } else { answers.answer(seen) })
+                .await;
+        let mut out = sink_with(multipart(addr), &TelemetryProbe::new());
+        let err = put(&mut out, 1, &[batch("m1")]).await.unwrap_err();
+        assert_eq!(classify(&err), Fault::Clean, "{op}: {err:#}");
+        assert!(!ops(&log).contains(&"complete"), "{op}");
+    }
+}
+
+/// A `CompleteMultipartUpload` `200` whose answer can't be read whole may have assembled the
+/// object: one over 64 KiB, and one whose connection drops mid-body, are `Ambiguous`.
+#[tokio::test]
+async fn a_complete_answer_over_64_kib_or_cut_short_is_ambiguous() {
+    let cases: [Named; 2] = [
+        ("over 64 KiB", || reply(200, vec![b' '; 64 * 1024 + 1])),
+        ("cut short", || Answer::Cut {
+            status: 200,
+            body: b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CompleteMultipart".to_vec(),
+        }),
+    ];
+    for (case, answer) in cases {
+        let model = Arc::new(Model::default());
+        let answers = Arc::clone(&model);
+        let (addr, _log) =
+            standin(
+                move |_, seen| {
+                    if op_of(seen) == "complete" {
+                        answer()
+                    } else {
+                        answers.answer(seen)
+                    }
+                },
+            )
+            .await;
+        let mut out = sink_with(multipart(addr), &TelemetryProbe::new());
+        let err = put(&mut out, 1, &[batch("m1")]).await.unwrap_err();
+        assert_eq!(classify(&err), Fault::Ambiguous, "{case}: {err:#}");
+        if case == "cut short" {
+            // The head arrived and the body didn't: the read, not the send, failed.
+            assert!(format!("{err:#}").contains("error decoding response body"), "{err:#}");
+        }
+    }
+}
+
+/// An abort answered `NoSuchUpload` left no parts behind, so it counts as aborted.
+#[tokio::test]
+async fn an_abort_answered_no_such_upload_counts_as_aborted() {
+    let model = Arc::new(Model::default());
+    let answers = Arc::clone(&model);
+    let (addr, log) = standin(move |_, seen| match op_of(seen) {
+        "complete" => reply(400, s3_error("InvalidPart")),
+        "abort" => reply(404, s3_error("NoSuchUpload")),
+        _ => answers.answer(seen),
+    })
+    .await;
+    let mut probe = TelemetryProbe::new();
+    let mut out = sink_with(multipart(addr), &probe);
+    put(&mut out, 1, &[batch("m1")]).await.unwrap_err();
+    assert_eq!(ops(&log).iter().filter(|op| **op == "abort").count(), 1);
+    let totals = probe.poll();
+    assert_eq!(totals.sum("logit.output.uploads.abandoned", &[("aborted", "true")]), 1.0);
+    assert_eq!(totals.sum("logit.output.uploads.abandoned", &[("aborted", "false")]), 0.0);
+}
+
+/// Under temporary credentials every multipart request carries and signs the session token, not
+/// only the one that creates the object.
+#[tokio::test]
+async fn every_multipart_request_carries_the_session_token() {
+    let model = Arc::new(Model::default());
+    let answers = Arc::clone(&model);
+    let (addr, log) = standin(move |_, seen| match op_of(seen) {
+        "complete" => reply(400, s3_error("InvalidPart")),
+        _ => answers.answer(seen),
+    })
+    .await;
+    let mut settings = multipart(addr);
+    settings.credentials.as_mut().unwrap().session_token = Some("session".to_string());
+    put(&mut sink_with(settings, &TelemetryProbe::new()), 1, &[batch("m1")]).await.unwrap_err();
+    let requests = seen(&log);
+    let mut sent: Vec<_> = requests.iter().map(op_of).collect();
+    sent.dedup();
+    assert_eq!(sent, ["create", "part", "complete", "abort"]);
+    for request in &requests {
+        let op = op_of(request);
+        assert_eq!(
+            request.headers.get("x-amz-security-token").map(String::as_str),
+            Some("session"),
+            "{op}"
+        );
+        assert!(request.headers["authorization"].contains(";x-amz-security-token"), "{op}");
+    }
+}
+
+/// A completed upload is done with: the next object starts its own upload, and nothing aborts
+/// the one that completed.
+#[tokio::test]
+async fn a_completed_upload_is_never_aborted() {
+    let model = Arc::new(Model::default());
+    let (addr, log) = model_standin(&model).await;
+    let mut probe = TelemetryProbe::new();
+    let mut out = sink_with(multipart(addr), &probe);
+    put(&mut out, 1, &[batch("m1")]).await.unwrap();
+    put(&mut out, 2, &[batch("m2")]).await.unwrap();
+    let sent = ops(&log);
+    assert_eq!(sent.iter().filter(|op| **op == "create").count(), 2, "{sent:?}");
+    assert!(!sent.contains(&"abort"), "{sent:?}");
+    let stored: Vec<_> = model.stored().into_values().collect();
+    assert_eq!(stored, [vec!["m1".to_string()], vec!["m2".to_string()]]);
+    let totals = probe.poll();
+    assert_eq!(totals.sum("logit.output.uploads.abandoned", &[("aborted", "true")]), 0.0);
+    assert_eq!(totals.sum("logit.output.uploads.abandoned", &[("aborted", "false")]), 0.0);
+}
+
+/// The late-Complete case of decision 3: an earlier attempt's `CompleteMultipartUpload`, answered
+/// `Ambiguous`, lands after its retry committed. The retry closed at the head's pinned count
+/// though more batches had arrived, so the late attempt holds every batch the retry committed,
+/// and the batches after them are in the next object.
+#[tokio::test]
+async fn a_late_complete_leaves_every_committed_batch_at_the_key() {
+    let model = Arc::new(Model::default());
+    let answers = Arc::clone(&model);
+    let release = Arc::new(Notify::new());
+    let landed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (held, landing) = (Arc::clone(&release), Arc::clone(&landed));
+    let (addr, log) = standin(move |_, seen| {
+        if op_of(seen) == "complete" && param(seen, "uploadId").as_deref() == Some("upload-0") {
+            // The store applies this Complete only once the test releases it, after the retry.
+            let body = answers.assembled("upload-0").unwrap();
+            let (model, held, key) = (Arc::clone(&answers), Arc::clone(&held), key_path(seen));
+            let landing = Arc::clone(&landing);
+            tokio::spawn(async move {
+                held.notified().await;
+                model.objects.lock().unwrap().insert(key, body);
+                landing.store(true, Ordering::SeqCst);
+            });
+            return reply(500, s3_error("InternalError"));
+        }
+        answers.answer(seen)
+    })
+    .await;
+    let mut settings = multipart(addr);
+    settings.max_age = Duration::from_millis(100);
+    let probe = TelemetryProbe::new();
+    let telemetry = probe.telemetry("out", "s3_out", "sink");
+    let mut out = sink_with(settings, &probe);
+    let store =
+        Arc::new(SinkStore::Memory(SinkQueue::new(SinkQueueConfig::default(), telemetry.clone())));
+    let push = |message: String| {
+        let store = Arc::clone(&store);
+        async move { store.push((Arc::new(batch(&message)), BatchContext::default())).await }
+    };
+    for message in names(3) {
+        push(message).await;
+    }
+    let producer = async {
+        wait_until("the first Complete", || ops(&log).contains(&"complete")).await;
+        push("m4".to_string()).await;
+        push("m5".to_string()).await;
+        wait_until("every batch committed", || store.queued() == 0).await;
+        release.notify_one();
+        wait_until("the late Complete landed", || landed.load(Ordering::SeqCst)).await;
+        store.close();
+    };
+    let config = crate::test_support::fast_retry();
+    logit_pipeline::test_util::drive_write_loop_over(
+        &mut out,
+        Arc::clone(&store),
+        config,
+        telemetry,
+        producer,
+    )
+    .await;
+    let stored: Vec<String> = model.stored().into_values().flatten().collect();
+    let mut sorted = stored.clone();
+    sorted.sort();
+    assert_eq!(sorted, names(5), "every committed batch is stored once: {stored:?}");
 }

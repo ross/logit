@@ -50,13 +50,13 @@ two the pipeline renames first (see their snippets below).
 lifts the span it describes:
 
 ```
-syslog_in / docker_in / tail_in -> json -> http_access -> trace_context -> kv_metrics -> keep -> keep_values -> aggregate -> sink
+syslog_in / docker_in / cri_in / tail_in -> json -> http_access -> trace_context -> kv_metrics -> keep -> keep_values -> aggregate -> sink
 ```
 
 ```yaml
 components:
   access_in:
-    type: syslog_in # or docker_in / tail_in, whichever matches how this server ships lines
+    type: syslog_in # or docker_in / cri_in / tail_in, whichever matches how this server ships lines
     bind: 0.0.0.0:5140
 
   # nginx's escape=json passes bytes >= 0x80 through raw, so one Latin-1 User-Agent makes the

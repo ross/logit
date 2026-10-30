@@ -337,7 +337,8 @@ line.
 | `kafka_out` encode_into 100 events, `format: json`, `text`, or `msgpack`, either `record:` | **0** | each event renders into a buffer the encoder keeps (a `String` for JSON and a text body, a `logit_proto::msgpack::Writer` for MessagePack), and a `record: batch` value fills one more kept `Vec`, so a warm `MessageBuf` never touches the allocator. `json` and `msgpack` share one walker (`crate::ndjson`'s `TreeWriter`); a MessagePack map's length goes in a placeholder header patched in place (`Writer::end_map`), which moves bytes inside the buffer but allocates nothing |
 | `kafka_out` encode_into 100 events, `format: native`, `record: event` | **3000** | one `CODEC_BATCH` frame per event through `logit_proto::native::encode_events`, so each event pays the `NativeEncoder::encode` 1-event row below: 30 |
 | `kafka_out` encode_into 100 events, `format: native`, `record: batch` | **2010** | one frame for all 100 events (they fit under the 1 MiB cap): 20 per event for the per-field TLV scratch buffers, 10 for the frame's dictionary, section buffers, and output. A batch over the cap costs more, since finding each record's longest run that fits encodes candidate frames |
-| `s3_out` stage one 100-event batch, `format: json`, `compression: gzip` or `none`, warm | **0** | `StagedObject::stage` (`crates/logit-outputs/src/s3/object.rs`): the lines render into the object's reused `String`, `flate2` deflates them into the body's `Vec` (or the body takes them as they are), and the SHA-256 context takes the new bytes in place; a growing body is a reallocation, not an allocation |
+| `s3_out` stage one 100-event batch, `format: json`, `compression: gzip` or `none`, warm | **0** | `StagedObject::stage` (`crates/logit-outputs/src/s3/object.rs`): the lines render into the object's reused `String`, `flate2` deflates them into the current part's `Vec` (or the part takes them as they are), and the part's SHA-256 context takes the new bytes in place; a growing part is a reallocation, not an allocation |
+| `s3_out` stage the 100-event batch that fills a part, `format: json`, `compression: none` | **3** | parts of 150,000 bytes, so the second 108,300-byte batch fills the first: the cut part's hex SHA-256 `String`, the first slot of the queue of cut parts, and the next part's buffer for the rest of the batch. Paid once per `part_size` of compressed body, not per batch; the cut part moves into its `UploadPart` request as the body, uncopied |
 | `s3_out` stage one 100-event batch, `format: json`, `compression: zstd`, warm, below the chunk | **0** | the lines are copied into the object's reused chunk buffer, uncompressed; `ruzstd` runs only once the buffer reaches `ZSTD_CHUNK_BYTES` (1 MiB) |
 | `s3_out` stage the 100-event batch that fills a 1 MiB zstd chunk, `format: json` | **582** | `ruzstd` has no reusable compressor, so each frame builds its own match tables and block buffers (about 2.7 MB allocated): paid once per MiB of encoded input, the tenth 100-event nginx batch here, not per batch |
 | `s3_out` stage one 100-event batch, `format: native`, `compression: gzip`, warm | **2010** | the `kafka_out` `format: native`, `record: batch` row's cost, the one 100-event frame `NativeEncoder::encode` returns; the deflate stream adds nothing |
@@ -1183,7 +1184,7 @@ Batch size is bounded where batches are assembled. A listener that builds batche
 datagrams, lines, or file records does it through a `BatchAccumulator` bounded by config-visible
 `batch_max_events`/`batch_max_bytes`: a UDP listener's `receive.batch_max_events`/`batch_max_bytes`,
 each connection on the shared TCP stream driver (`crates/logit-inputs/src/tcp.rs`), and each file
-`tail_in`/`docker_in` tracks (`docs/adr/file-tailing-and-docker-json-logs.md`). So one 65 KB syslog
+`tail_in`/`docker_in`/`cri_in` tracks (`docs/adr/file-tailing-and-docker-json-logs.md`). So one 65 KB syslog
 datagram that decodes to hundreds of events, or a TCP read of any size, still leaves the listener as
 bounded batches. A listener that receives a whole batch per request or frame (`otlp_in`,
 `logit_in`) passes on what the sender sent, sized by the sender.
@@ -1217,12 +1218,28 @@ A sink opted into `buffer.disk:` (`docs/adr/disk-backed-sink-buffer.md`) bounds 
 instead: `crates/logit-pipeline/src/disk_queue.rs`'s per-record encoded frame length, summed over
 every segment still on disk. The two figures differ on purpose: disk usage tracks exactly what was
 written, while the in-memory figure is an estimate. A sink's queue is in memory *or* on disk, never
-both, and only one bound applies: `buffer.max_batches`/`max_bytes` are rejected alongside a
-non-default `buffer.disk` (`crates/logit-pipeline/src/graph.rs` rule 35).
+both, and only the disk bound sizes the queue: `buffer.max_batches` is rejected beside
+`buffer.disk`, and so is a non-default `buffer.max_bytes`, except on a sink that collects windows
+(`graph::collects_windows`), where it bounds the open window's decoded batches
+(`crates/logit-pipeline/src/graph.rs` rule 35).
 
 A disk-spooled sink also holds decoded batches in memory: every record read but not yet committed
 sits in `DiskQueue`'s `read_ahead`, so a sink with a window of batches in flight holds up to that
 window of decoded `EventBatch`es outside both bounds.
+
+**`s3_out` holds about one part of compressed body.** Its open object's batches stay reserved
+in the store, decoded, until the object is stored, bounded by `buffer.max_bytes` on either store
+([ADR `collecting-sink-window`](../adr/collecting-sink-window.md), decision 2). Beyond those, the
+sink holds the compressed body not yet uploaded: the current part, whose buffer never grows past
+`part_size` (8 MiB by default; `parts_are_cut_at_part_size_and_hashed_each` in
+`crates/logit-outputs/src/s3/object.rs` pins the capacity), and the full parts the batch being
+staged cut, which `submit` uploads one at a time before it returns, so at most one batch's
+compressed overshoot. The compressor adds its own state: `flate2`'s deflate stream, or under
+`zstd` the 1 MiB chunk of encoded input not yet compressed, plus `ruzstd`'s tables while it
+compresses one (the 582-allocation row in §2). An object that never fills a part holds less than
+`part_size`. An object whose close leaves one part, with none uploaded, goes up as one
+`PutObject`; the close's flush can cut more than one part under `gzip` or `zstd`, and that object
+is a multipart upload.
 
 **Listeners bound undecoded bytes too.** [ADR `decoupled-listener-io`](../adr/decoupled-listener-io.md)
 generalizes `SinkQueue` into `BoundedQueue<T: Queued>` and weighs a UDP listener's receive queue
