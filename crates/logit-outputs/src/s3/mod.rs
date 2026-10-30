@@ -101,6 +101,8 @@
 //! |---|---|---|---|---|
 //! | `2xx`; `CompleteMultipartUpload` `200` with no `<Error>` body | delivered: the object is stored, or the request succeeded | | [PutObject]; [CompleteMultipartUpload] | `a_2xx_delivers_the_object`, `parts_are_part_size_and_each_is_signed_by_its_own_hash` |
 //! | `200` from `CompleteMultipartUpload` with an `<Error>` body | the class of its `<Code>` below, read at the status S3 answers that code with; a code with no row, or none, as `500` | AWS documents the error-in-`200` case | [CompleteMultipartUpload] | `a_200_complete_with_an_error_body_is_not_delivered` |
+//! | `200` from `CompleteMultipartUpload` whose answer is over 64 KiB or cut by a transport error | `Ambiguous` | the object may have been assembled | [CompleteMultipartUpload] | `a_complete_answer_over_64_kib_or_cut_short_is_ambiguous` |
+//! | `200` from `CreateMultipartUpload` with no `<UploadId>`, or from `UploadPart` with no `ETag` | `Clean` | nothing visible was stored; the object starts again | | `a_200_create_with_no_upload_id_or_part_with_no_etag_is_clean` |
 //! | `301` `PermanentRedirect`, `307` `TemporaryRedirect`, any other `3xx` | `Refused` | the wrong region or endpoint: the same answer for every object; the error carries `x-amz-bucket-region` | [S3 errors] | `a_3xx_is_refused_and_names_the_buckets_region` |
 //! | `400` `RequestTimeout`, `IncompleteBody`, `BadDigest`, `XAmzContentSHA256Mismatch` | `Clean` | the body didn't arrive whole, so nothing was stored | [S3 errors]; `XAmzContentSHA256Mismatch` from [MinIO's errors] and [Ceph RGW's errors] | `a_body_that_didnt_arrive_whole_is_clean` |
 //! | `400` `ExpiredToken`, `TokenRefreshRequired` | `Clean`, after `Chain::forget` | the credentials expired; fresh ones will sign the retry | [S3 errors] | `an_expired_token_is_clean_and_forgets_the_chains_credentials` |
@@ -110,7 +112,7 @@
 //! | `401`, `405`, `407`, any code | `Refused` | credentials, a method a proxy or store won't take, or a proxy's credentials: the shared HTTP default ([`crate::http::classify_status`]) | [RFC 9110] | `a_401_405_or_407_is_refused` |
 //! | `403`, any code | `Refused` | credentials or policy | [S3 errors] | `a_403_is_refused` |
 //! | `404` `NoSuchBucket`, and any other `404` | `Refused` | the bucket or endpoint is wrong | [S3 errors] | `a_404_is_refused` |
-//! | `404` `NoSuchUpload` | `Clean` | the upload was aborted underneath the sink; the object starts again, and the sink sends an abort for the old upload | [S3 errors] | `no_such_upload_starts_the_object_again_and_aborts_the_old_upload` |
+//! | `404` `NoSuchUpload` | `Clean` | the upload was aborted underneath the sink; the object starts again, and the sink sends an abort for the old upload; an abort answered so counts as aborted, since no parts are left | [S3 errors] | `no_such_upload_starts_the_object_again_and_aborts_the_old_upload`, `an_abort_answered_no_such_upload_counts_as_aborted` |
 //! | `408` | `Ambiguous` | the shared default ([ADR `sink-fault-classes`](../../../../docs/adr/sink-fault-classes.md)'s "Amendment: 408 is `Ambiguous`") | [RFC 9110] | `a_408_is_ambiguous` |
 //! | `409` `OperationAborted` | `Clean` | a conflicting operation was in progress; nothing was stored | [S3 errors] | `a_409_operation_aborted_is_clean` |
 //! | `411` `MissingContentLength` | `Refused` | a proxy or store that won't take the request's framing | [S3 errors] | `a_411_is_refused` |
@@ -127,9 +129,7 @@
 //! `Clean`: no object is visible at the key until `CompleteMultipartUpload` succeeds, so the
 //! request couldn't have stored a batch. Only `PutObject` and `CompleteMultipartUpload` can be
 //! `Ambiguous`, which keeps `at_most_once` from dropping an object that was never stored
-//! (`an_ambiguous_part_is_clean_and_an_ambiguous_complete_stays_ambiguous`). A
-//! `CreateMultipartUpload` `200` with no `<UploadId>`, and an `UploadPart` `200` with no `ETag`,
-//! are `Clean` too.
+//! (`an_ambiguous_part_is_clean_and_an_ambiguous_complete_stays_ambiguous`).
 //!
 //! `AccessControlListNotSupported` has no row: it answers a request carrying an ACL, and the sink
 //! sends none, so it falls to "any other `4xx`".

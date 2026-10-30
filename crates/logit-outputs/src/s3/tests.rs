@@ -52,7 +52,51 @@ enum Answer {
     Hang,
     /// Answers once the test notifies.
     After(Arc<Notify>, Box<Answer>),
+    /// Answers `status`, sends `body`, and drops the connection before the rest of the length it
+    /// announced.
+    Cut {
+        status: u16,
+        body: Vec<u8>,
+    },
 }
+
+/// A response body that sends its bytes, then fails, so the server drops the connection short of
+/// the length it announced. It yields once between the two, which lets the server flush the head
+/// and the bytes before the failure.
+struct CutBody {
+    bytes: Option<bytes::Bytes>,
+    yielded: bool,
+    announced: u64,
+}
+
+impl hyper::body::Body for CutBody {
+    type Data = bytes::Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<bytes::Bytes>, std::io::Error>>> {
+        if let Some(bytes) = self.bytes.take() {
+            return std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(bytes))));
+        }
+        if !self.yielded {
+            self.yielded = true;
+            cx.waker().wake_by_ref();
+            return std::task::Poll::Pending;
+        }
+        std::task::Poll::Ready(Some(Err(std::io::Error::other("the stand-in cut the body"))))
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        hyper::body::SizeHint::with_exact(self.announced)
+    }
+}
+
+type StandinBody = http_body_util::combinators::BoxBody<bytes::Bytes, std::io::Error>;
+
+/// A case's name and the answer it gets.
+type Named = (&'static str, fn() -> Answer);
 
 fn reply(status: u16, body: impl Into<Vec<u8>>) -> Answer {
     Answer::Reply { status, headers: Vec::new(), body: body.into() }
@@ -108,10 +152,23 @@ async fn standin(
                             log.len() - 1
                         };
                         let mut answer = respond(n, &seen);
-                        let (status, headers, body) = loop {
+                        let (status, headers, body): (_, _, StandinBody) = loop {
                             match answer {
                                 Answer::Reply { status, headers, body } => {
-                                    break (status, headers, body)
+                                    let body = http_body_util::Full::new(bytes::Bytes::from(body))
+                                        .map_err(|never| match never {})
+                                        .boxed();
+                                    break (status, headers, body);
+                                }
+                                Answer::Cut { status, body } => {
+                                    let announced = 2 * body.len() as u64 + 1;
+                                    let body = CutBody {
+                                        bytes: Some(body.into()),
+                                        yielded: false,
+                                        announced,
+                                    };
+                                    let body = body.boxed();
+                                    break (status, Vec::new(), body);
                                 }
                                 Answer::Hang => std::future::pending().await,
                                 Answer::After(notify, then) => {
@@ -124,11 +181,7 @@ async fn standin(
                         for (name, value) in headers {
                             response = response.header(name, value);
                         }
-                        Ok::<_, std::convert::Infallible>(
-                            response
-                                .body(http_body_util::Full::new(bytes::Bytes::from(body)))
-                                .unwrap(),
-                        )
+                        Ok::<_, std::convert::Infallible>(response.body(body).unwrap())
                     }
                 });
                 let _ = hyper::server::conn::http1::Builder::new()
@@ -1460,6 +1513,131 @@ async fn a_failed_abort_is_counted_and_not_retried() {
         totals.sum("logit.output.requests", &[("op", "abort_upload"), ("class", "5xx")]),
         1.0
     );
+}
+
+/// A `200` that lacks what the sink needs from it stored nothing visible: a
+/// `CreateMultipartUpload` with no `<UploadId>`, and an `UploadPart` with no `ETag`.
+#[tokio::test]
+async fn a_200_create_with_no_upload_id_or_part_with_no_etag_is_clean() {
+    let cases: [Named; 2] = [
+        ("create", || reply(200, Vec::new())),
+        ("part", || Answer::Reply { status: 200, headers: Vec::new(), body: Vec::new() }),
+    ];
+    for (op, answer) in cases {
+        let model = Arc::new(Model::default());
+        let answers = Arc::clone(&model);
+        let (addr, log) =
+            standin(move |_, seen| if op_of(seen) == op { answer() } else { answers.answer(seen) })
+                .await;
+        let mut out = sink_with(multipart(addr), &TelemetryProbe::new());
+        let err = put(&mut out, 1, &[batch("m1")]).await.unwrap_err();
+        assert_eq!(classify(&err), Fault::Clean, "{op}: {err:#}");
+        assert!(!ops(&log).contains(&"complete"), "{op}");
+    }
+}
+
+/// A `CompleteMultipartUpload` `200` whose answer can't be read whole may have assembled the
+/// object: one over 64 KiB, and one whose connection drops mid-body, are `Ambiguous`.
+#[tokio::test]
+async fn a_complete_answer_over_64_kib_or_cut_short_is_ambiguous() {
+    let cases: [Named; 2] = [
+        ("over 64 KiB", || reply(200, vec![b' '; 64 * 1024 + 1])),
+        ("cut short", || Answer::Cut {
+            status: 200,
+            body: b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CompleteMultipart".to_vec(),
+        }),
+    ];
+    for (case, answer) in cases {
+        let model = Arc::new(Model::default());
+        let answers = Arc::clone(&model);
+        let (addr, _log) =
+            standin(
+                move |_, seen| {
+                    if op_of(seen) == "complete" {
+                        answer()
+                    } else {
+                        answers.answer(seen)
+                    }
+                },
+            )
+            .await;
+        let mut out = sink_with(multipart(addr), &TelemetryProbe::new());
+        let err = put(&mut out, 1, &[batch("m1")]).await.unwrap_err();
+        assert_eq!(classify(&err), Fault::Ambiguous, "{case}: {err:#}");
+        if case == "cut short" {
+            // The head arrived and the body didn't: the read, not the send, failed.
+            assert!(format!("{err:#}").contains("error decoding response body"), "{err:#}");
+        }
+    }
+}
+
+/// An abort answered `NoSuchUpload` left no parts behind, so it counts as aborted.
+#[tokio::test]
+async fn an_abort_answered_no_such_upload_counts_as_aborted() {
+    let model = Arc::new(Model::default());
+    let answers = Arc::clone(&model);
+    let (addr, log) = standin(move |_, seen| match op_of(seen) {
+        "complete" => reply(400, s3_error("InvalidPart")),
+        "abort" => reply(404, s3_error("NoSuchUpload")),
+        _ => answers.answer(seen),
+    })
+    .await;
+    let mut probe = TelemetryProbe::new();
+    let mut out = sink_with(multipart(addr), &probe);
+    put(&mut out, 1, &[batch("m1")]).await.unwrap_err();
+    assert_eq!(ops(&log).iter().filter(|op| **op == "abort").count(), 1);
+    let totals = probe.poll();
+    assert_eq!(totals.sum("logit.output.uploads.abandoned", &[("aborted", "true")]), 1.0);
+    assert_eq!(totals.sum("logit.output.uploads.abandoned", &[("aborted", "false")]), 0.0);
+}
+
+/// Under temporary credentials every multipart request carries and signs the session token, not
+/// only the one that creates the object.
+#[tokio::test]
+async fn every_multipart_request_carries_the_session_token() {
+    let model = Arc::new(Model::default());
+    let answers = Arc::clone(&model);
+    let (addr, log) = standin(move |_, seen| match op_of(seen) {
+        "complete" => reply(400, s3_error("InvalidPart")),
+        _ => answers.answer(seen),
+    })
+    .await;
+    let mut settings = multipart(addr);
+    settings.credentials.as_mut().unwrap().session_token = Some("session".to_string());
+    put(&mut sink_with(settings, &TelemetryProbe::new()), 1, &[batch("m1")]).await.unwrap_err();
+    let requests = seen(&log);
+    let mut sent: Vec<_> = requests.iter().map(op_of).collect();
+    sent.dedup();
+    assert_eq!(sent, ["create", "part", "complete", "abort"]);
+    for request in &requests {
+        let op = op_of(request);
+        assert_eq!(
+            request.headers.get("x-amz-security-token").map(String::as_str),
+            Some("session"),
+            "{op}"
+        );
+        assert!(request.headers["authorization"].contains(";x-amz-security-token"), "{op}");
+    }
+}
+
+/// A completed upload is done with: the next object starts its own upload, and nothing aborts
+/// the one that completed.
+#[tokio::test]
+async fn a_completed_upload_is_never_aborted() {
+    let model = Arc::new(Model::default());
+    let (addr, log) = model_standin(&model).await;
+    let mut probe = TelemetryProbe::new();
+    let mut out = sink_with(multipart(addr), &probe);
+    put(&mut out, 1, &[batch("m1")]).await.unwrap();
+    put(&mut out, 2, &[batch("m2")]).await.unwrap();
+    let sent = ops(&log);
+    assert_eq!(sent.iter().filter(|op| **op == "create").count(), 2, "{sent:?}");
+    assert!(!sent.contains(&"abort"), "{sent:?}");
+    let stored: Vec<_> = model.stored().into_values().collect();
+    assert_eq!(stored, [vec!["m1".to_string()], vec!["m2".to_string()]]);
+    let totals = probe.poll();
+    assert_eq!(totals.sum("logit.output.uploads.abandoned", &[("aborted", "true")]), 0.0);
+    assert_eq!(totals.sum("logit.output.uploads.abandoned", &[("aborted", "false")]), 0.0);
 }
 
 /// The late-Complete case of decision 3: an earlier attempt's `CompleteMultipartUpload`, answered
