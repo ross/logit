@@ -1594,7 +1594,7 @@ Kafka record is the unit.
 | `logit.input.rebalances{reason="start"\|"rebalance"\|"membership_lost"\|"metadata"}` | count | each completed join |
 | `logit.input.commits{class="ok"\|"error"\|"fenced"}` | count | each OffsetCommit |
 | `logit.input.offsets.reset{reason="no_commit"\|"out_of_range"}` | count | a partition starting with no committed offset, or moved after `OFFSET_OUT_OF_RANGE` |
-| `logit.input.broker.errors{api, error}` | count | each broker error code, by its snake_case Kafka name, or `transport`, `tls`, `sasl`, or `unsupported_version` for a failed dial or request, or `response_too_large` for a Fetch answer over its cap |
+| `logit.input.broker.errors{api, error}` | count | each broker error code, by its snake_case Kafka name, or `transport`, `tls`, `sasl`, or `unsupported_version` for a failed dial or request, `response_too_large` for an answer over its request's cap (Fetch's `fetch.max_bytes` plus `max_batch_bytes` plus 1 MiB, 64 MiB for any other API), or `malformed` for a Metadata answer with a partition index outside its entries |
 | `logit.input.reconnects` | count | a redial of a connection the consumer dialed before |
 
 `Diagnostics` keys, each throttled: `records_dropped` (naming the topic, partition, and offset),

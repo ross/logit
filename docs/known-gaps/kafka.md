@@ -138,10 +138,25 @@ Entry format and the other areas: [the known-gaps index](README.md).
   refused before any of it is read, so no batch header in it is seen and there is no offset to
   skip to; the next fetch from the same offset draws the same answer
   ([ADR `kafka-input`](../adr/kafka-input.md), item 9). Any batch whose stored bytes pass the
-  cap does this, compressed or not.
-  - **Consequence:** the partition holds at that offset, counting
+  cap does this, compressed or not. Each broker's fetch loop asks for all its ready partitions
+  in one request, so the refusal holds every partition that broker leads for this consumer, not
+  only the one holding the batch.
+  - **Consequence:** those partitions hold at their offsets, counting
     `logit.input.broker.errors{api="fetch", error="response_too_large"}` with a throttled
-    `response_too_large` diagnostic on every fetch, and its records after the batch aren't read.
+    `response_too_large` diagnostic on every fetch, and none of their later records are read.
   - **Workaround:** raise `max_batch_bytes` above the batch's size.
   - **Revisit trigger:** a reader that skips a frame by its batch header alone, without holding
-    the whole answer.
+    the whole answer. Fetching that broker's partitions one per request after a refusal, so
+    only the partition holding the batch stays held, is the open remedy short of that.
+- **`kafka_in` skips a corrupt batch to the high watermark when nothing verified follows it.**
+  A batch that fails its CRC twice, or doesn't decompress or parse, gives no trustworthy length
+  or last offset, so the skip lands on the next batch in the answer whose CRC passes. When none
+  follows even after a refetch with `max_batch_bytes` of room for that partition, the skip lands
+  on the high watermark, or the last stable offset under `read_committed`
+  ([ADR `kafka-input`](../adr/kafka-input.md), item 9).
+  - **Consequence:** every record between the corrupt batch and the high watermark is counted
+    `logit.input.records.dropped{reason="corrupt"}` and not read, good batches included, when no
+    batch after the corrupt one lies within `max_batch_bytes` of it.
+  - **Workaround:** none in `logit`; a log with corrupt batches needs repair at the broker.
+  - **Revisit trigger:** a reader that can probe offsets past a corrupt batch, such as one
+    ListOffsets or fetch per candidate offset, or a report of this loss in practice.
