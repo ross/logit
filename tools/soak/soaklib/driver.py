@@ -421,9 +421,17 @@ class Run:
                    f"  {' '.join(self.docker.prefix)} compose -p {self.project} "
                    + "".join(f"-f {path} " for path in self.docker.compose_files) + "down -v")
             return 2
+        file_steps = any(spec.action in scenario_mod.FILE_ACTIONS
+                         for spec in self.scenario.steps)
+        if file_steps:
+            problem = faults.ensure_fileops_image(self.docker)
+            if problem is not None:
+                _print(f"soak: {problem}")
+                return 2
         images = ([self.image, NETEM_IMAGE] + ([VM_IMAGE] if self.has_vm else [])
                   + ([KAFKA_IMAGE] if self.kafka else [])
-                  + ([STANDIN_IMAGE] if self.standin else []))
+                  + ([STANDIN_IMAGE] if self.standin else [])
+                  + ([faults.FILEOPS_IMAGE] if file_steps and not self.standin else []))
         collect.provenance(self.run_dir, self.root.parent.parent, self.docker,
                            images, self.scenario.name,
                            self.duration, self.seed, self.argv, self.seed_source)

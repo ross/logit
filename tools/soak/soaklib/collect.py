@@ -5,6 +5,7 @@ Everything `check <run-dir>` reads is written here or by the driver through `Jso
 can be re-scored offline from its directory alone.
 """
 
+import gzip
 import json
 import os
 import platform
@@ -218,16 +219,24 @@ def service_inspect(run_dir, docker, ids):
         (out / f"{service}.json").write_text(json.dumps(info, indent=2, sort_keys=True) + "\n")
 
 
+# gzip's ID bytes (RFC 1952).
+GZIP_MAGIC = b"\x1f\x8b"
+
+
 def count_lines(directory):
     """`{files, lines, bytes}` over every regular file in `directory`: a file wire's writer's
     lines, counted outside both processes. A line is a newline; a write the writer never
-    finished leaves no newline, so it isn't one."""
+    finished leaves no newline, so it isn't one. A gzip file, which a `gzip` step makes of
+    lines the writer wrote, is counted decompressed, its `bytes` too."""
     files = lines = size = 0
     for path in sorted(Path(directory).iterdir()) if Path(directory).is_dir() else ():
         if not path.is_file():
             continue
         files += 1
-        with open(path, "rb") as handle:
+        with open(path, "rb") as raw:
+            packed = raw.read(2) == GZIP_MAGIC
+            raw.seek(0)
+            handle = gzip.GzipFile(fileobj=raw) if packed else raw
             while True:
                 block = handle.read(1 << 20)
                 if not block:
