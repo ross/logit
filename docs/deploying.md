@@ -2831,9 +2831,11 @@ see [ADR
   read is cached against that stat like a successful one; a torn read racing the daemon's rewrite is
   therefore picked up as soon as the rewrite lands. Either way, it fires once per failure, not once
   per tick while the failure persists.
-- `logit.input.files.identity_changed` / `.deselected` (count, `docker_in` only): a container's
-  identity (name, image, a watched label, or, under `host_name: container`, the hostname) changed,
-  or a tracked container was renamed out of `containers:` and stopped flowing. The matching `container_renamed`/`container_deselected`
+- `logit.input.files.identity_changed` / `.deselected` (count): under `docker_in`, a container's
+  identity (name, image, a watched label, or, under `host_name: container`, the hostname) changed
+  (`identity_changed`), or a tracked container was renamed out of `containers:` and stopped flowing
+  (`.deselected`). Under `cri_in`, `identity_changed` counts a file's `container.id` found after the
+  file was first read; `.deselected` is `docker_in` only. The matching `container_renamed`/`container_deselected`
   diagnostics name the container. **A deselection is process-local:** if `logit` restarts before the
   container is renamed back, the retained resume offset is lost.
 
