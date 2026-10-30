@@ -1520,6 +1520,9 @@ HTTP_LISTENERS = {
                                "logit.input.batches.deferred"),
     "prometheus_in": HttpListener("logit.input.writes", None, None),
 }
+# `cri_in`'s `partial_timeout` and `poll_interval` when the config names neither
+# (crates/logit-config, `ComponentKind::CriIn` and `TailOptions`).
+CRI_PIN_DEFAULTS_S = (5.0, 1.0)
 # A file wire's tailer reads at most this much of one file per read, so a kill can replay up to
 # one read's lines per file past its last checkpoint (docs/known-gaps/tailing.md, "The tail
 # driver notices shutdown only between two files' reads").
@@ -2553,9 +2556,21 @@ class Ledger:
         stop, restart, or `exit` ended emits each file's unterminated line at shutdown and the
         rest of it after the restart, one line more per file it had open
         (`logit.input.files.open` at its last drain), above (docs/known-gaps/tailing.md's
-        split-line entry). The final life adds nothing."""
+        split-line entry). The final life adds nothing.
+
+        A `cri_in` listener keeps one checkpoint position per file, pinned at a held `P` run's
+        first record while it waits for its `F` or for `partial_timeout`, and the other
+        stream's lines after the pin have already been sent. A stop or a kill while a run is
+        held replays them, so on a `cri` wire every stopped and killed life adds the lines of
+        `partial_timeout` + `poll_interval` above, at its rate over its last drain interval, or
+        its one drain's W when it has no interval (`CRI_PIN_DEFAULTS_S`)."""
         inn = self.inn
         text = self._sut_config_text(inn.service)
+        cri = [listener for listener in listeners if self.wires[listener] is WIRES[CRI_WIRE]]
+        pin = max(((component_duration(text, listener, "partial_timeout")
+                    or CRI_PIN_DEFAULTS_S[0])
+                   + (component_duration(text, listener, "poll_interval")
+                      or CRI_PIN_DEFAULTS_S[1]) for listener in cri), default=0.0)
         counted = self.data.phases.get("shared_counted") or {}
         line_bytes = (counted.get("bytes", 0) / counted["lines"]
                       if counted.get("lines") else 0.0)
@@ -2565,15 +2580,23 @@ class Ledger:
         for life in inn.lives:
             if life == inn.final:
                 continue
+            drains = self.ingress.life_drains(life)
+            gaps = [b - a for a, b in zip(drains, drains[1:])]
+            interval = statistics.median(gaps) if gaps else 0.0
+            last = sum(v for listener in listeners
+                       for ts, v, point_life in self.ingress.counter_points(
+                           self.wires[listener].w, component=listener)
+                       if point_life == life and drains and ts == drains[-1])
+            rate = last / gaps[-1] if gaps and gaps[-1] > 0 else 0.0
+            if cri:
+                held = round(rate * pin) if gaps else last
+                high += held
+                lines.append(f"life {life}: [0, +{_n(held)}]: the other stream's lines after a "
+                             f"held run's pin, " + (
+                                 f"{rate:,.0f} lines/s x {pin:g}s of partial_timeout plus "
+                                 "poll_interval" if gaps else
+                                 f"one drain, so its W of {_n(last)} lines"))
             if life in inn.killed:
-                drains = self.ingress.life_drains(life)
-                gaps = [b - a for a, b in zip(drains, drains[1:])]
-                interval = statistics.median(gaps) if gaps else 0.0
-                last = sum(v for listener in listeners
-                           for ts, v, point_life in self.ingress.counter_points(
-                               self.wires[listener].w, component=listener)
-                           if point_life == life and drains and ts == drains[-1])
-                rate = last / gaps[-1] if gaps and gaps[-1] > 0 else 0.0
                 checkpoint = max((component_duration(text, listener, "checkpoint_interval")
                                   or DEFAULT_TAIL_CHECKPOINT_INTERVAL_S)
                                  for listener in listeners)

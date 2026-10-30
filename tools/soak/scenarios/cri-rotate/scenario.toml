@@ -61,7 +61,8 @@ on = "logit"
 for = "35s"
 
 # A clean stop writes a final checkpoint and keeps each held run unsent, pinned at its first
-# record: the restart reads it whole, so nothing replays and nothing splits.
+# record: the restart reads it whole, so it doesn't split, but the other stream's lines after the
+# pin replay, which the cri wire's replay band allows.
 [[step]]
 at = "1m15s"
 action = "stop"
