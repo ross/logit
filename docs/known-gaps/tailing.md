@@ -104,7 +104,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Workaround:** don't give a container a name shaped like an id prefix. See [ADR
     `docker-container-identity-and-minimal-watches`](../adr/docker-container-identity-and-minimal-watches.md).
 - **An envelope over the cap is dropped by the splitter without the decoder seeing it, so a message
-  that lost one fragment leaves wrong.** `docker_in`'s `LineSplitter` drops a json-file line
+  that lost one fragment is delivered wrong.** `docker_in`'s `LineSplitter` drops a json-file line
   longer than its envelope bound (`envelope_cap` in `crates/logit-inputs/src/docker.rs`) whole and
   counts it (`long_line` and `logit.input.frames.dropped{reason="oversize"}`), and `DockerDecoder`
   never learns a line went missing. A dropped closing fragment leaves the held partial open, so
@@ -113,7 +113,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   full-size fragment of a container whose `attrs` outgrows the bound's slack is dropped this way
   (the next entry), so its long messages all lose fragments.
   - **To close:** a remedy that doesn't need the dropped fragment's stream, such as ending both
-    streams' held partials on any drop. The splitter-drop hook that `cri_in` adds
+    streams' held partials on any drop. The splitter-drop hook `cri_in` uses
     ([ADR `cri-container-logs`](../adr/cri-container-logs.md)'s "Implementation notes for W2")
     reports each drop in sequence, but it can't close this for json-file by itself: an envelope
     writes `stream` after `log`, so a dropped line's leading bytes can't name its stream. The

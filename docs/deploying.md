@@ -185,7 +185,7 @@ error.
   every direct consumer has closed, as happens while a shutdown tears the graph down, an
   acknowledging input refuses instead: `logit_in` answers `Reject{GOING_AWAY}` and closes the
   connection, an HTTP listener answers its protocol's retryable failure (a `503`, or gRPC status
-  14), and `tail_in`/`docker_in` stop writing their checkpoint and stop. A sink closing behind an
+  14), and `tail_in`/`docker_in`/`cri_in` stop writing their checkpoint and stop. A sink closing behind an
   open transform doesn't count: the transform took the batch. Each refused batch is counted
   `logit.input.batches.dropped{reason="closed_consumer"}`
   ([ADR `delivery-semantics`](adr/delivery-semantics.md), item 3, and its W3 amendment).
@@ -388,7 +388,8 @@ measurements behind it are in
 
 Only listeners share. A `buffer.disk:` spool belongs to one process at a time, so give each pod its
 own spool directory: a new pod that opens a spool the old pod still holds exits `2`. Two
-overlapping `tail_in` or `docker_in` listeners on the same files both deliver every line.
+overlapping `tail_in`, `docker_in`, or `cri_in` listeners on the same files both deliver every
+line.
 
 ### Kubernetes: a surging DaemonSet
 
@@ -697,7 +698,7 @@ that recorded the point.
 | Event | Level | When |
 |---|---|---|
 | `starting` | info | Config loaded, before graph resolution — named even if the config goes on to fail. |
-| `bound` | info | One component's socket opened, during the pre-bind pass — listeners (`syslog_in`/`statsd_in`/`lines_in`/`collectd_in`/`graphite_in`/`otlp_in`/`logit_in`/`datadog_in`/`datadog_trace_in`/`splunk_hec_in`/`influxdb_in`, and `prometheus_in` in receiver mode; `tail_in`/`docker_in` emit none) and sinks that listen (`prometheus_out`). A `collectd_in` (or any UDP listener) whose `bind` names a multicast group says so, naming the group it joined. The message names the address the socket bound, so a `bind` on port `0` reports the port the kernel assigned. |
+| `bound` | info | One component's socket opened, during the pre-bind pass — listeners (`syslog_in`/`statsd_in`/`lines_in`/`collectd_in`/`graphite_in`/`otlp_in`/`logit_in`/`datadog_in`/`datadog_trace_in`/`splunk_hec_in`/`influxdb_in`, and `prometheus_in` in receiver mode; `tail_in`/`docker_in`/`cri_in` emit none) and sinks that listen (`prometheus_out`). A `collectd_in` (or any UDP listener) whose `bind` names a multicast group says so, naming the group it joined. The message names the address the socket bound, so a `bind` on port `0` reports the port the kernel assigned. |
 | `admin bound` | info | The `admin:` endpoint's socket opened, before the pipeline's pre-bind pass. Carries `address`: the TCP address `admin.bind` bound (the assigned port when it names port `0`), or `admin.socket`'s path. One line per socket. |
 | `ready` | info | Every socket bound, every node task running, nothing has failed. |
 | `shutdown signal received` | info | A SIGTERM/SIGINT arrived. |
@@ -1261,7 +1262,7 @@ or backed-up destination downstream is ridden out.
 To tune it, add a `receive:` block to the listener; see the commented example in
 [`fixtures/statsd-to-influxdb.yaml`](../fixtures/statsd-to-influxdb.yaml). Every field has a
 default, so omitting `receive:` gives the values below. Validation rejects `receive:` on any kind
-except a datagram listener, a TCP listener, or a tail listener (`tail_in`/`docker_in`). A TCP or
+except a datagram listener, a TCP listener, or a tail listener (`tail_in`/`docker_in`/`cri_in`). A TCP or
 tail listener has no receive *queue*, so only the four batch-assembly fields apply to it; see
 [Tailing files and Docker logs](#tailing-files-and-docker-logs).
 
@@ -2484,8 +2485,10 @@ distribution, sets, counters, and a `|T`-stamped line over two windows:
 `tail_in` reads one or more files line by line. `docker_in` uses the same driver to tail Docker's
 json-file container logs, enriched with per-container identity read locally from the sibling
 `config.v2.json`, with no docker socket and no HTTP client
-([ADR `file-tailing-and-docker-json-logs`](adr/file-tailing-and-docker-json-logs.md)). Both handle
-rotation and truncation, and can checkpoint so a restart resumes instead of replaying or skipping.
+([ADR `file-tailing-and-docker-json-logs`](adr/file-tailing-and-docker-json-logs.md)). `cri_in`
+uses it to tail a Kubernetes node's container logs under `/var/log/pods`
+([below](#kubernetes-container-logs-cri_in)). All three handle rotation and truncation, and can
+checkpoint so a restart resumes instead of replaying or skipping.
 
 ### Root, and a read-only bind mount, for `docker_in`
 
@@ -2519,6 +2522,101 @@ keeps when its lines happened. `tail_in` stamps read time instead, because a pla
 time to trust; put a `timestamp` stage after the parser to resolve one from a parsed field. See
 [ADR `file-tailing-and-docker-json-logs`](adr/file-tailing-and-docker-json-logs.md)'s
 "`docker_in` timestamps" section.
+
+### Kubernetes container logs: `cri_in`
+
+`cri_in` tails every container's log that the kubelet lays out under `/var/log/pods`, in the CRI
+format containerd and CRI-O write, on the same driver as `tail_in`
+([ADR `cri-container-logs`](adr/cri-container-logs.md)). It joins each line the runtime split into
+`P` pieces back into one event, per file and per stream, stamps the event with the line's own CRI
+timestamp and `log.iostream` (`stdout` or `stderr`), and writes `k8s.namespace.name`,
+`k8s.pod.name`, `k8s.pod.uid`, `k8s.container.name`, and `k8s.container.restart_count` from the
+path onto the resource. It reads no API server and no runtime socket.
+
+```yaml
+components:
+  pods:
+    type: cri_in
+    checkpoint_path: /var/lib/logit/cri.checkpoint
+  not_system:
+    type: drop_attributes
+    sources: [pods]
+    resource: { k8s.namespace.name: kube-system }
+```
+
+[`examples/kubernetes/logit.yaml`](../examples/kubernetes/logit.yaml) is a whole config.
+
+**Run it as a DaemonSet, with the node's `/var/log/pods` mounted read-only at the same path.** The
+runtimes create each log file `0640` owned by root, so the container runs as root (`runAsUser: 0`)
+or as a user in the files' group. Mount `/var/log/pods` from a `hostPath`, with `readOnly: true`;
+`root:` defaults to that path, and only the last three parts of a file's path (pod directory,
+container directory, file name) are read for its identity, so another mount point works with
+`root:` set to it.
+
+**Put `checkpoint_path` on a `hostPath` too** (`/var/lib/logit`, say, `DirectoryOrCreate`). An
+`emptyDir` or the container's own filesystem goes away with the pod, so every rollout would
+re-apply `read_from`: under `end`, the default, the lines written while no pod ran are skipped, and
+under `beginning`, every file on the node is replayed. A run of `P` pieces still waiting for its
+`F` at a clean stop is kept unread when a checkpoint is configured, and read whole on the restart.
+
+**Roll a `cri_in` DaemonSet with `maxUnavailable: 1` and `maxSurge: 0`, not the surging rollout
+below.** Two pods on one node both read every file, so a surge delivers every line twice while it
+lasts, and two pods writing one `hostPath` checkpoint overwrite each other's offsets.
+
+**`host.name`.** The path names no node, so `cri_in` writes no `host.name`. A sink that fills a
+missing host uses `logit`'s hostname, which in a pod is the pod's name unless the pod runs with
+`hostNetwork: true`. Set the top-level `hostname: !env NODE_NAME` from the downward API (see
+[Hostname](#hostname)), or stamp `host.name` or `k8s.node.name` with `set` from the same variable.
+
+**Pick containers downstream.** `cri_in` follows every container under `root:`. Narrow the flow
+with `has_attributes` or `drop_attributes` on the resource's `k8s.namespace.name` or
+`k8s.pod.name`, as the example drops `kube-system`.
+
+**The record keeps what the runtime wrote.** containerd removes a CRLF line's `\r`; CRI-O keeps
+it, and so does `cri_in`. Trim it downstream where you want one form. A line that isn't valid
+UTF-8 is converted once, after its pieces are joined, with an `invalid_utf8` diagnostic.
+
+**A line over `max_line_bytes`** (1 MiB by default) is dropped whole, with its remaining pieces,
+counted once in `logit.input.frames.dropped{reason="oversize"}` with a `long_line` diagnostic. A
+record over the splitter's larger bound (about 6 MiB at the default; a containerd piece under a
+raised or unlimited `max_container_log_line_size`) drops its stream's line the same way.
+
+**A record that doesn't parse** (no timestamp, stream, or tag field, or a stream that's neither
+`stdout` nor `stderr`) is counted `logit.input.frames.dropped{reason="malformed"}` with a
+`bad_line` diagnostic, after both streams' waiting pieces are delivered as they stand. A timestamp
+that doesn't parse isn't malformed: the line is delivered with the read time and a `bad_time`
+diagnostic.
+
+**A run of `P` pieces with no `F` is delivered after `partial_timeout`** (`5s`), counted
+`logit.input.frames.truncated{reason="partial_timeout"}`. That isn't loss: the pieces are
+delivered, and if the `F` arrives later, it's delivered as a second event. The timer starts from
+each stream's last record and runs only once `logit` has read the file to its end, so a backlog
+never splits a line. `partial_timeout: 0s` turns it off, and a run then waits for its `F` or for the
+file to close, which the kubelet does only when it removes the file.
+
+#### Limits, and what to do about each
+
+- **A line split across a rotation leaves as two events.** containerd writes the line's head at the
+  end of the renamed file and the rest at the start of the new one. It happens at most once per
+  rotation per stream with a line in flight; a larger kubelet `containerLogMaxSize` makes rotations
+  rarer.
+- **A writer that stops mid-line for longer than `partial_timeout` leaves the line as two events.**
+  A steady `frames.truncated{reason="partial_timeout"}` rate on a workload you know writes whole
+  lines means `partial_timeout` is too short for it; raise it.
+- **A static pod's `k8s.pod.uid` is the kubelet's own uid, not its mirror pod's** in the API,
+  unless its manifest sets one. Join a static pod's lines to the API's pod objects by
+  `k8s.namespace.name` and `k8s.pod.name`.
+- **No `container.id`, pod labels, annotations, or node name.** The path doesn't hold them. Add
+  what you need with `set` (a constant or `!env` value, such as the node name above), or with a
+  `lua` stage that maps a pod name to more.
+- **CRI-O's own size rotation isn't followed across a restart.** Leave conmon's `log_size_max` at
+  its default, off, so the kubelet rotates, by names `cri_in` matches. With it on, a file conmon
+  replaced while `logit` was down has its unread rest counted
+  `logit.input.bytes.dropped{reason="gone"}`.
+- **cri-dockerd's files aren't read yet.** Under cri-dockerd, the file under each pods name is
+  Docker's json-file log, which `cri_in` doesn't parse yet: every line counts
+  `frames.dropped{reason="malformed"}`. Tail Docker's container directory with `docker_in` on
+  such a node instead.
 
 ### `read_from`, and why a checkpoint matters more here than for a plain UDP listener
 
@@ -2602,7 +2700,7 @@ A path that no `paths:` entry covers any more isn't counted, because changing th
 loss. To avoid the loss, match the rotated names too (`app.log*`), which covers a rename, and keep
 enough rotated files that the rotator can't delete one `logit` hasn't read while it's down.
 
-**A closed downstream stops the tailer.** When no consumer takes a batch, `tail_in`/`docker_in`
+**A closed downstream stops the tailer.** When no consumer takes a batch, a tail listener
 stops at the first refused batch and stops writing the checkpoint, and the node finishes. The
 checkpoint on disk is the last one written, at or before the last line a consumer took, up to one
 `checkpoint_interval` of lines behind it. A restart resumes there and may replay lines a consumer
@@ -2612,7 +2710,7 @@ already took. It's counted
 Each write goes to `<checkpoint_path>.tmp`, is `fsync`ed, renamed over `checkpoint_path`, and the
 directory is `fsync`ed, so a power loss leaves the previous checkpoint or the new one, never a torn
 one. A failed write counts `logit.input.checkpoint.errors{op="write"}` and is retried on the next
-tick. Give each `tail_in`/`docker_in` its own `checkpoint_path`: validation rejects two components
+tick. Give each tail listener its own `checkpoint_path`: validation rejects two components
 that name the same one, or one that names another's `<checkpoint_path>.tmp`.
 
 ### `watch: auto | inotify | poll`
@@ -2628,7 +2726,7 @@ runs on every iteration, whatever woke it, so once a content change on a tracked
 poll tick wakes it, it reads everything available.
 
 `inotify` watches deliberately little: one watch on the single directory a pattern reaches
-(`paths:` for `tail_in`, `root` for `docker_in`), plus one per file the listener has open. Nothing
+(`paths:` for `tail_in`, `root` for `docker_in` and `cri_in`), plus one per file the listener has open. Nothing
 watches a container this listener isn't tailing, and nothing wakes on a write to an untracked file.
 
 **For `docker_in`, three changes wait for `poll_interval` in every `watch` mode:** a log file's
@@ -2682,7 +2780,7 @@ see [ADR
   errno. A sustained nonzero rate is a permissions or descriptor-limit problem to fix; until it's
   fixed, a file renamed out of that directory stays open.
 - `logit.component.diagnostics{key="long_line"}` (count, via the `Diagnostics` bridge): a line,
-  or under `docker_in` a reassembled message, dropped whole for exceeding `max_line_bytes`, also
+  or under `docker_in` and `cri_in` a reassembled message, dropped whole for exceeding `max_line_bytes`, also
   counted `logit.input.frames.dropped{reason="oversize"}`. A long line is never truncated and passed
   through, because a truncated line would hand a downstream JSON parser something that looks
   well-formed but isn't the real line.
@@ -2690,7 +2788,7 @@ see [ADR
   tracked file's length shrinking under it. That's rare, but real for a tool that recreates a log
   file in place instead of renaming it away first. The file is reread from its start, and an
   unterminated line held from before the truncation is discarded and counted
-  `logit.input.frames.dropped{reason="truncated"}`. Under `docker_in`, each stream's held reassembly
+  `logit.input.frames.dropped{reason="truncated"}`. Under `docker_in` and `cri_in`, each stream's held reassembly
   is discarded and counted the same way, once with the unterminated line that continues it. The
   bytes the last scan or read saw past the read offset, which no read reached, are counted
   `logit.input.bytes.dropped{reason="truncated"}`. That count is usually `0` and is a floor: under

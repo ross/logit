@@ -378,14 +378,16 @@ This makes Graphite *less* forgiving than collectd or syslog in one place: with 
 wire path. That is the intended way to rename a series, because neither `graphite_in` nor
 `graphite_out` has a `prefix:`/`template:` field; [docs/deploying.md](../deploying.md) says so.
 
-`tail_in`/`docker_in` (`crates/logit-inputs/src/tail/`, `crates/logit-inputs/src/docker.rs`,
-[ADR `file-tailing-and-docker-json-logs`](../adr/file-tailing-and-docker-json-logs.md)) stamp two
-event attributes and a set of resource attributes:
+`tail_in`/`docker_in`/`cri_in` (`crates/logit-inputs/src/tail/`, `crates/logit-inputs/src/docker.rs`,
+`crates/logit-inputs/src/cri.rs`,
+[ADR `file-tailing-and-docker-json-logs`](../adr/file-tailing-and-docker-json-logs.md),
+[ADR `cri-container-logs`](../adr/cri-container-logs.md)) stamp two event attributes and a set of
+resource attributes:
 
 | Attribute | Value | Meaning |
 |---|---|---|
 | `log.file.path` | `Value::Str` | `tail_in` only. The absolute path of the file this line was read from. |
-| `log.iostream` | `Value::Str`: `stdout`\|`stderr` | `docker_in` only. Which of the container's two streams this line came from. `docker_in` has no per-stream filter; a downstream stage, such as a `lua` component reading this attribute, does that. |
+| `log.iostream` | `Value::Str`: `stdout`\|`stderr` | `docker_in` and `cri_in`. Which of the container's two streams this line came from. Neither has a per-stream filter; a downstream stage, such as a `lua` component reading this attribute, does that. |
 
 `docker_in`'s resource carries `container.id`, `container.name`, `container.image.name`,
 `container.image.tags` (a one-element array, absent for an untagged or digest reference), and `container.label.<key>` for
@@ -394,6 +396,22 @@ shape section). `docker_in` reads these from the sibling `config.v2.json` and re
 poll tick when its stat changes, so a `docker rename` reaches the resource within one
 `poll_interval`
 ([ADR `docker-container-identity-and-minimal-watches`](../adr/docker-container-identity-and-minimal-watches.md)).
+
+`cri_in`'s resource carries the Kubernetes semantic-convention keys its file's path names, under
+the kubelet's `/var/log/pods/<namespace>_<pod name>_<pod uid>/<container name>/<restart count>.log`
+layout. The path is this source's wire for the common-keys rule above, so `cri_in` writes them as a
+source writes the keys its protocol defines:
+
+| Attribute | Value | From the path |
+|---|---|---|
+| `k8s.namespace.name` | `Value::Str` | the pod directory's name, up to its first `_` |
+| `k8s.pod.name` | `Value::Str` | the pod directory's name, between its first and second `_` |
+| `k8s.pod.uid` | `Value::Str` | the rest of the pod directory's name, which may hold `_` for a static pod whose manifest sets its uid |
+| `k8s.container.name` | `Value::Str` | the container directory |
+| `k8s.container.restart_count` | `Value::I64` | the file name's `<restart count>`, an integer as the semantic convention types it (signed, so it stays an OTLP integer) |
+
+A rotated file (`<n>.log.<YYYYMMDD-HHMMSS>`) has its live file's resource. `cri_in` writes no
+`host.name` and no `container.id`.
 
 ### HTTP access-log names
 

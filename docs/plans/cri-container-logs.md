@@ -66,13 +66,13 @@ say so.
   splitter's bound dropping its stream's line through its `F`, counted once, under a small
   `max_line_bytes` and under an unlimited containerd piece size; a malformed record flushing both
   streams; `reset` counting per held stream; the idle flush firing on the tick only after a read
-  reached the file's end, never while unread bytes remain, and off under `0s`; event time from the
+  reached the file's end, never while unread bytes remain, and off under `0s`; one stream flushed
+  on time while the other keeps writing, its run still held; event time from the
   first record and the `bad_time` fallback. Driver-level tests on a scratch pods tree: discovery of
   both names and rejection of `.gz`, `.tmp`, and malformed directory names; a rename rotation
   rebinding with no duplicate; a restart resuming the rotated file from its checkpoint; the
-  clean-stop hold. The driver's existing proptests (`driver/verification.rs`,
-  `docker_verification.rs`) will gain a `cri_in` model where the reassembly differs from
-  `docker_in`'s.
+  clean-stop hold. A proptest drives the line splitter, the splitter-drop hook, and `CriDecoder`
+  together against a per-stream model, where the reassembly differs from `docker_in`'s.
 - **W3, `container.id`.** A scratch `containers_dir` of symlinks: a whole id, a cut name, a link
   made after the file is found, and a link removed while the file is still read, with the id kept.
 - **W4, cri-dockerd.** A pods-tree symlink into a scratch Docker container directory: the format
