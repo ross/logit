@@ -361,8 +361,9 @@ a black hole counts what it discards as `events.discarded`.
 15. A sink `buffer.max_batches` or `buffer.max_bytes` of `0`, or `buffer.retry_max_delay` of `0s`
     (a failing head would retry with no pause for as long as it fails).
 16. An `internal` `span_sample_rate` that is non-finite or outside `[0, 1]`.
-17. A non-default `receive:` outside a datagram, stream, or tail listener, or a receive-queue field
-    on a stream or tail listener.
+17. A non-default `receive:` outside a datagram, stream, or tail listener or a `kafka_in`, a
+    receive-queue field on a stream or tail listener, or on a `kafka_in` any `receive:` field but
+    `batch_max_events`, `batch_max_bytes`, and `shutdown_grace`.
 18. A `0` receive-queue or batch-assembly bound (`batch_flush_interval: 0s` is legal).
 19. An empty `trace_context` `trace_id`, `span_id`, or `flags` field name, after `format`'s
     defaults.
@@ -507,6 +508,18 @@ a black hole counts what it discards as `events.discarded`.
 99. An `otlp_in` `auth`, or a `prometheus_in` or `prometheus_out` `bind_auth`, with an empty bearer
     token, username, or password, a bearer token with leading or trailing whitespace, or a basic
     username containing `:`.
+100. A `kafka_in` with an empty `brokers` or an entry that isn't a `host:port`, a `tls` or `sasl`
+     failing 85's checks, an empty `group` or `client_id`, an empty `topics`, a topic that isn't a
+     legal Kafka topic name or that repeats, a `fetch` byte bound or `max_batch_bytes` of `0`, a
+     `fetch.min_bytes` over `fetch.max_bytes`, a `fetch.max_bytes` plus `max_batch_bytes` over
+     2147483647 (the Fetch request's `max_bytes` field), a `fetch.max_wait` not below `timeout`,
+     or a `fetch.max_wait`, `commit_interval`, `drain_timeout`, or `timeout` of `0s`.
+101. A `kafka_in` whose `heartbeat_interval` isn't below `session_timeout`, whose
+     `session_timeout` is over `rebalance_timeout`, or whose `drain_timeout` isn't below
+     `rebalance_timeout`.
+102. A `kafka_in` whose `topics:` shape doesn't match its `format:` (a map under `otlp_proto` or
+     `otlp_json`, a list under the others), an OTLP map with a key other than `logs`, `metrics`,
+     or `traces` or one topic under two keys, or a `record` under any format but `text`.
 
 **Deliberately not validated:** that a `by: {provenance: ..}` route key names a component in *this*
 graph — rule 37's reasoning; the key is as likely to name a component relayed from another process.

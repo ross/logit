@@ -59,8 +59,8 @@
 //!     name; on a `kafka_in`, those and `batch_flush_interval`, by name: Kafka holds its
 //!     backlog, and a fetch's records go out as they arrive (`docs/adr/kafka-input.md`, item 5).
 //! 18. A `receive.max_datagrams`/`max_bytes`/`read_batch` (datagram listeners) or
-//!     `batch_max_events`/`batch_max_bytes` (all three drivers and `kafka_in`) of `0`. `batch_flush_interval: 0s`
-//!     is legal ("no flush timer"); 57 owns `read_batch`'s upper end. A datagram listener's
+//!     `batch_max_events`/`batch_max_bytes` (all three drivers and `kafka_in`) of `0`.
+//!     `batch_flush_interval: 0s` is legal ("no flush timer"); 57 owns `read_batch`'s upper end. A datagram listener's
 //!     `receive.recover_below` outside `(0, 1)`, as rule 15 rejects `buffer.recover_below`.
 //! 19. A `trace_context` with an empty `trace_id`, `span_id`, or `flags` field name, after its
 //!     `format`'s defaults fill the absent ones: it could never match an attribute (`null`, not
@@ -361,8 +361,9 @@
 //!      `sasl` failing 85's checks, an empty `group` or `client_id`, an empty `topics`, a topic
 //!      that isn't a legal Kafka topic name or that repeats, a `fetch` byte bound or
 //!      `max_batch_bytes` of `0`, a `fetch.min_bytes` over `fetch.max_bytes`, a
-//!      `fetch.max_bytes` plus `max_batch_bytes` over `i32::MAX`, the Fetch request's
-//!      `max_bytes` field, a `fetch.max_wait` not below `timeout`, or a
+//!      `fetch.max_bytes` plus `max_batch_bytes` over `i32::MAX`: the consumer reads a Fetch
+//!      answer under their sum plus 1 MiB and asks for it in the request's `i32` `max_bytes`
+//!      field. Also a `fetch.max_wait` not below `timeout`, or a
 //!      `fetch.max_wait`, `commit_interval`, `drain_timeout`, or `timeout` of `0s`
 //!      (`docs/adr/kafka-input.md`, item 14).
 //! 101. A `kafka_in` whose `heartbeat_interval` isn't below `session_timeout`, whose
