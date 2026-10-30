@@ -1005,8 +1005,9 @@ by the number of sinks in the config, including several `influxdb_out`/`stdio_ou
 by different branches.
 
 `buffer.max_batches` (1024 default) is a second, independent bound on an in-memory queue; whichever
-trips first governs. A disk-backed queue drops that bound and uses `buffer.disk.max_bytes` alone
-(graph validation rejects setting both).
+trips first governs. A disk-backed queue drops both bounds and uses `buffer.disk.max_bytes` alone,
+so graph validation rejects setting either beside `buffer.disk:`. The one exception is `s3_out`,
+whose `buffer.max_bytes` still bounds the batches of the object it has open (see [`s3_out`: archiving to S3](#s3_out-archiving-to-s3)).
 
 Size for the worst outage you intend to ride out: make `max_bytes` deep enough to hold a real
 destination outage's worth of data, weighed against the memory or disk you're willing to commit to
@@ -1185,7 +1186,7 @@ counted amount.
 buffer:
   disk:
     path: spool/influxdb_out   # required, resolved relative to this config file's own directory
-    max_bytes: "1GiB"          # bound on the sum of on-disk segment sizes -- replaces buffer.max_bytes
+    max_bytes: "1GiB"          # bound on the sum of on-disk segment sizes -- replaces buffer.max_bytes as the queue's bound
     segment_bytes: "64MiB"     # soft rotation trigger, not a hard cap
     compression: none          # none | lz4
     checkpoint_interval: 1s    # how often the read cursor is persisted during normal operation

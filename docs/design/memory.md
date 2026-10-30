@@ -1218,8 +1218,10 @@ A sink opted into `buffer.disk:` (`docs/adr/disk-backed-sink-buffer.md`) bounds 
 instead: `crates/logit-pipeline/src/disk_queue.rs`'s per-record encoded frame length, summed over
 every segment still on disk. The two figures differ on purpose: disk usage tracks exactly what was
 written, while the in-memory figure is an estimate. A sink's queue is in memory *or* on disk, never
-both, and only one bound applies: `buffer.max_batches`/`max_bytes` are rejected alongside a
-non-default `buffer.disk` (`crates/logit-pipeline/src/graph.rs` rule 35).
+both, and only the disk bound sizes the queue: `buffer.max_batches` is rejected beside
+`buffer.disk`, and so is a non-default `buffer.max_bytes`, except on a sink that collects windows
+(`graph::collects_windows`), where it bounds the open window's decoded batches
+(`crates/logit-pipeline/src/graph.rs` rule 35).
 
 A disk-spooled sink also holds decoded batches in memory: every record read but not yet committed
 sits in `DiskQueue`'s `read_ahead`, so a sink with a window of batches in flight holds up to that
