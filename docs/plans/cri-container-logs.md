@@ -42,7 +42,7 @@ Each workstream will be one PR on branch `cri/w<N>`, stacked on the one before i
 | W3 | `cri/w3` | `container.id` from `containers_dir:` (section 8) | W2 |
 | W4 | `cri/w4` | cri-dockerd: the per-file format latch and the shared Docker decoder (section 9), with its `malformed` counter on `docker_in` too; decide and implement docker's splitter-drop remedy (known-gaps tailing entry) | W2 |
 | W5 | `cri/w5` | recorded fixtures from a real `kind` node (containerd), and from CRI-O where practical, through a new `script/record-fixtures cri` recipe, committed under `testdata/interop/cri/` and replayed by a test | W2 |
-| W6 | `cri/w6` | soak scenario `cri-rotate`: kubelet-style rename, reopen, and gzip rotation, with interleaved `P` and `F` runs on both streams | W2 |
+| W6 | `cri/w6` | soak scenario `cri-rotate`: kubelet-style rename, reopen, and gzip rotation, with interleaved `P` and `F` runs on both streams, from a stdlib writer (`tools/soak/soaklib/criwriter.py`) the ledger reads through a `cri` wire | W2 |
 
 W3 to W6 depend only on W2, but they'll stack in order, so each rebases on one parent.
 
@@ -89,7 +89,11 @@ say so.
   name, reopen the writer, and gzip the previous rotated file, while the SUT runs, is stopped, and
   is killed. The ledger will judge `cri_in`'s lines against the writer's, with a dangling run
   flushed by `partial_timeout` and a run split at a rotation each counted as the ADR says. The
-  writer is W6's choice: a `generate_in` template through `file_out`, or a small writer of its own.
+  writer is a small one of its own, `tools/soak/soaklib/criwriter.py`, since `file_out` can't
+  write CRI records, split a line into pieces, or rotate the kubelet's way. It reports its
+  finished lines in `internal`'s NDJSON grammar, and the soak harness's `cri` wire judges
+  `cri_in`'s events sent, less its `partial_timeout` flushes, against them
+  (`tools/soak/README.md`).
 
 ## Mechanics
 
