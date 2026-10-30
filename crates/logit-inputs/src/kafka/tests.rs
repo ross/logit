@@ -1071,4 +1071,18 @@ fn an_otlp_json_request_on_another_signals_topic_is_undecodable() {
     assert!(why.contains("logs request on topic \"metrics\", mapped to metrics"), "{why}");
     let (decoded, _) = decoder.decode("logs", 0, &kafka_record(1, records[0].0.clone()), 0);
     assert!(matches!(decoded, Decoded::Batches(_)), "{decoded:?}");
+    // The decoder reads the snake_case spelling too, so it's another signal's request as well.
+    let snake =
+        std::str::from_utf8(&records[0].0).unwrap().replace("resourceLogs", "resource_logs");
+    let (decoded, _) = decoder.decode("logs", 0, &kafka_record(2, Bytes::from(snake.clone())), 0);
+    assert!(matches!(decoded, Decoded::Batches(_)), "snake_case reads as logs: {decoded:?}");
+    let (decoded, _) = decoder.decode("metrics", 0, &kafka_record(3, Bytes::from(snake)), 0);
+    let Decoded::Undecodable(why) = decoded else { panic!("snake_case: {decoded:?}") };
+    assert!(why.contains("logs request"), "{why}");
+    // An empty list carried nothing.
+    for empty in [&br#"{"resourceLogs":[]}"#[..], br#"{"resource_logs":[]}"#] {
+        let record = kafka_record(4, Bytes::from_static(empty));
+        let (decoded, _) = decoder.decode("metrics", 0, &record, 0);
+        assert!(matches!(decoded, Decoded::Skipped("empty")), "{decoded:?}");
+    }
 }

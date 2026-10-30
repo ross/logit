@@ -185,11 +185,12 @@ Entry format and the other areas: [the known-gaps index](README.md).
     only the partition holding the batch stays held, is the open remedy short of that.
 - **`kafka_in` skips a corrupt batch to the high watermark when nothing verified follows it.**
   A batch that fails its CRC twice, or doesn't decompress or parse, gives no trustworthy length
-  or last offset, so the skip lands on the next batch in the answer whose CRC passes, else on the
-  base offset in the first 12 bytes of a batch the answer cut short, when it's above the corrupt
-  batch's base and at or below the high watermark. When neither follows even after a refetch with
-  `max_batch_bytes` of room for that partition, the skip lands on the high watermark, or the last
-  stable offset under `read_committed` ([ADR `kafka-input`](../adr/kafka-input.md), item 9).
+  or last offset. The skip lands on an offset above the corrupt batch's base and at or below the
+  high watermark: the next batch in the answer whose CRC passes, else the base offset in the
+  first 12 bytes of a batch the answer cut short. When neither falls in that range even after a
+  refetch with `max_batch_bytes` of room for that partition, the skip lands on the high
+  watermark, or the last stable offset under `read_committed`
+  ([ADR `kafka-input`](../adr/kafka-input.md), item 9).
   - **Consequence:** every record between the corrupt batch and the high watermark is counted
     `logit.input.records.dropped{reason="corrupt"}` and not read, good batches included, when no
     batch after the corrupt one starts within `max_batch_bytes` of it.

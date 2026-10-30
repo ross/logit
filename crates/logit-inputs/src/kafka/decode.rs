@@ -286,19 +286,76 @@ fn signal_name(signal: Signal) -> &'static str {
     }
 }
 
-/// The signal of an OTLP/JSON request whose top-level key names another signal than `mapped`.
-/// OTLP/JSON ignores a field it doesn't know, so such a request decodes to nothing under the
-/// topic's signal; read as `empty` it would be committed past with no loss counted. Called only
-/// for a request that decoded to no event.
+/// The signal of an OTLP/JSON request whose top-level resource list for another signal than
+/// `mapped` holds an entry, under either spelling `logit_proto`'s OTLP/JSON decoder reads
+/// (`resourceLogs` or `resource_logs`, and so on). OTLP/JSON ignores a field it doesn't know, so
+/// such a request decodes to nothing under the topic's signal; read as `empty` it would be
+/// committed past with no loss counted. An empty list carried nothing and stays `empty`. Called
+/// only for a request that decoded to no event.
 fn other_otlp_json_signal(value: &Bytes, mapped: Signal) -> Option<&'static str> {
-    let keys: std::collections::HashMap<String, serde::de::IgnoredAny> =
-        serde_json::from_slice(value).ok()?;
+    let keys: std::collections::HashMap<String, Carries> = serde_json::from_slice(value).ok()?;
+    let carries = |key: &str| keys.get(key).is_some_and(|c| c.0);
     [
-        ("resourceLogs", Signal::Logs),
-        ("resourceMetrics", Signal::Metrics),
-        ("resourceSpans", Signal::Traces),
+        ("resourceLogs", "resource_logs", Signal::Logs),
+        ("resourceMetrics", "resource_metrics", Signal::Metrics),
+        ("resourceSpans", "resource_spans", Signal::Traces),
     ]
     .into_iter()
-    .find(|&(key, signal)| signal != mapped && keys.contains_key(key))
-    .map(|(_, signal)| signal_name(signal))
+    .find(|&(camel, snake, signal)| signal != mapped && (carries(camel) || carries(snake)))
+    .map(|(_, _, signal)| signal_name(signal))
+}
+
+/// Whether a JSON value is an array with an entry; any other value reads `false`.
+struct Carries(bool);
+
+impl<'de> serde::Deserialize<'de> for Carries {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(CarriesVisitor)
+    }
+}
+
+struct CarriesVisitor;
+
+impl<'de> serde::de::Visitor<'de> for CarriesVisitor {
+    type Value = Carries;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("any JSON value")
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Carries, A::Error> {
+        let mut any = false;
+        while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+            any = true;
+        }
+        Ok(Carries(any))
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<Carries, A::Error> {
+        serde::de::IgnoredAny.visit_map(map).map(|_| Carries(false))
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<Carries, E> {
+        Ok(Carries(false))
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<Carries, E> {
+        Ok(Carries(false))
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<Carries, E> {
+        Ok(Carries(false))
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<Carries, E> {
+        Ok(Carries(false))
+    }
+
+    fn visit_str<E>(self, _: &str) -> Result<Carries, E> {
+        Ok(Carries(false))
+    }
+
+    fn visit_unit<E>(self) -> Result<Carries, E> {
+        Ok(Carries(false))
+    }
 }
