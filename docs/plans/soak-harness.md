@@ -5226,6 +5226,9 @@ run's table; the scenario's default is 4 hours.
   end. `fds` less `files.open` was 15 at nearly every drain, so the process holds 15
   descriptors besides its files, and `fds-bounded`'s 26 is 15 plus `files-open-bounded`'s 10
   plus one.
+  Since `0b9bc6a7` (the signal handlers on a runtime of their own, so `runtime.workers` can size
+  the pipeline's), every process holds 4 more (two epoll instances, an eventfd, and a socket):
+  19 besides its files at nearly every drain and at most 20, so `fds-bounded` is 31.
 - **The wait for G held 200 short.** The end sequence read G from the writer's chunk, and the
   tailers' W stopped at 1,206,000 after four reads, the kills' net −200. Against the shared
   count of 324,200 it would have returned at its first read.
