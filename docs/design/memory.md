@@ -1183,7 +1183,7 @@ Batch size is bounded where batches are assembled. A listener that builds batche
 datagrams, lines, or file records does it through a `BatchAccumulator` bounded by config-visible
 `batch_max_events`/`batch_max_bytes`: a UDP listener's `receive.batch_max_events`/`batch_max_bytes`,
 each connection on the shared TCP stream driver (`crates/logit-inputs/src/tcp.rs`), and each file
-`tail_in`/`docker_in` tracks (`docs/adr/file-tailing-and-docker-json-logs.md`). So one 65 KB syslog
+`tail_in`/`docker_in`/`cri_in` tracks (`docs/adr/file-tailing-and-docker-json-logs.md`). So one 65 KB syslog
 datagram that decodes to hundreds of events, or a TCP read of any size, still leaves the listener as
 bounded batches. A listener that receives a whole batch per request or frame (`otlp_in`,
 `logit_in`) passes on what the sender sent, sized by the sender.

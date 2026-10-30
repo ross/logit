@@ -12,6 +12,7 @@ backend later is an edit to `logit.yaml`, not a change to every application and 
 | [canonical](canonical/logit.yaml) ([graph](canonical/graph.svg)) | DogStatsD, syslog (with an nginx access-log branch), OTLP over gRPC and HTTP | Datadog, VictoriaMetrics, Loki, Tempo |
 | [lua](lua/logit.yaml) ([graph](lua/graph.svg), [script](lua/process.lua)) | An application's logfmt request log over syslog, processed by a Lua script | A syslog alert receiver, a syslog archive, and per-route metrics on stdout |
 | forwarding: [edge](forwarding/edge.yaml) ([graph](forwarding/edge.svg)) and [central](forwarding/central.yaml) ([graph](forwarding/central.svg)) | statsd and syslog at each edge, forwarded to the central node over the native transport | VictoriaMetrics, Loki, Tempo, from the central node |
+| [kubernetes](kubernetes/logit.yaml) ([graph](kubernetes/graph.svg), [README](kubernetes/README.md)) | Every container's log on a Kubernetes node, from `/var/log/pods`, run as a DaemonSet | Loki, with each line's pod and container |
 | [prusa](prusa/logit.yaml) ([graph](prusa/graph.svg), [script](prusa/prusa.lua), [README](prusa/README.md)) | Prusa printer metrics, InfluxDB line protocol inside syslog datagrams, processed by a Lua script | InfluxDB 2.x, one point per metric |
 | [s3](s3/logit.yaml) ([graph](s3/graph.svg)) | syslog and OTLP/HTTP logs | An S3 bucket, as gzipped JSON lines, one object per five minutes or 32 MiB |
 
@@ -27,6 +28,7 @@ DD_API_KEY=... logit validate examples/canonical/logit.yaml
 logit validate examples/lua/logit.yaml
 logit validate examples/forwarding/edge.yaml
 logit validate examples/forwarding/central.yaml
+NODE_NAME=node-1 logit validate examples/kubernetes/logit.yaml
 INFLUXDB_TOKEN=... logit validate examples/prusa/logit.yaml
 logit validate examples/s3/logit.yaml
 ```
