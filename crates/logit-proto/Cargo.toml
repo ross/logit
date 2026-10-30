@@ -48,8 +48,13 @@ serde.workspace = true
 # prometheus/compression.rs, which the remote-write sink and receiver share.
 snap.workspace = true
 ruzstd.workspace = true
-# OTLP/gRPC and OTLP/HTTP gzip bodies, through otlp/grpc.rs's `inflate_bounded`.
+# OTLP/gRPC and OTLP/HTTP gzip bodies, through otlp/grpc.rs's `inflate_bounded`, and Kafka's
+# gzip record batches.
 flate2.workspace = true
+# Kafka's record batch v2 (kafka/batch.rs) and the hook its five codecs run through
+# (docs/adr/kafka-input.md, item 1). `snap` and `ruzstd` above are its Snappy and zstd codecs and
+# `lz4_flex`'s `frame` feature its LZ4.
+kafka-protocol.workspace = true
 
 [dev-dependencies]
 # Generated corpora for the property tests (most of tests/*_fixed_point.rs, src/otlp/metrics.rs).

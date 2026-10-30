@@ -1,27 +1,25 @@
-//! SASL authentication for `kafka_out`'s broker connections (`docs/adr/kafka-sasl.md`).
+//! SASL authentication for Kafka broker connections (`docs/adr/kafka-sasl.md`).
 //!
-//! One [`Authenticator`] is built per sink from its `sasl:` block and shared by every
-//! connection. After `ApiVersions`, `super::conn::Dialer::connect` runs [`authenticate`]:
+//! One [`Authenticator`] is built per component from its `sasl:` block and shared by every
+//! connection. After `ApiVersions`, [`crate::conn::Dialer::connect`] runs [`authenticate`]:
 //! `SaslHandshake` v1 naming the mechanism, then [`Authenticator::start`] for a [`Session`], then
 //! one `SaslAuthenticate` per client message the session writes until it reports
 //! [`Step::Done`]. `start` is async and takes the broker's host so a mechanism can fetch a token
 //! or credentials, cache them in the authenticator across connections, or read a region from
 //! the host; a session only computes.
 //!
-//! A failure's class follows the module doc's table (`super`, "Response classes"): a transport
-//! failure during the exchange is `Clean`, because no produce byte has been written on the
-//! connection, and a broker's refusal or a server message the mechanism rejects is `Refused`. A
-//! session's own error is `Refused` unless it carries a class. A broker's error code on any
-//! `SaslAuthenticate` reaches the session through [`Session::refused`]. Every message names the
-//! mechanism and [`Authenticator::principal`], never a secret, and adds [`Session::failure`] to a
-//! broker's refusal.
+//! A failure's class follows `kafka_out`'s table (`crates/logit-outputs/src/kafka/mod.rs`,
+//! "Response classes"): a transport failure during the exchange is `Clean`, because no produce
+//! byte has been written on the connection, and a broker's refusal or a server message the
+//! mechanism rejects is `Refused`. A session's own error is `Refused` unless it carries a class.
+//! A broker's error code on any `SaslAuthenticate` reaches the session through
+//! [`Session::refused`]. Every message names the mechanism and [`Authenticator::principal`],
+//! never a secret, and adds [`Session::failure`] to a broker's refusal.
 
-mod aws_creds;
 mod msk_iam;
 mod oauth;
 mod plain;
 mod scram;
-mod sigv4;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,17 +31,17 @@ use kafka_protocol::protocol::StrBytes;
 use logit_pipeline::Fault;
 use tokio::time::Instant;
 
-use super::conn::{Conn, SASL_HANDSHAKE_VERSION};
-use super::fault;
+use crate::conn::{Conn, SASL_HANDSHAKE_VERSION};
+use crate::error;
 
-#[cfg(test)]
-pub(crate) use aws_creds::{Endpoints, Env};
-#[cfg(test)]
-pub(crate) use scram::{escape_username, ScramHash};
-#[cfg(test)]
-pub(crate) use sigv4::{AmzDate, Signer};
+#[cfg(any(test, feature = "test-util"))]
+pub use logit_aws::creds::{Endpoints, Env};
+#[cfg(any(test, feature = "test-util"))]
+pub use logit_aws::sigv4::{AmzDate, Signer};
+#[cfg(any(test, feature = "test-util"))]
+pub use scram::{escape_username, ScramHash};
 
-/// A `kafka_out` sink's SASL credentials. Mirrors `logit_config::KafkaSasl`; its `Debug` leaves
+/// A Kafka component's SASL credentials. Mirrors `logit_config::KafkaSasl`; its `Debug` leaves
 /// the password, the token, and the client secret out. `AwsMskIam` holds no secret: its
 /// credentials come from the AWS credential chain when a connection is dialed.
 #[derive(Clone, PartialEq, Eq)]
@@ -123,7 +121,7 @@ impl std::fmt::Debug for OAuthToken {
 }
 
 /// The [`Authenticator`] for `settings`. `timeout` bounds each token or credential request.
-pub(crate) fn authenticator(settings: &KafkaSasl, timeout: Duration) -> Arc<dyn Authenticator> {
+pub fn authenticator(settings: &KafkaSasl, timeout: Duration) -> Arc<dyn Authenticator> {
     match settings.clone() {
         KafkaSasl::Plain { username, password } => Arc::new(plain::Plain { username, password }),
         KafkaSasl::ScramSha256 { username, password } => {
@@ -147,14 +145,14 @@ pub(crate) fn authenticator(settings: &KafkaSasl, timeout: Duration) -> Arc<dyn 
             timeout,
         )),
         KafkaSasl::AwsMskIam { region } => {
-            Arc::new(msk_iam::MskIam::new(region, aws_creds::Chain::new(timeout)))
+            Arc::new(msk_iam::MskIam::new(region, logit_aws::creds::Chain::new(timeout)))
         }
     }
 }
 
 /// An `AWS_MSK_IAM` [`Authenticator`] whose credential chain reads `env` and asks `endpoints`.
-#[cfg(test)]
-pub(crate) fn msk_iam_with(
+#[cfg(any(test, feature = "test-util"))]
+pub fn msk_iam_with(
     region: Option<&str>,
     env: Env,
     endpoints: Endpoints,
@@ -162,13 +160,13 @@ pub(crate) fn msk_iam_with(
 ) -> Arc<dyn Authenticator> {
     Arc::new(msk_iam::MskIam::new(
         region.map(String::from),
-        aws_creds::Chain::with(env, endpoints, timeout),
+        logit_aws::creds::Chain::with(env, endpoints, timeout),
     ))
 }
 
 /// What a [`Session`] asks for after reading the broker's answer.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Step {
+pub enum Step {
     /// Send this client message in the next `SaslAuthenticate`.
     Send(Vec<u8>),
     /// The mechanism has finished and the connection is authenticated.
@@ -177,7 +175,7 @@ pub(crate) enum Step {
 
 /// A SASL mechanism, shared by every connection of one sink.
 #[async_trait::async_trait]
-pub(crate) trait Authenticator: Send + Sync {
+pub trait Authenticator: Send + Sync {
     /// The name `SaslHandshake` carries, such as `SCRAM-SHA-256`.
     fn mechanism(&self) -> &'static str;
 
@@ -194,7 +192,7 @@ pub(crate) trait Authenticator: Send + Sync {
 }
 
 /// One connection's exchange: the client's side of a mechanism's messages.
-pub(crate) trait Session: Send {
+pub trait Session: Send {
     /// The first client message.
     fn first(&mut self) -> anyhow::Result<Vec<u8>>;
 
@@ -229,7 +227,7 @@ fn classed(err: anyhow::Error, default: Fault) -> anyhow::Error {
 /// `version`. Returns when the session ends and its lifetime, if the broker gave it one,
 /// measured from the moment before the last `SaslAuthenticate` was written: no later than the
 /// broker's own start of the session.
-pub(crate) async fn authenticate(
+pub async fn authenticate(
     conn: &mut Conn,
     auth: &dyn Authenticator,
     version: i16,
@@ -246,14 +244,14 @@ pub(crate) async fn authenticate(
         .map_err(|err| err.error)
         .with_context(|| format!("{who}: SaslHandshake with {broker}"))
         .context(Fault::Clean)?;
-    if handshake.error_code != fault::code::NONE {
+    if handshake.error_code != error::code::NONE {
         let offered: Vec<&str> = handshake.mechanisms.iter().map(|m| m.as_str()).collect();
         return Err(anyhow!(
             "{who}: {broker} answered SaslHandshake {}; it offers [{}]",
-            fault::name(handshake.error_code),
+            error::name(handshake.error_code),
             offered.join(", ")
         ))
-        .context(fault::classify_sasl(handshake.error_code));
+        .context(error::classify_sasl(handshake.error_code));
     }
 
     let mut session = auth
@@ -276,7 +274,7 @@ pub(crate) async fn authenticate(
             .map_err(|err| err.error)
             .with_context(|| format!("{who}: SaslAuthenticate with {broker}"))
             .context(Fault::Clean)?;
-        if response.error_code != fault::code::NONE {
+        if response.error_code != error::code::NONE {
             session.refused();
             let mut detail =
                 response.error_message.as_ref().map(|m| format!(": {m}")).unwrap_or_default();
@@ -285,9 +283,9 @@ pub(crate) async fn authenticate(
             }
             return Err(anyhow!(
                 "{who}: {broker} answered SaslAuthenticate {}{detail}",
-                fault::name(response.error_code)
+                error::name(response.error_code)
             ))
-            .context(fault::classify_sasl(response.error_code));
+            .context(error::classify_sasl(response.error_code));
         }
         match session.next(&response.auth_bytes).map_err(refused)? {
             Step::Send(next) => message = next,

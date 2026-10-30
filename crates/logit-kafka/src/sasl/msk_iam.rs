@@ -3,7 +3,7 @@
 //!
 //! The object is the query of a SigV4 presigned `GET https://<broker host>/?Action=
 //! kafka-cluster:Connect` for service `kafka-cluster`, valid 900 seconds, with `host` the one
-//! signed header and an empty payload ([`super::sigv4::Signer::presign`]). Each query parameter
+//! signed header and an empty payload ([`logit_aws::sigv4::Signer::presign`]). Each query parameter
 //! becomes a key in lowercase with its value as it is, not percent-encoded, beside `version`
 //! (`2020_10_22`), `host` (the broker's host, as the connection names it), and `user-agent`:
 //!
@@ -26,33 +26,33 @@
 //! `boot-x.c1.kafka-serverless.us-west-2.amazonaws.com`, `.amazonaws.com.cn`, `.api.aws`), which
 //! are the `aws`, `aws-cn`, and `aws-us-gov` partitions' domains only
 //! (`docs/known-gaps/kafka.md`), else `AWS_REGION` or `AWS_DEFAULT_REGION`. With none, the
-//! exchange is `Refused`. Credentials come from [`super::aws_creds::Chain`].
+//! exchange is `Refused`. Credentials come from [`logit_aws::creds::Chain`].
 
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context};
 use logit_pipeline::Fault;
 
-use super::aws_creds::{Chain, Credentials};
-use super::sigv4::{AmzDate, Signer};
 use super::{Authenticator, Session, Step};
+use logit_aws::creds::{Chain, Credentials};
+use logit_aws::sigv4::{AmzDate, Signer};
 
 /// The payload version `aws-msk-iam-auth` sends.
-pub(crate) const VERSION: &str = "2020_10_22";
+pub const VERSION: &str = "2020_10_22";
 
 /// The action every payload asks for.
-pub(crate) const ACTION: &str = "kafka-cluster:Connect";
+pub const ACTION: &str = "kafka-cluster:Connect";
 
 /// The service the signature is scoped to.
-pub(crate) const SERVICE: &str = "kafka-cluster";
+pub const SERVICE: &str = "kafka-cluster";
 
 /// How long the presigned query is valid, `aws-msk-iam-auth`'s 15 minutes.
-pub(crate) const EXPIRES_SECS: u32 = 900;
+pub const EXPIRES_SECS: u32 = 900;
 
 /// The domains MSK brokers are named under, the region's label immediately before each.
 const AWS_DOMAINS: &[&str] = &[".amazonaws.com", ".amazonaws.com.cn", ".api.aws"];
 
-pub(crate) struct MskIam {
+pub struct MskIam {
     region: Option<String>,
     chain: Arc<Chain>,
     /// Where the last credentials came from, for messages.
@@ -60,7 +60,7 @@ pub(crate) struct MskIam {
 }
 
 impl MskIam {
-    pub(crate) fn new(region: Option<String>, chain: Chain) -> Self {
+    pub fn new(region: Option<String>, chain: Chain) -> Self {
         Self { region, chain: Arc::new(chain), source: Mutex::new(None) }
     }
 
@@ -109,12 +109,7 @@ impl Authenticator for MskIam {
 }
 
 /// The client message for a broker at `host` in `region`, signed with `credentials` at `date`.
-pub(crate) fn payload(
-    credentials: &Credentials,
-    host: &str,
-    region: &str,
-    date: &AmzDate,
-) -> Vec<u8> {
+pub fn payload(credentials: &Credentials, host: &str, region: &str, date: &AmzDate) -> Vec<u8> {
     let signer = Signer {
         access_key_id: &credentials.access_key_id,
         secret_access_key: &credentials.secret_access_key,
@@ -140,7 +135,7 @@ pub(crate) fn payload(
 
 /// The region label immediately before an AWS domain at the end of `host`, when it has a
 /// region's shape.
-pub(crate) fn region_from_host(host: &str) -> Option<String> {
+pub fn region_from_host(host: &str) -> Option<String> {
     let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
     AWS_DOMAINS.iter().find_map(|domain| {
         let rest = host.strip_suffix(domain)?;
@@ -151,7 +146,7 @@ pub(crate) fn region_from_host(host: &str) -> Option<String> {
 
 /// An AWS region's shape: a two-letter prefix, one or more words, and a number, such as
 /// `us-east-1` or `us-gov-west-1`.
-pub(crate) fn is_region(region: &str) -> bool {
+pub fn is_region(region: &str) -> bool {
     let parts: Vec<&str> = region.split('-').collect();
     parts.len() >= 3
         && parts[0].len() == 2
@@ -277,7 +272,7 @@ mod tests {
             credentials: Arc::new(credentials(None)),
             chain: Arc::new(Chain::with(
                 Arc::new(|_| None),
-                super::super::aws_creds::Endpoints::default(),
+                logit_aws::creds::Endpoints::default(),
                 std::time::Duration::from_secs(1),
             )),
         };

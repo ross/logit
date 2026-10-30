@@ -8,6 +8,9 @@ description = "Per-protocol listeners implementing logit-pipeline's Input trait.
 
 [dependencies]
 logit-core.workspace = true
+# kafka_in's broker connection, SASL, and error codes, shared with kafka_out
+# (docs/adr/kafka-input.md, item 1).
+logit-kafka.workspace = true
 logit-pipeline.workspace = true
 logit-proto.workspace = true
 anyhow.workspace = true

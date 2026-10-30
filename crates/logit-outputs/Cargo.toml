@@ -8,6 +8,9 @@ description = "Per-protocol sinks implementing logit-pipeline's Output trait (In
 
 [dependencies]
 logit-core.workspace = true
+logit-aws.workspace = true
+# kafka_out's broker connection, SASL, and error codes, shared with kafka_in.
+logit-kafka.workspace = true
 logit-pipeline.workspace = true
 logit-proto.workspace = true
 anyhow.workspace = true
@@ -22,16 +25,11 @@ hyper-util.workspace = true
 tower-service.workspace = true
 http.workspace = true
 http-body-util.workspace = true
-# otlp_out's optional gzip (docs/adr/otlp-compression-and-decompression-bounds.md), and
-# kafka_out's gzip record batches (docs/adr/kafka-output.md, item 1).
+# otlp_out's optional gzip (docs/adr/otlp-compression-and-decompression-bounds.md).
 flate2.workspace = true
-# kafka_out (docs/adr/kafka-output.md, item 1): the protocol codecs and record batch v2, and the
-# three other codecs it compresses through the crate's hook: raw snappy, an LZ4 frame, and zstd.
-# `broker` is for the tests' fake broker; the crate has no feature finer than that to gate on.
+# kafka_out's request codecs (docs/adr/kafka-output.md, item 1). Record batch v2 and its
+# compression are `logit_proto::kafka`'s.
 kafka-protocol.workspace = true
-snap.workspace = true
-lz4_flex.workspace = true
-ruzstd.workspace = true
 # otlp_out TLS on both transports (docs/adr/otlp-tls-and-pooled-grpc-client.md): the
 # `rustls::ClientConfig` `logit_pipeline::tls::build_client_config` builds, wrapped around
 # `hyper-util`'s pooled gRPC client by `hyper-rustls`; `webpki-roots` is the Mozilla root set
@@ -53,6 +51,11 @@ tokio.workspace = true
 tokio-rustls.workspace = true
 
 [dev-dependencies]
+# `HttpStub`, the stand-in for STS, the container endpoint, and IMDS in `kafka_out`'s tests.
+logit-aws = { workspace = true, features = ["test-util"] }
+# The fake broker `kafka_out`'s tests run against, and the `FakeStream` the stream sinks' tests
+# script.
+logit-kafka = { workspace = true, features = ["test-util"] }
 # Arms `logit_pipeline::fault` and compiles `logit_pipeline::test_util` in this crate's tests.
 # Dev-only, so the release binary never has either.
 logit-pipeline = { workspace = true, features = ["fault-injection", "test-util"] }
@@ -67,6 +70,8 @@ logit-inputs.workspace = true
 # TLS tests assert on the `insecure_skip_verify` warning, which reaches only `tracing`. Dev-only:
 # `logit-outputs` never installs a subscriber itself.
 tracing-subscriber.workspace = true
+# Remote-write sender tests undo the Snappy body they capture.
+snap.workspace = true
 # Codec fixed-point property tests (`decode(encode(decode(x))) == decode(x)`).
 proptest.workspace = true
 # `msgpack`'s parity test reads an NDJSON line into a tree that keeps each object's key order,

@@ -38,13 +38,13 @@ const GS2_HEADER_B64: &str = "biws";
 
 /// The hash a SCRAM mechanism is built on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ScramHash {
+pub enum ScramHash {
     Sha256,
     Sha512,
 }
 
 impl ScramHash {
-    pub(crate) fn mechanism(self) -> &'static str {
+    pub fn mechanism(self) -> &'static str {
         match self {
             ScramHash::Sha256 => "SCRAM-SHA-256",
             ScramHash::Sha512 => "SCRAM-SHA-512",
@@ -59,7 +59,7 @@ impl ScramHash {
     }
 
     /// RFC 5802's `Hi(password, salt, iterations)`: PBKDF2 with this hash's HMAC.
-    pub(crate) fn salted_password(self, password: &str, salt: &[u8], iterations: u32) -> Vec<u8> {
+    pub fn salted_password(self, password: &str, salt: &[u8], iterations: u32) -> Vec<u8> {
         let (algorithm, len) = match self {
             ScramHash::Sha256 => (pbkdf2::PBKDF2_HMAC_SHA256, digest::SHA256_OUTPUT_LEN),
             ScramHash::Sha512 => (pbkdf2::PBKDF2_HMAC_SHA512, digest::SHA512_OUTPUT_LEN),
@@ -70,15 +70,15 @@ impl ScramHash {
         out
     }
 
-    pub(crate) fn key(self, key: &[u8]) -> hmac::Key {
+    pub fn key(self, key: &[u8]) -> hmac::Key {
         hmac::Key::new(self.hmac_algorithm(), key)
     }
 
-    pub(crate) fn hmac(self, key: &[u8], data: &[u8]) -> Vec<u8> {
+    pub fn hmac(self, key: &[u8], data: &[u8]) -> Vec<u8> {
         hmac::sign(&self.key(key), data).as_ref().to_vec()
     }
 
-    pub(crate) fn hash(self, data: &[u8]) -> Vec<u8> {
+    pub fn hash(self, data: &[u8]) -> Vec<u8> {
         let algorithm = match self {
             ScramHash::Sha256 => &digest::SHA256,
             ScramHash::Sha512 => &digest::SHA512,
@@ -88,14 +88,14 @@ impl ScramHash {
 }
 
 /// RFC 5802's `saslname`: `=` as `=3D`, `,` as `=2C`.
-pub(crate) fn escape_username(username: &str) -> String {
+pub fn escape_username(username: &str) -> String {
     username.replace('=', "=3D").replace(',', "=2C")
 }
 
-pub(crate) struct Scram {
-    pub(crate) hash: ScramHash,
-    pub(crate) username: String,
-    pub(crate) password: String,
+pub struct Scram {
+    pub hash: ScramHash,
+    pub username: String,
+    pub password: String,
 }
 
 #[async_trait::async_trait]
@@ -138,7 +138,7 @@ enum State {
 }
 
 /// One connection's SCRAM exchange.
-pub(crate) struct ScramSession {
+pub struct ScramSession {
     hash: ScramHash,
     username: String,
     password: String,
@@ -148,7 +148,7 @@ pub(crate) struct ScramSession {
 
 impl ScramSession {
     /// A session whose client nonce is `nonce`; a test pins it to reproduce a published exchange.
-    pub(crate) fn new(hash: ScramHash, username: &str, password: &str, nonce: String) -> Self {
+    pub fn new(hash: ScramHash, username: &str, password: &str, nonce: String) -> Self {
         Self {
             hash,
             username: escape_username(username),

@@ -8,15 +8,16 @@
 //! (`docs/adr/kafka-output.md`, item 5's transport rows). A connection that failed a request is
 //! finished: the caller drops it, because its framing position is unknown.
 //!
-//! Version negotiation (item 8): `Produce` takes the highest version both sides support within
-//! v3 to v12, reading the broker's advertised minimum as no constraint, because a 4.x broker
-//! advertises v0 and rejects anything below v3. `Metadata` takes the highest within v4 (the first
-//! with `allow_auto_topic_creation`) to v12, and `InitProducerId` the highest within v0 to v5.
-//! With `sasl:` set, the broker must offer `SaslHandshake` v1, and `SaslAuthenticate` takes the
-//! highest within v0 to v2.
+//! Version negotiation (`docs/adr/kafka-output.md`, item 8): [`API_RANGES`] has a row per API
+//! `logit` sends, and each API takes the highest version both sides support within its row.
+//! `Produce` reads the broker's advertised minimum as no constraint, because a 4.x broker
+//! advertises v0 and rejects anything below v3. A broker without a version of an API the
+//! [`Dialer`] requires is `Refused`; any other API it lacks is `None` in [`Versions`]. With
+//! `sasl:` set, the broker must offer `SaslHandshake` v1 and a `SaslAuthenticate` version.
+//! `ApiVersions` itself is v3 alone.
 //!
 //! SASL (`docs/adr/kafka-sasl.md`): [`Dialer::connect`] authenticates the connection through
-//! `super::sasl` before returning it. A broker that sets `connections.max.reauth.ms` gives the
+//! [`crate::sasl`] before returning it. A broker that sets `connections.max.reauth.ms` gives the
 //! session a lifetime and closes the connection on the first request after it ends, so the
 //! connection gets a deadline ([`reauth_deadline`]) and [`Conn::is_open`] reads it as closed
 //! from then on, which makes the producer dial a new one instead of re-authenticating in band.
@@ -38,53 +39,87 @@ use tokio::net::TcpStream;
 use tokio::time::{timeout, timeout_at, Instant};
 use tokio_rustls::TlsConnector;
 
-use super::fault;
-use super::sasl::{self, Authenticator};
-use crate::tls::{poll_pending_close, AsyncStream, PendingClose};
+use logit_pipeline::tls::{poll_pending_close, AsyncStream, PendingClose};
 
-/// The `Produce` versions `kafka_out` sends.
-pub(crate) const PRODUCE_VERSIONS: RangeInclusive<i16> = 3..=12;
-const METADATA_VERSIONS: RangeInclusive<i16> = 4..=12;
-const INIT_PRODUCER_ID_VERSIONS: RangeInclusive<i16> = 0..=5;
-const SASL_AUTHENTICATE_VERSIONS: RangeInclusive<i16> = 0..=2;
-/// The `SaslHandshake` version `kafka_out` sends: v1, whose exchange runs in `SaslAuthenticate`
+use crate::error;
+use crate::sasl::{self, Authenticator};
+
+/// The `SaslHandshake` version `logit` sends: v1, whose exchange runs in `SaslAuthenticate`
 /// requests instead of raw frames.
-pub(crate) const SASL_HANDSHAKE_VERSION: i16 = 1;
+pub const SASL_HANDSHAKE_VERSION: i16 = 1;
+
+/// The versions of one API that `logit` sends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiRange {
+    pub key: ApiKey,
+    pub versions: RangeInclusive<i16>,
+    /// Whether the broker's advertised minimum constrains the choice. `false` takes the highest
+    /// version up to the broker's maximum even below its advertised minimum.
+    pub broker_min_counts: bool,
+}
+
+/// Every API `logit` sends after `ApiVersions`, one row each.
+pub const API_RANGES: [ApiRange; 5] = [
+    ApiRange { key: ApiKey::Produce, versions: 3..=12, broker_min_counts: false },
+    // v4 is the first with `allow_auto_topic_creation`.
+    ApiRange { key: ApiKey::Metadata, versions: 4..=12, broker_min_counts: true },
+    ApiRange { key: ApiKey::InitProducerId, versions: 0..=5, broker_min_counts: true },
+    ApiRange {
+        key: ApiKey::SaslHandshake,
+        versions: SASL_HANDSHAKE_VERSION..=SASL_HANDSHAKE_VERSION,
+        broker_min_counts: true,
+    },
+    ApiRange { key: ApiKey::SaslAuthenticate, versions: 0..=2, broker_min_counts: true },
+];
 /// The first flexible `ApiVersions` version, which every 2.4 or later broker answers.
 const API_VERSIONS_VERSION: i16 = 3;
 /// The first `Produce` version that can carry zstd.
-pub(crate) const PRODUCE_ZSTD_MIN: i16 = 7;
+pub const PRODUCE_ZSTD_MIN: i16 = 7;
 /// The first `Produce` version whose response names records in `record_errors`.
-pub(crate) const PRODUCE_RECORD_ERRORS_MIN: i16 = 8;
+pub const PRODUCE_RECORD_ERRORS_MIN: i16 = 8;
 /// A response size no broker answer to these four requests comes near; a larger length prefix
 /// is a framing error, not an allocation to make.
 const MAX_RESPONSE_BYTES: usize = 64 << 20;
 
-/// What every connection of one producer shares.
+/// What every connection of one client shares.
 #[derive(Clone)]
-pub(crate) struct Dialer {
-    pub(crate) tls: Option<Arc<rustls::ClientConfig>>,
-    pub(crate) timeout: Duration,
-    pub(crate) client_id: StrBytes,
-    pub(crate) sasl: Option<Arc<dyn Authenticator>>,
+pub struct Dialer {
+    pub tls: Option<Arc<rustls::ClientConfig>>,
+    pub timeout: Duration,
+    pub client_id: StrBytes,
+    pub sasl: Option<Arc<dyn Authenticator>>,
+    /// The APIs a broker must offer in a version of their [`API_RANGES`] row; a broker that
+    /// doesn't is `Refused`.
+    pub required: &'static [ApiKey],
 }
 
-/// The versions one connection negotiated.
+/// The versions one connection negotiated, one per [`API_RANGES`] row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Versions {
-    pub(crate) produce: i16,
-    pub(crate) metadata: i16,
-    pub(crate) init_producer_id: i16,
-    /// `None` when the broker doesn't offer `SaslHandshake` v1 and a `SaslAuthenticate` version
-    /// `kafka_out` sends, which matters only with `sasl:` set.
-    pub(crate) sasl_authenticate: Option<i16>,
+pub struct Versions([Option<i16>; API_RANGES.len()]);
+
+impl Versions {
+    /// Nothing negotiated.
+    const NONE: Versions = Versions([None; API_RANGES.len()]);
+
+    /// The version to send `key` at, or `None` when the broker offers none in its
+    /// [`API_RANGES`] row, or the table has no row for it. A key the [`Dialer`] requires always
+    /// has one.
+    pub fn for_key(&self, key: ApiKey) -> Option<i16> {
+        API_RANGES.iter().position(|row| row.key == key).and_then(|i| self.0[i])
+    }
+
+    /// The `SaslAuthenticate` version, when the broker also offers `SaslHandshake` v1: what a
+    /// connection with `sasl:` set needs.
+    pub fn sasl_authenticate(&self) -> Option<i16> {
+        self.for_key(ApiKey::SaslHandshake).and(self.for_key(ApiKey::SaslAuthenticate))
+    }
 }
 
 /// A failed request: the error, and whether any byte of it could have reached the broker.
 #[derive(Debug)]
-pub(crate) struct RequestError {
-    pub(crate) sent: bool,
-    pub(crate) error: anyhow::Error,
+pub struct RequestError {
+    pub sent: bool,
+    pub error: anyhow::Error,
 }
 
 impl RequestError {
@@ -97,7 +132,7 @@ impl RequestError {
     }
 
     /// `Clean` when nothing left, `Ambiguous` once anything may have.
-    pub(crate) fn fault(&self) -> Fault {
+    pub fn fault(&self) -> Fault {
         if self.sent {
             Fault::Ambiguous
         } else {
@@ -107,7 +142,7 @@ impl RequestError {
 }
 
 /// One negotiated broker connection.
-pub(crate) struct Conn {
+pub struct Conn {
     stream: Box<dyn AsyncStream>,
     tls: bool,
     versions: Versions,
@@ -123,16 +158,16 @@ pub(crate) struct Conn {
 /// before the session ends. A lifetime of twice `timeout` or less gets half the lifetime as its
 /// margin instead, so the connection carries some requests; a request the broker then drops at
 /// the session's end is `Ambiguous`, and the idempotent resend is deduplicated.
-pub(crate) fn reauth_deadline(end: Instant, lifetime: Duration, timeout: Duration) -> Instant {
+pub fn reauth_deadline(end: Instant, lifetime: Duration, timeout: Duration) -> Instant {
     end - timeout.min(lifetime / 2)
 }
 
 impl Dialer {
     /// Connects to `host:port`, with TLS whose server name is `host`, negotiates versions, and
-    /// authenticates when `sasl` is set. Every failure is `Clean`, since no produce byte goes out
-    /// before this returns, except a broker whose versions `kafka_out` can't use and a SASL
-    /// refusal, which are `Refused` (`super::sasl`).
-    pub(crate) async fn connect(&self, host: &str, port: u16) -> anyhow::Result<Conn> {
+    /// authenticates when `sasl` is set. Every failure is `Clean`, since no request byte of the
+    /// caller's goes out before this returns, except a broker without a version of a required API
+    /// and a SASL refusal, which are `Refused` ([`crate::sasl`]).
+    pub async fn connect(&self, host: &str, port: u16) -> anyhow::Result<Conn> {
         let tcp = timeout(self.timeout, TcpStream::connect((host, port)))
             .await
             .map_err(|_elapsed| {
@@ -174,12 +209,7 @@ impl Dialer {
         let mut conn = Conn {
             stream,
             tls: self.tls.is_some(),
-            versions: Versions {
-                produce: *PRODUCE_VERSIONS.start(),
-                metadata: *METADATA_VERSIONS.start(),
-                init_producer_id: *INIT_PRODUCER_ID_VERSIONS.start(),
-                sasl_authenticate: None,
-            },
+            versions: Versions::NONE,
             correlation: 0,
             client_id: self.client_id.clone(),
             timeout: self.timeout,
@@ -194,11 +224,11 @@ impl Dialer {
             .map_err(|err| err.error)
             .with_context(|| format!("ApiVersions with Kafka broker {host}:{port}"))
             .context(Fault::Clean)?;
-        conn.versions = negotiate(&response)
+        conn.versions = negotiate(&response, self.required)
             .with_context(|| format!("Kafka broker {host}:{port}"))
             .context(Fault::Refused)?;
         if let Some(auth) = &self.sasl {
-            let Some(version) = conn.versions.sasl_authenticate else {
+            let Some(version) = conn.versions.sasl_authenticate() else {
                 return Err(anyhow!(
                     "SASL {} as {}: Kafka broker {host}:{port} doesn't offer SaslHandshake v1 \
                      and SaslAuthenticate v0 to v2",
@@ -214,28 +244,32 @@ impl Dialer {
     }
 }
 
-/// The versions to use with a broker that answered `response`.
-pub(crate) fn negotiate(response: &ApiVersionsResponse) -> anyhow::Result<Versions> {
+/// The versions to use with a broker that answered `response`. An API in `required` that the
+/// broker offers in no version of its [`API_RANGES`] row is an error.
+pub fn negotiate(response: &ApiVersionsResponse, required: &[ApiKey]) -> anyhow::Result<Versions> {
     anyhow::ensure!(
-        response.error_code == fault::code::NONE,
+        response.error_code == error::code::NONE,
         "ApiVersions answered {}",
-        fault::name(response.error_code)
+        error::name(response.error_code)
     );
-    let range = |key: ApiKey| {
-        response
+    let pick = |row: &ApiRange| {
+        let key = row.key;
+        let theirs = response
             .api_keys
             .iter()
             .find(|v| v.api_key == key as i16)
             .map(|v| v.min_version..=v.max_version)
-            .ok_or_else(|| anyhow!("the broker doesn't offer {key:?}"))
-    };
-    let pick = |key: ApiKey, ours: RangeInclusive<i16>, ignore_min: bool| {
-        let theirs = range(key)?;
+            .ok_or_else(|| anyhow!("the broker doesn't offer {key:?}"))?;
+        let ours = &row.versions;
         let hi = (*theirs.end()).min(*ours.end());
-        let lo = if ignore_min { *ours.start() } else { (*theirs.start()).max(*ours.start()) };
+        let lo = if row.broker_min_counts {
+            (*theirs.start()).max(*ours.start())
+        } else {
+            *ours.start()
+        };
         anyhow::ensure!(
             hi >= lo,
-            "the broker offers {key:?} v{} to v{}; kafka_out sends v{} to v{}",
+            "the broker offers {key:?} v{} to v{}; logit sends v{} to v{}",
             theirs.start(),
             theirs.end(),
             ours.start(),
@@ -243,25 +277,26 @@ pub(crate) fn negotiate(response: &ApiVersionsResponse) -> anyhow::Result<Versio
         );
         Ok(hi)
     };
-    let sasl_authenticate =
-        pick(ApiKey::SaslHandshake, SASL_HANDSHAKE_VERSION..=SASL_HANDSHAKE_VERSION, false)
-            .and_then(|_| pick(ApiKey::SaslAuthenticate, SASL_AUTHENTICATE_VERSIONS, false))
-            .ok();
-    Ok(Versions {
-        produce: pick(ApiKey::Produce, PRODUCE_VERSIONS, true)?,
-        metadata: pick(ApiKey::Metadata, METADATA_VERSIONS, false)?,
-        init_producer_id: pick(ApiKey::InitProducerId, INIT_PRODUCER_ID_VERSIONS, false)?,
-        sasl_authenticate,
-    })
+    for &key in required {
+        let row = API_RANGES.iter().find(|row| row.key == key);
+        pick(row.ok_or_else(|| anyhow!("logit sends no version of {key:?}"))?)?;
+    }
+    let mut versions = Versions::NONE;
+    for (slot, row) in versions.0.iter_mut().zip(&API_RANGES) {
+        *slot = pick(row).ok();
+    }
+    Ok(versions)
 }
 
 impl Conn {
     /// A connection over `stream` with `versions` already negotiated, for tests that script
     /// the stream.
     #[cfg(test)]
-    pub(crate) fn over(stream: Box<dyn AsyncStream>, tls: bool, timeout: Duration) -> Self {
-        let versions =
-            Versions { produce: 12, metadata: 12, init_producer_id: 5, sasl_authenticate: Some(2) };
+    pub fn over(stream: Box<dyn AsyncStream>, tls: bool, timeout: Duration) -> Self {
+        let mut versions = Versions::NONE;
+        for (slot, row) in versions.0.iter_mut().zip(&API_RANGES) {
+            *slot = Some(*row.versions.end());
+        }
         Self {
             stream,
             tls,
@@ -273,7 +308,7 @@ impl Conn {
         }
     }
 
-    pub(crate) fn versions(&self) -> Versions {
+    pub fn versions(&self) -> Versions {
         self.versions
     }
 
@@ -281,7 +316,7 @@ impl Conn {
     /// an idle connection (`connections.max.idle.ms`), and writing a request into one already
     /// closed would turn a `Clean` redial into an `Ambiguous` failure. A connection past its SASL
     /// deadline reads as closed, because the broker closes it on the next request.
-    pub(crate) async fn is_open(&mut self) -> bool {
+    pub async fn is_open(&mut self) -> bool {
         if self.past_deadline() {
             return false;
         }
@@ -290,12 +325,12 @@ impl Conn {
 
     /// Whether the connection's SASL deadline has passed, with no socket poll: the check before
     /// each request after the first that one broker job writes.
-    pub(crate) fn past_deadline(&self) -> bool {
+    pub fn past_deadline(&self) -> bool {
         self.deadline.is_some_and(|deadline| Instant::now() >= deadline)
     }
 
     /// Sends `request` at `version` and waits for its response.
-    pub(crate) async fn request<R: Request>(
+    pub async fn request<R: Request>(
         &mut self,
         request: &R,
         version: i16,
@@ -306,7 +341,7 @@ impl Conn {
 
     /// Sends `request` at `version` without waiting: a `Produce` with `acks: none`, which the
     /// broker never answers.
-    pub(crate) async fn send_only<R: Request>(
+    pub async fn send_only<R: Request>(
         &mut self,
         request: &R,
         version: i16,
@@ -414,7 +449,21 @@ mod tests {
 
     use kafka_protocol::messages::api_versions_response::ApiVersion;
 
-    use crate::test_support::{FakeStream, ReadStep, WriteStep};
+    use crate::test_stream::{FakeStream, ReadStep, WriteStep};
+
+    /// What a producer's dialer requires.
+    const PRODUCER: &[ApiKey] = &[ApiKey::Produce, ApiKey::Metadata, ApiKey::InitProducerId];
+
+    /// The versions `negotiate` picked for `Produce`, `Metadata`, and `InitProducerId`, and
+    /// `SaslAuthenticate` beside `SaslHandshake` v1.
+    fn picked(versions: Versions) -> (Option<i16>, Option<i16>, Option<i16>, Option<i16>) {
+        (
+            versions.for_key(ApiKey::Produce),
+            versions.for_key(ApiKey::Metadata),
+            versions.for_key(ApiKey::InitProducerId),
+            versions.sasl_authenticate(),
+        )
+    }
 
     fn offered(ranges: &[(ApiKey, i16, i16)]) -> ApiVersionsResponse {
         ApiVersionsResponse::default().with_api_keys(
@@ -433,42 +482,57 @@ mod tests {
     /// The ranges `apache/kafka:4.2.0` advertises (`testdata/interop/kafka/api-versions.txt`).
     #[test]
     fn a_kafka_4_2_broker_negotiates_produce_v12_and_ignores_its_advertised_minimum() {
-        let versions = negotiate(&offered(&[
-            (ApiKey::Produce, 0, 13),
-            (ApiKey::Metadata, 0, 13),
-            (ApiKey::ApiVersions, 0, 4),
-            (ApiKey::InitProducerId, 0, 5),
-        ]))
+        let versions = negotiate(
+            &offered(&[
+                (ApiKey::Produce, 0, 13),
+                (ApiKey::Metadata, 0, 13),
+                (ApiKey::ApiVersions, 0, 4),
+                (ApiKey::InitProducerId, 0, 5),
+            ]),
+            PRODUCER,
+        )
         .unwrap();
-        assert_eq!(
-            versions,
-            Versions { produce: 12, metadata: 12, init_producer_id: 5, sasl_authenticate: None }
-        );
+        assert_eq!(picked(versions), (Some(12), Some(12), Some(5), None));
     }
 
     #[test]
     fn an_older_broker_negotiates_its_own_maximum() {
-        let versions = negotiate(&offered(&[
-            (ApiKey::Produce, 0, 7),
-            (ApiKey::Metadata, 0, 9),
-            (ApiKey::InitProducerId, 0, 2),
-        ]))
+        let versions = negotiate(
+            &offered(&[
+                (ApiKey::Produce, 0, 7),
+                (ApiKey::Metadata, 0, 9),
+                (ApiKey::InitProducerId, 0, 2),
+            ]),
+            PRODUCER,
+        )
         .unwrap();
-        assert_eq!(
-            versions,
-            Versions { produce: 7, metadata: 9, init_producer_id: 2, sasl_authenticate: None }
-        );
+        assert_eq!(picked(versions), (Some(7), Some(9), Some(2), None));
     }
 
     #[test]
     fn a_broker_without_produce_v3_is_refused() {
-        let err = negotiate(&offered(&[
-            (ApiKey::Produce, 0, 2),
-            (ApiKey::Metadata, 0, 9),
-            (ApiKey::InitProducerId, 0, 2),
-        ]))
+        let err = negotiate(
+            &offered(&[
+                (ApiKey::Produce, 0, 2),
+                (ApiKey::Metadata, 0, 9),
+                (ApiKey::InitProducerId, 0, 2),
+            ]),
+            PRODUCER,
+        )
         .unwrap_err();
         assert!(err.to_string().contains("Produce v0 to v2"), "{err}");
+    }
+
+    /// A required API the broker's answer omits altogether is an error, which `Dialer::connect`
+    /// classifies `Refused`.
+    #[test]
+    fn a_broker_that_omits_a_required_api_is_refused() {
+        let err = negotiate(
+            &offered(&[(ApiKey::Produce, 0, 12), (ApiKey::InitProducerId, 0, 4)]),
+            PRODUCER,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("doesn't offer Metadata"), "{err}");
     }
 
     fn metadata_request() -> kafka_protocol::messages::MetadataRequest {
@@ -534,6 +598,17 @@ mod tests {
         assert_eq!(request_over(&fake, false).await.fault(), Fault::Ambiguous);
     }
 
+    /// An API outside `required` that the broker lacks is `None`, not a refusal, as is a key
+    /// with no row.
+    #[test]
+    fn an_api_outside_the_required_set_is_none_when_the_broker_lacks_it() {
+        let versions =
+            negotiate(&offered(&[(ApiKey::Metadata, 0, 13)]), &[ApiKey::Metadata]).unwrap();
+        assert_eq!(versions.for_key(ApiKey::Metadata), Some(12));
+        assert_eq!(versions.for_key(ApiKey::Produce), None);
+        assert_eq!(versions.for_key(ApiKey::Fetch), None);
+    }
+
     /// `SaslAuthenticate` takes the highest version both sides offer up to v2, and only beside
     /// `SaslHandshake` v1.
     #[test]
@@ -542,7 +617,7 @@ mod tests {
             [(ApiKey::Produce, 0, 13), (ApiKey::Metadata, 0, 13), (ApiKey::InitProducerId, 0, 5)];
         let with = |extra: &[(ApiKey, i16, i16)]| {
             let all: Vec<_> = base.iter().chain(extra).copied().collect();
-            negotiate(&offered(&all)).unwrap().sasl_authenticate
+            negotiate(&offered(&all), PRODUCER).unwrap().sasl_authenticate()
         };
         assert_eq!(
             with(&[(ApiKey::SaslHandshake, 0, 1), (ApiKey::SaslAuthenticate, 0, 2)]),
@@ -586,7 +661,7 @@ mod tests {
 
     #[test]
     fn an_api_versions_error_fails_negotiation() {
-        let response = offered(&[]).with_error_code(fault::code::UNSUPPORTED_VERSION);
-        assert!(negotiate(&response).is_err());
+        let response = offered(&[]).with_error_code(error::code::UNSUPPORTED_VERSION);
+        assert!(negotiate(&response, &[]).is_err());
     }
 }

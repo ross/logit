@@ -1,6 +1,6 @@
 ---
 created: 2026-10-11
-updated: 2026-10-17
+updated: 2026-10-30
 ---
 
 # `kafka_out` SASL: PLAIN, SCRAM, OAUTHBEARER, and AWS MSK IAM, authenticated in the dialer and renewed by redial
@@ -59,7 +59,8 @@ mechanism, and the username, and nothing else from the block (AGENTS.md's config
 `Dialer` gains `sasl: Option<Arc<dyn Authenticator>>`. With one set, `Dialer::connect` sends
 `SaslHandshake` v1 naming the mechanism, then one or more `SaslAuthenticate` requests at the
 highest version both sides support, up to v2, until the mechanism finishes. A `kafka/sasl/`
-module holds the trait, the exchange loop, and one file per mechanism. The authenticator is async,
+module holds the trait, the exchange loop, and one file per mechanism (the SigV4 signer and the
+AWS credential chain are in `crates/logit-aws`, see the amendment at the end). The authenticator is async,
 because OAUTHBEARER and AWS MSK IAM fetch tokens and credentials over HTTP, and it caches what it
 fetches across connections.
 
@@ -400,3 +401,30 @@ The reference behavior, read from source:
   "Leave any existing token because it may have some life left, schedule a refresh for 10
   seconds later".
 - franz-go and sarama keep no token cache; the application's token provider owns it.
+
+## Amendment: the AWS code moved to `logit-aws` (2026-10-30)
+
+The SigV4 signer and the AWS credential chain moved from `crates/logit-outputs/src/kafka/sasl/`
+to `crates/logit-aws/src/` (`sigv4.rs`, `creds.rs`), so other AWS sinks can use them. The
+behavior, the tests, and the decisions above are unchanged. Two things follow:
+
+- The earlier amendments' descriptions of the signer and the credential chain ("Amendment: what
+  W3 settled") now describe code in `crates/logit-aws`. The MSK-specific glue (`msk_iam.rs`) stays
+  in `kafka/sasl/`.
+- The HTTP stub those tests use moved to `logit_aws::test_stub`, behind the `test-util` feature.
+
+`logit-aws` can't depend on `logit-outputs`, so four helpers the chain used from it are copies in
+`logit-aws`'s private `http` module: the client builder, the connect and idle timeout defaults,
+and the bounded body read from its `http` module, and the form URL encoder from
+`kafka/sasl/oauth.rs`. A change to a default in
+`logit-outputs` doesn't move the copies.
+
+## Amendment: the connection and SASL moved to `logit-kafka`
+
+`conn.rs` and `sasl/` (`msk_iam.rs` included) moved from `crates/logit-outputs/src/kafka/` to
+`crates/logit-kafka/src/`, so `kafka_in` shares them ([ADR `kafka-input`](kafka-input.md), item
+1). The decisions above are unchanged. A path above under `kafka/sasl/` or `kafka/conn.rs` now
+reads `crates/logit-kafka/src/`, and a test name `conn::` or `sasl::` now reads
+`logit_kafka::conn::` or `logit_kafka::sasl::`. `fault::code`, `fault::name`, and
+`fault::classify_sasl` are `logit_kafka::error`'s; `kafka_out`'s `fault` keeps the produce
+classes.

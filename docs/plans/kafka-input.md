@@ -58,8 +58,9 @@ stub as `logit_aws::test_stub` behind a `test-util` feature.
     its tests' `fault::code` paths change to match.
   - The HTTP helpers `sasl/oauth.rs` uses, as a TLS-less copy in `logit-kafka`'s own `http.rs`
     (the ADR's item 1 says why neither `logit-outputs::http`, whose `build_client` takes the
-    sinks' `rustls::ClientConfig`, nor `logit-aws`'s private copy is its home). `logit-outputs`
-    and `logit-aws` are unchanged by this bullet.
+    sinks' `rustls::ClientConfig`, nor `logit-aws`'s private copy is its home). `logit-outputs::http`
+    keeps its TLS-taking `build_client` and `client_builder` and loses `try_read_body_bytes`;
+    `logit-aws` is unchanged by this bullet.
   - `FakeStream`, `ReadStep`, and `WriteStep` from `crates/logit-outputs/src/test_support.rs`,
     behind `test-util`; `test_support` re-exports them so `stream.rs`' and the other sinks' tests
     resolve unchanged.
@@ -310,7 +311,7 @@ soak harness share no file, and neither changes `kafka_in`.
 | # | Branch | PR title | Size | Depends on | Status |
 |---|---|---|---|---|---|
 | W0 | `kin/w0` | `kin/w0: ADR and plan for kafka_in, a consumer-group client` | S | — | open |
-| W1 | `kin/w1` | `kin/w1: the logit-kafka crate, shared by kafka_out and kafka_in` | M | W0, the `s3` stream's `logit-aws` PR | not started |
+| W1 | `kin/w1` | `kin/w1: the logit-kafka crate, shared by kafka_out and kafka_in` | M | W0, the `s3` stream's `logit-aws` PR | open |
 | W2 | `kin/w2` | `kin/w2: the consumer core: group membership, assignors, offsets, and fetch` | L | W1 | not started |
 | W3 | `kin/w3` | `kin/w3: kafka_in, with json, text, and native, and kafka_out's text batch escape` | L | W2 | not started |
 | W4 | `kin/w4` | `kin/w4: kafka_in's msgpack and OTLP formats` | M | W3 | not started |
@@ -326,3 +327,12 @@ Recorded per workstream as each lands.
   classic group APIs at Kafka 2.4's versions or above (JoinGroup v0 to v6, SyncGroup v0 to v4,
   Fetch v4 to v13), checked with `kafka-broker-api-versions.sh`. `kafka-protocol`'s `Record`
   collapses repeated header names, so W2 decodes records itself.
+- **W1**: `kafka_out`'s `http::try_read_body_bytes` had no caller once `oauth.rs` moved, so it
+  left `logit-outputs`; `build_client` and `client_builder` stay. `prometheus::compression::decompress_bounded`
+  refuses a zstd frame whose declared window exceeds the bound, and the reference clients' corpus
+  frames declare a 2 MiB window (descriptor `0x58`), so `logit_proto::kafka`'s zstd decompressor
+  streams through a `take(max + 1)` under a window limit of `max(max, 8 MiB)` instead of reusing
+  it; `ruzstd` decodes until its ring buffer passes the declared window before a reader sees a
+  byte, so the window limit, not the `take`, bounds a frame's memory. `Dialer` gained a
+  `required` list of API keys a broker must offer or be `Refused`, which the producer sets to
+  Produce, Metadata, and InitProducerId; the consumer sets its own.

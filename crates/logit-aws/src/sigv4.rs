@@ -1,5 +1,5 @@
 //! AWS Signature Version 4 on `ring`: the canonical request, the string to sign, the derived
-//! signing key, and the presigned query `AWS_MSK_IAM` sends (`docs/adr/kafka-sasl.md`).
+//! signing key, and a presigned query (`AWS_MSK_IAM` sends one, `docs/adr/kafka-sasl.md`).
 //!
 //! The rules are AWS's "Create a signed AWS API request" guide, pinned by vectors from AWS's
 //! SigV4 test suite in `tests`:
@@ -16,26 +16,26 @@ use ring::{digest, hmac};
 pub(crate) const ALGORITHM: &str = "AWS4-HMAC-SHA256";
 
 /// The SHA-256 of an empty payload, in hex: a presigned `GET`'s payload hash.
-pub(crate) const EMPTY_PAYLOAD_SHA256: &str =
+pub const EMPTY_PAYLOAD_SHA256: &str =
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 /// A request time in SigV4's two forms.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AmzDate {
+pub struct AmzDate {
     /// `YYYYMMDDTHHMMSSZ`, the `X-Amz-Date`.
-    pub(crate) datetime: String,
+    pub datetime: String,
 }
 
 impl AmzDate {
     /// The time `nanos` after the Unix epoch, to the second.
-    pub(crate) fn from_unix_nanos(nanos: i64) -> Self {
+    pub fn from_unix_nanos(nanos: i64) -> Self {
         // `YYYY-MM-DDTHH:MM:SS.fffffffffZ`, the one form `format_rfc3339_utc` writes.
         let rfc3339 = logit_core::time::format_rfc3339_utc(nanos);
         let datetime: String = rfc3339[..19].chars().filter(|c| *c != '-' && *c != ':').collect();
         Self { datetime: format!("{datetime}Z") }
     }
 
-    pub(crate) fn now() -> Self {
+    pub fn now() -> Self {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX));
@@ -43,37 +43,37 @@ impl AmzDate {
     }
 
     /// `YYYYMMDD`, the credential scope's date.
-    pub(crate) fn date(&self) -> &str {
+    pub fn date(&self) -> &str {
         &self.datetime[..8]
     }
 }
 
 /// The credentials and scope a signature is made with.
-pub(crate) struct Signer<'a> {
-    pub(crate) access_key_id: &'a str,
-    pub(crate) secret_access_key: &'a str,
-    pub(crate) region: &'a str,
-    pub(crate) service: &'a str,
+pub struct Signer<'a> {
+    pub access_key_id: &'a str,
+    pub secret_access_key: &'a str,
+    pub region: &'a str,
+    pub service: &'a str,
 }
 
 /// The parts of a request SigV4 signs. Query names and values are given decoded.
-pub(crate) struct Request<'a> {
-    pub(crate) method: &'a str,
-    pub(crate) path: &'a str,
-    pub(crate) query: Vec<(String, String)>,
-    pub(crate) headers: Vec<(String, String)>,
+pub struct Request<'a> {
+    pub method: &'a str,
+    pub path: &'a str,
+    pub query: Vec<(String, String)>,
+    pub headers: Vec<(String, String)>,
     /// The payload's SHA-256 in hex, or `UNSIGNED-PAYLOAD`.
-    pub(crate) payload_hash: &'a str,
+    pub payload_hash: &'a str,
 }
 
 impl Signer<'_> {
     /// `<date>/<region>/<service>/aws4_request`.
-    pub(crate) fn scope(&self, date: &AmzDate) -> String {
+    pub fn scope(&self, date: &AmzDate) -> String {
         format!("{}/{}/{}/aws4_request", date.date(), self.region, self.service)
     }
 
     /// The signature of `request` at `date`, in hex.
-    pub(crate) fn sign(&self, request: &Request<'_>, date: &AmzDate) -> String {
+    pub fn sign(&self, request: &Request<'_>, date: &AmzDate) -> String {
         let sts = string_to_sign(date, &self.scope(date), &canonical_request(request));
         let key = signing_key(self.secret_access_key, date.date(), self.region, self.service);
         hex(hmac::sign(&key, sts.as_bytes()).as_ref())
@@ -84,7 +84,7 @@ impl Signer<'_> {
     /// signed header and an empty payload. Returns every parameter, decoded, in the order AWS's
     /// presigners write them: `query`, the signed `X-Amz-*` ones, then `X-Amz-Signature`. A
     /// session token is signed with the rest, as the AWS SDKs' presigners sign it.
-    pub(crate) fn presign(
+    pub fn presign(
         &self,
         host: &str,
         query: &[(&str, &str)],

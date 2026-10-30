@@ -129,7 +129,7 @@ _ORDER = {PASS: 0, SKIP: 0, WARN: 1, FAIL: 2}
 TLS_RELOAD_FAILED_KEY = "tls_reload_failed"
 TLS_RELOADED_KEY = "tls_reloaded"
 # The self-log key of a failed OAUTHBEARER token refresh that kept the cached token
-# (crates/logit-outputs/src/kafka/sasl/oauth.rs, `Endpoint::token`).
+# (crates/logit-kafka/src/sasl/oauth.rs, `Endpoint::token`).
 TOKEN_REFRESH_FAILED_KEY = "token_refresh_failed"
 
 

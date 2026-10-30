@@ -17,6 +17,7 @@ pub mod framing;
 pub mod graphite;
 pub mod influxdb;
 pub mod json;
+pub mod kafka;
 pub mod message;
 pub mod msgbuf;
 pub mod msgpack;

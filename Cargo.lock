@@ -1019,6 +1019,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
+name = "logit-aws"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "logit-core",
+ "logit-pipeline",
+ "reqwest",
+ "ring",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "logit-bench"
 version = "0.1.0"
 dependencies = [
@@ -1129,6 +1147,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "logit-core",
+ "logit-kafka",
  "logit-outputs",
  "logit-pipeline",
  "logit-proto",
@@ -1152,6 +1171,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "logit-kafka"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "bytes",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "kafka-protocol",
+ "logit-aws",
+ "logit-core",
+ "logit-pipeline",
+ "logit-proto",
+ "reqwest",
+ "ring",
+ "rustls",
+ "rustls-pki-types",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+]
+
+[[package]]
 name = "logit-outputs"
 version = "0.1.0"
 dependencies = [
@@ -1166,19 +1211,19 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "kafka-protocol",
+ "logit-aws",
  "logit-core",
  "logit-inputs",
+ "logit-kafka",
  "logit-pipeline",
  "logit-proto",
  "logit-script",
- "lz4_flex",
  "proptest",
  "prost",
  "reqwest",
  "ring",
  "rustls",
  "rustls-pki-types",
- "ruzstd",
  "serde",
  "serde_json",
  "snap",
@@ -1241,6 +1286,7 @@ dependencies = [
  "bytes",
  "crc32c",
  "flate2",
+ "kafka-protocol",
  "logit-core",
  "lz4_flex",
  "proptest",

@@ -3,9 +3,9 @@
 
 use super::{Authenticator, Session, Step};
 
-pub(crate) struct Plain {
-    pub(crate) username: String,
-    pub(crate) password: String,
+pub struct Plain {
+    pub username: String,
+    pub password: String,
 }
 
 #[async_trait::async_trait]
