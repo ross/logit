@@ -1,0 +1,6 @@
+# kafka_out's records under format: json, record: event, compression: none: the events of
+# cases/statsd/sub-millisecond-equal.json, one record each, in one record batch, apart from json-kinds since its
+# series share names with cases/statsd/cross-kinds.json.
+wire: json-sub-millisecond-equal.segment
+kafka: {format: json}
+exercises: [format_json, carriers, compression_none]

@@ -1,50 +1,50 @@
 {
   "beside-metrics": {"events": [
-    {"timestamp":"2027-01-15T08:00:04.000000000Z","log":{"format":"raw","message":"queue depth high"}},
-    {"timestamp":"2027-01-15T08:00:04.001000000Z","log":{"format":"raw","message":"{\"queue\":\"orders\",\"depth\":17}"}},
-    {"timestamp":"2027-01-15T08:00:04.002000000Z","log":{"format":"raw","message":"b\"caf\\xe9\""},"types":{"/log/message":"bytes"}},
-    {"timestamp":"2027-01-15T08:00:04.003000000Z","log":{"format":"raw","message":""}}
+    {"timestamp":"2027-01-15T08:00:04.000000000Z","log":{"format":"raw","message":"queue depth high"},"attributes":{"_logit.kafka.offset":0,"_logit.kafka.partition":0,"_logit.kafka.timestamp":"2027-01-15T08:00:04.000000000Z","_logit.kafka.timestamp_type":"create_time","_logit.kafka.topic":"logs"},"types":{"/attributes/_logit.kafka.timestamp":"timestamp"}},
+    {"timestamp":"2027-01-15T08:00:04.001000000Z","log":{"format":"raw","message":"{\"queue\":\"orders\",\"depth\":17}"},"attributes":{"_logit.kafka.offset":1,"_logit.kafka.partition":0,"_logit.kafka.timestamp":"2027-01-15T08:00:04.001000000Z","_logit.kafka.timestamp_type":"create_time","_logit.kafka.topic":"logs"},"types":{"/attributes/_logit.kafka.timestamp":"timestamp"}},
+    {"timestamp":"2027-01-15T08:00:04.002000000Z","log":{"format":"raw","message":"b\"caf\\xe9\""},"attributes":{"_logit.kafka.offset":2,"_logit.kafka.partition":0,"_logit.kafka.timestamp":"2027-01-15T08:00:04.002000000Z","_logit.kafka.timestamp_type":"create_time","_logit.kafka.topic":"logs"},"types":{"/attributes/_logit.kafka.timestamp":"timestamp","/log/message":"bytes"}},
+    {"timestamp":"2027-01-15T08:00:04.003000000Z","log":{"format":"raw","message":""},"attributes":{"_logit.kafka.offset":3,"_logit.kafka.partition":0,"_logit.kafka.timestamp":"2027-01-15T08:00:04.003000000Z","_logit.kafka.timestamp_type":"create_time","_logit.kafka.topic":"logs"},"types":{"/attributes/_logit.kafka.timestamp":"timestamp"}}
   ], "counters": {
     "logit.output.metrics.omitted{component=out,kind=kafka_out,reason=format,role=sink}": 4
   }},
   "bodies": {"events": [
-    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"a plain line"}},
-    {"timestamp":"2027-01-15T08:00:00.001000000Z","log":{"format":"raw","message":"42"}},
-    {"timestamp":"2027-01-15T08:00:00.002000000Z","log":{"format":"raw","message":"2.5"}},
-    {"timestamp":"2027-01-15T08:00:00.003000000Z","log":{"format":"raw","message":"true"}},
-    {"timestamp":"2027-01-15T08:00:00.004000000Z","log":{"format":"raw","message":"b\"caf\\xe9\""},"types":{"/log/message":"bytes"}},
-    {"timestamp":"2027-01-15T08:00:00.005000000Z","log":{"format":"raw","message":"{\"attempts\":3,\"user\":\"ada\"}"}},
-    {"timestamp":"2027-01-15T08:00:00.006000000Z","log":{"format":"raw","message":"[\"checkout\",7]"}},
-    {"timestamp":"2027-01-15T08:00:00.007000000Z","log":{"format":"raw","message":""}},
-    {"timestamp":"2027-01-15T08:00:00.008000000Z","log":{"format":"raw","message":""}},
-    {"timestamp":"2027-01-15T08:00:00.009000000Z","log":{"format":"raw","message":"{\"level\":\"info\",\"msg\":\"started\"}"}},
-    {"timestamp":"2027-01-15T08:00:00.010000000Z","log":{"format":"raw","message":"abc"}}
+    {"timestamp":"2027-01-15T08:00:00.000000000Z","log":{"format":"raw","message":"a plain line"},"attributes":{"_logit.kafka.offset":0,"_logit.kafka.partition":0,"_logit.kafka.timestamp":"2027-01-15T08:00:00.000000000Z","_logit.kafka.timestamp_type":"create_time","_logit.kafka.topic":"logs"},"types":{"/attributes/_logit.kafka.timestamp":"timestamp"}},
+    {"timestamp":"2027-01-15T08:00:00.001000000Z","log":{"format":"raw","message":"42"},"attributes":{"_logit.kafka.offset":1,"_logit.kafka.partition":0,"_logit.kafka.timestamp":"2027-01-15T08:00:00.001000000Z","_logit.kafka.timestamp_type":"create_time","_logit.kafka.topic":"logs"},"types":{"/attributes/_logit.kafka.timestamp":"timestamp"}},
+    {"timestamp":"2027-01-15T08:00:00.002000000Z","log":{"format":"raw","message":"2.5"},"attributes":{"_logit.kafka.offset":2,"_logit.kafka.partition":0,"_logit.kafka.timestamp":"2027-01-15T08:00:00.002000000Z","_logit.kafka.timestamp_type":"create_time","_logit.kafka.topic":"logs"},"types":{"/attributes/_logit.kafka.timestamp":"timestamp"}},
+    {"timestamp":"2027-01-15T08:00:00.003000000Z","log":{"format":"raw","message":"true"},"attributes":{"_logit.kafka.offset":3,"_logit.kafka.partition":0,"_logit.kafka.timestamp":"2027-01-15T08:00:00.003000000Z","_logit.kafka.timestamp_type":"create_time","_logit.kafka.topic":"logs"},"types":{"/attributes/_logit.kafka.timestamp":"timestamp"}},
+    {"timestamp":"2027-01-15T08:00:00.004000000Z","log":{"format":"raw","message":"b\"caf\\xe9\""},"attributes":{"_logit.kafka.offset":4,"_logit.kafka.partition":0,"_logit.kafka.timestamp":"2027-01-15T08:00:00.004000000Z","_logit.kafka.timestamp_type":"create_time","_logit.kafka.topic":"logs"},"types":{"/attributes/_logit.kafka.timestamp":"timestamp","/log/message":"bytes"}},
+    {"timestamp":"2027-01-15T08:00:00.005000000Z","log":{"format":"raw","message":"{\"attempts\":3,\"user\":\"ada\"}"},"attributes":{"_logit.kafka.offset":5,"_logit.kafka.partition":0,"_logit.kafka.timestamp":"2027-01-15T08:00:00.005000000Z","_logit.kafka.timestamp_type":"create_time","_logit.kafka.topic":"logs"},"types":{"/attributes/_logit.kafka.timestamp":"timestamp"}},
+    {"timestamp":"2027-01-15T08:00:00.006000000Z","log":{"format":"raw","message":"[\"checkout\",7]"},"attributes":{"_logit.kafka.offset":6,"_logit.kafka.partition":0,"_logit.kafka.timestamp":"2027-01-15T08:00:00.006000000Z","_logit.kafka.timestamp_type":"create_time","_logit.kafka.topic":"logs"},"types":{"/attributes/_logit.kafka.timestamp":"timestamp"}},
+    {"timestamp":"2027-01-15T08:00:00.007000000Z","log":{"format":"raw","message":""},"attributes":{"_logit.kafka.offset":7,"_logit.kafka.partition":0,"_logit.kafka.timestamp":"2027-01-15T08:00:00.007000000Z","_logit.kafka.timestamp_type":"create_time","_logit.kafka.topic":"logs"},"types":{"/attributes/_logit.kafka.timestamp":"timestamp"}},
+    {"timestamp":"2027-01-15T08:00:00.008000000Z","log":{"format":"raw","message":""},"attributes":{"_logit.kafka.offset":8,"_logit.kafka.partition":0,"_logit.kafka.timestamp":"2027-01-15T08:00:00.008000000Z","_logit.kafka.timestamp_type":"create_time","_logit.kafka.topic":"logs"},"types":{"/attributes/_logit.kafka.timestamp":"timestamp"}},
+    {"timestamp":"2027-01-15T08:00:00.009000000Z","log":{"format":"raw","message":"{\"level\":\"info\",\"msg\":\"started\"}"},"attributes":{"_logit.kafka.offset":9,"_logit.kafka.partition":0,"_logit.kafka.timestamp":"2027-01-15T08:00:00.009000000Z","_logit.kafka.timestamp_type":"create_time","_logit.kafka.topic":"logs"},"types":{"/attributes/_logit.kafka.timestamp":"timestamp"}},
+    {"timestamp":"2027-01-15T08:00:00.010000000Z","log":{"format":"raw","message":"abc"},"attributes":{"_logit.kafka.offset":10,"_logit.kafka.partition":0,"_logit.kafka.timestamp":"2027-01-15T08:00:00.010000000Z","_logit.kafka.timestamp_type":"create_time","_logit.kafka.topic":"logs"},"types":{"/attributes/_logit.kafka.timestamp":"timestamp"}}
   ], "counters": {}},
   "fields": {"events": [
-    {"timestamp":"2027-01-15T08:00:03.000000000Z","log":{"format":"raw","message":"<13>Jan 15 07:59:59 host app: relayed"}},
-    {"timestamp":"2027-01-15T08:00:03.000000000Z","log":{"format":"raw","message":"observed later"}}
+    {"timestamp":"2027-01-15T08:00:03.000000000Z","log":{"format":"raw","message":"<13>Jan 15 07:59:59 host app: relayed"},"attributes":{"_logit.kafka.offset":1,"_logit.kafka.partition":0,"_logit.kafka.timestamp":"2027-01-15T08:00:03.000000000Z","_logit.kafka.timestamp_type":"create_time","_logit.kafka.topic":"logs"},"types":{"/attributes/_logit.kafka.timestamp":"timestamp"}},
+    {"timestamp":"2027-01-15T08:00:03.000000000Z","log":{"format":"raw","message":"observed later"},"attributes":{"_logit.kafka.offset":0,"_logit.kafka.partition":0,"_logit.kafka.timestamp":"2027-01-15T08:00:03.000000000Z","_logit.kafka.timestamp_type":"create_time","_logit.kafka.topic":"logs"},"types":{"/attributes/_logit.kafka.timestamp":"timestamp"}}
   ], "counters": {}},
   "severity": {"events": [
-    {"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"format":"raw","message":"trace band"}},
-    {"timestamp":"2027-01-15T08:00:01.001000000Z","log":{"format":"raw","message":"debug band"}},
-    {"timestamp":"2027-01-15T08:00:01.002000000Z","log":{"format":"raw","message":"info band"}},
-    {"timestamp":"2027-01-15T08:00:01.003000000Z","log":{"format":"raw","message":"warn band"}},
-    {"timestamp":"2027-01-15T08:00:01.004000000Z","log":{"format":"raw","message":"error band"}},
-    {"timestamp":"2027-01-15T08:00:01.005000000Z","log":{"format":"raw","message":"fatal band"}},
-    {"timestamp":"2027-01-15T08:00:01.006000000Z","log":{"format":"raw","message":"no severity"}},
-    {"timestamp":"2027-01-15T08:00:01.007000000Z","log":{"format":"raw","message":"INFO2 from the wire"}},
-    {"timestamp":"2027-01-15T08:00:01.008000000Z","log":{"format":"raw","message":"a number only"}}
+    {"timestamp":"2027-01-15T08:00:01.000000000Z","log":{"format":"raw","message":"trace band"},"attributes":{"_logit.kafka.offset":0,"_logit.kafka.partition":0,"_logit.kafka.timestamp":"2027-01-15T08:00:01.000000000Z","_logit.kafka.timestamp_type":"create_time","_logit.kafka.topic":"logs"},"types":{"/attributes/_logit.kafka.timestamp":"timestamp"}},
+    {"timestamp":"2027-01-15T08:00:01.001000000Z","log":{"format":"raw","message":"debug band"},"attributes":{"_logit.kafka.offset":1,"_logit.kafka.partition":0,"_logit.kafka.timestamp":"2027-01-15T08:00:01.001000000Z","_logit.kafka.timestamp_type":"create_time","_logit.kafka.topic":"logs"},"types":{"/attributes/_logit.kafka.timestamp":"timestamp"}},
+    {"timestamp":"2027-01-15T08:00:01.002000000Z","log":{"format":"raw","message":"info band"},"attributes":{"_logit.kafka.offset":2,"_logit.kafka.partition":0,"_logit.kafka.timestamp":"2027-01-15T08:00:01.002000000Z","_logit.kafka.timestamp_type":"create_time","_logit.kafka.topic":"logs"},"types":{"/attributes/_logit.kafka.timestamp":"timestamp"}},
+    {"timestamp":"2027-01-15T08:00:01.003000000Z","log":{"format":"raw","message":"warn band"},"attributes":{"_logit.kafka.offset":3,"_logit.kafka.partition":0,"_logit.kafka.timestamp":"2027-01-15T08:00:01.003000000Z","_logit.kafka.timestamp_type":"create_time","_logit.kafka.topic":"logs"},"types":{"/attributes/_logit.kafka.timestamp":"timestamp"}},
+    {"timestamp":"2027-01-15T08:00:01.004000000Z","log":{"format":"raw","message":"error band"},"attributes":{"_logit.kafka.offset":4,"_logit.kafka.partition":0,"_logit.kafka.timestamp":"2027-01-15T08:00:01.004000000Z","_logit.kafka.timestamp_type":"create_time","_logit.kafka.topic":"logs"},"types":{"/attributes/_logit.kafka.timestamp":"timestamp"}},
+    {"timestamp":"2027-01-15T08:00:01.005000000Z","log":{"format":"raw","message":"fatal band"},"attributes":{"_logit.kafka.offset":5,"_logit.kafka.partition":0,"_logit.kafka.timestamp":"2027-01-15T08:00:01.005000000Z","_logit.kafka.timestamp_type":"create_time","_logit.kafka.topic":"logs"},"types":{"/attributes/_logit.kafka.timestamp":"timestamp"}},
+    {"timestamp":"2027-01-15T08:00:01.006000000Z","log":{"format":"raw","message":"no severity"},"attributes":{"_logit.kafka.offset":6,"_logit.kafka.partition":0,"_logit.kafka.timestamp":"2027-01-15T08:00:01.006000000Z","_logit.kafka.timestamp_type":"create_time","_logit.kafka.topic":"logs"},"types":{"/attributes/_logit.kafka.timestamp":"timestamp"}},
+    {"timestamp":"2027-01-15T08:00:01.007000000Z","log":{"format":"raw","message":"INFO2 from the wire"},"attributes":{"_logit.kafka.offset":7,"_logit.kafka.partition":0,"_logit.kafka.timestamp":"2027-01-15T08:00:01.007000000Z","_logit.kafka.timestamp_type":"create_time","_logit.kafka.topic":"logs"},"types":{"/attributes/_logit.kafka.timestamp":"timestamp"}},
+    {"timestamp":"2027-01-15T08:00:01.008000000Z","log":{"format":"raw","message":"a number only"},"attributes":{"_logit.kafka.offset":8,"_logit.kafka.partition":0,"_logit.kafka.timestamp":"2027-01-15T08:00:01.008000000Z","_logit.kafka.timestamp_type":"create_time","_logit.kafka.topic":"logs"},"types":{"/attributes/_logit.kafka.timestamp":"timestamp"}}
   ], "counters": {}},
   "telemetrygen": {"events": [
-    {"timestamp":"2026-09-10T21:22:17.985000000Z","log":{"format":"raw","message":"the message"}},
-    {"timestamp":"2026-09-10T21:22:17.985000000Z","log":{"format":"raw","message":"the message"}},
-    {"timestamp":"2026-09-10T21:22:18.985000000Z","log":{"format":"raw","message":"the message"}}
+    {"timestamp":"2026-09-10T21:22:17.985000000Z","log":{"format":"raw","message":"the message"},"attributes":{"_logit.kafka.offset":0,"_logit.kafka.partition":0,"_logit.kafka.timestamp":"2026-09-10T21:22:17.985000000Z","_logit.kafka.timestamp_type":"create_time","_logit.kafka.topic":"logs"},"types":{"/attributes/_logit.kafka.timestamp":"timestamp"}},
+    {"timestamp":"2026-09-10T21:22:17.985000000Z","log":{"format":"raw","message":"the message"},"attributes":{"_logit.kafka.offset":1,"_logit.kafka.partition":0,"_logit.kafka.timestamp":"2026-09-10T21:22:17.985000000Z","_logit.kafka.timestamp_type":"create_time","_logit.kafka.topic":"logs"},"types":{"/attributes/_logit.kafka.timestamp":"timestamp"}},
+    {"timestamp":"2026-09-10T21:22:18.985000000Z","log":{"format":"raw","message":"the message"},"attributes":{"_logit.kafka.offset":2,"_logit.kafka.partition":0,"_logit.kafka.timestamp":"2026-09-10T21:22:18.985000000Z","_logit.kafka.timestamp_type":"create_time","_logit.kafka.topic":"logs"},"types":{"/attributes/_logit.kafka.timestamp":"timestamp"}}
   ], "counters": {}},
   "trace": {"events": [
-    {"timestamp":"2027-01-15T08:00:02.000000000Z","log":{"format":"raw","message":"checkout completed"}},
-    {"timestamp":"2027-01-15T08:00:02.001000000Z","log":{"format":"raw","message":"no span id"}},
-    {"timestamp":"2027-01-15T08:00:02.002000000Z","log":{"format":"raw","message":"beside its span"}},
-    {"timestamp":"2027-01-15T08:00:02.003000000Z","log":{"format":"raw","message":"an id attribute beside the trace"}}
+    {"timestamp":"2027-01-15T08:00:02.000000000Z","log":{"format":"raw","message":"checkout completed"},"attributes":{"_logit.kafka.offset":0,"_logit.kafka.partition":0,"_logit.kafka.timestamp":"2027-01-15T08:00:02.000000000Z","_logit.kafka.timestamp_type":"create_time","_logit.kafka.topic":"logs"},"types":{"/attributes/_logit.kafka.timestamp":"timestamp"}},
+    {"timestamp":"2027-01-15T08:00:02.001000000Z","log":{"format":"raw","message":"no span id"},"attributes":{"_logit.kafka.offset":1,"_logit.kafka.partition":0,"_logit.kafka.timestamp":"2027-01-15T08:00:02.001000000Z","_logit.kafka.timestamp_type":"create_time","_logit.kafka.topic":"logs"},"types":{"/attributes/_logit.kafka.timestamp":"timestamp"}},
+    {"timestamp":"2027-01-15T08:00:02.002000000Z","log":{"format":"raw","message":"beside its span"},"attributes":{"_logit.kafka.offset":2,"_logit.kafka.partition":0,"_logit.kafka.timestamp":"2027-01-15T08:00:02.002000000Z","_logit.kafka.timestamp_type":"create_time","_logit.kafka.topic":"logs"},"types":{"/attributes/_logit.kafka.timestamp":"timestamp"}},
+    {"timestamp":"2027-01-15T08:00:02.003000000Z","log":{"format":"raw","message":"an id attribute beside the trace"},"attributes":{"_logit.kafka.offset":3,"_logit.kafka.partition":0,"_logit.kafka.timestamp":"2027-01-15T08:00:02.003000000Z","_logit.kafka.timestamp_type":"create_time","_logit.kafka.topic":"logs"},"types":{"/attributes/_logit.kafka.timestamp":"timestamp"}}
   ], "counters": {
     "logit.output.spans.omitted{component=out,kind=kafka_out,reason=format,role=sink}": 1
   }}

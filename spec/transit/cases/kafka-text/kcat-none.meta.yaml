@@ -1,0 +1,5 @@
+# kcat's three keyed records with an `h1` header under compression none,
+# as the broker stored them, read in place from testdata/interop/kafka/.
+wire: ../../../../testdata/interop/kafka/batches/kcat-none.segment
+kafka: {format: text}
+exercises: [format_text, kcat_producer, record_key, record_headers, carriers, compression_none]

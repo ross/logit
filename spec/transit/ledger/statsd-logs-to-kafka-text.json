@@ -25,7 +25,5 @@
     {"sink":"kafka_out","row":"span/needs_agent_processing","cell":0,"observed":[]},
     {"sink":"kafka_out","row":"span/not_datadog_origin","cell":0,"observed":[]}
   ],
-  "unspecified": [
-    {"sink":"kafka_out","row":"gauge/f64","reached_by":["statsd-logs-to-kafka-text × span-beside-metrics"]}
-  ]
+  "unspecified": []
 }

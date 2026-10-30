@@ -1,0 +1,18 @@
+{
+  "cells": [
+    {"sink":"kafka_out","row":"attributes/default_tag","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"attributes/kafka_key_headers","cell":0,"observed":["lost"]},
+    {"sink":"kafka_out","row":"attributes/no_host","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"attributes/private_carrier","cell":0,"observed":["exact","normalized"]},
+    {"sink":"kafka_out","row":"attributes/syslog_facility","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"log/blank_message","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"log/body_format","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"log/bytes_message","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"log/observed_timestamp_unset","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"log/plain","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"log/severity_unset","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"log/timestamp","cell":0,"observed":["exact"]},
+    {"sink":"kafka_out","row":"log/trace_unset","cell":0,"observed":["exact"]}
+  ],
+  "unspecified": []
+}

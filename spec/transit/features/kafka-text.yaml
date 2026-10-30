@@ -1,0 +1,37 @@
+# The Kafka wire features a case under cases/kafka-text/ can exercise: `kafka_in`'s
+# `format: text` (crates/logit-inputs/src/kafka/decode.rs) over record batch v2 as
+# crates/logit-proto/src/kafka/record.rs decodes it, from `kafka_out` and from the reference
+# clients' batches testdata/interop/kafka/ records. A case names the ones it exercises in its
+# `.meta.yaml`.
+- name: format_text
+  text: '`format: text`: one record''s value as one log''s message, at the record''s timestamp.'
+- name: format_text_batch
+  text: >-
+    `format: text` under `record: batch`: one log per line of a record's value, each line
+    unescaped.
+- name: bytes_message
+  text: A value that isn't UTF-8, read as a `Bytes` message.
+- name: java_producer
+  text: '`kafka-console-producer.sh`''s batch: idempotent, its records'' timestamps apart.'
+- name: kcat_producer
+  text: kcat's batch, librdkafka with no idempotence.
+- name: record_key
+  text: A record key, carried as `_logit.kafka.key`.
+- name: record_headers
+  text: A record header, carried in `_logit.kafka.headers`.
+- name: compression_none
+  text: An uncompressed record batch.
+- name: compression_gzip
+  text: A gzip-compressed record batch.
+- name: compression_snappy
+  text: A raw Snappy block, as kcat writes one.
+- name: compression_snappy_xerial
+  text: A xerial-framed Snappy payload, as the Java client's snappy-java writes one.
+- name: compression_lz4
+  text: An LZ4 frame.
+- name: compression_zstd
+  text: A zstd frame.
+- name: carriers
+  text: >-
+    Each event's `_logit.kafka.topic`, `partition`, `offset`, `timestamp`, and `timestamp_type`
+    carriers.

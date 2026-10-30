@@ -1,0 +1,7 @@
+# kafka_out's records under format: json, record: event, compression: none: the events of
+# cases/statsd/flagged-kinds.json and flagged-histogram.json and cases/otlp/no-recorded-value.json,
+# one record each, in one record batch: records flagged with no recorded value, kept apart from
+# json-kinds since a case doesn't mix flagged and unflagged records of one kind.
+wire: json-flagged.segment
+kafka: {format: json}
+exercises: [format_json, carriers, compression_none]
