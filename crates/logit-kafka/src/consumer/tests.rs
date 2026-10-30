@@ -21,6 +21,10 @@ use crate::fake_broker::{Action, FakeCluster, GroupState, Step, KAFKA_2_4};
 
 const GROUP: &str = "g";
 
+/// A scripted 25 or 82 leaves the old member in the fake's group, so a rejoin under a new id
+/// waits the rebalance timeout for the old one to rejoin before the coordinator removes it.
+const STALE_MEMBER_WAIT: Duration = Duration::from_millis(200);
+
 fn values(values: &[&str]) -> Vec<ProducerRecord> {
     values
         .iter()
@@ -801,6 +805,7 @@ async fn heartbeat_fences(
     let mut probe = TelemetryProbe::new();
     let mut s = settings(&cluster, &["t"]);
     s.commit_interval = Duration::from_secs(60);
+    s.rebalance_timeout = STALE_MEMBER_WAIT;
     let mut c = consumer(&probe, "in", s);
     let Next::Records(f) = next(&mut c).await else { panic!("records first") };
     let member = c.membership().unwrap().0.to_string();
@@ -949,6 +954,7 @@ async fn a_commit_refused_for_membership_never_lands() {
         let mut probe = TelemetryProbe::new();
         let mut s = settings(&cluster, &["t"]);
         s.commit_interval = Duration::from_secs(60);
+        s.rebalance_timeout = STALE_MEMBER_WAIT;
         let mut c = consumer(&probe, "in", s);
         take(&mut c, 1).await;
         cluster.script(Step::api(ApiKey::OffsetCommit, Action::Error(error)));
