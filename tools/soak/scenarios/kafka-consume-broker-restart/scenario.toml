@@ -10,8 +10,8 @@ description = "generator -> kafka_out -> Kafka (restarted, paused) -> kafka_in (
 duration = "10m"          # warmup + one cycle + cooldown; --duration overrides
 warmup = "60s"            # no faults: baseline rate, RSS, fds
 cooldown = "120s"         # no faults at the end; >= recovery_bound
-# The dead member's 10 s session, a rejoin, a backoff of up to 10 s to a broker back from a
-# fault, and two aggregate windows.
+# A rejoin, a backoff of up to 10 s to a broker back from a fault, and two aggregate
+# windows.
 recovery_bound = "60s"
 cycle = "7m"              # >= last recovery (6m30s) + one progress window and slack
 compose = "compose.override.yaml"   # creates the topic before the SUT starts
@@ -59,8 +59,9 @@ action = "pause"
 on = "kafka"
 for = "40s"
 
-# No final commit and no LeaveGroup: the restarted member's join waits out the dead one's
-# session, then reads from the last commit, replaying what the killed life read after it.
+# No final commit and no LeaveGroup: the coordinator expires the dead member's 10 s session
+# while the SUT is down for 30 s, so the restarted member joins at once and reads from the last
+# commit, replaying what the killed life read after it.
 [[step]]
 at = "3m15s"
 action = "kill"

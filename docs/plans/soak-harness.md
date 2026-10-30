@@ -770,7 +770,7 @@ service (W4; see "The driver loop and end sequence" for the arithmetic), and
 | `victoria-metrics` (role `backend`) | `victoriametrics/victoria-metrics:v1.152.0`, `-retentionPeriod=100y`, `ports: ["127.0.0.1::8428"]`, so the host driver polls freshness every 30 s and dumps the final export with no checker container. The driver re-reads the port after any start of this service |
 | `logit` (the ingress SUT, role `sut`; an override can add more, §2's "Several SUT services") | `depends_on: [victoria-metrics]`, not required from W5, when `victoria-metrics` moved to the compose profile `local` the driver enables for a local target only; `environment:` passes each variable an external target may list (`DD_API_KEY`), empty when unset |
 | `generator` (role `generator`) | `depends_on: {logit: {condition: service_healthy}}`. An override can add more generators (W8b), each with `extends` from this one and its own config volume |
-| `kafka` (role `broker`) | `apache/kafka:4.2.0`, a single-node KRaft broker in the compose profile `kafka`, which the driver enables for a Kafka target only; one partition per topic, topics created on first use, a `kafka-broker-api-versions.sh` health check the SUT's optional `depends_on` waits for. No published port: the driver reads the topic through `docker exec` |
+| `kafka` (role `broker`) | `apache/kafka:4.2.0`, a single-node KRaft broker in the compose profile `kafka`, which the driver enables for a Kafka target or a Kafka wire; one partition per topic, topics created on first use unless a scenario's override creates them (`kafka-consume-broker-restart`'s makes two partitions), a `kafka-broker-api-versions.sh` health check the SUT's optional `depends_on` waits for. No published port: the driver reads the topic through `docker exec` |
 | `standin` (role `standin`, W9a) | `python:3.13.16-alpine3.24` running `tools/soak/standin/standin.py`, mounted read-only, in the compose profile `standin`, which the driver enables for a stand-in target only. Its data port, 8080, isn't published; its control port is, `ports: ["127.0.0.1::8081"]`, which the driver re-reads after any start of the service, as a backend's. A health check against the control port's `/health`, which the SUT's optional `depends_on` waits for. Its stdout is the record |
 
 Each service's role is its `soak.role` label (W7b). A scenario's `compose` override is passed
@@ -1101,12 +1101,13 @@ and takes the worst status; `report.py` is unchanged.
 
 | Symbol | Source |
 |---|---|
-| G | per source (W8b), its generator's `logit.output.messages{component=<generator_sink>}`; precondition: equals that sink's `logit.output.datagrams` |
-| W | per listener (W8b), SUT `logit.input.datagrams{component=<sut_listener>}` |
+| G | per source (W8b), its generator's `logit.output.messages{component=<generator_sink>}`; precondition: equals that sink's `logit.output.datagrams`. On a Kafka wire, the writer's `logit.output.records`, the records the broker accepted |
+| W | per listener (W8b), SUT `logit.input.datagrams{component=<sut_listener>}`. On a Kafka wire, `logit.input.records`, the records the consumer counted when fetched |
 | K | per listener, SUT `logit.input.kernel.dropped` |
 | F | per listener, SUT `logit.input.frames.dropped`: on a TCP wire (W11a) under the framer's reasons, `truncated`, `oversize`, `drained`, and `malformed`; on a file wire (W11b) under `oversize` and `truncated`; else 0 |
 | D | per listener, SUT `logit.component.datagrams.dropped` under every reason, from telemetry; the listener's stderr shutdown lines only cross-check its `shutdown` part, and a killed life counts none |
-| B | per listener, SUT `logit.input.messages.dropped{reason=malformed}` plus `logit.input.frames.dropped{reason=undecodable}` plus `logit.input.frames.dropped{reason=oversize}` (W8b): a line the decoder refused, a datagram it refused whole, and a line over `lines_in`'s `max_line_bytes`, which its decoder drops with a throttled diagnostic and no decoder error. Each is 0 on a listener with no such rule |
+| B | per listener, SUT `logit.input.messages.dropped{reason=malformed}` plus `logit.input.frames.dropped{reason=undecodable}` plus `logit.input.frames.dropped{reason=oversize}` (W8b): a line the decoder refused, a datagram it refused whole, and a line over `lines_in`'s `max_line_bytes`, which its decoder drops with a throttled diagnostic and no decoder error. Each is 0 on a listener with no such rule. On a Kafka wire, `logit.input.records.dropped` and `logit.input.records.skipped` under every reason, the client's own drops (`corrupt`, `oversize`, `legacy_format`, `retention`, `aborted`) included |
+| Q | on a Kafka wire, per listener, SUT `logit.input.batches.deferred`: batches deferred at a revoke or shutdown, each in W, in neither E nor B, and read again, up to `batch_max_events` records each; else 0 |
 | E | per listener, SUT `logit.component.events.sent{component=<sut_listener>}` |
 | X | per listener, SUT `logit.component.events.dropped{component=<sut_listener>}` under every reason (W7a): events the listener counted as sent and then dropped, such as a batch sent into the inbox of a node that has failed (`closed_consumer`) |
 | Y | on a scrape wire (W25), per listener, 3 × SUT `logit.input.scrapes{component=<sut_listener>}` under every class: the synthetic samples E counts and W leaves out; else 0 |
@@ -1397,9 +1398,11 @@ The rows:
   - each lost membership, `logit.input.rebalances{reason="membership_lost"}`: the same above,
     at the life's peak rate, since a fenced commit's records are read again;
   - each deferred batch, Q, `logit.input.batches.deferred`: up to `batch_max_events` records
-    above. A deferred batch is in W and never sent, so `ledger.intake`'s balance and an earlier
-    life's residual, and `ledger.egress`'s gap, accept a positive difference up to Q's records
-    in a life that deferred one;
+    above. A deferred batch is in W and in neither E nor B, so in a life that deferred one
+    `ledger.intake`'s balance, an earlier life's residual, and `ledger.summary`'s W − D − E − B
+    term accept a positive difference up to Q's records. `ledger.egress` accepts a positive gap
+    up to them only in an earlier life, whose residual holds them: in the final life a deferred
+    batch never reaches `aggregate`, so it can't explain Ab − V;
   - a stop commits before it leaves the group and adds nothing else.
 
   The end sequence waits, once the generators stop, until the listener's `logit.input.lag`
@@ -1847,9 +1850,9 @@ letters, digits, `.`, `_`, and `-`, up to 249 characters, not `.` or `..`), an `
 VictoriaMetrics ledger key `vm_every_window`, and anything but one `[[ledger.sink]]`, the
 `kafka_out` whose topic is V, with no `backend` or `vm_selector`. The `kafka` service carries the
 role `broker`, and the `kafka` profile is the only one that runs it, so a fault on `kafka` is
-known for a Kafka target only, and one on `victoria-metrics` is refused for it as an unknown
-service, as for an external target; `kill` stays the SUT's only. Every fault on the broker
-affects egress. A `topic` on any other target is refused.
+known for a Kafka target or a Kafka wire only, and one on `victoria-metrics` is refused for a
+Kafka target as an unknown service, as for an external target; `kill` stays the SUT's only.
+Every fault on the broker affects egress, and on a Kafka wire it affects the wire too. A `topic` on any other target is refused.
 
 **The driver.** Compose runs the `kafka` profile in place of `local`, with no env-file copy.
 The driver skips everything that reads VictoriaMetrics, and its end sequence waits for the sink's

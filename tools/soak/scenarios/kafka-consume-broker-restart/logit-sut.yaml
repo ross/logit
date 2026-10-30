@@ -15,8 +15,8 @@ components:
     # `earliest` reads those records rather than skipping them.
     start: earliest
     # Under the scenario's 40 s pause of the broker, so the coordinator expires the member when
-    # the broker resumes; the kill's restarted member also waits out the dead one's session
-    # before its join completes.
+    # the broker resumes, and under the 30 s kill, so the dead member's session has expired
+    # before the restarted one joins.
     session_timeout: 10s
     heartbeat_interval: 2s
     commit_interval: 5s
