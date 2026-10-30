@@ -103,15 +103,21 @@ Entry format and the other areas: [the known-gaps index](README.md).
   different container whose id begins `deadbeefcafe`.
   - **Workaround:** don't give a container a name shaped like an id prefix. See [ADR
     `docker-container-identity-and-minimal-watches`](../adr/docker-container-identity-and-minimal-watches.md).
-- **An envelope over the cap is dropped by the splitter without the decoder seeing it, so a dropped
-  *closing* fragment lets the next line on that stream splice onto the held partial.**
-  `docker_in`'s `LineSplitter` drops a json-file line longer than its envelope bound
-  (`envelope_cap` in `crates/logit-inputs/src/docker.rs`) whole and counts it (`long_line` and
-  `logit.input.frames.dropped{reason="oversize"}`), and
-  `DockerDecoder` never learns a line went missing. If the dropped line was a message's closing
-  fragment, the held partial stays open and the next same-stream line joins it.
-  - **To close:** the splitter must report drops in sequence, and a `TailDecoder` hook must
-    receive them. See [ADR
+- **An envelope over the cap is dropped by the splitter without the decoder seeing it, so a message
+  that lost one fragment leaves wrong.** `docker_in`'s `LineSplitter` drops a json-file line
+  longer than its envelope bound (`envelope_cap` in `crates/logit-inputs/src/docker.rs`) whole and
+  counts it (`long_line` and `logit.input.frames.dropped{reason="oversize"}`), and `DockerDecoder`
+  never learns a line went missing. A dropped closing fragment leaves the held partial open, so
+  the next line on that stream joins it; a dropped middle fragment leaves the message without its
+  middle; and a dropped first fragment leaves the rest of the message as a line with no head. Every
+  full-size fragment of a container whose `attrs` outgrows the bound's slack is dropped this way
+  (the next entry), so its long messages all lose fragments.
+  - **To close:** a remedy that doesn't need the dropped fragment's stream, such as ending both
+    streams' held partials on any drop. The splitter-drop hook that `cri_in` adds
+    ([ADR `cri-container-logs`](../adr/cri-container-logs.md)'s "Implementation notes for W2")
+    reports each drop in sequence, but it can't close this for json-file by itself: an envelope
+    writes `stream` after `log`, so a dropped line's leading bytes can't name its stream. The
+    `cri` plan's W4 decides the remedy. See [ADR
     `file-tailing-and-docker-json-logs`](../adr/file-tailing-and-docker-json-logs.md)'s 2026-09-28
     amendment.
 - **An `attrs` object larger than the envelope bound's slack can drop entries as `long_line`.**

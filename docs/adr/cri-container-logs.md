@@ -24,11 +24,13 @@ in six workstreams; this record holds the decisions they share.
 /var/log/pods/<namespace>_<pod name>_<pod uid>/<container name>/<restart count>.log
 ```
 
-A namespace, a pod name, and a container name can't hold `_`, and a uid is hex and `-`, so the
-directory name splits on `_` into three parts. The kubelet also writes a symlink per container
-attempt, `/var/log/containers/<pod>_<namespace>_<container>-<container id>.log`, pointing at that
-file (`pkg/kubelet/kuberuntime/legacy.go`, `logSymlink`). It cuts the link's name to 251 bytes
-before appending `.log`, so a long name loses its container id.
+A namespace, a pod name, and a container name can't hold `_`, so a pod directory name's first two
+`_` end its namespace and its pod name, and the rest is its uid. A uid the API server or the kubelet
+generates is hex and `-`, but a static pod's manifest can set its own uid, and that uid may hold `_`
+(section 2). The kubelet also writes a symlink per container attempt,
+`/var/log/containers/<pod>_<namespace>_<container>-<container id>.log`, pointing at that file
+(`pkg/kubelet/kuberuntime/legacy.go`, `logSymlink`). It cuts the link's name to 251 bytes before
+appending `.log`, so a long name loses its container id.
 
 **Line grammar.** One record per line, from `k8s.io/cri-api`'s `constants.go` and the kubelet's
 reader (`staging/src/k8s.io/cri-client/pkg/logs/logs.go`, `parseCRILog`):
@@ -109,11 +111,18 @@ then each container directory, and match two names in it:
 - `<n>.log`, where `<n>` is decimal digits that fit an `i64`: the live file.
 - `<n>.log.<YYYYMMDD-HHMMSS>`: a rotated file the kubelet hasn't compressed yet.
 
-A pod directory name that doesn't split on `_` into three non-empty parts, a container directory
-name holding `_` or `.`, and every other file name won't be matched: no `.gz`, no `.tmp`, and no
-conmon `.new` or `.1`. A symlinked directory won't be followed, as `docker_in`'s walk doesn't follow
-one. A file name will be matched whether it's a regular file or a symlink to one (section 9). Failed
-listings will follow the driver's rule: a listing that failed retires nothing
+A pod directory name will be split at its first two `_`: the namespace, the pod name, and the rest
+as the uid, so a static pod whose manifest-set uid holds `_` is read with its whole uid. The
+kubelet's own reader of this name, `parsePodUIDFromLogsDirectory`
+(`pkg/kubelet/kuberuntime/helpers.go`, for its log garbage collection), also splits on `_`, but
+takes the last part as the uid, which such a uid would cut short; splitting at the first two `_` is
+the form `BuildPodLogsDirectory` writes. A pod directory name with fewer than two `_` or an empty
+part, a container directory name holding `_` or `.`, and every other file name won't be matched: no
+`.gz`, no `.tmp`, and no conmon `.new` or `.1`. An unmatched name is skipped with no counter and no
+diagnostic, as a name outside a `tail_in` pattern is. A symlinked directory won't be followed, as
+`docker_in`'s walk doesn't follow one. A file name will be matched whether it's a regular file or a
+symlink to one (section 9). Failed listings will follow the driver's rule: a listing that failed
+retires nothing
 ([ADR `tail-discovery-failure-and-resume-identity`](tail-discovery-failure-and-resume-identity.md),
 decision 1).
 
@@ -193,10 +202,11 @@ the two streams inside a run. The state and its rules will follow `DockerDecoder
   (Implementation notes for W2). From them the decoder reads the record's stream and tag, drops that
   stream's held run, discards every later piece of the stream through its `F` (none when the dropped
   record is itself the `F`), and counts the whole line once as `frames.dropped{reason="oversize"}`,
-  with one `long_line`. A stream already dropping its line isn't counted again. When the leading
-  bytes don't parse, the decoder flushes both streams' held runs, as before a malformed record, and
-  the driver counts the drop as it does today. Without the hook, the tail of a line whose middle the
-  splitter dropped would leave as a line of its own, and each dropped piece would count once.
+  with one `long_line`. A stream already dropping its line isn't counted again, and a dropped `F`
+  ends its stream's drop, whether the drop began with it or earlier. When the leading bytes don't
+  parse, the decoder flushes both streams' held runs, as before a malformed record, and the driver
+  counts the drop as it does today. Without the hook, the tail of a line whose middle the splitter
+  dropped would leave as a line of its own, and each dropped piece would count once.
 - **Checkpoint:** while a run is held, `holds_entry` pins the checkpoint at the run's first record,
   so a crash replays the whole line. As for `docker_in`, the pin is the oldest held record across
   both streams.
@@ -223,20 +233,23 @@ treats as two files, for a case that occurs once per rotation per stream with a 
 
 ### 5. A dangling run flushes after an idle `partial_timeout`
 
-A held run will be emitted as it stands once its file has had nothing new to read for
-`partial_timeout` (default `5s`). A `P` with no `F` is normal: containerd writes one when a
-container exits mid-line and at a reopen, and CRI-O writes one whenever a write was split across
-reads. Holding it until the file closes would hold it until the kubelet's container garbage
-collection removes the file, minutes or never, with the checkpoint pinned the whole time.
+A held run will be emitted as it stands once its stream has had no new record for `partial_timeout`
+(default `5s`) and the reader has caught up with its file. A `P` with no `F` is normal: containerd
+writes one when a container exits mid-line and at a reopen, and CRI-O writes one whenever a write
+was split across reads. Holding it until the file closes would hold it until the kubelet's container
+garbage collection removes the file, minutes or never, with the checkpoint pinned the whole time.
 
-- The timer arms only when a read of the file reaches its end with a run held, and any read that
-  returns bytes disarms it. So a reader that is behind (a backlog after a restart, or a send blocked
-  by back-pressure) never fires it while the run's `F` is already in the file.
-- The driver checks armed timers on its `poll_interval` tick, and before it flushes, confirms
-  through the open handle's length that the file has no unread bytes; a file with unread bytes is
-  read instead. A dangling run waits between `partial_timeout` and `partial_timeout` plus one
-  `poll_interval`.
-- The timer runs on the process's monotonic clock, not the CRI timestamps, which are the node's
+- **The file must be at its end.** A file is a candidate only once a read of it has reached its end
+  with a run held, and only while no read since has returned bytes. On the `poll_interval` tick, the
+  driver also confirms through the open handle's length that the file has no unread bytes, and reads
+  it instead if it has. So a reader that is behind (a backlog after a restart, or a send blocked by
+  back-pressure) never flushes a run whose `F` is already in the file.
+- **Each stream expires by its own last record.** For a file at its end, the decoder flushes each
+  stream whose last record is at least `partial_timeout` old, and leaves the other stream's run
+  held. So a stdout prompt with no `F` is flushed on time while the container's stderr keeps
+  writing, instead of pinning the checkpoint until stderr goes quiet. A dangling run waits between
+  `partial_timeout` and `partial_timeout` plus one `poll_interval` after the reader catches up.
+- Ages are measured on the process's monotonic clock, not the CRI timestamps, which are the node's
   local clock and are written per record or per read.
 - A flush also ends an oversize drop in progress, so the stream's next record starts a new line.
 - `partial_timeout: 0s` turns the timer off: a run waits for its `F` or for the file to close.
@@ -266,7 +279,7 @@ Each file's resource will hold the semantic-convention keys its path names:
 |---|---|---|
 | `k8s.namespace.name` | string | the pod directory's first part |
 | `k8s.pod.name` | string | its second part |
-| `k8s.pod.uid` | string | its third part |
+| `k8s.pod.uid` | string | the rest, after its second `_` |
 | `k8s.container.name` | string | the container directory |
 | `k8s.container.restart_count` | `i64` | the file name's `<n>` |
 | `container.id` | string | section 8, when known |
@@ -318,12 +331,13 @@ name is a symlink there, and the driver stats and opens through it, so the ident
 inode, and a Docker rotation (a rename of the target) reads as a rotation. An empty file stays
 undecided until its first byte.
 
-The Docker decoder will ignore the splitter-drop hook, under `cri_in` and `docker_in` alike, so the
-driver keeps counting the drop and `docs/known-gaps/tailing.md`'s "An envelope over the cap is
-dropped by the splitter without the decoder seeing it" stays open. Using the hook the same way isn't
-possible: json-file writes `stream` after `log`, so a dropped envelope's leading bytes can't name
-its stream. Under `envelope_cap`, only an `attrs` object past the bound's slack or a writer other
-than dockerd produces such an envelope.
+The Docker decoder can't use the splitter-drop hook the way `CriDecoder` does: json-file writes
+`stream` after `log`, so a dropped envelope's leading bytes can't name its stream. W2 leaves it on
+the hook's default, so the driver keeps counting the drop, and `docs/known-gaps/tailing.md`'s "An
+envelope over the cap is dropped by the splitter without the decoder seeing it" stays open. W4
+decides and builds a remedy that doesn't need the stream, under `cri_in` and `docker_in` alike.
+Under `envelope_cap`, only an `attrs` object past the bound's slack or a writer other than dockerd
+produces such an envelope.
 
 The shared decoder will count a rejected json-file entry as
 `logit.input.frames.dropped{reason="malformed"}`, as section 4 counts a CRI record, so `docker_in`
@@ -433,16 +447,21 @@ The driver changes `cri_in` needs, named here so W2 builds what this record deci
   out: &mut Vec<Event>) -> bool`, with a default that returns `false`. `LineSplitter` keeps the
   first bytes of each line it drops (enough for a record's timestamp, stream, and first tag; 128
   bytes) and reports each drop in sequence with the line's start offset, between the lines it emits.
-  The driver calls the hook for each drop. It returns `true` when the decoder counted the drop and
-  sent `long_line` itself, so the driver counts neither, and `false` when the driver counts as it
-  does today. The driver then updates `held_from` from `holds_entry`, as after `decode_line`, so a
-  checkpoint during the drop stays at the line's first record. `CriDecoder` implements it (section
-  4); `DockerDecoder` and `LineDecoder` keep the default (section 9).
-- **An idle-flush hook on `TailDecoder`:** `fn flush_idle(&mut self, out: &mut Vec<Event>)`, default
-  a no-op, which the driver calls on the poll tick for a file whose idle timer has expired (section
-  5). The driver owns the timer: armed when a read reaches the file's end while `holds_entry` is
-  true, disarmed by any read that returns bytes, and checked against the open handle's length before
-  the call.
+  The driver calls the hook for each drop. It returns `true` when the decoder took the drop (counted
+  it with its `long_line`, or absorbed it into a line it already counted), so the driver counts
+  neither, and `false` when the head doesn't parse, so the driver counts as it does today. The
+  driver then updates `held_from` from `holds_entry`, as after `decode_line`, so a checkpoint during
+  the drop stays at the line's first record. `CriDecoder` implements it (section 4); `DockerDecoder`
+  and `LineDecoder` keep the default (section 9).
+- **The head parse** reads the timestamp, the stream, and the first byte or bytes of the tag, enough
+  to tell `P` from any other first tag. It doesn't require the space after the tag within the
+  128-byte head, since a long tag field can push that space past it.
+- **An idle-flush hook on `TailDecoder`:** `fn flush_idle(&mut self, now: Instant, out: &mut
+  Vec<Event>)`, default a no-op, which the driver calls on each poll tick for every file at its end
+  (section 5): a read of it has reached its end while `holds_entry` was true, no read since has
+  returned bytes, and the open handle's length shows no unread bytes. The decoder keeps each
+  stream's last-record `Instant`, taken when a record leaves the stream holding a run, and its
+  `partial_timeout`, and flushes each stream whose last record is at least that old.
 - **Per-decoder choices:** whether the splitter strips one trailing `\r`, and whether the driver
   lossily converts each line to UTF-8 before `decode_line` (section 3). Both default to today's
   behavior.
