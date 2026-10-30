@@ -231,6 +231,17 @@ fn assert_segments(got: &[&Delivered], segments: &[Vec<String>], what: &str) {
     }
 }
 
+/// The highest `<n>` of a container directory's `<n>.log` files.
+fn restart_count(dir: &Path) -> i64 {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| {
+            e.unwrap().file_name().into_string().unwrap().strip_suffix(".log")?.parse().ok()
+        })
+        .max()
+        .unwrap()
+}
+
 fn s(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
@@ -251,18 +262,19 @@ fn assert_first_record_time(delivered: &[&Delivered], raw: &[Raw], expected_byte
     assert_eq!(delivered.len(), expected_bytes.len());
     for (d, want) in delivered.iter().zip(expected_bytes) {
         let head = &want[..want.len().min(64)];
-        let first = raw
-            .iter()
-            .find(|r| {
-                r.stream == d.stream
-                    && if want.len() <= 64 {
-                        r.content == head
-                    } else {
-                        r.content.starts_with(head)
-                    }
-            })
-            .unwrap_or_else(|| panic!("no record starts the line {:?}", s(head)));
-        assert_eq!(d.timestamp, nanos(&first.time), "time of {:?}", s(head));
+        let mut times = raw.iter().filter(|r| {
+            r.stream == d.stream
+                && if want.len() <= 64 { r.content == head } else { r.content.starts_with(head) }
+        });
+        let what = s(head);
+        if want.len() > 64 {
+            // A long line is unique: its first record is the one that starts it.
+            let first = times.next().unwrap_or_else(|| panic!("no record starts {what:?}"));
+            assert_eq!(d.timestamp, nanos(&first.time), "time of {what:?}");
+        } else {
+            // A short line can repeat (several empty lines), so any identical record's time fits.
+            assert!(times.any(|r| nanos(&r.time) == d.timestamp), "time of {what:?}");
+        }
     }
 }
 
@@ -342,7 +354,11 @@ async fn check_tree(runtime: &str, crlf: &[u8]) {
     assert_eq!((closes.stream.as_str(), closes.tag.as_str()), ("stdout", "F"));
     assert_eq!(before.last().unwrap().tag, "P", "the rotated file ends on a dangling run");
 
-    let count = 23 + 2 * 3 + unread.len() + 2;
+    // The kubelet restarts the container until the recording ends, so the number of restarts is
+    // whatever `<n>.log` files the edge directory holds past 0.log.
+    let restarts = restart_count(&edge_dir);
+    assert!(restarts >= 1, "the recording holds a restart");
+    let count = 23 + 2 * restarts as usize + unread.len() + 2;
     let mut probe = TelemetryProbe::new();
     let delivered = replay(runtime, count, &mut probe).await;
 
@@ -400,8 +416,8 @@ async fn check_tree(runtime: &str, crlf: &[u8]) {
         assert_first_record_time(&[d], &raw, &[d.message.clone().into_bytes()]);
     }
 
-    // edge restarted into 1.log, 2.log, and 3.log, each ending on a dangling run.
-    for restart in 1..=3 {
+    // Each restart ended on a dangling run.
+    for restart in 1..=restarts {
         let stdout = lines(&delivered, &edge, "writer", restart, "stdout");
         assert_segments(
             &stdout,
@@ -433,9 +449,12 @@ async fn check_tree(runtime: &str, crlf: &[u8]) {
         "static stderr",
     );
 
-    // Dangling runs flushed on the idle timer: edge's held head and last line, three restarts, and
+    // Dangling runs flushed on the idle timer: edge's held head and last line, every restart, and
     // the rotator's tail. Nothing was lost, and the one invalid line was diagnosed.
-    assert_eq!(probe.sum("logit.input.frames.truncated", &[("reason", "partial_timeout")]), 6.0);
+    assert_eq!(
+        probe.sum("logit.input.frames.truncated", &[("reason", "partial_timeout")]),
+        (3 + restarts) as f64
+    );
     assert_eq!(probe.sum("logit.input.frames.dropped", &[]), 0.0);
     assert_eq!(probe.sum("logit.component.diagnostics", &[("key", "invalid_utf8")]), 1.0);
 }
@@ -465,7 +484,9 @@ fn check_symlinks(runtime: &str) {
         assert!(root.join("pods").join(dir).join(container).join(file).exists(), "{name}");
         seen += 1;
     }
-    assert_eq!(seen, 6, "edge's four attempts, the rotator, and the static pod");
+    let edge = pod_dir(runtime, "edge");
+    let attempts = 1 + restart_count(&root.join("pods").join(edge).join("writer"));
+    assert_eq!(seen, attempts + 2, "edge's attempts, the rotator, and the static pod");
 }
 
 #[tokio::test]

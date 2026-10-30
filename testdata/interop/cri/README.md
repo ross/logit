@@ -70,7 +70,7 @@ rotated file names, and symlink form. Observations the ADR doesn't state:
   file as a `P` and the continuation to the new file, so that run leaves `cri_in` as two lines
   (ADR section 4).
 - **Container garbage collection.** The kubelet removes an older dead attempt's directory within
-  a minute of the next attempt starting. A first recording that copied the tree once at the end
+  a minute of the next attempt starting. A recording that copied the tree once at the end
   found only `2.log`, so the script copies `edge`'s directory every half second while it runs.
 - **Lossy conversion.** `cri_in` replaces the invalid bytes with U+FFFD and diagnoses
   `invalid_utf8`; the test pins one occurrence per runtime.
@@ -80,10 +80,9 @@ rotated file names, and symlink form. Observations the ADR doesn't state:
 - Only the `cri-fixture` namespace is copied. The cluster's own pods (`kube-system` and the rest)
   and their symlinks are left out.
 - File contents are as the node held them, gzipped files included.
-- `crio/versions.txt` keeps the first lines of `crio --version`, the Kubernetes version
-  (`kubelet` isn't on the node's `PATH`; the script now also looks in
-  `/var/lib/minikube/binaries/`), and the BusyBox image id. The first recording's output is
-  trimmed by hand to the lines the script now prints.
+- `crio/versions.txt` is the script's output: the first lines of `crio --version`, the Kubernetes
+  version, and the BusyBox image id. The `kubelet: not found` line is the lookup on the node's
+  `PATH` that fails before the script tries `/var/lib/minikube/binaries/`.
 - `containerd/` was recorded with the pod image named `busybox:1.37.0`; the pod specs now say
   `docker.io/library/busybox:1.37.0`, which CRI-O needs to resolve a short name and containerd
   treats as the same reference.
@@ -99,3 +98,9 @@ rotated file names, and symlink form. Observations the ADR doesn't state:
   `--force` as root. The script deletes both clusters on exit, and removes the root-owned
   `minikube` home.
 - The script pins linux-amd64 binaries and stops on other machines.
+
+## Fuzz seeds
+
+`fuzz/seedgen` reads the uncompressed files here and writes a few records of each as seeds for the
+`cri` fuzz target: the first two short records, the first `P`, the first empty one, and the first
+with invalid UTF-8. Regenerate them with `script/unsafe-check fuzz-seed` after a new recording.
