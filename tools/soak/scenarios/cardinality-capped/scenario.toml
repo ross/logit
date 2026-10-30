@@ -1,0 +1,108 @@
+# The positive control to `cardinality`: tag values that never repeat, at 200 a second, under 10
+# fixed metric names, with `aggregate`'s `max_series_per_metric` set. New names would escape the
+# limit, which bounds series per name, so the names stay fixed and the values churn. Each name
+# holds 10 series and folds every later value into its overflow series, counted
+# `metrics.overflowed` and never dropped, which `vm_selector` matches too, so the ledger stays
+# exact. The claim under test is that the SUT's RSS stays flat for over an hour: a tag value
+# isn't interned, and the limit bounds `aggregate`'s state. The schema is
+# docs/plans/soak-harness.md's "The scenario schema".
+
+name = "cardinality-capped"
+description = "statsd-vm's load plus 200 never-repeating tag values a second under 10 names, with max_series_per_metric 10, for 75 minutes: the overflow series absorbs them and rss_slope PASSes on the SUT"
+duration = "75m"          # over an hour, which an rss_slope verdict needs; --duration overrides
+warmup = "2m"
+cooldown = "3m"           # >= recovery_bound
+recovery_bound = "45s"    # retry_max_delay 10s + two aggregate windows + a drain
+cycle = "30m"
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"
+
+[ledger]
+sut_aggregate = "window"
+wire_loss_outside_faults = 0.0
+
+[[ledger.source]]         # both inputs share the generator's one statsd sink, so G counts both
+service = "generator"
+generator_input = "load"
+generator_sink = "statsd"
+sut_listener = "statsd"
+
+[[ledger.sink]]           # every series, the overflow series included, so V holds every increment
+id = "victoria_metrics"
+backend = "victoria-metrics"
+vm_selector = '{__name__=~"soak_requests_[0-9]+_total|soak_churn_[0-9]+_total"}'
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 48   # cardinality's limit, which its interner growth FAILs
+fd_growth = 8
+
+[expected]
+rss_slope = { logit = "PASS" }
+
+[[step]]
+at = "5m"
+action = "netem"
+on = "logit"
+args = "delay 200ms 50ms"
+for = "2m"
+
+[[step]]
+at = "15m"
+action = "stop"
+on = "victoria-metrics"
+for = "90s"
+
+# Each of the 10 churn names passes its limit in every window, and no other name does.
+[[expect]]
+name = "values-overflow"
+service = "logit"
+metric = "logit.transform.metrics.overflowed"
+component = "window"
+window = "run"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "ten-names-overflowing"
+service = "logit"
+metric = "logit.transform.metrics.overflowing"
+component = "window"
+window = "run"
+reduce = "max"
+min = 10
+max = 10
+
+# 100 load series, 10 admitted series per churn name, and 10 overflow series, in the window a
+# life starts; after it the admitted series idle and only 110 are active.
+[[expect]]
+name = "series-bounded"
+service = "logit"
+metric = "logit.transform.series.active"
+component = "window"
+window = "run"
+reduce = "max"
+max = 210
+
+# The overflow series takes what passes the limit, so `max_series` never refuses a record.
+[[expect]]
+name = "no-series-limit-drops"
+service = "logit"
+metric = "logit.transform.metrics.dropped"
+component = "window"
+attrs = { reason = "series_limit" }
+window = "run"
+reduce = "delta"
+max = 0
+
+# A tag value isn't interned: the SUT's interner holds the fixed names and keys, and doesn't
+# grow with the 720,000 values an hour.
+[[expect]]
+name = "sut-interner-flat"
+service = "logit"
+metric = "logit.process.interner.strings"
+window = "run"
+reduce = "slope"
+max = 3600                # strings an hour: one a second, against 720,000 if values interned

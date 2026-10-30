@@ -1123,9 +1123,20 @@ async fn respond(
                 // Only a delivery clears a busy `/health`: a body the codec skipped whole says
                 // nothing about the pipeline.
                 shared.health.mark_accepted();
-                if let Err(undelivered) = deliver_detached(&shared.sink, batches.collect()).await {
+                // The drop is counted on the delivery's task, so a client that closes mid-wait
+                // doesn't leave it uncounted.
+                let settle = {
+                    let (telemetry, diag) = (shared.telemetry.clone(), shared.diag.clone());
+                    let peer = shared.peer.clone();
+                    move |outcome: Result<(), Undelivered>| {
+                        if let Err(undelivered) = outcome {
+                            count_closed(&telemetry, diag, &peer, undelivered.count());
+                        }
+                    }
+                };
+                let delivered = deliver_detached(&shared.sink, batches.collect(), settle).await;
+                if let Err(undelivered) = delivered {
                     // Before the `ackId` draw, so a refused body mints no id.
-                    count_closed(shared, undelivered.count());
                     let response = hec_response(HecStatus::INTERNAL_SERVER_ERROR);
                     return (name, undelivered.reason(), response);
                 }
@@ -1146,7 +1157,7 @@ async fn respond(
                 return (name, BUSY, server_busy());
             }
             Err(undelivered @ Undelivered::Closed(_)) => {
-                count_closed(shared, total);
+                count_closed(&shared.telemetry, shared.diag.clone(), &shared.peer, total);
                 return (name, undelivered.reason(), server_busy());
             }
         }
@@ -1254,18 +1265,11 @@ fn server_busy() -> http::Response<Full<Bytes>> {
 
 /// Counts `n` batches of a body that no consumer took and reports it through the throttled
 /// `closed_consumer` diagnostic.
-fn count_closed(shared: &Shared, n: usize) {
-    shared.telemetry.count(
-        "logit.input.batches.dropped",
-        n as f64,
-        &[("reason", "closed_consumer")],
-    );
-    shared.diag.clone().warn_throttled(
+fn count_closed(telemetry: &Telemetry, mut diag: Diagnostics, peer: &ConnectionPeer, n: usize) {
+    telemetry.count("logit.input.batches.dropped", n as f64, &[("reason", "closed_consumer")]);
+    diag.warn_throttled(
         "closed_consumer",
-        format_args!(
-            "splunk_hec_in: refused a body from {}: no consumer took a batch",
-            shared.peer
-        ),
+        format_args!("splunk_hec_in: refused a body from {peer}: no consumer took a batch"),
     );
 }
 
@@ -2473,6 +2477,30 @@ mod tests {
         probe
             .wait_for("the connections gauge to read 0", |t| {
                 t.gauge("logit.input.connections", &[]) == Some(0.0)
+            })
+            .await;
+    }
+
+    /// A client that closes while its body's second batch is parked on the detached delivery
+    /// drops the handler. The consumer then closes, so that batch is refused, and the drop is
+    /// still counted: the count runs on the delivery's task, not after the handler's wait.
+    #[tokio::test]
+    async fn a_batch_refused_after_its_client_closed_is_still_counted_dropped() {
+        let (addr, _running, rx, mut probe) = shutdown_listener(plaintext_shutdown_input()).await;
+        let mut client = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        write_event(&mut client, &addr, TWO_ENVELOPES).await;
+        wait_for_a_park(&mut probe, "the second batch to park on the full edge").await;
+
+        drop(client);
+        probe
+            .wait_for("the closed connection to end its task", |t| {
+                t.gauge("logit.input.connections", &[]) == Some(0.0)
+            })
+            .await;
+        drop(rx);
+        probe
+            .wait_for("the refused batch counted dropped", |t| {
+                t.sum("logit.input.batches.dropped", &[("reason", "closed_consumer")]) == 1.0
             })
             .await;
     }

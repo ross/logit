@@ -138,7 +138,14 @@ Entry format and the other areas: [the known-gaps index](README.md).
     `concurrency: 1`, the one that arrives later can be the older batch's. `dedup_timestamps`
     holds no state between batches either.
   - **Workaround:** keep one series' readings of one second in one batch: an `aggregate` upstream
-    leaves one point per series per window.
+    leaves one point per series per window. That fails at the `aggregate`'s own shutdown or
+    restart flush: it emits a partial window, which can fall in the same whole second as the
+    last full one and leaves in a separate request, so Datadog keeps one of the two, uncounted.
+    The soak scenario `delta-datadog` hit it on a generator restart: all 20 series sent a full
+    5 s window (250) stamped +794.5 s from the run's start and a 0.5 s partial window (25) at
+    +795.0 s, both truncating to one epoch second, 1793297098, in two requests (`tools/soak/README.md`'s "A delta transform's value"; its `ledger.standin` row
+    WARNs on such a pair). No configuration avoids it, since the flush's offset into a second
+    depends on when the process stops.
 - **`datadog_out` sends a container id unresolved.** `container.id` leaves as a bare
   `container_id` tag (a `ddtags` entry on a log, the payload field on a trace or stats payload).
   An Agent resolves a container id through its tagger into the container's image, name, and

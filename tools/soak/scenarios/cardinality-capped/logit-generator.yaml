@@ -1,0 +1,32 @@
+# The load source in `script/soak`'s cardinality-capped scenario: statsd-vm's 2,000 counter lines
+# a second over 100 names, plus a second input of 200 lines a second over 10 fixed names, each
+# line tagged with an `id` no earlier line had. Both go through one UDP sink, one line per
+# datagram, so G counts both.
+admin: { bind: 127.0.0.1:9600 }
+components:
+  load:
+    type: generate_in               # unbounded
+    rate: 2000
+    batch: 100
+    event:
+      metric: { name: "soak_requests_{seq%100}", kind: sum, value: 1 }
+  churn:
+    type: generate_in               # unbounded
+    rate: 200
+    batch: 20
+    event:
+      # The modulus is past any count a run reaches (200/s for 24 hours is 17.28 million), so no
+      # value repeats.
+      attributes: { id: "{seq%1000000000}" }
+      metric: { name: "soak_churn_{seq%10}", kind: sum, value: 1 }
+  statsd:
+    type: statsd_out
+    sources: [load, churn]
+    endpoint: logit:8125
+    format: dogstatsd               # writes the attribute as `|#id:N`
+    # One line per datagram, the ledger's unit: the longest line,
+    # `soak_churn_9:1|c|#id:999999999`, is 30 bytes, and two joined by a newline would be 61.
+    max_packet_bytes: "32"
+    buffer: { overflow: drop_newest, retry_max_delay: 1s }   # never stall generate_in
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }

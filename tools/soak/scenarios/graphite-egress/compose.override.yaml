@@ -1,0 +1,8 @@
+# graphite-egress's backend, merged onto tools/soak/compose.yaml: VictoriaMetrics with its carbon
+# plaintext listener on 2003, which the SUT's `graphite_out` writes to. Compose replaces a
+# service's `command` whole, so this list repeats the base file's flag.
+services:
+  victoria-metrics:
+    command:
+      - -retentionPeriod=100y
+      - -graphiteListenAddr=:2003

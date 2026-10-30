@@ -1,0 +1,29 @@
+# The system under test in `script/soak`'s dedup-merge scenario: statsd over UDP, a
+# `dedup_timestamps` at 1 ms, a 10 s cumulative aggregate, and remote-write 1.0 (zstd) to
+# VictoriaMetrics. statsd_in stamps each datagram with one clock read per receive call plus the
+# datagram's index in nanoseconds, so the lines of one series that one read takes share a
+# millisecond, and `dedup` folds them into one record whose value is their sum. A real config
+# puts `dedup_timestamps` last before its sink; here it sits before `aggregate`, the one place
+# the ledger follows a transform. Its `internal` telemetry goes to stdout as NDJSON for the
+# harness to read.
+admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
+components:
+  statsd: { type: statsd_in, bind: 0.0.0.0:8125 }   # receive: defaults (drop_oldest)
+  dedup:
+    type: dedup_timestamps
+    sources: [statsd]
+    precision: 1ms
+  window:
+    type: aggregate
+    sources: [dedup]
+    interval: 10s
+    temporality: cumulative
+    series_retention: 360           # a fault must never evict a series
+  victoria_metrics:
+    type: prometheus_out
+    sources: [window]
+    endpoint: http://victoria-metrics:8428/api/v1/write
+    version: 1
+    compression: zstd               # buffer: defaults (block, at_least_once, retry_max_delay 10s)
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }

@@ -1,0 +1,22 @@
+# The system under test in `script/soak`'s prometheus-scrape scenario: `prometheus_in` scrapes
+# the generator's exposition every 5 s and relays every sample as remote-write 1.0 (zstd) to
+# VictoriaMetrics behind a two-batch blocking queue. Its `internal` telemetry goes to stdout as
+# NDJSON for the harness to read; `script/soak` runs it with `--log-format json`.
+admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
+components:
+  scrape:
+    # Each scrape is one batch: a sample per series, then `up`, `scrape_duration_seconds`, and
+    # `scrape_samples_scraped`.
+    type: prometheus_in
+    scrape_targets: ["http://generator:9464/metrics"]
+    interval: 5s
+    timeout: 500ms                  # under the generator's 1 s window and its 3 s netem delay
+  victoria_metrics:
+    type: prometheus_out
+    sources: [scrape]
+    endpoint: http://victoria-metrics:8428/api/v1/write
+    version: 1
+    compression: zstd
+    buffer: { max_batches: 2 }      # overflow: block, the default
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }

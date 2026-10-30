@@ -1,0 +1,32 @@
+# The load source in `script/soak`'s splunk-hec-ingress scenario: 1,000 log lines a second to the
+# system under test over HEC's `/event`, each batch of 100 one request, each request polled on
+# `/ack` until the SUT acknowledges it. Its `internal` telemetry goes to stdout as NDJSON, so the
+# harness reads what it sent.
+admin: { bind: 127.0.0.1:9600 }
+components:
+  load:
+    type: generate_in               # unbounded
+    rate: 1000
+    batch: 100
+    event:
+      # One HEC object per event: a log alone, since a log beside a metric is two objects. A
+      # constant resource keeps every body one envelope, so the SUT decodes it to one batch.
+      log: "soak"
+      attributes:
+        series: "{seq%100}"
+  hec:
+    type: splunk_hec_out
+    sources: [load]
+    endpoint: http://logit:8088/services/collector
+    token: soak
+    # A batch counts delivered only once the SUT answers its id `true` on `/ack`, at the first
+    # poll 0.5 s after the body, so one batch in flight carries 200 lines a second at most;
+    # eight carry the rate with room. A restarted SUT has forgotten the ids it issued, and the
+    # sink resends the batch once `ack_timeout` passes (30 s, the default).
+    ack: true
+    concurrency: 8
+    # 50 batches is 5 s of load, so a SUT that answers nothing for longer overflows it and the
+    # loss is counted here; never stall generate_in.
+    buffer: { max_batches: 50, overflow: drop_newest, retry_max_delay: 1s }
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }

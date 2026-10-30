@@ -882,6 +882,20 @@ at once. Batches queue behind the head up to `max_batches`/`max_bytes`. With the
 `logit.component.buffer.utilization`, and choose a `drop_*` policy, or `at_most_once`, if intake
 matters more than the held batch.
 
+### A stream sink has no acknowledgment
+
+`syslog_out`, `statsd_out`, and `graphite_out` over TCP or TLS, and `statsd_out` over a Unix
+stream, count a batch sent once the kernel or the TLS session takes its bytes. A line protocol
+carries no acknowledgment, so a receiver that dies with bytes still in either socket buffer loses
+them, and neither side counts the loss
+([ADR `delivery-semantics`](adr/delivery-semantics.md), item 6). The posture can't help: no
+fault reaches the sink for those bytes. Where a lost tail matters, use a protocol with an
+acknowledgment: the native hop (`logit_out` to `logit_in`), or an HTTP sink whose destination
+answers after it holds the batch. Smaller socket buffers narrow the window, at a throughput
+cost. Over TCP and TLS they're `net.ipv4.tcp_wmem` on the sender and `net.ipv4.tcp_rmem` on the
+receiver. Those settings cover TCP sockets only: a Unix stream's buffer is the sending socket's
+`SO_SNDBUF`, which defaults to `net.core.wmem_default`.
+
 ### Sink failure semantics
 
 A sink classifies each failed send into one of four faults, and none of them ends `logit run`
@@ -2131,7 +2145,9 @@ components:
   the receive-queue gauges above. Under `transport: tcp`: `logit.input.connections` (a gauge that
   should match the number of connected senders),
   `logit.input.connections.rejected{reason="limit"}` (nonzero means the `max_connections` cap is
-  binding), `logit.input.frames`/`.frame.bytes` (one frame is one statsd line), and
+  binding), `logit.input.connections.closed{reason="reset"}` (a peer that reset its connection
+  after sending data; a partial frame it cut off is also counted `truncated`),
+  `logit.input.frames`/`.frame.bytes` (one frame is one statsd line), and
   `logit.input.frames.dropped{reason="oversize"|"drained"|"truncated"}`. On either transport, a malformed
   *line* is the decoder's `logit.input.messages.dropped{reason="malformed"}` (diagnostic `bad_line`),
   not a framing error, and a datagram or frame that isn't UTF-8 is
@@ -4806,7 +4822,9 @@ listener"](#idle_timeout-on-a-tcp-listener) above.
   connections are counted the same way, since both take the same connect path.
 - `syslog_in`: `logit.input.connections` (a gauge that should match the number of connected
   `syslog_out` peers) and `logit.input.connections.rejected{reason="limit"}` (nonzero means the
-  `max_connections` cap is binding).
+  `max_connections` cap is binding), and `logit.input.connections.closed{reason="reset"}`, a
+  peer that reset its connection after sending data. A reset that cut off a partial frame is also
+  counted `frames.dropped{reason="truncated"}`.
 - Both: a handshake failure, a framing violation, or an oversize or malformed frame surfaces through
   `logit.component.diagnostics{key="connection_error"|"framing_error"}` and
   `logit.input.frames.dropped{reason="oversize"|"malformed"|"truncated"}`. There is no separate

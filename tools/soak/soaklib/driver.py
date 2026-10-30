@@ -39,10 +39,13 @@ needs at the code:
   does every SUT service after `logit` (`Scenario.suts`). The end sequence stops every generator
   before it waits on the sinks, then each SUT service in chain order: an earlier one once its
   `[[ledger.hop]]` sink's queue is empty and nothing is in flight, the last, which holds the
-  `[[ledger.sink]]` sinks, once their stored totals hold or their queues are empty.
+  `[[ledger.sink]]` sinks, once their stored totals hold or their queues are empty. When the
+  sinks name a `relay`, `logit` holds them and is stopped once they're drained, and the relay,
+  last, once the stored totals hold.
 - Every `backend` service has its own published port, re-read after any revert of a fault on
   it. Freshness is sampled per `[[ledger.sink]]`, the end sequence waits until every sink's stored
-  total holds, and each sink's export lands in `vm-export/<sink>.jsonl`.
+  total holds, and each sink's export lands in `vm-export/<sink>.jsonl`, and what its
+  `vm_absent_selector` matches, if it has one, in `vm-export/<sink>.absent.jsonl`.
 - An external target (`[target] kind = "external"`) runs without the `local` compose profile,
   so with no backend. It passes compose a second `--env-file`: a plain `KEY=value` copy of the
   variables `SOAK_EXTERNAL_ENV` sets for the target, in a private temporary directory outside
@@ -745,12 +748,16 @@ class Run:
         self.finish_end_sequence()
 
     def stop_chain(self, suts):
-        """Stops each SUT service in chain order: an earlier one once its `[[ledger.hop]]` sink
-        is drained, the last once its sinks' stored totals hold or their queues are empty."""
+        """Stops each SUT service in chain order: an earlier one once its `[[ledger.hop]]` sink,
+        or the `[[ledger.sink]]` sinks a relay carries on, is drained, the last once its sinks'
+        stored totals hold or their queues are empty. A relay is last, so the stored totals
+        holding covers what it passes on."""
         for service in suts:
             if service != suts[-1]:
-                self.wait_sink_drained(service, sinks=[hop["sink"] for hop in self.scenario.hops
-                                                       if hop.get("from") == service])
+                sinks = [hop["sink"] for hop in self.scenario.hops if hop.get("from") == service]
+                if service == self.scenario.sink_sut:
+                    sinks += [sink["id"] for sink in self.scenario.sinks]
+                self.wait_sink_drained(service, sinks=sinks)
             elif self.has_vm:
                 self.wait_quiet()
             else:
@@ -799,7 +806,22 @@ class Run:
             except (vm.VmError, TypeError) as err:
                 export_path.write_text("")
                 self.phase("vm_export_failed", sink=sink["id"], error=str(err))
+            if sink.get("vm_absent_selector"):
+                self.export_absent(export_dir, sink, base)
         self.phase("end_end")
+
+    def export_absent(self, export_dir, sink, base):
+        """Exports what `sink`'s `vm_absent_selector` matches into
+        `vm-export/<sink>.absent.jsonl`, which `ledger.absent` requires to hold no series. The
+        phase records the export, so the check tells an empty one from one that never ran."""
+        path = export_dir / f"{sink['id']}{checks.ABSENT_SUFFIX}"
+        try:
+            text = vm.export_raw(base, sink["vm_absent_selector"], 0, timeout=120)
+            path.write_text(text)
+            self.phase("vm_absent_exported", sink=sink["id"], series=len(vm.parse_export(text)))
+        except (vm.VmError, TypeError) as err:
+            path.write_text("")
+            self.phase("vm_absent_export_failed", sink=sink["id"], error=str(err))
 
     def read_topic(self):
         """Reads the Kafka target's topic back from the broker after the SUT stopped: each

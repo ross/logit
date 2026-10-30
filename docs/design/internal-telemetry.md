@@ -845,14 +845,15 @@ and referenced below. A listener on `logit-inputs::tcp::TcpListener` records:
 | `logit.input.connections.rejected{reason="limit"}` | count | a connection closed at the connection cap, before any TLS handshake |
 | `logit.input.connections.rejected{reason="proxy_header"}` | count | a connection under `proxy_protocol: true` whose PROXY header was missing, malformed, cut short by the peer closing, or not complete within `handshake_timeout`; read before any TLS handshake |
 | `logit.input.accept.errors{reason="connection"\|"resource"\|"fatal"\|"other"}` | count | an `accept()` that failed, by class (`crates/logit-inputs/src/listener.rs`'s `classify_accept_error` has the table). `connection` retries at once; `resource` (fd exhaustion, realistically) and `other` back off 100 ms and continue; `fatal` ends the listener |
-| `logit.input.connections.closed{reason="idle"\|"shutdown"}` | count | `idle`: an operator-configured `idle_timeout:` closed the connection. Policy, not a fault: counted, never diagnosed, and only possible when the field is set. `shutdown`: an HTTP listener (`otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, `influxdb_in`, and `prometheus_in`'s remote-write receiver) closed an open connection at shutdown, one count per connection whose close sequence finished before `run_input`'s backstop. It lands after the shutdown signal, so only a dedicated `internal` pipeline exports it (see "With a dedicated pipeline, `internal` drains last"). The stream listeners and `logit_in` don't count a shutdown close |
+| `logit.input.connections.closed{reason="idle"\|"shutdown"\|"reset"}` | count | `idle`: an operator-configured `idle_timeout:` closed the connection. Policy, not a fault: counted, never diagnosed, and only possible when the field is set. `reset`: on this driver only, the peer reset the connection (`ECONNRESET`) after its first payload byte, also diagnosed `connection_error`. Not a loss: a partial frame the reset cut off is counted `frames.dropped{reason="truncated"}`, and a reset between frames loses nothing. A reset before the first payload byte, which is how a load balancer ends a health check, isn't counted. A Unix stream socket shares the code but doesn't count one in practice: Linux resets a Unix peer only when the other end closes with bytes it hasn't read, and the driver never writes to a peer. `shutdown`: an HTTP listener (`otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, `influxdb_in`, and `prometheus_in`'s remote-write receiver) closed an open connection at shutdown, one count per connection whose close sequence finished before `run_input`'s backstop. It lands after the shutdown signal, so only a dedicated `internal` pipeline exports it (see "With a dedicated pipeline, `internal` drains last"). The stream listeners and `logit_in` don't count a shutdown close |
 | `logit.input.frames` / `logit.input.frame.bytes` | count/sum | frames received, at the protocol's own unit |
 | `logit.input.frames.dropped{reason="oversize"\|"drained"\|"malformed"\|"truncated"\|"undecodable"}` | count | the same per-reason shape `logit.proto.errors{reason}` uses. `drained` is a line-framed listener's line that crossed its bound before its `LF` arrived: counted once, after which the connection discards input until its next `LF`. `undecodable` is a frame the decoder rejected whole (the `bad_frame` diagnostic): the only reason counted *after* `logit.input.frames`, so it is also in that count |
 
 The driver's `Diagnostics` keys: `framing_error` (any `frames.dropped` reason), `bad_frame` (a
 decoder that rejects a whole frame), `connection_error` (I/O, a TLS handshake that failed or
 timed out, or a connection that sent no first byte inside `handshake_timeout` and so gave its
-permit back; never an idle close, nor a reset before the connection's first payload byte), `proxy_header` (any `connections.rejected{reason="proxy_header"}`
+permit back; never an idle close, nor a reset before the connection's first payload byte; a reset
+after it is also counted `connections.closed{reason="reset"}`), `proxy_header` (any `connections.rejected{reason="proxy_header"}`
 refusal), and `accept_error` (any `accept.errors` reason). These keys
 and the decoder's own `bad_line` throttle listener-wide rather than per connection, because a `Diagnostics` clone shares its original's
 counts ([ADR `service-lifecycle-and-output-retry`](../adr/service-lifecycle-and-output-retry.md)'s
@@ -1132,14 +1133,18 @@ would add one point per probe interval to this key forever.
 |---|---|---|---|
 | scrape | `logit.input.scrapes{class="2xx"\|"4xx"\|"5xx"\|"other"\|"network_error"\|"timeout"\|"parse_error"\|"oversize"}` | count | one per target per tick: the HTTP classes plus three ways a scrape fails before or after a status (`parse_error` is a 2xx body that wouldn't decode) |
 | scrape | `logit.input.scrape.duration` | timing | one per target per tick, recorded regardless of outcome |
-| bind | `logit.input.writes{class="ok"\|"not_found"\|"method"\|"unauthorized"\|"unsupported"\|"oversize"\|"timeout"\|"bad_request"\|"closed_consumer"}`, plus `encoding="snappy"\|"zstd"` on `class="ok"` | count | one per request, one class per row of the module doc's routes table. See below. |
-| bind | `logit.input.write.duration` | timing | one per request, every exit included, which is why the count and the timer live in one wrapper around the routing itself |
+| bind | `logit.input.writes{class="ok"\|"not_found"\|"method"\|"unauthorized"\|"unsupported"\|"oversize"\|"timeout"\|"bad_request"\|"closed_consumer"}`, plus `encoding="snappy"\|"zstd"` on `class="ok"` | count | one per request, one class per row of the module doc's routes table. A write that reaches delivery is counted on the delivery's task, so it counts even when its sender closed before the response. See below. |
+| bind | `logit.input.write.duration` | timing | one per request answered, every exit included, which is why the timer lives in one wrapper around the routing itself |
 | both | `logit.input.samples` | count | a different unit in each mode. See below. |
 
 These are this component's own spellings, not `otlp_in`'s, which counts only refused requests. In `logit.input.writes`:
 
 - `ok` carries the body's `encoding`, so a vmagent that stayed on its default zstd wire, rather
-  than downgrading to Snappy, reads as `encoding="zstd"`.
+  than downgrading to Snappy, reads as `encoding="zstd"`. It counts a delivered write whose
+  sender timed out waiting for the `204` too: the batch went out, and the sender's resend is the
+  ordinary at-least-once duplicate. So `ok` and `closed_consumer` sum to the listener's
+  `logit.component.batches.sent` while no write decodes to nothing: a write that decodes to no
+  events, such as a 1.0 metadata-only request, is answered `204` and counts `ok` with no batch sent.
 - `unauthorized` is a `401` from `bind_auth:`, checked before the body. It's also counted
   `logit.input.requests.rejected{reason="auth"}`, the spelling every listener that checks a
   credential shares.

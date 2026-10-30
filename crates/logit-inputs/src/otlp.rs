@@ -26,8 +26,8 @@
 //! `docs/design/pipeline-graph.md`'s "Backpressure" section. A client that gives up and closes
 //! cancels only the handler's wait: [`crate::http::deliver_detached`] runs the request's sends on
 //! a task of their own, so every consumer still gets every batch of the request, however many
-//! batches (one per resource) it decoded to. The retry then duplicates on every branch alike
-//! rather than on some.
+//! batches (one per resource) it decoded to, and counts a refused batch dropped on that task. The
+//! retry then duplicates on every branch alike rather than on some.
 //!
 //! **A request no consumer takes is refused, not acknowledged.** When every consumer of the
 //! listener has closed, the request is answered `503` with `Retry-After: 1` (gRPC `UNAVAILABLE`,
@@ -819,8 +819,8 @@ async fn handle_http(
     match result {
         Ok(mut batches) => {
             request_peer.stamp_batches(&mut batches);
-            if let Err(undelivered) = crate::http::deliver_detached(&sink, batches).await {
-                count_undelivered(&telemetry, undelivered);
+            let settle = count_undelivered(&telemetry);
+            if crate::http::deliver_detached(&sink, batches, settle).await.is_err() {
                 let mut response =
                     text_response(StatusCode::SERVICE_UNAVAILABLE, NO_CONSUMER_TOOK_THE_BATCH);
                 response
@@ -1038,12 +1038,10 @@ async fn handle_grpc(
     match decoder.decode_signal(signal, payload) {
         Ok(mut batches) => {
             request_peer.stamp_batches(&mut batches);
-            match crate::http::deliver_detached(&sink, batches).await {
+            let settle = count_undelivered(&telemetry);
+            match crate::http::deliver_detached(&sink, batches, settle).await {
                 Ok(()) => Ok(grpc_response(0, "", Some(export_response(0, "")))),
-                Err(undelivered) => {
-                    count_undelivered(&telemetry, undelivered);
-                    Ok(grpc_response(14, NO_CONSUMER_TOOK_THE_BATCH, None))
-                }
+                Err(_) => Ok(grpc_response(14, NO_CONSUMER_TOOK_THE_BATCH, None)),
             }
         }
         Err(err) => Ok(grpc_response(3, &err.to_string(), None)),
@@ -1060,9 +1058,17 @@ struct Gate {
 /// The refusal's message, on both transports.
 const NO_CONSUMER_TOOK_THE_BATCH: &str = "no consumer took the batch";
 
-/// Counts a request's batches that no consumer took, the refused one included.
-fn count_undelivered(telemetry: &Telemetry, undelivered: crate::http::Undelivered) {
-    undelivered.record(telemetry);
+/// The delivery task's count of a request's batches that no consumer took, the refused one
+/// included: on that task, so a client that closed mid-wait doesn't leave the drop uncounted.
+fn count_undelivered(
+    telemetry: &Telemetry,
+) -> impl FnOnce(Result<(), crate::http::Undelivered>) + Send + 'static {
+    let telemetry = telemetry.clone();
+    move |outcome| {
+        if let Err(undelivered) = outcome {
+            undelivered.record(&telemetry);
+        }
+    }
 }
 
 /// Matches an OTLP/HTTP path (`/v1/logs`, `/v1/metrics`, `/v1/traces`) to its [`Signal`].
@@ -3274,6 +3280,28 @@ mod tests {
         probe
             .wait_for("the connections gauge to read 0", |t| {
                 t.gauge("logit.input.connections", &[]) == Some(0.0)
+            })
+            .await;
+    }
+
+    /// A client that closes while its export is parked drops the handler. The consumer then
+    /// closes, so the detached delivery's batch is refused, and the drop is still counted: the
+    /// count runs on the delivery's task, not after the handler's wait.
+    #[tokio::test]
+    async fn a_batch_refused_after_its_client_closed_is_still_counted_dropped() {
+        let (addr, _running, rx, mut probe) = parked_listener().await;
+        let client = park_a_request(&addr, &mut probe).await;
+
+        drop(client);
+        probe
+            .wait_for("the closed connection to end its task", |t| {
+                t.gauge("logit.input.connections", &[]) == Some(0.0)
+            })
+            .await;
+        drop(rx);
+        probe
+            .wait_for("the refused batch counted dropped", |t| {
+                t.sum("logit.input.batches.dropped", &[("reason", "closed_consumer")]) == 1.0
             })
             .await;
     }
