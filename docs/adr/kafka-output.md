@@ -368,8 +368,8 @@ every record. The `otlp_proto` and `otlp_json` formats write a topic per signal 
 `kafka-otlp-formats`](kafka-otlp-formats.md)). Kafka headers keep their order and, in `kafka-protocol`'s `Record`, can't repeat a
 key.
 
-Each format stays decodable: `kafka_in` reads `json`, `text`, and `native` back
-([ADR `kafka-input`](kafka-input.md)), and refuses `msgpack` at startup.
+Each format stays decodable: `kafka_in` reads every format back
+([ADR `kafka-input`](kafka-input.md)).
 
 ## Alternatives considered
 

@@ -353,8 +353,7 @@ Recorded per workstream as each lands.
 - **W3**: The input decodes a whole `Fetched`, then cuts it by `receive.batch_max_events` and
   `batch_max_bytes` (record value bytes, a record never split), so every record's outcome is
   counted before any batch goes out. To offer a batch again after a send slice,
-  `logit_pipeline::SendTimeout` now hands the batch back. The W4 formats are refused in
-  `logit-cli`'s registry when `logit run` builds the node, so `logit validate` accepts every
+  `logit_pipeline::SendTimeout` now hands the batch back. `logit validate` accepts every
   schema value. At shutdown the batch in flight waits the lesser of `drain_timeout` and half of
   `receive.shutdown_grace`, leaving the other half for the commit and LeaveGroup. The batches
   behind a `closed_consumer` drop count `batches.deferred`, since nothing past the dropped one is
