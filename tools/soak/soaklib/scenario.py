@@ -89,7 +89,8 @@ STANDIN_ROLES = {"standin": STANDIN_ROLE}
 # Every action the scenario schema accepts. faults.py implements them; the names must match its
 # ACTIONS.
 ACTION_NAMES = ("netem", "pause", "stop", "kill", "restart", "partition", "mark", "exit",
-                "respond", "signal", "rename", "rotate", "probe")
+                "respond", "signal", "rename", "rotate", "probe", "copytruncate", "gzip",
+                "replace")
 # Actions allowed on a SUT service only, each with the reason. A `kill` exists to end a `logit`
 # process with no shutdown; on the generator, the lines it sent after its last telemetry drain
 # reach the SUT with no G behind them, and `ledger.wire` would net them against real loss. An
@@ -103,13 +104,19 @@ SUT_ONLY_ACTIONS = {
 # Docker call (an `exit`'s revert starts the container the event ended), so a `[random]`
 # schedule, which draws faults, can't hold them.
 EXPECTED_EVENT_ACTIONS = ("mark", "exit")
+# The file operations a logrotate run makes on a file wire's files, on the writer's service:
+# `copytruncate` copies `path` to `to` and truncates `path`, `gzip` compresses `path` into `to`
+# and removes `path`, and `replace` puts `path`'s content back under a new inode, as a restore
+# or a migration does (fileops.py).
+FILE_ACTIONS = ("copytruncate", "gzip", "replace")
 # Actions that open no fault window: a `signal` sends a `logit` service a signal it handles
 # while it runs, a `rename` moves a file aside in the run's shared directory, a `rotate` issues
-# a certificate into the run's TLS directory, and a `probe` handshakes with a listener, so none
-# excuses anything a check judges (checks.py's `RunData.events`). A `signal` or a `probe` may
-# start inside a `rename` or a `rotate` on its own service (`HOLDING_ACTIONS`), and no other
-# step may overlap one of these on its service.
-NO_WINDOW_ACTIONS = ("signal", "rename", "rotate", "probe")
+# a certificate into the run's TLS directory, a `probe` handshakes with a listener, and a
+# `FILE_ACTIONS` step rotates a file wire's files, so none excuses anything a check judges
+# (checks.py's `RunData.events`); `ledger.wire` accounts for a `copytruncate`'s lines from its
+# record instead. A `signal` or a `probe` may start inside a `rename` or a `rotate` on its own
+# service (`HOLDING_ACTIONS`), and no other step may overlap one of these on its service.
+NO_WINDOW_ACTIONS = ("signal", "rename", "rotate", "probe") + FILE_ACTIONS
 HOLDING_ACTIONS = ("rename", "rotate")
 HELD_ACTIONS = ("signal", "probe")
 # The signals a `signal` step may send: SIGHUP, which a `logit` process answers by reopening
@@ -450,7 +457,8 @@ class StepSpec:
     count: object = None
     headers: object = None
     fault_class: object = None
-    # A `signal`'s signal, and a `rename`'s file and new name in the shared directory.
+    # A `signal`'s signal, and a `rename`'s or a file action's file and new name in the shared
+    # directory (a `replace` has no new name).
     signal: object = None
     path: object = None
     to: object = None
@@ -664,8 +672,9 @@ class Scenario:
     @property
     def uses_shared_dir(self):
         """Whether the run gets `<run>/shared`: for a file wire's writer and tailer, or for a
-        `rename` step's file."""
-        return bool(self.file_sources) or any(spec.action == "rename" for spec in self.steps)
+        `rename` step's or a file action's file."""
+        return bool(self.file_sources) or any(spec.action in ("rename",) + FILE_ACTIONS
+                                              for spec in self.steps)
 
     @property
     def uses_tls_dir(self):
@@ -2368,6 +2377,7 @@ def validate(scenario, duration=None, seed=None):
 
     run_duration = scenario.duration if duration is None else duration
     problems += _rename_problems(scenario, run_duration)
+    problems += _file_action_problems(scenario, run_duration)
     problems += _rotate_problems(scenario, run_duration)
     quiet_end = run_duration - scenario.cooldown
     if quiet_end < scenario.warmup:
@@ -2503,8 +2513,10 @@ def _respond_problems(spec, where, shape=None):
 
 def _signal_problems(spec, where):
     """What a step breaks of the `signal` and `rename` keys: `signal`, one of `SIGNALS`, required
-    on a `signal` and refused elsewhere; `path` and `to` required on a `rename` and refused
-    elsewhere. `_rename_problems()` checks a rename against its service's config."""
+    on a `signal` and refused elsewhere; `path` and `to` required on a `rename`, a `copytruncate`,
+    and a `gzip`, `path` alone on a `replace`, and both refused elsewhere. `_rename_problems()`
+    checks a rename against its service's config, and `_file_action_problems()` a file action
+    against the file sources."""
     problems = []
     if spec.action == "signal":
         if spec.signal is None:
@@ -2514,22 +2526,24 @@ def _signal_problems(spec, where):
                             f"{spec.signal!r}")
     elif spec.signal is not None:
         problems.append(f"{where}: `signal` is for signal only")
-    if spec.action == "rename":
-        for name in ("path", "to"):
-            value = getattr(spec, name)
-            if value is None:
-                problems.append(f"{where}: rename needs `{name}`, a file name in "
-                                f"{SHARED_MOUNT}")
-            elif (not isinstance(value, str) or not value or "/" in value
-                  or value in (".", "..")):
-                problems.append(f"{where}: `{name}` must be a bare file name in "
-                                f"{SHARED_MOUNT}, with no `/`, got {value!r}")
-        if spec.path is not None and spec.path == spec.to:
-            problems.append(f"{where}: `to` must differ from `path`")
-    else:
-        for name in ("path", "to"):
-            if getattr(spec, name) is not None:
-                problems.append(f"{where}: `{name}` is for rename only")
+    needs = (("path", "to") if spec.action in ("rename", "copytruncate", "gzip")
+             else ("path",) if spec.action == "replace" else ())
+    for name in needs:
+        value = getattr(spec, name)
+        if value is None:
+            problems.append(f"{where}: {spec.action} needs `{name}`, a file name in "
+                            f"{SHARED_MOUNT}")
+        elif (not isinstance(value, str) or not value or "/" in value
+              or value in (".", "..")):
+            problems.append(f"{where}: `{name}` must be a bare file name in "
+                            f"{SHARED_MOUNT}, with no `/`, got {value!r}")
+    if "to" in needs and spec.path is not None and spec.path == spec.to:
+        problems.append(f"{where}: `to` must differ from `path`")
+    for name in ("path", "to"):
+        if name not in needs and getattr(spec, name) is not None:
+            users = ("rename, copytruncate, gzip, and replace" if name == "path"
+                     else "rename, copytruncate, and gzip")
+            problems.append(f"{where}: `{name}` is for {users} only")
     return problems
 
 
@@ -2608,6 +2622,40 @@ def _rename_problems(scenario, duration):
                 problems.append(f"step {index + 1} (rename): runs {count} times in "
                                 f"{format_duration(duration)}, and a second rename would find "
                                 "its `to` taken; set max_duration to one cycle's run")
+    return problems
+
+
+def _file_action_problems(scenario, duration):
+    """What the `FILE_ACTIONS` steps break: each on the writer of a `[[ledger.source]]` whose
+    wire is `file`, so `ledger.wire` charges what it moves to that source; each `to` distinct;
+    and each step with a `to` once per run of `duration`, since a second cycle's would find its
+    `to` taken."""
+    problems = []
+    steps = [spec for spec in scenario.steps if spec.action in FILE_ACTIONS]
+    writers = {source.get("service") for source in scenario.file_sources}
+    seen_to = {}
+    for spec in steps:
+        where = f"step {spec.index + 1} ({spec.action} on {spec.on or '?'})"
+        if spec.on not in writers:
+            problems.append(f"{where}: {spec.action} is for a file source's writer; the "
+                            f"scenario's are {', '.join(sorted(map(str, writers))) or 'none'}")
+        if isinstance(spec.to, str):
+            if spec.to in seen_to:
+                problems.append(f"{where}: `to` {spec.to!r} repeats step "
+                                f"{seen_to[spec.to] + 1}'s, which would find it taken")
+            else:
+                seen_to[spec.to] = spec.index
+    if seen_to and scenario.random is None and scenario.cycle > 0:
+        counts = {}
+        for step in expand(scenario, duration):
+            if step.action in FILE_ACTIONS and step.action != "replace":
+                counts[step.spec_index] = counts.get(step.spec_index, 0) + 1
+        for index, count in sorted(counts.items()):
+            if count > 1:
+                problems.append(f"step {index + 1} ({scenario.steps[index].action}): runs "
+                                f"{count} times in {format_duration(duration)}, and a second "
+                                "run would find its `to` taken; set max_duration to one "
+                                "cycle's run")
     return problems
 
 

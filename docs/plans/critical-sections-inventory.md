@@ -1552,9 +1552,9 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
     tracked.offset` short-circuits (the early return in `reconcile_truncation`); a `copytruncate` followed quickly by enough
     writes to exceed the old offset before the next tick leaves the offset pointing into the new
     generation — lines are then silently skipped/garbled with no diagnostic. Inherent to
-    size-based detection; not listed in `known-gaps/`. Medium confidence. Still open: now
-    recorded in `docs/known-gaps/` ("A `copytruncate` that the writer refills past the old
-    offset before the next check goes undetected").
+    size-based detection; not listed in `known-gaps/`. Medium confidence. Now a decided limit:
+    [ADR `tail-content-identity`](../adr/tail-content-identity.md), decision 8, with the
+    workaround in `docs/deploying.md`'s "Rotation" paragraph.
   - `scan` does blocking `read_dir`/`metadata` (and, for `docker_in`, `read` of every
     `config.v2.json`) directly on the async worker thread; `PathPattern::scan`'s doc comment argues
     this is cheap, but it is O(containers) per tick on a busy host. Low severity, high confidence.
@@ -1921,8 +1921,10 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   (`a_reaped_files_stale_checkpoint_entry_is_gone_before_an_inode_reuse_can_resume_from_it`). The
   three dead `shutdown_grace` copies are removed; `InputRuntimeConfig::shutdown_grace` is the one.
   Two gaps are documented, not fixed: the checkpoint is at-least-once only up to the downstream
-  in-memory queues (a sink's grace drop isn't replayed), and a rotated file still draining at
-  shutdown whose new name matches no pattern is orphaned on restart (`docs/known-gaps/`).
+  in-memory queues (a sink's grace drop isn't replayed), a decided limit in [ADR
+  `tail-content-identity`](../adr/tail-content-identity.md), decision 1; and a rotated file still
+  draining at shutdown whose new name matches no pattern is orphaned on restart
+  (`docs/known-gaps/`).
 
 ### TAIL-07 — Hand-rolled `inotify` backend: every `unsafe`/syscall site in this area
 - **Location:** `crates/logit-inputs/src/tail/watch.rs`, `mod inotify` (the module roughly doubled
