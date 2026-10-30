@@ -1387,7 +1387,10 @@ async fn an_empty_file_waits_for_its_first_byte_and_a_truncation_latches_again()
         })
         .await;
     append(&log, &format!("{}\n", docker_entry("stdout", "a docker line, then cri\n")));
-    assert_eq!(lines(&recv_events(&mut rx, 1).await), pairs(&[("a docker line, then cri", "stdout")]));
+    assert_eq!(
+        lines(&recv_events(&mut rx, 1).await),
+        pairs(&[("a docker line, then cri", "stdout")])
+    );
 
     std::fs::write(&log, record("stdout", "F", "cri")).unwrap();
     assert_eq!(lines(&recv_events(&mut rx, 1).await), pairs(&[("cri", "stdout")]));
