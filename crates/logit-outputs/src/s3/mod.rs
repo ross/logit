@@ -5,16 +5,18 @@
 //! ## The window
 //!
 //! The sink collects through the window protocol (`docs/adr/collecting-sink-window.md`): it
-//! reports a [`Output::window`] of `usize::MAX`, and [`Output::collecting`] returns the open
-//! object's `max_age` deadline until the object is full. Every batch of an open or uploading
+//! reports a [`Output::window`] of `usize::MAX` while the object takes batches, and
+//! [`Output::collecting`] returns the open object's `max_age` deadline until the object is full. Every batch of an open or uploading
 //! object stays reserved in the sink's store, uncommitted, until the object is stored.
 //!
 //! - **`submit` stages.** The first batch submitted into an empty object opens it and names its
 //!   key; each batch is encoded, compressed, and hashed into the body as it arrives
 //!   ([`StagedObject`]).
-//! - **Full.** `collecting()` reads `None` once the staged batches' encoded bytes reach
-//!   `max_bytes`, the compressed body reaches `part_size`, or the object holds the head's pinned
-//!   batch count.
+//! - **Full.** `collecting()` reads `None`, and `window()` reads the batches staged, once the
+//!   staged batches' encoded bytes reach `max_bytes`, the compressed body reaches `part_size`, or
+//!   the object holds the head's pinned batch count. The `window()` bound is what stops the fill
+//!   when the head alone fills the object: no collecting window opens then, and the loop's
+//!   ordinary fill would otherwise submit every batch the store holds.
 //! - **`await_ack` on the head completes the object**: it closes the body and sends one
 //!   `PutObject`, and answers the head with the object's outcome. From then until each batch
 //!   behind the head is answered, `window()` reads the answers owed, `collecting()` reads `None`,
@@ -28,18 +30,20 @@
 //! - **The shutdown grace.** [`Output::reached_destination`] reads 0 until the `PutObject` is
 //!   sent, so an at-most-once grace cut commits none of an object that never left the process.
 //!
-//! **W3a's limit: one `PutObject` per object.** An object closes once its compressed body reaches
-//! `part_size`, where the multipart path will upload a part and keep the object open. Until that
-//! path lands an object is at most about `part_size` plus one batch's compressed bytes, whatever
+//! **One `PutObject` per object.** Multipart upload isn't built yet, so an object closes once its
+//! compressed body reaches `part_size`: an object is at most about `part_size` plus one batch's
+//! compressed bytes, and under `zstd` plus the uncompressed chunk not yet compressed, whatever
 //! `max_bytes` says (`docs/known-gaps/sinks.md`).
 //!
 //! ## The key
 //!
 //! `{prefix}{partition}{object_time}-{store id}-{first seq}.{ext}` ([`key`]'s module doc). The
 //! head pins `object_time` and, from the object's first close, its batch count, so every retry
-//! of that head in this process writes the same key and holds no more batches than an attempt
-//! that may still land; the count only falls (`docs/adr/s3-object-archive.md`, decision 3). A
-//! key holds no configuration value but `prefix` and `partition`.
+//! of that head in this process writes the same key and holds no more batches than any attempt
+//! before it, so an attempt that lands late loses nothing; the count only falls
+//! (`docs/adr/s3-object-archive.md`, decision 3). A shorter retry, or a head dropped `Rejected`,
+//! moves batches an earlier attempt may have stored to the next object, where they're stored
+//! twice. A key holds no configuration value but `prefix` and `partition`.
 //!
 //! ## Requests
 //!
@@ -68,39 +72,51 @@
 //! runtime drops the head alone, counted `batches.dropped{reason="rejected"}`, and the next
 //! attempt uploads the rest again. This table is canonical; [ADR
 //! `s3-object-archive`](../../../../docs/adr/s3-object-archive.md)'s decision 6 was its first copy.
-//! A row the single-`PutObject` path can't receive is tested with the multipart path, W3b of
-//! [the plan](../../../../docs/plans/s3-object-archive.md).
+//! A row only the multipart path can receive has no test yet: multipart upload isn't built, and
+//! [`classify`] already reads its codes.
 //!
-//! | Answer | Class | Why | Evidence |
-//! |---|---|---|---|
-//! | `2xx` | delivered | the object is stored | `a_2xx_delivers_the_object` |
-//! | `200` from `CompleteMultipartUpload` with an `<Error>` body | the class of its `<Code>` below | AWS documents the error-in-`200` case | W3b |
-//! | `301` `PermanentRedirect`, `307` `TemporaryRedirect`, any other `3xx` | `Refused` | the wrong region or endpoint: the same answer for every object; the error carries `x-amz-bucket-region` | `a_3xx_is_refused_and_names_the_buckets_region` |
-//! | `400` `RequestTimeout`, `IncompleteBody`, `BadDigest`, `XAmzContentSHA256Mismatch` | `Clean` | the body didn't arrive whole, so nothing was stored | `a_body_that_didnt_arrive_whole_is_clean` |
-//! | `400` `ExpiredToken`, `TokenRefreshRequired` | `Clean`, after `Chain::forget` | the credentials expired; fresh ones will sign the retry | `an_expired_token_is_clean_and_forgets_the_chains_credentials` |
-//! | `400` `EntityTooLarge`, `413` | `Refused` | a body is at most `part_size`, so the destination's limit is below it: configuration, not a batch | `a_body_too_large_is_refused` |
-//! | `400` `InvalidArgument`, `InvalidToken`, `AuthorizationHeaderMalformed`, `InvalidBucketName`, `InvalidEncryptionAlgorithmError`, any `KMS.*`, `InvalidStorageClass`, `AccessControlListNotSupported`, `KeyTooLongError`, `InvalidRequest` | `Refused` | configuration: the same answer for every object | `a_configuration_code_is_refused` |
-//! | `400` `InvalidPart`, `InvalidPartOrder`, `EntityTooSmall` | `Clean` | the sink built a bad upload; nothing is visible yet, so the object starts again | W3b |
-//! | `403`, any code | `Refused` | credentials or policy | `a_403_is_refused` |
-//! | `404` `NoSuchBucket`, and any other `404` | `Refused` | the bucket or endpoint is wrong | `a_404_is_refused` |
-//! | `404` `NoSuchUpload` | `Clean` | the upload was aborted underneath the sink; the object starts again | W3b |
-//! | `408` | `Ambiguous` | the shared default ([ADR `sink-fault-classes`](../../../../docs/adr/sink-fault-classes.md)'s "Amendment: 408 is `Ambiguous`") | `a_408_is_ambiguous` |
-//! | `409` `OperationAborted` | `Clean` | a conflicting operation was in progress; nothing was stored | `a_409_operation_aborted_is_clean` |
-//! | `411` `MissingContentLength` | `Refused` | a proxy or store that won't take the request's framing | `a_411_is_refused` |
-//! | `429`; any `503` with an S3 XML `<Code>` (`SlowDown`, `ServiceUnavailable`, MinIO's `SlowDownWrite` and `SlowDownRead`) | `Clean` | the store refused the request before processing it; `PutObject` is atomic | `a_429_or_a_503_with_a_code_is_clean` |
-//! | `503` with no S3 `<Code>` | `Ambiguous` | a load balancer's answer, which says nothing about the store: the shared default | `a_503_with_no_code_is_ambiguous` |
-//! | `500` (`InternalError` or any other code), `502`, `504`, and any other `5xx` | `Ambiguous` | the request may have been applied; a retry rewrites the same key; the shared default | `a_5xx_is_ambiguous` |
-//! | `501` `NotImplemented` | `Refused` | the store lacks a feature the sink uses | `a_501_is_refused` |
-//! | any other `4xx` | `Rejected` | [ADR `sink-fault-classes`](../../../../docs/adr/sink-fault-classes.md)'s rule for an answer the sink can't attribute | `any_other_4xx_is_rejected` |
-//! | connect failure; a dial `connect_timeout:` ended | `Clean` | nothing left the process: the shared HTTP driver's default ([`crate::http::classify_reqwest_error`]) | `a_refused_or_stalled_dial_is_clean` |
-//! | request timeout, or another transport error after the connection opened | `Ambiguous` | the request may have been applied: the shared HTTP driver's default | `a_request_timeout_is_ambiguous` |
+//! | Answer | Class | Why | Source | Evidence |
+//! |---|---|---|---|---|
+//! | `2xx` | delivered | the object is stored | [PutObject] | `a_2xx_delivers_the_object` |
+//! | `200` from `CompleteMultipartUpload` with an `<Error>` body | the class of its `<Code>` below | AWS documents the error-in-`200` case | [CompleteMultipartUpload] | multipart only |
+//! | `301` `PermanentRedirect`, `307` `TemporaryRedirect`, any other `3xx` | `Refused` | the wrong region or endpoint: the same answer for every object; the error carries `x-amz-bucket-region` | [S3 errors] | `a_3xx_is_refused_and_names_the_buckets_region` |
+//! | `400` `RequestTimeout`, `IncompleteBody`, `BadDigest`, `XAmzContentSHA256Mismatch` | `Clean` | the body didn't arrive whole, so nothing was stored | [S3 errors]; `XAmzContentSHA256Mismatch` from [MinIO's errors] and [Ceph RGW's errors] | `a_body_that_didnt_arrive_whole_is_clean` |
+//! | `400` `ExpiredToken`, `TokenRefreshRequired` | `Clean`, after `Chain::forget` | the credentials expired; fresh ones will sign the retry | [S3 errors] | `an_expired_token_is_clean_and_forgets_the_chains_credentials` |
+//! | `400` `EntityTooLarge`, `413` | `Refused` | a body is at most about `part_size` plus one batch, a size the configuration sets, so the destination's limit is below it: configuration, not a batch | [S3 errors]; [RFC 9110] | `a_body_too_large_is_refused` |
+//! | `400` `InvalidArgument`, `InvalidToken`, `AuthorizationHeaderMalformed`, `InvalidBucketName`, `InvalidEncryptionAlgorithmError`, `InvalidStorageClass`, `KeyTooLongError`, `InvalidRequest`; any `4xx` whose code starts `KMS.` | `Refused` | configuration: the same answer for every object | [S3 errors]; `KMS.*` from [AWS KMS's errors] and [MinIO's errors] | `a_configuration_code_is_refused` |
+//! | `400` `InvalidPart`, `InvalidPartOrder`, `EntityTooSmall` | `Clean` | the sink built a bad upload; nothing is visible yet, so the object starts again | [CompleteMultipartUpload] | multipart only |
+//! | `401`, `405`, `407`, any code | `Refused` | credentials, a method a proxy or store won't take, or a proxy's credentials: the shared HTTP default ([`crate::http::classify_status`]) | [RFC 9110] | `a_401_405_or_407_is_refused` |
+//! | `403`, any code | `Refused` | credentials or policy | [S3 errors] | `a_403_is_refused` |
+//! | `404` `NoSuchBucket`, and any other `404` | `Refused` | the bucket or endpoint is wrong | [S3 errors] | `a_404_is_refused` |
+//! | `404` `NoSuchUpload` | `Clean` | the upload was aborted underneath the sink; the object starts again | [S3 errors] | multipart only |
+//! | `408` | `Ambiguous` | the shared default ([ADR `sink-fault-classes`](../../../../docs/adr/sink-fault-classes.md)'s "Amendment: 408 is `Ambiguous`") | [RFC 9110] | `a_408_is_ambiguous` |
+//! | `409` `OperationAborted` | `Clean` | a conflicting operation was in progress; nothing was stored | [S3 errors] | `a_409_operation_aborted_is_clean` |
+//! | `411` `MissingContentLength` | `Refused` | a proxy or store that won't take the request's framing | [S3 errors] | `a_411_is_refused` |
+//! | `429`; any `503` with an S3 XML `<Code>` (`SlowDown`, `ServiceUnavailable`, MinIO's `SlowDownWrite` and `SlowDownRead`) | `Clean` | the store refused the request before processing it; `PutObject` is atomic | [S3 errors]; [MinIO's errors] | `a_429_or_a_503_with_a_code_is_clean` |
+//! | `503` with no S3 `<Code>` | `Ambiguous` | a load balancer's answer, which says nothing about the store: the shared default | [RFC 9110] | `a_503_with_no_code_is_ambiguous` |
+//! | `500` (`InternalError` or any other code), `502`, `504`, and any other `5xx` | `Ambiguous` | the request may have been applied; a retry rewrites the same key; the shared default | [S3 errors] | `a_5xx_is_ambiguous` |
+//! | `501` `NotImplemented` | `Refused` | the store lacks a feature the sink uses | [S3 errors] | `a_501_is_refused` |
+//! | any other `4xx` | `Rejected` | [ADR `sink-fault-classes`](../../../../docs/adr/sink-fault-classes.md)'s rule for an answer the sink can't attribute | | `any_other_4xx_is_rejected` |
+//! | connect failure; a dial `connect_timeout:` ended | `Clean` | nothing left the process: the shared HTTP driver's default ([`crate::http::classify_reqwest_error`]) | | `a_refused_or_stalled_dial_is_clean` |
+//! | request timeout, or another transport error after the connection opened | `Ambiguous` | the request may have been applied: the shared HTTP driver's default | | `a_request_timeout_is_ambiguous` |
+//!
+//! `AccessControlListNotSupported` has no row: it answers a request carrying an ACL, and the sink
+//! sends none, so it falls to "any other `4xx`".
+//!
+//! [PutObject]: https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html
+//! [CompleteMultipartUpload]: https://docs.aws.amazon.com/AmazonS3/latest/API/API_CompleteMultipartUpload.html
+//! [S3 errors]: https://docs.aws.amazon.com/AmazonS3/latest/API/ErrorResponses.html
+//! [MinIO's errors]: https://github.com/minio/minio/blob/master/cmd/api-errors.go
+//! [Ceph RGW's errors]: https://github.com/ceph/ceph/blob/main/src/rgw/rgw_common.cc
+//! [AWS KMS's errors]: https://docs.aws.amazon.com/kms/latest/APIReference/API_GenerateDataKey.html#API_GenerateDataKey_Errors
+//! [RFC 9110]: https://www.rfc-editor.org/rfc/rfc9110#name-status-codes
 //!
 //! A credential lookup that fails before any request is the chain's own fault: `Clean` when an
 //! endpoint was unreachable or busy, `Refused` otherwise (`logit_aws::creds`' module doc).
 //!
 //! **Retries are the loop's.** Every retryable class restarts the object from its head through
-//! the window protocol, holding no more than the head's pinned count; the sink retries no request
-//! of its own. **Posture:** the default, `at_least_once`, because a retry rewrites the same key.
+//! the window protocol, holding no more than the head's pinned count (the "Full" bound above);
+//! the sink retries no request of its own. **Posture:** the default, `at_least_once`, because a retry rewrites the same key.
 //! Under `at_most_once` an `Ambiguous` `PutObject` drops every batch of its object, which may be
 //! stored.
 //!
@@ -243,9 +259,6 @@ pub struct S3Output {
     object: StagedObject,
     open: Option<OpenObject>,
     pin: Option<Pin>,
-    /// The head's `await_ack` closed the object and hasn't answered yet; set until it does, so a
-    /// submit after a cancelled close opens a new object.
-    closing: bool,
     /// The answers owed to the batches behind a stored object's head.
     owed: usize,
     /// The current object's `PutObject` was sent.
@@ -309,7 +322,6 @@ impl S3Output {
             credentials,
             open: None,
             pin: None,
-            closing: false,
             owed: 0,
             visible: false,
             answered: None,
@@ -400,7 +412,6 @@ impl S3Output {
         self.object.reset();
         self.open =
             Some(OpenObject { key, deadline: tokio::time::Instant::now() + self.settings.max_age });
-        self.closing = false;
         self.owed = 0;
         self.visible = false;
         Ok(())
@@ -566,6 +577,9 @@ impl S3Output {
 /// body's `<Code>`. Every row is here, the multipart rows included.
 pub(crate) fn classify(status: u16, code: Option<&str>) -> Fault {
     let code = code.unwrap_or_default();
+    if code.starts_with("KMS.") && (400..=499).contains(&status) {
+        return Fault::Refused;
+    }
     match status {
         300..=399 => Fault::Refused,
         400 => match code {
@@ -585,13 +599,11 @@ pub(crate) fn classify(status: u16, code: Option<&str>) -> Fault {
             | "InvalidBucketName"
             | "InvalidEncryptionAlgorithmError"
             | "InvalidStorageClass"
-            | "AccessControlListNotSupported"
             | "KeyTooLongError"
             | "InvalidRequest" => Fault::Refused,
-            kms if kms.starts_with("KMS.") => Fault::Refused,
             _ => Fault::Rejected,
         },
-        403 | 411 | 413 | 501 => Fault::Refused,
+        401 | 403 | 405 | 407 | 411 | 413 | 501 => Fault::Refused,
         404 if code == "NoSuchUpload" => Fault::Clean,
         404 => Fault::Refused,
         408 => Fault::Ambiguous,
@@ -620,13 +632,16 @@ impl Output for S3Output {
     fn window(&self) -> usize {
         if self.owed > 0 {
             self.owed
+        } else if self.object.batches() > 0 && self.full() {
+            // The fill stops here when no collecting window opened: the head alone filled it.
+            self.object.batches()
         } else {
             usize::MAX
         }
     }
 
     fn collecting(&self) -> Option<tokio::time::Instant> {
-        if self.owed > 0 || self.closing || self.object.batches() == 0 || self.full() {
+        if self.owed > 0 || self.object.batches() == 0 || self.full() {
             return None;
         }
         self.open.as_ref().map(|open| open.deadline)
@@ -654,7 +669,8 @@ impl Output for S3Output {
         _ctx: BatchContext,
         seq: SeqId,
     ) -> anyhow::Result<()> {
-        if self.open.is_none() || self.closing || self.object.batches() == 0 {
+        // A closed object's body was taken, so a submit after a cancelled close opens a new one.
+        if self.open.is_none() || self.object.batches() == 0 {
             self.open(seq)?;
         }
         self.object
@@ -677,14 +693,12 @@ impl Output for S3Output {
         };
         let key = open.key.clone();
         let staged = self.object.batches();
-        self.closing = true;
         let closed_at = tokio::time::Instant::now();
         if let Some(pin) = &mut self.pin {
             pin.close_at(staged);
         }
         let object = self.object.finish();
         let result = self.put_object(&key, object).await;
-        self.closing = false;
         match result {
             Ok(()) => {
                 self.telemetry.count("logit.output.objects", 1.0, &[]);

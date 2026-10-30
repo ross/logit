@@ -226,7 +226,8 @@ logs/dt=2026-10-30/hour=14/20261030T142501.123Z-6f1c...e09a-00000000000000000042
   reads. **`format: native`** writes concatenated bare native frames, as `file_out` does under
   `format: native`.
 - **`compression: gzip`**, the default, through `flate2`, as one gzip member per object.
-  **`zstd`**, through `ruzstd`, as one zstd frame per staged batch: `ruzstd` 0.9's
+  **`zstd`**, through `ruzstd`, as one zstd frame per staged batch (amended: one per 1 MiB of
+  input, in "Implementation notes (2026-10-30)"): `ruzstd` 0.9's
   `FrameCompressor` compresses a whole input into one frame and has no streaming encoder, and a
   zstd stream of concatenated frames is valid and reads back as one. W3 measures what the
   per-batch frames cost in ratio against a single frame. **`none`** writes the encoding as it is.
@@ -285,9 +286,10 @@ first copy and isn't updated.
 | `301` `PermanentRedirect`, `307` `TemporaryRedirect`, any other `3xx` | `Refused` | the wrong region or endpoint: the same answer for every object; the diagnostic carries `x-amz-bucket-region` |
 | `400` `RequestTimeout`, `IncompleteBody`, `BadDigest`, `XAmzContentSHA256Mismatch` | `Clean` | the body didn't arrive whole, so nothing was stored |
 | `400` `ExpiredToken`, `TokenRefreshRequired` | `Clean`, after `Chain::forget` | the credentials expired; fresh ones will sign the retry |
-| `400` `EntityTooLarge`, `413` | `Refused` | a body is at most `part_size`, so the destination's limit is below it: configuration, not a batch |
-| `400` `InvalidArgument`, `InvalidToken`, `AuthorizationHeaderMalformed`, `InvalidBucketName`, `InvalidEncryptionAlgorithmError`, any `KMS.*`, `InvalidStorageClass`, `AccessControlListNotSupported`, `KeyTooLongError`, `InvalidRequest` | `Refused` | configuration: the same answer for every object |
+| `400` `EntityTooLarge`, `413` | `Refused` | a body is at most `part_size` (about `part_size` plus one batch while every object is one `PutObject`), so the destination's limit is below it: configuration, not a batch |
+| `400` `InvalidArgument`, `InvalidToken`, `AuthorizationHeaderMalformed`, `InvalidBucketName`, `InvalidEncryptionAlgorithmError`, `InvalidStorageClass`, `KeyTooLongError`, `InvalidRequest`; any `4xx` whose code starts `KMS.` | `Refused` | configuration: the same answer for every object |
 | `400` `InvalidPart`, `InvalidPartOrder`, `EntityTooSmall` | `Clean` | the sink built a bad upload; nothing is visible yet, so the object starts again |
+| `401`, `405`, `407`, any code | `Refused` | credentials, a method a proxy or store won't take, or a proxy's credentials: the shared HTTP default |
 | `403`, any code | `Refused` | credentials or policy |
 | `404` `NoSuchBucket`, and any other `404` | `Refused` | the bucket or endpoint is wrong |
 | `404` `NoSuchUpload` | `Clean` | the upload was aborted underneath the sink; the object starts again |
@@ -424,18 +426,37 @@ W3a built the single-`PutObject` path and decided these points the record left o
   day in year 9999 (every weekday and month name), and takes the longest result with the longest
   key tail. `endpoint:` may end in one `/`.
 - **`logit.output.parts`** counts `UploadPart` requests only, so a `PutObject` counts none.
-- **The cost of zstd's per-batch frames.** Fifty 100-event nginx batches, staged into one object
-  by `StagedObject` with `ruzstd` at its fastest level, beside one frame over the whole object:
+- **zstd writes a frame per 1 MiB of encoded input**, not per batch: the encoding collects in a
+  reused buffer, a frame is compressed each time it reaches `ZSTD_CHUNK_BYTES` (1 MiB), and the
+  close compresses the rest. Compressed bytes, with `ruzstd` at its fastest level, for each
+  fixture staged into one object:
 
-  | Encoding | `none` | `gzip` | `zstd`, a frame per batch | `zstd`, one frame |
-  |---|---|---|---|---|
-  | `json` | 5,415,000 | 29,398 | 33,300 | 27,540 |
-  | `native` | 1,857,800 | 13,382 | 26,100 | 7,892 |
+  | Fixture, encoding | `gzip` | `zstd`, 64 KiB chunks | `zstd`, 256 KiB | `zstd`, 1 MiB | `zstd`, 4 MiB | `zstd`, one frame |
+  |---|---|---|---|---|---|---|
+  | 50 nginx batches of 100, `json` (5.4 MB) | 29,401 | 54,559 | 27,800 | 27,605 | 27,553 | 27,540 |
+  | 50 nginx batches of 100, `native` (1.9 MB) | 13,399 | 15,826 | 7,983 | 7,905 | 7,892 | 7,892 |
+  | 500 nginx batches of 10, `native` (2.0 MB) | 10,515 | 16,554 | 8,605 | 8,527 | 8,514 | 8,514 |
+  | 50 statsd batches of 100, `json` (1.2 MB) | 4,861 | 5,831 | 3,081 | 3,042 | 3,029 | 3,029 |
 
-  The fixture repeats one batch, so the single frame's gain from cross-batch matches is an upper
-  bound. At 10 events per batch the per-batch frames are about ten times the single frame. A
-  frame per batch is always larger than gzip's one member here, so `gzip` stays the default and
-  `zstd` is worth choosing only for large batches, until `ruzstd` gains a streaming encoder.
+  A frame per batch had cost up to ten times the single frame's size, more than `gzip` in every
+  case. At 1 MiB the frames are within 0.5% of one frame for the whole object, and 4 MiB buys under
+  0.2% more for four times the buffer, so 1 MiB it is. The fixtures repeat one batch, which
+  favors one long frame. The chunk not yet
+  compressed lags `part_size`'s check by up to 1 MiB of encoded input, as gzip's deflate buffer
+  does by less.
+- **`401`, `405`, and `407` are `Refused`**, the shared HTTP default, and not decision 6's "any
+  other `4xx`": each says the same thing about every object (credentials, a method the store or a
+  proxy won't take, a proxy's credentials), and `Rejected` would drain the queue one head batch
+  per attempt.
+- **A `KMS.*` code is `Refused` under any `4xx`.** MinIO answers
+  `KMS.DefaultKeyAlreadyConfiguredException` with `409`.
+- **`AccessControlListNotSupported` has no row.** It answers a request carrying an ACL, and the
+  sink sends none.
+- **A head that fills the object alone bounds the fill.** No collecting window opens then, so
+  the sink's `window()` reads the batches staged while the object is full, and the loop's
+  ordinary fill stops there instead of submitting every batch the store holds.
+- **`prefix` and `partition` may not make a `.` or `..` segment**: a URL drops it, while SigV4
+  for S3 signs the path as written, so every request would answer `SignatureDoesNotMatch`.
 
 ## Alternatives considered
 
@@ -481,7 +502,8 @@ W3a built the single-`PutObject` path and decided these points the record left o
   under `examples/`; `docs/design/internal-telemetry.md`; `docs/design/memory.md`.
 - **Duplicates.** A replay after a restart writes its batches again under a new key, since its
   `object_time` is new; a late `CompleteMultipartUpload` or `PutObject` after its retry rewrites the
-  same key with the same batches or more; and a `Rejected` drop moves the head, so when an earlier
+  same key with the same batches or more, so the batches past a retry's lowered pin are stored
+  both there and in the next object; and a `Rejected` drop moves the head, so when an earlier
   attempt at the old key landed, the rest of that object is stored twice. An operator
   who needs none deduplicates downstream, as for every other at-least-once sink.
 - **Billing.** An abandoned multipart upload is billed until the lifecycle rule removes it.

@@ -3368,15 +3368,33 @@ fn s3_stage_json_gzip() {
     );
 }
 
-/// `format: json`, `compression: zstd`: 179. `ruzstd` has no reusable compressor, so each
-/// batch's frame builds its own match tables and block buffers.
+/// `format: json`, `compression: zstd`, a stage that doesn't fill the chunk: 0. The lines are
+/// copied into the object's reused chunk buffer, uncompressed.
 #[test]
 fn s3_stage_json_zstd() {
     expect_allocs(
         "s3_out: stage json+zstd",
         s3_stage(ObjectFormat::Json, ObjectCompression::Zstd),
-        179,
+        0,
     );
+}
+
+/// `format: json`, `compression: zstd`, the stage that fills the chunk: 582.
+/// `ruzstd` has no reusable compressor, so each frame builds its own match tables and block
+/// buffers, once per `ZSTD_CHUNK_BYTES` of input rather than per batch. Nine 100-event batches
+/// (108,300 bytes of lines each) stay under the 1 MiB chunk, and the tenth fills it.
+#[test]
+fn s3_stage_json_zstd_filling_a_chunk() {
+    let mut object = StagedObject::new(ObjectFormat::Json, ObjectCompression::Zstd);
+    let batch = fixtures::nginx_batch(100);
+    for _ in 0..9 {
+        object.stage(&batch).expect("should stage");
+    }
+    let before = object.compressed_bytes();
+    let ((), stats) = measure(|| object.stage(&batch).expect("should stage"));
+    assert_eq!(before, 0, "nine batches stay in the chunk");
+    assert!(object.compressed_bytes() > 0, "the tenth compresses a frame");
+    expect_allocs("s3_out: stage json+zstd, filling a chunk", stats, 582);
 }
 
 /// `format: json`, `compression: none`: 0, the rendered lines appended to the body.

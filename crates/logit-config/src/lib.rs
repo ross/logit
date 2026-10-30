@@ -1250,7 +1250,8 @@ pub enum S3Compression {
     /// One gzip member per object. The key ends `.gz`.
     #[default]
     Gzip,
-    /// One zstd frame per batch, which a zstd reader reads as one stream. The key ends `.zst`.
+    /// One zstd frame per mebibyte of uncompressed data, which a zstd reader reads as one
+    /// stream. The key ends `.zst`.
     Zstd,
     /// No compression.
     None,
@@ -4175,7 +4176,8 @@ pub enum ComponentKind {
         #[serde(default)]
         path_style: Option<bool>,
         /// Prepended to every object key, as written: end it with `/` to make it a folder, such
-        /// as `logs/`. Empty by default.
+        /// as `logs/`. Empty by default. Neither it nor `partition` may make a `.` or `..` folder,
+        /// which a URL would remove.
         #[serde(default)]
         prefix: String,
         /// A strftime pattern formatted in UTC at the time the object's first batch was staged,

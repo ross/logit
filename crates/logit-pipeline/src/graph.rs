@@ -360,7 +360,7 @@
 //! 100. An `s3_out` with an empty `bucket`, `region`, or `storage_class`; an `endpoint` that
 //!      isn't an `http://` or `https://` URL with a host and no path, query, fragment, or user
 //!      info; a `partition` jiff can't format, or a `prefix` and `partition` whose longest key
-//!      passes S3's 1,024 bytes; a `max_bytes` of `0` or above 9,000 times `part_size`, which
+//!      passes S3's 1,024 bytes or that make a `.` or `..` segment; a `max_bytes` of `0` or above 9,000 times `part_size`, which
 //!      would pass S3's 10,000 parts; a `part_size` outside S3's 5 MiB to 5 GiB; a `max_age`,
 //!      `timeout`, or `connect_timeout` of `0s`; an `sse` `kms_key_id` or `bucket_key` outside
 //!      `aws_kms`, or an empty `kms_key_id`; `credentials` with an empty value; or a `tls` failing
@@ -4919,11 +4919,18 @@ fn validate_s3_out(id: &str, kind: &ComponentKind) -> anyhow::Result<()> {
             anyhow::bail!("component '{id}': s3_out 'endpoint' ({}) {why}", redact::url(endpoint));
         }
     }
-    let longest = longest_partition(partition).map_err(|err| {
+    let probe = probe_partition(prefix, partition).map_err(|err| {
         anyhow::anyhow!(
             "component '{id}': s3_out 'partition' isn't a pattern jiff can format: {err}"
         )
     })?;
+    if probe.dot_segment {
+        anyhow::bail!(
+            "component '{id}': s3_out 'prefix' and 'partition' can make a key with a '.' or '..' \
+             segment -- a URL drops it, so the key the sink signs isn't the one it sends"
+        );
+    }
+    let longest = probe.longest;
     let key = prefix.len() + longest + logit_config::S3_KEY_TAIL_BYTES;
     if key > logit_config::S3_MAX_KEY_BYTES {
         anyhow::bail!(
@@ -5022,20 +5029,34 @@ fn check_s3_endpoint(endpoint: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// The most bytes `partition` formats to, in UTC: the longest over one instant per month and
-/// weekday in year 9999, the longest year jiff formats, at the last millisecond of a day, so
-/// month and weekday names and every numeric field are at their widest.
-fn longest_partition(partition: &str) -> Result<usize, jiff::Error> {
-    let mut longest = 0;
+/// What [`probe_partition`] found.
+struct PartitionProbe {
+    /// The most bytes `partition` formats to.
+    longest: usize,
+    /// Whether `prefix` and a formatted `partition` make a `.` or `..` path segment.
+    dot_segment: bool,
+}
+
+/// Formats `partition` in UTC at one instant per month and weekday in year 9999, the longest
+/// year jiff formats, at the last millisecond of a day, so month and weekday names and every
+/// numeric field are at their widest. Each result follows `prefix` to find a dot segment: every
+/// `/`-ended segment, since the key's own tail follows the last one.
+fn probe_partition(prefix: &str, partition: &str) -> Result<PartitionProbe, jiff::Error> {
+    let mut probe = PartitionProbe { longest: 0, dot_segment: false };
     for month in 1..=12 {
         for day in 20..=26 {
             let instant = jiff::civil::date(9999, month, day)
                 .at(23, 59, 59, 999_000_000)
                 .to_zoned(jiff::tz::TimeZone::UTC)?;
-            longest = longest.max(jiff::fmt::strtime::format(partition, &instant)?.len());
+            let formatted = jiff::fmt::strtime::format(partition, &instant)?;
+            probe.longest = probe.longest.max(formatted.len());
+            let path = format!("{prefix}{formatted}");
+            let mut segments: Vec<&str> = path.split('/').collect();
+            segments.pop();
+            probe.dot_segment |= segments.iter().any(|segment| matches!(*segment, "." | ".."));
         }
     }
-    Ok(longest)
+    Ok(probe)
 }
 
 /// Whether a sink of `kind` keeps a window open across arrivals through `Output::collecting`
@@ -8907,6 +8928,7 @@ mod tests {
             r#""sse": {"algorithm": "aes256"}, "storage_class": "STANDARD_IA""#,
             r#""credentials": {"access_key_id": "a", "secret_access_key": "s"}"#,
             r#""partition": "%A/%B/%s/""#,
+            r#""prefix": "logs/.hidden/a..b/", "partition": "x/.""#,
         ] {
             resolve(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], s3_out(extra))]))
                 .unwrap_or_else(|err| panic!("{extra}: {err}"));
@@ -8938,6 +8960,10 @@ mod tests {
             (r#""endpoint": "https://minio?x=1""#.into(), "has a path, query, or fragment"),
             (r#""partition": "dt=%""#.into(), "isn't a pattern jiff can format"),
             (long_prefix, "can make a 1025-byte key"),
+            (r#""prefix": "./logs/""#.into(), "'.' or '..' segment"),
+            (r#""prefix": "logs/../""#.into(), "'.' or '..' segment"),
+            (r#""prefix": "logs/.", "partition": "./""#.into(), "'.' or '..' segment"),
+            (r#""partition": "%Y/../""#.into(), "'.' or '..' segment"),
             (r#""part_size": "5242879""#.into(), "S3 takes parts from"),
             (r#""part_size": "5121MiB""#.into(), "S3 takes parts from"),
             (r#""max_bytes": "0""#.into(), "'max_bytes' is 0"),

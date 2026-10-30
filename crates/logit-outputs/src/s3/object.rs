@@ -7,9 +7,11 @@
 //!   ([`crate::ndjson::render_ndjson`]) into a reused buffer; `format: native` writes one bare
 //!   native frame per batch, uncompressed, as `file_out` does under `format: native`.
 //! - **Compression.** `gzip` is one gzip member per object through `flate2`, whose output lags
-//!   its input by what the deflate stream holds back. `zstd` is one frame per staged batch through
-//!   `ruzstd`, which has no streaming encoder; a zstd reader reads concatenated frames as one
-//!   stream. `none` appends the encoding as it is.
+//!   its input by what the deflate stream holds back. `zstd` is one frame per
+//!   [`ZSTD_CHUNK_BYTES`] of encoded input through `ruzstd`, which has no streaming encoder: the
+//!   encoding collects in a reused buffer, a frame is compressed each time the buffer reaches the
+//!   chunk size, and the close compresses the rest. A zstd reader reads concatenated frames as
+//!   one stream. `none` appends the encoding as it is.
 //! - **Hashing.** The body's SHA-256 is updated with the compressed bytes each stage produced, so
 //!   the close hashes only what the compressor's finish adds.
 
@@ -22,10 +24,21 @@ use logit_proto::{CodecError, Encoder};
 use ring::digest;
 use std::io::Write;
 
+/// How much encoded input one zstd frame takes. A frame finds no match in another frame, so a
+/// smaller chunk costs ratio, and the chunk is held uncompressed until it fills, so a larger one
+/// costs memory and lags `part_size`'s check (`docs/adr/s3-object-archive.md`'s
+/// "Implementation notes (2026-10-30)" has the measurement).
+pub const ZSTD_CHUNK_BYTES: usize = 1024 * 1024;
+
 /// The compressed body so far.
 enum Body {
     Gzip(GzEncoder<Vec<u8>>),
-    /// `zstd`'s frames, or `none`'s encoding, appended as each batch is staged.
+    /// `zstd`'s frames so far, and the encoded input not yet compressed into one.
+    Zstd {
+        frames: Vec<u8>,
+        chunk: Vec<u8>,
+    },
+    /// `none`'s encoding, appended as each batch is staged.
     Plain(Vec<u8>),
 }
 
@@ -35,15 +48,29 @@ impl Body {
             ObjectCompression::Gzip => {
                 Body::Gzip(GzEncoder::new(Vec::new(), flate2::Compression::default()))
             }
-            ObjectCompression::Zstd | ObjectCompression::None => Body::Plain(Vec::new()),
+            ObjectCompression::Zstd => Body::Zstd { frames: Vec::new(), chunk: Vec::new() },
+            ObjectCompression::None => Body::Plain(Vec::new()),
         }
     }
 
     fn written(&self) -> &[u8] {
         match self {
             Body::Gzip(encoder) => encoder.get_ref(),
+            Body::Zstd { frames, .. } => frames,
             Body::Plain(body) => body,
         }
+    }
+}
+
+/// Compresses `chunk` into one zstd frame at the end of `frames`, and empties it.
+fn compress_chunk(frames: &mut Vec<u8>, chunk: &mut Vec<u8>) {
+    if !chunk.is_empty() {
+        ruzstd::encoding::compress(
+            chunk.as_slice(),
+            &mut *frames,
+            ruzstd::encoding::CompressionLevel::Fastest,
+        );
+        chunk.clear();
     }
 }
 
@@ -101,12 +128,16 @@ impl StagedObject {
             Body::Gzip(encoder) => {
                 encoder.write_all(encoded).expect("a gzip encoder writing to a Vec doesn't fail")
             }
-            Body::Plain(body) if self.compression == ObjectCompression::Zstd => {
-                ruzstd::encoding::compress(
-                    encoded,
-                    &mut *body,
-                    ruzstd::encoding::CompressionLevel::Fastest,
-                );
+            Body::Zstd { frames, chunk } => {
+                let mut rest = encoded;
+                while !rest.is_empty() {
+                    let take = rest.len().min(ZSTD_CHUNK_BYTES - chunk.len());
+                    chunk.extend_from_slice(&rest[..take]);
+                    rest = &rest[take..];
+                    if chunk.len() == ZSTD_CHUNK_BYTES {
+                        compress_chunk(frames, chunk);
+                    }
+                }
             }
             Body::Plain(body) => body.extend_from_slice(encoded),
         }
@@ -129,7 +160,8 @@ impl StagedObject {
     }
 
     /// The compressed bytes written so far. Under `gzip` it trails the input by what the deflate
-    /// stream holds back until the next block or the finish.
+    /// stream holds back until the next block or the finish, and under `zstd` by the chunk not yet
+    /// compressed.
     pub fn compressed_bytes(&self) -> usize {
         self.body.written().len()
     }
@@ -137,11 +169,18 @@ impl StagedObject {
     /// Closes the object: finishes the compressed stream and the hash, and leaves an empty
     /// object behind.
     pub fn finish(&mut self) -> FinishedObject {
-        let body = match std::mem::replace(&mut self.body, Body::new(self.compression)) {
-            Body::Gzip(encoder) => {
-                encoder.finish().expect("a gzip encoder writing to a Vec doesn't fail")
+        let body = match &mut self.body {
+            // The chunk buffer stays, with its capacity, for the next object.
+            Body::Zstd { frames, chunk } => {
+                compress_chunk(frames, chunk);
+                std::mem::take(frames)
             }
-            Body::Plain(body) => body,
+            _ => match std::mem::replace(&mut self.body, Body::new(self.compression)) {
+                Body::Gzip(encoder) => {
+                    encoder.finish().expect("a gzip encoder writing to a Vec doesn't fail")
+                }
+                Body::Plain(body) | Body::Zstd { frames: body, .. } => body,
+            },
         };
         let mut hash = std::mem::replace(&mut self.hash, digest::Context::new(&digest::SHA256));
         hash.update(&body[self.hashed..]);
@@ -155,7 +194,13 @@ impl StagedObject {
     /// Drops everything staged, as for an object a fault abandoned.
     pub fn reset(&mut self) {
         if self.batches > 0 || self.hashed > 0 {
-            self.body = Body::new(self.compression);
+            match &mut self.body {
+                Body::Zstd { frames, chunk } => {
+                    frames.clear();
+                    chunk.clear();
+                }
+                body => *body = Body::new(self.compression),
+            }
             self.hash = digest::Context::new(&digest::SHA256);
         }
         self.hashed = 0;

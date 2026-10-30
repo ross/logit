@@ -266,6 +266,11 @@ fn messages(batches: Vec<EventBatch>) -> Vec<String> {
         .collect()
 }
 
+/// How many events the gzipped JSON objects the stand-in received from request `from` on hold.
+fn stored_messages(log: &SeenLog, from: usize) -> usize {
+    seen(log).iter().skip(from).map(|r| json_messages(&gunzip(&r.body)).len()).sum()
+}
+
 fn names(n: usize) -> Vec<String> {
     (1..=n).map(|i| format!("m{i}")).collect()
 }
@@ -428,13 +433,23 @@ async fn a_configuration_code_is_refused() {
             "KMS.NotFoundException",
             "KMS.DisabledException",
             "InvalidStorageClass",
-            "AccessControlListNotSupported",
             "KeyTooLongError",
             "InvalidRequest",
         ],
         Fault::Refused,
     )
     .await;
+    // A KMS code reads as configuration under any `4xx`: MinIO answers one with `409`.
+    assert_codes(409, &["KMS.DefaultKeyAlreadyConfiguredException"], Fault::Refused).await;
+}
+
+#[tokio::test]
+async fn a_401_405_or_407_is_refused() {
+    for status in [401, 405, 407] {
+        let (fault, message) = fault_of(move || reply(status, "")).await;
+        assert_eq!(fault, Fault::Refused, "{status}: {message}");
+    }
+    assert_codes(405, &["MethodNotAllowed"], Fault::Refused).await;
 }
 
 #[tokio::test]
@@ -510,7 +525,9 @@ async fn a_501_is_refused() {
 async fn any_other_4xx_is_rejected() {
     assert_codes(400, &["MalformedXML", "SomethingNew"], Fault::Rejected).await;
     assert_codes(409, &["BucketAlreadyExists"], Fault::Rejected).await;
-    for status in [400, 405, 422] {
+    // The sink sends no ACL, so this can't arrive; it has no row of its own.
+    assert_codes(400, &["AccessControlListNotSupported"], Fault::Rejected).await;
+    for status in [400, 418, 422] {
         let (fault, message) = fault_of(move || reply(status, "")).await;
         assert_eq!(fault, Fault::Rejected, "{status}: {message}");
     }
@@ -557,7 +574,7 @@ async fn a_request_timeout_is_ambiguous() {
     );
 }
 
-/// The rows only the multipart path can receive, through the classifier their tests in W3b reach.
+/// The rows only the multipart path can receive, through the classifier its requests will use.
 #[test]
 fn the_multipart_rows_classify_as_the_table_says() {
     for code in ["InvalidPart", "InvalidPartOrder", "EntityTooSmall"] {
@@ -574,8 +591,8 @@ fn classify_answer(status: u16, code: &str) -> Fault {
 // The window, the key, and the pin
 // ---------------------------------------------------------------------------------------------
 
-/// The object closes once its encoded bytes reach `max_bytes`, and, W3a's limit, once its
-/// compressed body reaches `part_size`.
+/// The object closes once its encoded bytes reach `max_bytes`, and, while multipart upload isn't
+/// built, once its compressed body reaches `part_size`.
 #[tokio::test]
 async fn an_object_is_full_at_max_bytes_or_at_part_size() {
     let (addr, _log) = standin(|_, _| ok()).await;
@@ -711,7 +728,7 @@ async fn an_encode_failure_leaves_the_object_staged() {
 /// sent.
 #[tokio::test]
 async fn nothing_reaches_the_destination_before_the_put_is_sent() {
-    let (addr, _log) = standin(|_, _| Answer::Hang).await;
+    let (addr, log) = standin(|_, _| Answer::Hang).await;
     let mut out = sink(addr);
     out.submit(&batch("m1"), BatchContext::default(), seq(1)).await.unwrap();
     assert_eq!(out.reached_destination(1), 0);
@@ -719,16 +736,102 @@ async fn nothing_reaches_the_destination_before_the_put_is_sent() {
     assert!(upload.is_err(), "the stand-in never answers");
     assert_eq!(out.reached_destination(1), 1);
     // A submit after the cancelled close opens a new object under the same key.
+    NOW.with(|now| now.set(T0 + 5_000_000_000));
     out.submit(&batch("m1"), BatchContext::default(), seq(1)).await.unwrap();
     assert_eq!(out.reached_destination(1), 0);
+    let upload = tokio::time::timeout(Duration::from_millis(200), out.await_ack()).await;
+    assert!(upload.is_err(), "the stand-in never answers");
+    let requests = seen(&log);
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].path, requests[0].path, "the same key, its object_time pinned");
+}
+
+/// A head that fills the object alone opens no collecting window, and the fill stops at it: three
+/// queued batches under `max_bytes: 1` are three objects of one batch each.
+#[tokio::test]
+async fn a_head_that_fills_the_object_alone_is_its_object() {
+    let (addr, log) = standin(|_, _| ok()).await;
+    let mut settings = settings(addr);
+    settings.max_bytes = 1;
+    let probe = TelemetryProbe::new();
+    let telemetry = probe.telemetry("out", "s3_out", "sink");
+    let mut out = sink_with(settings, &probe);
+    let store =
+        Arc::new(SinkStore::Memory(SinkQueue::new(SinkQueueConfig::default(), telemetry.clone())));
+    for message in ["m1", "m2", "m3"] {
+        store.push((Arc::new(batch(message)), BatchContext::default())).await;
+    }
+    let producer = async {
+        wait_until("every batch uploaded", || stored_messages(&log, 0) == 3).await;
+        store.close();
+    };
+    let config = crate::test_support::fast_retry();
+    logit_pipeline::test_util::drive_write_loop_over(
+        &mut out,
+        Arc::clone(&store),
+        config,
+        telemetry,
+        producer,
+    )
+    .await;
+    let bodies: Vec<Vec<String>> =
+        seen(&log).iter().map(|r| json_messages(&gunzip(&r.body))).collect();
+    assert_eq!(bodies, [["m1"], ["m2"], ["m3"]]);
+}
+
+/// A one-batch object the deadline closed is retried holding its head alone, though more batches
+/// arrived during the backoff: its pin is 1, and the earlier attempt may still land.
+#[tokio::test]
+async fn a_retry_of_a_one_batch_object_holds_the_head_alone() {
+    let release = Arc::new(Notify::new());
+    let held = Arc::clone(&release);
+    let (addr, log) = standin(move |n, _| match n {
+        0 => Answer::After(Arc::clone(&held), Box::new(reply(500, s3_error("InternalError")))),
+        _ => ok(),
+    })
+    .await;
+    let mut settings = settings(addr);
+    settings.max_age = Duration::from_millis(100);
+    let probe = TelemetryProbe::new();
+    let telemetry = probe.telemetry("out", "s3_out", "sink");
+    let mut out = sink_with(settings, &probe);
+    let store =
+        Arc::new(SinkStore::Memory(SinkQueue::new(SinkQueueConfig::default(), telemetry.clone())));
+    store.push((Arc::new(batch("m1")), BatchContext::default())).await;
+    let producer = async {
+        wait_until("the first upload", || seen(&log).len() == 1).await;
+        for message in ["m2", "m3"] {
+            store.push((Arc::new(batch(message)), BatchContext::default())).await;
+        }
+        release.notify_one();
+        wait_until("every batch uploaded after the failure", || stored_messages(&log, 1) == 3)
+            .await;
+        store.close();
+    };
+    let config = crate::test_support::fast_retry();
+    logit_pipeline::test_util::drive_write_loop_over(
+        &mut out,
+        Arc::clone(&store),
+        config,
+        telemetry,
+        producer,
+    )
+    .await;
+    let requests = seen(&log);
+    assert_eq!(requests[1].path, requests[0].path, "the retry writes the same key");
+    assert_eq!(json_messages(&gunzip(&requests[0].body)), ["m1"]);
+    assert_eq!(json_messages(&gunzip(&requests[1].body)), ["m1"], "the retry holds the head alone");
+    assert_eq!(requests.len(), 3, "the failed object, its retry, and the next object");
+    assert_ne!(requests[2].path, requests[0].path);
+    assert_eq!(json_messages(&gunzip(&requests[2].body)), ["m2", "m3"]);
 }
 
 // ---------------------------------------------------------------------------------------------
 // Formats, compression, and headers
 // ---------------------------------------------------------------------------------------------
 
-/// Every format and compression reads back as `replay_in` decodes it. `replay_in` doesn't yet
-/// decompress (W4 of the plan), so the test decompresses with `flate2` and `ruzstd` first.
+/// Every format and compression reads back as `replay_in` decodes it. `replay_in` doesn't
+/// decompress, so the test decompresses with `flate2` and `ruzstd` first.
 #[tokio::test]
 async fn every_object_round_trips_through_replay_ins_decoders() {
     use ObjectCompression as C;
