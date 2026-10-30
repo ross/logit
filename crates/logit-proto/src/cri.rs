@@ -12,8 +12,8 @@
 //! `parseCRILog` (`staging/src/k8s.io/cri-client/pkg/logs/logs.go`), which reads each of the three
 //! leading fields up to the next space:
 //!
-//! - **Timestamp.** The kubelet parses RFC 3339 with 0 to 9 fraction digits and `Z` or `±hh:mm`
-//!   (`RFC3339NanoLenient`). [`parse`] hands the field to
+//! - **Timestamp.** The kubelet parses the field with Go's `time.Parse` and
+//!   `RFC3339NanoLenient`. [`parse`] hands the field to
 //!   [`logit_core::time::parse_rfc3339_to_nanos`], which accepts every form either runtime
 //!   writes. Go's parser is wider (more than nine fraction digits, a `,` separator, an offset
 //!   hour of 24 or a minute of 60); logit reads those as a timestamp error. A timestamp that
