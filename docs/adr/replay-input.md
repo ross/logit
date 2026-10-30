@@ -134,7 +134,7 @@ replay:
 object that an archiving sink writes compressed, and an operator downloads, replays with no
 separate decompress step.
 
-1. **Detection is by magic, with no config field.** `1f 8b` is gzip and `28 b5 2f fd` is zstd. A
+1. **Detection is by magic, with no config field.** `1f 8b` is gzip and `28 b5 2f fd` is zstd. A zstd skippable frame's magic (`50 2a 4d 18` through `5f 2a 4d 18`) also selects zstd, because a file may open with one. The sniffed bytes are put back in front of the stream, not re-read, so a named pipe replays. A
    file starting with neither, or shorter than the magic, is plain, as before. The file's name is
    never consulted, so a renamed or extensionless download works. A plain file whose first bytes
    are a magic isn't a valid `json` or `native` file anyway: `json` starts with `{` or white
@@ -149,8 +149,10 @@ separate decompress step.
    reader goes away, so a closed consumer ends it.
 4. **The bounds are the format's.** A zstd frame declaring a window over 64 MiB is refused,
    because `ruzstd` reserves the declared window before decoding, and a content checksum that
-   doesn't match is refused. Decompressed size has no cap, because the line reader and the frame
-   scanner already bound a line or a frame, and a file is an operator's own.
+   doesn't match is refused. Decompressed size has no cap. The native frame scanner bounds a frame (`too_large`), but a
+   JSON line is read whole with no bound, as for a plain file, so a small compressed file can
+   inflate into one line that grows memory. The file is an operator's own, and bounding a line is
+   left open.
 5. **A stream that can't be finished is a loss.** A cut or corrupt stream, a checksum mismatch, or
    a window over the cap is counted `logit.input.frames.dropped{reason="decompress"}` with a
    `bad_compression` diagnostic. What decompressed before the fault is read, and the replay ends,

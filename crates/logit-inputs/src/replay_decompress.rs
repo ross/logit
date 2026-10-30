@@ -14,7 +14,7 @@
 
 use flate2::read::MultiGzDecoder;
 use ruzstd::decoding::{FrameDecoder, StreamingDecoder};
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufReader, Cursor, Read};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncWriteExt, DuplexStream};
 use tokio::runtime::Handle;
@@ -36,9 +36,13 @@ pub(crate) enum Compression {
 }
 
 impl Compression {
-    /// The compression a file starting with `head` uses. A file shorter than a magic is plain.
+    /// The compression a file starting with `head` uses. A zstd file may open with a skippable
+    /// frame. A file shorter than a magic is plain.
     pub(crate) fn sniff(head: &[u8]) -> Self {
-        if head.starts_with(&ZSTD_MAGIC) {
+        let skippable = head.len() >= 4
+            && u32::from_le_bytes([head[0], head[1], head[2], head[3]]) & 0xffff_fff0
+                == 0x184d_2a50;
+        if head.starts_with(&ZSTD_MAGIC) || skippable {
             Self::Zstd
         } else if head.starts_with(&GZIP_MAGIC) {
             Self::Gzip
@@ -68,7 +72,7 @@ impl Decompressing {
 }
 
 /// Decodes `file` as `compression` on a blocking thread. Must run inside a Tokio runtime.
-pub(crate) fn spawn(file: std::fs::File, compression: Compression) -> Decompressing {
+pub(crate) fn spawn(file: impl Read + Send + 'static, compression: Compression) -> Decompressing {
     debug_assert_ne!(compression, Compression::None);
     let (writer, output) = tokio::io::duplex(PIPE_CAPACITY);
     let error = Arc::new(Mutex::new(None));
@@ -103,16 +107,19 @@ fn pump(mut decoder: impl Read, mut writer: DuplexStream, handle: &Handle) -> Re
     }
 }
 
+/// The four bytes read ahead of a frame, put back in front of its source for the decoder.
+type Lookahead<R> = std::io::Chain<Cursor<[u8; 4]>, R>;
+
 /// A `Read` over every zstd frame in a stream, one `StreamingDecoder` at a time.
-struct ZstdFrames<R: BufRead> {
+struct ZstdFrames<R: Read> {
     /// The input between frames. `None` while `current` owns it.
     source: Option<R>,
-    current: Option<StreamingDecoder<R, FrameDecoder>>,
+    current: Option<StreamingDecoder<Lookahead<R>, FrameDecoder>>,
     /// The previous frame's decoder, kept so the next frame reuses its buffers.
     spare: Option<FrameDecoder>,
 }
 
-impl<R: BufRead> ZstdFrames<R> {
+impl<R: Read> ZstdFrames<R> {
     fn new(source: R) -> Self {
         Self { source: Some(source), current: None, spare: None }
     }
@@ -121,15 +128,13 @@ impl<R: BufRead> ZstdFrames<R> {
     fn next_frame(&mut self) -> std::io::Result<bool> {
         let mut source = self.source.take().expect("no frame is open");
         loop {
-            let head = peek4(&mut source)?;
-            let Some(head) = head else {
+            let Some(head) = read_head(&mut source)? else {
                 self.source = Some(source);
                 return Ok(false);
             };
             // Skippable frames: magic 0x184D2A50..=0x184D2A5F, a 4-byte length, then that many
             // opaque bytes.
             if u32::from_le_bytes(head) & 0xffff_fff0 == 0x184d_2a50 {
-                source.consume(4);
                 let mut len = [0u8; 4];
                 source.read_exact(&mut len).map_err(|_| truncated("skippable frame"))?;
                 let len = u64::from(u32::from_le_bytes(len));
@@ -141,8 +146,9 @@ impl<R: BufRead> ZstdFrames<R> {
             }
             let mut decoder = self.spare.take().unwrap_or_default();
             decoder.set_max_window_size(MAX_WINDOW);
-            let streaming = StreamingDecoder::new_with_decoder(source, decoder)
-                .map_err(|err| std::io::Error::other(format!("invalid zstd frame: {err}")))?;
+            let streaming =
+                StreamingDecoder::new_with_decoder(Cursor::new(head).chain(source), decoder)
+                    .map_err(|err| std::io::Error::other(format!("invalid zstd frame: {err}")))?;
             self.current = Some(streaming);
             return Ok(true);
         }
@@ -150,19 +156,20 @@ impl<R: BufRead> ZstdFrames<R> {
 
     fn finish_frame(&mut self) -> std::io::Result<()> {
         let streaming = self.current.take().expect("a frame is open");
-        let (source, decoder) = streaming.into_parts();
+        let (chain, decoder) = streaming.into_parts();
         if let Some(sent) = decoder.get_checksum_from_data() {
             if decoder.get_calculated_checksum() != Some(sent) {
                 return Err(std::io::Error::other("zstd content checksum mismatch"));
             }
         }
-        self.source = Some(source);
+        // The decoder read the four lookahead bytes first, as a frame is longer than its magic.
+        self.source = Some(chain.into_inner().1);
         self.spare = Some(decoder);
         Ok(())
     }
 }
 
-impl<R: BufRead> Read for ZstdFrames<R> {
+impl<R: Read> Read for ZstdFrames<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -184,14 +191,18 @@ fn truncated(what: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::UnexpectedEof, format!("truncated zstd {what}"))
 }
 
-/// The next 4 bytes without consuming them. `None` at a clean end of input. A shorter tail is an
-/// error, because no frame is under 4 bytes; a file read returns less than the buffer holds only
-/// at its end.
-fn peek4<R: BufRead>(source: &mut R) -> std::io::Result<Option<[u8; 4]>> {
-    let buf = source.fill_buf()?;
-    match buf {
-        [] => Ok(None),
-        [a, b, c, d, ..] => Ok(Some([*a, *b, *c, *d])),
-        _ => Err(truncated("frame header")),
+/// Reads the next 4 bytes, looping over short reads: a `BufReader` returns what is buffered
+/// without refilling, so one read can end at a buffer edge mid-header. `None` at a clean end of
+/// input; a shorter tail is an error, because no frame is under 4 bytes.
+fn read_head<R: Read>(source: &mut R) -> std::io::Result<Option<[u8; 4]>> {
+    let mut head = [0u8; 4];
+    let mut have = 0;
+    while have < head.len() {
+        match source.read(&mut head[have..])? {
+            0 if have == 0 => return Ok(None),
+            0 => return Err(truncated("frame header")),
+            n => have += n,
+        }
     }
+    Ok(Some(head))
 }

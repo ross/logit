@@ -214,6 +214,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Consequence:** a JSON archive takes its full size on disk until an external tool compresses
     it.
   - **Workaround:** archive as `format: native` with `compression: lz4`, or compress the rotated
-    file with `gzip` or `zstd`, which `replay_in` reads as it is.
+    file with `gzip` or `zstd`, which `replay_in` reads as it is. For a compression it doesn't
+    read (xz, bzip2, lz4-framed JSON), decompress to a file or a named pipe before replaying.
   - **Remedy:** gzip on `file_out`'s `format: json` rotation, so archiving and replaying stay one
     story.
