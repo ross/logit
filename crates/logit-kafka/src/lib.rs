@@ -1,6 +1,7 @@
 //! What `kafka_out` and `kafka_in` share: the broker connection ([`conn`]), its SASL mechanisms
 //! ([`sasl`]), Kafka's error codes and the fault class of a SASL answer ([`error`]), and the
-//! [`KafkaSasl`] settings `logit-cli` builds from config. Behind the `test-util` feature, the
+//! [`KafkaSasl`] settings `logit-cli` builds from config; and `kafka_in`'s consumer-group client
+//! ([`consumer`]), which has no config of its own. Behind the `test-util` feature, the
 //! in-process fake broker ([`fake_broker`]) and the scripted stream ([`test_stream`]) both
 //! crates' tests drive.
 //!
@@ -18,6 +19,7 @@
 //! ([`conn::RequestError::fault`]).
 
 pub mod conn;
+pub mod consumer;
 pub mod error;
 mod http;
 pub mod sasl;
