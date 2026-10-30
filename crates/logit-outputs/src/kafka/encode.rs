@@ -24,7 +24,8 @@
 //! An event dropped as `oversize` under `record: batch` counts only there. An OTLP format counts
 //! an event with no log, span, or metric, which no request holds, in [`EncodeStats::no_payload`],
 //! and each attribute value it writes as a double, a `u64` above `i64::MAX`, in
-//! [`EncodeStats::u64_as_double`]. What each metric kind, log field, span, and attribute
+//! [`EncodeStats::u64_as_double`]: an event's when a log, a span, or a metric the mapping keeps
+//! carries it to a request, and the resource's and scope's when any record is written. What each metric kind, log field, span, and attribute
 //! becomes, in every format, is the generated table under "What each metric, log, span, and
 //! attribute becomes".
 //!
@@ -717,9 +718,9 @@ pub struct EncodeStats {
     /// Events an OTLP format skipped for carrying no log, span, or metric, which no request
     /// holds, as `otlp_out` skips one.
     pub no_payload: usize,
-    /// Attribute values an OTLP format wrote as a double for being a `u64` above `i64::MAX`, on
-    /// the events it wrote and the batch's resource and scope, once per batch as `otlp_out`
-    /// counts them.
+    /// Attribute values an OTLP format wrote as a double for being a `u64` above `i64::MAX`: on
+    /// each event with a log, a span, or a metric the OTLP mapping keeps, and on the batch's
+    /// resource and scope when any record was written, once per batch as `otlp_out` counts them.
     pub u64_as_double: usize,
     /// Metric records `format: text` left out of a record it wrote from the event's log.
     pub metrics_omitted: usize,
@@ -1122,25 +1123,40 @@ impl KafkaEncoder {
     ) {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
         let timestamp = millis(i64::try_from(nanos).unwrap_or(i64::MAX));
-        let mut written = false;
         for event in &batch.events {
             if event.log.is_none() && event.span.is_none() && event.metrics.is_empty() {
                 stats.no_payload += 1;
-            } else {
-                written = true;
-                stats.u64_as_double += u64_as_double_count(&event.attributes);
+                continue;
+            }
+            let n = u64_as_double_count(&event.attributes);
+            if n > 0 && self.reaches_a_request(batch, event) {
+                stats.u64_as_double += n;
             }
         }
-        if written {
-            stats.u64_as_double += u64_as_double_count(&batch.resource.attributes)
-                + batch.scope.as_ref().map_or(0, |s| u64_as_double_count(&s.attributes));
-        }
+        let records = out.len();
         for signal in SIGNALS {
             let groups = self.groups(signal, batch);
             for group in groups {
                 self.otlp_group(signal, batch, group, timestamp, out, stats);
             }
         }
+        // The resource and scope go out once per record but count once, as one batch's values.
+        if out.len() > records {
+            stats.u64_as_double += u64_as_double_count(&batch.resource.attributes)
+                + batch.scope.as_ref().map_or(0, |s| u64_as_double_count(&s.attributes));
+        }
+    }
+
+    /// Whether any of `event`'s signals maps to a record, as `otlp_out` decides an event's
+    /// attributes go out: a log or a span always does, and a metric only when the OTLP mapping
+    /// doesn't skip or drop it, which this probes with the gate muted so nothing counts twice.
+    fn reaches_a_request(&mut self, batch: &EventBatch, event: &Event) -> bool {
+        if event.log.is_some() || event.span.is_some() {
+            return true;
+        }
+        let (resource, scope) = (&batch.resource, batch.scope.as_deref());
+        let otlp = &mut self.otlp;
+        self.gate.muted(|| otlp.request(Signal::Metrics, resource, scope, [event]).is_some())
     }
 
     /// `signal`'s events of `batch`, grouped by their key: one group per trace id, in order of
@@ -2039,6 +2055,28 @@ mod tests {
             let b = batch(big("res"), vec![log, Event::empty(0, big("unsent"))]);
             let (_, stats) = records(&mut encoder(format, RecordMode::Request, usize::MAX), &b);
             assert_eq!(stats.u64_as_double, 2, "{format:?}: the event's and the resource's");
+        }
+    }
+
+    /// An event whose only metric the OTLP mapping drops or skips reaches no request, so neither
+    /// its `u64` attribute nor the resource's counts, as `otlp_out` counts none of them.
+    #[test]
+    fn an_otlp_format_counts_no_u64_attribute_for_an_event_whose_metrics_all_drop() {
+        let big = |k: &str| {
+            let mut a = AttrMap::new();
+            a.insert(k, Value::U64(u64::MAX));
+            a
+        };
+        for format in [RecordFormat::OtlpProto, RecordFormat::OtlpJson] {
+            let mut e = Event::empty(1, big("big"));
+            e.metrics.push(logit_core::MetricRecord::new(
+                intern("adj"),
+                logit_core::MetricKind::GaugeDelta(1.0.into()),
+            ));
+            let b = batch(big("res"), vec![e]);
+            let (out, stats) = records(&mut encoder(format, RecordMode::Request, usize::MAX), &b);
+            assert_eq!(out.len(), 0, "{format:?}: the gauge delta is dropped");
+            assert_eq!(stats.u64_as_double, 0, "{format:?}: nothing reached the wire");
         }
     }
 }
