@@ -29,8 +29,9 @@ directory) the script has written:
     logs/<container>.log                  each container's log
 
 Prints one row per leg and store (tools/s3-interop/README.md, "What it runs"): PASS (the leg did
-what that table says it checks), GAP (the store behaves differently from AWS S3 in a way the row
-records), or FAIL. Writes the same rows to /out/results.md. Exits 1 on any FAIL.
+what that table says it checks), GAP (the store differs from AWS S3, or the row can't check its
+property against this store; the row records which), or FAIL. Writes the same rows to
+/out/results.md. Exits 1 on any FAIL.
 """
 
 import json
@@ -359,10 +360,15 @@ def leg_sse(store, run_prefix, target):
     if probe not in refused:
         return "FAIL", (f"the AWS CLI's PutObject was refused {' '.join(probe)}, but the sink "
                         f"wasn't refused the same way; {sink}")
-    if classes.get("2xx") or not classes.get("4xx"):
+    if set(classes) != {"4xx"}:
         return "FAIL", f"the sink's requests aren't all refusals; {sink}"
     if lost:
         return "FAIL", f"the refusal dropped data: {shown(lost)}; {sink}"
+    # Held to the end: past the snapshot, only SIGTERM's drop of the held queue is expected.
+    late = {k: v for k, v in dropped(telemetry(f"sse-{store}")).items()
+            if not k.endswith("{reason=shutdown}")}
+    if late:
+        return "FAIL", f"the sink stopped holding and dropped {shown(late)}; {sink}"
     return "GAP", (f"nothing stored under sse: aes256 and nothing dropped while held; phase 1 "
                    f"{sink}; the AWS CLI's PutObject with the same header is refused "
                    f"{' '.join(probe)} too")

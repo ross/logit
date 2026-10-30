@@ -125,7 +125,7 @@ A run writes `perf/results/s3-interop/<timestamp>/` (git-ignored):
 | `results.md` | the rows below |
 | `fetch/<store>/` | every object, the listings, each leg's `head-object`, and the SSE reference request's outcome (`sse-probe.*`) |
 | `probe/<store>/body` | that request's body |
-| `<leg>-<store>-telemetry.log` | each leg's `internal` telemetry and self-logs; the `creds` and `bucket` legs also keep a `-phase1` copy |
+| `<leg>-<store>-telemetry.log` | each leg's `internal` telemetry and self-logs; the `creds`, `bucket`, and `sse` legs also keep a `-phase1` copy |
 | `replay/<store>/` | the decompressed `native` objects and the events `replay_in` read back |
 | `provenance.txt`, `exits.txt`, `timeline.log`, `logs/` | image digests and versions, each leg's exit code, the run's phases, and every container's log, with AWS mode's cleanup in `logs/cleanup.log` |
 

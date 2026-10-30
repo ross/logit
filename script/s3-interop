@@ -259,7 +259,7 @@ cleanup() {
         fi
     fi
     # After the last aws_cli call: nothing else needs the credentials.
-    rm -f "${RUN_DIR}/stores/aws.env" "${BAD_SECRET_ENV:-}"
+    rm -f "${RUN_DIR}/stores/aws.env" "${BAD_SECRET_ENV:-}" "${RUN_DIR}"/probe/*/debug.log
     return 0
 }
 

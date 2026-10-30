@@ -218,9 +218,10 @@ reference; a wrong secret held and retried with no drop, then delivered from the
 restart; and a missing bucket held until the script creates it. Built on W3a without W4, so the
 script decompresses `native` objects before `replay_in` reads them.
 
-Not in W5: the multipart and forced-retry legs move to W3b. A `3xx` from a wrong region and a
-store's answer to `x-amz-content-sha256` signed bodies need a fault injector or a store
-configuration the harness doesn't have, and are the follow-up `s3/interop-faults`.
+Not in W5: the multipart and forced-retry legs move to W3b. A `3xx` from a wrong region, a
+store's answer to `x-amz-content-sha256` signed bodies, and a `tc netem` reset during uploads need
+a fault injector or a store configuration the harness doesn't have, and are the follow-up
+`s3/interop-faults`.
 
 **Files.** `tools/s3-interop/` (compose file, `logit-*.yaml` legs, `fetch.sh`, `check.py`,
 `Dockerfile.tools`, README), `script/s3-interop`, and `script/validate` and
