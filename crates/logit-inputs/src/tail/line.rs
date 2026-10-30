@@ -13,15 +13,34 @@ use std::sync::Arc;
 
 /// Turns one split line into zero or more [`Event`]s appended to `out`.
 ///
-/// The line has no `\n`, has had one trailing `\r` stripped (a second one stays), and is valid
-/// UTF-8 (the driver's `ensure_utf8`). `read_at` is when the line was read, not necessarily the
-/// event's timestamp: `docker_in` uses the envelope's own `time` and falls back to `read_at` only
-/// when that's unparseable.
+/// The line has no `\n`. Unless the decoder turns them off, it has had one trailing `\r` stripped
+/// (a second one stays; [`TailDecoder::STRIPS_CR`]) and is valid UTF-8 (the driver's
+/// `ensure_utf8`; [`TailDecoder::LOSSY_UTF8`]). `read_at` is when the line was read, not
+/// necessarily the event's timestamp: `docker_in` uses the envelope's own `time` and falls back to
+/// `read_at` only when that's unparseable.
 ///
 /// A decoder may push events to `out` and then return `Err`: held state it flushed because the
 /// rejected line ended a run. The driver still emits those events, under
 /// [`TailDecoder::resource`].
 pub trait TailDecoder: Send {
+    /// Whether the splitter strips one trailing `\r` from each line. `cri_in` turns it off: a
+    /// `\r` there is content, either a CRLF line's or a byte inside a line the runtime cut in
+    /// pieces (`docs/adr/cri-container-logs.md`, section 3).
+    const STRIPS_CR: bool = true;
+
+    /// Whether the driver lossily converts each line to UTF-8 (diagnosed `invalid_utf8`) before
+    /// [`TailDecoder::decode_line`]. Off, the decoder receives the raw bytes and owns the
+    /// conversion: `cri_in` converts a reassembled line once, since a piece can end inside a
+    /// character.
+    const LOSSY_UTF8: bool = true;
+
+    /// Whether the splitter keeps the first [`DROP_HEAD_BYTES`] of each line it drops for
+    /// [`TailDecoder::line_dropped`]. Off, the hook receives an empty head.
+    const KEEPS_DROP_HEADS: bool = false;
+
+    /// Whether the driver offers this decoder [`TailDecoder::flush_idle`] on the poll tick.
+    const FLUSHES_IDLE: bool = false;
+
     fn decode_line(
         &mut self,
         line: Bytes,
@@ -61,6 +80,23 @@ pub trait TailDecoder: Send {
     /// nothing held ([`LineDecoder`] is stateless across lines).
     fn reset(&mut self) {}
 
+    /// The splitter dropped a line over its bound, in sequence with the lines around it. `head` is
+    /// the line's first bytes (up to [`DROP_HEAD_BYTES`], empty unless
+    /// [`TailDecoder::KEEPS_DROP_HEADS`]), and `start` its file offset. Returns `true` when the
+    /// decoder took the drop: it counted it with its own `long_line` diagnostic, or absorbed it into
+    /// a line it already counted. `false` leaves the driver to count it
+    /// `logit.input.frames.dropped{reason="oversize"}` with a `long_line`. Events pushed to `out`
+    /// are emitted either way. Default: the driver counts every drop.
+    fn line_dropped(&mut self, _head: &[u8], _start: u64, _out: &mut Vec<Event>) -> bool {
+        false
+    }
+
+    /// The driver's poll tick found this file at its end (a read reached it while
+    /// [`TailDecoder::holds_entry`] was true, no read since returned bytes, and the handle's
+    /// length shows nothing unread). The decoder emits whatever it holds that has waited long
+    /// enough by `now`. Called only when [`TailDecoder::FLUSHES_IDLE`]. Default: nothing.
+    fn flush_idle(&mut self, _now: tokio::time::Instant, _out: &mut Vec<Event>) {}
+
     /// This decoder's resource, readable before any line is decoded.
     ///
     /// [`LineDecoder`]'s never changes. `docker_in`'s can: `DecoderFactory::refresh` may swap in
@@ -77,8 +113,25 @@ pub struct LineStats {
     pub dropped_lines: u32,
 }
 
-/// Splits read chunks into `\n`-terminated lines with one trailing `\r` stripped, carrying an
-/// incomplete line across chunks.
+/// How many of a dropped line's first bytes [`LineSplitter::push_split`] keeps when asked to:
+/// enough for a CRI record's timestamp, stream, and first tag.
+pub const DROP_HEAD_BYTES: usize = 128;
+
+/// One item of [`LineSplitter::push_split`], in file order. `start` is where the line starts, as
+/// [`LineSplitter::push`] reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Split {
+    Line(Bytes, Option<usize>),
+    /// A line over the bound, dropped whole and counted in [`LineStats`] once, when the drop
+    /// began. `head` is its first bytes, or empty unless the splitter keeps them.
+    Dropped {
+        head: Bytes,
+        start: Option<usize>,
+    },
+}
+
+/// Splits read chunks into `\n`-terminated lines with one trailing `\r` stripped (unless built
+/// with [`LineSplitter::with_options`] to keep it), carrying an incomplete line across chunks.
 ///
 /// A line inside one chunk is a zero-copy `Bytes::slice` of it; only a line spanning chunks is
 /// copied into `partial`, since `Bytes` can't concatenate two allocations. That upholds
@@ -93,25 +146,55 @@ pub struct LineSplitter {
     /// While `dropping`, how many of the dropped line's bytes have been consumed so far: a count,
     /// not held bytes, so memory stays bounded by `max_line_bytes`.
     dropping_len: u64,
+    strip_cr: bool,
+    keep_drop_heads: bool,
 }
 
 impl LineSplitter {
+    /// A splitter with `tail_in`'s choices: the `\r` strip, and no drop heads.
+    #[cfg(test)]
     pub fn new(max_line_bytes: usize) -> Self {
-        Self { partial: BytesMut::new(), max_line_bytes, dropping: false, dropping_len: 0 }
+        Self::with_options(max_line_bytes, true, false)
     }
 
-    /// Feeds one read chunk, calling `emit` once per complete line (no `\n`, one `\r` stripped).
+    /// A splitter that strips one trailing `\r` only under `strip_cr`, and keeps each dropped
+    /// line's first [`DROP_HEAD_BYTES`] for [`Split::Dropped`] under `keep_drop_heads`.
+    pub fn with_options(max_line_bytes: usize, strip_cr: bool, keep_drop_heads: bool) -> Self {
+        Self {
+            partial: BytesMut::new(),
+            max_line_bytes,
+            dropping: false,
+            dropping_len: 0,
+            strip_cr,
+            keep_drop_heads,
+        }
+    }
+
+    /// Feeds one read chunk, calling `emit` once per complete line; [`LineSplitter::push_split`]
+    /// without the drops.
+    #[cfg(test)]
+    pub fn push(&mut self, chunk: Bytes, mut emit: impl FnMut(Bytes, Option<usize>)) -> LineStats {
+        self.push_split(chunk, |item| {
+            if let Split::Line(line, start) = item {
+                emit(line, start);
+            }
+        })
+    }
+
+    /// Feeds one read chunk, calling `emit` once per complete line (no `\n`, one `\r` stripped)
+    /// and once per dropped line, in file order.
     ///
-    /// `emit`'s second argument is where the line starts: `Some(i)` at index `i` of `chunk`, or
-    /// `None` when it began in an earlier chunk, at the start of the partial
+    /// Each item's `start` is where its line starts: `Some(i)` at index `i` of `chunk`, or `None`
+    /// when it began in an earlier chunk, at the start of the partial
     /// [`LineSplitter::pending_bytes`] counted before this call.
     ///
     /// A line over `max_line_bytes` (measured before the `\r` strip) is dropped whole, never
-    /// truncated, and counted in the returned [`LineStats`]. That holds across a restart too:
-    /// while dropping, [`LineSplitter::pending_bytes`] covers the dropped line, so a checkpoint
-    /// stays at its start and a restart drops it whole again (counted a second time) rather than
-    /// emitting its tail as a line.
-    pub fn push(&mut self, chunk: Bytes, mut emit: impl FnMut(Bytes, Option<usize>)) -> LineStats {
+    /// truncated, reported as a [`Split::Dropped`] when the drop begins, and counted in the
+    /// returned [`LineStats`]. That holds across a restart too: while dropping,
+    /// [`LineSplitter::pending_bytes`] covers the dropped line, so a checkpoint stays at its start
+    /// and a restart drops it whole again (counted a second time) rather than emitting its tail as
+    /// a line.
+    pub fn push_split(&mut self, chunk: Bytes, mut emit: impl FnMut(Split)) -> LineStats {
         let mut stats = LineStats::default();
         let mut start = 0usize;
         while start < chunk.len() {
@@ -132,11 +215,13 @@ impl LineSplitter {
                     // Zero-copy path: the whole line is in this chunk.
                     if seg.len() > self.max_line_bytes {
                         stats.dropped_lines += 1;
+                        emit(Split::Dropped { head: self.head_of(&seg), start: Some(start) });
                     } else {
-                        emit(strip_cr(seg), Some(start));
+                        emit(Split::Line(self.strip(seg), Some(start)));
                     }
                 } else if seg.len() > self.max_line_bytes {
                     stats.dropped_lines += 1;
+                    emit(Split::Dropped { head: self.head_of(&seg), start: Some(start) });
                     self.dropping = true;
                     self.dropping_len = seg.len() as u64;
                 } else {
@@ -144,6 +229,8 @@ impl LineSplitter {
                 }
             } else if self.partial.len() + seg.len() > self.max_line_bytes {
                 stats.dropped_lines += 1;
+                let head = self.spanning_head(&seg);
+                emit(Split::Dropped { head, start: None });
                 if nl.is_none() {
                     self.dropping = true;
                     self.dropping_len = (self.partial.len() + seg.len()) as u64;
@@ -153,7 +240,7 @@ impl LineSplitter {
                 self.partial.extend_from_slice(&seg);
                 if nl.is_some() {
                     let line = self.partial.split().freeze();
-                    emit(strip_cr(line), None);
+                    emit(Split::Line(self.strip(line), None));
                 }
             }
 
@@ -174,7 +261,38 @@ impl LineSplitter {
         if self.dropping || self.partial.is_empty() {
             return None;
         }
-        Some(strip_cr(self.partial.split().freeze()))
+        let line = self.partial.split().freeze();
+        Some(self.strip(line))
+    }
+
+    fn strip(&self, line: Bytes) -> Bytes {
+        if self.strip_cr {
+            strip_cr(line)
+        } else {
+            line
+        }
+    }
+
+    /// A dropped line's head when the whole line starts in `seg`: a slice, no copy.
+    fn head_of(&self, seg: &Bytes) -> Bytes {
+        if self.keep_drop_heads {
+            seg.slice(..seg.len().min(DROP_HEAD_BYTES))
+        } else {
+            Bytes::new()
+        }
+    }
+
+    /// A dropped line's head when it starts in the held partial and continues in `seg`.
+    fn spanning_head(&self, seg: &[u8]) -> Bytes {
+        if !self.keep_drop_heads {
+            return Bytes::new();
+        }
+        let from_partial = self.partial.len().min(DROP_HEAD_BYTES);
+        let from_seg = (DROP_HEAD_BYTES - from_partial).min(seg.len());
+        let mut head = Vec::with_capacity(from_partial + from_seg);
+        head.extend_from_slice(&self.partial[..from_partial]);
+        head.extend_from_slice(&seg[..from_seg]);
+        Bytes::from(head)
     }
 
     /// Bytes read (so already in the tailer's offset) since the current line's start: the held
@@ -523,6 +641,78 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].0.len(), 140_000);
         assert_eq!(lines[0].1, None);
+    }
+
+    fn splits_of(splitter: &mut LineSplitter, chunk: &[u8]) -> Vec<Split> {
+        let mut out = Vec::new();
+        splitter.push_split(Bytes::copy_from_slice(chunk), |item| out.push(item));
+        out
+    }
+
+    /// Drops are reported in sequence with the lines around them, with the line's start, and a
+    /// head only when asked for.
+    #[test]
+    fn push_split_reports_each_drop_between_the_lines_around_it() {
+        let mut s = LineSplitter::with_options(4, true, true);
+        assert_eq!(
+            splits_of(&mut s, b"ab\ntoolong\ncd\n"),
+            vec![
+                Split::Line(Bytes::from_static(b"ab"), Some(0)),
+                Split::Dropped { head: Bytes::from_static(b"toolong"), start: Some(3) },
+                Split::Line(Bytes::from_static(b"cd"), Some(11)),
+            ]
+        );
+        let mut s = LineSplitter::new(4);
+        assert_eq!(
+            splits_of(&mut s, b"toolong\n"),
+            vec![Split::Dropped { head: Bytes::new(), start: Some(0) }]
+        );
+    }
+
+    /// The head is the line's first bytes whichever branch began the drop: one chunk, a drop
+    /// begun without a newline, and a partial pushed over the bound by the next chunk.
+    #[test]
+    fn a_kept_head_is_the_first_bytes_of_the_line_in_every_branch() {
+        let long: Vec<u8> = (0..300u32).map(|i| b'a' + (i % 26) as u8).collect();
+        let want = Bytes::copy_from_slice(&long[..DROP_HEAD_BYTES]);
+
+        let mut s = LineSplitter::with_options(200, true, true);
+        let mut chunk = long.clone();
+        chunk.push(b'\n');
+        assert_eq!(
+            splits_of(&mut s, &chunk),
+            vec![Split::Dropped { head: want.clone(), start: Some(0) }]
+        );
+
+        let mut s = LineSplitter::with_options(200, true, true);
+        assert_eq!(
+            splits_of(&mut s, &long),
+            vec![Split::Dropped { head: want.clone(), start: Some(0) }]
+        );
+        assert_eq!(
+            splits_of(&mut s, b"x\nok\n"),
+            vec![Split::Line(Bytes::from_static(b"ok"), Some(2))]
+        );
+
+        for cut in [10, 150] {
+            let mut s = LineSplitter::with_options(200, true, true);
+            assert_eq!(splits_of(&mut s, &long[..cut]), vec![]);
+            assert_eq!(
+                splits_of(&mut s, &long[cut..]),
+                vec![Split::Dropped { head: want.clone(), start: None }],
+                "cut at {cut}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_splitter_built_without_the_cr_strip_keeps_it_in_lines_and_the_partial() {
+        let mut s = LineSplitter::with_options(1024, false, false);
+        assert_eq!(
+            splits_of(&mut s, b"a\r\nb\r"),
+            vec![Split::Line(Bytes::from_static(b"a\r"), Some(0))]
+        );
+        assert_eq!(s.take_partial(), Some(Bytes::from_static(b"b\r")));
     }
 
     #[test]
