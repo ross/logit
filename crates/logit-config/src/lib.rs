@@ -2612,8 +2612,9 @@ pub enum ComponentKind {
     },
     /// Tails every Kubernetes container log under the kubelet's pod log directory
     /// (`<root>/<namespace>_<pod>_<pod uid>/<container>/<restart count>.log`), in the CRI format
-    /// containerd and CRI-O write, and stamps each line's pod and container identity from its
-    /// path as `k8s.namespace.name`, `k8s.pod.name`, `k8s.pod.uid`, `k8s.container.name`, and
+    /// containerd and CRI-O write, or cri-dockerd's Docker json-file (told apart per file by its
+    /// first byte, `{`), and stamps each line's pod and container identity from its path as
+    /// `k8s.namespace.name`, `k8s.pod.name`, `k8s.pod.uid`, `k8s.container.name`, and
     /// `k8s.container.restart_count` resource attributes. A line the runtime wrote in pieces is
     /// put back together per stream, so each event is one line of the container's stdout or
     /// stderr, with `log.iostream` naming which and the runtime's timestamp as the event's time.

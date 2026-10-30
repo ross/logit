@@ -1,7 +1,7 @@
 //! `cri_in`: tails every Kubernetes container log under the kubelet's pod log directory
 //! (`<root>/<namespace>_<pod>_<uid>/<container>/<n>.log`, default `/var/log/pods`) in the CRI
-//! format containerd and CRI-O write, and stamps each file's pod and container identity from its
-//! path. It runs on `tail_in`'s driver (`crate::tail`), with [`CriDecoder`] in place of
+//! format containerd and CRI-O write, or cri-dockerd's Docker json-file, and stamps each file's
+//! pod and container identity from its path. It runs on `tail_in`'s driver (`crate::tail`), with [`CriDecoder`] in place of
 //! [`crate::tail::LineDecoder`] and [`PathPattern::pod_logs`] in place of config-driven patterns.
 //! `receive:` takes the tail listener's batch-assembly fields. The decisions are
 //! `docs/adr/cri-container-logs.md`'s; this doc cites its sections.
@@ -9,6 +9,11 @@
 //! - **Discovery** (section 2): the live `<n>.log` and every rotated `<n>.log.<YYYYMMDD-HHMMSS>`
 //!   the kubelet hasn't compressed, so a restart resumes a renamed file. A rotation by rename
 //!   rebinds the tracked inode to its new name and keeps its decoder and resource.
+//! - **Format** (section 9): latched per file from its first byte, which the driver reads even
+//!   when reading resumes past it. `{` is cri-dockerd's Docker json-file, whose pods entry is a
+//!   symlink the driver follows to Docker's file; it goes through `docker_in`'s [`DockerDecoder`]
+//!   under this file's resource and `partial_timeout`. Anything else is CRI, as the rest of this
+//!   doc describes.
 //! - **Records** go through `logit_proto::cri::parse`. The splitter keeps a trailing `\r` and
 //!   the driver hands over raw bytes: a reassembled line is converted to UTF-8 once, diagnosed
 //!   `invalid_utf8` when that replaced anything (section 3).
@@ -77,7 +82,7 @@ enum Format {
     Undecided,
     Cri,
     /// cri-dockerd's file: Docker json-file, decoded by `docker_in`'s decoder.
-    Docker(DockerDecoder),
+    Docker(Box<DockerDecoder>),
 }
 
 /// The byte a Docker json-file line opens with.
@@ -157,7 +162,7 @@ impl CriDecoder {
                     .with_diagnostics(self.diag.clone())
                     .with_telemetry(self.telemetry.clone())
                     .with_partial_timeout(self.partial_timeout);
-                self.format = Format::Docker(docker);
+                self.format = Format::Docker(Box::new(docker));
             }
         }
     }

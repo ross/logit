@@ -23,7 +23,7 @@
 //! | pods `entry.file_type()` of a pod or container directory | a directory is walked; anything else is absent (a symlink isn't followed) | absent | [`Scan::failed_dirs`] |
 //! | docker `entry.file_type()` | a directory is walked; anything else is absent (a symlink isn't followed) | absent | [`Scan::unknown`] (the built log path) |
 //! | docker log-path `metadata` | a regular file is matched; anything else is absent | absent (the log isn't written yet; a later scan finds it) | [`Scan::unknown`] |
-//! | `Tailer::scan`'s per-path `metadata`, once per distinct matched path | a regular file is discovered; anything else is absent | absent | unknown |
+//! | `Tailer::scan`'s per-path `metadata`, once per distinct matched path | a regular file, or a symlink to one (a cri-dockerd pods entry), is discovered as its target's inode; anything else is absent | absent, a dangling symlink included | unknown |
 //!
 //! A name that isn't UTF-8 is skipped: no pattern can name it. A tracked path that is absent is
 //! retired. A tracked path that is unknown, or that a failed listing [covers](PathPattern::covers),
