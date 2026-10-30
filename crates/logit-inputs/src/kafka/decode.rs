@@ -6,21 +6,31 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use logit_core::interner::intern;
-use logit_core::{AttrMap, BodyFormat, Event, EventBatch, LogRecord, Resource, Symbol, Value};
+use logit_core::{
+    AttrMap, BodyFormat, Event, EventBatch, LogRecord, Resource, Symbol, Telemetry, Value,
+};
 use logit_proto::event_json::EventJsonDecoder;
 use logit_proto::frame::read_frame;
 use logit_proto::kafka::{Record, TimestampType};
+use logit_proto::msgpack_event::MsgpackEventDecoder;
 use logit_proto::native::{decode_batch, DecodeBudget, CODEC_BATCH};
+use logit_proto::otlp::OtlpDecoder;
+use logit_proto::{Signal, SignalDecoder};
 
 /// What a record's value holds. Mirrors the `format:` values `kafka_in` reads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KafkaInFormat {
     /// `logit`'s event JSON: one object, or NDJSON.
     Json,
+    /// The same objects as MessagePack maps, one or several back to back.
+    Msgpack,
     /// One log per value, or under `batch` one per escaped line.
     Text { batch: bool },
     /// One `CODEC_BATCH` frame.
     Native,
+    /// One OTLP export request, protobuf or (`json`) OTLP/JSON, of the signal its topic is
+    /// mapped to in `topics`.
+    Otlp { json: bool, topics: Vec<(String, Signal)> },
 }
 
 /// One record's outcome.
@@ -63,6 +73,8 @@ impl Keys {
 pub(crate) struct RecordDecoder {
     format: KafkaInFormat,
     json: EventJsonDecoder,
+    msgpack: MsgpackEventDecoder,
+    otlp: OtlpDecoder,
     /// `text`'s resource, one `Arc` for every record, so consecutive records' logs share a
     /// batch.
     empty: Arc<Resource>,
@@ -77,9 +89,16 @@ impl RecordDecoder {
         Self {
             format,
             json: EventJsonDecoder::new(),
+            msgpack: MsgpackEventDecoder::new(),
+            otlp: OtlpDecoder::new(),
             empty: Arc::new(Resource::default()),
             keys: Keys::new(),
         }
+    }
+
+    /// Counts what the OTLP mapping skips (`logit.input.metrics.skipped`) on `telemetry`.
+    pub(crate) fn set_telemetry(&mut self, telemetry: Telemetry) {
+        self.otlp = OtlpDecoder::new().with_telemetry(telemetry);
     }
 
     /// Decodes `record` of `topic`/`partition`. `now` is the read time, a `text` log's
@@ -94,16 +113,35 @@ impl RecordDecoder {
         let Some(value) = &record.value else {
             return (Decoded::Skipped("tombstone"), OmittedHeaders(0));
         };
-        let batches = match self.format {
+        let batches = match &self.format {
             KafkaInFormat::Json => match self.json.decode_batches(value) {
                 Ok(batches) => batches,
                 Err(e) => return (Decoded::Undecodable(e.to_string()), OmittedHeaders(0)),
             },
+            KafkaInFormat::Msgpack => match self.msgpack.decode_batches(value) {
+                Ok(batches) => batches,
+                Err(e) => return (Decoded::Undecodable(e.to_string()), OmittedHeaders(0)),
+            },
+            KafkaInFormat::Otlp { json, topics } => {
+                let Some(&(_, signal)) = topics.iter().find(|(t, _)| t == topic) else {
+                    let why = format!("topic {topic:?} is mapped to no signal");
+                    return (Decoded::Undecodable(why), OmittedHeaders(0));
+                };
+                let decoded = if *json {
+                    self.otlp.decode_signal_json(signal, value.clone())
+                } else {
+                    self.otlp.decode_signal(signal, value.clone())
+                };
+                match decoded {
+                    Ok(batches) => batches,
+                    Err(e) => return (Decoded::Undecodable(e.to_string()), OmittedHeaders(0)),
+                }
+            }
             KafkaInFormat::Native => match native(value) {
                 Ok(batch) => vec![batch],
                 Err(e) => return (Decoded::Undecodable(e), OmittedHeaders(0)),
             },
-            KafkaInFormat::Text { batch } => {
+            &KafkaInFormat::Text { batch } => {
                 let timestamp = match record.timestamp {
                     -1 => now,
                     ms => ms.saturating_mul(1_000_000),

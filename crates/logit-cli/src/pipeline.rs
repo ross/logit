@@ -2072,18 +2072,26 @@ fn kafka_in_settings(
         logit_config::KafkaFormat::Text => {
             KafkaInFormat::Text { batch: *record == Some(logit_config::KafkaRecord::Batch) }
         }
-        other @ (logit_config::KafkaFormat::Msgpack
-        | logit_config::KafkaFormat::OtlpProto
-        | logit_config::KafkaFormat::OtlpJson) => {
-            let name = match other {
-                logit_config::KafkaFormat::Msgpack => "msgpack",
-                logit_config::KafkaFormat::OtlpProto => "otlp_proto",
-                _ => "otlp_json",
+        logit_config::KafkaFormat::Msgpack => KafkaInFormat::Msgpack,
+        logit_config::KafkaFormat::OtlpProto | logit_config::KafkaFormat::OtlpJson => {
+            // Rule 102 admits only these keys, each topic once.
+            let logit_config::KafkaInTopics::Signals(map) = topics else {
+                anyhow::bail!("component '{id}': kafka_in under an OTLP format needs a topics map")
             };
-            anyhow::bail!(
-                "component '{id}': kafka_in can't read 'format: {name}' yet -- it reads json, \
-                 text, and native"
-            )
+            let topics = map
+                .iter()
+                .filter_map(|(signal, topic)| {
+                    let signal = match signal.as_str() {
+                        "logs" => logit_proto::Signal::Logs,
+                        "metrics" => logit_proto::Signal::Metrics,
+                        "traces" => logit_proto::Signal::Traces,
+                        _ => return None,
+                    };
+                    Some((topic.clone(), signal))
+                })
+                .collect();
+            let json = *format == logit_config::KafkaFormat::OtlpJson;
+            KafkaInFormat::Otlp { json, topics }
         }
     };
     let topics = match topics {
@@ -5059,25 +5067,27 @@ mod tests {
         assert!(c.sasl.is_some() && c.tls.is_none());
     }
 
-    /// `msgpack` and the OTLP formats parse and validate, and `logit run` refuses them at
-    /// startup, naming the format and never the config.
+    /// An OTLP format's `topics:` map becomes the topic-to-signal table the decoder reads, and
+    /// `msgpack` reads as itself.
     #[test]
-    fn kafka_in_refuses_the_formats_it_does_not_read_yet() {
-        for (format, topics) in [
-            ("msgpack", r#"["t"]"#),
-            ("otlp_proto", r#"{"logs": "t"}"#),
-            ("otlp_json", r#"{"logs": "t"}"#),
-        ] {
-            let kind = kafka_in_kind(&format!(
-                r#"{{"type": "kafka_in", "brokers": ["k:9092"], "topics": {topics}, "group": "g",
-                    "format": "{format}",
-                    "sasl": {{"mechanism": "plain", "username": "u", "password": "secret"}}}}"#
-            ));
-            let err = kafka_in_settings("in", &kind, &Default::default()).err().unwrap();
-            let err = format!("{err:#}");
-            assert!(err.contains(&format!("'format: {format}' yet")), "{err}");
-            assert!(!err.contains("secret"), "{err}");
-        }
+    fn kafka_in_settings_map_each_topic_to_its_signal() {
+        let kind = kafka_in_kind(
+            r#"{"type": "kafka_in", "brokers": ["k:9092"], "group": "g", "format": "otlp_json",
+                "topics": {"logs": "l", "traces": "s"}}"#,
+        );
+        let s = kafka_in_settings("in", &kind, &Default::default()).unwrap();
+        let topics = vec![
+            ("l".to_string(), logit_proto::Signal::Logs),
+            ("s".to_string(), logit_proto::Signal::Traces),
+        ];
+        assert_eq!(s.format, KafkaInFormat::Otlp { json: true, topics });
+        assert_eq!(s.consumer.topics, ["l", "s"]);
+        let kind = kafka_in_kind(
+            r#"{"type": "kafka_in", "brokers": ["k:9092"], "group": "g", "format": "msgpack",
+                "topics": ["t"]}"#,
+        );
+        let s = kafka_in_settings("in", &kind, &Default::default()).unwrap();
+        assert_eq!(s.format, KafkaInFormat::Msgpack);
     }
 
     #[tokio::test]
