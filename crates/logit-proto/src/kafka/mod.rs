@@ -5,11 +5,18 @@
 //!
 //! - [`batch`] encodes a partition batch's records as one record batch v2, and decodes every
 //!   batch in a buffer.
+//! - [`record`] decodes the records blob of a Fetch response: every record batch v2 in it, with
+//!   headers kept in wire order and keys, values, and header fields sliced out of the buffer.
 //! - [`compression`] runs the five codecs through `kafka-protocol`'s custom-compression hook,
 //!   with every decompressor bounded.
 
 pub mod batch;
 pub mod compression;
+pub mod record;
+
+pub use record::{
+    decode, BatchError, BatchErrorKind, Decoded, Header, Record, RecordBatch, TimestampType,
+};
 
 /// `seq + count` on the broker's sequence ring, which wraps from `i32::MAX` to 0
 /// (`DefaultRecordBatch.incrementSequence`).

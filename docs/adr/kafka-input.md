@@ -1,6 +1,6 @@
 ---
 created: 2026-10-29
-updated: 2026-10-29
+updated: 2026-10-30
 ---
 
 # `kafka_in`: a pure-Rust consumer-group client on `kafka-protocol`, committing an offset once its records are in every downstream inbox
@@ -249,9 +249,13 @@ from Redpanda at all.
   covers a contiguous offset range of one partition, so each partition's batches are accepted in
   offset order.
 - **Memory bound.** A partition buffers at most one fetch's data for it: `max_partition_bytes`
-  compressed, or one record batch larger than that, which a broker returns whole so a consumer
-  can't stall (KIP-74). Batches decompress one at a time, each bounded by `max_batch_bytes`
-  (default 64 MiB, item 10). One fetch request is bounded by `max_bytes`.
+  compressed. A Fetch answer returns at most one record batch larger than that, whole so a
+  consumer can't stall (KIP-74), and only for the first partition in the answer with data; a later
+  partition whose first batch is over its limit returns nothing that round (Kafka's
+  `ReplicaManager.readFromLog`). Batches decompress one at a time, each bounded by `max_batch_bytes`
+  (default 64 MiB, item 10). One fetch request is bounded by `max_bytes`, and its answer is read
+  under the Fetch cap, `max_bytes` plus `max_batch_bytes` plus 1 MiB, so the one batch KIP-74
+  returns over `max_bytes` fits; every other answer is held to 64 MiB.
 - **Every send goes through `Fanout::send_with_deadline`**, which reserves a slot on every consumer
   before it sends, so a send that times out has sent nothing and none is dropped part way
   ([`fanout.rs`](../../crates/logit-pipeline/src/fanout.rs)'s module doc). While no revoke is
@@ -287,7 +291,9 @@ wire asked for the outcome.
   owner.
 - **Starting position.** OffsetFetch for each assigned partition; a partition with no commit
   starts at `start:`, through ListOffsets (`-1` latest, `-2` earliest), counted
-  `logit.input.offsets.reset{reason="no_commit"}`.
+  `logit.input.offsets.reset{reason="no_commit"}`. Its start position goes out with the first
+  commit after it's resolved, as Java's auto-commit commits it, so a restart before any record
+  arrives reads on from there instead of resolving `start:` again.
 - **At-least-once.** A crash, a lost membership, or a revoke whose drain misses its deadline
   replays every record after the last commit; the next owner reads them again. These duplicates
   are accepted under [ADR `delivery-semantics`](delivery-semantics.md) item 2 and absorbed or not
@@ -336,9 +342,10 @@ An input has no batch to hold, so `write_loop`'s four fault classes don't apply.
 one of five actions: **rejoin**, **refresh** metadata and retry, **rediscover** the coordinator and
 retry, **back off** and retry with no end, or **skip** and count. A backoff starts at 100 ms and
 doubles to 10 s, reset by a success. No broker outcome ends the input or the process; only the
-generic rules do, such as a panicking task. The `kafka_in` module doc becomes the canonical table
-when the stream builds it, one row per outcome backed by a fake-broker test, and this table isn't
-kept in step after that.
+generic rules do, such as a panicking task. The module doc of `logit_kafka::consumer`
+(`crates/logit-kafka/src/consumer/mod.rs`) becomes the canonical table for the broker outcomes, and
+`kafka_in`'s for the record outcomes, one row per outcome backed by a fake-broker test, and this
+table isn't kept in step after that.
 
 Every outcome below counts `logit.input.broker.errors{api, error}`, `error` the lowercase Kafka
 error name or `transport`, `tls`, or `sasl`, besides the counter in its row.
@@ -348,7 +355,8 @@ error name or `transport`, `tls`, or `sasl`, besides the counter in its row.
 | DNS, connect, or TLS handshake failure; a timeout or disconnect | — | Back off; a coordinator connection rediscovers, a leader connection refreshes | `logit.input.reconnects` on the redial |
 | SASL refused (`UNSUPPORTED_SASL_MECHANISM`, `ILLEGAL_SASL_STATE`, `SASL_AUTHENTICATION_FAILED`), or a token endpoint's `4xx` | 33, 34, 58 | Back off, no fallback to another mechanism or to no authentication ([ADR `kafka-sasl`](kafka-sasl.md)) | Diagnostic `auth_failed` |
 | `OFFSET_OUT_OF_RANGE` | 1 | ListOffsets earliest and latest; a position below the log start moves to the log start, one above the log end moves to the log end | `logit.input.offsets.reset{reason="out_of_range"}`; below the start, `logit.input.records.dropped{reason="retention"}` for the offsets between |
-| `CORRUPT_MESSAGE`, or a batch whose CRC-32C doesn't match | 2 | Refetch the partition once from the same offset; a second mismatch skips the batch | `logit.input.records.dropped{reason="corrupt"}`, the batch's record count |
+| `CORRUPT_MESSAGE` on a Fetch partition | 2 | Back off and refetch from the same offset, with no end: the answer carries no batch to skip | — |
+| A batch whose CRC-32C doesn't match | — | Refetch the partition once from the same offset; a second failure at that batch skips it: the skip ends at the base offset of the next batch in the answer whose CRC passes; else at the base offset in the first 12 bytes of a batch the answer cut short, when it's above the failed batch's base and at or below the high watermark; else, after one refetch widened to `max_batch_bytes` (the row for a lone failed batch), at the high watermark (the last stable offset under `read_committed`). It never passes the high watermark, and reads nothing from the failed batch's header but its base offset, since neither its length nor its offset delta can be trusted; every entry decoded between it and the landing batch is skipped with it. A batch whose length reaches past the answer's end at the fetch position is corrupt the same way and skips to the high watermark | `logit.input.records.dropped{reason="corrupt"}`, the offsets skipped |
 | `UNKNOWN_TOPIC_OR_PARTITION` on Metadata | 3 | The topic isn't subscribed until it exists; refresh every 5 minutes, and rejoin when it appears | Diagnostic `topic_missing` |
 | `UNKNOWN_TOPIC_OR_PARTITION` on Fetch, `LEADER_NOT_AVAILABLE`, `NOT_LEADER_OR_FOLLOWER`, `REPLICA_NOT_AVAILABLE`, `KAFKA_STORAGE_ERROR`, `FENCED_LEADER_EPOCH`, `UNKNOWN_LEADER_EPOCH`, `OFFSET_NOT_AVAILABLE` | 3, 5, 6, 9, 56, 74, 75, 78 | Refresh, then fetch the partition from its leader after a backoff | — |
 | `COORDINATOR_LOAD_IN_PROGRESS` | 14 | Back off, same coordinator | — |
@@ -366,9 +374,12 @@ error name or `transport`, `tls`, or `sasl`, besides the counter in its row.
 | An OffsetCommit that fails with a transport error or a retriable code | — | The positions stay pending and go with the next commit | `logit.input.commits{class="error"}` |
 | An OffsetCommit refused for generation or membership (22, 25, 82) | — | As the row for the code; the positions are dropped from the commit | `logit.input.commits{class="fenced"}` |
 | A `throttle_time_ms` above 0 in any response | — | No request to that broker before it passes, as Java mutes the connection | — |
-| A record batch whose decompressed size passes `max_batch_bytes` | — | Skip the batch | `logit.input.records.dropped{reason="oversize"}`, its record count |
-| A batch that doesn't decompress, or whose record framing doesn't parse | — | Skip the batch | `logit.input.records.dropped{reason="corrupt"}` |
-| A message set of magic 0 or 1 | — | Skip it; Kafka 4.0 removed those formats (KIP-724), and only a 2.x or 3.x broker's old segment holds one | `logit.input.records.dropped{reason="legacy_format"}` |
+| A record batch whose decompressed size passes `max_batch_bytes`; no broker error | — | Skip the batch | `logit.input.records.dropped{reason="oversize"}`, its record count |
+| A batch that doesn't decompress, or whose record framing doesn't parse; no broker error | — | As a CRC mismatch: refetch once, then skip the batch; the skip ends at the base offset of the next batch in the answer whose CRC passes; else at the base offset in the first 12 bytes of a batch the answer cut short, when it's above the failed batch's base and at or below the high watermark; else, after one refetch widened to `max_batch_bytes` (the row for a lone failed batch), at the high watermark (the last stable offset under `read_committed`). It never passes the high watermark, and reads nothing from the failed batch's header but its base offset, since neither its length nor its offset delta can be trusted; every entry decoded between it and the landing batch is skipped with it. A batch whose length reaches past the answer's end at the fetch position is corrupt the same way and skips to the high watermark | `logit.input.records.dropped{reason="corrupt"}`, the offsets skipped |
+| A Fetch answer whose length is over `max_bytes` plus `max_batch_bytes` plus 1 MiB: a batch too large to read | — | Back off and refetch; with no offsets read, the batch can't be skipped, and every partition that broker's fetch loop asks for holds with it, since one request covers them all ([known gap](../known-gaps/kafka.md)) | `logit.input.broker.errors{api="fetch", error="response_too_large"}`; diagnostic `response_too_large`, naming `max_batch_bytes` |
+| A batch that failed twice with no CRC-verified batch after it in the answer and no cut batch's base within the high watermark, and offsets past its base before the high watermark | — | Refetch the partition once with `max_batch_bytes` of room (`max_bytes` raised by as much for that request), so a next batch that `max_partition_bytes` kept out arrives whole beside it and its base is the landing; if nothing verified follows even then, skip to the high watermark ([known gap](../known-gaps/kafka.md)) | As a CRC mismatch |
+| A Metadata answer with a partition index outside its partition entries | — | The topic is left out of that answer, as one with an error code | `logit.input.broker.errors{api="metadata", error="malformed"}`; diagnostic `broker_error` |
+| A message set of magic 0 or 1; no broker error | — | Skip it; Kafka 4.0 removed those formats (KIP-724), and only a 2.x or 3.x broker's old segment holds one | `logit.input.records.dropped{reason="legacy_format"}`, one per offset the message set covers, since it declares no record count |
 | A record whose value doesn't decode in `format:` | — | Skip the record and commit past it (item 10) | `logit.input.records.dropped{reason="undecodable"}` |
 
 `OFFSET_METADATA_TOO_LARGE` (12) can't occur: `kafka_in` commits no metadata string. Any other code
@@ -377,7 +388,10 @@ backs off with a diagnostic naming it, and counts under its own name.
 ### 10. A record that won't decode is skipped and committed past
 
 A record, or a batch, that fails a bound or doesn't decode fails the same way on every read, so
-retrying it would wedge the partition forever. It's skipped, counted
+retrying it would wedge the partition forever. A batch that fails its CRC-32C, or doesn't
+decompress or parse, is refetched once from the same offset first, to rule out a corruption in
+transport; on the second failure, and at once for a bound, it's skipped (after one more refetch
+with `max_batch_bytes` of room when nothing verified follows it in the answer, item 9), counted
 `logit.input.records.dropped{reason}` with a throttled diagnostic naming the topic, partition, and
 offset, and the position moves past it, as Vector commits past a decompression failure and the
 Collector's `message_marking.on_permanent_error` does. `max_batch_bytes` bounds one batch's
@@ -525,8 +539,9 @@ Graph rules, numbered from the next free one:
 - **Rule 100**: a `kafka_in` with an empty `brokers` or an entry that isn't `host:port`, a bad
   `tls` or `sasl` (rule 85's helpers, shared), an empty `group` or `client_id`, an empty `topics`,
   a topic that isn't a legal Kafka name or that repeats, a `fetch` bound of 0, a `min_bytes` over
-  `max_bytes`, a `max_wait` not below `timeout`, or a `max_batch_bytes`, `commit_interval`,
-  `drain_timeout`, or `timeout` of 0.
+  `max_bytes`, a `fetch.max_bytes` plus `max_batch_bytes` that doesn't fit Fetch's i32 `max_bytes`
+  field, a `max_wait` not below `timeout`, or a `max_batch_bytes`, `commit_interval`, `drain_timeout`, or
+  `timeout` of 0.
 - **Rule 101**: a `kafka_in` whose `heartbeat_interval` isn't below `session_timeout`, whose
   `session_timeout` is over `rebalance_timeout`, or whose `drain_timeout` isn't below
   `rebalance_timeout`.

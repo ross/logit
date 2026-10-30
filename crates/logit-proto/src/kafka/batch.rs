@@ -1,6 +1,6 @@
 //! A partition batch's records, and their encoding as one record batch v2 (magic 2) through
-//! `kafka-protocol`'s encoder with [`super::compression`] as its compression hook, and the decode
-//! that reads it back.
+//! `kafka-protocol`'s encoder with [`super::compression`] as its compression hook.
+//! [`super::record::decode`] reads it back.
 //!
 //! `kafka-protocol`'s encoder starts a new batch whenever a record's producer fields differ from
 //! the first record's or `offset - sequence` changes, and writes the first record's `sequence`,
@@ -118,28 +118,6 @@ pub fn encode(
     Ok(buf.freeze())
 }
 
-/// Decodes every record batch in `bytes` through `kafka-protocol`'s decoder, with
-/// [`super::compression::decompress`] as its decompression hook, bounding each batch's
-/// decompressed records section at `max_records_bytes`.
-pub fn decode(
-    mut bytes: Bytes,
-    max_records_bytes: usize,
-) -> anyhow::Result<Vec<kafka_protocol::records::RecordSet>> {
-    use bytes::Buf;
-    use kafka_protocol::records::RecordBatchDecoder;
-
-    let mut sets = Vec::new();
-    while bytes.has_remaining() {
-        sets.push(RecordBatchDecoder::decode_with_custom_compression(
-            &mut bytes,
-            Some(|payload: &mut Bytes, codec| {
-                super::compression::decompress(codec, payload, max_records_bytes).map(Bytes::from)
-            }),
-        )?);
-    }
-    Ok(sets)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,18 +149,24 @@ mod tests {
     /// A record's key, value, and headers.
     type Content = (Option<Bytes>, Option<Bytes>, Vec<(String, Bytes)>);
 
-    fn content(records: &[Record]) -> Vec<Content> {
+    fn content(records: &[super::super::Record]) -> Vec<Content> {
         records
             .iter()
             .map(|r| {
                 let headers = r
                     .headers
                     .iter()
-                    .map(|(k, v)| (k.to_string(), v.clone().unwrap_or_default()))
+                    .map(|h| {
+                        (h.name_str().unwrap().to_string(), h.value.clone().unwrap_or_default())
+                    })
                     .collect();
                 (r.key.clone(), r.value.clone(), headers)
             })
             .collect()
+    }
+
+    fn decode(bytes: Bytes) -> Vec<super::super::RecordBatch> {
+        super::super::decode(&bytes, MAX).entries.into_iter().map(|b| b.unwrap()).collect()
     }
 
     fn sample(n: usize) -> Vec<ProducerRecord> {
@@ -205,24 +189,24 @@ mod tests {
     #[test]
     fn every_recorded_batch_decodes_to_its_producers_uncompressed_records() {
         for producer in ["java", "kcat"] {
-            let plain = decode(corpus(&format!("{producer}-none.segment")), MAX).unwrap();
+            let plain = decode(corpus(&format!("{producer}-none.segment")));
             assert_eq!(plain.len(), 1);
             let want = content(&plain[0].records);
             assert_eq!(want.len(), 3);
             assert_eq!(want[0].0.as_deref(), Some(&b"key-1"[..]));
             for (name, codec) in CODECS {
                 let file = format!("{producer}-{name}.segment");
-                let sets = decode(corpus(&file), MAX).unwrap_or_else(|e| panic!("{file}: {e:#}"));
+                let sets = decode(corpus(&file));
                 assert_eq!(sets.len(), 1, "{file}");
-                assert_eq!(sets[0].compression, codec, "{file}");
+                assert_eq!(sets[0].compression(), codec, "{file}");
                 assert_eq!(content(&sets[0].records), want, "{file}");
-                let first = &sets[0].records[0];
+                let batch = &sets[0];
                 if producer == "java" {
-                    assert!(first.producer_id >= 0, "{file}: Java is idempotent by default");
-                    assert_eq!(first.sequence, 0, "{file}");
+                    assert!(batch.producer_id >= 0, "{file}: Java is idempotent by default");
+                    assert_eq!(batch.base_sequence, 0, "{file}");
                 } else {
-                    assert_eq!(first.producer_id, NO_PRODUCER_ID, "{file}");
-                    assert_eq!(first.sequence, NO_SEQUENCE, "{file}");
+                    assert_eq!(batch.producer_id, NO_PRODUCER_ID, "{file}");
+                    assert_eq!(batch.base_sequence, NO_SEQUENCE, "{file}");
                 }
             }
         }
@@ -239,24 +223,31 @@ mod tests {
     }
 
     #[test]
-    fn an_encoded_batch_decodes_through_the_crates_decoder_for_every_codec() {
+    fn an_encoded_batch_decodes_through_the_record_decoder_for_every_codec() {
         let records = sample(5);
         let stamp = Stamp { producer_id: 7, producer_epoch: 3, base_sequence: 40 };
         for (name, codec) in CODECS {
-            let sets = decode(encode(&records, stamp, codec).unwrap(), MAX).unwrap();
+            let sets = decode(encode(&records, stamp, codec).unwrap());
             assert_eq!(sets.len(), 1, "{name}: one batch");
-            assert_eq!(sets[0].compression, codec, "{name}");
+            assert_eq!(sets[0].compression(), codec, "{name}");
+            assert_eq!(sets[0].producer_id, 7, "{name}");
+            assert_eq!(sets[0].producer_epoch, 3, "{name}");
+            assert_eq!(sets[0].base_sequence, 40, "{name}");
             let got = &sets[0].records;
             assert_eq!(got.len(), records.len(), "{name}");
             for (i, (got, want)) in got.iter().zip(&records).enumerate() {
                 assert_eq!(got.key, want.key, "{name} record {i}");
                 assert_eq!(got.value, want.value, "{name} record {i}");
-                assert_eq!(got.headers, want.headers, "{name} record {i}");
+                let headers: Vec<_> = got
+                    .headers
+                    .iter()
+                    .map(|h| (h.name_str().unwrap().to_string(), h.value.clone()))
+                    .collect();
+                let wanted: Vec<_> =
+                    want.headers.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+                assert_eq!(headers, wanted, "{name} record {i}");
                 assert_eq!(got.timestamp, want.timestamp, "{name} record {i}");
-                assert_eq!(got.timestamp_type, TimestampType::Creation, "{name}");
-                assert_eq!(got.producer_id, 7, "{name}");
-                assert_eq!(got.producer_epoch, 3, "{name}");
-                assert_eq!(got.sequence, 40 + i as i32, "{name} record {i}");
+                assert_eq!(got.timestamp_type, super::super::TimestampType::CreateTime, "{name}");
                 assert_eq!(got.offset, i as i64, "{name} record {i}");
             }
         }

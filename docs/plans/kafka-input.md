@@ -66,7 +66,7 @@ stub as `logit_aws::test_stub` behind a `test-util` feature.
     resolve unchanged.
   - The outputs-side `KafkaSasl` and `OAuthToken` settings types, which `logit-cli` builds from
     `logit_config::KafkaSasl`.
-  - `fake_broker.rs`, behind a `test-util` cargo feature, with `TokenEndpoint` and the other
+  - `fake_broker` (now the `fake_broker/` directory), behind a `test-util` cargo feature, with `TokenEndpoint` and the other
     stubs; it re-exports `logit_aws::test_stub::HttpStub` as it does after #926.
 - **`logit_proto::kafka`** (`crates/logit-proto/src/kafka/`) receives `batch.rs` and
   `compression.rs`. `next_sequence` moves here from `producer.rs`, and `decode`, `decompress`, and the xerial
@@ -117,8 +117,10 @@ The protocol client, with no `Input` and no config: everything W3 drives.
   - `fetch.rs`: one loop per leader broker, full fetches only (session id 0, epoch -1), a
     partition left out while its buffer holds records, `aborted_transactions` filtering under
     `read_committed`, `throttle_time_ms`, and the out-of-range rule.
-  - `consumer.rs`: the API W3 drives: assignment changes, buffered records per partition,
+  - `client.rs`: the API W3 drives: assignment changes, buffered records per partition,
     `mark_accepted`, `commit`, and the revoke and shutdown sequence of the ADR's item 8.
+  - `pool.rs`: one connection per role (metadata, the coordinator, heartbeats, each leader's
+    fetch loop), dialed on demand, with throttle muting and a per-request answer cap.
 - **Fake broker.** Gains FindCoordinator, JoinGroup, SyncGroup, Heartbeat, LeaveGroup,
   OffsetCommit, OffsetFetch, ListOffsets, and Fetch, served from the batches its Produce path
   stores. A group coordinator model: generations, eager rebalance on a join or a leave, session
@@ -140,13 +142,16 @@ The protocol client, with no `Input` and no config: everything W3 drives.
   `script/schema`.
 - **Graph rules.** Rules 100, 101, and 102 in `crates/logit-pipeline/src/graph.rs` (its module
   doc's "Validation rules" is the canonical list), reusing rule 85's broker, topic, TLS, and SASL
-  helpers, and rule 17's predicates extended to `kafka_in`.
+  helpers, and rule 17's predicates extended to `kafka_in`. Rule 100 also rejects a
+  `fetch.max_bytes` plus `max_batch_bytes` that doesn't fit Fetch's i32 `max_bytes` field: the
+  consumer reads a Fetch answer under that sum plus 1 MiB.
   [docs/design/pipeline-graph.md](../design/pipeline-graph.md)'s "Validation" mirrors them. A test
   per rejection.
 - **Registry.** `crates/logit-cli/src/pipeline.rs` builds `KafkaInSettings`.
-- **The input.** `crates/logit-inputs/src/kafka/`: `mod.rs`, whose module doc is the canonical
-  outcome table (the ADR's item 9, one row per outcome with its test), the carriers, and the
-  commit rule; `input.rs`, the `Input` with `run_until_shutdown` overridden for the item 8
+- **The input.** `crates/logit-inputs/src/kafka/`: `mod.rs`, whose module doc holds the input's
+  own outcomes (an undecodable record, a tombstone, an empty value, an omitted header, a deferred
+  or dropped batch), each with its test, beside a pointer to `logit_kafka::consumer`'s table of
+  broker outcomes (the ADR's item 9), the carriers, and the commit rule; `input.rs`, the `Input` with `run_until_shutdown` overridden for the item 8
   sequence; `decode.rs`, the `json`, `text` (both `record:` modes), and `native` decoders and the
   carriers. Batches go through `Fanout::send_with_deadline` as item 5 describes.
 - **`kafka_out` changes.**
@@ -312,7 +317,7 @@ soak harness share no file, and neither changes `kafka_in`.
 |---|---|---|---|---|---|
 | W0 | `kin/w0` | `kin/w0: ADR and plan for kafka_in, a consumer-group client` | S | — | open |
 | W1 | `kin/w1` | `kin/w1: the logit-kafka crate, shared by kafka_out and kafka_in` | M | W0, the `s3` stream's `logit-aws` PR | open |
-| W2 | `kin/w2` | `kin/w2: the consumer core: group membership, assignors, offsets, and fetch` | L | W1 | not started |
+| W2 | `kin/w2` | `kin/w2: the consumer core: group membership, assignors, offsets, and fetch` | L | W1 | open |
 | W3 | `kin/w3` | `kin/w3: kafka_in, with json, text, and native, and kafka_out's text batch escape` | L | W2 | not started |
 | W4 | `kin/w4` | `kin/w4: kafka_in's msgpack and OTLP formats` | M | W3 | not started |
 | W5 | `kin/w5` | `kin/w5: kafka_in in the transit spec, the eleventh lossless pair, and fuzz targets` | M | W4 | not started |
@@ -336,3 +341,12 @@ Recorded per workstream as each lands.
   byte, so the window limit, not the `take`, bounds a frame's memory. `Dialer` gained a
   `required` list of API keys a broker must offer or be `Refused`, which the producer sets to
   Produce, Metadata, and InitProducerId; the consumer sets its own.
+- **W2**: `kafka-protocol`'s `ListOffsetsRequest` defaults `replica_id` to 0, a follower's id, so
+  the consumer sets -1. The consumer tops Fetch at v12, since v13 names topics by id. Four of its
+  departures from the ADR's first draft are now in the ADR: `CORRUPT_MESSAGE` on a Fetch answer
+  refetches with no end while a bad batch is refetched once and then skipped, only the first
+  partition with data gets a batch over `max_partition_bytes` (KIP-74), a partition with no
+  commit commits its start position, and `legacy_format` counts offsets. The periodic commit runs
+  inside `Consumer::next`, so the input calls it between batches. A dial failure carries the
+  stage it failed in (`conn::DialStage`), which tags `broker.errors`. The outcome table is
+  `crates/logit-kafka/src/consumer/mod.rs`'s module doc, not the input's.

@@ -9,13 +9,17 @@ use logit_pipeline::Fault;
 /// Kafka error codes `logit` reads by name. A code a classifier reaches through its default arm
 /// is named here for the tests that pin its row.
 pub mod code {
+    pub const UNKNOWN_SERVER_ERROR: i16 = -1;
     pub const NONE: i16 = 0;
+    pub const OFFSET_OUT_OF_RANGE: i16 = 1;
     pub const CORRUPT_MESSAGE: i16 = 2;
     pub const UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
     pub const LEADER_NOT_AVAILABLE: i16 = 5;
     pub const NOT_LEADER_OR_FOLLOWER: i16 = 6;
     pub const REQUEST_TIMED_OUT: i16 = 7;
+    pub const REPLICA_NOT_AVAILABLE: i16 = 9;
     pub const MESSAGE_TOO_LARGE: i16 = 10;
+    pub const OFFSET_METADATA_TOO_LARGE: i16 = 12;
     pub const NETWORK_EXCEPTION: i16 = 13;
     pub const COORDINATOR_LOAD_IN_PROGRESS: i16 = 14;
     pub const COORDINATOR_NOT_AVAILABLE: i16 = 15;
@@ -24,7 +28,13 @@ pub mod code {
     pub const NOT_ENOUGH_REPLICAS: i16 = 19;
     pub const NOT_ENOUGH_REPLICAS_AFTER_APPEND: i16 = 20;
     pub const INVALID_REQUIRED_ACKS: i16 = 21;
+    pub const ILLEGAL_GENERATION: i16 = 22;
+    pub const INCONSISTENT_GROUP_PROTOCOL: i16 = 23;
+    pub const UNKNOWN_MEMBER_ID: i16 = 25;
+    pub const INVALID_SESSION_TIMEOUT: i16 = 26;
+    pub const REBALANCE_IN_PROGRESS: i16 = 27;
     pub const TOPIC_AUTHORIZATION_FAILED: i16 = 29;
+    pub const GROUP_AUTHORIZATION_FAILED: i16 = 30;
     pub const CLUSTER_AUTHORIZATION_FAILED: i16 = 31;
     pub const INVALID_TIMESTAMP: i16 = 32;
     pub const UNSUPPORTED_SASL_MECHANISM: i16 = 33;
@@ -38,8 +48,15 @@ pub mod code {
     pub const KAFKA_STORAGE_ERROR: i16 = 56;
     pub const SASL_AUTHENTICATION_FAILED: i16 = 58;
     pub const UNKNOWN_PRODUCER_ID: i16 = 59;
+    pub const FENCED_LEADER_EPOCH: i16 = 74;
+    pub const UNKNOWN_LEADER_EPOCH: i16 = 75;
     pub const UNSUPPORTED_COMPRESSION_TYPE: i16 = 76;
+    pub const OFFSET_NOT_AVAILABLE: i16 = 78;
+    pub const MEMBER_ID_REQUIRED: i16 = 79;
+    pub const GROUP_MAX_SIZE_REACHED: i16 = 81;
+    pub const FENCED_INSTANCE_ID: i16 = 82;
     pub const INVALID_RECORD: i16 = 87;
+    pub const UNSTABLE_OFFSET_COMMIT: i16 = 88;
     pub const THROTTLING_QUOTA_EXCEEDED: i16 = 89;
     pub const UNKNOWN_TOPIC_ID: i16 = 100;
     pub const INCONSISTENT_TOPIC_ID: i16 = 103;

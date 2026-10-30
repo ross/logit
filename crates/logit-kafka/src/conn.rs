@@ -10,6 +10,8 @@
 //!
 //! Version negotiation (`docs/adr/kafka-output.md`, item 8): [`API_RANGES`] has a row per API
 //! `logit` sends, and each API takes the highest version both sides support within its row.
+//! The [`Dialer`]'s `required` list names what one client can't run without: the producer's
+//! `Produce`, `Metadata`, and `InitProducerId`, the consumer's [`CONSUMER_APIS`].
 //! `Produce` reads the broker's advertised minimum as no constraint, because a 4.x broker
 //! advertises v0 and rejects anything below v3. A broker without a version of an API the
 //! [`Dialer`] requires is `Refused`; any other API it lacks is `None` in [`Versions`]. With
@@ -58,8 +60,10 @@ pub struct ApiRange {
     pub broker_min_counts: bool,
 }
 
-/// Every API `logit` sends after `ApiVersions`, one row each.
-pub const API_RANGES: [ApiRange; 5] = [
+/// Every API `logit` sends after `ApiVersions`, one row each. The consumer's rows are
+/// `docs/adr/kafka-input.md`'s item 3: each minimum is Kafka 4.0's floor or the first version with
+/// a field the consumer needs, each maximum the last that names a topic by name.
+pub const API_RANGES: [ApiRange; 14] = [
     ApiRange { key: ApiKey::Produce, versions: 3..=12, broker_min_counts: false },
     // v4 is the first with `allow_auto_topic_creation`.
     ApiRange { key: ApiKey::Metadata, versions: 4..=12, broker_min_counts: true },
@@ -70,6 +74,34 @@ pub const API_RANGES: [ApiRange; 5] = [
         broker_min_counts: true,
     },
     ApiRange { key: ApiKey::SaslAuthenticate, versions: 0..=2, broker_min_counts: true },
+    // v4 adds `isolation_level`; v13 names topics by id.
+    ApiRange { key: ApiKey::Fetch, versions: 4..=12, broker_min_counts: true },
+    // v2 adds `isolation_level`.
+    ApiRange { key: ApiKey::ListOffsets, versions: 2..=10, broker_min_counts: true },
+    ApiRange { key: ApiKey::OffsetCommit, versions: 2..=9, broker_min_counts: true },
+    // v7 adds `require_stable`; v8 moves the group into a `groups` array.
+    ApiRange { key: ApiKey::OffsetFetch, versions: 1..=9, broker_min_counts: true },
+    // v4 batches its keys into `coordinator_keys`.
+    ApiRange { key: ApiKey::FindCoordinator, versions: 0..=6, broker_min_counts: true },
+    // From v4 a first join is answered `MEMBER_ID_REQUIRED` with the id to join under.
+    ApiRange { key: ApiKey::JoinGroup, versions: 2..=9, broker_min_counts: true },
+    ApiRange { key: ApiKey::SyncGroup, versions: 0..=5, broker_min_counts: true },
+    ApiRange { key: ApiKey::Heartbeat, versions: 0..=4, broker_min_counts: true },
+    // v3 addresses members by list.
+    ApiRange { key: ApiKey::LeaveGroup, versions: 0..=5, broker_min_counts: true },
+];
+/// The APIs a consumer's [`Dialer`] requires: every consumer API in [`API_RANGES`].
+pub const CONSUMER_APIS: &[ApiKey] = &[
+    ApiKey::Metadata,
+    ApiKey::Fetch,
+    ApiKey::ListOffsets,
+    ApiKey::OffsetCommit,
+    ApiKey::OffsetFetch,
+    ApiKey::FindCoordinator,
+    ApiKey::JoinGroup,
+    ApiKey::SyncGroup,
+    ApiKey::Heartbeat,
+    ApiKey::LeaveGroup,
 ];
 /// The first flexible `ApiVersions` version, which every 2.4 or later broker answers.
 const API_VERSIONS_VERSION: i16 = 3;
@@ -77,9 +109,51 @@ const API_VERSIONS_VERSION: i16 = 3;
 pub const PRODUCE_ZSTD_MIN: i16 = 7;
 /// The first `Produce` version whose response names records in `record_errors`.
 pub const PRODUCE_RECORD_ERRORS_MIN: i16 = 8;
-/// A response size no broker answer to these four requests comes near; a larger length prefix
-/// is a framing error, not an allocation to make.
-const MAX_RESPONSE_BYTES: usize = 64 << 20;
+/// The default bound on a response's length prefix: no answer but a Fetch's comes near it, and a
+/// larger prefix is a framing error, not an allocation to make. A Fetch answer can carry
+/// `max_bytes` of records and one record batch past it (KIP-74), so the consumer reads Fetch
+/// through [`Conn::request_capped`] with a cap sized from its own bounds.
+pub const MAX_RESPONSE_BYTES: usize = 64 << 20;
+
+/// The step of [`Dialer::connect_staged`] a dial failed in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialStage {
+    /// The TCP connect.
+    Connect,
+    /// The TLS handshake, or a host that isn't a TLS server name.
+    Tls,
+    /// The `ApiVersions` request.
+    ApiVersions,
+    /// The broker offers no version of a required API in range: `Refused`.
+    Negotiate,
+    /// The SASL handshake and authentication: `Refused` when the broker or the token endpoint
+    /// refused it, `Clean` on a transport failure.
+    Sasl,
+}
+
+/// A failed dial: the error [`Dialer::connect`] returns, with its `Fault` context and text, and
+/// the stage it failed in.
+#[derive(Debug)]
+pub struct DialError {
+    pub stage: DialStage,
+    pub error: anyhow::Error,
+}
+
+impl std::fmt::Display for DialError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.error)
+    }
+}
+
+trait Stage<T> {
+    fn stage(self, stage: DialStage) -> Result<T, DialError>;
+}
+
+impl<T> Stage<T> for anyhow::Result<T> {
+    fn stage(self, stage: DialStage) -> Result<T, DialError> {
+        self.map_err(|error| DialError { stage, error })
+    }
+}
 
 /// What every connection of one client shares.
 #[derive(Clone)]
@@ -115,6 +189,23 @@ impl Versions {
     }
 }
 
+/// A response whose length prefix is over the cap its request was read under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResponseTooLarge {
+    pub api: ApiKey,
+    pub declared: usize,
+    pub cap: usize,
+}
+
+impl std::fmt::Display for ResponseTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { api, declared, cap } = self;
+        write!(f, "a {api:?} response declares {declared} bytes, over the {cap}-byte cap")
+    }
+}
+
+impl std::error::Error for ResponseTooLarge {}
+
 /// A failed request: the error, and whether any byte of it could have reached the broker.
 #[derive(Debug)]
 pub struct RequestError {
@@ -129,6 +220,12 @@ impl RequestError {
 
     fn sent(error: anyhow::Error) -> Self {
         Self { sent: true, error }
+    }
+
+    /// The response's declared length when it was over the request's cap. The connection's
+    /// framing is lost with it, and the same request draws the same answer again.
+    pub fn too_large(&self) -> Option<&ResponseTooLarge> {
+        self.error.downcast_ref()
     }
 
     /// `Clean` when nothing left, `Ambiguous` once anything may have.
@@ -168,6 +265,12 @@ impl Dialer {
     /// caller's goes out before this returns, except a broker without a version of a required API
     /// and a SASL refusal, which are `Refused` ([`crate::sasl`]).
     pub async fn connect(&self, host: &str, port: u16) -> anyhow::Result<Conn> {
+        self.connect_staged(host, port).await.map_err(|err| err.error)
+    }
+
+    /// [`Dialer::connect`], with the stage a failure happened in.
+    pub async fn connect_staged(&self, host: &str, port: u16) -> Result<Conn, DialError> {
+        use DialStage::*;
         let tcp = timeout(self.timeout, TcpStream::connect((host, port)))
             .await
             .map_err(|_elapsed| {
@@ -177,7 +280,8 @@ impl Dialer {
                 )
             })
             .and_then(|r| r.with_context(|| format!("connecting to Kafka broker {host}:{port}")))
-            .context(Fault::Clean)?;
+            .context(Fault::Clean)
+            .stage(Connect)?;
         // A produce request waits on its response; Nagle's algorithm would hold its tail.
         let _ = tcp.set_nodelay(true);
         let stream: Box<dyn AsyncStream> = match &self.tls {
@@ -187,7 +291,8 @@ impl Dialer {
                     .map_err(|err| {
                         anyhow!("Kafka broker host {host:?} isn't a TLS server name: {err}")
                     })
-                    .context(Fault::Clean)?;
+                    .context(Fault::Clean)
+                    .stage(Tls)?;
                 let tls =
                     timeout(self.timeout, TlsConnector::from(config.clone()).connect(name, tcp))
                         .await
@@ -202,7 +307,8 @@ impl Dialer {
                                 format!("TLS handshake with Kafka broker {host}:{port}")
                             })
                         })
-                        .context(Fault::Clean)?;
+                        .context(Fault::Clean)
+                        .stage(Tls)?;
                 Box::new(tls)
             }
         };
@@ -223,10 +329,12 @@ impl Dialer {
             .await
             .map_err(|err| err.error)
             .with_context(|| format!("ApiVersions with Kafka broker {host}:{port}"))
-            .context(Fault::Clean)?;
+            .context(Fault::Clean)
+            .stage(ApiVersions)?;
         conn.versions = negotiate(&response, self.required)
             .with_context(|| format!("Kafka broker {host}:{port}"))
-            .context(Fault::Refused)?;
+            .context(Fault::Refused)
+            .stage(Negotiate)?;
         if let Some(auth) = &self.sasl {
             let Some(version) = conn.versions.sasl_authenticate() else {
                 return Err(anyhow!(
@@ -235,9 +343,12 @@ impl Dialer {
                     auth.mechanism(),
                     auth.principal()
                 ))
-                .context(Fault::Refused);
+                .context(Fault::Refused)
+                .stage(Sasl);
             };
-            let end = sasl::authenticate(&mut conn, auth.as_ref(), version, host, port).await?;
+            let end = sasl::authenticate(&mut conn, auth.as_ref(), version, host, port)
+                .await
+                .stage(Sasl)?;
             conn.deadline = end.map(|(end, lifetime)| reauth_deadline(end, lifetime, self.timeout));
         }
         Ok(conn)
@@ -335,8 +446,32 @@ impl Conn {
         request: &R,
         version: i16,
     ) -> Result<R::Response, RequestError> {
+        self.request_within(request, version, self.timeout).await
+    }
+
+    /// [`Conn::request`] with `wait` bounding the response wait in place of the timeout: a
+    /// `JoinGroup` the coordinator holds until the group rejoins, or a `Fetch` the broker holds
+    /// up to its `max_wait_ms`.
+    pub async fn request_within<R: Request>(
+        &mut self,
+        request: &R,
+        version: i16,
+        wait: Duration,
+    ) -> Result<R::Response, RequestError> {
+        self.request_capped(request, version, wait, MAX_RESPONSE_BYTES).await
+    }
+
+    /// [`Conn::request_within`] refusing a response whose length prefix is over `max_response`
+    /// bytes in place of [`MAX_RESPONSE_BYTES`].
+    pub async fn request_capped<R: Request>(
+        &mut self,
+        request: &R,
+        version: i16,
+        wait: Duration,
+        max_response: usize,
+    ) -> Result<R::Response, RequestError> {
         let correlation = self.write(request, version).await?;
-        self.read::<R>(version, correlation).await
+        self.read::<R>(version, correlation, wait, max_response).await
     }
 
     /// Sends `request` at `version` without waiting: a `Produce` with `acks: none`, which the
@@ -402,28 +537,30 @@ impl Conn {
         }
     }
 
-    /// Reads the response to the request numbered `correlation`, under the timeout.
+    /// Reads the response to the request numbered `correlation`, waiting at most `wait`.
     async fn read<R: Request>(
         &mut self,
         version: i16,
         correlation: i32,
+        wait: Duration,
+        max_response: usize,
     ) -> Result<R::Response, RequestError> {
         let key = ApiKey::try_from(R::KEY).expect("every request type has an API key");
         let body = async {
             let len = self.stream.read_i32().await?;
             let len = usize::try_from(len)
-                .ok()
-                .filter(|&n| n <= MAX_RESPONSE_BYTES)
-                .ok_or_else(|| anyhow!("a {key:?} response declares {len} bytes"))?;
+                .map_err(|_| anyhow!("a {key:?} response declares {len} bytes"))?;
+            if len > max_response {
+                let err = ResponseTooLarge { api: key, declared: len, cap: max_response };
+                return Err(anyhow::Error::new(err));
+            }
             let mut body = vec![0; len];
             self.stream.read_exact(&mut body).await?;
             anyhow::Ok(Bytes::from(body))
         };
-        let mut body = timeout(self.timeout, body)
+        let mut body = timeout(wait, body)
             .await
-            .map_err(|_elapsed| {
-                anyhow!("waiting for a {key:?} response timed out after {:?}", self.timeout)
-            })
+            .map_err(|_elapsed| anyhow!("waiting for a {key:?} response timed out after {wait:?}"))
             .and_then(|r| r.with_context(|| format!("reading a {key:?} response")))
             .map_err(RequestError::sent)?;
         let header = ResponseHeader::decode(&mut body, key.response_header_version(version))
