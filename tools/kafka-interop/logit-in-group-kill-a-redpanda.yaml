@@ -1,0 +1,49 @@
+# The group-kill leg of `script/kafka-interop` against Redpanda: two `kafka_in` members of the group
+# `consume-group-kill` on the 6-partition `group-kill` topic, both started with the legs. Member `a`
+# (`logit-in-group-kill-a-*`) also writes 400 records keyed by `seq`, 10 a second; the script kills
+# member `b` (`logit-in-group-kill-b-*`) with SIGKILL 20 s in, so it neither commits nor leaves, and
+# `a` takes its partitions once the coordinator expires its 10 s session. check.py judges that every
+# record was read, `a` reading `b`'s partitions from `b`'s last commit, and that no partition was
+# read by both members in one generation.
+admin: { bind: 127.0.0.1:9600 }
+
+components:
+  load:
+    type: generate_in
+    count: 400
+    rate: 10
+    batch: 5
+    event:
+      log: "group-kill {seq}"
+      attributes: { seq: "{seq}" }
+
+  produce:
+    type: kafka_out
+    sources: [load]
+    brokers: ["redpanda:9092"]
+    topic: group-kill
+    key: { attribute: seq }
+
+  member:
+    type: kafka_in
+    brokers: ["redpanda:9092"]
+    topics: [group-kill]
+    group: consume-group-kill
+    format: json
+    start: earliest
+    session_timeout: 10s
+    heartbeat_interval: 1s
+    rebalance_timeout: 20s
+
+  read:
+    type: stdio_out
+    sources: [member]
+    target: /out/consume-group-kill-a-redpanda.jsonl
+    format: json
+
+  self: { type: internal, interval: 1s, span_sample_rate: 0.0, logs: off }
+  telemetry:
+    type: stdio_out
+    sources: [self]
+    target: /out/in-group-kill-a-redpanda-telemetry.log
+    format: json

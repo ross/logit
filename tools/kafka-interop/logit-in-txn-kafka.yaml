@@ -1,0 +1,44 @@
+# The transaction leg of `script/kafka-interop` against Apache Kafka 4.2.0: before the legs start,
+# the script runs `Txn.java`, a transactional Java producer that writes 10 transactions of 10
+# records to the `txn` topic, committing the even ones and aborting the odd ones. Two `kafka_in`
+# members, each in its own group, read the topic as `format: text`: `committed` under
+# `read_committed` and `uncommitted` under `read_uncommitted`.
+admin: { bind: 127.0.0.1:9600 }
+
+components:
+  committed:
+    type: kafka_in
+    brokers: ["kafka:9092"]
+    topics: [txn]
+    group: consume-txn-committed
+    format: text
+    start: earliest
+    isolation: read_committed
+
+  uncommitted:
+    type: kafka_in
+    brokers: ["kafka:9092"]
+    topics: [txn]
+    group: consume-txn-uncommitted
+    format: text
+    start: earliest
+    isolation: read_uncommitted
+
+  read_committed:
+    type: stdio_out
+    sources: [committed]
+    target: /out/consume-txn-committed-kafka.jsonl
+    format: json
+
+  read_uncommitted:
+    type: stdio_out
+    sources: [uncommitted]
+    target: /out/consume-txn-uncommitted-kafka.jsonl
+    format: json
+
+  self: { type: internal, interval: 1s, span_sample_rate: 0.0, logs: off }
+  telemetry:
+    type: stdio_out
+    sources: [self]
+    target: /out/in-txn-kafka-telemetry.log
+    format: json

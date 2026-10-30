@@ -1,0 +1,673 @@
+# The relay legs of `script/kafka-interop` against Apache Kafka 4.2.0: `kafka_out` writes one set of
+# events in every format, `record:` mode, and codec, each to its own topic, and `kafka_in` reads
+# every topic back. check.py compares what each `kafka_in` read, carriers removed, with what the
+# generators wrote to `relay-kafka-sent.jsonl` and `relay-kafka-text-sent.jsonl`.
+#
+#   relay-<format>-<record>-<codec>         json, msgpack, native, and text, under both `record:`
+#                                           modes and all five codecs: 40 topics
+#   relay-<otlp format>-<codec>-<signal>    otlp_proto and otlp_json under all five codecs, one
+#                                           topic per signal: 30 topics
+#
+# `mint` makes, per tick, a metrics event with five kinds, a log, and a span, with attributes of
+# several value types; `text` carries a log body and nothing else, so its own generator makes
+# body-only logs. Every sink drops its oldest batch rather than stall the others, so a drop shows as
+# a missing event.
+admin: { bind: 127.0.0.1:9600 }
+
+components:
+  load:
+    type: generate_in
+    count: 40
+    rate: 20
+    batch: 10
+    resource:
+      service.name: kafka-interop-relay
+    event:
+      attributes: { seq: "{seq}" }
+
+  mint:
+    type: lua
+    sources: [load]
+    script: |
+      function process(event)
+        local s = tonumber(event.attributes.seq)
+        local ts = event.timestamp
+        local trace_id = "b2" .. string.format("%030x", s % 8)
+        local span_id = string.format("%016x", s + 1)
+        local attributes = {seq = s, ratio = s / 4, ok = s % 2 == 0, tags = {"a", "b"},
+                            nested = {k = "v", n = s}}
+        local metrics = Event.new{
+          timestamp = ts,
+          attributes = attributes,
+          metrics = {
+            {name = "relay_delta_sum", kind = "sum", value = 1, temporality = "delta"},
+            {name = "relay_cumulative_sum", kind = "sum", value = s + 1,
+             temporality = "cumulative"},
+            {name = "relay_gauge", kind = "gauge", value = s * 0.5, unit = "By",
+             description = "a gauge"},
+            {name = "relay_hist", kind = "histogram", temporality = "delta", sum = 10 + s,
+             buckets = {{bound = 1, count = 1}, {bound = 5, count = s % 3},
+                        {bound = math.huge, count = 2}}},
+            {name = "relay_exphist", kind = "exponential_histogram", scale = 0, zero_count = 1,
+             count = 4, zero_threshold = 0, sum = 7, temporality = "delta",
+             positive = {offset = 0, counts = {1, 2}}, negative = {offset = 0, counts = {}}},
+          },
+        }
+        local log = Event.new{timestamp = ts, attributes = attributes,
+          log = {message = "relay log " .. s, severity = "warn", trace_id = trace_id,
+                 span_id = span_id}}
+        local span = Event.new{
+          timestamp = ts,
+          attributes = attributes,
+          span = {
+            trace_id = trace_id, span_id = span_id, name = "relay-span-" .. s, kind = "client",
+            status = (s % 5 == 0) and "error" or "ok",
+            status_message = (s % 5 == 0) and "boom" or nil,
+            end_timestamp = ts, events = {{timestamp = ts, name = "retry"}},
+          },
+        }
+        return {metrics, log, span}
+      end
+
+  sent:
+    type: stdio_out
+    sources: [mint]
+    target: /out/relay-kafka-sent.jsonl
+    format: json
+
+  load_text:
+    type: generate_in
+    count: 40
+    rate: 20
+    batch: 10
+    event:
+      log: "relay text {seq} \\ é\nsecond line"
+
+  sent_text:
+    type: stdio_out
+    sources: [load_text]
+    target: /out/relay-kafka-text-sent.jsonl
+    format: json
+
+  out_json_event_none:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    topic: relay-json-event-none
+    format: json
+    record: event
+    compression: none
+    buffer: { overflow: drop_oldest }
+  out_json_event_gzip:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    topic: relay-json-event-gzip
+    format: json
+    record: event
+    compression: gzip
+    buffer: { overflow: drop_oldest }
+  out_json_event_snappy:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    topic: relay-json-event-snappy
+    format: json
+    record: event
+    compression: snappy
+    buffer: { overflow: drop_oldest }
+  out_json_event_lz4:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    topic: relay-json-event-lz4
+    format: json
+    record: event
+    compression: lz4
+    buffer: { overflow: drop_oldest }
+  out_json_event_zstd:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    topic: relay-json-event-zstd
+    format: json
+    record: event
+    compression: zstd
+    buffer: { overflow: drop_oldest }
+  out_json_batch_none:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    topic: relay-json-batch-none
+    format: json
+    record: batch
+    compression: none
+    buffer: { overflow: drop_oldest }
+  out_json_batch_gzip:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    topic: relay-json-batch-gzip
+    format: json
+    record: batch
+    compression: gzip
+    buffer: { overflow: drop_oldest }
+  out_json_batch_snappy:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    topic: relay-json-batch-snappy
+    format: json
+    record: batch
+    compression: snappy
+    buffer: { overflow: drop_oldest }
+  out_json_batch_lz4:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    topic: relay-json-batch-lz4
+    format: json
+    record: batch
+    compression: lz4
+    buffer: { overflow: drop_oldest }
+  out_json_batch_zstd:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    topic: relay-json-batch-zstd
+    format: json
+    record: batch
+    compression: zstd
+    buffer: { overflow: drop_oldest }
+  out_msgpack_event_none:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    topic: relay-msgpack-event-none
+    format: msgpack
+    record: event
+    compression: none
+    buffer: { overflow: drop_oldest }
+  out_msgpack_event_gzip:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    topic: relay-msgpack-event-gzip
+    format: msgpack
+    record: event
+    compression: gzip
+    buffer: { overflow: drop_oldest }
+  out_msgpack_event_snappy:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    topic: relay-msgpack-event-snappy
+    format: msgpack
+    record: event
+    compression: snappy
+    buffer: { overflow: drop_oldest }
+  out_msgpack_event_lz4:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    topic: relay-msgpack-event-lz4
+    format: msgpack
+    record: event
+    compression: lz4
+    buffer: { overflow: drop_oldest }
+  out_msgpack_event_zstd:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    topic: relay-msgpack-event-zstd
+    format: msgpack
+    record: event
+    compression: zstd
+    buffer: { overflow: drop_oldest }
+  out_msgpack_batch_none:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    topic: relay-msgpack-batch-none
+    format: msgpack
+    record: batch
+    compression: none
+    buffer: { overflow: drop_oldest }
+  out_msgpack_batch_gzip:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    topic: relay-msgpack-batch-gzip
+    format: msgpack
+    record: batch
+    compression: gzip
+    buffer: { overflow: drop_oldest }
+  out_msgpack_batch_snappy:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    topic: relay-msgpack-batch-snappy
+    format: msgpack
+    record: batch
+    compression: snappy
+    buffer: { overflow: drop_oldest }
+  out_msgpack_batch_lz4:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    topic: relay-msgpack-batch-lz4
+    format: msgpack
+    record: batch
+    compression: lz4
+    buffer: { overflow: drop_oldest }
+  out_msgpack_batch_zstd:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    topic: relay-msgpack-batch-zstd
+    format: msgpack
+    record: batch
+    compression: zstd
+    buffer: { overflow: drop_oldest }
+  out_native_event_none:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    topic: relay-native-event-none
+    format: native
+    record: event
+    compression: none
+    buffer: { overflow: drop_oldest }
+  out_native_event_gzip:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    topic: relay-native-event-gzip
+    format: native
+    record: event
+    compression: gzip
+    buffer: { overflow: drop_oldest }
+  out_native_event_snappy:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    topic: relay-native-event-snappy
+    format: native
+    record: event
+    compression: snappy
+    buffer: { overflow: drop_oldest }
+  out_native_event_lz4:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    topic: relay-native-event-lz4
+    format: native
+    record: event
+    compression: lz4
+    buffer: { overflow: drop_oldest }
+  out_native_event_zstd:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    topic: relay-native-event-zstd
+    format: native
+    record: event
+    compression: zstd
+    buffer: { overflow: drop_oldest }
+  out_native_batch_none:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    topic: relay-native-batch-none
+    format: native
+    record: batch
+    compression: none
+    buffer: { overflow: drop_oldest }
+  out_native_batch_gzip:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    topic: relay-native-batch-gzip
+    format: native
+    record: batch
+    compression: gzip
+    buffer: { overflow: drop_oldest }
+  out_native_batch_snappy:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    topic: relay-native-batch-snappy
+    format: native
+    record: batch
+    compression: snappy
+    buffer: { overflow: drop_oldest }
+  out_native_batch_lz4:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    topic: relay-native-batch-lz4
+    format: native
+    record: batch
+    compression: lz4
+    buffer: { overflow: drop_oldest }
+  out_native_batch_zstd:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    topic: relay-native-batch-zstd
+    format: native
+    record: batch
+    compression: zstd
+    buffer: { overflow: drop_oldest }
+  out_text_event_none:
+    type: kafka_out
+    sources: [load_text]
+    brokers: ["kafka:9092"]
+    topic: relay-text-event-none
+    format: text
+    record: event
+    compression: none
+    buffer: { overflow: drop_oldest }
+  out_text_event_gzip:
+    type: kafka_out
+    sources: [load_text]
+    brokers: ["kafka:9092"]
+    topic: relay-text-event-gzip
+    format: text
+    record: event
+    compression: gzip
+    buffer: { overflow: drop_oldest }
+  out_text_event_snappy:
+    type: kafka_out
+    sources: [load_text]
+    brokers: ["kafka:9092"]
+    topic: relay-text-event-snappy
+    format: text
+    record: event
+    compression: snappy
+    buffer: { overflow: drop_oldest }
+  out_text_event_lz4:
+    type: kafka_out
+    sources: [load_text]
+    brokers: ["kafka:9092"]
+    topic: relay-text-event-lz4
+    format: text
+    record: event
+    compression: lz4
+    buffer: { overflow: drop_oldest }
+  out_text_event_zstd:
+    type: kafka_out
+    sources: [load_text]
+    brokers: ["kafka:9092"]
+    topic: relay-text-event-zstd
+    format: text
+    record: event
+    compression: zstd
+    buffer: { overflow: drop_oldest }
+  out_text_batch_none:
+    type: kafka_out
+    sources: [load_text]
+    brokers: ["kafka:9092"]
+    topic: relay-text-batch-none
+    format: text
+    record: batch
+    compression: none
+    buffer: { overflow: drop_oldest }
+  out_text_batch_gzip:
+    type: kafka_out
+    sources: [load_text]
+    brokers: ["kafka:9092"]
+    topic: relay-text-batch-gzip
+    format: text
+    record: batch
+    compression: gzip
+    buffer: { overflow: drop_oldest }
+  out_text_batch_snappy:
+    type: kafka_out
+    sources: [load_text]
+    brokers: ["kafka:9092"]
+    topic: relay-text-batch-snappy
+    format: text
+    record: batch
+    compression: snappy
+    buffer: { overflow: drop_oldest }
+  out_text_batch_lz4:
+    type: kafka_out
+    sources: [load_text]
+    brokers: ["kafka:9092"]
+    topic: relay-text-batch-lz4
+    format: text
+    record: batch
+    compression: lz4
+    buffer: { overflow: drop_oldest }
+  out_text_batch_zstd:
+    type: kafka_out
+    sources: [load_text]
+    brokers: ["kafka:9092"]
+    topic: relay-text-batch-zstd
+    format: text
+    record: batch
+    compression: zstd
+    buffer: { overflow: drop_oldest }
+  out_otlp_proto_none:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    format: otlp_proto
+    compression: none
+    buffer: { overflow: drop_oldest }
+    topics: { logs: relay-otlp_proto-none-logs, metrics: relay-otlp_proto-none-metrics, traces: relay-otlp_proto-none-spans }
+  out_otlp_proto_gzip:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    format: otlp_proto
+    compression: gzip
+    buffer: { overflow: drop_oldest }
+    topics: { logs: relay-otlp_proto-gzip-logs, metrics: relay-otlp_proto-gzip-metrics, traces: relay-otlp_proto-gzip-spans }
+  out_otlp_proto_snappy:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    format: otlp_proto
+    compression: snappy
+    buffer: { overflow: drop_oldest }
+    topics: { logs: relay-otlp_proto-snappy-logs, metrics: relay-otlp_proto-snappy-metrics, traces: relay-otlp_proto-snappy-spans }
+  out_otlp_proto_lz4:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    format: otlp_proto
+    compression: lz4
+    buffer: { overflow: drop_oldest }
+    topics: { logs: relay-otlp_proto-lz4-logs, metrics: relay-otlp_proto-lz4-metrics, traces: relay-otlp_proto-lz4-spans }
+  out_otlp_proto_zstd:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    format: otlp_proto
+    compression: zstd
+    buffer: { overflow: drop_oldest }
+    topics: { logs: relay-otlp_proto-zstd-logs, metrics: relay-otlp_proto-zstd-metrics, traces: relay-otlp_proto-zstd-spans }
+  out_otlp_json_none:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    format: otlp_json
+    compression: none
+    buffer: { overflow: drop_oldest }
+    topics: { logs: relay-otlp_json-none-logs, metrics: relay-otlp_json-none-metrics, traces: relay-otlp_json-none-spans }
+  out_otlp_json_gzip:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    format: otlp_json
+    compression: gzip
+    buffer: { overflow: drop_oldest }
+    topics: { logs: relay-otlp_json-gzip-logs, metrics: relay-otlp_json-gzip-metrics, traces: relay-otlp_json-gzip-spans }
+  out_otlp_json_snappy:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    format: otlp_json
+    compression: snappy
+    buffer: { overflow: drop_oldest }
+    topics: { logs: relay-otlp_json-snappy-logs, metrics: relay-otlp_json-snappy-metrics, traces: relay-otlp_json-snappy-spans }
+  out_otlp_json_lz4:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    format: otlp_json
+    compression: lz4
+    buffer: { overflow: drop_oldest }
+    topics: { logs: relay-otlp_json-lz4-logs, metrics: relay-otlp_json-lz4-metrics, traces: relay-otlp_json-lz4-spans }
+  out_otlp_json_zstd:
+    type: kafka_out
+    sources: [mint]
+    brokers: ["kafka:9092"]
+    format: otlp_json
+    compression: zstd
+    buffer: { overflow: drop_oldest }
+    topics: { logs: relay-otlp_json-zstd-logs, metrics: relay-otlp_json-zstd-metrics, traces: relay-otlp_json-zstd-spans }
+
+  in_json_event:
+    type: kafka_in
+    brokers: ["kafka:9092"]
+    topics: [relay-json-event-none, relay-json-event-gzip, relay-json-event-snappy, relay-json-event-lz4, relay-json-event-zstd]
+    group: relay-json-event
+    format: json
+    start: earliest
+  in_json_batch:
+    type: kafka_in
+    brokers: ["kafka:9092"]
+    topics: [relay-json-batch-none, relay-json-batch-gzip, relay-json-batch-snappy, relay-json-batch-lz4, relay-json-batch-zstd]
+    group: relay-json-batch
+    format: json
+    start: earliest
+  in_msgpack_event:
+    type: kafka_in
+    brokers: ["kafka:9092"]
+    topics: [relay-msgpack-event-none, relay-msgpack-event-gzip, relay-msgpack-event-snappy, relay-msgpack-event-lz4, relay-msgpack-event-zstd]
+    group: relay-msgpack-event
+    format: msgpack
+    start: earliest
+  in_msgpack_batch:
+    type: kafka_in
+    brokers: ["kafka:9092"]
+    topics: [relay-msgpack-batch-none, relay-msgpack-batch-gzip, relay-msgpack-batch-snappy, relay-msgpack-batch-lz4, relay-msgpack-batch-zstd]
+    group: relay-msgpack-batch
+    format: msgpack
+    start: earliest
+  in_native_event:
+    type: kafka_in
+    brokers: ["kafka:9092"]
+    topics: [relay-native-event-none, relay-native-event-gzip, relay-native-event-snappy, relay-native-event-lz4, relay-native-event-zstd]
+    group: relay-native-event
+    format: native
+    start: earliest
+  in_native_batch:
+    type: kafka_in
+    brokers: ["kafka:9092"]
+    topics: [relay-native-batch-none, relay-native-batch-gzip, relay-native-batch-snappy, relay-native-batch-lz4, relay-native-batch-zstd]
+    group: relay-native-batch
+    format: native
+    start: earliest
+  in_text_event:
+    type: kafka_in
+    brokers: ["kafka:9092"]
+    topics: [relay-text-event-none, relay-text-event-gzip, relay-text-event-snappy, relay-text-event-lz4, relay-text-event-zstd]
+    group: relay-text-event
+    format: text
+    record: event
+    start: earliest
+  in_text_batch:
+    type: kafka_in
+    brokers: ["kafka:9092"]
+    topics: [relay-text-batch-none, relay-text-batch-gzip, relay-text-batch-snappy, relay-text-batch-lz4, relay-text-batch-zstd]
+    group: relay-text-batch
+    format: text
+    record: batch
+    start: earliest
+  in_otlp_proto_none:
+    type: kafka_in
+    brokers: ["kafka:9092"]
+    topics: { logs: relay-otlp_proto-none-logs, metrics: relay-otlp_proto-none-metrics, traces: relay-otlp_proto-none-spans }
+    group: relay-otlp_proto-none
+    format: otlp_proto
+    start: earliest
+  in_otlp_proto_gzip:
+    type: kafka_in
+    brokers: ["kafka:9092"]
+    topics: { logs: relay-otlp_proto-gzip-logs, metrics: relay-otlp_proto-gzip-metrics, traces: relay-otlp_proto-gzip-spans }
+    group: relay-otlp_proto-gzip
+    format: otlp_proto
+    start: earliest
+  in_otlp_proto_snappy:
+    type: kafka_in
+    brokers: ["kafka:9092"]
+    topics: { logs: relay-otlp_proto-snappy-logs, metrics: relay-otlp_proto-snappy-metrics, traces: relay-otlp_proto-snappy-spans }
+    group: relay-otlp_proto-snappy
+    format: otlp_proto
+    start: earliest
+  in_otlp_proto_lz4:
+    type: kafka_in
+    brokers: ["kafka:9092"]
+    topics: { logs: relay-otlp_proto-lz4-logs, metrics: relay-otlp_proto-lz4-metrics, traces: relay-otlp_proto-lz4-spans }
+    group: relay-otlp_proto-lz4
+    format: otlp_proto
+    start: earliest
+  in_otlp_proto_zstd:
+    type: kafka_in
+    brokers: ["kafka:9092"]
+    topics: { logs: relay-otlp_proto-zstd-logs, metrics: relay-otlp_proto-zstd-metrics, traces: relay-otlp_proto-zstd-spans }
+    group: relay-otlp_proto-zstd
+    format: otlp_proto
+    start: earliest
+  in_otlp_json_none:
+    type: kafka_in
+    brokers: ["kafka:9092"]
+    topics: { logs: relay-otlp_json-none-logs, metrics: relay-otlp_json-none-metrics, traces: relay-otlp_json-none-spans }
+    group: relay-otlp_json-none
+    format: otlp_json
+    start: earliest
+  in_otlp_json_gzip:
+    type: kafka_in
+    brokers: ["kafka:9092"]
+    topics: { logs: relay-otlp_json-gzip-logs, metrics: relay-otlp_json-gzip-metrics, traces: relay-otlp_json-gzip-spans }
+    group: relay-otlp_json-gzip
+    format: otlp_json
+    start: earliest
+  in_otlp_json_snappy:
+    type: kafka_in
+    brokers: ["kafka:9092"]
+    topics: { logs: relay-otlp_json-snappy-logs, metrics: relay-otlp_json-snappy-metrics, traces: relay-otlp_json-snappy-spans }
+    group: relay-otlp_json-snappy
+    format: otlp_json
+    start: earliest
+  in_otlp_json_lz4:
+    type: kafka_in
+    brokers: ["kafka:9092"]
+    topics: { logs: relay-otlp_json-lz4-logs, metrics: relay-otlp_json-lz4-metrics, traces: relay-otlp_json-lz4-spans }
+    group: relay-otlp_json-lz4
+    format: otlp_json
+    start: earliest
+  in_otlp_json_zstd:
+    type: kafka_in
+    brokers: ["kafka:9092"]
+    topics: { logs: relay-otlp_json-zstd-logs, metrics: relay-otlp_json-zstd-metrics, traces: relay-otlp_json-zstd-spans }
+    group: relay-otlp_json-zstd
+    format: otlp_json
+    start: earliest
+
+  read:
+    type: stdio_out
+    sources: [in_json_event, in_json_batch, in_msgpack_event, in_msgpack_batch, in_native_event, in_native_batch, in_text_event, in_text_batch, in_otlp_proto_none, in_otlp_proto_gzip, in_otlp_proto_snappy, in_otlp_proto_lz4, in_otlp_proto_zstd, in_otlp_json_none, in_otlp_json_gzip, in_otlp_json_snappy, in_otlp_json_lz4, in_otlp_json_zstd]
+    target: /out/consume-relay-kafka.jsonl
+    format: json
+
+  self: { type: internal, interval: 1s, span_sample_rate: 0.0, logs: off }
+  telemetry:
+    type: stdio_out
+    sources: [self]
+    target: /out/in-relay-kafka-telemetry.log
+    format: json
