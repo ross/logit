@@ -456,7 +456,8 @@ points the record left open.
   day in year 9999 (every weekday and month name), at millisecond 999 and at millisecond 0
   (where `%.f` writes nothing), and takes the longest result with the longest
   key tail. `endpoint:` may end in one `/`.
-- **`logit.output.parts`** counts `UploadPart` requests only, so a `PutObject` counts none.
+- **`logit.output.parts` is one per `UploadPart` request sent**, resends and failed requests
+  included, so a `PutObject` counts none. This corrects decision 8's "per uploaded part".
 - **zstd writes a frame per 1 MiB of encoded input**, not per batch: the encoding collects in a
   reused buffer, a frame is compressed each time it reaches `ZSTD_CHUNK_BYTES` (1 MiB), and the
   close compresses the rest. Compressed bytes, with `ruzstd` at its fastest level, for each

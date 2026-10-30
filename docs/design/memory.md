@@ -1237,7 +1237,9 @@ staged cut, which `submit` uploads one at a time before it returns, so at most o
 compressed overshoot. The compressor adds its own state: `flate2`'s deflate stream, or under
 `zstd` the 1 MiB chunk of encoded input not yet compressed, plus `ruzstd`'s tables while it
 compresses one (the 582-allocation row in §2). An object that never fills a part holds less than
-`part_size`, and goes up as one `PutObject`.
+`part_size`. An object whose close leaves one part, with none uploaded, goes up as one
+`PutObject`; the close's flush can cut more than one part under `gzip` or `zstd`, and that object
+is a multipart upload.
 
 **Listeners bound undecoded bytes too.** [ADR `decoupled-listener-io`](../adr/decoupled-listener-io.md)
 generalizes `SinkQueue` into `BoundedQueue<T: Queued>` and weighs a UDP listener's receive queue
