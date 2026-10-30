@@ -1,0 +1,7 @@
+minikube v1.39.0
+crio version 1.35.7
+   GitCommit:      e79a9cbff48f30781b8c54cdbc589a372a113896
+sh: 1: kubelet: not found
+Kubernetes v1.37.0
+crictl version v1.35.0
+docker.io/library/busybox                 1.37.0               66a6306db78bf       30ecbe1509090       4.67MB

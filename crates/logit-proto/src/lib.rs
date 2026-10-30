@@ -9,6 +9,7 @@
 pub mod auth;
 pub mod buffer;
 pub mod collectd;
+pub mod cri;
 pub mod datadog;
 pub mod event_json;
 pub mod forwarded;

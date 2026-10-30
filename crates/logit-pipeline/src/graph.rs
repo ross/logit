@@ -78,10 +78,11 @@
 //! 26. A `tail_in` `paths` entry that is empty or has a `*` outside the final path component, which
 //!     the tail matcher never expands (`check_tail_glob`). No `paths` is legal and tails nothing.
 //! 27. A `docker_in` with an empty `containers`/`labels` entry, a duplicate `containers` entry, or
-//!     an empty `root`. No `containers` without `discover: true` is legal and follows nothing.
-//! 28. A `tail_in`/`docker_in` `poll_interval`, `checkpoint_interval`, or `max_line_bytes` of `0`:
-//!     a busy loop, a checkpoint write every tick, or every line dropped. 26-28 are
-//!     `docs/adr/file-tailing-and-docker-json-logs.md`'s.
+//!     an empty `root`. No `containers` without `discover: true` is legal and follows nothing. A
+//!     `cri_in` with an empty `root` or `containers_dir` (`docs/adr/cri-container-logs.md`).
+//! 28. A `tail_in`/`docker_in`/`cri_in` `poll_interval`, `checkpoint_interval`, or
+//!     `max_line_bytes` of `0`: a busy loop, a checkpoint write every tick, or every line
+//!     dropped. 26-28 are `docs/adr/file-tailing-and-docker-json-logs.md`'s.
 //! 29. A `file_out` `rotate.max_bytes` or `max_files` of `0`, or a `max_files` above
 //!     `logit_config::MAX_ROTATE_FILES`. `max_files` counts the active file, so `0` is a bound no
 //!     file could meet; the sink would clamp it to `1`, which truncates in place. A `rotate:` with
@@ -200,7 +201,7 @@
 //!     naming both or neither side, or with a non-finite value; or `missing:` without `key:`.
 //!     `rate: 1` keeps every event, and `rate: 0` keeps only what `always_keep` flags or
 //!     `missing: keep` keeps (`docs/adr/consistent-sampling-component.md`).
-//! 62. Two `tail_in`/`docker_in` components sharing a literal `checkpoint_path`, or one whose
+//! 62. Two `tail_in`/`docker_in`/`cri_in` components sharing a literal `checkpoint_path`, or one whose
 //!     `checkpoint_path` is another's `<checkpoint_path>.tmp`: each would overwrite, or truncate
 //!     and rename away, the other's offsets (`docs/adr/file-tailing-and-docker-json-logs.md`).
 //! 63. A `datadog_in` with an empty `bind`, or an `api_keys` entry that is empty or has leading or
@@ -449,6 +450,7 @@ pub fn role(kind: &ComponentKind) -> Role {
         | InfluxDbIn { .. }
         | TailIn { .. }
         | DockerIn { .. }
+        | CriIn { .. }
         | LogitIn { .. }
         | Internal { .. }
         | PrometheusIn { .. }
@@ -528,6 +530,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         InfluxDbIn { .. } => "influxdb_in",
         TailIn { .. } => "tail_in",
         DockerIn { .. } => "docker_in",
+        CriIn { .. } => "cri_in",
         LogitIn { .. } => "logit_in",
         Internal { .. } => "internal",
         PrometheusIn { .. } => "prometheus_in",
@@ -662,6 +665,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::InfluxDbIn { .. }
             | ComponentKind::TailIn { .. }
             | ComponentKind::DockerIn { .. }
+            | ComponentKind::CriIn { .. }
             | ComponentKind::Internal { .. }
             | ComponentKind::PrometheusIn { .. }
             | ComponentKind::Lua { .. }
@@ -1419,7 +1423,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         anyhow::bail!(
             "component '{id}': 'receive' is only meaningful on a datagram, stream or tail \
              listener (statsd_in, lines_in, collectd_in, syslog_in, graphite_in, tail_in, \
-             docker_in), but \
+             docker_in, cri_in), but \
              '{id}' is a {}",
             role(&component.kind).as_str()
         );
@@ -1506,12 +1510,26 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 27, `cri_in`'s part: an empty `root` or `containers_dir` would resolve to the working
+    // directory.
+    for (id, component) in &components {
+        if let ComponentKind::CriIn { root, containers_dir, .. } = &component.kind {
+            if root.is_empty() {
+                anyhow::bail!("component '{id}': 'root' must not be empty");
+            }
+            if containers_dir.is_empty() {
+                anyhow::bail!("component '{id}': 'containers_dir' must not be empty");
+            }
+        }
+    }
+
     // Rule 28: a tail listener's knobs must be positive: `0` would busy-loop (`poll_interval`),
     // checkpoint every tick (`checkpoint_interval`), or drop every line (`max_line_bytes`).
     for (id, component) in &components {
         let tail_options = match &component.kind {
             ComponentKind::TailIn { tail, .. } => Some(tail),
             ComponentKind::DockerIn { tail, .. } => Some(tail),
+            ComponentKind::CriIn { tail, .. } => Some(tail),
             _ => None,
         };
         if let Some(tail) = tail_options {
@@ -3161,7 +3179,9 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     let mut checkpoint_paths: Vec<(&str, &str)> = components
         .iter()
         .filter_map(|(id, component)| match &component.kind {
-            ComponentKind::TailIn { tail, .. } | ComponentKind::DockerIn { tail, .. } => {
+            ComponentKind::TailIn { tail, .. }
+            | ComponentKind::DockerIn { tail, .. }
+            | ComponentKind::CriIn { tail, .. } => {
                 tail.checkpoint_path.as_deref().map(|path| (path, id.as_str()))
             }
             _ => None,
@@ -5158,7 +5178,10 @@ fn is_stream_listener(kind: &ComponentKind) -> bool {
 /// is its own durable buffer, so there is no receive queue. An explicit list, like
 /// [`is_datagram_listener`].
 fn is_tail_listener(kind: &ComponentKind) -> bool {
-    matches!(kind, ComponentKind::TailIn { .. } | ComponentKind::DockerIn { .. })
+    matches!(
+        kind,
+        ComponentKind::TailIn { .. } | ComponentKind::DockerIn { .. } | ComponentKind::CriIn { .. }
+    )
 }
 
 /// Whether `name` is a placeholder `generate_in` substitutes: `seq` (the 0-based event counter) or
@@ -12723,6 +12746,57 @@ mod tests {
                 ..logit_config::TailOptions::default()
             },
         }
+    }
+
+    fn cri_in(tail: logit_config::TailOptions) -> ComponentKind {
+        ComponentKind::CriIn {
+            root: "/var/log/pods".to_string(),
+            containers_dir: "/var/log/containers".to_string(),
+            partial_timeout: std::time::Duration::from_secs(5),
+            tail,
+        }
+    }
+
+    #[test]
+    fn cri_in_is_a_tail_listener_with_its_root_and_knobs_checked() {
+        assert_eq!(kind_name(&cri_in(Default::default())), "cri_in");
+        assert_eq!(role(&cri_in(Default::default())), Role::Listener);
+        assert!(is_tail_listener(&cri_in(Default::default())));
+        resolve(cfg(vec![("in", vec![], cri_in(Default::default())), ("out", vec!["in"], sink())]))
+            .expect("a default cri_in validates");
+
+        let mut kind = cri_in(Default::default());
+        if let ComponentKind::CriIn { root, .. } = &mut kind {
+            root.clear();
+        }
+        let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+        assert!(err.contains("'root' must not be empty"), "got: {err}");
+
+        let mut kind = cri_in(Default::default());
+        if let ComponentKind::CriIn { containers_dir, .. } = &mut kind {
+            containers_dir.clear();
+        }
+        let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+        assert!(err.contains("'containers_dir' must not be empty"), "got: {err}");
+
+        let zero = logit_config::TailOptions {
+            poll_interval: std::time::Duration::ZERO,
+            ..Default::default()
+        };
+        let err = expect_err(cfg(vec![("in", vec![], cri_in(zero)), ("out", vec!["in"], sink())]));
+        assert!(err.contains("'poll_interval' must be greater than 0s"), "got: {err}");
+
+        // Rule 62 names `cri_in` beside the other two tail kinds.
+        let shared = logit_config::TailOptions {
+            checkpoint_path: Some("state/tail.json".to_string()),
+            ..Default::default()
+        };
+        let err = expect_err(cfg(vec![
+            ("logs", vec![], tail_in_checkpointing_to("state/tail.json")),
+            ("pods", vec![], cri_in(shared)),
+            ("out", vec!["logs", "pods"], sink()),
+        ]));
+        assert!(err.contains("both set 'checkpoint_path' to 'state/tail.json'"), "got: {err}");
     }
 
     fn docker_in_checkpointing_to(checkpoint_path: &str) -> ComponentKind {

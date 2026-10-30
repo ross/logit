@@ -112,7 +112,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import collect, faults, standin, telemetry, topic, vm
-from .scenario import (DEFAULT_RSS_SETTLE_S, DEFAULT_WIRE, EXPECT_REDUCERS, FILE_WIRE, EXTERNAL_TARGET, GENERATOR_ROLE,
+from .scenario import (CRI_WIRE, DEFAULT_RSS_SETTLE_S, DEFAULT_WIRE, EXPECT_REDUCERS, FILE_WIRE,
+                       FILE_WIRES, EXTERNAL_TARGET, GENERATOR_ROLE,
                        HTTP_WIRE, KAFKA_TARGET, SCRAPE_WIRE, LOCAL_TARGET, LOGIT_ROLES, NO_WINDOW_ACTIONS,
                        IDP_ROLE, RUN_WINDOW, SHARED_DIR, SHARED_MOUNT, STANDIN_ROLE, STANDIN_TARGET,
                        SUT_CONFIG_ENV, SUT_CONFIG_KEY, SUT_SERVICE, TARGET_SPLIT,
@@ -1410,8 +1411,9 @@ class Wire:
     """One wire's ledger symbols (the plan's "The ledger and identities"): `g`, the generator
     sink's counter for G; `w`, the listener's counter for W; `k`, its kernel drops, or None where
     the wire has none; `counted`, the `logit.input.frames.dropped` reasons that lose a line
-    before W counts it, F, counted wire loss; and `b_frames`, the `frames.dropped` reasons in B,
-    lines W counted and the listener then refused."""
+    before W counts it, F, counted wire loss; `b_frames`, the `frames.dropped` reasons in B,
+    lines W counted and the listener then refused; and `split`, the `(name, attrs)` counter of
+    the events W counts past one per line, S, or None where the wire has none."""
 
     label: str
     g: str
@@ -1419,6 +1421,7 @@ class Wire:
     k: object
     counted: tuple
     b_frames: tuple
+    split: object = None
 
 
 # A TCP listener counts `input.frames` once its framer has a whole line, so a line its framer
@@ -1443,7 +1446,29 @@ WIRES = {
     "http": Wire("HTTP", "logit.component.events.delivered", "logit.component.events.sent",
                  None, (), ()),
     "scrape": Wire("scrape", "logit.component.events.sent", "logit.input.samples", None, (), ()),
+    "cri": Wire("CRI file", "logit.component.events.delivered", "logit.component.events.sent",
+                None, ("oversize", "truncated", "malformed"), (),
+                ("logit.input.frames.truncated", {"reason": "partial_timeout"})),
 }
+# A `cri` wire's G is logical lines, the `F` records `criwriter.py` finished, and its W is
+# `cri_in`'s events sent, not `logit.input.lines`, which counts each `P` and `F` record. A line
+# leaves as two events when its run is held past `partial_timeout` (a stall, or a run split at a
+# rotation, whose head ends the renamed file), and each such flush counts once in
+# `frames.truncated{reason="partial_timeout"}`, S: W − S counts each line once while every
+# flushed run's rest arrives later, which the writer guarantees by finishing every line before
+# it exits. A line `cri_in` drops (`oversize`, `truncated`, `malformed`) is never sent, so it's
+# F, not B.
+
+
+def read_counter(tel, wire, listener):
+    """`{life: W − S}` of `listener` on `wire`: its W less the events past one per line its
+    wire counts (`Wire.split`), or W alone on a wire with none."""
+    counts = dict(tel.counter_by_life(wire.w, component=listener))
+    if wire.split is not None:
+        name, attrs = wire.split
+        for life, value in tel.counter_by_life(name, component=listener, **attrs).items():
+            counts[life] = counts.get(life, 0) - value
+    return counts
 # A scrape wire is a pull of running totals, so its G is the increments the generator's
 # `generate_in`s sent, less what they and its `aggregate`s dropped (`_scrape_increments`),
 # and `ledger.wire` judges G against V per generator life (`_scrape_wire_one`). A failed scrape
@@ -1495,6 +1520,9 @@ HTTP_LISTENERS = {
                                "logit.input.batches.deferred"),
     "prometheus_in": HttpListener("logit.input.writes", None, None),
 }
+# `cri_in`'s `partial_timeout` and `poll_interval` when the config names neither
+# (crates/logit-config, `ComponentKind::CriIn` and `TailOptions`).
+CRI_PIN_DEFAULTS_S = (5.0, 1.0)
 # A file wire's tailer reads at most this much of one file per read, so a kill can replay up to
 # one read's lines per file past its last checkpoint (docs/known-gaps/tailing.md, "The tail
 # driver notices shutdown only between two files' reads").
@@ -1747,6 +1775,10 @@ class Ledger:
             one = self.per[listener] = {}
             wire = self.wires[listener]
             one["W"] = sut.counter_by_life(wire.w, component=listener)
+            # S: on a wire that counts a line's events past its first (`Wire.split`), those
+            # events, which `ledger.wire` takes out of W.
+            one["S"] = (sut.counter_by_life(wire.split[0], component=listener, **wire.split[1])
+                        if wire.split else {})
             one["K"] = (sut.counter_by_life(wire.k, component=listener) if wire.k else {})
             # D, every reason. Every SUT config gives `internal` a dedicated pipeline, so its
             # final drain runs after every data node has exited and carries the shutdown drops.
@@ -2524,9 +2556,21 @@ class Ledger:
         stop, restart, or `exit` ended emits each file's unterminated line at shutdown and the
         rest of it after the restart, one line more per file it had open
         (`logit.input.files.open` at its last drain), above (docs/known-gaps/tailing.md's
-        split-line entry). The final life adds nothing."""
+        split-line entry). The final life adds nothing.
+
+        A `cri_in` listener keeps one checkpoint position per file, pinned at a held `P` run's
+        first record while it waits for its `F` or for `partial_timeout`, and the other
+        stream's lines after the pin have already been sent. A stop or a kill while a run is
+        held replays them, so on a `cri` wire every stopped and killed life adds the lines of
+        `partial_timeout` + `poll_interval` above, at its rate over its last drain interval, or
+        its one drain's W when it has no interval (`CRI_PIN_DEFAULTS_S`)."""
         inn = self.inn
         text = self._sut_config_text(inn.service)
+        cri = [listener for listener in listeners if self.wires[listener] is WIRES[CRI_WIRE]]
+        pin = max(((component_duration(text, listener, "partial_timeout")
+                    or CRI_PIN_DEFAULTS_S[0])
+                   + (component_duration(text, listener, "poll_interval")
+                      or CRI_PIN_DEFAULTS_S[1]) for listener in cri), default=0.0)
         counted = self.data.phases.get("shared_counted") or {}
         line_bytes = (counted.get("bytes", 0) / counted["lines"]
                       if counted.get("lines") else 0.0)
@@ -2536,15 +2580,23 @@ class Ledger:
         for life in inn.lives:
             if life == inn.final:
                 continue
+            drains = self.ingress.life_drains(life)
+            gaps = [b - a for a, b in zip(drains, drains[1:])]
+            interval = statistics.median(gaps) if gaps else 0.0
+            last = sum(v for listener in listeners
+                       for ts, v, point_life in self.ingress.counter_points(
+                           self.wires[listener].w, component=listener)
+                       if point_life == life and drains and ts == drains[-1])
+            rate = last / gaps[-1] if gaps and gaps[-1] > 0 else 0.0
+            if cri:
+                held = round(rate * pin) if gaps else last
+                high += held
+                lines.append(f"life {life}: [0, +{_n(held)}]: the other stream's lines after a "
+                             f"held run's pin, " + (
+                                 f"{rate:,.0f} lines/s x {pin:g}s of partial_timeout plus "
+                                 "poll_interval" if gaps else
+                                 f"one drain, so its W of {_n(last)} lines"))
             if life in inn.killed:
-                drains = self.ingress.life_drains(life)
-                gaps = [b - a for a, b in zip(drains, drains[1:])]
-                interval = statistics.median(gaps) if gaps else 0.0
-                last = sum(v for listener in listeners
-                           for ts, v, point_life in self.ingress.counter_points(
-                               self.wires[listener].w, component=listener)
-                           if point_life == life and drains and ts == drains[-1])
-                rate = last / gaps[-1] if gaps and gaps[-1] > 0 else 0.0
                 checkpoint = max((component_duration(text, listener, "checkpoint_interval")
                                   or DEFAULT_TAIL_CHECKPOINT_INTERVAL_S)
                                  for listener in listeners)
@@ -3122,6 +3174,10 @@ def _wire_buckets(data, led, source, combined=None, anchors_out=None):
         for name in [wire.w] + ([wire.k] if wire.k else []):
             for ts, value, _ in sut.counter_points(name, component=listener):
                 counts[ts] = counts.get(ts, 0) + value
+        if wire.split is not None:
+            for ts, value, _ in sut.counter_points(wire.split[0], component=listener,
+                                                   **wire.split[1]):
+                counts[ts] = counts.get(ts, 0) - value
         for reason in wire.counted:
             for ts, value, _ in sut.counter_points("logit.input.frames.dropped",
                                                    component=listener, reason=reason):
@@ -3424,7 +3480,7 @@ def _wire_one(data, led, source, instances=None):
     wire_name = source_wire(source)
     wire = WIRES[wire_name]
     udp = wire_name == DEFAULT_WIRE
-    if wire_name == FILE_WIRE:
+    if wire_name in FILE_WIRES:
         return _file_wire_one(data, led, source)
     if wire_name == SCRAPE_WIRE:
         return _scrape_wire_one(data, led, source)
@@ -3725,14 +3781,24 @@ def _file_wire_one(data, led, source):
     alone: the count must not exceed G, and the directory must hold `min(rotations + 1,
     max_files)` files per writer. The row also FAILs a SUT down long enough for the writer to
     delete a file it hadn't read (`_file_retention_problems`). The end sequence's wait for the
-    tailers (`tail_caught_up`) is reported beside it."""
+    tailers (`tail_caught_up`) is reported beside it.
+
+    On a `cri` wire the row judges W − S + F − G instead (`WIRES`), and the writer's own counts
+    replace `file_out`'s rules (`_cri_writer_problems`)."""
     service, listener = source.get("service"), source.get("sut_listener")
     stats = led.gen_stats[service]
     status = PASS
     lines = []
     W = sum(led.per[listener]["W"].values())
+    S = sum(led.per[listener]["S"].values())
     F = sum(led.per[listener]["F"].values())
     G = stats["G"]
+    cri = source_wire(source) == CRI_WIRE
+    if cri:
+        problems, removed, note = _cri_writer_problems(data, led, source, G, S)
+        return _file_wire_end(data, led, source, W - S, F, G, problems, [note],
+                              f"W {_n(W)} − S {_n(S)}", "W − S + F − G",
+                              f", the writer's rotations having removed {_n(removed)}")
     writers = _file_writers(data, led, source)
     deleted = sum(max(0, rotations - (max_files - 1)) for _, rotations, max_files, _ in writers)
     kept = sum(min(rotations + 1, max_files) for _, rotations, max_files, _ in writers)
@@ -3782,8 +3848,18 @@ def _file_wire_one(data, led, source):
                          "line (reported, not judged)")
             lines.append(note)
     problems += _file_retention_problems(data, led, source)
-    if problems:
-        status = FAIL
+    return _file_wire_end(data, led, source, W, F, G, problems, lines, f"W {_n(W)}",
+                          "W + F − G", f", the writer having deleted {_n(deleted)}"
+                          if deleted else "")
+
+
+def _file_wire_end(data, led, source, W, F, G, problems, lines, w_text, over_text, deleted):
+    """`_file_wire_one`'s judgment once the writer's preconditions are in `problems`: the run's
+    `over_text`, W + F − G, against `Ledger.replay_band`, with the runs of `_wire_buckets`
+    reported. `w_text` shows W, and `deleted` notes what the writer deleted, or is ""."""
+    listener = source.get("sut_listener")
+    counted = data.phases.get("shared_counted")
+    status = FAIL if problems else PASS
     caught = data.phases.get("tail_caught_up") or {}
     low, high, band_lines = led.replay_band([listener])
     runs = []
@@ -3804,20 +3880,79 @@ def _file_wire_one(data, led, source):
     if not low <= over <= high:
         status = FAIL
         what = "uncounted loss" if over < low else "surplus"
-        problems.insert(0, f"W + F − G {_n(over)} is {what}, outside the replay band "
-                           f"[{_n(low)}, {_n(high)}]")
+        problems = [f"{over_text} {_n(over)} is {what}, outside the replay band "
+                    f"[{_n(low)}, {_n(high)}]"] + problems
     lines = problems + lines
     wait = ("" if not caught else
             f"; the tailers {'reached G' if caught.get('reached') else 'stopped short'} at the "
             f"end with W {_n(caught.get('w') or 0)}")
     shared = ("uncounted" if counted is None else
               f"{_n(counted.get('lines', 0))} lines in {_n(counted.get('files', 0))} files"
-              + (f", the writer having deleted {_n(deleted)}" if deleted else ""))
-    detail = (f"G {_n(G)} (shared directory: {shared}) vs W {_n(W)} + counted {_n(F)}: "
-              f"W + F − G {_n(over)} against the replay band [{_n(low)}, {_n(high)}]" + wait)
+              + deleted)
+    detail = (f"G {_n(G)} (shared directory: {shared}) vs {w_text} + counted {_n(F)}: "
+              f"{over_text} {_n(over)} against the replay band [{_n(low)}, {_n(high)}]" + wait)
     if status != PASS:
         detail = f"{lines[0]}; {detail}"
     return status, detail, lines
+
+
+# `criwriter.py`'s own counters on its sink: rotations, the finished lines in the files its
+# rotations removed, and the lines it split at a stall or a rotation.
+CRI_ROTATIONS = "soak.writer.rotations"
+CRI_REMOVED = "soak.writer.lines.removed"
+CRI_SPLIT = "soak.writer.lines.split"
+# The rotations a SUT down window may hold before a `cri` writer compresses a file the tailer
+# hadn't finished, which `cri_in` never reads: a rotation compresses every uncompressed rotated
+# file, so a stop, kill, restart, or `exit` loses the live file's unread tail at its second
+# rotation, and a pause, whose tailer keeps reading what it holds open, the file created at
+# its first rotation at its third.
+CRI_DOWN_ROTATIONS = 2
+CRI_PAUSE_ROTATIONS = 3
+
+
+def _cri_writer_problems(data, led, source, G, S):
+    """`(problems, removed, note)`: a `cri` source's preconditions on its writer: the shared
+    directory's finished lines (`collect.count_cri_lines`) plus the lines its rotations removed
+    must equal G, and no SUT
+    down window may hold enough rotations to compress a file the tailer hadn't read
+    (`CRI_DOWN_ROTATIONS`, `CRI_PAUSE_ROTATIONS`), each window widened by one writer drain
+    interval on each side, since a rotation is counted at the drain after it. `removed` is the
+    lines the rotations removed, and `note` reports the lines the writer split against S."""
+    gen = led.gens[source.get("service")]
+    sinks = source_ids(source, "generator_sink")
+
+    def total(name):
+        return sum(sum(gen.counter_by_life(name, component=sink).values()) for sink in sinks)
+
+    problems = []
+    counted = data.phases.get("shared_counted")
+    removed = total(CRI_REMOVED)
+    if counted is None:
+        problems.append("precondition: no shared_counted phase, so G has no count from the "
+                        "shared directory to hold it to")
+    elif counted.get("lines", 0) + removed != G:
+        problems.append(f"precondition: the shared directory holds {_n(counted.get('lines', 0))} "
+                        f"finished line(s) and the writer's rotations removed {_n(removed)}, "
+                        f"but the writer's events.delivered is {_n(G)}")
+    gaps = [b - a for a, b in zip(gen.drains, gen.drains[1:])]
+    pad = statistics.median(gaps) if gaps else 0.0
+    for fault in data.faults:
+        if fault.on != led.inn.service or fault.action not in FILE_RETENTION_ACTIONS:
+            continue
+        limit = CRI_PAUSE_ROTATIONS if fault.action == "pause" else CRI_DOWN_ROTATIONS
+        rotated = sum(gen.counter_in(CRI_ROTATIONS, fault.start - pad, fault.end + pad,
+                                     component=sink) for sink in sinks)
+        if rotated >= limit:
+            problems.append(
+                f"the writer rotated {_n(rotated)} time(s) while the SUT was down "
+                f"({fault.action} [{data.offset(fault.start)}, {data.offset(fault.end)}]), "
+                f"enough to compress a file it hadn't read: {limit} rotation(s) in a "
+                f"{fault.action} trip the guard")
+    split = total(CRI_SPLIT)
+    return problems, removed, (f"the writer split {_n(split)} line(s) at a stall or a "
+                               f"rotation; cri_in flushed S {_n(S)} run(s) at partial_timeout "
+                               "(reported, not judged: a run held across a SUT stop can "
+                               "complete unflushed)")
 
 
 def _per_life_lines(led):
@@ -4615,7 +4750,7 @@ def check_ledger_summary(data):
         bound_status, bound_text = _end_to_end(data, led)
         status = worst([status, bound_status])
         wire += f"; {bound_text}"
-    if led.hop is None and any(source_wire(source) in (FILE_WIRE, HTTP_WIRE)
+    if led.hop is None and any(source_wire(source) in FILE_WIRES + (HTTP_WIRE,)
                                for source in led.sources):
         bound_status, bound_text = _end_to_end(data, led)
         status = worst([status, bound_status])
@@ -4895,7 +5030,7 @@ def _summary_targeted(data, led):
     if led.gens and not data.external:
         read = sum(led.W.values()) + sum(led.K.values()) + sum(led.F.values())
         detail += f"; wire G − (W + K + F) {_n(led.G - read)} over the run; ledger.wire's"
-    if any(source_wire(source) in (FILE_WIRE, HTTP_WIRE) for source in led.sources):
+    if any(source_wire(source) in FILE_WIRES + (HTTP_WIRE,) for source in led.sources):
         bound_status, bound_text = _end_to_end(data, led)
         status = worst([status, bound_status])
         detail += f"; {bound_text}"
@@ -4963,7 +5098,8 @@ def _end_to_end(data, led):
     on an HTTP wire no X, which the client resends), plus one generator batch per ambiguous
     attempt on a TCP wire and per transport-error attempt or ack timeout on an HTTP wire, as
     `ledger.wire` allows, and
-    on a file wire the replay band's upper edge. With a `fan_out`, each source's share is
+    on a file wire the replay band's upper edge, and on a `cri` wire S, each split line's
+    second event. With a `fan_out`, each source's share is
     carried through its chain instead (`Ledger.through`). A kill on either side shifts lives but
     never adds increments, so V above that is a surplus whatever was killed; V below it is the
     per-life rows' to judge."""
@@ -4988,11 +5124,13 @@ def _end_to_end(data, led):
     # A file wire's tailers replay lines after a kill and split one line per file at a stop,
     # so V may exceed G by the replay band's upper edge.
     files = [source.get("sut_listener") for source in led.sources
-             if source_wire(source) == FILE_WIRE]
+             if source_wire(source) in FILE_WIRES]
     replay = led.replay_band(files)[1] if files else 0
-    limit = led.G - counted + partial + resent + replay
+    # On a `cri` wire each split line's second event reaches `aggregate` too.
+    splits = sum(sum(led.per[listener]["S"].values()) for listener in files)
+    limit = led.G - counted + partial + resent + replay + splits
     bound = ("G − counted" + (" + partial" if partial else "") + (" + resent" if https else "")
-             + (" + replay" if files else ""))
+             + (" + replay" if files else "") + (" + S" if splits else ""))
     carried = ""
     if led.reshaped:
         # Each source's own share of the limit, in its listener's events, carried through its
@@ -5009,8 +5147,8 @@ def _end_to_end(data, led):
             if service in led.gens and source_wire(source) in ("tcp", HTTP_WIRE):
                 share += (sum(v for _, v in _ambiguous_drops(led, source))
                           * led.gen_stats[service]["batch"])
-            if source_wire(source) == FILE_WIRE:
-                share += led.replay_band([listener])[1]
+            if source_wire(source) in FILE_WIRES:
+                share += led.replay_band([listener])[1] + sum(one["S"].values())
             limit += led.through(listener, share, lives)
         bound = f"({bound}) carried through the chains"
         carried = f", carried through the chains' fan_out and discards to {_n(limit)}"
@@ -5028,6 +5166,8 @@ def _end_to_end(data, led):
                                      if partial else "")
                     + (f" plus a resend allowance {_n(resent)}" if https else "")
                     + (f" plus the replay band's {_n(replay)}" if files else "")
+                    + (f" plus S {_n(splits)}, the split lines' second events" if splits
+                       else "")
                     + carried + ": " + "; ".join(parts))
 
 
