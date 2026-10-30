@@ -110,12 +110,18 @@ before it is in a batch `Fanout` accepted, and decodes every format `kafka_out` 
     actions) and never to hold a batch.
   - **HTTP helpers.** `sasl/oauth.rs` uses `build_client`, `DEFAULT_CONNECT_TIMEOUT`,
     `DEFAULT_IDLE_TIMEOUT`, `read_body_bytes`, and `try_read_body_bytes` from
-    `crates/logit-outputs/src/http.rs`. [#926](https://github.com/ross/logit/pull/926) copied
-    the connect and idle defaults, a client builder (`client_builder`), and
-    `try_read_body_bytes` into `logit-aws` as `pub(crate)` items, not public ones. W1 makes
-    that copy public, adds `build_client` and `read_body_bytes` beside it, and has `logit-kafka`
-    import all five from `logit-aws`. It deletes the `logit-outputs` originals those five replace
-    and has `logit-outputs::http` re-export them for the HTTP sinks.
+    `crates/logit-outputs/src/http.rs`, with no TLS config: the token endpoint trusts the bundled
+    roots ([ADR `kafka-sasl`](kafka-sasl.md)). The `logit-outputs` `build_client` and
+    `client_builder` take a `rustls::ClientConfig` and apply `with_http_alpn` for the HTTP sinks,
+    and [#926](https://github.com/ross/logit/pull/926) keeps a private, TLS-less copy of the
+    subset `aws_creds.rs` needs inside `logit-aws`. Neither is a home for `oauth.rs`: a
+    re-export of the `logit-outputs` originals would drag the sinks' TLS path into
+    `logit-kafka`, and a public `logit_aws::http` would put a generic HTTP client in a crate
+    named for AWS. So `logit-kafka` holds its own TLS-less copy of those five helpers for
+    `oauth.rs`, `logit-outputs::http` is unchanged, and `logit-aws` keeps #926's copy. Three
+    small copies is a cost this ADR accepts; a shared home (a `reqwest` helper module in
+    `logit-pipeline`, which already builds every `rustls::ClientConfig`) is the fix when a fourth
+    user appears, and the `logit-kafka` module doc says so.
   - **Sequence arithmetic.** `producer::next_sequence`, which the fake broker also calls, is
     wrapping `i32` sequence arithmetic, a wire fact. It moves to `logit_proto::kafka` beside the
     record-batch codec, and `producer.rs` imports it from there.

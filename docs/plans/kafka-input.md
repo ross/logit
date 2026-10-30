@@ -56,10 +56,10 @@ stub as `logit_aws::test_stub` behind a `test-util` feature.
   - `logit_kafka::error`, holding `fault.rs`'s `code` table, `name`, and `classify_sasl`.
     `kafka_out`'s `fault.rs` keeps the per-code produce classes and imports the table from here;
     its tests' `fault::code` paths change to match.
-  - The HTTP helpers `sasl/oauth.rs` uses. #926 left them `pub(crate)` in `logit-aws`, so W1
-    makes that copy public (adding `build_client` and `read_body_bytes`), imports it in
-    `logit-kafka`, deletes the replaced `logit-outputs` originals, and re-exports from
-    `logit-outputs::http`.
+  - The HTTP helpers `sasl/oauth.rs` uses, as a TLS-less copy in `logit-kafka`'s own `http.rs`
+    (the ADR's item 1 says why neither `logit-outputs::http`, whose `build_client` takes the
+    sinks' `rustls::ClientConfig`, nor `logit-aws`'s private copy is its home). `logit-outputs`
+    and `logit-aws` are unchanged by this bullet.
   - `FakeStream`, `ReadStep`, and `WriteStep` from `crates/logit-outputs/src/test_support.rs`,
     behind `test-util`; `test_support` re-exports them so `stream.rs`' and the other sinks' tests
     resolve unchanged.
