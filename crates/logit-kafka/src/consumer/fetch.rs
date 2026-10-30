@@ -19,12 +19,16 @@
 //!   records aren't counted.
 //! - **Bad batches.** A CRC mismatch or an unparsable batch refetches the partition once from
 //!   the same offset; a second failure at the same batch skips it, counted
-//!   `records.dropped{reason="corrupt"}` per offset skipped. The skip ends at the next decoded
-//!   batch's base offset in the answer; else at the base offset in the first 12 bytes of a batch
-//!   the answer cut short, when it's above the failed batch's base and at or below the high
-//!   watermark; else at the high watermark (the last stable offset under `read_committed`). It
-//!   never ends at an offset the failed batch's header names. An oversize batch (`oversize`) and a magic 0 or 1
-//!   message set (`legacy_format`) are skipped at once. Each skip has a throttled diagnostic
+//!   `records.dropped{reason="corrupt"}` per offset skipped. The skip ends at the base offset of
+//!   the next batch in the answer whose CRC passes; else at the base offset in the first 12 bytes
+//!   of a batch the answer cut short, within the failed batch's base and the high watermark; else,
+//!   after one refetch giving the partition `max_batch_bytes` of room so a batch
+//!   `max_partition_bytes` kept out arrives beside it, at the high watermark (the last stable
+//!   offset under `read_committed`), never past it. No
+//!   CRC covers a batch's length, so nothing decoded after a failed batch is trusted until a CRC
+//!   passes. A batch whose length reaches past the answer's end at the fetch position is corrupt
+//!   the same way. An oversize batch (`oversize`) and a magic 0 or 1 message set
+//!   (`legacy_format`) are skipped at once. Each skip has a throttled diagnostic
 //!   naming the topic, partition, and offset.
 //! - **A loop's response is applied only to partitions still at the requested offset, led by
 //!   that loop, in the same assignment epoch**, so a response that crosses a revoke or a leader
@@ -116,6 +120,9 @@ pub(crate) struct Part {
     pub(crate) backoff: Backoff,
     /// The base offset of a batch that failed once and is being refetched.
     pub(crate) corrupt_at: Option<i64>,
+    /// The base offset of a batch that failed twice with nothing verified after it: the next
+    /// fetch gives the partition `max_batch_bytes` of room.
+    pub(crate) widen_at: Option<i64>,
     pub(crate) tracker: Tracker,
 }
 
@@ -132,6 +139,7 @@ impl Part {
             retry_at: None,
             backoff: Backoff::new(),
             corrupt_at: None,
+            widen_at: None,
             tracker,
         }
     }
@@ -205,7 +213,7 @@ const FETCH_ANSWER_SLACK: usize = 1 << 20;
 impl LoopSettings {
     /// The largest Fetch answer to read: `max_bytes` of records, plus one batch past it, which
     /// KIP-74 returns whole and `max_batch_bytes` bounds, plus the answer's own framing. A
-    /// batch over `max_batch_bytes` in a larger answer fails as a transport error.
+    /// larger answer is refused as `response_too_large`.
     pub(crate) fn max_response(&self) -> usize {
         usize::try_from(self.bounds.max_bytes.max(0)).unwrap_or(0)
             + self.max_batch_bytes
@@ -428,14 +436,27 @@ async fn fetch(
     ready: Vec<(TopicPartition, i64)>,
 ) -> Result<(), ()> {
     let bounds = settings.bounds;
+    let widened = i32::try_from(settings.max_batch_bytes).unwrap_or(i32::MAX);
+    let mut max_bytes = bounds.max_bytes;
     let mut topics: BTreeMap<Arc<str>, Vec<FetchPartition>> = BTreeMap::new();
-    for (tp, offset) in &ready {
-        topics.entry(tp.topic.clone()).or_default().push(
-            FetchPartition::default()
-                .with_partition(tp.partition)
-                .with_fetch_offset(*offset)
-                .with_partition_max_bytes(bounds.max_partition_bytes),
-        );
+    {
+        let state = shared.lock().unwrap();
+        for (tp, offset) in &ready {
+            let widen = state.parts.get(tp).is_some_and(|p| p.widen_at.is_some());
+            let limit = if widen {
+                // The response cap already allows `max_bytes` plus `max_batch_bytes`.
+                max_bytes = bounds.max_bytes.saturating_add(widened);
+                bounds.max_partition_bytes.max(widened)
+            } else {
+                bounds.max_partition_bytes
+            };
+            topics.entry(tp.topic.clone()).or_default().push(
+                FetchPartition::default()
+                    .with_partition(tp.partition)
+                    .with_fetch_offset(*offset)
+                    .with_partition_max_bytes(limit),
+            );
+        }
     }
     let wait = bounds.max_wait + pool.timeout();
     let max_wait_ms = i32::try_from(bounds.max_wait.as_millis()).unwrap_or(i32::MAX);
@@ -444,7 +465,7 @@ async fn fetch(
             FetchRequest::default()
                 .with_max_wait_ms(max_wait_ms)
                 .with_min_bytes(bounds.min_bytes)
-                .with_max_bytes(bounds.max_bytes)
+                .with_max_bytes(max_bytes)
                 .with_isolation_level(settings.isolation.wire())
                 .with_topics(
                     topics
@@ -467,7 +488,8 @@ async fn fetch(
                 format_args!(
                     "Kafka broker {node}: a Fetch answer declares {} bytes, over the {}-byte cap \
                      of fetch.max_bytes plus max_batch_bytes plus 1 MiB; a record batch this \
-                     large holds its partition until max_batch_bytes is raised",
+                     large holds every partition fetched from this broker until \
+                     max_batch_bytes is raised",
                     err.declared, err.cap
                 ),
             );
@@ -536,9 +558,10 @@ async fn fetch(
                 Isolation::ReadCommitted => data.last_stable_offset,
                 Isolation::ReadUncommitted => data.high_watermark,
             };
-            let read =
-                read(&blob, from, &aborted, settings.max_batch_bytes, part.corrupt_at, stable);
+            let bad = (part.corrupt_at, part.widen_at);
+            let read = read(&blob, from, &aborted, settings.max_batch_bytes, bad, stable);
             part.corrupt_at = read.corrupt_at;
+            part.widen_at = read.widen_at;
             part.backoff.reset();
             part.retry_at = None;
             count_read(pool, &tp, &read);
@@ -581,27 +604,67 @@ pub(crate) struct Read {
     pub(crate) position: i64,
     /// Set when a bad batch at this base offset is to be refetched once.
     pub(crate) corrupt_at: Option<i64>,
+    /// Set when the refetch for a bad batch at this base offset is to be widened.
+    pub(crate) widen_at: Option<i64>,
     /// `(reason, records, base offset)` of each skipped batch.
     pub(crate) dropped: Vec<(&'static str, i64, i64)>,
     pub(crate) aborted: i64,
 }
 
+/// What the answer shows after a batch at `base` that failed twice.
+struct AfterCorrupt {
+    base: i64,
+    /// The base of the first later entry whose CRC passed.
+    verified: Option<i64>,
+    /// The base in the first 12 bytes of a batch the answer cut short.
+    partial: Option<i64>,
+    /// Whether this answer was the widened refetch for `base`.
+    widened: bool,
+}
+
+impl AfterCorrupt {
+    /// Skips the batch, or asks for one widened refetch: `None` when `out` is to be returned as
+    /// it stands, else whether the skip landed on the verified base. The skip lands on the verified base, else on the partial base, each only within
+    /// `(base, end]`; with neither, and offsets past `base + 1` that a batch could hold, the
+    /// partition is fetched once more with `max_batch_bytes` of room so the next batch arrives
+    /// whole beside this one; after that, the skip lands on `end`. It never passes `end` when the
+    /// answer has one, and always moves past the position.
+    fn skip(self, out: &mut Read, end: i64) -> Option<bool> {
+        let Self { base, verified, partial, widened } = self;
+        let within = |b: &i64| *b > base && (end < 0 || *b <= end);
+        let (next, on_verified) = match (verified.filter(within), partial.filter(within)) {
+            (Some(next), _) => (next, true),
+            (None, Some(next)) => (next, false),
+            (None, None) if !widened && end > base + 1 => {
+                out.corrupt_at = Some(base);
+                out.widen_at = Some(base);
+                return None;
+            }
+            (None, None) => (end, false),
+        };
+        let next = next.max(out.position + 1);
+        out.dropped.push(("corrupt", next - out.position, base));
+        out.position = next;
+        Some(on_verified)
+    }
+}
+
 /// Reads a partition's records blob from offset `from`. `aborted` is the answer's aborted
 /// transactions, `(producer id, first offset)`, empty under `read_uncommitted`; `corrupt_at` is
-/// the base offset of a batch that already failed once; `end` is the answer's high watermark, or
-/// its last stable offset under `read_committed`.
+/// the base offset of a batch that already failed once, and `widened_at` the one this answer's
+/// widened refetch was for; `end` is the answer's high watermark, or its last stable offset under
+/// `read_committed`.
 ///
-/// A corrupt batch's skip never trusts its header past the base offset, since the CRC covers
-/// `last_offset_delta` and `record_count`: it lands on the next entry's base offset when one
-/// follows in the blob; else on the base offset of a batch the blob ends inside of, read from its
-/// first 12 bytes, when that is above the failed batch's base and at or below `end`; else on
-/// `end`. It counts the offsets it passes.
+/// A corrupt batch's skip reads nothing from its header but the base offset, since no CRC covers
+/// its length and the CRC failed over `last_offset_delta` and `record_count`
+/// ([`AfterCorrupt::skip`]). A batch whose length passes the blob's end at `from` is corrupt the
+/// same way. Each skip counts the offsets it passes.
 pub(crate) fn read(
     blob: &Bytes,
     from: i64,
     aborted: &[(i64, i64)],
     max_batch_bytes: usize,
-    corrupt_at: Option<i64>,
+    (corrupt_at, widened_at): (Option<i64>, Option<i64>),
     end: i64,
 ) -> Read {
     let mut pending: Vec<(i64, i64)> = aborted.to_vec();
@@ -610,15 +673,32 @@ pub(crate) fn read(
     let mut aborting: HashSet<i64> = HashSet::new();
     let mut out = Read { position: from, ..Read::default() };
     let decoded = logit_proto::kafka::decode(blob, max_batch_bytes);
+    let partial_base = decoded.partial_base;
     let entries = decoded.entries;
-    let bases: Vec<i64> = entries
-        .iter()
-        .map(|e| match e {
-            Ok(batch) => batch.base_offset,
-            Err(err) => err.base_offset,
-        })
-        .collect();
+    // A batch whose length passes the blob's end, at the position: the broker returns the first
+    // batch whole, so its length field is corrupt and nothing after it can be found.
+    if entries.is_empty() {
+        if let Some(base) = partial_base.filter(|&b| b <= from) {
+            if corrupt_at != Some(base) {
+                out.corrupt_at = Some(base);
+                return out;
+            }
+            let widened = widened_at == Some(base);
+            AfterCorrupt { base, verified: None, partial: None, widened }.skip(&mut out, end);
+            return out;
+        }
+    }
+    // Only a CRC-verified entry shows decoding is aligned with the batches again.
+    let verified: Vec<Option<i64>> =
+        entries.iter().map(|e| e.as_ref().ok().map(|b| b.base_offset)).collect();
+    let count = entries.len();
+    // Entries before this index follow a corrupt batch with no verified entry between: decoding
+    // may have resumed inside its bytes, so their headers mean nothing.
+    let mut resume = 0;
     for (i, entry) in entries.into_iter().enumerate() {
+        if i < resume {
+            continue;
+        }
         let batch = match entry {
             Ok(batch) => batch,
             Err(err) if err.kind == BatchErrorKind::Corrupt => {
@@ -627,14 +707,18 @@ pub(crate) fn read(
                     return out;
                 }
                 let base = err.base_offset;
-                let partial = decoded.partial_base.filter(|&b| b > base && b <= end);
-                let next = match bases.get(i + 1) {
-                    Some(&next) => next,
-                    None => partial.unwrap_or(end),
+                let next_ok = (i + 1..count).find(|&j| verified[j].is_some());
+                let after = AfterCorrupt {
+                    base,
+                    verified: next_ok.and_then(|j| verified[j]),
+                    partial: partial_base,
+                    widened: widened_at == Some(base),
+                };
+                match after.skip(&mut out, end) {
+                    None => return out,
+                    Some(true) => resume = next_ok.unwrap_or(count),
+                    Some(false) => resume = count,
                 }
-                .max(out.position + 1);
-                out.dropped.push(("corrupt", next - out.position, err.base_offset));
-                out.position = next;
                 continue;
             }
             Err(err) => {
@@ -719,6 +803,114 @@ fn count_read(pool: &Pool, tp: &TopicPartition, read: &Read) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use kafka_protocol::records::Compression;
+    use logit_proto::kafka::batch::{encode, ProducerRecord, Stamp};
+
+    /// One batch of `n` records at `base`, its CRC valid.
+    fn batch_at(base: i64, n: usize) -> Vec<u8> {
+        let records: Vec<ProducerRecord> = (0..n)
+            .map(|i| ProducerRecord {
+                key: None,
+                value: Some(Bytes::from(format!("value {i}"))),
+                headers: Default::default(),
+                timestamp: 1_000,
+            })
+            .collect();
+        let mut raw = encode(&records, Stamp::NONE, Compression::None).unwrap().to_vec();
+        raw[..8].copy_from_slice(&base.to_be_bytes());
+        raw
+    }
+
+    fn with_length(mut raw: Vec<u8>, length: i32) -> Vec<u8> {
+        raw[8..12].copy_from_slice(&length.to_be_bytes());
+        raw
+    }
+
+    fn length(raw: &[u8]) -> i32 {
+        i32::from_be_bytes(raw[8..12].try_into().unwrap())
+    }
+
+    /// `read` for a batch at 0 that already failed and had its widened refetch.
+    fn read_final(blob: Vec<u8>, end: i64) -> Read {
+        read(&Bytes::from(blob), 0, &[], 1 << 20, (Some(0), Some(0)), end)
+    }
+
+    /// A shrunk length makes decoding resume inside the failed batch's records, where any header
+    /// is garbage: the skip may not land on one, nor past `end`.
+    #[test]
+    fn a_shrunk_length_never_lands_on_an_offset_decoded_inside_the_batch() {
+        let bad = batch_at(0, 3);
+        for shrink in [8, 20, 40] {
+            let bad = with_length(bad.clone(), length(&bad) - shrink);
+            let blob = [bad.clone(), batch_at(3, 1)].concat();
+            let read = read_final(blob, 4);
+            assert!((1..=4).contains(&read.position), "shrink {shrink}: {}", read.position);
+            let dropped: i64 = read.dropped.iter().map(|d| d.1).sum();
+            assert_eq!(dropped + read.records.len() as i64, read.position, "shrink {shrink}");
+        }
+    }
+
+    /// An entry after the failed batch whose own CRC fails names a base inside the failed batch's
+    /// offsets, as one decoded from a misaligned position does: only the verified batch after it
+    /// is a landing.
+    #[test]
+    fn only_a_crc_verified_entry_is_a_landing() {
+        let mut bad = batch_at(0, 3);
+        bad[17] ^= 1;
+        let mut garbage = batch_at(2, 1);
+        garbage[17] ^= 1;
+        let read = read_final([bad, garbage, batch_at(3, 1)].concat(), 4);
+        assert_eq!(read.position, 4);
+        assert_eq!(read.records.len(), 1);
+        assert_eq!(read.dropped, vec![("corrupt", 3, 0)]);
+    }
+
+    /// A length grown past the answer leaves no entry at all: the batch at the position is
+    /// refetched, refetched widened, then skipped to `end`, counted.
+    #[test]
+    fn a_length_past_the_answer_at_the_position_is_corrupt() {
+        let bad = batch_at(0, 3);
+        let blob =
+            Bytes::from([with_length(bad.clone(), length(&bad) + 1_000), batch_at(3, 1)].concat());
+        let first = read(&blob, 0, &[], 1 << 20, (None, None), 4);
+        assert_eq!((first.position, first.corrupt_at, first.widen_at), (0, Some(0), None));
+        let second = read(&blob, 0, &[], 1 << 20, (Some(0), None), 4);
+        assert_eq!((second.position, second.widen_at), (0, Some(0)));
+        assert!(second.dropped.is_empty());
+        let last = read(&blob, 0, &[], 1 << 20, (Some(0), Some(0)), 4);
+        assert_eq!(last.position, 4);
+        assert_eq!(last.dropped, vec![("corrupt", 4, 0)]);
+    }
+
+    /// A cut batch's base counts only within the failed batch's base and `end`.
+    #[test]
+    fn a_partial_base_outside_the_range_lands_on_end() {
+        let mut bad = batch_at(0, 3);
+        bad[17] ^= 1;
+        for (partial, landing) in [(0, 10), (-5, 10), (11, 10), (5, 5)] {
+            let cut = batch_at(partial, 1)[..20].to_vec();
+            let read = read_final([bad.clone(), cut].concat(), 10);
+            assert_eq!(read.position, landing, "partial base {partial}");
+            assert_eq!(read.dropped, vec![("corrupt", landing, 0)], "partial base {partial}");
+        }
+    }
+
+    /// The widened refetch for a lone failed batch: with nothing verified after it, and offsets
+    /// left before `end`, the second failure asks for room rather than skipping to `end`.
+    #[test]
+    fn a_lone_failed_batch_is_refetched_widened_before_skipping_to_end() {
+        let mut bad = batch_at(0, 3);
+        bad[17] ^= 1;
+        let blob = Bytes::from(bad);
+        let second = read(&blob, 0, &[], 1 << 20, (Some(0), None), 10);
+        assert_eq!((second.position, second.widen_at, second.corrupt_at), (0, Some(0), Some(0)));
+        let last = read(&blob, 0, &[], 1 << 20, (Some(0), Some(0)), 10);
+        assert_eq!((last.position, last.widen_at), (10, None));
+        // With no offset past the batch's own, there's nothing to widen for.
+        let alone = read(&blob, 0, &[], 1 << 20, (Some(0), None), 1);
+        assert_eq!((alone.position, alone.widen_at), (1, None));
+    }
 
     fn part(position: i64, committed: i64) -> Part {
         Part::new(Position::At(position), Tracker::new(position, Some(committed)))
