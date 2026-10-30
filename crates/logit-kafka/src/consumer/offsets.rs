@@ -94,11 +94,16 @@ impl Tracker {
         self.committed = Some(offset);
     }
 
-    /// Moves the candidate to `position` with nothing done above it: the position a log-end
-    /// reset sets.
+    /// Moves the candidate down to `position` if it's above it, and forgets what was done at or
+    /// above `position`: a log-end reset after the log was truncated below the fetch position.
+    /// Never moves the candidate up, since records handed out below `position` may not be
+    /// accepted yet.
     pub fn reset(&mut self, position: i64) {
-        self.candidate = position;
-        self.done.clear();
+        self.candidate = self.candidate.min(position);
+        self.done.retain(|&start, _| start < position);
+        for end in self.done.values_mut() {
+            *end = (*end).min(position);
+        }
     }
 }
 
@@ -328,6 +333,25 @@ mod tests {
         t.mark(9..12);
         t.reset(7);
         t.mark(7..9);
+        assert_eq!(t.candidate(), 5, "a reset above the candidate leaves it");
+        t.mark(5..7);
         assert_eq!(t.candidate(), 9, "the done range above the reset went with it");
+    }
+
+    /// A log truncated below the fetch position: the handed-out records under the new end aren't
+    /// accepted yet, so the candidate stays, and what was done below the end survives.
+    #[test]
+    fn a_reset_below_the_fetch_position_never_moves_the_candidate_up() {
+        let mut t = Tracker::new(100, Some(100));
+        t.mark(105..110);
+        t.mark(112..140);
+        t.reset(120);
+        assert_eq!(t.candidate(), 100);
+        t.mark(100..105);
+        assert_eq!(t.candidate(), 110);
+        t.mark(110..112);
+        assert_eq!(t.candidate(), 120, "112..140 was cut at the new end");
+        t.reset(90);
+        assert_eq!(t.candidate(), 90, "a reset below the candidate moves it down");
     }
 }

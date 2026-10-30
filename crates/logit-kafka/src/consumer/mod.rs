@@ -27,7 +27,7 @@
 //! | Connect, TLS, or timeout failure; a disconnect | — | Back off; a fetch loop's asks for a refresh, a coordinator link's rediscovers | `logit.input.reconnects` on the redial | `a_broker_restart_redials_and_counts_a_reconnect`, `an_expired_session_rejoins_with_an_empty_id`, `a_failed_commit_keeps_the_positions_for_the_next_one` |
 //! | SASL refused, or a token endpoint's `4xx` | 33, 34, 58 | Back off; no other mechanism, no fallback to none | Diagnostic `auth_failed` | `a_refused_sasl_login_backs_off_with_no_fallback` |
 //! | `OFFSET_OUT_OF_RANGE` | 1 | ListOffsets earliest and latest; below the log start moves to it, above the log end moves back to it | `offsets.reset{reason="out_of_range"}`; below the start, `records` and `records.dropped{reason="retention"}` for the offsets between, and diagnostic `records_dropped` | `a_position_below_the_log_start_moves_to_it_and_counts_the_gap_as_retention`, `a_position_above_the_log_end_moves_back_to_it` |
-//! | A batch whose CRC-32C doesn't match | — | Refetch once from the same offset; a second mismatch at that batch skips it | `records` and `records.dropped{reason="corrupt"}`, the batch's record count; diagnostic `records_dropped`; no broker error | `a_crc_mismatch_refetches_once_and_reads_the_batch`, `a_second_crc_mismatch_skips_the_batch_as_corrupt` |
+//! | A batch whose CRC-32C doesn't match | — | Refetch once from the same offset; a second mismatch at that batch skips it: the skip ends at the next decoded batch's base offset when one follows in the answer, else at the high watermark (the last stable offset under `read_committed`), never at an offset read from the failed batch's header | `records` and `records.dropped{reason="corrupt"}`, the offsets skipped; diagnostic `records_dropped`; no broker error | `a_crc_mismatch_refetches_once_and_reads_the_batch`, `a_second_crc_mismatch_skips_the_batch_as_corrupt`, `a_corrupt_batch_with_a_far_delta_skips_to_the_next_batch`, `a_corrupt_last_batch_skips_to_the_high_watermark` |
 //! | `CORRUPT_MESSAGE` on a Fetch partition | 2 | Back off and refetch from the same offset; an answer with no batch names nothing to skip | — | `corrupt_message_on_fetch_refetches_after_a_backoff` |
 //! | `UNKNOWN_TOPIC_OR_PARTITION` on Metadata | 3 | Not assigned until it exists; a refresh (`metadata_max_age`) that finds it, or a subscribed topic's partition count changed, revokes and rejoins | Diagnostic `topic_missing`; `rebalances{reason="metadata"}` | `a_missing_topic_is_subscribed_once_it_appears` |
 //! | `NOT_LEADER_OR_FOLLOWER` on Fetch | 6 | Refresh, then fetch from the leader after a backoff | — | `a_leader_move_refreshes_metadata_and_fetches_from_the_new_leader` |
@@ -47,9 +47,10 @@
 //! | An OffsetCommit with a transport error or a retriable code | — | The positions stay pending for the next commit | `commits{class="error"}` | `a_failed_commit_keeps_the_positions_for_the_next_one` |
 //! | An OffsetCommit refused for generation or membership | 22, 25, 82 | As the code's row; the positions are dropped | `commits{class="fenced"}` | `a_commit_refused_for_membership_never_lands` |
 //! | `throttle_time_ms` above 0 in any answer | — | No request on that connection before it passes | Not counted | `a_throttled_answer_mutes_the_connection_until_it_passes` |
-//! | A batch whose records decompress past `max_batch_bytes` | — | Skip it | `records` and `records.dropped{reason="oversize"}`; diagnostic `records_dropped` | `a_batch_over_max_batch_bytes_is_skipped_as_oversize` |
-//! | A batch that doesn't decompress, or whose records don't parse | — | As a CRC mismatch: refetch once, then skip | `records.dropped{reason="corrupt"}` | `a_batch_that_does_not_decompress_is_skipped_as_corrupt` |
-//! | A magic 0 or 1 message set | — | Skip it | `records.dropped{reason="legacy_format"}`, one per offset it covers | `a_legacy_message_set_is_skipped_as_legacy_format` |
+//! | A batch whose records decompress past `max_batch_bytes` | — | Skip it | `records` and `records.dropped{reason="oversize"}`; diagnostic `records_dropped`; no broker error | `a_batch_over_max_batch_bytes_is_skipped_as_oversize` |
+//! | A batch that doesn't decompress, or whose records don't parse | — | As a CRC mismatch: refetch once, then skip; the skip ends at the next decoded batch's base offset when one follows in the answer, else at the high watermark (the last stable offset under `read_committed`), never at an offset read from the failed batch's header | `records.dropped{reason="corrupt"}`, the offsets skipped; no broker error | `a_batch_that_does_not_decompress_is_skipped_as_corrupt` |
+//! | A magic 0 or 1 message set | — | Skip it | `records.dropped{reason="legacy_format"}`, one per offset it covers; no broker error |
+//! | A Metadata answer with a partition index outside its partition entries | — | The topic is left out of that answer, as one with an error code | Error `malformed`; diagnostic `broker_error` | `metadata::tests::an_index_outside_the_entries_is_malformed` | `a_legacy_message_set_is_skipped_as_legacy_format` |
 //!
 //! `OFFSET_METADATA_TOO_LARGE` (12) can't occur: no commit carries metadata. Any other code backs
 //! off with diagnostic `broker_error` and counts under its own name. A record whose value
@@ -300,7 +301,8 @@ pub(crate) fn group_code(error: i16) -> GroupCode {
 pub(crate) enum PartitionCode {
     Ok,
     OutOfRange,
-    /// Refetch once from the same offset.
+    /// Back off and refetch from the same offset, with no end: the answer holds no batch to
+    /// skip.
     Corrupt,
     /// Refresh metadata, then fetch from the leader after a backoff.
     Refresh,

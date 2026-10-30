@@ -7,7 +7,8 @@
 //!    `commit_interval`, refreshes metadata, and returns a partition's buffered records
 //!    ([`Next::Records`]) or a pending revoke ([`Next::Revoke`]).
 //! 2. The caller cuts the records into batches, sends each, and calls
-//!    [`Consumer::mark_accepted`] with [`Fetched::cut`]'s range for each batch accepted.
+//!    [`Consumer::mark_accepted`] with the `Fetched`'s epoch and [`Fetched::cut`]'s range for each
+//!    batch accepted.
 //!    Between attempts at a send it reads [`Consumer::revoke_pending`]: once a revoke is
 //!    pending, the batch in flight gets the drain deadline and the rest are deferred.
 //! 3. On a revoke (`docs/adr/kafka-input.md`, item 8), the fetch loops have stopped and buffered
@@ -312,10 +313,13 @@ impl Consumer {
     }
 
     /// Marks `range` of `tp` accepted (or otherwise done): the commit candidate moves across it
-    /// once every offset before it is done too.
-    pub fn mark_accepted(&mut self, tp: &TopicPartition, range: Range<i64>) {
+    /// once every offset before it is done too. `epoch` is the [`Fetched::epoch`] the range came
+    /// from: a range from before the partition's last reset is cut at the offset the reset moved
+    /// to, since the offsets above it may now name records never read, and a range from an
+    /// earlier assignment is ignored.
+    pub fn mark_accepted(&mut self, tp: &TopicPartition, epoch: u64, range: Range<i64>) {
         if let Some(part) = self.shared.lock().unwrap().parts.get_mut(tp) {
-            part.tracker.mark(range);
+            part.accept(epoch, range);
         }
     }
 
@@ -367,7 +371,8 @@ impl Consumer {
             state
                 .parts
                 .iter()
-                .filter(|(_, p)| p.tracker.pending())
+                // A partition whose start ListOffsets hasn't resolved has no position to commit.
+                .filter(|(_, p)| !matches!(p.position, Position::Start(_)) && p.tracker.pending())
                 .map(|(tp, p)| (tp.clone(), p.tracker.candidate()))
                 .collect()
         };
@@ -573,23 +578,93 @@ impl Consumer {
         };
         let assignment: Vec<TopicPartition> =
             assigned.iter().map(|(t, p)| TopicPartition::new(t, *p)).collect();
-        let committed = if assignment.is_empty() {
-            HashMap::new()
-        } else {
-            match offsets::fetch_committed(
-                &mut self.coordinator,
-                &self.pool,
-                &self.settings.group,
-                &assignment,
-            )
-            .await
-            {
-                Ok(committed) => committed,
-                Err(failure) => return Err(self.group_failure(ApiKey::OffsetFetch, failure)),
-            }
-        };
-        self.install(joined, cluster, assignment, committed);
+        self.member =
+            Some(Member { member_id: joined.member_id.clone(), generation: joined.generation });
+        self.heartbeat = Some(heartbeat::spawn(
+            self.pool.clone(),
+            heartbeat::Member {
+                group: self.settings.group.clone(),
+                member_id: joined.member_id.clone(),
+                generation: joined.generation,
+                coordinator: self.coordinator.target.clone(),
+            },
+            self.settings.heartbeat_interval,
+            self.signal.clone(),
+        ));
+        let committed = self.fetch_committed(&assignment).await?;
+        self.install(cluster, assignment, committed);
         Ok(())
+    }
+
+    /// The committed offsets of `assignment`, retried with a backoff while the membership holds,
+    /// as Java's `ConsumerCoordinator.fetchCommittedOffsets` does: a leader's JoinGroup would
+    /// rebalance the whole group, so only a revoke, or a fenced or rebalance code, joins again.
+    async fn fetch_committed(
+        &mut self,
+        assignment: &[TopicPartition],
+    ) -> Result<HashMap<TopicPartition, Option<i64>>, Retry> {
+        if assignment.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut backoff = Backoff::new();
+        loop {
+            let pending = *self.signal_rx.borrow();
+            if let Some(revoke) = pending {
+                self.abandon(revoke);
+                return Err(Retry::Now);
+            }
+            if self.locate().await {
+                let answer = offsets::fetch_committed(
+                    &mut self.coordinator,
+                    &self.pool,
+                    &self.settings.group,
+                    assignment,
+                )
+                .await;
+                match answer {
+                    Ok(committed) => return Ok(committed),
+                    Err(failure) => {
+                        group::count(&self.pool, ApiKey::OffsetFetch, &failure);
+                        match failure {
+                            Failure::Call(_) => self.located = false,
+                            Failure::Code(c) => match group_code(c) {
+                                GroupCode::Fenced { reset_member } => {
+                                    let reason = RevokeReason::MembershipLost;
+                                    self.abandon(Revoke { reason, reset_member });
+                                    return Err(Retry::Now);
+                                }
+                                GroupCode::Rebalance => {
+                                    self.abandon(Revoke::new(RevokeReason::Rebalance));
+                                    return Err(Retry::Now);
+                                }
+                                GroupCode::Rediscover => self.located = false,
+                                GroupCode::BackOff(Some(key)) => self.counters.warn(
+                                    key,
+                                    format_args!(
+                                        "Kafka group {:?}: OffsetFetch answered {}",
+                                        self.settings.group,
+                                        crate::error::name(c)
+                                    ),
+                                ),
+                                GroupCode::BackOff(None) | GroupCode::Ok => {}
+                            },
+                        }
+                    }
+                }
+            }
+            backoff.wait().await;
+        }
+    }
+
+    /// Drops a membership the join hadn't finished installing, for `revoke`'s rejoin.
+    fn abandon(&mut self, revoke: Revoke) {
+        self.heartbeat = None;
+        self.member = None;
+        if revoke.reset_member {
+            self.member_id.clear();
+        }
+        self.join_reason = revoke.reason.tag();
+        self.signal.send_replace(None);
     }
 
     /// Counts and classifies a group request's failure: what the join loop does next.
@@ -671,10 +746,9 @@ impl Consumer {
         )
     }
 
-    /// Becomes the member `joined` describes, with `assignment` starting at `committed`.
+    /// Installs `assignment` starting at `committed`, for the member `try_join` made.
     fn install(
         &mut self,
-        joined: Joined,
         cluster: Cluster,
         assignment: Vec<TopicPartition>,
         committed: HashMap<TopicPartition, Option<i64>>,
@@ -710,19 +784,6 @@ impl Consumer {
         self.counters.telemetry.gauge("logit.input.partitions", assignment.len() as f64, &[]);
         self.snapshot = self.subscribed_counts(&cluster);
         self.assignment = assignment;
-        self.member =
-            Some(Member { member_id: joined.member_id.clone(), generation: joined.generation });
-        self.heartbeat = Some(heartbeat::spawn(
-            self.pool.clone(),
-            heartbeat::Member {
-                group: self.settings.group.clone(),
-                member_id: joined.member_id,
-                generation: joined.generation,
-                coordinator: self.coordinator.target.clone(),
-            },
-            self.settings.heartbeat_interval,
-            self.signal.clone(),
-        ));
         self.apply_cluster(cluster);
     }
 

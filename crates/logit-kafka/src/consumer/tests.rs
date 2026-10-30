@@ -78,7 +78,7 @@ async fn take(c: &mut Consumer, n: usize) -> Vec<String> {
     while out.len() < n {
         match next(c).await {
             Next::Records(f) => {
-                c.mark_accepted(&f.tp, f.cut(0..f.records.len()));
+                c.mark_accepted(&f.tp, f.epoch, f.cut(0..f.records.len()));
                 out.extend(f.records.iter().map(text));
             }
             Next::Revoke(reason) => panic!("an unexpected revoke: {reason:?}"),
@@ -132,7 +132,7 @@ fn drive(mut c: Consumer) -> Driven {
                 }
                 n = c.next() => match n {
                     Next::Records(f) => {
-                        c.mark_accepted(&f.tp, f.cut(0..f.records.len()));
+                        c.mark_accepted(&f.tp, f.epoch, f.cut(0..f.records.len()));
                         let _ = tx.send(Seen::Records);
                     }
                     Next::Revoke(reason) => {
@@ -237,6 +237,25 @@ async fn a_partition_with_no_commit_starts_at_the_log_end_by_default() {
     assert_eq!(cluster.state().list_offsets[0].4, offsets::LATEST);
     cluster.state().append("t", 0, &values(&["new"]), Compression::None);
     assert_eq!(reading.await.unwrap(), ["new"]);
+}
+
+/// A partition whose `latest` ListOffsets hasn't answered has no offset to commit: committing
+/// its tracker's placeholder would move a new group's start.
+#[tokio::test]
+async fn an_unresolved_start_position_is_never_committed() {
+    let cluster = cluster(1, &[0]).await;
+    cluster.state().append("t", 0, &values(&["a", "b", "c", "d"]), Compression::None);
+    for _ in 0..5 {
+        cluster.script(Step::api(ApiKey::ListOffsets, Action::Error(code::LEADER_NOT_AVAILABLE)));
+    }
+    let probe = TelemetryProbe::new();
+    let mut s = settings(&cluster, &["t"]);
+    s.start = StartPosition::Latest;
+    s.commit_interval = Duration::from_secs(60);
+    let mut c = consumer(&probe, "in", s);
+    c.rejoin().await;
+    assert_eq!(c.commit_all().await, CommitOutcome::Nothing);
+    assert_eq!(committed(&cluster, 0), None);
 }
 
 fn used_versions(cluster: &FakeCluster) -> std::collections::HashMap<ApiKey, i16> {
@@ -392,15 +411,15 @@ async fn the_commit_never_passes_an_unaccepted_offset() {
     assert_eq!(c.commit_all().await, CommitOutcome::Committed);
     assert_eq!(committed(&cluster, 0), Some(0));
     // The second and fourth records accepted, the first not.
-    c.mark_accepted(&tp, f.cut(1..2));
-    c.mark_accepted(&tp, f.cut(3..4));
+    c.mark_accepted(&tp, f.epoch, f.cut(1..2));
+    c.mark_accepted(&tp, f.epoch, f.cut(3..4));
     assert_eq!(c.commit_all().await, CommitOutcome::Nothing);
     assert_eq!(committed(&cluster, 0), Some(0));
-    c.mark_accepted(&tp, f.cut(0..1));
+    c.mark_accepted(&tp, f.epoch, f.cut(0..1));
     assert_eq!(c.candidate(&tp), Some(2));
     assert_eq!(c.commit_all().await, CommitOutcome::Committed);
     assert_eq!(committed(&cluster, 0), Some(2));
-    c.mark_accepted(&tp, f.cut(2..3));
+    c.mark_accepted(&tp, f.epoch, f.cut(2..3));
     assert_eq!(c.commit_all().await, CommitOutcome::Committed);
     assert_eq!(committed(&cluster, 0), Some(4));
 }
@@ -499,6 +518,41 @@ async fn a_position_above_the_log_end_moves_back_to_it() {
     assert_eq!(probe.sum("logit.input.records.dropped", &[]), 0.0);
 }
 
+/// A reset to a log end below the commit candidate's range keeps the candidate, and a range
+/// fetched before the reset still moves it up to the reset point.
+#[tokio::test]
+async fn a_reset_below_a_handed_out_range_keeps_the_commit_movable() {
+    let cluster = cluster(1, &[0]).await;
+    cluster.state().append("t", 0, &values(&["a", "b"]), Compression::None);
+    let mut probe = TelemetryProbe::new();
+    let mut s = settings(&cluster, &["t"]);
+    s.commit_interval = Duration::from_secs(60);
+    let mut c = consumer(&probe, "in", s);
+    take(&mut c, 2).await;
+    assert_eq!(c.commit_all().await, CommitOutcome::Committed);
+    cluster.state().append("t", 0, &values(&["c", "d", "e", "f"]), Compression::None);
+    let Next::Records(early) = next(&mut c).await else { panic!("records") };
+    let range = early.cut(0..early.records.len());
+    assert_eq!(range, 2..6);
+    let tp = early.tp.clone();
+
+    // The topic is recreated with three offsets: the fetch at 6 is past its end.
+    cluster.state().add_topic("t", &[0]);
+    cluster.state().append("t", 0, &values(&["x", "y", "z"]), Compression::None);
+    wait_until("the reset to the new log end", || {
+        probe.sum("logit.input.offsets.reset", &[("reason", "out_of_range")]) == 1.0
+    })
+    .await;
+    assert_eq!(c.candidate(&tp), Some(2));
+    c.mark_accepted(&tp, early.epoch, range);
+    assert_eq!(c.candidate(&tp), Some(3));
+
+    cluster.state().append("t", 0, &values(&["w"]), Compression::None);
+    assert_eq!(take(&mut c, 1).await, ["w"]);
+    assert_eq!(c.commit_all().await, CommitOutcome::Committed);
+    assert_eq!(committed(&cluster, 0), Some(4));
+}
+
 #[tokio::test]
 async fn a_crc_mismatch_refetches_once_and_reads_the_batch() {
     let cluster = cluster(1, &[0]).await;
@@ -528,6 +582,48 @@ async fn a_second_crc_mismatch_skips_the_batch_as_corrupt() {
     assert!(diagnostics(&mut probe, "records_dropped") >= 1.0);
     assert_eq!(c.commit_all().await, CommitOutcome::Committed);
     assert_eq!(committed(&cluster, 0), Some(3));
+}
+
+/// A batch of `values` whose `last_offset_delta` reads `delta`, its CRC left stale.
+fn bad_delta(values_: &[&str], delta: i32) -> Bytes {
+    use logit_proto::kafka::batch::{encode, Stamp};
+    let mut raw = encode(&values(values_), Stamp::NONE, Compression::None).unwrap().to_vec();
+    raw[23..27].copy_from_slice(&delta.to_be_bytes());
+    Bytes::from(raw)
+}
+
+/// A failed CRC leaves the header's offsets untrusted: the skip ends at the next batch's base.
+#[tokio::test]
+async fn a_corrupt_batch_with_a_far_delta_skips_to_the_next_batch() {
+    for delta in [1_000, -5] {
+        let cluster = cluster(1, &[0]).await;
+        cluster.state().append_raw("t", 0, bad_delta(&["a", "b", "c"], delta), 3);
+        cluster.state().append("t", 0, &values(&["d"]), Compression::None);
+        let mut probe = TelemetryProbe::new();
+        let mut s = settings(&cluster, &["t"]);
+        s.commit_interval = Duration::from_secs(60);
+        let mut c = consumer(&probe, "in", s);
+        assert_eq!(take(&mut c, 1).await, ["d"], "delta {delta}");
+        assert_eq!(probe.sum("logit.input.records.dropped", &[("reason", "corrupt")]), 3.0);
+        assert_eq!(c.commit_all().await, CommitOutcome::Committed);
+        assert_eq!(committed(&cluster, 0), Some(4));
+    }
+}
+
+/// With no batch after it in the answer, the skip ends at the high watermark, not at the
+/// offset the header names past the log end.
+#[tokio::test]
+async fn a_corrupt_last_batch_skips_to_the_high_watermark() {
+    let cluster = cluster(1, &[0]).await;
+    cluster.state().append_raw("t", 0, bad_delta(&["a", "b", "c"], 1_000), 3);
+    let mut probe = TelemetryProbe::new();
+    let mut c = consumer(&probe, "in", settings(&cluster, &["t"]));
+    let reading = tokio::spawn(async move { take(&mut c, 1).await });
+    wait_until("a fetch at the high watermark", || fetches_at(&cluster, 3) > 0).await;
+    cluster.state().append("t", 0, &values(&["d"]), Compression::None);
+    assert_eq!(reading.await.unwrap(), ["d"]);
+    assert_eq!(probe.sum("logit.input.records.dropped", &[("reason", "corrupt")]), 3.0);
+    assert_eq!(probe.sum("logit.input.offsets.reset", &[("reason", "out_of_range")]), 0.0);
 }
 
 #[tokio::test]
@@ -630,6 +726,24 @@ async fn a_batch_over_max_batch_bytes_is_skipped_as_oversize() {
     assert!(diagnostics(&mut probe, "records_dropped") >= 1.0);
 }
 
+/// Fetch reads an answer up to `fetch.max_bytes` plus `max_batch_bytes`, past the 64 MiB other
+/// requests' answers are held to, so a batch under `max_batch_bytes` is never refused as a
+/// transport failure.
+#[tokio::test]
+async fn an_answer_over_64_mib_holding_a_batch_under_max_batch_bytes_is_read() {
+    let cluster = cluster(1, &[0]).await;
+    let big = "x".repeat(65 << 20);
+    cluster.state().append("t", 0, &values(&[&big]), Compression::None);
+    cluster.state().append("t", 0, &values(&["small"]), Compression::None);
+    let probe = TelemetryProbe::new();
+    let mut s = settings(&cluster, &["t"]);
+    s.max_batch_bytes = 128 << 20;
+    let mut c = consumer(&probe, "in", s);
+    let taken = take(&mut c, 2).await;
+    assert_eq!(taken[0].len(), big.len());
+    assert_eq!(taken[1], "small");
+}
+
 /// A batch of `records` whose attributes claim gzip over an uncompressed records section, its
 /// CRC valid.
 fn undecompressable(records: &[ProducerRecord]) -> Bytes {
@@ -650,6 +764,12 @@ async fn a_batch_that_does_not_decompress_is_skipped_as_corrupt() {
     let mut c = consumer(&probe, "in", settings(&cluster, &["t"]));
     assert_eq!(take(&mut c, 1).await, ["d"]);
     assert_eq!(probe.sum("logit.input.records.dropped", &[("reason", "corrupt")]), 3.0);
+    assert_eq!(fetches_at(&cluster, 0), 2);
+}
+
+/// The fetches that asked for partition 0 at `offset`.
+fn fetches_at(cluster: &FakeCluster, offset: i64) -> usize {
+    cluster.state().fetches.iter().filter(|f| f.partitions.iter().any(|p| p.2 == offset)).count()
 }
 
 /// A magic 1 message set of one message.
@@ -783,7 +903,7 @@ async fn rebalance_in_progress_on_a_heartbeat_revokes_commits_and_rejoins() {
     s.commit_interval = Duration::from_secs(60);
     let mut c = consumer(&probe, "in", s);
     let Next::Records(f) = next(&mut c).await else { panic!("records first") };
-    c.mark_accepted(&f.tp, f.cut(0..1));
+    c.mark_accepted(&f.tp, f.epoch, f.cut(0..1));
     cluster.script(Step::api(ApiKey::Heartbeat, Action::Error(code::REBALANCE_IN_PROGRESS)));
     let Next::Revoke(RevokeReason::Rebalance) = next(&mut c).await else { panic!("a revoke") };
     assert_eq!(c.commit_all().await, CommitOutcome::Committed);
@@ -810,7 +930,7 @@ async fn heartbeat_fences(
     let Next::Records(f) = next(&mut c).await else { panic!("records first") };
     let member = c.membership().unwrap().0.to_string();
     let joins = cluster.state().joins.len();
-    c.mark_accepted(&f.tp, f.cut(0..1));
+    c.mark_accepted(&f.tp, f.epoch, f.cut(0..1));
     cluster.script(Step::api(ApiKey::Heartbeat, Action::Error(error)));
     let Next::Revoke(RevokeReason::MembershipLost) = next(&mut c).await else {
         panic!("a membership revoke")
@@ -914,13 +1034,17 @@ async fn unsupported_version_from_a_group_request_backs_off() {
 #[tokio::test]
 async fn unstable_offset_commit_on_offset_fetch_backs_off() {
     let cluster = cluster(1, &[0]).await;
-    cluster.script(Step::api(ApiKey::OffsetFetch, Action::Error(code::UNSTABLE_OFFSET_COMMIT)));
+    for _ in 0..3 {
+        cluster.script(Step::api(ApiKey::OffsetFetch, Action::Error(code::UNSTABLE_OFFSET_COMMIT)));
+    }
     cluster.state().append("t", 0, &values(&["a"]), Compression::None);
     let mut probe = TelemetryProbe::new();
     let mut c = consumer(&probe, "in", settings(&cluster, &["t"]));
     assert_eq!(take(&mut c, 1).await, ["a"]);
-    assert_eq!(errors(&mut probe, "offset_fetch", "unstable_offset_commit"), 1.0);
-    assert_eq!(requests(&cluster, ApiKey::OffsetFetch), 2);
+    assert_eq!(errors(&mut probe, "offset_fetch", "unstable_offset_commit"), 3.0);
+    assert_eq!(requests(&cluster, ApiKey::OffsetFetch), 4);
+    // A leader's rejoin would rebalance the whole group; the retry keeps the membership.
+    assert_eq!(requests(&cluster, ApiKey::JoinGroup), 2);
     assert_eq!(diagnostics(&mut probe, "broker_error"), 0.0);
 }
 

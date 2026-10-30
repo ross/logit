@@ -9,6 +9,7 @@ use logit_pipeline::Fault;
 /// Kafka error codes `logit` reads by name. A code a classifier reaches through its default arm
 /// is named here for the tests that pin its row.
 pub mod code {
+    pub const UNKNOWN_SERVER_ERROR: i16 = -1;
     pub const NONE: i16 = 0;
     pub const OFFSET_OUT_OF_RANGE: i16 = 1;
     pub const CORRUPT_MESSAGE: i16 = 2;
