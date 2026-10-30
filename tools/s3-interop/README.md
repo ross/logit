@@ -3,7 +3,7 @@
 `script/s3-interop` checks `s3_out` against a real MinIO and a real Ceph RGW, or, in
 [AWS mode](#aws-mode), a real S3 bucket. It runs the legs in [What it runs](#what-it-runs) against
 each store, fetches every object with the AWS CLI, tests each with the stock `gzip` and `zstd`, and
-prints one row per leg and store. [Recorded run](#recorded-run) records what a run showed.
+prints one row per leg and store. [Recorded run](#recorded-run) records what a run in each mode showed.
 
 The script runs on the host and drives docker (`$DOCKER`, `sudo docker` by default), like
 `script/kafka-interop` and `script/splunk-interop`. It isn't part of `script/cibuild`, and no test
@@ -90,6 +90,8 @@ The credentials need these permissions, and nothing else:
   covers.
 - `s3:CreateBucket` and `s3:DeleteBucket` on the late bucket. Without them the `bucket` leg reads
   `GAP`.
+- `s3:AbortMultipartUpload` on the object ARNs of both buckets, once the multipart legs land; the
+  single-`PutObject` legs don't use it.
 
 Static keys only: a session token isn't read.
 
@@ -102,7 +104,8 @@ there. Two rows prove nothing against AWS, and read `GAP` when their legs work:
   object with the `json-gzip` leg's, written with no SSE header, and reads `GAP` when both report
   `AES256`.
 
-Nobody has run this mode yet.
+One run so far, in us-west-2, is in [Recorded run](#recorded-run): every leg that can fail
+against AWS passed, and `vhost` and `sse` read the `GAP` this section describes.
 
 ## Running it
 
@@ -137,6 +140,8 @@ The project name is fixed, so one run at a time per daemon: the script refuses t
 project has containers, and prints the `down` command for a stack a crashed run left behind.
 
 ## Recorded run
+
+### Local mode
 
 2026-10-30, local mode, `s3_out` at `20ed4753` (the `s3/w3a` branch) with this harness, against
 MinIO `RELEASE.2026-08-04T00-00-00Z` and Ceph 19.2.0 (squid), 17 of 18 rows `PASS`, one `GAP`, no
@@ -180,6 +185,25 @@ What the run showed:
   control caught that.
 - **Ceph needed its address.** RGW treats any `Host` that is neither its DNS name nor an address as
   a bucket name, so the path-style legs dial the container's address.
+
+### AWS mode
+
+2026-10-30, AWS mode against a bucket in us-west-2, `s3_out` at `fad50a82` (the `s3/w3a` branch)
+with this harness: 7 rows `PASS`, 2 `GAP`, no `FAIL`. The run directory is
+`perf/results/s3-interop/20261030T212811Z/`. Cleanup deleted the run's prefix and the late bucket
+with no failure in `logs/cleanup.log`, and left no credential file in the run directory.
+
+| Leg | AWS S3 |
+|---|---|
+| json + gzip (default) | `PASS`: 1 object, 1000 events, each `seq` once |
+| json + zstd | `PASS` |
+| json, no compression | `PASS` |
+| native format, replayed | `PASS`: 1000 events back through `replay_in` |
+| virtual-hosted addressing | `GAP`: 500 events, each `seq` once; AWS accepts path-style requests, so only the local run checks the addressing |
+| SSE-S3 header | `GAP`: 200 events, each `seq` once, and `ServerSideEncryption` reads `AES256`, as it does for the `json-gzip` leg's object, written with no SSE header |
+| refused credentials | `PASS`: 12 `4xx`, `retrying` 1, no drop; 400 events after the restart |
+| missing bucket | `PASS`: 12 `4xx`, `retrying` 1, no drop; 200 events once the bucket was created |
+| process exits | `PASS` |
 
 ## Cleanup and a shared daemon
 
