@@ -10,6 +10,7 @@ the same date, write the record, then add a row here.
 
 | ADR | Created | Updated |
 |---|---|---|
+| [`kafka_in`: a pure-Rust consumer-group client on `kafka-protocol`, committing an offset once its records are in every downstream inbox](kafka-input.md) | 2026-10-29 | 2026-10-29 |
 | [Tail content identity: the inode stays primary, content claims an unmatched inode, and what a restart or rotation still loses is decided or counted](tail-content-identity.md) | 2026-10-29 | 2026-10-29 |
 | [Listener authentication: static bearer and basic credentials on the HTTP listeners, and a proxy for everything else](listener-authentication.md) | 2026-10-25 | 2026-10-25 |
 | [Sink request concurrency: a per-sink `concurrency:` keeps several batches in flight, each settled on its own](sink-request-concurrency.md) | 2026-10-25 | 2026-10-25 |
