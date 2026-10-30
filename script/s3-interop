@@ -161,13 +161,15 @@ aws_cli() {
         "${AWSCLI_IMAGE}" --endpoint-url "$(env_value "${RUN_DIR}/stores/${store}.env" S3_INTEROP_ENDPOINT)" "$@"
 }
 
-# aws_cli_stdin <store> <args...>: aws_cli with stdin attached.
-aws_cli_stdin() {
+# aws_cli_probe <store> <args...>: aws_cli with the store's probe directory mounted at /probe,
+# for a request that reads its body from a file: `--body` takes a regular file only, never a pipe.
+aws_cli_probe() {
     local store="$1"
     shift
-    ${DOCKER} run --rm -i --network "${NETWORK}" --env-file "${RUN_DIR}/stores/${store}.env" \
+    ${DOCKER} run --rm --network "${NETWORK}" --env-file "${RUN_DIR}/stores/${store}.env" \
         -e AWS_REQUEST_CHECKSUM_CALCULATION=when_required \
         -e AWS_RESPONSE_CHECKSUM_VALIDATION=when_required -e AWS_EC2_METADATA_DISABLED=true \
+        -v "${RUN_DIR}/probe/${store}:/probe:ro,z" \
         "${AWSCLI_IMAGE}" --endpoint-url "$(env_value "${RUN_DIR}/stores/${store}.env" S3_INTEROP_ENDPOINT)" "$@"
 }
 
@@ -183,17 +185,21 @@ create_bucket() {
     fi
 }
 
-# start_leg <leg> <store> <name suffix> <secret> <run>: one detached `logit` for a leg on a store.
+# start_leg <leg> <store> <name suffix> <run> [override env file]: one detached `logit` for a leg on
+# a store. A credential reaches the container only through an env file, never the command line,
+# where `ps` and sudo's log would show it; the override file's values replace the store's.
 start_leg() {
-    local leg="$1" store="$2" suffix="$3" secret="$4" run="$5" name telemetry
+    local leg="$1" store="$2" suffix="$3" run="$4" override="${5:-}" name telemetry
+    local env_files=(--env-file "${RUN_DIR}/stores/${store}.env")
+    [ -z "${override}" ] || env_files+=(--env-file "${override}")
     name="$(container_name "${leg}${suffix}" "${store}")"
     telemetry="/out/${leg}${suffix}-${store}-telemetry.log"
     mkdir -p "${RUN_DIR}/spool/${leg}-${store}"
     chmod 777 "${RUN_DIR}/spool/${leg}-${store}"
     ${DOCKER} run -d --name "${name}" --network "${NETWORK}" \
-        --env-file "${RUN_DIR}/stores/${store}.env" \
+        "${env_files[@]}" \
         -e "S3_INTEROP_PREFIX=${RUN_PREFIX}${leg}/" -e "S3_INTEROP_TELEMETRY=${telemetry}" \
-        -e "S3_INTEROP_SECRET_KEY=${secret}" -e "S3_INTEROP_RUN=${run}" \
+        -e "S3_INTEROP_RUN=${run}" \
         -v "${TOOLS_DIR}/logit-${leg}.yaml:/config.yaml:ro,z" -v "${RUN_DIR}:/out:z" \
         -v "${RUN_DIR}/spool/${leg}-${store}:/spool:z" \
         "${IMAGE}" run /config.yaml >/dev/null
@@ -209,8 +215,20 @@ stop_leg() {
 STARTED=0
 LEG_CONTAINERS=()
 
+# cleanup_step <what> <command...>: runs a cleanup command, appending its output to
+# logs/cleanup.log and naming a failure on stderr, so nothing left behind goes unreported.
+cleanup_step() {
+    local what="$1"
+    shift
+    echo "== ${what}" >>"${RUN_DIR}/logs/cleanup.log"
+    if ! "$@" >>"${RUN_DIR}/logs/cleanup.log" 2>&1; then
+        echo "s3-interop: cleanup couldn't ${what}; see ${RUN_DIR}/logs/cleanup.log" >&2
+    fi
+}
+
 # Captures every leg's log, then removes the containers, the compose project, and aws mode's
-# network and objects. Runs on every exit, including a failed start.
+# network and objects, and last the env files that hold credentials. Runs on every exit, including
+# a failed start.
 cleanup() {
     local name
     if [ "${STARTED}" -eq 1 ]; then
@@ -226,16 +244,22 @@ cleanup() {
             [ -n "${S3_INTEROP_KEEP:-}" ] || s3_compose down -v --remove-orphans >/dev/null 2>&1 || true
         elif [ -z "${S3_INTEROP_KEEP:-}" ]; then
             # The run prefix and the late bucket this run created are the only things it owns.
-            aws_cli aws s3 rm "s3://$(env_value "${RUN_DIR}/stores/aws.env" S3_INTEROP_BUCKET)/${RUN_PREFIX}" \
-                --recursive >/dev/null 2>&1 || true
+            # The late bucket loses only the run prefix, and `rb` without `--force` refuses a
+            # bucket that holds anything else.
+            cleanup_step "delete the run's objects" aws_cli aws s3 rm \
+                "s3://$(env_value "${RUN_DIR}/stores/aws.env" S3_INTEROP_BUCKET)/${RUN_PREFIX}" --recursive
             if [ -f "${RUN_DIR}/late-created-aws" ]; then
                 local late
                 late="$(env_value "${RUN_DIR}/stores/aws.env" S3_INTEROP_LATE_BUCKET)"
-                aws_cli aws s3 rb "s3://${late}" --force >/dev/null 2>&1 || true
+                cleanup_step "delete the run's objects in the late bucket" aws_cli aws s3 rm \
+                    "s3://${late}/${RUN_PREFIX}" --recursive
+                cleanup_step "delete the late bucket" aws_cli aws s3 rb "s3://${late}"
             fi
-            ${DOCKER} network rm "${NETWORK}" >/dev/null 2>&1 || true
+            cleanup_step "remove the network" ${DOCKER} network rm "${NETWORK}"
         fi
     fi
+    # After the last aws_cli call: nothing else needs the credentials.
+    rm -f "${RUN_DIR}/stores/aws.env" "${BAD_SECRET_ENV:-}"
     return 0
 }
 
@@ -259,9 +283,14 @@ else
     ${DOCKER} build -q -f "${TOOLS_DIR}/Dockerfile.tools" -t "${TOOLS_IMAGE}" "${TOOLS_DIR}" >/dev/null
 fi
 
+trap cleanup EXIT
 for store in "${STORES[@]}"; do
     write_store_env "${store}"
 done
+# The creds leg's wrong secret, as an override env file over the store's.
+BAD_SECRET_ENV="${RUN_DIR}/stores/bad-secret.env"
+echo "S3_INTEROP_SECRET_KEY=${BAD_SECRET}" >"${BAD_SECRET_ENV}"
+chmod 600 "${BAD_SECRET_ENV}"
 
 # `logit validate` with the first store's environment: the same files the legs run on.
 for config in "${TOOLS_DIR}"/logit-*.yaml; do
@@ -274,7 +303,6 @@ for config in "${TOOLS_DIR}"/logit-*.yaml; do
     }
 done
 
-trap cleanup EXIT
 STARTED=1
 if [ "${TARGET}" = local ]; then
     say "starting MinIO and Ceph RGW (run directory ${RUN_DIR})"
@@ -290,19 +318,26 @@ if [ "${TARGET}" = local ]; then
 fi
 
 # MinIO is up in seconds; Ceph's demo takes a minute or more to bring up a monitor, an OSD, and
-# the gateway. The first bucket call that works is the store's readiness.
+# the gateway. The first bucket call that works is the store's readiness. On AWS that is
+# HeadBucket on the run's bucket, which `s3:ListBucket` covers; ListBuckets would need the
+# account-wide `s3:ListAllMyBuckets`.
 for store in "${STORES[@]}"; do
     say "waiting for ${store}"
+    if [ "${TARGET}" = aws ]; then
+        ready_call=(s3api head-bucket --bucket "$(env_value "${RUN_DIR}/stores/${store}.env" S3_INTEROP_BUCKET)")
+    else
+        ready_call=(s3api list-buckets)
+    fi
     ready=
     for _ in $(seq 1 120); do
-        if aws_cli "${store}" s3api list-buckets >/dev/null 2>&1; then
+        if aws_cli "${store}" "${ready_call[@]}" >/dev/null 2>&1; then
             ready=1
             break
         fi
         sleep 2
     done
     [ -n "${ready}" ] || {
-        echo "s3-interop: ${store} never answered ListBuckets" >&2
+        echo "s3-interop: ${store} never answered ${ready_call[1]}" >&2
         exit 1
     }
     if [ "${TARGET}" = local ]; then
@@ -310,6 +345,22 @@ for store in "${STORES[@]}"; do
             >/dev/null
     fi
 done
+
+# Cleanup deletes the late bucket, so it must be one this run creates. In us-east-1 CreateBucket
+# answers 200 for a bucket the account already owns, so only a 404 from HeadBucket proves that.
+if [ "${TARGET}" = aws ]; then
+    late="$(env_value "${RUN_DIR}/stores/aws.env" S3_INTEROP_LATE_BUCKET)"
+    if [ "${late}" = "$(env_value "${RUN_DIR}/stores/aws.env" S3_INTEROP_BUCKET)" ]; then
+        echo "s3-interop: S3_INTEROP_LATE_BUCKET names the run's own bucket" >&2
+        exit 1
+    fi
+    if aws_cli aws s3api head-bucket --bucket "${late}" >"${RUN_DIR}/logs/late-bucket-head.log" 2>&1 \
+        || ! grep -q '(404)' "${RUN_DIR}/logs/late-bucket-head.log"; then
+        echo "s3-interop: the late bucket ${late} must not exist (HeadBucket must answer 404);" \
+            "see ${RUN_DIR}/logs/late-bucket-head.log" >&2
+        exit 1
+    fi
+fi
 
 {
     echo "s3-interop provenance"
@@ -332,12 +383,11 @@ done
 : >"${RUN_DIR}/exits.txt"
 say "starting ${#LEGS[@]} legs on each of ${#STORES[@]} store(s)"
 for store in "${STORES[@]}"; do
-    secret="$(env_value "${RUN_DIR}/stores/${store}.env" S3_INTEROP_SECRET_KEY)"
     for leg in "${LEGS[@]}"; do
         if [ "${leg}" = creds ]; then
-            start_leg "${leg}" "${store}" "" "${BAD_SECRET}" run1
+            start_leg "${leg}" "${store}" "" run1 "${BAD_SECRET_ENV}"
         else
-            start_leg "${leg}" "${store}" "" "${secret}" run1
+            start_leg "${leg}" "${store}" "" run1
         fi
         LEG_CONTAINERS+=("$(container_name "${leg}" "${store}")")
     done
@@ -346,8 +396,7 @@ done
 sleep "${PHASE1_SECONDS}"
 say "snapshotting the refused legs, creating the missing bucket, and restarting creds"
 for store in "${STORES[@]}"; do
-    secret="$(env_value "${RUN_DIR}/stores/${store}.env" S3_INTEROP_SECRET_KEY)"
-    for leg in creds bucket; do
+    for leg in creds bucket sse; do
         cp "${RUN_DIR}/${leg}-${store}-telemetry.log" "${RUN_DIR}/${leg}-${store}-phase1-telemetry.log" || true
     done
     if create_bucket "${store}" "$(env_value "${RUN_DIR}/stores/${store}.env" S3_INTEROP_LATE_BUCKET)" \
@@ -355,7 +404,7 @@ for store in "${STORES[@]}"; do
         touch "${RUN_DIR}/late-created-${store}"
     fi
     stop_leg "$(container_name creds "${store}")"
-    start_leg creds "${store}" 2 "${secret}" run2
+    start_leg creds "${store}" 2 run2
     LEG_CONTAINERS+=("$(container_name creds2 "${store}")")
 done
 
@@ -378,16 +427,26 @@ for store in "${STORES[@]}"; do
 done
 
 # The reference for the sse leg: the AWS CLI's own PutObject with the same header. A store that
-# refuses logit's must refuse this one, or the sink is at fault.
+# refuses logit's must refuse this one with the same status and code, or the sink is at fault.
+# `--debug` is what logs the response's status and body; its log also holds the request's
+# signature, so only the status line, the body's `<Code>`, and the CLI's error line are kept.
 for store in "${STORES[@]}"; do
-    if echo probe | aws_cli_stdin "${store}" s3api put-object --server-side-encryption AES256 \
+    mkdir -p "${RUN_DIR}/probe/${store}"
+    chmod 755 "${RUN_DIR}/probe" "${RUN_DIR}/probe/${store}"
+    echo probe >"${RUN_DIR}/probe/${store}/body"
+    chmod 644 "${RUN_DIR}/probe/${store}/body"
+    debug="${RUN_DIR}/probe/${store}/debug.log"
+    if aws_cli_probe "${store}" --debug s3api put-object --server-side-encryption AES256 \
         --bucket "$(env_value "${RUN_DIR}/stores/${store}.env" S3_INTEROP_BUCKET)" \
-        --key "${RUN_PREFIX}sse-probe" --body /dev/stdin >"${RUN_DIR}/fetch/${store}/sse-probe.json" \
-        2>"${RUN_DIR}/fetch/${store}/sse-probe.err"; then
+        --key "${RUN_PREFIX}sse-probe" --body /probe/body >"${RUN_DIR}/fetch/${store}/sse-probe.json" \
+        2>"${debug}"; then
         echo ok >"${RUN_DIR}/fetch/${store}/sse-probe.status"
     else
         echo failed >"${RUN_DIR}/fetch/${store}/sse-probe.status"
     fi
+    grep -oE '"PUT [^"]*" [0-9]{3} |<Code>[A-Za-z]+</Code>|An error occurred \([A-Za-z0-9]+\)|aws: \[ERROR\].*' \
+        "${debug}" >"${RUN_DIR}/fetch/${store}/sse-probe.err" || true
+    rm -f "${debug}"
 done
 
 say "decompressing the native objects and replaying each through replay_in"

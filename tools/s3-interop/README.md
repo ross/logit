@@ -36,20 +36,23 @@ The legs, each run against both stores:
 | `zstd`, `none` | `logit-zstd.yaml`, `logit-none.yaml` | the same for `.ndjson.zst` (`zstd -t`, `application/zstd`) and `.ndjson` (`application/x-ndjson`) |
 | `native` | `logit-native.yaml`, `logit-replay-native.yaml` | `format: native` objects, gunzipped, replay through `replay_in` into `stdio_out` `format: json`, and the replay holds 1,000 events, each `seq` once |
 | `vhost` | `logit-vhost.yaml` | 500 events with `path_style: false`. Only `<bucket>.<endpoint host>` resolves on the network, so a sink that sent a path-style request couldn't connect |
-| `sse` | `logit-sse.yaml` | `sse: {algorithm: aes256}`: the stored object's `ServerSideEncryption` reads `AES256`. When the store refuses the header, the row is `GAP` with the store's answer, and `FAIL` unless the AWS CLI's own `PutObject` with the same header fails too |
+| `sse` | `logit-sse.yaml` | `sse: {algorithm: aes256}`: the stored object's `ServerSideEncryption` reads `AES256`. When the sink stores nothing, the script's reference request, the AWS CLI's own `PutObject` with the same header, decides the row: `GAP` only when the store refuses that request with the same HTTP status and S3 error code it gave the sink, the sink's requests are all `4xx`, and nothing is dropped; anything else is `FAIL` |
 | `creds` | `logit-creds.yaml` | a wrong secret key is `Refused`: the sink holds, `logit.component.retrying` reads 1, requests are all `4xx`, and no `*.dropped` is nonzero. The script stops it, restarts it with the right key, and the objects hold the spool's first-run events and the second run's, each `seq` once per run |
 | `bucket` | `logit-bucket.yaml` | a bucket that doesn't exist is `Refused` and held the same way; the script creates the bucket while the sink retries, and the queue drains into it with every `seq` once |
 | process exits | | every leg exits 0 on `SIGTERM` after its shutdown grace |
 
-`creds` and `bucket` snapshot their telemetry 20 seconds in, before the fault clears, so the held
-state is read from the run itself.
+`creds`, `bucket`, and `sse` snapshot their telemetry 20 seconds in, before the fault clears, so the
+held state is read from the run itself. A refused `sse` leg has no `buffer.disk:`, so at `SIGTERM`
+it drops its held queue, counted `reason=shutdown`; the row reads the snapshot taken while it held.
 
 ### Not covered
 
 The harness runs on the single-`PutObject` path, so it has no multipart legs, no forced retry that
 overwrites a key, no `3xx` from a wrong region, and no check of a store's answer to a signed
-`x-amz-content-sha256` body. A `tc netem` reset during uploads isn't in it either. The plan's W5
-section lists them; each needs either the multipart path or a fault injector.
+`x-amz-content-sha256` body. A `tc netem` reset during uploads isn't in it either. Each needs either
+the multipart path or a fault injector;
+[the plan](../../docs/plans/s3-object-archive.md)'s W5 section assigns the first two to
+W3b and the rest to a follow-up.
 
 ## AWS mode
 
@@ -70,13 +73,36 @@ S3_INTEROP_LATE_BUCKET=
 The script refuses to start when the file is missing, isn't git-ignored, or lacks the first four
 keys, and it never prints a credential. Every leg writes under `s3-interop/<timestamp>-<pid>/`, so
 runs against one bucket never read each other's objects, and the script deletes that prefix and the
-late bucket when it ends (`S3_INTEROP_KEEP=1` leaves them). The credentials need `s3:PutObject`,
-`s3:GetObject`, and `s3:ListBucket` on the bucket, `s3:CreateBucket` and `s3:DeleteBucket` for the
-late bucket, and nothing else; the `bucket` leg reads `GAP` when the script can't create the late
-bucket. Static keys only: a session token isn't read.
+late bucket when it ends (`S3_INTEROP_KEEP=1` leaves them). Cleanup deletes only the run's prefix
+in the late bucket, then the bucket without `--force`, so a bucket holding anything else stays; a
+cleanup step that fails is named on stderr and logged to `logs/cleanup.log`. The script then
+deletes its copy of the credentials under the run directory.
+
+The late bucket must not exist when the run starts: the script refuses to start unless
+`HeadBucket` on it answers `404` and its name differs from `S3_INTEROP_BUCKET`. In us-east-1,
+`CreateBucket` on a bucket the account already owns succeeds, so this check is what keeps cleanup
+from deleting a bucket the run didn't create.
+
+The credentials need these permissions, and nothing else:
+
+- `s3:PutObject`, `s3:GetObject`, `s3:DeleteObject`, and `s3:ListBucket` on both the bucket and the
+  late bucket. The script reads readiness from `HeadBucket` on the bucket, which `s3:ListBucket`
+  covers.
+- `s3:CreateBucket` and `s3:DeleteBucket` on the late bucket. Without them the `bucket` leg reads
+  `GAP`.
+
+Static keys only: a session token isn't read.
 
 AWS addresses the buckets virtual-hosted in this mode, because path-style requests are deprecated
-there. Nobody has run this mode yet.
+there. Two rows prove nothing against AWS, and read `GAP` when their legs work:
+
+- `vhost`: S3's regional endpoints still answer path-style requests, so a sink that sent one would
+  pass. Only the local run checks the addressing.
+- `sse`: S3 encrypts every new object with SSE-S3 by default, so the row compares the `sse` leg's
+  object with the `json-gzip` leg's, written with no SSE header, and reads `GAP` when both report
+  `AES256`.
+
+Nobody has run this mode yet.
 
 ## Running it
 
@@ -97,10 +123,11 @@ A run writes `perf/results/s3-interop/<timestamp>/` (git-ignored):
 | File | Contents |
 |---|---|
 | `results.md` | the rows below |
-| `fetch/<store>/` | every object, the listings, and each leg's `head-object` |
+| `fetch/<store>/` | every object, the listings, each leg's `head-object`, and the SSE reference request's outcome (`sse-probe.*`) |
+| `probe/<store>/body` | that request's body |
 | `<leg>-<store>-telemetry.log` | each leg's `internal` telemetry and self-logs; the `creds` and `bucket` legs also keep a `-phase1` copy |
 | `replay/<store>/` | the decompressed `native` objects and the events `replay_in` read back |
-| `provenance.txt`, `exits.txt`, `timeline.log`, `logs/` | image digests and versions, each leg's exit code, the run's phases, and every container's log |
+| `provenance.txt`, `exits.txt`, `timeline.log`, `logs/` | image digests and versions, each leg's exit code, the run's phases, and every container's log, with AWS mode's cleanup in `logs/cleanup.log` |
 
 The `replay_in` leg decompresses first, because this tree's `replay_in` reads uncompressed files
 only. Once `replay_in` reads `.gz` and `.zst` (the W4 branch), the decompression step in the script
@@ -114,7 +141,7 @@ project has containers, and prints the `down` command for a stack a crashed run 
 2026-10-30, local mode, `s3_out` at `20ed4753` (the `s3/w3a` branch) with this harness, against
 MinIO `RELEASE.2026-08-04T00-00-00Z` and Ceph 19.2.0 (squid), 17 of 18 rows `PASS`, one `GAP`, no
 `FAIL`, and no `s3_out` bug. The run directory is
-`perf/results/s3-interop/20261030T184002Z/`.
+`perf/results/s3-interop/20261030T190719Z/`.
 
 | Leg | MinIO | Ceph RGW |
 |---|---|---|
@@ -123,28 +150,34 @@ MinIO `RELEASE.2026-08-04T00-00-00Z` and Ceph 19.2.0 (squid), 17 of 18 rows `PAS
 | json, no compression | `PASS` | `PASS` |
 | native format, replayed | `PASS`: 1000 events back through `replay_in` | `PASS`, the same |
 | virtual-hosted addressing | `PASS`: 500 events | `PASS`, the same |
-| SSE-S3 header | `PASS`: `ServerSideEncryption` reads `AES256` | `GAP`: `400 InvalidRequest`, empty message, 74 `4xx` attempts held; the AWS CLI's `PutObject` with the header fails too |
-| refused credentials | `PASS`: 14 `4xx`, `retrying` 1, no drop; 400 events after the restart | `PASS`: 29 `4xx`, the same |
-| missing bucket | `PASS`: 13 `4xx`, `retrying` 1, no drop; 200 events once created | `PASS`: 29 `4xx`, the same |
+| SSE-S3 header | `PASS`: `ServerSideEncryption` reads `AES256` | `GAP`: `400 InvalidRequest`, empty message, 28 `4xx` attempts held in the first 20 seconds with no drop; the AWS CLI's `PutObject` with the header is refused `400 InvalidRequest` too |
+| refused credentials | `PASS`: 13 `4xx`, `retrying` 1, no drop; 400 events after the restart | `PASS`: 28 `4xx`, the same |
+| missing bucket | `PASS`: 13 `4xx`, `retrying` 1, no drop; 200 events once created | `PASS`: 28 `4xx`, the same |
 | process exits | `PASS` | `PASS` |
 
 What the run showed:
 
-- **The Ceph demo container refuses SSE-S3.** It answers `400 InvalidRequest` with an empty body to
-  `x-amz-server-side-encryption: AES256`; it has no key manager configured, and the harness doesn't
-  configure one. `s3_out` reads the answer as `Refused`, as its response table says
-  for `InvalidRequest`: it holds the queue and retries, and counts no `*.dropped`. The row is `GAP`
-  because the store, not the sink, declines the header.
+- **The Ceph demo container refuses SSE-S3.** It answers `400 InvalidRequest` to
+  `x-amz-server-side-encryption: AES256`, from `s3_out` and from the AWS CLI's own `PutObject`
+  alike; it has no key manager configured, and the harness doesn't configure one. The CLI then
+  fails to parse Ceph's error body and prints a Python error instead of the code, so the script
+  reads the status and `<Code>` from the CLI's `--debug` log. `s3_out` reads the answer as
+  `Refused`, as its response table says for `InvalidRequest`: it holds the queue and retries, and
+  counts no `*.dropped` while it holds. The row is `GAP` because the store, not the sink, declines
+  the header.
 - **The refused legs are not vacuous.** Their phase-1 telemetry holds `4xx` requests and no `2xx`,
   and the objects appear only after the credentials or the bucket are fixed.
 - **The `creds` restart exercises the spool.** The second process generates its own 200 events
   (`run: run2`); the first run's 200 (`run: run1`) come out of `buffer.disk:`, so each run's
   `seq` set is checked separately.
-- **Negative controls.** Setting the `vhost` leg to `path_style: true` fails its row on both stores
-  (26 and 32 `connect_error` attempts: the sink dials a name that doesn't resolve), and setting the
-  `zstd` leg to `compression: none` fails its row (the key ends `.ndjson`, not `.ndjson.zst`).
-  Before `rgw` lost its `hostname:`, the Ceph `vhost` row passed under `path_style: true`, because
-  Docker's DNS resolved the bare name; the control caught that.
+- **Negative controls.** Giving the `sse` leg a wrong secret fails its row on both stores: on MinIO
+  the sink is refused `403 SignatureDoesNotMatch` while the AWS CLI's `PutObject` with the header
+  succeeds, and on Ceph the sink's `403` isn't the CLI's `400 InvalidRequest`. Setting the `vhost`
+  leg to `path_style: true` fails its row on both stores (26 and 32 `connect_error` attempts: the
+  sink dials a name that doesn't resolve), and setting the `zstd` leg to `compression: none` fails
+  its row (the key ends `.ndjson`, not `.ndjson.zst`). Before `rgw` lost its `hostname:`, the Ceph
+  `vhost` row passed under `path_style: true`, because Docker's DNS resolved the bare name; the
+  control caught that.
 - **Ceph needed its address.** RGW treats any `Host` that is neither its DNS name nor an address as
   a bucket name, so the path-style legs dial the container's address.
 

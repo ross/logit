@@ -14,11 +14,15 @@ directory) the script has written:
     fetch/<store>/head/<leg>.{json,err}   `head-object` of the leg's first object
     fetch/<store>/sse-probe.status        `ok` or `failed`: the AWS CLI's PutObject with the sse
                                           leg's header, as the reference for the sse row
+    fetch/<store>/sse-probe.err           that request's status line, the error body's
+                                          `<Code>`, and the CLI's error line, from its `--debug`
+                                          log
     replay/<store>/out/replay-<n>.ndjson  the `native` objects, decompressed and read back by
                                           `replay_in` into `stdio_out` `format: json`
     <leg>-<store>-telemetry.log           the leg's `internal` telemetry and warnings, one JSON
                                           object a line
-    {creds,bucket}-<store>-phase1-telemetry.log  a copy taken before the fault was cleared
+    {creds,bucket,sse}-<store>-phase1-telemetry.log  a copy taken 20 s in, while a refused leg
+                                          still holds and before the fault was cleared
     creds2-<store>-telemetry.log          the second `creds` run
     late-created-<store>                  present when the script created the late bucket
     exits.txt                             `<container> <exit code>` per leg
@@ -302,8 +306,24 @@ def leg_native(store, run_prefix):
                     f"back through replay_in, each seq once; requests {shown(requests(events))}")
 
 
-def leg_sse(store, run_prefix):
-    events = telemetry(f"sse-{store}")
+def probe_answer(store):
+    """The SSE probe's outcome: (`ok`, `failed`, or `missing`, `(status, code)` or None). The
+    status comes from the request's urllib3 line, the code from the response body's `<Code>`, else
+    the CLI's error line: the CLI can fail to parse an error body it then logs."""
+    base = OUT / "fetch" / store
+    status_file = base / "sse-probe.status"
+    outcome = status_file.read_text().strip() if status_file.exists() else "missing"
+    err_file = base / "sse-probe.err"
+    text = err_file.read_text(errors="replace") if err_file.exists() else ""
+    statuses = re.findall(r'"PUT [^"]*" (\d{3}) ', text)
+    code = (re.search(r"<Code>(\w+)</Code>", text)
+            or re.search(r"An error occurred \((\w+)\)", text))
+    if statuses and code:
+        return outcome, (statuses[-1], code.group(1))
+    return outcome, None
+
+
+def leg_sse(store, run_prefix, target):
     keys = keys_for(listing(store), f"{run_prefix}sse/")
     if keys:
         info = head(store, "sse")
@@ -313,17 +333,49 @@ def leg_sse(store, run_prefix):
         verdict, detail = leg_plain(store, "sse", run_prefix)
         if verdict != "PASS":
             return verdict, detail
+        # S3 encrypts every new object with SSE-S3 by default, so AES256 on the sse leg's object
+        # proves the header only where an object written without it reads otherwise.
+        if target == "aws" and head(store, "json-gzip").get("ServerSideEncryption") == "AES256":
+            return "GAP", (f"{detail}; head-object reports AES256, but so does the json-gzip "
+                           f"leg's object, written with no SSE header: the bucket encrypts by "
+                           f"default, so this row can't tell whether the sink sent the header")
         return "PASS", f"{detail}; head-object reports ServerSideEncryption AES256"
+    # Nothing stored. That is the store's limit only when the AWS CLI's own PutObject with the
+    # header got the same refusal, and the sink was refused, never accepted, and dropped nothing.
+    # The verdict reads the copy taken while the sink held: at SIGTERM a held queue with no
+    # `buffer.disk:` is dropped, counted `reason=shutdown`, which says nothing about the refusal.
+    events = telemetry(f"sse-{store}-phase1")
+    classes = requests(events)
     answers = refusals(events)
-    probe = OUT / "fetch" / store / "sse-probe.status"
-    probe_status = probe.read_text().strip() if probe.exists() else "missing"
-    if probe_status != "failed":
+    lost = dropped(events)
+    outcome, probe = probe_answer(store)
+    sink = f"requests {shown(classes)}; the sink's answers: {' | '.join(answers) or 'none'}"
+    if outcome != "failed" or probe is None:
+        read = f" ({' '.join(probe) if probe else 'no status and code read'})"
         return "FAIL", (f"the sink stored nothing under sse: aes256, but the AWS CLI's own "
-                        f"PutObject with the header gave '{probe_status}'; the sink's answers: "
-                        f"{' | '.join(answers) or 'none'}")
-    return "GAP", (f"nothing stored under sse: aes256; requests {shown(requests(events))}; the "
-                   f"store's answer: {' | '.join(answers) or 'no refusal captured'}; the AWS CLI's "
-                   f"PutObject with the same header fails too")
+                        f"PutObject with the header gave '{outcome}'"
+                        f"{read if outcome == 'failed' else ''}; {sink}")
+    refused = {tuple(a.split(":", 1)[0].split(" ", 1)) for a in answers}
+    if probe not in refused:
+        return "FAIL", (f"the AWS CLI's PutObject was refused {' '.join(probe)}, but the sink "
+                        f"wasn't refused the same way; {sink}")
+    if classes.get("2xx") or not classes.get("4xx"):
+        return "FAIL", f"the sink's requests aren't all refusals; {sink}"
+    if lost:
+        return "FAIL", f"the refusal dropped data: {shown(lost)}; {sink}"
+    return "GAP", (f"nothing stored under sse: aes256 and nothing dropped while held; phase 1 "
+                   f"{sink}; the AWS CLI's PutObject with the same header is refused "
+                   f"{' '.join(probe)} too")
+
+
+def leg_vhost(store, run_prefix, target):
+    verdict, detail = leg_plain(store, "vhost", run_prefix)
+    if verdict == "PASS" and target == "aws":
+        # Every AWS leg runs virtual-hosted, and S3's regional endpoints still answer path-style
+        # requests, so a sink that sent one would pass here too.
+        return "GAP", (f"{detail}; AWS accepts path-style requests, so only the local run checks "
+                       f"the addressing")
+    return verdict, detail
 
 
 def refusal_phase(name, store):
@@ -405,8 +457,8 @@ def main():
         ("json + zstd", lambda s: leg_plain(s, "zstd", run_prefix)),
         ("json, no compression", lambda s: leg_plain(s, "none", run_prefix)),
         ("native format, replayed", lambda s: leg_native(s, run_prefix)),
-        ("virtual-hosted addressing", lambda s: leg_plain(s, "vhost", run_prefix)),
-        ("SSE-S3 header", lambda s: leg_sse(s, run_prefix)),
+        ("virtual-hosted addressing", lambda s: leg_vhost(s, run_prefix, target)),
+        ("SSE-S3 header", lambda s: leg_sse(s, run_prefix, target)),
         ("refused credentials", lambda s: leg_creds(s, run_prefix)),
         ("missing bucket", lambda s: leg_bucket(s, run_prefix)),
     ]
