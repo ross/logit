@@ -302,6 +302,10 @@ pub fn decode_record_batches(
         "the bytes end inside the record batch at offset {}",
         decoded.partial_base.unwrap_or_default()
     );
+    anyhow::ensure!(
+        batch_frames_end(bytes) == bytes.len(),
+        "the bytes end with a stray tail shorter than a batch header"
+    );
     let mut out = Vec::new();
     for entry in decoded.entries {
         let batch = entry.map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -322,6 +326,23 @@ pub fn decode_record_batches(
         }
     }
     Ok(out)
+}
+
+/// Where the run of batch frames in `bytes` ends, read from each frame's length alone: short of
+/// `bytes.len()` when fewer than 12 bytes trail the last frame, which
+/// `logit_proto::kafka::decode` leaves unread without saying so.
+fn batch_frames_end(bytes: &[u8]) -> usize {
+    let mut pos = 0usize;
+    while bytes.len() - pos >= 12 {
+        let length = i32::from_be_bytes(bytes[pos + 8..pos + 12].try_into().unwrap_or_default());
+        let Ok(length) = usize::try_from(length) else { return pos };
+        let end = pos + 12 + length;
+        if end > bytes.len() {
+            return pos;
+        }
+        pos = end;
+    }
+    pos
 }
 
 fn signal_name(signal: Signal) -> &'static str {
