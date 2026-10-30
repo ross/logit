@@ -161,7 +161,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Revisit trigger:** an operator whose topics come and go by a naming pattern.
 - **A record relayed through `kafka_in` and `kafka_out` loses its key and headers.** `kafka_in`
   keeps them as the `_logit.kafka.key` and `_logit.kafka.headers` carriers, and `kafka_out` leaves
-  every `_logit.kafka.*` carrier out and writes neither back ([ADR `kafka-input`](../adr/kafka-input.md), item 11).
+  every `_logit.kafka.*` carrier out and writes neither back ([ADR `kafka-input`](../adr/kafka-input.md), item 11). The transit spec reads it as `attributes/kafka_key_headers`, `lost` and uncounted at `kafka_out`.
   - **Consequence:** the relayed record goes to the partition `kafka_out`'s own `key:` picks, with
     its own `headers:`, so a consumer that partitions or routes on the source key or a header
     sees neither.
@@ -185,13 +185,15 @@ Entry format and the other areas: [the known-gaps index](README.md).
     only the partition holding the batch stays held, is the open remedy short of that.
 - **`kafka_in` skips a corrupt batch to the high watermark when nothing verified follows it.**
   A batch that fails its CRC twice, or doesn't decompress or parse, gives no trustworthy length
-  or last offset, so the skip lands on the next batch in the answer whose CRC passes. When none
-  follows even after a refetch with `max_batch_bytes` of room for that partition, the skip lands
-  on the high watermark, or the last stable offset under `read_committed`
+  or last offset. The skip lands on an offset above the corrupt batch's base and at or below the
+  high watermark: the next batch in the answer whose CRC passes, else the base offset in the
+  first 12 bytes of a batch the answer cut short. When neither falls in that range even after a
+  refetch with `max_batch_bytes` of room for that partition, the skip lands on the high
+  watermark, or the last stable offset under `read_committed`
   ([ADR `kafka-input`](../adr/kafka-input.md), item 9).
   - **Consequence:** every record between the corrupt batch and the high watermark is counted
     `logit.input.records.dropped{reason="corrupt"}` and not read, good batches included, when no
-    batch after the corrupt one lies within `max_batch_bytes` of it.
+    batch after the corrupt one starts within `max_batch_bytes` of it.
   - **Workaround:** none in `logit`; a log with corrupt batches needs repair at the broker.
   - **Revisit trigger:** a reader that can probe offsets past a corrupt batch, such as one
     ListOffsets or fetch per candidate offset, or a report of this loss in practice.

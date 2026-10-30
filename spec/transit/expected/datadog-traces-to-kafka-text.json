@@ -3,7 +3,7 @@
     "logit.output.events.skipped{component=out,kind=kafka_out,reason=no_log,role=sink}": 30
   }},
   "beside": {"events": [
-    {"timestamp":"2027-01-15T08:00:07.400000000Z","log":{"format":"raw","message":"beside its span"}}
+    {"timestamp":"2027-01-15T08:00:07.400000000Z","log":{"format":"raw","message":"beside its span"},"attributes":{"_logit.kafka.offset":0,"_logit.kafka.partition":0,"_logit.kafka.timestamp":"2027-01-15T08:00:07.400000000Z","_logit.kafka.timestamp_type":"create_time","_logit.kafka.topic":"logs"},"types":{"/attributes/_logit.kafka.timestamp":"timestamp"}}
   ], "counters": {
     "logit.output.events.skipped{component=out,kind=kafka_out,reason=no_log,role=sink}": 3,
     "logit.output.spans.omitted{component=out,kind=kafka_out,reason=format,role=sink}": 1

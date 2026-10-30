@@ -36,10 +36,12 @@
 //! | `logit.output.records.dropped{reason}` | `oversize` (one record over `max_request_bytes`; under `record: batch` one event whose value alone is over it; under an OTLP format one per signal record an event too large alone would have formed; never sent), `rejected` (a partition batch the broker rejected), `invalid_timestamp` or `invalid_record` (records the broker named), or `ambiguous_at_most_once` (records left unsettled when `at_most_once` drops an `Ambiguous` batch, or an `Ambiguous` partition batch beside a `Refused` one, on any topic) |
 //! | `logit.output.records.unkeyed` | records sent without a key because the configured key had no value: on their event, or under an OTLP format on the request's events or resource |
 //! | `logit.output.events.skipped{reason="no_log"}` | events `format: text` skipped for having no log record |
+//! | `logit.output.events.skipped{reason="no_payload"}` | events an OTLP format skipped for carrying no log, span, or metric |
+//! | `logit.output.attributes.normalized{reason="u64_as_double"}` | under an OTLP format, attribute values written as a double for being a `u64` above `i64::MAX`, on the events written and the batch's resource and scope |
 //! | `logit.output.metrics.omitted{reason="format"}`, `logit.output.spans.omitted{reason="format"}` | under `format: text`, the metric records and spans an event carries beside the log body its record holds, one per metric record and one per span |
 //! | `logit.output.metrics.skipped{metric_kind}`, `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}`, `logit.output.metrics.degraded{metric_kind}` | under an OTLP format, metrics the OTLP mapping skips, drops, or degrades (`logit_proto::otlp::metrics`), once per metric |
 //!
-//! `oversize`, `records.unkeyed`, `events.skipped`, `metrics.omitted`, `spans.omitted`, and the
+//! `oversize`, `records.unkeyed`, `events.skipped`, `attributes.normalized`, `metrics.omitted`, `spans.omitted`, and the
 //! OTLP mapping's counters are encode-side, counted once per batch; `requests` and `reconnects`
 //! count per attempt; the others follow the broker's answer, which a retry never meets twice for
 //! one partition batch. Each drop but `ambiguous_at_most_once` raises a
@@ -81,6 +83,7 @@ const RECORDS: &str = "logit.output.records";
 const RECORDS_DROPPED: &str = "logit.output.records.dropped";
 const RECORDS_UNKEYED: &str = "logit.output.records.unkeyed";
 const EVENTS_SKIPPED: &str = "logit.output.events.skipped";
+const ATTRIBUTES_NORMALIZED: &str = "logit.output.attributes.normalized";
 const METRICS_OMITTED: &str = "logit.output.metrics.omitted";
 const SPANS_OMITTED: &str = "logit.output.spans.omitted";
 
@@ -187,15 +190,81 @@ fn record_headers(headers: &[(String, String)]) -> IndexMap<StrBytes, Option<Byt
         .collect()
 }
 
+/// The topic a record of `signal` goes to: its `topics` entry under an OTLP format, else `topic`.
+fn topic_of<'a>(
+    topic: &'a str,
+    topics: Option<&'a SignalTopics>,
+    signal: Option<Signal>,
+) -> &'a str {
+    match (topics, signal) {
+        (Some(topics), Some(Signal::Logs)) => &topics.logs,
+        (Some(topics), Some(Signal::Metrics)) => &topics.metrics,
+        (Some(topics), Some(Signal::Traces)) => &topics.traces,
+        _ => topic,
+    }
+}
+
+/// `compression` as the record batch encoder names it.
+fn codec(compression: KafkaCompression) -> Compression {
+    match compression {
+        KafkaCompression::None => Compression::None,
+        KafkaCompression::Gzip => Compression::Gzip,
+        KafkaCompression::Snappy => Compression::Snappy,
+        KafkaCompression::Lz4 => Compression::Lz4,
+        KafkaCompression::Zstd => Compression::Zstd,
+    }
+}
+
+/// `messages`, the records one or more encodes wrote, as the record batch v2 bytes a partition of
+/// each topic would store: one batch per topic, in first-record order, each record with its key,
+/// timestamp, and `settings`' headers, compressed under `settings`' `compression:`, with no
+/// idempotent stamp. The producer's partitioning, size check, and request packing aren't run. The
+/// transit spec reads a sink's records back through `kafka_in`'s decoder with this.
+pub fn record_batches(
+    settings: &KafkaSettings,
+    messages: &MessageBuf<RecordMeta>,
+) -> anyhow::Result<Vec<(String, Bytes)>> {
+    let headers = record_headers(&settings.headers);
+    let mut topics: Vec<(String, Vec<ProducerRecord>)> = Vec::new();
+    for (value, meta) in messages.iter_with() {
+        let topic = topic_of(&settings.topic, settings.topics.as_ref(), meta.signal);
+        let record = ProducerRecord {
+            key: meta.key.clone(),
+            value: Some(Bytes::copy_from_slice(value)),
+            headers: headers.clone(),
+            timestamp: meta.timestamp,
+        };
+        match topics.iter_mut().find(|(name, _)| name == topic) {
+            Some((_, records)) => records.push(record),
+            None => topics.push((topic.to_string(), vec![record])),
+        }
+    }
+    let codec = codec(settings.compression);
+    topics
+        .into_iter()
+        .map(|(topic, records)| {
+            Ok((topic, super::batch::encode(&records, super::batch::Stamp::NONE, codec)?))
+        })
+        .collect()
+}
+
 /// Counts what one encode of a batch reports, but for the oversize drops, which the sink counts
 /// with a warning naming its `max_request_bytes`: the unkeyed records, the events `format: text`
-/// skips, and the metrics and spans it leaves beside a log body.
+/// skips, the events an OTLP format skips for carrying no signal and the `u64` attribute values
+/// it writes as a double, and the metrics and spans `format: text` leaves beside a log body.
 pub fn report_encode_stats(telemetry: &Telemetry, stats: &EncodeStats) {
     if stats.missing_key > 0 {
         telemetry.count(RECORDS_UNKEYED, stats.missing_key as f64, &[]);
     }
     if stats.no_log > 0 {
         telemetry.count(EVENTS_SKIPPED, stats.no_log as f64, &[("reason", "no_log")]);
+    }
+    if stats.no_payload > 0 {
+        telemetry.count(EVENTS_SKIPPED, stats.no_payload as f64, &[("reason", "no_payload")]);
+    }
+    if stats.u64_as_double > 0 {
+        let n = stats.u64_as_double as f64;
+        telemetry.count(ATTRIBUTES_NORMALIZED, n, &[("reason", "u64_as_double")]);
     }
     if stats.metrics_omitted > 0 {
         let n = stats.metrics_omitted as f64;
@@ -260,13 +329,7 @@ impl KafkaOutput {
                 KafkaAcks::None => Acks::None,
             },
             idempotent: settings.idempotent,
-            compression: match settings.compression {
-                KafkaCompression::None => Compression::None,
-                KafkaCompression::Gzip => Compression::Gzip,
-                KafkaCompression::Snappy => Compression::Snappy,
-                KafkaCompression::Lz4 => Compression::Lz4,
-                KafkaCompression::Zstd => Compression::Zstd,
-            },
+            compression: codec(settings.compression),
             timeout: settings.timeout,
             max_request_bytes: settings.max_request_bytes,
             tls: None,
@@ -313,12 +376,7 @@ impl KafkaOutput {
 
     /// The topic a record of `signal` goes to.
     fn topic_of(&self, signal: Option<Signal>) -> &str {
-        match (&self.topics, signal) {
-            (Some(topics), Some(Signal::Logs)) => &topics.logs,
-            (Some(topics), Some(Signal::Metrics)) => &topics.metrics,
-            (Some(topics), Some(Signal::Traces)) => &topics.traces,
-            _ => &self.topic,
-        }
+        topic_of(&self.topic, self.topics.as_ref(), signal)
     }
 
     /// Turns on TLS to every broker (`tls:`; its presence turns TLS on, so an empty block means

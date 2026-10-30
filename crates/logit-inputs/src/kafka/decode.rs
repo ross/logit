@@ -133,7 +133,18 @@ impl RecordDecoder {
                     self.otlp.decode_signal(signal, value.clone())
                 };
                 match decoded {
-                    Ok(batches) => batches,
+                    Ok(batches) => {
+                        if *json && batches.iter().all(|b| b.events.is_empty()) {
+                            if let Some(found) = other_otlp_json_signal(value, signal) {
+                                let why = format!(
+                                    "an OTLP/JSON {found} request on topic {topic:?}, mapped to {}",
+                                    signal_name(signal),
+                                );
+                                return (Decoded::Undecodable(why), OmittedHeaders(0));
+                            }
+                        }
+                        batches
+                    }
                     Err(e) => return (Decoded::Undecodable(e.to_string()), OmittedHeaders(0)),
                 }
             }
@@ -265,4 +276,153 @@ fn native(value: &Bytes) -> Result<EventBatch, String> {
         return Err(format!("{} bytes after the frame", bytes.len()));
     }
     decode_batch(&mut payload, &DecodeBudget::default()).map_err(|e| e.to_string())
+}
+
+/// Decodes `bytes`, one partition's record batches as a Fetch answer carries them, as `kafka_in`
+/// reads them: `logit_proto::kafka::decode`, each batch's records decompressed to at most
+/// `max_batch_bytes`, then each record through `format:`'s decoder with its carriers stamped.
+/// Every event of `topic`'s `partition` comes back in offset order. A batch that doesn't decode,
+/// a record the input would skip or drop, and a header name the input would omit each fail,
+/// naming the offset: the transit spec reads a sink's own bytes through this, where any of them
+/// is a finding.
+pub fn decode_record_batches(
+    format: KafkaInFormat,
+    topic: &str,
+    partition: i32,
+    bytes: &Bytes,
+    max_batch_bytes: usize,
+    now: i64,
+    telemetry: Telemetry,
+) -> anyhow::Result<Vec<EventBatch>> {
+    let mut decoder = RecordDecoder::new(format);
+    decoder.set_telemetry(telemetry);
+    let decoded = logit_proto::kafka::decode(bytes, max_batch_bytes);
+    anyhow::ensure!(
+        decoded.partial_base.is_none(),
+        "the bytes end inside the record batch at offset {}",
+        decoded.partial_base.unwrap_or_default()
+    );
+    anyhow::ensure!(
+        batch_frames_end(bytes) == bytes.len(),
+        "the bytes end with a stray tail shorter than a batch header"
+    );
+    let mut out = Vec::new();
+    for entry in decoded.entries {
+        let batch = entry.map_err(|e| anyhow::anyhow!("{e}"))?;
+        for record in &batch.records {
+            let offset = record.offset;
+            match decoder.decode(topic, partition, record, now) {
+                (Decoded::Batches(batches), OmittedHeaders(0)) => out.extend(batches),
+                (Decoded::Batches(_), OmittedHeaders(n)) => {
+                    anyhow::bail!("the record at offset {offset} has {n} header name(s) not UTF-8")
+                }
+                (Decoded::Skipped(reason), _) => {
+                    anyhow::bail!("the record at offset {offset} is skipped as {reason}")
+                }
+                (Decoded::Undecodable(why), _) => {
+                    anyhow::bail!("the record at offset {offset} doesn't decode: {why}")
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Where the run of batch frames in `bytes` ends, read from each frame's length alone: short of
+/// `bytes.len()` when fewer than 12 bytes trail the last frame, which
+/// `logit_proto::kafka::decode` leaves unread without saying so.
+fn batch_frames_end(bytes: &[u8]) -> usize {
+    let mut pos = 0usize;
+    while bytes.len() - pos >= 12 {
+        let length = i32::from_be_bytes(bytes[pos + 8..pos + 12].try_into().unwrap_or_default());
+        let Ok(length) = usize::try_from(length) else { return pos };
+        let end = pos + 12 + length;
+        if end > bytes.len() {
+            return pos;
+        }
+        pos = end;
+    }
+    pos
+}
+
+fn signal_name(signal: Signal) -> &'static str {
+    match signal {
+        Signal::Logs => "logs",
+        Signal::Metrics => "metrics",
+        Signal::Traces => "traces",
+    }
+}
+
+/// The signal of an OTLP/JSON request whose top-level resource list for another signal than
+/// `mapped` holds an entry, under either spelling `logit_proto`'s OTLP/JSON decoder reads
+/// (`resourceLogs` or `resource_logs`, and so on). OTLP/JSON ignores a field it doesn't know, so
+/// such a request decodes to nothing under the topic's signal; read as `empty` it would be
+/// committed past with no loss counted. An empty list carried nothing and stays `empty`. Called
+/// only for a request that decoded to no event.
+fn other_otlp_json_signal(value: &Bytes, mapped: Signal) -> Option<&'static str> {
+    let keys: std::collections::HashMap<String, Carries> = serde_json::from_slice(value).ok()?;
+    let carries = |key: &str| keys.get(key).is_some_and(|c| c.0);
+    [
+        ("resourceLogs", "resource_logs", Signal::Logs),
+        ("resourceMetrics", "resource_metrics", Signal::Metrics),
+        ("resourceSpans", "resource_spans", Signal::Traces),
+    ]
+    .into_iter()
+    .find(|&(camel, snake, signal)| signal != mapped && (carries(camel) || carries(snake)))
+    .map(|(_, _, signal)| signal_name(signal))
+}
+
+/// Whether a JSON value is an array with an entry; any other value reads `false`.
+struct Carries(bool);
+
+impl<'de> serde::Deserialize<'de> for Carries {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(CarriesVisitor)
+    }
+}
+
+struct CarriesVisitor;
+
+impl<'de> serde::de::Visitor<'de> for CarriesVisitor {
+    type Value = Carries;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("any JSON value")
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Carries, A::Error> {
+        let mut any = false;
+        while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+            any = true;
+        }
+        Ok(Carries(any))
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<Carries, A::Error> {
+        serde::de::IgnoredAny.visit_map(map).map(|_| Carries(false))
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<Carries, E> {
+        Ok(Carries(false))
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<Carries, E> {
+        Ok(Carries(false))
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<Carries, E> {
+        Ok(Carries(false))
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<Carries, E> {
+        Ok(Carries(false))
+    }
+
+    fn visit_str<E>(self, _: &str) -> Result<Carries, E> {
+        Ok(Carries(false))
+    }
+
+    fn visit_unit<E>(self) -> Result<Carries, E> {
+        Ok(Carries(false))
+    }
 }

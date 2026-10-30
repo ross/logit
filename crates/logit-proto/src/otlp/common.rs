@@ -114,8 +114,9 @@ pub(crate) fn attrs_to_key_values(attrs: &AttrMap) -> Vec<pb::KeyValue> {
 }
 
 /// How many values [`attrs_to_key_values`] writes as a `DoubleValue` for a `Value::U64` above
-/// `i64::MAX` (the module doc's lossy cases), nested ones included, for the encoder to count.
-pub(crate) fn u64_as_double_count(attrs: &AttrMap) -> usize {
+/// `i64::MAX` (the module doc's lossy cases), nested ones included, for the encoder to count,
+/// and for a sink that builds OTLP requests itself, as `kafka_out` does.
+pub fn u64_as_double_count(attrs: &AttrMap) -> usize {
     fn count(value: &Value) -> usize {
         match value {
             Value::U64(u) => usize::from(*u > i64::MAX as u64),

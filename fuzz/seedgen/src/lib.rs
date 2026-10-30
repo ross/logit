@@ -1,6 +1,6 @@
 //! Builds the committed starting seeds under `fuzz/seeds/<target>/` from `testdata/interop/`,
-//! `testdata/differential/`'s decoder corpora, and encoder round trips, so every fuzz target starts from inputs its
-//! decoder accepts.
+//! `testdata/differential/`'s decoder corpora, encoder round trips, and constructed inputs, so
+//! every fuzz target starts from inputs its decoder accepts.
 //!
 //! A target that takes a selector byte gets it prepended, matching the target's own doc: the
 //! OTLP targets' signal (`0` logs, `1` metrics, `2` traces), `prom_decompress`'s encoding,
@@ -11,6 +11,8 @@
 //! rewrites the same bytes and leaves `git status` clean.
 
 use bytes::{Bytes, BytesMut};
+use kafka_protocol::protocol::StrBytes;
+use kafka_protocol::records::Compression as KafkaCompression;
 use logit_core::interner::intern;
 use logit_core::{
     AttrMap, DdSketch, Event, EventBatch, HyperLogLog, LogRecord, Mapping, MetricKind,
@@ -22,6 +24,7 @@ use logit_proto::collectd::{
 };
 use logit_proto::frame::{write_frame, write_frame_with_flags, Compression, FLAG_CONTROL};
 use logit_proto::graphite::pickle::write_datapoints;
+use logit_proto::kafka::batch::{encode as kafka_encode, ProducerRecord, Stamp};
 use logit_proto::native::control::{
     Ack, AckStatus, ControlMessage, Hello, HelloAck, Reject, ACK_REJECTED_DECODE_BUDGET,
 };
@@ -312,6 +315,14 @@ pub fn generate(testdata: &Path) -> std::io::Result<(Seeds, Vec<String>)> {
 
     for (name, bytes) in influxdb_line_seeds(testdata)? {
         add("influxdb_line", name, bytes);
+    }
+
+    for (name, bytes) in kafka_batch_seeds(testdata)? {
+        add("kafka_batch", name, bytes);
+    }
+
+    for (name, bytes) in msgpack_event_seeds()? {
+        add("msgpack_event", name, bytes);
     }
 
     for (target, seeds) in message_seeds() {
@@ -1392,6 +1403,227 @@ fn message_seeds() -> Vec<(&'static str, Vec<(&'static str, Vec<u8>)>)> {
     ]
 }
 
+/// The record batch codecs, each with the name `testdata/interop/kafka/batches/` gives it.
+const KAFKA_CODECS: [(KafkaCompression, &str); 5] = [
+    (KafkaCompression::None, "none"),
+    (KafkaCompression::Gzip, "gzip"),
+    (KafkaCompression::Snappy, "snappy"),
+    (KafkaCompression::Lz4, "lz4"),
+    (KafkaCompression::Zstd, "zstd"),
+];
+
+/// Records blobs for `kafka_batch`: each recorded segment under
+/// `testdata/interop/kafka/batches/` (one batch of three records from the Java client or kcat),
+/// all ten back to back as one blob, and that blob cut inside its last batch, as a broker cuts a
+/// Fetch answer. Then `logit_proto::kafka::batch::encode`'s batch per codec, of records with and
+/// without keys, values, and headers, under an idempotent stamp; and, uncompressed, one whose
+/// second record repeats a header name and one with a header name that isn't UTF-8, which the
+/// encoder can't write, so a header name is rewritten in place and the CRC-32C recomputed. Each
+/// must decode whole, and only the cut blob ends inside a batch.
+fn kafka_batch_seeds(testdata: &Path) -> std::io::Result<Vec<(String, Vec<u8>)>> {
+    let mut out = Vec::new();
+    let mut blob = Vec::new();
+    for producer in ["java", "kcat"] {
+        for (_, codec) in KAFKA_CODECS {
+            let name = format!("{producer}-{codec}");
+            let segment =
+                std::fs::read(testdata.join(format!("interop/kafka/batches/{name}.segment")))?;
+            blob.extend_from_slice(&segment);
+            out.push((format!("segment-{name}"), segment));
+        }
+    }
+    out.push(("segments-all".to_string(), blob.clone()));
+    blob.truncate(blob.len() - 10);
+    out.push(("segments-all-cut".to_string(), blob));
+
+    let header = |name: &'static str, value: Option<&'static [u8]>| {
+        (StrBytes::from_static_str(name), value.map(Bytes::from_static))
+    };
+    let records = [
+        ProducerRecord {
+            key: Some(Bytes::from_static(b"key-1")),
+            value: Some(Bytes::from_static(br#"{"msg":"first","n":1}"#)),
+            headers: [header("h1", Some(b"hv1")), header("h2", Some(b"hv2"))].into_iter().collect(),
+            timestamp: 1_800_000_000_000,
+        },
+        ProducerRecord {
+            key: None,
+            value: Some(Bytes::from_static(b"second\\nline")),
+            headers: [header("h1", Some(b"hv1")), header("h3", None)].into_iter().collect(),
+            timestamp: 1_800_000_000_250,
+        },
+        ProducerRecord {
+            key: Some(Bytes::new()),
+            value: None,
+            headers: Default::default(),
+            timestamp: 1_800_000_000_500,
+        },
+    ];
+    let stamp = Stamp { producer_id: 7, producer_epoch: 0, base_sequence: 42 };
+    for (codec, label) in KAFKA_CODECS {
+        let batch = kafka_encode(&records, stamp, codec)
+            .map_err(|e| std::io::Error::other(format!("encoding a {label} batch: {e}")))?;
+        out.push((format!("encoded-{label}"), batch.to_vec()));
+    }
+
+    let plain = kafka_encode(&records, Stamp::NONE, KafkaCompression::None)
+        .map_err(|e| std::io::Error::other(format!("encoding a batch: {e}")))?
+        .to_vec();
+    out.push(("encoded-none-unstamped".to_string(), plain.clone()));
+    for (label, from, to) in
+        [("repeated-header", b"h3", b"h1"), ("non-utf8-header", b"h3", b"\xff3")]
+    {
+        let mut batch = plain.clone();
+        let at = batch
+            .windows(2)
+            .rposition(|w| w == from)
+            .ok_or_else(|| std::io::Error::other("the encoded batch holds no header h3"))?;
+        batch[at..at + 2].copy_from_slice(to);
+        let crc = crc32c::crc32c(&batch[21..]);
+        batch[17..21].copy_from_slice(&crc.to_be_bytes());
+        out.push((format!("encoded-none-{label}"), batch));
+    }
+
+    for (name, bytes) in &out {
+        let decoded = logit_proto::kafka::decode(&Bytes::copy_from_slice(bytes), 1 << 20);
+        let whole = decoded.entries.iter().all(Result::is_ok);
+        let cut = decoded.partial_base.is_some();
+        if !whole || cut != name.ends_with("-cut") {
+            return Err(std::io::Error::other(format!("kafka_batch seed {name} doesn't decode")));
+        }
+    }
+    Ok(out)
+}
+
+/// `format: msgpack` values for `msgpack_event`, built from `format: json` lines in the grammar of
+/// `crates/logit-outputs/src/ndjson.rs`'s module doc and written in the value forms of
+/// `crates/logit-outputs/src/msgpack.rs`'s: a `b"..."` string is a `bin`, and a non-finite
+/// number's string is a float64. One seed per line and one of every line back to back, as a
+/// `record: batch` value holds them. Each must decode, so a line the grammar refuses fails
+/// `generate`.
+fn msgpack_event_seeds() -> std::io::Result<Vec<(String, Vec<u8>)>> {
+    const RESOURCE: &str = r#""resource":{"attributes":{"host.name":"web-1","service.name":"checkout"}},"scope":{"name":"checkout.lib","version":"1.2.0","attributes":{"library.language":"go"}}"#;
+    let lines = [
+        ("empty", r#"{"timestamp":"2027-01-15T08:00:00.000000000Z"}"#.to_string()),
+        (
+            "log",
+            format!(
+                r#"{{"timestamp":"2027-01-15T08:00:04.000000000Z","log":{{"severity":"warn","format":"raw","message":"queue depth high","trace_id":"4bf92f3577b34da6a3ce929d0e0e4703","span_id":"00f067aa0ba90203","trace_flags":1}},"attributes":{{"queue":"orders","depth":17,"ratio":0.75,"ok":true,"none":null,"tags":["a",2],"owner":{{"team":"payments"}}}},{RESOURCE}}}"#
+            ),
+        ),
+        (
+            "log-structured",
+            r#"{"timestamp":"2027-01-15T08:00:04.001000000Z","log":{"severity":"info","format":"structured","message":{"queue":"orders","depth":17}},"attributes":{"queue":"payments"}}"#.to_string(),
+        ),
+        (
+            "log-bytes",
+            r#"{"timestamp":"2027-01-15T08:00:04.002000000Z","log":{"severity":"info","format":"raw","message":"b\"caf\\xe9\""},"attributes":{"digest":"b\"abc\""},"types":{"/log/message":"bytes","/attributes/digest":"bytes"}}"#.to_string(),
+        ),
+        (
+            "gauge",
+            format!(
+                r#"{{"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{{"name":"cart.value","kind":"gauge","value":42.5,"unit":"USD"}},{{"name":"build.info","kind":"gauge","value":1}},{{"name":"temp","kind":"gauge","value":"NaN"}}],{RESOURCE}}}"#
+            ),
+        ),
+        (
+            "sum",
+            format!(
+                r#"{{"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{{"name":"orders.placed","kind":"sum","value":18446744073709551615,"temporality":"cumulative","monotonic":true,"unit":"{{order}}","start_timestamp":"2027-01-15T07:58:50.000000000Z","exemplars":[{{"timestamp":"2027-01-15T07:59:47.000000000Z","value":1,"trace_id":"5b8efff798038103d269b633813fc60c","span_id":"eee19b7ec3c1b174","trace_flags":0,"attributes":{{"customer.tier":"gold"}}}}]}}],"types":{{"/metrics/0/value":"u64"}},{RESOURCE}}}"#
+            ),
+        ),
+        (
+            "histogram",
+            format!(
+                r#"{{"timestamp":"2027-01-15T07:59:50.000000000Z","metrics":[{{"name":"queue.wait","kind":"histogram","temporality":"cumulative","buckets":[{{"bound":10.0,"count":3}},{{"bound":"inf","count":4}}],"sum":140.0,"unit":"ms"}},{{"name":"rpc.latency","kind":"summary","temporality":"cumulative","count":4,"sum":2.5,"quantiles":[{{"quantile":0.5,"value":0.4}},{{"quantile":0.99,"value":1.2}}]}}],{RESOURCE}}}"#
+            ),
+        ),
+        (
+            "span",
+            format!(
+                r#"{{"timestamp":"2027-01-15T08:00:05.000000000Z","span":{{"name":"GET /cart","trace_id":"4bf92f3577b34da6a3ce929d0e0e4703","span_id":"00f067aa0ba90203","parent_span_id":"00f067aa0ba90201","kind":"server","status":"error","status_message":"timeout","start":"2027-01-15T08:00:05.000000000Z","end":"2027-01-15T08:00:05.003000000Z","duration_ns":3000000,"events":[{{"name":"retry","timestamp":"2027-01-15T08:00:05.001000000Z","attributes":{{"attempt":2}}}}],"links":[{{"trace_id":"5b8efff798038103d269b633813fc60c","span_id":"eee19b7ec3c1b174","flags":1,"attributes":{{"link.kind":"follows"}}}}]}},"attributes":{{"http.route":"/cart","app.bytes":"b\"de\\xad\""}},"types":{{"/attributes/app.bytes":"bytes"}},{RESOURCE}}}"#
+            ),
+        ),
+    ];
+    let mut out = Vec::new();
+    let mut all = Vec::new();
+    for (name, line) in &lines {
+        let json: serde_json::Value = serde_json::from_str(line)
+            .map_err(|e| std::io::Error::other(format!("msgpack_event seed {name}: {e}")))?;
+        let mut w = logit_proto::msgpack::Writer::new();
+        write_msgpack(&mut w, &json);
+        let bytes = w.into_inner();
+        logit_proto::msgpack_event::MsgpackEventDecoder::new()
+            .decode_batches(&Bytes::copy_from_slice(&bytes))
+            .map_err(|e| std::io::Error::other(format!("msgpack_event seed {name}: {e}")))?;
+        all.extend_from_slice(&bytes);
+        out.push((name.to_string(), bytes));
+    }
+    out.push(("back-to-back".to_string(), all));
+    Ok(out)
+}
+
+/// `value` as MessagePack, in `kafka_out`'s value forms: a `b"..."` string's inner text (ASCII
+/// with `\xHH` escapes) is a `bin`, and `"NaN"`, `"inf"`, and `"-inf"` are float64s.
+fn write_msgpack(w: &mut logit_proto::msgpack::Writer, value: &serde_json::Value) {
+    use serde_json::Value as J;
+    match value {
+        J::Null => w.write_nil(),
+        J::Bool(b) => w.write_bool(*b),
+        J::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                w.write_i64(i);
+            } else if let Some(u) = n.as_u64() {
+                w.write_u64(u);
+            } else {
+                w.write_f64(n.as_f64().unwrap_or(f64::NAN));
+            }
+        }
+        J::String(s) => match s.as_str() {
+            "NaN" => w.write_f64(f64::NAN),
+            "inf" => w.write_f64(f64::INFINITY),
+            "-inf" => w.write_f64(f64::NEG_INFINITY),
+            _ => match s.strip_prefix("b\"").and_then(|r| r.strip_suffix('"')) {
+                Some(inner) => w.write_bin(&unescape_hex(inner)),
+                None => w.write_str(s),
+            },
+        },
+        J::Array(items) => {
+            w.write_array_len(items.len());
+            for item in items {
+                write_msgpack(w, item);
+            }
+        }
+        J::Object(map) => {
+            w.write_map_len(map.len());
+            for (key, item) in map {
+                w.write_str(key);
+                write_msgpack(w, item);
+            }
+        }
+    }
+}
+
+/// `text` with each `\xHH` as its byte.
+fn unescape_hex(text: &str) -> Vec<u8> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = bytes.get(i + 2..i + 4).and_then(|h| std::str::from_utf8(h).ok());
+        match (bytes[i], bytes.get(i + 1), hex.and_then(|h| u8::from_str_radix(h, 16).ok())) {
+            (b'\\', Some(b'x'), Some(byte)) => {
+                out.push(byte);
+                i += 4;
+            }
+            (b, _, _) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 fn prefixed(selector: u8, body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + body.len());
     out.push(selector);
@@ -1457,10 +1689,12 @@ mod tests {
                 "hll_bytes",
                 "http_auth",
                 "influxdb_line",
+                "kafka_batch",
                 "message_csv",
                 "message_json",
                 "message_kv",
                 "message_logfmt",
+                "msgpack_event",
                 "native_batch",
                 "native_control",
                 "native_frame",

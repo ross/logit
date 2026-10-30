@@ -1779,9 +1779,10 @@ pub(crate) enum SinkEncoder {
     /// the sink counts it.
     Splunk { encoder: logit_proto::splunk::SplunkEncoder, max_body_bytes: usize },
     /// `kafka_out`: one record value per [`logit_proto::MessageBuf`] entry, its key and timestamp
-    /// beside it, under `format`. The producer's batching, compression, and per-record size check
-    /// aren't run.
-    Kafka { encoder: logit_outputs::kafka::KafkaEncoder, format: RecordFormat },
+    /// beside it, under the sink's `settings`, written into one record batch per topic
+    /// (`logit_outputs::kafka::record_batches`). The producer's partitioning, request packing, and
+    /// per-record size check aren't run.
+    Kafka { encoder: logit_outputs::kafka::KafkaEncoder, settings: Box<KafkaSettings> },
     /// `datadog_trace_out`: one trace request and one stats request per batch, at `version`'s
     /// path, with the tracer headers the sink restores
     /// (`logit_outputs::datadog_trace::encode_requests`).
@@ -1900,9 +1901,13 @@ pub(crate) fn sink_encoder(
         },
         KafkaOut { .. } => {
             let settings = kafka_settings("transit", kind)?;
+            // A fresh gate is open, so the OTLP mapping counts every encode, as the sink's
+            // first encode of a batch does.
+            let gate = logit_core::CountGate::new();
             SinkEncoder::Kafka {
-                encoder: logit_outputs::kafka::encoder(&settings),
-                format: settings.format,
+                encoder: logit_outputs::kafka::encoder(&settings)
+                    .with_counters(telemetry, diag, &gate),
+                settings: Box::new(settings),
             }
         }
         DatadogTraceOut { version, .. } => SinkEncoder::DatadogTrace {

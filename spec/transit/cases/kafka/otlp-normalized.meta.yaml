@@ -1,0 +1,4 @@
+# Hand-written: events kafka_in reads from a `format: json` record that an OTLP format rewrites,
+# none of which an OTLP source's case holds: delta and cumulative histograms whose last bound is
+# finite, a log with an RFC 5424 `syslog.timestamp`, and a log with no trace beside a span.
+exercises: [format_json, carriers]

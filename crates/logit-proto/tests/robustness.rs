@@ -29,7 +29,8 @@
 //! the logfmt and csv quote scanners at a line's end, and the largest allocation each
 //! `message_*` fuzz target's worst 64 KiB message makes. The influxdb section runs
 //! `influxdb::InfluxDecoder` over truncations and bit flips of a Telegraf-shaped body and pins the
-//! largest allocation the worst 64 KiB body makes.
+//! largest allocation the worst 64 KiB body makes. The msgpack_event section pins the peak a nest
+//! of containers each declaring the input's length in entries reaches.
 //!
 //! For each decoder: every single-byte truncation of a valid input, thousands of seeded bit flips,
 //! length fields inflated past the input, and, for `decode_batch`, `Value` nesting past the depth
@@ -3954,4 +3955,34 @@ fn influx_worst_case_body_stays_under_the_fuzz_malloc_limit() {
         eprintln!("{name}: {} bytes, {events} events, peak {peak}, largest {largest}", body.len());
         assert!(largest < MALLOC_LIMIT, "{name}: largest allocation {largest}");
     }
+}
+
+// -- msgpack_event ----------------------------------------------------------------------------
+
+/// A nest of arrays each declaring as many entries as the input has bytes passes every level's
+/// count check. Each level reserving its declared count would hold `levels × count` tree nodes
+/// before the budget charged one; the reservation is capped per container, so the peak stays
+/// near what the innermost array's nodes take.
+#[test]
+fn a_msgpack_nest_of_inflated_counts_never_reserves_per_level() {
+    use logit_proto::msgpack::Writer;
+    use logit_proto::msgpack_event::MsgpackEventDecoder;
+    const LEVELS: usize = 120;
+    const COUNT: usize = 60_000;
+    let mut w = Writer::new();
+    w.write_map_len(1);
+    w.write_str("k");
+    for _ in 0..LEVELS {
+        w.write_array_len(COUNT);
+    }
+    for _ in 0..COUNT {
+        w.write_nil();
+    }
+    let bytes = Bytes::copy_from_slice(w.as_slice());
+    let mut got = None;
+    let peak = peak_live_bytes(|| got = Some(MsgpackEventDecoder::new().decode_batches(&bytes)));
+    let got = got.unwrap().expect_err("the outer arrays run out of input");
+    assert!(got.to_string().contains("truncated"), "{got}");
+    eprintln!("{} bytes, peak {peak}", bytes.len());
+    assert!(peak < 64 << 20, "peak {peak} for {} bytes", bytes.len());
 }
