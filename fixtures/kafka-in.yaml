@@ -14,7 +14,8 @@ components:
     brokers: ["kafka:9092"]
     topics: [logs]
     group: logit-fixture             # required; every member of one group shares the partitions
-    format: json                     # required: json | text | native, as kafka_out wrote them
+    format: json                     # required: json | text | msgpack | native, as kafka_out
+                                     # wrote them; kafka-in-otlp.yaml reads the OTLP formats
     start: earliest                  # read what was produced before the group's first run
     # record: event                  # format: text only; batch reads kafka_out's batch records
     # isolation: read_uncommitted    # the default; read_committed skips aborted transactions

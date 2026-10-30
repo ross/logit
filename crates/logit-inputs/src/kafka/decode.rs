@@ -6,21 +6,31 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use logit_core::interner::intern;
-use logit_core::{AttrMap, BodyFormat, Event, EventBatch, LogRecord, Resource, Symbol, Value};
+use logit_core::{
+    AttrMap, BodyFormat, Event, EventBatch, LogRecord, Resource, Symbol, Telemetry, Value,
+};
 use logit_proto::event_json::EventJsonDecoder;
 use logit_proto::frame::read_frame;
 use logit_proto::kafka::{Record, TimestampType};
+use logit_proto::msgpack_event::MsgpackEventDecoder;
 use logit_proto::native::{decode_batch, DecodeBudget, CODEC_BATCH};
+use logit_proto::otlp::OtlpDecoder;
+use logit_proto::{Signal, SignalDecoder};
 
 /// What a record's value holds. Mirrors the `format:` values `kafka_in` reads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KafkaInFormat {
     /// `logit`'s event JSON: one object, or NDJSON.
     Json,
+    /// The same objects as MessagePack maps, one or several back to back.
+    Msgpack,
     /// One log per value, or under `batch` one per escaped line.
     Text { batch: bool },
     /// One `CODEC_BATCH` frame.
     Native,
+    /// One OTLP export request, protobuf or (`json`) OTLP/JSON, of the signal its topic is
+    /// mapped to in `topics`.
+    Otlp { json: bool, topics: Vec<(String, Signal)> },
 }
 
 /// One record's outcome.
@@ -63,6 +73,8 @@ impl Keys {
 pub(crate) struct RecordDecoder {
     format: KafkaInFormat,
     json: EventJsonDecoder,
+    msgpack: MsgpackEventDecoder,
+    otlp: OtlpDecoder,
     /// `text`'s resource, one `Arc` for every record, so consecutive records' logs share a
     /// batch.
     empty: Arc<Resource>,
@@ -77,9 +89,16 @@ impl RecordDecoder {
         Self {
             format,
             json: EventJsonDecoder::new(),
+            msgpack: MsgpackEventDecoder::new(),
+            otlp: OtlpDecoder::new(),
             empty: Arc::new(Resource::default()),
             keys: Keys::new(),
         }
+    }
+
+    /// Counts what the OTLP mapping skips (`logit.input.metrics.skipped`) on `telemetry`.
+    pub(crate) fn set_telemetry(&mut self, telemetry: Telemetry) {
+        self.otlp = OtlpDecoder::new().with_telemetry(telemetry);
     }
 
     /// Decodes `record` of `topic`/`partition`. `now` is the read time, a `text` log's
@@ -94,16 +113,46 @@ impl RecordDecoder {
         let Some(value) = &record.value else {
             return (Decoded::Skipped("tombstone"), OmittedHeaders(0));
         };
-        let batches = match self.format {
+        let batches = match &self.format {
             KafkaInFormat::Json => match self.json.decode_batches(value) {
                 Ok(batches) => batches,
                 Err(e) => return (Decoded::Undecodable(e.to_string()), OmittedHeaders(0)),
             },
+            KafkaInFormat::Msgpack => match self.msgpack.decode_batches(value) {
+                Ok(batches) => batches,
+                Err(e) => return (Decoded::Undecodable(e.to_string()), OmittedHeaders(0)),
+            },
+            KafkaInFormat::Otlp { json, topics } => {
+                let Some(&(_, signal)) = topics.iter().find(|(t, _)| t == topic) else {
+                    let why = format!("topic {topic:?} is mapped to no signal");
+                    return (Decoded::Undecodable(why), OmittedHeaders(0));
+                };
+                let decoded = if *json {
+                    self.otlp.decode_signal_json(signal, value.clone())
+                } else {
+                    self.otlp.decode_signal(signal, value.clone())
+                };
+                match decoded {
+                    Ok(batches) => {
+                        if *json && batches.iter().all(|b| b.events.is_empty()) {
+                            if let Some(found) = other_otlp_json_signal(value, signal) {
+                                let why = format!(
+                                    "an OTLP/JSON {found} request on topic {topic:?}, mapped to {}",
+                                    signal_name(signal),
+                                );
+                                return (Decoded::Undecodable(why), OmittedHeaders(0));
+                            }
+                        }
+                        batches
+                    }
+                    Err(e) => return (Decoded::Undecodable(e.to_string()), OmittedHeaders(0)),
+                }
+            }
             KafkaInFormat::Native => match native(value) {
                 Ok(batch) => vec![batch],
                 Err(e) => return (Decoded::Undecodable(e), OmittedHeaders(0)),
             },
-            KafkaInFormat::Text { batch } => {
+            &KafkaInFormat::Text { batch } => {
                 let timestamp = match record.timestamp {
                     -1 => now,
                     ms => ms.saturating_mul(1_000_000),
@@ -227,4 +276,86 @@ fn native(value: &Bytes) -> Result<EventBatch, String> {
         return Err(format!("{} bytes after the frame", bytes.len()));
     }
     decode_batch(&mut payload, &DecodeBudget::default()).map_err(|e| e.to_string())
+}
+
+fn signal_name(signal: Signal) -> &'static str {
+    match signal {
+        Signal::Logs => "logs",
+        Signal::Metrics => "metrics",
+        Signal::Traces => "traces",
+    }
+}
+
+/// The signal of an OTLP/JSON request whose top-level resource list for another signal than
+/// `mapped` holds an entry, under either spelling `logit_proto`'s OTLP/JSON decoder reads
+/// (`resourceLogs` or `resource_logs`, and so on). OTLP/JSON ignores a field it doesn't know, so
+/// such a request decodes to nothing under the topic's signal; read as `empty` it would be
+/// committed past with no loss counted. An empty list carried nothing and stays `empty`. Called
+/// only for a request that decoded to no event.
+fn other_otlp_json_signal(value: &Bytes, mapped: Signal) -> Option<&'static str> {
+    let keys: std::collections::HashMap<String, Carries> = serde_json::from_slice(value).ok()?;
+    let carries = |key: &str| keys.get(key).is_some_and(|c| c.0);
+    [
+        ("resourceLogs", "resource_logs", Signal::Logs),
+        ("resourceMetrics", "resource_metrics", Signal::Metrics),
+        ("resourceSpans", "resource_spans", Signal::Traces),
+    ]
+    .into_iter()
+    .find(|&(camel, snake, signal)| signal != mapped && (carries(camel) || carries(snake)))
+    .map(|(_, _, signal)| signal_name(signal))
+}
+
+/// Whether a JSON value is an array with an entry; any other value reads `false`.
+struct Carries(bool);
+
+impl<'de> serde::Deserialize<'de> for Carries {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(CarriesVisitor)
+    }
+}
+
+struct CarriesVisitor;
+
+impl<'de> serde::de::Visitor<'de> for CarriesVisitor {
+    type Value = Carries;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("any JSON value")
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Carries, A::Error> {
+        let mut any = false;
+        while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+            any = true;
+        }
+        Ok(Carries(any))
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<Carries, A::Error> {
+        serde::de::IgnoredAny.visit_map(map).map(|_| Carries(false))
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<Carries, E> {
+        Ok(Carries(false))
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<Carries, E> {
+        Ok(Carries(false))
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<Carries, E> {
+        Ok(Carries(false))
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<Carries, E> {
+        Ok(Carries(false))
+    }
+
+    fn visit_str<E>(self, _: &str) -> Result<Carries, E> {
+        Ok(Carries(false))
+    }
+
+    fn visit_unit<E>(self) -> Result<Carries, E> {
+        Ok(Carries(false))
+    }
 }

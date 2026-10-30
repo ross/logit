@@ -1,0 +1,24 @@
+# OTLP from Kafka, one block per event out: `kafka_in` reading the per-signal topics
+# `fixtures/kafka-otlp.yaml` produces to on the dev stack's broker (`compose.yaml`'s `kafka`
+# service), one OTLP export request per record, as the OpenTelemetry Collector's Kafka exporter
+# writes them.
+#
+#   kafka:9092, topics otlp_logs, otlp_metrics, otlp_spans --> kafka_in --> stdio_out
+#
+# Start the broker, which `script/server` doesn't, run `fixtures/kafka-otlp.yaml` and send it OTLP
+# as its header says, then run this config in the dev container on the compose network. A topic
+# that doesn't exist yet logs a `topic_missing` warning until a metadata refresh finds it.
+components:
+  kafka:
+    type: kafka_in
+    brokers: ["kafka:9092"]
+    # Each signal on its own topic, the Collector's defaults: a request doesn't name its signal,
+    # so its topic does. A signal left out isn't read.
+    topics: {logs: otlp_logs, metrics: otlp_metrics, traces: otlp_spans}
+    group: logit-otlp-fixture
+    format: otlp_proto               # or otlp_json, matching the producer
+    start: earliest                  # read what was produced before the group's first run
+
+  out:
+    type: stdio_out
+    sources: [kafka]

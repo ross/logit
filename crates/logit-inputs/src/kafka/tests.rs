@@ -18,10 +18,12 @@ use logit_pipeline::test_util::{
     fanout_channel, recv_batch, recv_events, spawn_input, wait_until, TelemetryProbe, RECV_TIMEOUT,
 };
 use logit_pipeline::{Edge, Fanout};
+use logit_proto::event_json::EventJsonDecoder;
 use logit_proto::kafka::batch::ProducerRecord;
-use logit_proto::{FramedEncoder, MessageBuf};
+use logit_proto::{FramedEncoder, MessageBuf, Signal};
 use tokio::time::Instant;
 
+use super::decode::{Decoded, RecordDecoder};
 use super::{KafkaInFormat, KafkaInSettings, KafkaInput};
 
 const GROUP: &str = "g";
@@ -159,6 +161,8 @@ async fn every_format_under_each_record_mode_reads_back_what_kafka_out_wrote() {
     let cases = [
         (RecordFormat::Json, RecordMode::Event, KafkaInFormat::Json),
         (RecordFormat::Json, RecordMode::Batch, KafkaInFormat::Json),
+        (RecordFormat::Msgpack, RecordMode::Event, KafkaInFormat::Msgpack),
+        (RecordFormat::Msgpack, RecordMode::Batch, KafkaInFormat::Msgpack),
         (RecordFormat::Native, RecordMode::Event, KafkaInFormat::Native),
         (RecordFormat::Native, RecordMode::Batch, KafkaInFormat::Native),
         (RecordFormat::Text, RecordMode::Event, KafkaInFormat::Text { batch: false }),
@@ -170,7 +174,7 @@ async fn every_format_under_each_record_mode_reads_back_what_kafka_out_wrote() {
         produce(&cluster, &batch, out_format, mode);
         let probe = TelemetryProbe::new();
         let (sink, mut rx) = fanout_channel(16);
-        let running = spawn_input(input(&probe, settings(&cluster, in_format)), sink).await;
+        let running = spawn_input(input(&probe, settings(&cluster, in_format.clone())), sink).await;
         let got: Vec<Event> =
             recv_events(&mut rx, events.len()).await.into_iter().map(without_carriers).collect();
         running.stop().await;
@@ -573,4 +577,512 @@ async fn a_blocked_batch_keeps_its_place_ahead_of_a_later_sender() {
     assert_eq!(message(&recv_batch(&mut rx).await.events[0]), "other");
     assert!(later.await.unwrap());
     running.stop().await;
+}
+
+// ---- msgpack -----------------------------------------------------------------------------
+
+/// `batches` as the lossless `format: json` lines, one per event, resource and scope included.
+/// `kafka_out` leaves the `_logit.kafka.*` carriers out.
+fn render(batches: &[EventBatch]) -> Vec<String> {
+    let mut encoder =
+        KafkaEncoder::new(&RecordKey::None, RecordFormat::Json, RecordMode::Event, usize::MAX);
+    let mut out: MessageBuf<RecordMeta> = MessageBuf::default();
+    let mut lines = Vec::new();
+    for batch in batches {
+        encoder.encode_into(batch, &mut out);
+        lines.extend(out.iter_with().map(|(v, _)| String::from_utf8(v.to_vec()).expect("utf-8")));
+    }
+    lines
+}
+
+/// `value` as a record at `offset`.
+fn kafka_record(offset: i64, value: Bytes) -> logit_proto::kafka::Record {
+    logit_proto::kafka::Record {
+        offset,
+        timestamp: 1_000,
+        timestamp_type: logit_proto::kafka::TimestampType::CreateTime,
+        key: None,
+        value: Some(value),
+        headers: Vec::new(),
+    }
+}
+
+/// Every record's batches through a `RecordDecoder` of `format`, each record's on `topic_of` its
+/// meta, in record order.
+fn read_back(
+    format: KafkaInFormat,
+    records: &[(Bytes, RecordMeta)],
+    topic_of: impl Fn(&RecordMeta) -> &'static str,
+) -> Vec<EventBatch> {
+    let mut decoder = RecordDecoder::new(format);
+    let mut batches = Vec::new();
+    for (i, (value, meta)) in records.iter().enumerate() {
+        let record = kafka_record(i as i64, value.clone());
+        match decoder.decode(topic_of(meta), 0, &record, 0).0 {
+            Decoded::Batches(b) => batches.extend(b),
+            other => panic!("record {i}: {other:?}"),
+        }
+    }
+    batches
+}
+
+fn encode_records(
+    batch: &EventBatch,
+    key: &RecordKey,
+    format: RecordFormat,
+    mode: RecordMode,
+    budget: usize,
+) -> Vec<(Bytes, RecordMeta)> {
+    let mut encoder = KafkaEncoder::new(key, format, mode, budget);
+    let mut out: MessageBuf<RecordMeta> = MessageBuf::default();
+    encoder.encode_into(batch, &mut out);
+    out.iter_with().map(|(v, meta)| (Bytes::copy_from_slice(v), meta.clone())).collect()
+}
+
+/// Every transit case's events, one entry per case file, as `format: json` reads them.
+fn transit_cases(dirs: &[&str]) -> Vec<(String, Vec<EventBatch>)> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec/transit/cases");
+    let mut cases = Vec::new();
+    for dir in std::fs::read_dir(&root).expect("the transit cases") {
+        let dir = dir.unwrap().path();
+        let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+        if !dirs.is_empty() && !dirs.contains(&name.as_str()) {
+            continue;
+        }
+        let mut files: Vec<_> =
+            std::fs::read_dir(&dir).unwrap().map(|f| f.unwrap().path()).collect();
+        files.sort();
+        for file in files.into_iter().filter(|f| f.extension().is_some_and(|e| e == "json")) {
+            let bytes = std::fs::read(&file).unwrap();
+            let batches = EventJsonDecoder::new()
+                .decode_batches(&bytes)
+                .unwrap_or_else(|e| panic!("{}: {e}", file.display()));
+            cases.push((file.display().to_string(), batches));
+        }
+    }
+    cases
+}
+
+/// A batch the transit cases leave out: every `Value` variant nested, non-finite floats in a
+/// value and a metric, a `Bytes` message, and a span with its extension, events, and links.
+fn shapes_batch() -> EventBatch {
+    let mut attrs = AttrMap::new();
+    attrs.insert("v.bytes", Value::Bytes(Bytes::from_static(b"\xff\\\x00")));
+    attrs.insert("v.nan", Value::F64(f64::NAN));
+    attrs.insert("v.inf", Value::F64(f64::NEG_INFINITY));
+    attrs.insert("v.u64", Value::U64(u64::MAX));
+    attrs.insert("v.u64small", Value::U64(7));
+    attrs.insert("v.ts", Value::Timestamp(-1));
+    let mut inner = AttrMap::new();
+    inner
+        .insert("deep", Value::Array(vec![Value::Bytes(Bytes::from_static(b"\x01")), Value::Null]));
+    attrs.insert("v.nested", Value::Map(Box::new(inner)));
+    let mut log = log("x", &[]);
+    log.attributes = attrs;
+    log.log.as_mut().unwrap().message = Value::Bytes(Bytes::from_static(b"\xfe body"));
+    let mut metric = Event::empty(5, AttrMap::new());
+    metric.metrics.push(logit_core::MetricRecord::new(
+        logit_core::interner::intern("m.inf"),
+        logit_core::MetricKind::gauge(f64::INFINITY),
+    ));
+    let span = logit_core::SpanRecord {
+        trace_id: [0xab; 16],
+        span_id: [0xcd; 8],
+        parent_span_id: Some([0xef; 8]),
+        name: Value::Bytes(Bytes::from_static(b"\xff")),
+        kind: logit_core::SpanKind::Server,
+        status: logit_core::SpanStatus::Error,
+        events: vec![logit_core::SpanEvent {
+            timestamp: 1_200,
+            name: Value::str("retry"),
+            attributes: AttrMap::new(),
+            dropped_attributes_count: 4,
+        }],
+        links: vec![logit_core::SpanLink {
+            trace_id: [1; 16],
+            span_id: [2; 8],
+            attributes: AttrMap::new(),
+            flags: 1,
+            trace_state: Some(Bytes::from_static(b"a=b")),
+            dropped_attributes_count: 5,
+        }],
+        end_timestamp: 500,
+        flags: 0x301,
+        ext: Some(Box::new(logit_core::SpanExt {
+            status_message: Some(Bytes::from_static(b"boom\xfe")),
+            trace_state: None,
+            dropped_attributes_count: 1,
+            dropped_events_count: 0,
+            dropped_links_count: 0,
+        })),
+    };
+    let span = Event::span(1_000, AttrMap::new(), span);
+    let scope = logit_core::Scope {
+        name: Bytes::from_static(b"io.logit\xff"),
+        version: Bytes::from_static(b"1"),
+        attributes: AttrMap::new(),
+        dropped_attributes_count: 2,
+        schema_url: None,
+    };
+    EventBatch {
+        resource: Arc::new(Resource::default()),
+        scope: Some(Arc::new(scope)),
+        events: vec![log, metric, span],
+    }
+}
+
+/// Every transit case, and the shapes they leave out, through `kafka_out`'s `msgpack` under
+/// both `record:` modes and back through the reader, equal as their lossless JSON lines.
+#[test]
+fn msgpack_reads_back_every_transit_case_under_both_record_modes() {
+    let mut cases = transit_cases(&[]);
+    assert!(cases.len() > 50, "found {} case files", cases.len());
+    cases.push(("shapes".to_string(), vec![shapes_batch()]));
+    for (name, batches) in cases {
+        let want = render(&batches);
+        for mode in [RecordMode::Event, RecordMode::Batch] {
+            let mut got = Vec::new();
+            for batch in &batches {
+                let records =
+                    encode_records(batch, &RecordKey::None, RecordFormat::Msgpack, mode, 64 << 20);
+                got.extend(read_back(KafkaInFormat::Msgpack, &records, |_| "t"));
+            }
+            assert_eq!(render(&got), want, "{name} under {mode:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_msgpack_value_that_does_not_decode_is_dropped_and_committed_past() {
+    let cluster = cluster().await;
+    let ok = one_value(vec![log("ok", &[])], RecordFormat::Msgpack);
+    let truncated = ok.slice(..ok.len() - 1);
+    append(&cluster, &[Some(&truncated), Some(&ok)]);
+    let mut probe = TelemetryProbe::new();
+    let (sink, mut rx) = fanout_channel(16);
+    let running =
+        spawn_input(input(&probe, settings(&cluster, KafkaInFormat::Msgpack)), sink).await;
+    let got = recv_events(&mut rx, 1).await;
+    assert_eq!(message(&got[0]), "ok");
+    assert_eq!(attr(&got[0], "_logit.kafka.offset"), Some(&Value::I64(1)));
+    running.stop().await;
+    assert_eq!(probe.sum("logit.input.records.dropped", &[("reason", "undecodable")]), 1.0);
+    assert_eq!(committed(&cluster), Some(2));
+}
+
+// ---- OTLP --------------------------------------------------------------------------------
+
+const OTLP_TOPICS: [(&str, Signal); 3] =
+    [("logs", Signal::Logs), ("metrics", Signal::Metrics), ("spans", Signal::Traces)];
+
+fn otlp_format(json: bool) -> KafkaInFormat {
+    let topics = OTLP_TOPICS.iter().map(|&(t, s)| (t.to_string(), s)).collect();
+    KafkaInFormat::Otlp { json, topics }
+}
+
+fn topic_of(meta: &RecordMeta) -> &'static str {
+    let signal = meta.signal.expect("an OTLP record names its signal");
+    OTLP_TOPICS.iter().find(|(_, s)| *s == signal).unwrap().0
+}
+
+/// The OTLP transit cases through `kafka_out`'s `otlp_proto` and `otlp_json`, whole and split by
+/// `key: trace_id` and by a small `max_request_bytes`, and back through the reader: every split
+/// reads back the events the whole request does, each signal from its own topic.
+#[test]
+fn otlp_reads_back_kafka_outs_requests_whole_and_split() {
+    let mut split = [[false; 2]; 2];
+    for (name, mut batches) in transit_cases(&["otlp", "otlp-logs", "otlp-traces"]) {
+        // The OTLP encoder stamps an unset observed time with the clock, so each encode would
+        // differ.
+        for event in batches.iter_mut().flat_map(|b| &mut b.events) {
+            if let Some(log) = &mut event.log {
+                log.observed_timestamp = log.observed_timestamp.max(1);
+            }
+        }
+        for (j, (out_format, json)) in
+            [(RecordFormat::OtlpProto, false), (RecordFormat::OtlpJson, true)]
+                .into_iter()
+                .enumerate()
+        {
+            let read = |key: RecordKey, budget: usize| {
+                let mut lines = Vec::new();
+                let mut records = 0;
+                for batch in &batches {
+                    let r = encode_records(batch, &key, out_format, RecordMode::Request, budget);
+                    records += r.len();
+                    lines.extend(render(&read_back(otlp_format(json), &r, topic_of)));
+                }
+                lines.sort();
+                (lines, records)
+            };
+            let (want, whole) = read(RecordKey::None, usize::MAX);
+            assert!(!want.is_empty(), "{name}");
+            // The largest request of one event, plus a trace id key: every event fits alone,
+            // and a request of several splits.
+            let one = batches
+                .iter()
+                .flat_map(|b| {
+                    b.events.iter().map(|e| EventBatch {
+                        resource: b.resource.clone(),
+                        scope: b.scope.clone(),
+                        events: vec![e.clone()],
+                    })
+                })
+                .flat_map(|b| {
+                    let r = encode_records(
+                        &b,
+                        &RecordKey::None,
+                        out_format,
+                        RecordMode::Request,
+                        usize::MAX,
+                    );
+                    r.into_iter().map(|(v, _)| v.len())
+                })
+                .max()
+                .unwrap();
+            let splits = [(RecordKey::TraceId, usize::MAX), (RecordKey::None, one + 32)];
+            for (k, (key, budget)) in splits.into_iter().enumerate() {
+                let (got, records) = read(key.clone(), budget);
+                split[k][j] |= records > whole;
+                assert_eq!(got, want, "{name} as {out_format:?} under {key:?} and {budget}");
+            }
+        }
+    }
+    assert_eq!(split, [[true; 2]; 2], "some request split by trace id, and some by size");
+}
+
+/// A cluster with the three OTLP topics, one partition each.
+async fn otlp_cluster() -> FakeCluster {
+    let cluster = FakeCluster::start(1).await;
+    for (topic, _) in OTLP_TOPICS {
+        cluster.state().add_topic(topic, &[0]);
+    }
+    cluster
+}
+
+fn otlp_settings(cluster: &FakeCluster, json: bool) -> KafkaInSettings {
+    let mut s = settings(cluster, otlp_format(json));
+    s.consumer.topics = OTLP_TOPICS.iter().map(|(t, _)| t.to_string()).collect();
+    s
+}
+
+fn committed_on(cluster: &FakeCluster, topic: &str) -> Option<i64> {
+    cluster.state().groups.get(GROUP)?.committed.get(&(topic.to_string(), 0)).copied()
+}
+
+/// A log-only batch whose resource names `host`.
+fn host_batch(host: &str) -> EventBatch {
+    let mut resource = Resource::default();
+    resource.attributes.insert("host.name", Value::str(host));
+    EventBatch { resource: Arc::new(resource), scope: None, events: vec![log(host, &[])] }
+}
+
+/// One `otlp_proto` logs request with a resource per host: protobuf concatenates repeated
+/// fields, so two requests back to back are one request holding both.
+fn multi_resource_request(hosts: &[&str]) -> Bytes {
+    let mut value = Vec::new();
+    for host in hosts {
+        let records = encode_records(
+            &host_batch(host),
+            &RecordKey::None,
+            RecordFormat::OtlpProto,
+            RecordMode::Request,
+            usize::MAX,
+        );
+        value.extend_from_slice(&records[0].0);
+    }
+    Bytes::from(value)
+}
+
+fn host(batch: &EventBatch) -> Value {
+    batch.resource.attributes.get("host.name").cloned().expect("a host")
+}
+
+#[tokio::test]
+async fn each_signal_reads_from_its_own_topic_through_the_input() {
+    for json in [false, true] {
+        let cluster = otlp_cluster().await;
+        let batch = &transit_cases(&["otlp-traces"])
+            .into_iter()
+            .find(|(n, _)| n.ends_with("beside.json"))
+            .expect("the beside case")
+            .1[0];
+        let format = if json { RecordFormat::OtlpJson } else { RecordFormat::OtlpProto };
+        let records = encode_records(batch, &RecordKey::None, format, RecordMode::Request, 1 << 20);
+        let want = render(&read_back(otlp_format(json), &records, topic_of));
+        for (value, meta) in &records {
+            let record = ProducerRecord {
+                key: None,
+                value: Some(value.clone()),
+                headers: Default::default(),
+                timestamp: 1_000,
+            };
+            cluster.state().append(topic_of(meta), 0, &[record], Compression::None);
+        }
+        let probe = TelemetryProbe::new();
+        let (sink, mut rx) = fanout_channel(16);
+        let running = spawn_input(input(&probe, otlp_settings(&cluster, json)), sink).await;
+        let mut got = Vec::new();
+        while got.len() < want.len() {
+            got.extend(render(&[recv_batch(&mut rx).await]));
+        }
+        running.stop().await;
+        for topic in ["logs", "metrics", "spans"] {
+            assert_eq!(committed_on(&cluster, topic), Some(1), "{topic}");
+        }
+        got.sort();
+        let mut want = want;
+        want.sort();
+        assert_eq!(got, want, "json: {json}");
+    }
+}
+
+/// A request of two resources is two batches, and its record is marked only after the second
+/// is accepted: a revoke that defers the second reads the whole record again, the first batch
+/// included.
+#[tokio::test]
+async fn a_multi_resource_request_is_marked_only_after_its_last_batch() {
+    let cluster = otlp_cluster().await;
+    let value = multi_resource_request(&["a", "b"]);
+    let record = ProducerRecord {
+        key: None,
+        value: Some(value),
+        headers: Default::default(),
+        timestamp: 1_000,
+    };
+    cluster.state().append("logs", 0, &[record], Compression::None);
+    let mut probe = TelemetryProbe::new();
+    let mut s = otlp_settings(&cluster, false);
+    s.drain_timeout = Duration::from_millis(200);
+    // A channel of one: `a` fills it, and `b` waits for room the test doesn't give.
+    let (sink, mut rx) = fanout_channel(1);
+    let running = spawn_input(input(&probe, s), sink).await;
+    wait_until("a delivered", || rx.len() == 1).await;
+    cluster.script(Step::api(ApiKey::Heartbeat, Action::Error(code::REBALANCE_IN_PROGRESS)));
+    probe.wait_for("b deferred", |t| t.sum("logit.input.batches.deferred", &[]) >= 1.0).await;
+    let hosts: Vec<Value> =
+        [recv_batch(&mut rx).await, recv_batch(&mut rx).await, recv_batch(&mut rx).await]
+            .iter()
+            .map(host)
+            .collect();
+    assert_eq!(hosts, [Value::str("a"), Value::str("a"), Value::str("b")]);
+    running.stop().await;
+    assert_eq!(committed_on(&cluster, "logs"), Some(1));
+}
+
+#[tokio::test]
+async fn an_otlp_request_on_another_signals_topic_is_undecodable() {
+    let cluster = otlp_cluster().await;
+    let logs = multi_resource_request(&["a"]);
+    let on = |topic: &str, value: &Bytes| {
+        let record = ProducerRecord {
+            key: None,
+            value: Some(value.clone()),
+            headers: Default::default(),
+            timestamp: 1_000,
+        };
+        cluster.state().append(topic, 0, &[record], Compression::None);
+    };
+    on("metrics", &logs);
+    on("logs", &logs);
+    let mut probe = TelemetryProbe::new();
+    let (sink, mut rx) = fanout_channel(16);
+    let running = spawn_input(input(&probe, otlp_settings(&cluster, false)), sink).await;
+    let got = recv_batch(&mut rx).await;
+    assert_eq!(host(&got), Value::str("a"));
+    probe
+        .wait_for("the mismatch dropped", |t| {
+            t.sum("logit.input.records.dropped", &[("reason", "undecodable")]) >= 1.0
+        })
+        .await;
+    running.stop().await;
+    assert_eq!(probe.sum("logit.input.records.dropped", &[("reason", "undecodable")]), 1.0);
+    assert_eq!(committed_on(&cluster, "metrics"), Some(1));
+    assert_eq!(committed_on(&cluster, "logs"), Some(1));
+}
+
+#[tokio::test]
+async fn an_otlp_request_with_no_records_is_skipped_empty() {
+    let cluster = otlp_cluster().await;
+    // An empty `LogsData` is zero bytes in protobuf and `{}` in OTLP/JSON.
+    let record = |value: &'static [u8]| ProducerRecord {
+        key: None,
+        value: Some(Bytes::from_static(value)),
+        headers: Default::default(),
+        timestamp: 1_000,
+    };
+    for json in [false, true] {
+        let value: &'static [u8] = if json { b"{}" } else { b"" };
+        cluster.state().append("logs", 0, &[record(value)], Compression::None);
+        let mut probe = TelemetryProbe::new();
+        let (sink, _rx) = fanout_channel(16);
+        let running = spawn_input(input(&probe, otlp_settings(&cluster, json)), sink).await;
+        probe
+            .wait_for("skipped", |t| {
+                t.sum("logit.input.records.skipped", &[("reason", "empty")]) >= 1.0
+            })
+            .await;
+        running.stop().await;
+        let offset = if json { 2 } else { 1 };
+        assert_eq!(committed_on(&cluster, "logs"), Some(offset), "json: {json}");
+    }
+}
+
+/// The OTLP codec's own counts reach `kafka_in`'s telemetry: a metric with no data is skipped
+/// and counted, as on `otlp_in`, and its request, left with no event, is `empty`.
+#[tokio::test]
+async fn the_otlp_codecs_skips_are_counted_through_the_input() {
+    let cluster = otlp_cluster().await;
+    let value = br#"{"resourceMetrics":[{"scopeMetrics":[{"metrics":[{"name":"m"}]}]}]}"#;
+    let record = ProducerRecord {
+        key: None,
+        value: Some(Bytes::from_static(value)),
+        headers: Default::default(),
+        timestamp: 1_000,
+    };
+    cluster.state().append("metrics", 0, &[record], Compression::None);
+    let mut probe = TelemetryProbe::new();
+    let (sink, _rx) = fanout_channel(16);
+    let running = spawn_input(input(&probe, otlp_settings(&cluster, true)), sink).await;
+    probe
+        .wait_for("the request skipped", |t| {
+            t.sum("logit.input.records.skipped", &[("reason", "empty")]) >= 1.0
+        })
+        .await;
+    running.stop().await;
+    let no_data = [("metric_kind", "unknown"), ("reason", "no_data")];
+    assert_eq!(probe.sum("logit.input.metrics.skipped", &no_data), 1.0);
+}
+
+/// OTLP/JSON ignores a field it doesn't know, so a logs request read as metrics decodes to no
+/// event; its top-level key makes it undecodable, as `otlp_proto` reads it, not `empty`.
+#[test]
+fn an_otlp_json_request_on_another_signals_topic_is_undecodable() {
+    let records = encode_records(
+        &host_batch("a"),
+        &RecordKey::None,
+        RecordFormat::OtlpJson,
+        RecordMode::Request,
+        usize::MAX,
+    );
+    let mut decoder = RecordDecoder::new(otlp_format(true));
+    let (decoded, _) = decoder.decode("metrics", 0, &kafka_record(0, records[0].0.clone()), 0);
+    let Decoded::Undecodable(why) = decoded else { panic!("{decoded:?}") };
+    assert!(why.contains("logs request on topic \"metrics\", mapped to metrics"), "{why}");
+    let (decoded, _) = decoder.decode("logs", 0, &kafka_record(1, records[0].0.clone()), 0);
+    assert!(matches!(decoded, Decoded::Batches(_)), "{decoded:?}");
+    // The decoder reads the snake_case spelling too, so it's another signal's request as well.
+    let snake =
+        std::str::from_utf8(&records[0].0).unwrap().replace("resourceLogs", "resource_logs");
+    let (decoded, _) = decoder.decode("logs", 0, &kafka_record(2, Bytes::from(snake.clone())), 0);
+    assert!(matches!(decoded, Decoded::Batches(_)), "snake_case reads as logs: {decoded:?}");
+    let (decoded, _) = decoder.decode("metrics", 0, &kafka_record(3, Bytes::from(snake)), 0);
+    let Decoded::Undecodable(why) = decoded else { panic!("snake_case: {decoded:?}") };
+    assert!(why.contains("logs request"), "{why}");
+    // An empty list carried nothing.
+    for empty in [&br#"{"resourceLogs":[]}"#[..], br#"{"resource_logs":[]}"#] {
+        let record = kafka_record(4, Bytes::from_static(empty));
+        let (decoded, _) = decoder.decode("metrics", 0, &record, 0);
+        assert!(matches!(decoded, Decoded::Skipped("empty")), "{decoded:?}");
+    }
 }

@@ -106,7 +106,7 @@ pub struct KafkaInput {
 
 impl KafkaInput {
     pub fn new(settings: KafkaInSettings) -> Self {
-        let decoder = RecordDecoder::new(settings.format);
+        let decoder = RecordDecoder::new(settings.format.clone());
         Self {
             settings,
             telemetry: Telemetry::default(),
@@ -117,6 +117,7 @@ impl KafkaInput {
     }
 
     pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
+        self.decoder.set_telemetry(telemetry.clone());
         self.telemetry = telemetry;
         self
     }

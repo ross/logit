@@ -4163,9 +4163,8 @@ accepted, `logit.output.records.dropped{reason}`, `logit.output.records.unkeyed`
 
 `kafka_in` reads Kafka topics as a member of a consumer group, with the Java consumer's group
 protocol and defaults, and sends each record downstream as events. It reads what `kafka_out`
-writes under `format: json`, `text`, and `native`; `msgpack`, `otlp_proto`, and `otlp_json` pass
-`logit validate` but `logit run` refuses them at startup, since `kafka_in` doesn't read them yet.
-Like `kafka_out`, it speaks the protocol from Kafka 2.4 on.
+writes under each of its formats: `json`, `text`, `msgpack`, `native`, `otlp_proto`, and
+`otlp_json`. Like `kafka_out`, it speaks the protocol from Kafka 2.4 on.
 [`fixtures/kafka-in.yaml`](../fixtures/kafka-in.yaml) reads back what
 [`fixtures/kafka-out.yaml`](../fixtures/kafka-out.yaml) produces.
 
@@ -4176,7 +4175,7 @@ components:
     brokers: ["kafka-1:9092", "kafka-2:9092"]
     topics: [logs]
     group: logit-logs          # required; every member of one group shares the partitions
-    format: json               # required: json | text | native
+    format: json               # required: json | text | msgpack | native | otlp_proto | otlp_json
     # record: event            # format: text only; batch reads kafka_out's text batch records
     # start: latest            # where a partition with no committed offset starts; earliest
     # isolation: read_uncommitted  # read_committed skips aborted transactions
@@ -4219,6 +4218,33 @@ components:
 
 `format: json` reads only `logit`'s own event objects, the ones `stdio_out`'s `format: json`
 writes, and drops anything else as `logit.input.records.dropped{reason="undecodable"}`.
+`format: msgpack` reads the same objects as `kafka_out` writes them in MessagePack.
+
+**OTLP from the Collector's Kafka exporter.** The OpenTelemetry Collector's `kafkaexporter`
+writes one OTLP export request per record, each signal to its own topic: `otlp_spans`,
+`otlp_metrics`, and `otlp_logs` by default. `kafka_out` under `format: otlp_proto` or
+`otlp_json` writes the same. Under either format, `kafka_in` takes `topics:` as a map from signal
+to topic and decodes each record as its topic's signal:
+
+```yaml
+components:
+  collector:
+    type: kafka_in
+    brokers: ["kafka:9092"]
+    topics: {logs: otlp_logs, metrics: otlp_metrics, traces: otlp_spans}
+    group: logit-otlp
+    format: otlp_proto     # or otlp_json, for an exporter set to `encoding: otlp_json`
+```
+
+Give each signal its own topic. A protobuf request doesn't name its signal, and the exporter
+writes no `otelcol.signal` header by default, so the topic is the only signal there is: two
+signals on one topic fail `logit validate`. A request read as the wrong signal, such as a logs
+request on the topic mapped to `metrics`, is dropped and counted
+`logit.input.records.dropped{reason="undecodable"}`. A signal left out of the map isn't read. A
+request holding several resources is delivered as one batch per resource, and its record is
+committed once every one of them is accepted.
+[`fixtures/kafka-in-otlp.yaml`](../fixtures/kafka-in-otlp.yaml) reads what
+[`fixtures/kafka-otlp.yaml`](../fixtures/kafka-otlp.yaml) produces.
 
 **What a commit means, and what a crash costs.** `kafka_in` commits a partition's offset only
 once every record before it is in a batch every downstream component accepted into its inbox. It

@@ -319,7 +319,7 @@ soak harness share no file, and neither changes `kafka_in`.
 | W1 | `kin/w1` | `kin/w1: the logit-kafka crate, shared by kafka_out and kafka_in` | M | W0, the `s3` stream's `logit-aws` PR | open |
 | W2 | `kin/w2` | `kin/w2: the consumer core: group membership, assignors, offsets, and fetch` | L | W1 | open |
 | W3 | `kin/w3` | `kin/w3: kafka_in, with json, text, and native, and kafka_out's text batch escape` | L | W2 | open |
-| W4 | `kin/w4` | `kin/w4: kafka_in's msgpack and OTLP formats` | M | W3 | not started |
+| W4 | `kin/w4` | `kin/w4: kafka_in's msgpack and OTLP formats` | M | W3 | open |
 | W5 | `kin/w5` | `kin/w5: kafka_in in the transit spec, the eleventh lossless pair, and fuzz targets` | M | W4 | not started |
 | W6a | `kin/w6a` | `kin/w6a: kafka_in interop legs on Apache Kafka and Redpanda` | M | W5 | not started |
 | W6b | `kin/w6b` | `kin/w6b: the kafka-consume-broker-restart soak scenario` | M | W5 | not started |
@@ -353,8 +353,7 @@ Recorded per workstream as each lands.
 - **W3**: The input decodes a whole `Fetched`, then cuts it by `receive.batch_max_events` and
   `batch_max_bytes` (record value bytes, a record never split), so every record's outcome is
   counted before any batch goes out. To offer a batch again after a send slice,
-  `logit_pipeline::SendTimeout` now hands the batch back. The W4 formats are refused in
-  `logit-cli`'s registry when `logit run` builds the node, so `logit validate` accepts every
+  `logit_pipeline::SendTimeout` now hands the batch back. `logit validate` accepts every
   schema value. At shutdown the batch in flight waits the lesser of `drain_timeout` and half of
   `receive.shutdown_grace`, leaving the other half for the commit and LeaveGroup. The batches
   behind a `closed_consumer` drop count `batches.deferred`, since nothing past the dropped one is
@@ -364,4 +363,18 @@ Recorded per workstream as each lands.
   `max_batch_bytes` by Fetch's `i32` `max_bytes` field, not by the connection's 64 MiB response
   cap. A repeated header name can't come from `kafka-protocol`'s producer types, so the carrier
   tests hand-build a record batch.
-
+- **W4**: `logit_proto::msgpack::Reader` already read every format the grammar uses, so it
+  gained nothing; the bounds live in `logit_proto::msgpack_event`. `event_json` now parses a line
+  into a tree of its own (`event_tree::Node`) rather than `serde_json::Value`, so one walk reads
+  both formats and keeps a `bin` and a non-finite float apart. A MessagePack input's trees are
+  charged to the default 256 MiB `DecodeBudget`, which JSON has no equivalent of. `logit_proto::otlp`
+  has no decode budget to reuse: `otlp_in`'s one bound is its 4 MiB cap on an HTTP body, so an
+  OTLP record is bounded by `max_batch_bytes` alone. A request's batches needed no change to the
+  input: a record's batches always fall in one cut, which is marked after its last batch. A logs
+  request on the metrics topic is `undecodable` under both encodings. OTLP/JSON ignores a field it
+  doesn't know, so under `otlp_json` such a request decodes to no event, and the input reads its
+  top-level `resourceLogs`, `resourceMetrics`, or `resourceSpans` list, or the snake_case
+  `resource_logs`, `resource_metrics`, or `resource_spans` the decoder also reads, to tell it from
+  an empty request. A list with no entry carried nothing, and the request stays `empty`. `kafka_out` never writes a request of
+  several resources, so the test builds one by concatenating two protobuf requests. The OTLP
+  encoder stamps a log with no observed time with the clock, so the split round trip sets one.

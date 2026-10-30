@@ -32,8 +32,8 @@
 //! | Outcome | Counted | Committed | Test |
 //! |---|---|---|---|
 //! | A record with a null value (a tombstone) | `logit.input.records.skipped{reason="tombstone"}` | yes | `a_tombstone_an_empty_value_and_an_undecodable_one_are_counted_and_committed_past` |
-//! | A `json` or `native` value that decodes to no event | `logit.input.records.skipped{reason="empty"}` | yes | same |
-//! | A value that doesn't decode in `format:` | `logit.input.records.dropped{reason="undecodable"}`, diagnostic `records_dropped` naming topic, partition, and offset | yes | same |
+//! | A `json`, `msgpack`, or `native` value, or an OTLP request, that decodes to no event | `logit.input.records.skipped{reason="empty"}` | yes | same, and `an_otlp_request_with_no_records_is_skipped_empty` |
+//! | A value that doesn't decode in `format:`, an OTLP request of another signal than its topic's included (an `otlp_json` one decodes to no event, since OTLP/JSON ignores a field it doesn't know, and is found by a non-empty top-level `resourceLogs`, `resourceMetrics`, or `resourceSpans` list, or its snake_case `resource_logs`, `resource_metrics`, or `resource_spans` spelling) | `logit.input.records.dropped{reason="undecodable"}`, diagnostic `records_dropped` naming topic, partition, and offset | yes | same, `a_msgpack_value_that_does_not_decode_is_dropped_and_committed_past`, `an_otlp_request_on_another_signals_topic_is_undecodable`, and `an_otlp_json_request_on_another_signals_topic_is_undecodable` |
 //! | A header whose name isn't UTF-8 | `logit.input.headers.omitted{reason="invalid_name"}`; the record is delivered without it | with the record | `a_header_name_that_is_not_utf8_is_omitted_and_counted` |
 //! | A batch not accepted by the drain deadline of a revoke or shutdown | `logit.input.batches.deferred`, with every batch behind it | no | `a_revoke_whose_drain_deadline_passes_defers_and_commits_nothing_past_it` |
 //! | A batch no consumer took | `logit.input.batches.dropped{reason="closed_consumer"}`, the batches behind it `batches.deferred`, diagnostic `closed_consumer`; the input commits, leaves the group, and ends | no | `a_closed_consumer_stops_commits_the_batch_before_and_leaves` |
@@ -43,12 +43,20 @@
 //!
 //! # Formats and carriers
 //!
-//! `json` reads `logit_proto::event_json`'s objects, one or several as lines; `native` one
-//! `CODEC_BATCH` frame filling the value, under the default per-frame decode budget; `text` the
-//! value as one log, or under `record: batch` one log per line through
-//! `logit_proto::kafka::text::unescape_lines`, with the record's timestamp (the read time when
-//! it has none), no severity, the `raw` body format, and an empty resource. `msgpack`,
-//! `otlp_proto`, and `otlp_json` are refused at startup by `logit-cli`'s registry.
+//! `json` reads `logit_proto::event_json`'s objects, one or several as lines; `msgpack` the same
+//! objects as maps, one or several back to back, through `logit_proto::msgpack_event` under its
+//! default bounds; `native` one `CODEC_BATCH` frame filling the value, under the default
+//! per-frame decode budget; `text` the value as one log, or under `record: batch` one log per
+//! line through `logit_proto::kafka::text::unescape_lines`, with the record's timestamp (the
+//! read time when it has none), no severity, the `raw` body format, and an empty resource.
+//!
+//! `otlp_proto` and `otlp_json` read one export request per value, through
+//! `logit_proto::otlp::OtlpDecoder`'s `decode_signal` or `decode_signal_json` for the signal
+//! the record's topic maps to in `topics:`. A request is one batch per resource and scope, and a
+//! record's batches all fall in one cut, so the record is marked accepted only after its last
+//! batch is; a batch deferred at a revoke leaves the whole record uncommitted, to be read again.
+//! The mapping's own skips count `logit.input.metrics.skipped` as on `otlp_in`. No size cap
+//! applies beyond `max_batch_bytes`: `otlp_in`'s 4 MiB is a cap on an HTTP body it reads.
 //!
 //! Every event of a record carries the record's metadata as private attributes:
 //!
