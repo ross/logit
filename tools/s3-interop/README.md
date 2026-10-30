@@ -111,10 +111,10 @@ project has containers, and prints the `down` command for a stack a crashed run 
 
 ## Recorded run
 
-2026-10-30, local mode, `s3_out` at `bd09253f` (the `s3/w3a` branch) with this harness, against
+2026-10-30, local mode, `s3_out` at `20ed4753` (the `s3/w3a` branch) with this harness, against
 MinIO `RELEASE.2026-08-04T00-00-00Z` and Ceph 19.2.0 (squid), 17 of 18 rows `PASS`, one `GAP`, no
 `FAIL`, and no `s3_out` bug. The run directory is
-`perf/results/s3-interop/20261030T182019Z/`.
+`perf/results/s3-interop/20261030T184002Z/`.
 
 | Leg | MinIO | Ceph RGW |
 |---|---|---|
@@ -123,9 +123,9 @@ MinIO `RELEASE.2026-08-04T00-00-00Z` and Ceph 19.2.0 (squid), 17 of 18 rows `PAS
 | json, no compression | `PASS` | `PASS` |
 | native format, replayed | `PASS`: 1000 events back through `replay_in` | `PASS`, the same |
 | virtual-hosted addressing | `PASS`: 500 events | `PASS`, the same |
-| SSE-S3 header | `PASS`: `ServerSideEncryption` reads `AES256` | `GAP`: `400 InvalidRequest`, empty message, 76 `4xx` attempts held; the AWS CLI's `PutObject` with the header fails too |
+| SSE-S3 header | `PASS`: `ServerSideEncryption` reads `AES256` | `GAP`: `400 InvalidRequest`, empty message, 74 `4xx` attempts held; the AWS CLI's `PutObject` with the header fails too |
 | refused credentials | `PASS`: 14 `4xx`, `retrying` 1, no drop; 400 events after the restart | `PASS`: 29 `4xx`, the same |
-| missing bucket | `PASS`: 14 `4xx`, `retrying` 1, no drop; 200 events once created | `PASS`: 29 `4xx`, the same |
+| missing bucket | `PASS`: 13 `4xx`, `retrying` 1, no drop; 200 events once created | `PASS`: 29 `4xx`, the same |
 | process exits | `PASS` | `PASS` |
 
 What the run showed:
@@ -140,9 +140,11 @@ What the run showed:
 - **The `creds` restart exercises the spool.** The second process generates its own 200 events
   (`run: run2`); the first run's 200 (`run: run1`) come out of `buffer.disk:`, so each run's
   `seq` set is checked separately.
-- **Negative controls.** Setting the `vhost` leg to `path_style: true` fails its row (the sink dials
-  `vhminio`, which doesn't resolve), and setting the `zstd` leg to `compression: none` fails its
-  row (the key's extension and `Content-Type` are `.ndjson`).
+- **Negative controls.** Setting the `vhost` leg to `path_style: true` fails its row on both stores
+  (26 and 32 `connect_error` attempts: the sink dials a name that doesn't resolve), and setting the
+  `zstd` leg to `compression: none` fails its row (the key ends `.ndjson`, not `.ndjson.zst`).
+  Before `rgw` lost its `hostname:`, the Ceph `vhost` row passed under `path_style: true`, because
+  Docker's DNS resolved the bare name; the control caught that.
 - **Ceph needed its address.** RGW treats any `Host` that is neither its DNS name nor an address as
   a bucket name, so the path-style legs dial the container's address.
 

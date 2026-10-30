@@ -10,7 +10,7 @@
 #
 # MinIO's `MINIO_DOMAIN` (`vhminio`) and Ceph's `rgw dns name` (`ceph`) make each store answer
 # virtual-hosted requests for `logit-test.vhminio` and `logit-test.ceph`. The network aliases
-# resolve exactly those two names to the store, so `vhminio` and `ceph` alone resolve to nothing:
+# resolve only those two names to the store, so `vhminio` and `ceph` alone resolve to nothing:
 # a virtual-hosted leg with `endpoint: http://vhminio:9000` only connects if the sink prefixes the
 # bucket to the host, and a sink that sent a path-style request would fail to dial. The
 # path-style legs dial `minio` and Ceph's address. `MINIO_KMS_SECRET_KEY` turns on MinIO's
@@ -41,8 +41,8 @@ services:
 
   rgw:
     image: quay.io/ceph/demo:latest@sha256:522483cf07cfce6386b8e18a3edfa88a1b32c688dee231d0a6962b1513557723
-    hostname: ceph
-    # RGW_NAME sets `rgw dns name`, so the service's own name (`rgw`) is not a virtual-host suffix.
+    # RGW_NAME sets `rgw dns name`. No `hostname:`: Docker's DNS would resolve it, and bare `ceph`
+    # must not resolve (see the header).
     environment:
       CEPH_DAEMON: demo
       DEMO_DAEMONS: mon,mgr,osd,rgw
