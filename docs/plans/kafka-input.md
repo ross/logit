@@ -19,7 +19,7 @@ Goals:
 
 - `kafka_in` consumes a topic in a group alongside other `kafka_in` and Java members, survives
   broker restarts and rebalances, and never commits past a record no consumer took.
-- `kafka_out -> kafka_in` relays losslessly in every format but `text`, modulo the ADR's item 13,
+- `kafka_in -> kafka_out` relays losslessly in every format but `text`, modulo the ADR's item 13,
   and the transit spec reads `kafka_out` through the pair's decoder.
 - Every claim about a broker is checked against Apache Kafka 4.2.0 and Redpanda v26.2.3 by
   `script/kafka-interop`, and the commit rule under faults by a soak scenario.
@@ -49,16 +49,27 @@ stub as `logit_aws::test_stub` behind a `test-util` feature.
   - `conn.rs`, with version negotiation generalized from the three range constants to a table
     keyed by API key (a range and whether the broker's advertised minimum counts), and `Versions`
     answering any key. `PRODUCE_VERSIONS`, `METADATA_VERSIONS`, and `INIT_PRODUCER_ID_VERSIONS`
-    become rows. `RequestError` keeps its `sent` flag; its mapping to a sink `Fault` stays in
-    `kafka_out`'s `fault.rs`.
+    become rows. `RequestError::fault()` and the `Fault` contexts on connect, TLS, and
+    ApiVersions move with the file, as in the ADR's item 1.
   - `sasl/` except `sigv4.rs` and `aws_creds.rs`, which `logit-aws` holds; `msk_iam.rs` (the
     presigned payload and the `Authenticator` glue) stays here.
+  - `logit_kafka::error`, holding `fault.rs`'s `code` table, `name`, and `classify_sasl`.
+    `kafka_out`'s `fault.rs` keeps the per-code produce classes and imports the table from here;
+    its tests' `fault::code` paths change to match.
+  - The HTTP helpers `sasl/oauth.rs` uses. #926 left them `pub(crate)` in `logit-aws`, so W1
+    makes that copy public (adding `build_client` and `read_body_bytes`), imports it in
+    `logit-kafka`, deletes the replaced `logit-outputs` originals, and re-exports from
+    `logit-outputs::http`.
+  - `FakeStream`, `ReadStep`, and `WriteStep` from `crates/logit-outputs/src/test_support.rs`,
+    behind `test-util`; `test_support` re-exports them so `stream.rs`' and the other sinks' tests
+    resolve unchanged.
   - The outputs-side `KafkaSasl` and `OAuthToken` settings types, which `logit-cli` builds from
     `logit_config::KafkaSasl`.
   - `fake_broker.rs`, behind a `test-util` cargo feature, with `TokenEndpoint` and the other
     stubs; it re-exports `logit_aws::test_stub::HttpStub` as it does after #926.
 - **`logit_proto::kafka`** (`crates/logit-proto/src/kafka/`) receives `batch.rs` and
-  `compression.rs`. `decode`, `decompress`, and the xerial snappy reader become public, and every
+  `compression.rs`. `next_sequence` moves here from `producer.rs`, and `decode`, `decompress`, and the xerial
+  snappy reader become public, and every
   decompressor is bounded as `inflate_bounded` and `decompress_bounded` are: at most the bound plus
   one byte produced, the extra byte an error. `kafka-protocol` joins `logit-proto`'s dependencies.
   The fake broker decodes through it. No production path calls `decode` yet.
@@ -154,7 +165,10 @@ The protocol client, with no `Input` and no config: everything W3 drives.
   [ADR `telemetry-loss-vocabulary`](../adr/telemetry-loss-vocabulary.md) and a row in its
   migration record.
 - **Amendments.** [ADR `delivery-semantics`](../adr/delivery-semantics.md) item 3's list of what
-  an acknowledgment is gains `kafka_in`'s committed offset. [ADR
+  an acknowledgment is gains `kafka_in`'s committed offset, and a new amendment names its commit
+  past a record dropped under the ADR's item 10 as a third exception to item 3, beside the two
+  native-hop ones (the at-or-below-the-mark acknowledgment and the rejected `Ack`). AGENTS.md's
+  "Delivery targets at-least-once per hop" bullet, which lists those exceptions, gains it. [ADR
   `private-attribute-namespace`](../adr/private-attribute-namespace.md)'s table gains a Kafka row,
   and its whole-event render list says `kafka_out` leaves out its own family's carriers. [ADR
   `protocol-knowledge-stays-in-family`](../adr/protocol-knowledge-stays-in-family.md) gains the

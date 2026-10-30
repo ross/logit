@@ -97,9 +97,35 @@ before it is in a batch `Fanout` accepted, and decodes every format `kafka_out` 
   `logit_pipeline::tls`, beside `build_client_config`, which already lives there.
   `crates/logit-outputs/src/tls.rs` keeps its other helpers and re-exports these, because
   `stream.rs` and `syslog.rs` use them too.
+- **Code the moved files depend on moves with them.**
+  - **Error codes.** `fault.rs`'s code table (`fault::code`) and `fault::name` move to
+    `logit_kafka::error`, because `conn.rs` and `sasl/` read both. The producer's per-code class
+    mapping, what `kafka_out` does with each code on a produce, stays in `kafka_out`'s `fault.rs`,
+    which imports the table from `logit_kafka::error`.
+  - **Fault classes.** `conn.rs` and `sasl/` attach `logit_pipeline::Fault` themselves today
+    (`RequestError::fault()`, and `.context(Fault::Clean)` or `Fault::Refused` on connect, TLS,
+    and ApiVersions) and keep doing so in `logit-kafka`, as `logit-aws` already depends on `Fault`
+    the same way. `classify_sasl`, which returns a `Fault`, moves with `sasl/` into
+    `logit_kafka::error`. The consumer reads these classes only to choose a backoff (item 9's
+    actions) and never to hold a batch.
+  - **HTTP helpers.** `sasl/oauth.rs` uses `build_client`, `DEFAULT_CONNECT_TIMEOUT`,
+    `DEFAULT_IDLE_TIMEOUT`, `read_body_bytes`, and `try_read_body_bytes` from
+    `crates/logit-outputs/src/http.rs`. [#926](https://github.com/ross/logit/pull/926) copied
+    the connect and idle defaults, a client builder (`client_builder`), and
+    `try_read_body_bytes` into `logit-aws` as `pub(crate)` items, not public ones. W1 makes
+    that copy public, adds `build_client` and `read_body_bytes` beside it, and has `logit-kafka`
+    import all five from `logit-aws`. It deletes the `logit-outputs` originals those five replace
+    and has `logit-outputs::http` re-export them for the HTTP sinks.
+  - **Sequence arithmetic.** `producer::next_sequence`, which the fake broker also calls, is
+    wrapping `i32` sequence arithmetic, a wire fact. It moves to `logit_proto::kafka` beside the
+    record-batch codec, and `producer.rs` imports it from there.
+  - **Stream doubles.** `FakeStream`, `ReadStep`, and `WriteStep`, which `conn.rs`'s tests use,
+    move to `logit-kafka` behind the `test-util` feature. `logit-outputs`' `test_support` re-exports
+    them, so the tests there that use them (`stream.rs`, `syslog.rs`, `statsd.rs`, `graphite.rs`,
+    `tls.rs`, `logit.rs`, and `stream_pins.rs`, through `ScriptedDial` and directly) keep their
+    imports.
 - **`kafka_out` keeps the producer-only code**: `producer.rs`, `multi.rs`, `sink.rs`, `encode.rs`,
-  `partitioner.rs`, and `fault.rs`. `conn.rs`'s `RequestError` keeps its `sent` flag, and the
-  mapping from it to a sink `Fault` stays in `fault.rs`, because an input has no fault classes.
+  `partitioner.rs`, and `fault.rs` (the per-code class mapping).
 
 ### 2. Reference semantics: the Java consumer 4.x, classic protocol
 
@@ -230,10 +256,19 @@ from Redpanda at all.
 
 ### 6. Offset commit is the input's acknowledgment
 
-[ADR `delivery-semantics`](delivery-semantics.md) item 3 applies as written: `kafka_in` commits a
+[ADR `delivery-semantics`](delivery-semantics.md) item 3 sets the rule: `kafka_in` commits a
 partition's offset only once every record before it is in a batch `Fanout` accepted into every open
 downstream inbox, and at least one. It never waits for a sink, and never commits before
-acceptance.
+acceptance, with one exception.
+
+**The exception.** Committing past a record dropped under item 10 (`undecodable`, `corrupt`,
+`oversize`, `legacy_format`, `retention`) is an exception to item 3 of the same kind as the
+native hop's rejected `Ack` ([ADR `delivery-semantics`](delivery-semantics.md), "Amendment: a
+rejected `Ack`"): the loss is counted `*.dropped` and acknowledged to the broker so the partition
+isn't wedged, though no consumer took the record. A skipped record (a tombstone, an empty value,
+or an aborted transaction's record under `read_committed`) and a control record are outside the
+exception. They carry no event a consumer could take, so nothing is lost, and the config or the
+wire asked for the outcome.
 
 - **The committed offset is the highest contiguous accepted offset**, plus one, per partition,
   Redpanda Connect's rule. A record that needs no delivery counts as done once it's read: a record
@@ -423,7 +458,7 @@ opt-in and no public copy ([ADR `private-attribute-namespace`](private-attribute
   - Restoring a relayed record's key and headers from the carriers is a follow-up; today `key:`
     and `headers:` are config.
 
-### 13. `kafka_out -> kafka_in` is the eleventh lossless pair
+### 13. `kafka_in -> kafka_out` is the eleventh lossless pair
 
 Under [ADR `lossless-transit`](lossless-transit.md), `kafka_in -> kafka_out` relays losslessly in
 `json`, `msgpack`, `native`, and the two OTLP formats, modulo these permitted normalizations:
