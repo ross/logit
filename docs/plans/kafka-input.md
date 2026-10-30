@@ -166,7 +166,7 @@ The protocol client, with no `Input` and no config: everything W3 drives.
   migration record.
 - **Amendments.** [ADR `delivery-semantics`](../adr/delivery-semantics.md) item 3's list of what
   an acknowledgment is gains `kafka_in`'s committed offset, and a new amendment names its commit
-  past a record dropped under the ADR's item 10 as a third exception to item 3, beside the two
+  past a record dropped under the ADR's item 9 or 10 as a third exception to item 3, beside the two
   native-hop ones (the at-or-below-the-mark acknowledgment and the rejected `Ack`). AGENTS.md's
   "Delivery targets at-least-once per hop" bullet, which lists those exceptions, gains it. [ADR
   `private-attribute-namespace`](../adr/private-attribute-namespace.md)'s table gains a Kafka row,
