@@ -413,7 +413,8 @@ behavior, the tests, and the decisions above are unchanged. Two things follow:
   in `kafka/sasl/`.
 - The HTTP stub those tests use moved to `logit_aws::test_stub`, behind the `test-util` feature.
 
-`logit-aws` can't depend on `logit-outputs`, so four helpers the chain used from its `http`
-module are copies in `logit-aws`'s private `http` module: the client builder, the connect and idle
-timeout defaults, the bounded body read, and the form URL encoder. A change to a default in
+`logit-aws` can't depend on `logit-outputs`, so four helpers the chain used from it are copies in
+`logit-aws`'s private `http` module: the client builder, the connect and idle timeout defaults,
+and the bounded body read from its `http` module, and the form URL encoder from
+`kafka/sasl/oauth.rs`. A change to a default in
 `logit-outputs` doesn't move the copies.
