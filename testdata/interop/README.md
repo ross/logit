@@ -3,7 +3,8 @@
 This directory holds real wire traffic, captured once from real third-party producers and
 committed. The producers are syslog senders, collectd, OTel SDKs, carbon senders, Prometheus,
 node_exporter, a `prometheus_client` app, vmagent, statsd/DogStatsD clients, a Datadog Agent, a dd-trace tracer, four Splunk HEC
-clients, and Telegraf's InfluxDB v2 output. The fixtures check `logit`'s decoders against what those producers put on the wire:
+clients, Telegraf's InfluxDB v2 output, and the pod log files a kubelet leaves with containerd and
+CRI-O. The fixtures check `logit`'s decoders against what those producers put on the wire:
 
 - `crates/logit-proto/src/syslog/`
 - `crates/logit-proto/src/statsd/`
@@ -17,6 +18,7 @@ clients, and Telegraf's InfluxDB v2 output. The fixtures check `logit`'s decoder
   `crates/logit-inputs/src/datadog_trace.rs`
 - `crates/logit-proto/src/splunk/` and `crates/logit-inputs/src/splunk.rs`
 - `crates/logit-proto/src/influxdb/`
+- `crates/logit-inputs/src/cri.rs` and `crates/logit-proto/src/cri.rs`
 
 Without them, a decoder is checked only against this team's reading of RFC 3164/5424, collectd's
 `network.c`, the OTLP spec, or the remote-write spec, and against `logit`'s own encoder. An encoder
@@ -87,6 +89,10 @@ testdata/interop/
                           identity as sent, one file per request
   influxdb/*.headers   -- one sidecar per body: the route with its query string, and the
                           compression
+  cri/README.md        -- provenance for cri/*, and what each recording settled
+  cri/<runtime>/pods/  -- the kubelet's /var/log/pods tree from a containerd node (kind) and a CRI-O
+                          node (minikube), rotated and gzipped files included; symlinks.txt lists
+                          the /var/log/containers symlinks; not wire captures
   kafka/README.md      -- provenance for kafka/*: Java-client murmur2 partition vectors, record
                           batches as a broker stored them (Java and kcat, five codecs), and the
                           broker's ApiVersions ranges; not wire captures

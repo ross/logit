@@ -1,0 +1,95 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cri-fixture
+---
+# edge: one run per container start. The first run writes each shape the CRI format has trouble
+# with, then exits on an unterminated line; the container restarts into 1.log, which takes the
+# short branch because the emptyDir outlives the container.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: edge
+  namespace: cri-fixture
+spec:
+  restartPolicy: Always
+  containers:
+    - name: writer
+      image: docker.io/library/busybox:1.37.0
+      imagePullPolicy: IfNotPresent
+      volumeMounts:
+        - name: state
+          mountPath: /state
+      command:
+        - sh
+        - -c
+        - |
+          if [ -e /state/ran ]; then
+            echo "second run"
+            printf 'second run dangling'
+            exit 0
+          fi
+          touch /state/ran
+          echo "first run"
+          echo "stderr line" >&2
+          # 20500 bytes with no newline: a P of 16384 bytes goes out once the runtime holds more
+          # than that, a stderr line lands before the F that closes this one, and the file is still
+          # under the kubelet's 24 KiB limit.
+          head -c 20500 /dev/zero | tr '\0' y
+          sleep 1
+          echo "stderr between" >&2
+          sleep 1
+          echo
+          # containerd removes the CR of a CRLF line.
+          printf 'crlf line\r\n'
+          printf 'cr mid\rline\n'
+          echo ""
+          # 17384 bytes: a P of 16384, then an F of 1000.
+          head -c 17384 /dev/zero | tr '\0' x
+          echo
+          # 16383 ASCII bytes, e-acute (C3 A9), 100 ASCII bytes: the 16384-byte cut falls between
+          # the two bytes of e-acute.
+          head -c 16383 /dev/zero | tr '\0' a
+          printf '\303\251'
+          head -c 100 /dev/zero | tr '\0' b
+          echo
+          printf 'bad \377\376 utf8\n'
+          # The log is over the limit now, so the kubelet rotates it inside this wait: the runtime
+          # writes the unterminated head to the renamed file and the rest to the new one.
+          printf 'held across rotation'
+          sleep 5
+          echo ' rest'
+          for i in 1 2 3 4 5; do
+            echo "out $i"
+            echo "err $i" >&2
+          done
+          printf 'dangling no newline'
+          exit 0
+  volumes:
+    - name: state
+      emptyDir: {}
+---
+# rotator: enough output for the kubelet to rotate about three times under a 24 KiB limit.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rotator
+  namespace: cri-fixture
+spec:
+  restartPolicy: Never
+  containers:
+    - name: spin
+      image: docker.io/library/busybox:1.37.0
+      imagePullPolicy: IfNotPresent
+      command:
+        - sh
+        - -c
+        - |
+          pad="$(head -c 70 /dev/zero | tr '\0' p)"
+          i=1
+          while [ "$i" -le 850 ]; do
+            printf 'rotate %04d %s\n' "$i" "$pad"
+            i=$((i + 1))
+            sleep 0.05
+          done
+          printf 'rotate done no newline'
