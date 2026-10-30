@@ -578,9 +578,10 @@ impl Consumer {
         };
         let assignment: Vec<TopicPartition> =
             assigned.iter().map(|(t, p)| TopicPartition::new(t, *p)).collect();
-        self.member =
-            Some(Member { member_id: joined.member_id.clone(), generation: joined.generation });
-        self.heartbeat = Some(heartbeat::spawn(
+        // Held here until `install`: a caller that drops the join while the offset fetch retries
+        // drops the heartbeat with it, and the next call joins again.
+        let member = Member { member_id: joined.member_id.clone(), generation: joined.generation };
+        let heartbeat = heartbeat::spawn(
             self.pool.clone(),
             heartbeat::Member {
                 group: self.settings.group.clone(),
@@ -590,9 +591,9 @@ impl Consumer {
             },
             self.settings.heartbeat_interval,
             self.signal.clone(),
-        ));
+        );
         let committed = self.fetch_committed(&assignment).await?;
-        self.install(cluster, assignment, committed);
+        self.install(cluster, assignment, committed, member, heartbeat);
         Ok(())
     }
 
@@ -656,10 +657,9 @@ impl Consumer {
         }
     }
 
-    /// Drops a membership the join hadn't finished installing, for `revoke`'s rejoin.
+    /// Gives up a join that hadn't installed its membership, for `revoke`'s rejoin; the caller
+    /// drops the membership and heartbeat it held.
     fn abandon(&mut self, revoke: Revoke) {
-        self.heartbeat = None;
-        self.member = None;
         if revoke.reset_member {
             self.member_id.clear();
         }
@@ -752,7 +752,11 @@ impl Consumer {
         cluster: Cluster,
         assignment: Vec<TopicPartition>,
         committed: HashMap<TopicPartition, Option<i64>>,
+        member: Member,
+        heartbeat: Heartbeat,
     ) {
+        self.member = Some(member);
+        self.heartbeat = Some(heartbeat);
         let mut no_commit = 0;
         {
             let mut state = self.shared.lock().unwrap();
