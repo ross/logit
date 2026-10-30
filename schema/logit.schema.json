@@ -1361,7 +1361,7 @@
           "additionalProperties": false
         },
         {
-          "description": "Tails every Kubernetes container log under the kubelet's pod log directory (`<root>/<namespace>_<pod>_<pod uid>/<container>/<restart count>.log`), in the CRI format containerd and CRI-O write, and stamps each line's pod and container identity from its path as `k8s.namespace.name`, `k8s.pod.name`, `k8s.pod.uid`, `k8s.container.name`, and `k8s.container.restart_count` resource attributes. A line the runtime wrote in pieces is put back together per stream, so each event is one line of the container's stdout or stderr, with `log.iostream` naming which and the runtime's timestamp as the event's time. Follows every container under `root`; narrow the flow downstream on the `k8s.*` attributes. Also reads a rotated file the kubelet hasn't compressed yet (`<n>.log.<YYYYMMDD-HHMMSS>`), never a `.gz` one. No API server and no runtime socket. Takes the same tailing options as `tail_in`.",
+          "description": "Tails every Kubernetes container log under the kubelet's pod log directory (`<root>/<namespace>_<pod>_<pod uid>/<container>/<restart count>.log`), in the CRI format containerd and CRI-O write, or cri-dockerd's Docker json-file (told apart per file by its first byte, `{`), and stamps each line's pod and container identity from its path as `k8s.namespace.name`, `k8s.pod.name`, `k8s.pod.uid`, `k8s.container.name`, and `k8s.container.restart_count` resource attributes. A line the runtime wrote in pieces is put back together per stream, so each event is one line of the container's stdout or stderr, with `log.iostream` naming which and the runtime's timestamp as the event's time. Follows every container under `root`; narrow the flow downstream on the `k8s.*` attributes. Also reads a rotated file the kubelet hasn't compressed yet (`<n>.log.<YYYYMMDD-HHMMSS>`), never a `.gz` one. No API server and no runtime socket. Takes the same tailing options as `tail_in`.",
           "type": "object",
           "required": [
             "type"
@@ -1380,6 +1380,11 @@
                 "string",
                 "null"
               ]
+            },
+            "containers_dir": {
+              "description": "The kubelet's container symlink directory, read for each container's id. Defaults to `/var/log/containers`. Must be non-empty. The kubelet links each container's log there under a name ending in the container's 64-character id (`<pod>_<namespace>_<container>-<id>.log`), and `cri_in` writes that id as the `container.id` resource attribute. A container whose link is missing, was removed before `cri_in` listed it, or has a name the kubelet cut short of a whole id gets no `container.id`. A directory that doesn't exist is not an error: no container gets an id. `logit` needs read access to this directory, and the links' targets need not be reachable through it, since only the link text is read.",
+              "default": "/var/log/containers",
+              "type": "string"
             },
             "max_line_bytes": {
               "description": "A line longer than this is dropped whole (not truncated) and diagnosed, so a downstream JSON parser never sees a value that looks well-formed but isn't the real line. The length counts a trailing `\\r`, so a CRLF file has one byte less room per line. Under `docker_in` it bounds the reassembled `log` message, not the json-file line that carries it, and under `cri_in` the reassembled line, not the CRI record that carries a piece of it. A byte-count string. Defaults to `\"1MiB\"`; `0` is rejected.",

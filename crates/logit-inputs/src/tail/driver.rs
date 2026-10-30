@@ -2132,13 +2132,16 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 return;
             }
         }
-        let decoder = match self.factory.open(&path) {
+        let mut decoder = match self.factory.open(&path) {
             Ok(d) => d,
             Err(err) => {
                 self.diag.warn_throttled("open_error", format!("{}: {err}", path.display()));
                 return;
             }
         };
+        if sniffed {
+            decoder.file_head(&head);
+        }
         // A failure is non-fatal (the file relies on `poll_interval`) but diagnosed: at scale
         // it's `ENOSPC` against `fs.inotify.max_user_watches`, and this diagnostic is the only
         // sign. Registered once per tracked inode and never retried (`docs/known-gaps/tailing.md`).
@@ -2354,6 +2357,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             match sniff(&tracked.head) {
                 Sniff::Text => {
                     tracked.sniffed = true;
+                    tracked.decoder.file_head(&tracked.head);
                     self.skipped.remove(&id);
                 }
                 Sniff::Undecided => {
@@ -3102,7 +3106,7 @@ fn new_splitter<D: TailDecoder>(max_line_bytes: usize) -> LineSplitter {
 
 /// Lossily converts (and diagnoses `invalid_utf8`) a line that isn't UTF-8, upholding
 /// `Value::Str`'s invariant for every [`TailDecoder`].
-fn ensure_utf8(line: Bytes, diag: &mut Diagnostics) -> Bytes {
+pub(crate) fn ensure_utf8(line: Bytes, diag: &mut Diagnostics) -> Bytes {
     match std::str::from_utf8(&line) {
         Ok(_) => line,
         Err(_) => {

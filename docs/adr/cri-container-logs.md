@@ -6,10 +6,10 @@ updated: 2026-10-30
 # `cri_in`: Kubernetes container logs from `/var/log/pods`, on `tail_in`'s driver
 
 ## Status
-Accepted. Partly built: `cri_in` reads CRI-format files under `root:` as sections 1 to 7, 10, and
-11 describe. `container.id` (section 8) and cri-dockerd's Docker-format files (section 9) are the
-[`cri` plan](../plans/cri-container-logs.md)'s next workstreams, so those two sections describe
-`cri_in` as it will behave.
+Accepted. Built: `cri_in` reads CRI-format files and cri-dockerd's Docker-format files under
+`root:` and stamps `container.id`, as every section describes. The
+[`cri` plan](../plans/cri-container-logs.md) holds the workstreams still to come, which add recorded
+fixtures and a soak scenario.
 
 ## Context
 
@@ -152,7 +152,7 @@ no loss window for the tick to widen.
 
 **Discovery doesn't read `/var/log/containers`.** Its names put the pod before the namespace, carry no
 uid, and lose their container id past 251 bytes, and a symlink is made after the container starts,
-so lines can exist before the link does. Section 8 will read it for `container.id` alone.
+so lines can exist before the link does. Section 8 reads it for `container.id` alone.
 
 ### 3. The line parser lives in `logit-proto`, with a fuzz target
 
@@ -227,8 +227,8 @@ streams inside a run. The state and its rules follow `DockerDecoder`'s:
 - **Malformed record:** both streams' held runs are flushed, stdout first, then the record is
   reported. It's counted `logit.input.frames.dropped{reason="malformed"}` beside the driver's
   `bad_line` diagnostic, since a record's loss reported only by a diagnostic needs a counter
-  ([ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)). `docker_in` counts its rejected
-  json-file entry nowhere today; section 9 closes that for both kinds.
+  ([ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)). The shared Docker decoder
+  counts a rejected json-file entry the same way, under both kinds (section 9).
 
 A run split across a rotation leaves as two lines: containerd writes the head as a `P` at the
 end of the renamed file, and the continuation starts the new file, a different inode with its own
@@ -288,7 +288,7 @@ Each file's resource holds the semantic-convention keys its path names:
 | `k8s.pod.uid` | string | the rest, after its second `_` |
 | `k8s.container.name` | string | the container directory |
 | `k8s.container.restart_count` | `i64` | the file name's `<n>` |
-| `container.id` | string | section 8, when known (not yet built) |
+| `container.id` | string | section 8, when known |
 
 Each event carries `log.iostream` (`stdout` or `stderr`) and its line as an unparsed message
 (`body_format: Raw`, no severity), as `docker_in`'s does. A rotated file has its live file's
@@ -310,44 +310,142 @@ and name.
 
 ### 8. `container.id` from the `/var/log/containers` symlinks, best effort
 
-`cri_in` will list `containers_dir:` (default `/var/log/containers`), read each symlink's target,
-and index it by the target's last three path components (`<pod dir>/<container>/<n>.log`) to the id,
-when the link name's last `-`-separated part before `.log` is 64 lowercase hex characters, the form
-Fluent Bit's `kubernetes` filter reads. Keying on the last three components rather than the whole
-target lets a `root:` mounted at another path still match.
+`cri_in` lists `containers_dir:` (default `/var/log/containers`), reads each symlink's target, and
+indexes it by the target's last three path components (`<pod dir>/<container>/<n>.log`) to the id,
+the form Fluent Bit's `kubernetes` filter reads. Keying on the last three components rather than
+the whole target lets a `root:` mounted at another path still match. It reads only the link's name
+and target text, never the file the link names, so the links' targets need not be reachable
+through `containers_dir`'s mount.
 
-- The value is the bare hex id, never a `containerd://` prefix: semantic conventions' form, and the
-  one OpenTelemetry's `k8sattributes` processor and SDK resource detectors write, so a log joins to
-  a trace or metric from the same container.
-- It's cached per file identity, so the kubelet removing the link after the container exits doesn't
-  remove the id from that file's later lines, and a rotated file has its live file's id.
-- The listing runs on the `poll_interval` tick and on a miss, since the kubelet makes the link after
-  the container starts. An id found later replaces the file's resource, which starts a new batch, as
-  `docker_in`'s identity refresh does.
-- A missing link, or a name cut short of a whole id, writes no `container.id`. A failed listing
-  keeps the cache and is diagnosed (`container_id_error`), with no counter: no data is lost.
+- **Which names count.** The id is the text after the name's last `-` and before `.log`, and only
+  when that text is exactly 64 lowercase hex characters. The kubelet cuts a link's name to 251
+  bytes before it appends `.log`, so a long name loses its id; its last `-` part is then part of a
+  name or a partial id, fails the test, and yields no id.
+- **The value is the bare hex id**, never a `containerd://` prefix: semantic conventions' form, and
+  the one OpenTelemetry's `k8sattributes` processor and SDK resource detectors write, so a log
+  joins to a trace or metric from the same container.
+- **It's cached per file identity.** A file's identity here is its key, `<pod dir>/<container>/<n>`,
+  which a rotated file shares with its live file. An entry lives while any discovered file maps to
+  its key, so the kubelet removing the link after the container exits doesn't remove the id from
+  that file's later lines. The cache is in memory: a `logit` that starts after the kubelet removed
+  a link has no id for that container.
+- **The listing runs on a miss, at most once per scan.** The first lookup in a scan that the cache
+  can't answer lists the directory and reads the links it hasn't read before; a scan in which every
+  file has its id lists nothing. The kubelet makes the link after the container starts, so a file
+  can be read first: its next `poll_interval` scan finds the link. A file whose link never comes
+  (a cut name) costs one listing per scan, never one per line.
+- **An id found later replaces the file's resource** through the driver's `refresh` hook, which
+  returns `Identity` as `docker_in`'s does and is counted in `logit.input.files.identity_changed`.
+  The batch accumulator closes the open batch when the resource changes, so no batch holds a file's
+  lines from before and after, and none holds two containers'.
+- **A missing link or a cut name writes no `container.id`**, and the id is never guessed from
+  another source.
+- **A directory that doesn't exist is an empty listing.** It means no ids and is neither diagnosed
+  nor counted: a node that doesn't mount `/var/log/containers` gets `k8s.*` and no `container.id`,
+  as the operator's mounts say. Any other failure to list or read a link (a permission error, a
+  path that isn't a directory) keeps the cache and is diagnosed `container_id_error`, throttled.
+- **A failed listing isn't counted in `scan.errors`.** That counter's failures are discovery
+  listings, which can hide a tracked file and so are held to the rule that a failed listing retires
+  nothing ([ADR `tail-discovery-failure-and-resume-identity`](tail-discovery-failure-and-resume-identity.md),
+  decision 1). This listing decides one attribute and loses no data, so it gets no counter, and no
+  `*.dropped` ([ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)); the diagnostic is
+  the signal.
 
 ### 9. cri-dockerd's files are recognized and decoded as Docker JSON
 
-`cri_in` will latch each file identity's format from its first byte: `{` is Docker json-file, and
-anything else is CRI. A Docker-format file will go through `docker_in`'s envelope decoder and its 16
-KiB partial-line reassembly, under `cri_in`'s path resource, and the splitter bound
-`envelope_cap(max_line_bytes)` (section 4) is the one `docker_in` gives it. The file under the pods
-name is a symlink there, and the driver stats and opens through it, so the identity is the target's
-inode, and a Docker rotation (a rename of the target) reads as a rotation. An empty file stays
-undecided until its first byte.
+`cri_in` latches each file's format from the file's first byte: `{` is Docker json-file, and
+anything else is CRI. A Docker-format file goes through `docker_in`'s decoder, `DockerDecoder`,
+shared rather than copied, under `cri_in`'s path resource and `container.id` (sections 7 and 8).
 
-The Docker decoder can't use the splitter-drop hook the way `CriDecoder` does: json-file writes
-`stream` after `log`, so a dropped envelope's leading bytes can't name its stream. W2 leaves it on
-the hook's default, so the driver keeps counting the drop, and `docs/known-gaps/tailing.md`'s "An
-envelope over the cap is dropped by the splitter without the decoder seeing it" stays open. W4
-decides and builds a remedy that doesn't need the stream, under `cri_in` and `docker_in` alike.
+**The latch reads byte 0, wherever reading starts.** The driver already reads a file's first bytes
+when it opens one, to skip a compressed file and to check a checkpoint's head, and it hands them to
+the decoder through a `TailDecoder::file_head` hook once they show the file is text, before any line
+reaches the decoder. So a restart that resumes a file past its first line still latches from offset
+0: a line of the other format after the checkpoint is malformed, as it would be in a first read,
+rather than decoded in a format the file doesn't hold.
+
+- **An empty file stays undecided** until its first byte is written. The driver splits no line of a
+  file before its first bytes are sniffed, so no line is decoded in a guessed format.
+- **A file whose first byte is gone is decided again by its new one.** A file keeps its identity
+  and loses byte 0 only through an in-place truncation; a rename rotation moves the whole file. After
+  a truncation the driver resets the decoder (counting what it held, section 4) and sniffs the new
+  content from offset 0, and `file_head` latches from its first byte. A resume whose checkpoint the
+  file no longer matches restarts at offset 0, which is the same case.
+
+**The pods entry is a symlink, and the driver follows it.** cri-dockerd makes
+`/var/log/pods/.../<n>.log` a symlink to Docker's `/var/lib/docker/containers/<id>/<id>-json.log`.
+Discovery matches the link's name (section 2), and the driver's `stat` and `open` of a matched path
+follow a symlink, so the file's identity, its checkpoint entry, and its watch are the target's
+inode. Docker rotates by renaming `<id>-json.log` to `<id>-json.log.1` in its own directory and
+writing a new `<id>-json.log`; the link keeps naming the path, so the next scan finds a new inode
+under the pods name and reads the rotation as one: the renamed inode drains to its end and closes,
+and the new one is read from its start. A scan between the rename and the new file finds the link
+dangling, which retires the old inode the same way, with no loss; as for logrotate's `create`, that
+rotation then misses `logit.input.files.rotated`. The rotated name is outside `root:`, so its unread
+tail at a restart counts `gone` (a documented limit below). No driver change was needed for any of
+this: the tests read a pods-tree symlink through a Docker rotation.
+
+**What the Docker branch keeps from `docker_in`:** the 16 KiB fragment reassembly per stream, the
+envelope's `time` with the `bad_time` fallback, `max_line_bytes` over the reassembled message, and the
+splitter bound `envelope_cap(max_line_bytes)` that `cri_in` already uses (section 4). The envelope's
+`attrs` become event attributes, as under `docker_in`: one decoder reads one format one way, and an
+`attrs` object is there only because the node's Docker daemon was configured with `--log-opt labels`,
+`env`, or `tag`, which asked for it.
+
+**What it takes from `cri_in`:**
+
+- **`partial_timeout`** flushes a dangling fragment as section 5 flushes a dangling run, counted
+  `frames.truncated{reason="partial_timeout"}`. Whether dockerd itself ever leaves a fragment
+  without its closing entry isn't verified, but a writer that stops mid-line can, and the kubelet
+  keeps an exited container's file until it collects the container, so section 5's reason holds
+  for any file `cri_in` reads. The timer costs nothing until a fragment dangles. `docker_in` has no
+  such key, and its decoder's timer is off.
+- **Raw bytes.** `cri_in` turns off the driver's UTF-8 conversion and `\r` strip (section 3), so the
+  Docker branch converts each envelope itself, with the driver's `invalid_utf8` diagnostic, before
+  parsing it. A `\r` after an envelope's `}` is JSON whitespace, so keeping it changes nothing.
+
+**A rejected json-file entry is counted.** An entry that isn't JSON or names an unknown stream counts
+`logit.input.frames.dropped{reason="malformed"}` beside the driver's `bad_line`, under `docker_in`
+and `cri_in` alike, as section 4 counts a CRI record. `docker_in` counted it nowhere before, though a
+record's loss reported only by a diagnostic needs a counter
+([ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)).
+
+**A splitter drop ends both streams' reassembly, under `docker_in` and `cri_in` alike.** The splitter
+drops an envelope over `envelope_cap` before the decoder sees it, and json-file writes `stream` after
+`log`, so the dropped envelope's leading bytes can't name its stream. `DockerDecoder` takes the drop
+through the splitter-drop hook (Implementation notes for W2) and, not knowing the stream:
+
+- discards each stream's held fragment, counting it `frames.dropped{reason="oversize"}`, one line
+  each;
+- ends each stream's drop in progress, already counted when it began;
+- counts the drop itself as one `oversize` line only when neither stream held a fragment or was
+  dropping a line, and otherwise folds it into the line it most likely continues;
+- reports one `long_line` whenever it counts.
+
+What that closes, and what it can't:
+
+- **No splice.** A dropped closing fragment no longer leaves its line's head held, to be joined to
+  the stream's next line: the head is discarded and counted.
+- **No missing middle.** A held head is never joined to fragments after a dropped one, so no event
+  is delivered with a gap inside it.
+- **A headless tail remains.** The fragments after a dropped first or middle fragment, through
+  their closing entry, arrive on a stream holding nothing and leave as one line without its head.
+  The decoder can't tell them from a new line without the dropped envelope's stream. Their line's loss
+  is counted, as the discarded head or as the drop, except in the case below.
+- **The count can be one short.** When the dropped envelope starts a line on a stream holding
+  nothing while the other stream holds a fragment or is dropping, the drop is folded into the other
+  stream's line, and the dropped line's head goes uncounted. Counting it would count the drop twice
+  in the common case, where the dropped envelope continues the held line.
+- **The count can be high.** When the splitter drops several fragments of one line in a row, each
+  drop finds nothing held or dropping, since the one before it ended both streams' reassembly, so
+  each counts once. Folding a drop that follows a drop would instead undercount whole entries
+  dropped back to back, and counting too much loss is the safer error. This is the reachable case:
+  a container whose `attrs` outgrows the slack loses every full-size fragment, so each of its lines
+  with several of them counts once per fragment.
+
 Under `envelope_cap`, only an `attrs` object past the bound's slack or a writer other than dockerd
-produces such an envelope.
-
-The shared decoder will count a rejected json-file entry as
-`logit.input.frames.dropped{reason="malformed"}`, as section 4 counts a CRI record, so `docker_in`
-will gain the counter its `bad_line` diagnostic lacked.
+writes an envelope the splitter drops, and the operator's remedy for either is in
+[`docs/deploying.md`](../deploying.md)'s "Tailing files and Docker logs".
 
 ### 10. What `cri_in` doesn't read
 
@@ -373,7 +471,7 @@ will gain the counter its `bad_line` diagnostic lacked.
 | Key | Default | Meaning |
 |---|---|---|
 | `root` | `/var/log/pods` | the kubelet's pod log directory; an empty value is rejected |
-| `containers_dir` | `/var/log/containers` | where the kubelet's symlinks are, for `container.id`; an empty value is rejected, and a missing directory is an empty listing (not yet built) |
+| `containers_dir` | `/var/log/containers` | where the kubelet's symlinks are, for `container.id`; an empty value is rejected, and a missing directory is an empty listing |
 | `partial_timeout` | `5s` | section 5; `0s` turns the timer off |
 
 It flattens `TailOptions` as `tail_in` and `docker_in` do: `checkpoint_path`, `read_from`,
@@ -381,10 +479,8 @@ It flattens `TailOptions` as `tail_in` and `docker_in` do: `checkpoint_path`, `r
 reassembled line as under `docker_in`. Its `receive:` block takes the tail listeners' three
 batch-assembly fields and `shutdown_grace`.
 
-`containers_dir` arrives with section 8's lookup, not before it: a key that configures nothing would
-pass `logit validate` while reading nothing, and the config's `deny_unknown_fields` rejects it until
-then. An empty `root` is rejected under the graph's rule 27, beside the other empty-path checks,
-rather than under a rule number of its own.
+An empty `root` or `containers_dir` is rejected under the graph's rule 27, beside the other
+empty-path checks, rather than under a rule number of its own.
 
 ## Alternatives considered
 
@@ -408,10 +504,22 @@ rather than under a rule number of its own.
   needed: one parser takes both forms, and conmon's `+00:00` and containerd on a non-UTC node look
   alike anyway.
 
+- **Latching a file's format from the first line read.** Rejected: a restart that resumes past the
+  first line would latch from whatever line follows the checkpoint, so a stray line of the other
+  format could flip a file's decoder for the rest of the run. The driver reads byte 0 anyway.
+- **Under a splitter drop in a Docker file, dropping each held stream's line through its closing
+  entry.** It would also discard the tail after a dropped middle fragment, but when the dropped
+  envelope was a closing fragment, the stream's next line would be discarded with it, uncounted,
+  since nothing tells that line from the rest of the dropped one. A headless tail is delivered and
+  its line's loss is counted; a silently discarded line is neither.
+- **No idle flush for a Docker-format file under `cri_in`**, as under `docker_in`. Rejected: a
+  dangling fragment would wait for the kubelet's garbage collection with the checkpoint pinned, the
+  case section 5 exists for, and `partial_timeout` is `cri_in`'s key for every file it reads.
+
 ## Consequences
 
-- `ComponentKind::CriIn` has `root`, `partial_timeout`, and flattened `TailOptions`, with
-  `containers_dir` to come (section 11), and a graph shape rule beside `docker_in`'s. `cri_in` joins `is_tail_listener`,
+- `ComponentKind::CriIn` has `root`, `containers_dir`, `partial_timeout`, and flattened
+  `TailOptions`, and a graph shape rule beside `docker_in`'s. `cri_in` joins `is_tail_listener`,
   which feeds the `receive:` rules (17 and 18), and joins rule 28 (positive `poll_interval`,
   `checkpoint_interval`, and `max_line_bytes`) and rule 62 (a unique `checkpoint_path`) beside
   `tail_in` and `docker_in`, which those two rules name by kind. Without rule 62, a `cri_in` sharing
@@ -424,14 +532,16 @@ rather than under a rule number of its own.
   and one the decoder would have folded into a drop it already counted is counted twice.
 - A file's splitter can hold up to `envelope_cap(max_line_bytes)` of an unterminated record, about 6
   MiB at the default, as `docker_in`'s can.
-- `DockerDecoder`'s envelope decoding and reassembly will become reachable from `cri_in`, and the
-  shared decoder will count a rejected entry (section 9, not yet built).
+- `DockerDecoder`'s envelope decoding and reassembly are reachable from `cri_in`. `docker_in` gains
+  the `malformed` counter and the splitter-drop remedy with it (section 9).
+- `TailDecoder` gains `file_head`, called with a file's first bytes before any of its lines and
+  again after a truncation. Its default does nothing, so `tail_in` and `docker_in` ignore it.
 - New counter uses: `logit.input.frames.truncated{reason="partial_timeout"}`, and
-  `frames.dropped{reason="malformed"}` on `cri_in` (and on `docker_in` with section 9). New
-  diagnostic key, with section 8: `container_id_error`.
+  `frames.dropped{reason="malformed"}` on `cri_in` and `docker_in`. New
+  diagnostic key, from section 8: `container_id_error`.
 - Reading needs what `docker_in` needs: the runtimes create each log file `0640` as root, so
-  `logit` runs as root or with a group grant, with `/var/log/pods` (and, with section 8,
-  `/var/log/containers`) mounted read-only. Under cri-dockerd, the symlinks' targets, Docker's container directory, must be
+  `logit` runs as root or with a group grant, with `/var/log/pods` and
+  `/var/log/containers` mounted read-only. Under cri-dockerd, the symlinks' targets, Docker's container directory, must be
   mounted at their host path too.
 - One open descriptor and one file watch per rotated file the kubelet hasn't compressed, at most one
   per container in the kubelet's steady state.
@@ -446,7 +556,7 @@ rather than under a rule number of its own.
 - **A static pod's `k8s.pod.uid` is the kubelet's hash, not the mirror pod's uid**, unless its
   manifest sets a uid (section 7).
 - **A symlink name the kubelet cut short writes no `container.id`**, and neither does a container
-  whose link isn't there yet or was removed before `cri_in` listed it (section 8).
+  whose link is gone before `cri_in` starts, or whose link `cri_in` hasn't listed yet (section 8).
 - **No pod labels or annotations, and no node name** (section 10). An enrichment stage or `set` adds
   what a deployment needs.
 - **conmon's own size rotation isn't followed across a restart.** CRI-O's `log_size_max`, off by
@@ -455,6 +565,9 @@ rather than under a rule number of its own.
   tail counts `gone`.
 - **Under cri-dockerd, a Docker-rotated file (`-json.log.1`) is outside `root:`**, so its unread
   tail at a restart counts `gone`, the same as `docker_in` counts it.
+- **Under cri-dockerd and `docker_in`, the fragments after an envelope the splitter dropped can leave
+  as a line without its head**, and the drop's count can be one short, or one per fragment when
+  several of a line's fragments are dropped in a row (section 9).
 
 ## Implementation notes for W2
 
@@ -468,8 +581,8 @@ The driver changes `cri_in` needs, as W2 built them:
   it with its `long_line`, or absorbed it into a line it already counted), so the driver counts
   neither, and `false` when the head doesn't parse, so the driver counts as it does for the other
   kinds. The driver then updates `held_from` from `holds_entry`, as after `decode_line`, so a
-  checkpoint during the drop stays at the line's first record. `CriDecoder` implements it (section 4); `DockerDecoder`
-  and `LineDecoder` keep the default (section 9).
+  checkpoint during the drop stays at the line's first record. `CriDecoder` implements it (section 4),
+  `DockerDecoder` implements it without the head (section 9), and `LineDecoder` keeps the default.
 - **The head parse** reads the timestamp, the stream, and the first byte or bytes of the tag, enough
   to tell `P` from any other first tag. It doesn't require the space after the tag within the
   128-byte head, since a long tag field can push that space past it.

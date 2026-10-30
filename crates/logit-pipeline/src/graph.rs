@@ -79,7 +79,7 @@
 //!     the tail matcher never expands (`check_tail_glob`). No `paths` is legal and tails nothing.
 //! 27. A `docker_in` with an empty `containers`/`labels` entry, a duplicate `containers` entry, or
 //!     an empty `root`. No `containers` without `discover: true` is legal and follows nothing. A
-//!     `cri_in` with an empty `root` (`docs/adr/cri-container-logs.md`).
+//!     `cri_in` with an empty `root` or `containers_dir` (`docs/adr/cri-container-logs.md`).
 //! 28. A `tail_in`/`docker_in`/`cri_in` `poll_interval`, `checkpoint_interval`, or
 //!     `max_line_bytes` of `0`: a busy loop, a checkpoint write every tick, or every line
 //!     dropped. 26-28 are `docs/adr/file-tailing-and-docker-json-logs.md`'s.
@@ -1496,11 +1496,15 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 27, `cri_in`'s part: an empty `root` would resolve to the working directory.
+    // Rule 27, `cri_in`'s part: an empty `root` or `containers_dir` would resolve to the working
+    // directory.
     for (id, component) in &components {
-        if let ComponentKind::CriIn { root, .. } = &component.kind {
+        if let ComponentKind::CriIn { root, containers_dir, .. } = &component.kind {
             if root.is_empty() {
                 anyhow::bail!("component '{id}': 'root' must not be empty");
+            }
+            if containers_dir.is_empty() {
+                anyhow::bail!("component '{id}': 'containers_dir' must not be empty");
             }
         }
     }
@@ -12405,6 +12409,7 @@ mod tests {
     fn cri_in(tail: logit_config::TailOptions) -> ComponentKind {
         ComponentKind::CriIn {
             root: "/var/log/pods".to_string(),
+            containers_dir: "/var/log/containers".to_string(),
             partial_timeout: std::time::Duration::from_secs(5),
             tail,
         }
@@ -12424,6 +12429,13 @@ mod tests {
         }
         let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
         assert!(err.contains("'root' must not be empty"), "got: {err}");
+
+        let mut kind = cri_in(Default::default());
+        if let ComponentKind::CriIn { containers_dir, .. } = &mut kind {
+            containers_dir.clear();
+        }
+        let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+        assert!(err.contains("'containers_dir' must not be empty"), "got: {err}");
 
         let zero = logit_config::TailOptions {
             poll_interval: std::time::Duration::ZERO,

@@ -939,10 +939,11 @@ pub(crate) fn build_spec(
                 input_runtime_config(&component.receive),
             )
         }
-        CriIn { root, partial_timeout, tail } => NodeSpec::Input(
+        CriIn { root, containers_dir, partial_timeout, tail } => NodeSpec::Input(
             Box::new(
                 CriInput::new(
                     base_dir.join(root),
+                    base_dir.join(containers_dir),
                     *partial_timeout,
                     tail_config(tail, &component.receive, base_dir),
                 )

@@ -286,6 +286,10 @@ pub fn generate(testdata: &Path) -> std::io::Result<(Seeds, Vec<String>)> {
         add("cri", name.to_string(), bytes);
     }
 
+    for (name, bytes) in cri_recorded_seeds(testdata)? {
+        add("cri", name, bytes);
+    }
+
     for (name, bytes) in authorization_headers() {
         add("http_auth", name.to_string(), bytes);
     }
@@ -434,6 +438,80 @@ fn cri_lines() -> Vec<(&'static str, Vec<u8>)> {
         ("docker-json", br#"{"log":"x\n","stream":"stdout","time":"2026-09-21T13:33:20Z"}"#),
     ];
     lines.into_iter().map(|(name, line)| (name, line.to_vec())).collect()
+}
+
+/// A few records of each uncompressed file under `testdata/interop/cri/<runtime>/pods/`: the first
+/// two short ones, the first `P` record of at most 9000 bytes, the first empty one, and the first whose content isn't
+/// UTF-8. A record is one line without its terminator, which is what `cri::parse` reads. Names
+/// leave out the pod uid and the rotation time, which change between recordings.
+fn cri_recorded_seeds(testdata: &Path) -> std::io::Result<Vec<(String, Vec<u8>)>> {
+    const SHORT: usize = 300;
+    const LONG: usize = 9000;
+    let mut out = Vec::new();
+    let sorted_entries = |dir: &Path| -> std::io::Result<Vec<std::path::PathBuf>> {
+        let mut paths = std::fs::read_dir(dir)?
+            .map(|e| e.map(|e| e.path()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        paths.sort();
+        Ok(paths)
+    };
+    let name_of = |path: &Path| path.file_name().unwrap().to_string_lossy().into_owned();
+    for runtime in sorted_entries(&testdata.join("interop/cri"))? {
+        let pods = runtime.join("pods");
+        if !pods.is_dir() {
+            continue;
+        }
+        for pod in sorted_entries(&pods)? {
+            // <namespace>_<pod>_<uid>: the pod name is the middle field.
+            let dir_name = name_of(&pod);
+            let pod_name = dir_name.split('_').nth(1).unwrap_or("pod").to_string();
+            for container in sorted_entries(&pod)? {
+                for file in sorted_entries(&container)? {
+                    let file_name = name_of(&file);
+                    let Some((n, rest)) = file_name.split_once(".log") else { continue };
+                    let kind = match rest {
+                        "" => "live",
+                        r if r.ends_with(".gz") || r.ends_with(".tmp") => continue,
+                        _ => "rotated",
+                    };
+                    let label = format!(
+                        "recorded-{}-{pod_name}-{}-{n}-{kind}",
+                        name_of(&runtime),
+                        name_of(&container)
+                    );
+                    let bytes = std::fs::read(&file)?;
+                    let records: Vec<&[u8]> =
+                        bytes.split(|&b| b == b'\n').filter(|r| !r.is_empty()).collect();
+                    let tag_of = |r: &[u8]| r.splitn(4, |&b| b == b' ').nth(2).map(<[u8]>::to_vec);
+                    let content_of =
+                        |r: &[u8]| r.splitn(4, |&b| b == b' ').nth(3).unwrap_or(&[]).to_vec();
+                    let mut picked: Vec<(&str, &[u8])> = Vec::new();
+                    for r in records.iter().filter(|r| r.len() <= SHORT).take(2) {
+                        picked.push(("short", r));
+                    }
+                    if let Some(r) = records
+                        .iter()
+                        .find(|r| r.len() <= LONG && tag_of(r).as_deref() == Some(b"P"))
+                    {
+                        picked.push(("partial", r));
+                    }
+                    if let Some(r) = records.iter().find(|r| content_of(r).is_empty()) {
+                        picked.push(("empty", r));
+                    }
+                    if let Some(r) = records
+                        .iter()
+                        .find(|r| r.len() <= LONG && std::str::from_utf8(&content_of(r)).is_err())
+                    {
+                        picked.push(("invalid-utf8", r));
+                    }
+                    for (i, (why, record)) in picked.into_iter().enumerate() {
+                        out.push((format!("{label}-{i}-{why}"), record.to_vec()));
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// `Authorization` header values from `logit_proto::auth`'s unit vectors, each behind the

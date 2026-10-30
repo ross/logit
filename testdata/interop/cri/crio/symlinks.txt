@@ -1,0 +1,5 @@
+edge_cri-fixture_writer-03e0cb5caf9f8e6da52e0f62408e80274c5166a199faf983e2172f065b895b7d.log -> /var/log/pods/cri-fixture_edge_63b8b56d-b78e-476c-94e9-1c390d9d2a16/writer/0.log
+edge_cri-fixture_writer-65bac01d3ce18b9fae6347b0e02b6a27263f7a60d3c093b4614b4cc6edbd3e6a.log -> /var/log/pods/cri-fixture_edge_63b8b56d-b78e-476c-94e9-1c390d9d2a16/writer/1.log
+edge_cri-fixture_writer-f10fb79b7a0cda075a2451a608abb1ca4f2aafc4f8aecdb9757d8a9fd14e18cd.log -> /var/log/pods/cri-fixture_edge_63b8b56d-b78e-476c-94e9-1c390d9d2a16/writer/2.log
+rotator_cri-fixture_spin-6080d2ea550bde3d5618639236f36f83a1ab1da6f9ab2ff39070c40b3fa398d4.log -> /var/log/pods/cri-fixture_rotator_a247fee4-1918-432f-a921-13c85767d5b4/spin/0.log
+static-hello-logit-record-crio_cri-fixture_hello-ebd05f60d6b9a3e6176809d52831b048f3a0dc28703185511ee3b2aaa286abb0.log -> /var/log/pods/cri-fixture_static-hello-logit-record-crio_42fc60615b41e07cc0c275e367815f10/hello/0.log
