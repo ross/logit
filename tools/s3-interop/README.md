@@ -133,9 +133,8 @@ A run writes `perf/results/s3-interop/<timestamp>/` (git-ignored):
 | `replay/<store>/` | the decompressed `native` objects and the events `replay_in` read back |
 | `provenance.txt`, `exits.txt`, `timeline.log`, `logs/` | image digests and versions, each leg's exit code, the run's phases, and every container's log, with AWS mode's cleanup in `logs/cleanup.log` |
 
-The `replay_in` leg decompresses first, because this tree's `replay_in` reads uncompressed files
-only. Once `replay_in` reads `.gz` and `.zst` (the W4 branch), the decompression step in the script
-can go.
+The `replay_in` leg decompresses each object before `replay_in` reads it. `replay_in` now reads
+`.gz` and `.zst` files itself, so that step can go once a run confirms it.
 
 The project name is fixed, so one run at a time per daemon: the script refuses to start while the
 project has containers, and prints the `down` command for a stack a crashed run left behind.
