@@ -36,10 +36,12 @@ Non-goals:
 
 ### W1: the `logit-kafka` crate, with no behavior change
 
-W1 cuts after the `s3` stream's `logit-aws` extraction PR merges. If it hasn't, W1 does that
-extraction itself in the same shape: `crates/logit-aws` holding `sasl/sigv4.rs` and
-`sasl/aws_creds.rs` (SigV4 signing and the AWS credential chain), depending on `ring`, `reqwest`,
-`logit-core`, and `logit-pipeline`'s `Fault`.
+W1 cuts after the `s3` stream's `logit-aws` extraction,
+[#926](https://github.com/ross/logit/pull/926), merges. If it hasn't, W1 does that extraction
+itself in the same shape: `crates/logit-aws` holding `sasl/sigv4.rs` and `sasl/aws_creds.rs`
+(SigV4 signing, the AWS credential chain, and the partition-domain lookup it calls), depending
+on `ring`, `reqwest`, `logit-core`, and `logit-pipeline`'s `Fault`, with the AWS endpoints' HTTP
+stub as `logit_aws::test_stub` behind a `test-util` feature.
 
 - **`crates/logit-kafka`**, a workspace member depending on `logit-core`, `logit-pipeline`,
   `logit-proto`, `logit-aws`, `kafka-protocol`, and the TLS crates. It receives from
@@ -50,10 +52,11 @@ extraction itself in the same shape: `crates/logit-aws` holding `sasl/sigv4.rs` 
     become rows. `RequestError` keeps its `sent` flag; its mapping to a sink `Fault` stays in
     `kafka_out`'s `fault.rs`.
   - `sasl/` except `sigv4.rs` and `aws_creds.rs`, which `logit-aws` holds; `msk_iam.rs` (the
-    presigned payload, the partition domain, the `Authenticator` glue) stays here.
+    presigned payload and the `Authenticator` glue) stays here.
   - The outputs-side `KafkaSasl` and `OAuthToken` settings types, which `logit-cli` builds from
     `logit_config::KafkaSasl`.
-  - `fake_broker.rs`, behind a `test-util` cargo feature, with `TokenEndpoint` and `HttpStub`.
+  - `fake_broker.rs`, behind a `test-util` cargo feature, with `TokenEndpoint` and the other
+    stubs; it re-exports `logit_aws::test_stub::HttpStub` as it does after #926.
 - **`logit_proto::kafka`** (`crates/logit-proto/src/kafka/`) receives `batch.rs` and
   `compression.rs`. `decode`, `decompress`, and the xerial snappy reader become public, and every
   decompressor is bounded as `inflate_bounded` and `decompress_bounded` are: at most the bound plus

@@ -77,9 +77,11 @@ before it is in a batch `Fanout` accepted, and decodes every format `kafka_out` 
 - **The AWS pieces live in `crates/logit-aws`.** SigV4 signing (`sasl/sigv4.rs`) and the AWS
   credential chain (`sasl/aws_creds.rs`) serve an S3 sink too, so they move to a small
   `logit-aws` crate (depending on `ring`, `reqwest`, `logit-core`, and `logit-pipeline`'s
-  `Fault`), which the `s3` stream extracts for `s3_out`. `logit-kafka` depends on it and keeps the
-  MSK-specific part, `msk_iam.rs`: the presigned payload, the partition domain, and the
-  `Authenticator` glue.
+  `Fault`), which the `s3` stream extracts for `s3_out` in
+  [#926](https://github.com/ross/logit/pull/926), along with the partition-domain lookup the
+  chain's STS call needs (`logit_aws::creds`) and the HTTP stub its tests use
+  (`logit_aws::test_stub`, behind a `test-util` feature). `logit-kafka` depends on it and keeps
+  the MSK-specific part, `msk_iam.rs`: the presigned payload and the `Authenticator` glue.
 - **Version negotiation becomes a per-API table.** `conn.rs` hard-codes a range per API it sends
   today (`PRODUCE_VERSIONS`, `METADATA_VERSIONS`, `INIT_PRODUCER_ID_VERSIONS`). It becomes one
   table keyed by API key, each entry a supported range and whether a broker's advertised minimum
