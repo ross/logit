@@ -37,8 +37,9 @@
 //! (relative to the case's directory) the `.json` is decoded from by `<system>_in`'s decoder at
 //! [`RECEIVED_AT`] (with the request's `name: value` headers from a `.headers` sidecar beside
 //! the wire file, for a collectd case the `types.db` file an optional `types_db:` names, for a
-//! graphite case the carbon protocol an optional `protocol: plaintext | pickle` names, and for a
-//! syslog case the transport an optional `framing: datagram | stream` names, as [`decode_wire`]
+//! graphite case the carbon protocol an optional `protocol: plaintext | pickle` names, for a
+//! syslog case the transport an optional `framing: datagram | stream` names, and for a kafka
+//! case the `kafka_in` format, `record:`, and topic its `kafka:` names, as [`decode_wire`]
 //! reads them), and optional `tolerance:` entries (`{path, abs}`: an RFC 6901
 //! pointer into each event of the document, and the most the number there may differ by). A hand-written case
 //! has no `wire:`, and its `.json` must read back to itself through `logit_proto::event_json`
@@ -63,6 +64,7 @@ use anyhow::{bail, ensure, Context};
 use bytes::Bytes;
 use logit_config::ComponentKind;
 use logit_core::{Diagnostics, EventBatch, Resource};
+use logit_inputs::kafka::KafkaInFormat;
 use logit_outputs::ndjson::render_ndjson;
 use logit_pipeline::test_util::TelemetryProbe;
 use logit_proto::collectd::{CollectdDecoder, TypesDb};
@@ -118,8 +120,28 @@ struct Meta {
     #[serde(default)]
     framing: Option<SyslogFraming>,
     #[serde(default)]
+    kafka: Option<KafkaWire>,
+    #[serde(default)]
     tolerance: Vec<Tolerance>,
 }
+
+/// How a kafka case's records read: `kafka_in`'s `format:`, its `record:` under `text`, and the
+/// topic they were fetched from, [`KAFKA_TOPIC`] when unset. Under an OTLP format the topic picks
+/// the signal by the `kafka_out` default topic names (`otlp_logs`, `otlp_metrics`, `otlp_spans`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KafkaWire {
+    format: logit_config::KafkaFormat,
+    #[serde(default)]
+    record: Option<logit_config::KafkaRecord>,
+    #[serde(default)]
+    topic: Option<String>,
+}
+
+/// The topic a kafka case's records were fetched from when its meta names none, and the topic
+/// every non-OTLP `kafka_out` flow writes, so the `_logit.kafka.topic` carrier reads back as it
+/// came.
+const KAFKA_TOPIC: &str = "transit";
 
 /// How a syslog case's wire file reached `syslog_in` ([`decode_wire`]).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -328,7 +350,11 @@ fn canonical(case: &Case) -> anyhow::Result<String> {
         ensure!(case.system == "syslog", "framing: names how a syslog_in case arrived");
     }
     let framing = case.meta.framing.unwrap_or_default();
-    decode_wire(&case.system, bytes, &headers, types_db.as_deref(), carbon, framing)
+    if case.meta.kafka.is_some() {
+        ensure!(case.system.starts_with("kafka"), "kafka: names how a kafka_in case reads");
+    }
+    let kafka = case.meta.kafka.as_ref();
+    decode_wire(&case.system, bytes, &headers, types_db.as_deref(), carbon, framing, kafka)
         .with_context(|| format!("decoding {}", path.display()))
 }
 
@@ -419,6 +445,9 @@ const SCRAPE_INSTANCE: &str = "transit:9100";
 /// - `splunk`: one request body through `splunk_hec_in`'s own `decode_request`, which picks the
 ///   route from `path:`, a `/raw` body's envelope from its percent-decoded query string, and the
 ///   decompression from `content-encoding:`, as the listener does.
+/// - `kafka`: one partition's record batches, as a broker's segment file stores them, through
+///   `kafka_in`'s `decode_record_batches` in the meta's `kafka:` format, on partition 0 of the
+///   meta's topic, so every event carries its record's `_logit.kafka.*` carriers.
 fn decode_wire(
     system: &str,
     bytes: Vec<u8>,
@@ -426,6 +455,7 @@ fn decode_wire(
     types_db: Option<&str>,
     carbon: CarbonWire,
     framing: SyslogFraming,
+    kafka: Option<&KafkaWire>,
 ) -> anyhow::Result<String> {
     let mut probe = TelemetryProbe::new();
     let id = "transit.case";
@@ -672,6 +702,42 @@ fn decode_wire(
                 decoder,
             )
             .map_err(|err| anyhow::anyhow!("splunk_hec_in refused the request: {err}"))?
+        }
+        "kafka" => {
+            let telemetry = probe.telemetry(id, "kafka_in", "listener");
+            let wire = kafka.context("a kafka case's meta names no kafka: format")?;
+            let topic = wire.topic.as_deref().unwrap_or(KAFKA_TOPIC);
+            let batch = wire.record == Some(logit_config::KafkaRecord::Batch);
+            let format = match wire.format {
+                logit_config::KafkaFormat::Json => KafkaInFormat::Json,
+                logit_config::KafkaFormat::Msgpack => KafkaInFormat::Msgpack,
+                logit_config::KafkaFormat::Native => KafkaInFormat::Native,
+                logit_config::KafkaFormat::Text => KafkaInFormat::Text { batch },
+                logit_config::KafkaFormat::OtlpProto | logit_config::KafkaFormat::OtlpJson => {
+                    let topics = logit_outputs::kafka::SignalTopics::default();
+                    KafkaInFormat::Otlp {
+                        json: wire.format == logit_config::KafkaFormat::OtlpJson,
+                        topics: vec![
+                            (topics.logs, Signal::Logs),
+                            (topics.metrics, Signal::Metrics),
+                            (topics.traces, Signal::Traces),
+                        ],
+                    }
+                }
+            };
+            ensure!(
+                batch || wire.record.is_none(),
+                "record: batch is the only record: a case sets"
+            );
+            logit_inputs::kafka::decode_record_batches(
+                format,
+                topic,
+                0,
+                &Bytes::from(bytes),
+                super::wire::MAX_RECORDS_BYTES,
+                RECEIVED_AT,
+                telemetry,
+            )?
         }
         other => bail!("no wire decoder for a {other} case yet"),
     };
@@ -1271,6 +1337,12 @@ flow_tests! {
     influxdb_to_otlp => "influxdb-to-otlp",
     influxdb_to_statsd => "influxdb-to-statsd",
     influxdb_to_graphite => "influxdb-to-graphite",
+    kafka_relay_json => "kafka-relay-json",
+    kafka_relay_msgpack => "kafka-relay-msgpack",
+    kafka_relay_native => "kafka-relay-native",
+    kafka_relay_otlp_json => "kafka-relay-otlp-json",
+    kafka_relay_otlp_proto => "kafka-relay-otlp-proto",
+    kafka_relay_text => "kafka-relay-text",
     otlp_delta_to_datadog => "otlp-delta-to-datadog",
     otlp_logs_relay => "otlp-logs-relay",
     otlp_logs_to_datadog => "otlp-logs-to-datadog",
@@ -1380,6 +1452,7 @@ mod tests {
             None,
             CarbonWire::Plaintext,
             SyslogFraming::Datagram,
+            None,
         )
         .expect("datadog_trace_in decodes the capture");
         let events: Vec<Value> =
