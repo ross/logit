@@ -66,7 +66,7 @@ The ADRs are the design; this section doesn't restate their tables. In short:
 | W3a | `s3/w3a` | `s3/w3a: s3_out sink, single-PutObject path` | L | W1, W2 | open |
 | W3b | `s3/w3b` | `s3/w3b: s3_out multipart upload` | M | W3a | not started |
 | W4 | `s3/w4` | `s3/w4: replay_in reads gzip and zstd files` | S | — | not started |
-| W5 | `s3/w5` | `s3/w5: an S3 interop harness` | M | W3, W4 | not started |
+| W5 | `s3/w5` | `s3/w5: an S3 interop harness` | M | W3a | open (#945) |
 
 ### W0: ADRs and plan
 
@@ -149,7 +149,8 @@ config variant and its graph rules, the key, the staged object (encode, compress
 cuts), `PutObject` and the multipart path, the XML extractor, the response classes, the abort of
 an upload abandoned in the process, credentials and `ExpiredToken`'s refresh, and the telemetry.
 If the diff runs large, it splits into `s3/w3a` (the single-`PutObject` path, objects under one
-part) and `s3/w3b` (multipart), stacked.
+part) and `s3/w3b` (multipart), stacked. W3b also adds two legs to W5's `tools/s3-interop/`: a
+multipart object, and a forced retry that overwrites a key.
 
 **Files.** `crates/logit-outputs/src/s3/` (new), `crates/logit-outputs/src/lib.rs`,
 `crates/logit-outputs/Cargo.toml` (`logit-aws`), `crates/logit-config/src/lib.rs`,
@@ -207,19 +208,28 @@ and `AGENTS.md`'s inputs row.
 ### W5: `script/s3-interop`
 
 **Scope.** An out-of-CI harness, `tools/s3-interop/` and `script/s3-interop`, shaped like
-`script/splunk-interop`: pinned MinIO and Ceph RGW containers beside one `logit` per leg, and AWS
-S3 legs from a gitignored env file. Each leg lists what arrived, reads each object back through
-`replay_in`, and prints a `PASS`, `GAP`, or `FAIL` row: single-`PutObject` and multipart objects,
-each compression and format, a forced retry that overwrites a key, a `3xx` from a wrong region,
-and a store's answer to `x-amz-content-sha256` signed bodies.
+`script/splunk-interop`: a pinned MinIO and a pinned single-container Ceph RGW beside one `logit`
+per leg and store, and an AWS mode that runs the same legs against a bucket named in a gitignored
+env file. A pinned AWS CLI container lists, fetches, and heads every object, and each leg prints a
+`PASS`, `GAP`, or `FAIL` row on the single-`PutObject` path: `json` with `gzip`, `zstd`, and no
+compression; `format: native` decompressed and read back through `replay_in`; virtual-hosted
+addressing; `sse: aes256`, against the AWS CLI's own `PutObject` with the header as the
+reference; a wrong secret held and retried with no drop, then delivered from the spool after a
+restart; and a missing bucket held until the script creates it. Built on W3a without W4, so the
+script decompresses `native` objects before `replay_in` reads them.
 
-**Files.** `tools/s3-interop/` (compose file, `logit-*.yaml` legs, checker, README),
-`script/s3-interop`, and `.gitignore` for the env file.
+Not in W5: the multipart and forced-retry legs move to W3b. A `3xx` from a wrong region and a
+store's answer to `x-amz-content-sha256` signed bodies need a fault injector or a store
+configuration the harness doesn't have, and are the follow-up `s3/interop-faults`.
+
+**Files.** `tools/s3-interop/` (compose file, `logit-*.yaml` legs, `fetch.sh`, `check.py`,
+`Dockerfile.tools`, README), `script/s3-interop`, and `script/validate` and
+`crates/logit-cli/src/config.rs` for the legs' environment.
 
 **Tests.** The legs' configs join `script/validate` and `every_shipped_config_loads_and_validates`.
 
-**Docs.** `tools/s3-interop/README.md` with a recorded run, `AGENTS.md`'s environment table and
-harness list, and the ADR's decision 6 rows each run confirms or corrects.
+**Docs.** `tools/s3-interop/README.md` with a recorded run and its negative controls, and
+`AGENTS.md`'s environment table and harness list.
 
 ### Mechanics
 

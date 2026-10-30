@@ -817,7 +817,9 @@ the operator-facing account of all of this.
   `kafkaexporter`, and a request split under `max_request_bytes`). AWS_MSK_IAM isn't in it: no
   broker outside AWS implements it. See [tools/kafka-interop/README.md](tools/kafka-interop/README.md).
 - **S3 interop**: `script/s3-interop` checks `s3_out` against a real MinIO and a real Ceph RGW,
-  and with `S3_INTEROP_TARGET=aws` against a real S3 bucket from a gitignored env file. See
+  and with `S3_INTEROP_TARGET=aws` against a real S3 bucket from a gitignored env file. The
+  README's [Recorded run](tools/s3-interop/README.md#recorded-run) section records a local run,
+  `perf/results/s3-interop/20261030T190719Z/`; AWS mode has never been run. See
   [tools/s3-interop/README.md](tools/s3-interop/README.md).
 - **Soak**: `script/soak` runs real `logit` containers for minutes or hours under `tc netem` and
   Docker lifecycle faults from a scenario's TOML timeline (`tools/soak/scenarios/`), and scores crashes,
