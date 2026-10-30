@@ -725,7 +725,7 @@ async fn an_object_is_full_at_max_bytes_not_at_part_size() {
     assert_eq!(out.collecting(), None, "max_bytes reached");
 
     let mut settings = multipart(addr);
-    settings.part_size = one as u64;
+    settings.part_size = one;
     let mut out = sink_with(settings, &TelemetryProbe::new());
     out.submit(&batch("m1"), BatchContext::default(), seq(1)).await.unwrap();
     out.submit(&batch("m2"), BatchContext::default(), seq(2)).await.unwrap();
@@ -1274,7 +1274,8 @@ async fn a_bad_upload_is_clean_and_starts_the_object_again() {
 /// `Ambiguous`, and any other class passes through.
 #[tokio::test]
 async fn an_ambiguous_part_is_clean_and_an_ambiguous_complete_stays_ambiguous() {
-    let cases: [(&str, fn() -> Answer, Fault); 9] = [
+    type Case = (&'static str, fn() -> Answer, Fault);
+    let cases: [Case; 9] = [
         ("create", || reply(500, s3_error("InternalError")), Fault::Clean),
         ("create", || reply(503, "<html>busy</html>"), Fault::Clean),
         ("part", || reply(500, s3_error("InternalError")), Fault::Clean),

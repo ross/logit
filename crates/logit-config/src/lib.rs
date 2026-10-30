@@ -4211,8 +4211,9 @@ pub enum ComponentKind {
         max_age: Duration,
         /// The size of each part of a multipart upload, in compressed bytes. A byte-count
         /// string. Defaults to `"8MiB"`; must be between `"5MiB"` and `"5GiB"`, S3's part
-        /// bounds. Each object is written with one request today, so an object also closes once
-        /// its compressed bytes reach this.
+        /// bounds. An object whose compressed bytes pass it is uploaded in parts of this size as
+        /// it fills; a smaller one is written with one request. No request body is larger, so
+        /// keep `timeout` long enough to send one part.
         #[serde(default = "default_s3_part_size", with = "human_bytes")]
         #[schemars(with = "String")]
         part_size: u64,

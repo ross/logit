@@ -2529,16 +2529,16 @@ so the sink holds no `BatchAccounting` gate, and loss is the runtime's to count.
 
 | Name | Kind | Meaning |
 |---|---|---|
-| `logit.output.requests{op, class}` | count | one per request; `op` is `put_object`, and `class` the status class (`status_class`), `connect_error` for a failed dial (a dial `connect_timeout:` ended included), or `network_error` for any other transport error or a timeout |
+| `logit.output.requests{op, class}` | count | one per request; `op` is `put_object`, `create_upload`, `upload_part`, `complete_upload`, or `abort_upload`, and `class` the status class (`status_class`), `connect_error` for a failed dial (a dial `connect_timeout:` ended included), or `network_error` for any other transport error or a timeout |
 | `logit.output.request.duration{op}` | timer | one sample per request that returned, answered or failed; a request the shutdown grace cancels records none |
 | `logit.output.objects` | count | one per object stored |
-| `logit.output.bytes` | count | the compressed bytes of every request body sent, resends included; a failed dial sent none |
+| `logit.output.parts` | count | one per `UploadPart` request, answered or not; a `PutObject` counts none |
+| `logit.output.bytes` | count | the compressed bytes of every `PutObject` and `UploadPart` body sent, resends included; a failed dial sent none |
+| `logit.output.uploads.abandoned{aborted}` | count | one per multipart upload the sink gave up while running, after a failed part or completion, or one a cancelled call left: `aborted="true"` when its `AbortMultipartUpload` succeeded or found the upload gone, `"false"` when it failed and the bucket's lifecycle rule must remove the parts. An upload open at a crash or a cut shutdown isn't counted |
 
 The window's own `logit.component.window.closed{cause}`, and `send.duration` measured from an
 object's close to its answer, are layer 2's
-([ADR `collecting-sink-window`](../adr/collecting-sink-window.md), decision 4). Multipart upload
-isn't built yet; it adds the `create_upload`, `upload_part`, `complete_upload`, and
-`abort_upload` ops, `logit.output.parts`, and `logit.output.uploads.abandoned{aborted}`. No
+([ADR `collecting-sink-window`](../adr/collecting-sink-window.md), decision 4). No
 `Diagnostics` key: a failed request's error carries the bucket, the key, the status, and S3's
 `<Code>` and `<Message>`, never a credential.
 

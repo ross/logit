@@ -189,7 +189,9 @@ and in an amendment to the sink's own record:
   OTLP specification's non-retryable list (2026-10-04)", below).
 - `s3_out`: a `3xx`, a size limit, `411`, and the `400` codes that name configuration are
   `Refused`, since no S3 answer names one batch; a body that didn't arrive whole, an expired
-  token, `409` `OperationAborted`, `429`, and a `503` carrying an S3 code are `Clean`
+  token, a bad upload the sink assembled, `404` `NoSuchUpload`, `409` `OperationAborted`, `429`,
+  and a `503` carrying an S3 code are `Clean`, as is an `Ambiguous` answer to a request that
+  can't make an object visible
   (`crates/logit-outputs/src/s3/mod.rs`, "Response classes"; "Amendment: `s3_out`'s departures
   from the status-only default (2026-10-30)", below).
 
@@ -536,8 +538,8 @@ in four directions:
 
 - **`Refused` where the default drops.** A `3xx` (the sink follows no redirect, and a wrong
   region or endpoint answers every object alike), `413` and `400` `EntityTooLarge` (a body's size
-  is set by configuration: at most `part_size`, or about `part_size` plus one batch while every
-  object is one `PutObject`, so a smaller limit is configuration), `411`, and the `400` codes
+  is set by configuration: every body is at most `part_size`, so a smaller limit is
+  configuration), `411`, and the `400` codes
   that name configuration. `401`, `405`, and `407` keep the default `Refused`. S3 never interprets an object's content, so no S3 answer names
   one batch.
 - **`Clean` where the default drops or doubts.** A `400` whose body never arrived whole, an

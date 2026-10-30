@@ -64,7 +64,7 @@ The ADRs are the design; this section doesn't restate their tables. In short:
 | W1 | `s3/w1` | `s3/w1: move SigV4 and the AWS credential chain into logit-aws` | S | — | open (#926) |
 | W2 | `s3/w2` | `s3/w2: collecting sink window in the write loop` | M | W0 | open |
 | W3a | `s3/w3a` | `s3/w3a: s3_out sink, single-PutObject path` | L | W1, W2 | open |
-| W3b | `s3/w3b` | `s3/w3b: s3_out multipart upload` | M | W3a | not started |
+| W3b | `s3/w3b` | `s3/w3b: s3_out multipart upload` | M | W3a | open |
 | W4 | `s3/w4` | `s3/w4: replay_in reads gzip and zstd files` | S | — | not started |
 | W5 | `s3/w5` | `s3/w5: an S3 interop harness` | M | W3, W4 | not started |
 
@@ -299,3 +299,16 @@ Recorded per workstream as each lands.
 - W3b owes the multipart rows' tests (`InvalidPart`, `InvalidPartOrder`, `EntityTooSmall`,
   `NoSuchUpload`, and a `200` `CompleteMultipartUpload` with an `<Error>` body), the abort of an
   abandoned upload, and the late-Complete test.
+
+### W3b
+
+- Every test W3a owed is in `crates/logit-outputs/src/s3/tests.rs`: each multipart row of the
+  response table, part sizes and per-part hashes, the `<Error>` in a `200` completion, the abort
+  of an abandoned upload, poisoning past the head, and the late completion. The known-gaps entry
+  for W3a's object size is gone.
+- The close can cut more than one part, since finishing `gzip` or `zstd` writes what the
+  compressor held back, so the close, not staging, picks `PutObject` or a multipart upload, and
+  no request body is over `part_size` ([ADR `s3-object-archive`](../adr/s3-object-archive.md)'s
+  "Implementation notes (2026-10-30)" has this and the other points W3b decided).
+- A part's buffer never grows past `part_size`; cutting a part costs three allocations, once per
+  part ([`docs/design/memory.md`](../design/memory.md)).

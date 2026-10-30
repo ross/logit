@@ -6,9 +6,9 @@ updated: 2026-10-30
 # `s3_out`: one object per time and size window, delivered at completion, under a key its first batch names
 
 ## Status
-Accepted. The single-`PutObject` path is built (W3a of [the plan](../plans/s3-object-archive.md));
-the multipart path is W3b. "Implementation notes (2026-10-30)", below, records what W3a decided
-that this record left open. The
+Accepted. Built in W3a (the single-`PutObject` path) and W3b (the multipart path) of [the
+plan](../plans/s3-object-archive.md). "Implementation notes (2026-10-30)", below, records what
+each decided that this record left open. The
 window mechanics are [ADR `collecting-sink-window`](collecting-sink-window.md), and the response
 classes that depart from the shared default are recorded in [ADR
 `sink-fault-classes`](sink-fault-classes.md)'s "Amendment: `s3_out`'s departures from the
@@ -286,7 +286,7 @@ first copy and isn't updated.
 | `301` `PermanentRedirect`, `307` `TemporaryRedirect`, any other `3xx` | `Refused` | the wrong region or endpoint: the same answer for every object; the diagnostic carries `x-amz-bucket-region` |
 | `400` `RequestTimeout`, `IncompleteBody`, `BadDigest`, `XAmzContentSHA256Mismatch` | `Clean` | the body didn't arrive whole, so nothing was stored |
 | `400` `ExpiredToken`, `TokenRefreshRequired` | `Clean`, after `Chain::forget` | the credentials expired; fresh ones will sign the retry |
-| `400` `EntityTooLarge`, `413` | `Refused` | a body is at most `part_size` (about `part_size` plus one batch while every object is one `PutObject`), so the destination's limit is below it: configuration, not a batch |
+| `400` `EntityTooLarge`, `413` | `Refused` | every body is at most `part_size`, so the destination's limit is below it: configuration, not a batch |
 | `400` `InvalidArgument`, `InvalidToken`, `AuthorizationHeaderMalformed`, `InvalidBucketName`, `InvalidEncryptionAlgorithmError`, `InvalidStorageClass`, `KeyTooLongError`, `InvalidRequest`; any `4xx` whose code starts `KMS.` | `Refused` | configuration: the same answer for every object |
 | `400` `InvalidPart`, `InvalidPartOrder`, `EntityTooSmall` | `Clean` | the sink built a bad upload; nothing is visible yet, so the object starts again |
 | `401`, `405`, `407`, any code | `Refused` | credentials, a method a proxy or store won't take, or a proxy's credentials: the shared HTTP default |
@@ -405,11 +405,42 @@ The maintainer set both.
 
 ## Implementation notes (2026-10-30)
 
-W3a built the single-`PutObject` path and decided these points the record left open.
+W3a built the single-`PutObject` path and W3b the multipart path. Between them they decided these
+points the record left open.
 
-- **An object closes at `part_size` until W3b.** With no multipart path, an object closes once
-  its compressed body reaches `part_size`, so an object is at most about `part_size` plus one
-  batch's compressed bytes, whatever `max_bytes` says (`docs/known-gaps/sinks.md`).
+- **The close picks the request.** The close finishes the compressed stream, which can write
+  more than one part's worth: `gzip`'s deflate stream flushes what it held back, and `zstd`
+  compresses the chunk not yet compressed. An object whose close leaves one part, with none
+  uploaded, is one `PutObject`; any other is a multipart upload, even one whose staging cut no
+  part. So every request body is at most `part_size`, which is what decision 6's `EntityTooLarge`
+  row rests on.
+- **A part failure at the head is the head's own.** Decision 1's poisoning covers a part that
+  fails past the head, which the loop leaves unclassified. One that fails inside the head's own
+  `submit`, when the head alone fills a part, is the head's fault, which the loop classifies as
+  any submit failure with nothing in flight: the sink aborts the upload and fails the submit with
+  the part's class, and keeps no poison, so a `Rejected` head is dropped alone and the next batch
+  opens its own object.
+- **The loop resubmitting an object's first batch starts the object again**, whatever state a
+  cancelled `submit` or `await_ack` left, and aborts any upload that call left open.
+- **An abandoned upload is aborted at once.** The abort is sent from the call whose request failed,
+  before its fault returns, so a held queue doesn't leave uploads open between attempts. It
+  follows a failed `CompleteMultipartUpload` too, `Ambiguous` included: an abort after a
+  completion that did apply answers `NoSuchUpload`, which counts as `aborted="true"`, since no
+  parts are left either way.
+- **An `<Error>` in a `200` `CompleteMultipartUpload`** is read at the status S3 answers its code
+  with (`InternalError` `500`, `SlowDown` `503`, `NoSuchUpload` `404`, and so on), and a code the
+  table has no row for, or none, as `500`: the request may have been applied. The answer is read
+  whole, up to 64 KiB, since S3 can send whitespace before it; a body cut by a transport error or
+  over that bound is `Ambiguous`.
+- **A `200` missing what the sink needs is `Clean`.** A `CreateMultipartUpload` with no
+  `<UploadId>` or an `UploadPart` with no `ETag` stored nothing visible; the object starts again.
+- **The object's headers go on the request that creates it.** `Content-Type`, `storage_class:`,
+  and `sse:` go on `PutObject` or `CreateMultipartUpload`; `UploadPart`, `CompleteMultipartUpload`
+  (with `Content-Type: application/xml`), and `AbortMultipartUpload` carry none of them.
+- **`logit.output.bytes` counts object bytes**, the `PutObject` and `UploadPart` bodies, not
+  `CompleteMultipartUpload`'s part list.
+- **No `s3:ListMultipartUploadParts`.** The sink keeps each part's `ETag` from its answer and
+  never lists an upload's parts.
 - **An encode that fails past the head doesn't poison the object.** The failed batch was never
   staged, so the loop's unclassified stop completes the object without it, and the batch fails
   again at the head of the next object, where it's dropped alone as `Rejected`. Poisoning the
@@ -442,7 +473,7 @@ W3a built the single-`PutObject` path and decided these points the record left o
   case. At 1 MiB the frames are within 0.5% of one frame for the whole object, and 4 MiB buys under
   0.2% more for four times the buffer, so 1 MiB it is. The fixtures repeat one batch, which
   favors one long frame. The chunk not yet
-  compressed lags `part_size`'s check by up to 1 MiB of encoded input, as gzip's deflate buffer
+  compressed lags the part cut by up to 1 MiB of encoded input, as gzip's deflate buffer
   does by less.
 - **`401`, `405`, and `407` are `Refused`**, the shared HTTP default, and not decision 6's "any
   other `4xx`": each says the same thing about every object (credentials, a method the store or a

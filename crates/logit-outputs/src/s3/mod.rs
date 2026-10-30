@@ -10,30 +10,43 @@
 //! object stays reserved in the sink's store, uncommitted, until the object is stored.
 //!
 //! - **`submit` stages.** The first batch submitted into an empty object opens it and names its
-//!   key; each batch is encoded, compressed, and hashed into the body as it arrives
-//!   ([`StagedObject`]).
+//!   key; each batch is encoded, compressed, and cut into parts as it arrives ([`StagedObject`]),
+//!   and each full part is uploaded before `submit` returns, the first starting the multipart
+//!   upload.
 //! - **Full.** `collecting()` reads `None`, and `window()` reads the batches staged, once the
-//!   staged batches' encoded bytes reach `max_bytes`, the compressed body reaches `part_size`, or
-//!   the object holds the head's pinned batch count. The `window()` bound is what stops the fill
+//!   staged batches' encoded bytes reach `max_bytes` or the object holds the head's pinned batch
+//!   count. The `window()` bound is what stops the fill
 //!   when the head alone fills the object: no collecting window opens then, and the loop's
 //!   ordinary fill would otherwise submit every batch the store holds.
 //! - **`await_ack` on the head completes the object**: it closes the body and sends one
-//!   `PutObject`, and answers the head with the object's outcome. From then until each batch
+//!   `PutObject` when the body is one part and no part went up, else uploads the rest and sends
+//!   `CompleteMultipartUpload`, and answers the head with the object's outcome. From then until each batch
 //!   behind the head is answered, `window()` reads the answers owed, `collecting()` reads `None`,
 //!   and each later `await_ack` answers `Ok` at once.
-//! - **A fault covers the object.** A failed `PutObject`, or a credential lookup that failed
-//!   before it, returns its fault without `HeadOnly`, so the loop resubmits from the head and
-//!   the object is staged again under the same key.
+//! - **A fault covers the object.** A failed request, or a credential lookup that failed before
+//!   it, returns its fault without `HeadOnly`, so the loop resubmits from the head and the object
+//!   is staged again under the same key, in a new upload.
+//! - **A failed part poisons the object.** A part that fails inside `submit` past the head is
+//!   left unclassified by the loop, which stops the fill and reads the answers owed. The sink
+//!   never completes that upload, and the head's `await_ack` fails with the part's class and
+//!   without `HeadOnly`. At the head, the failure is the head's own, which the loop classifies.
+//! - **An abandoned upload is aborted.** Whenever an object with an upload starts again, or a
+//!   cancelled call left one behind, the sink sends `AbortMultipartUpload` once, bounded by
+//!   `timeout`, and counts it in `logit.output.uploads.abandoned{aborted}`. A failed abort isn't
+//!   retried; the bucket's lifecycle rule removes the parts. One answered `NoSuchUpload` counts
+//!   as aborted: no parts are left.
 //! - **An encode that fails** is the batch's own `Rejected` fault at the head. Past the head the
 //!   failed batch was never staged, so the loop's unclassified stop completes the object without
 //!   it, and the batch fails again at the head of the next object, where it's dropped alone.
-//! - **The shutdown grace.** [`Output::reached_destination`] reads 0 until the `PutObject` is
-//!   sent, so an at-most-once grace cut commits none of an object that never left the process.
+//! - **The shutdown grace.** [`Output::reached_destination`] reads 0 until the `PutObject` or
+//!   `CompleteMultipartUpload` is sent, so an at-most-once grace cut commits none of an object
+//!   that never became visible.
 //!
-//! **One `PutObject` per object.** Multipart upload isn't built yet, so an object closes once its
-//! compressed body reaches `part_size`: an object is at most about `part_size` plus one batch's
-//! compressed bytes, and under `zstd` plus the uncompressed chunk not yet compressed, whatever
-//! `max_bytes` says (`docs/known-gaps/sinks.md`).
+//! **Memory.** Every part but the last is `part_size` bytes, and a part's buffer never grows past
+//! it, so an object holds one part of compressed body, plus the full parts one batch cut before
+//! `submit` uploads them, plus the compressor's state: deflate's window, or the 1 MiB `zstd`
+//! chunk (`docs/design/memory.md`). The staged batches themselves are the store's, bounded by
+//! `buffer.max_bytes`.
 //!
 //! ## The key
 //!
@@ -47,19 +60,27 @@
 //!
 //! ## Requests
 //!
-//! One `PutObject` per object, with a known `Content-Length`, the body's hex SHA-256 in
-//! `x-amz-content-sha256`, signed with SigV4 header auth ([`sign`]'s module doc), and
-//! `Content-Type` `application/gzip`, `application/zstd`, `application/x-ndjson`, or
-//! `application/octet-stream`. No `Content-Encoding`: a client fetching the object would
-//! decompress it in transit and hand on bytes whose name says they're compressed. `storage_class:`
-//! sets `x-amz-storage-class`, and `sse:` sets `x-amz-server-side-encryption` with
-//! `x-amz-server-side-encryption-aws-kms-key-id` and
-//! `x-amz-server-side-encryption-bucket-key-enabled` under `aws_kms`. Redirects are off
-//! ([`crate::http::build_client`]), and every request is bounded by `timeout`.
+//! An object that closes as one part is one `PutObject`. Any other is a multipart upload:
+//! `CreateMultipartUpload` (`POST ?uploads`) once the first part fills, `UploadPart`
+//! (`PUT ?partNumber=N&uploadId=…`) per part, one at a time, and `CompleteMultipartUpload`
+//! (`POST ?uploadId=…`) naming each part's `ETag`; `AbortMultipartUpload` (`DELETE ?uploadId=…`)
+//! gives one up. No request body is over `part_size`. `PutObject` and `UploadPart` carry a known
+//! `Content-Length` and the body's hex SHA-256 in `x-amz-content-sha256`; every request is signed
+//! with SigV4 header auth, its query included ([`sign`]'s module doc). The request that creates
+//! the object, `PutObject` or `CreateMultipartUpload`, carries its `Content-Type`
+//! (`application/gzip`, `application/zstd`, `application/x-ndjson`, or
+//! `application/octet-stream`), `storage_class:` as `x-amz-storage-class`, and `sse:` as
+//! `x-amz-server-side-encryption` with `x-amz-server-side-encryption-aws-kms-key-id` and
+//! `x-amz-server-side-encryption-bucket-key-enabled` under `aws_kms`. No `Content-Encoding`: a
+//! client fetching the object would decompress it in transit and hand on bytes whose name says
+//! they're compressed. Redirects are off ([`crate::http::build_client`]), and every request is
+//! bounded by `timeout`.
 //!
 //! Credentials come from `credentials:`, else `logit_aws::creds::Chain`. An error answer's body
 //! is read bounded, to [`xml::ERROR_BODY_BYTES`], for its `<Code>` and `<Message>`, which the
-//! error quotes with the bucket and the key, never a credential.
+//! error quotes with the bucket and the key, never a credential. `CompleteMultipartUpload` can
+//! answer `200` and then fail, so its body is read whole, up to 64 KiB, before the object counts
+//! as stored: a body cut by a transport error or over the bound is `Ambiguous`.
 //!
 //! **No encode-side counts.** The json and native encoders count nothing, so the sink holds no
 //! `BatchAccounting` gate; every count below is per request or per object.
@@ -72,33 +93,42 @@
 //! runtime drops the head alone, counted `batches.dropped{reason="rejected"}`, and the next
 //! attempt uploads the rest again. This table is canonical; [ADR
 //! `s3-object-archive`](../../../../docs/adr/s3-object-archive.md)'s decision 6 was its first copy.
-//! A row only the multipart path can receive has no test yet: multipart upload isn't built, and
-//! [`classify`] already reads its codes.
+//! Every row applies to every request but where it names one, and the rule below the table
+//! reads an `Ambiguous` row as `Clean` for a request that can't make an object visible.
 //!
 //! | Answer | Class | Why | Source | Evidence |
 //! |---|---|---|---|---|
-//! | `2xx` | delivered | the object is stored | [PutObject] | `a_2xx_delivers_the_object` |
-//! | `200` from `CompleteMultipartUpload` with an `<Error>` body | the class of its `<Code>` below | AWS documents the error-in-`200` case | [CompleteMultipartUpload] | multipart only |
+//! | `2xx`; `CompleteMultipartUpload` `200` with no `<Error>` body | delivered: the object is stored, or the request succeeded | | [PutObject]; [CompleteMultipartUpload] | `a_2xx_delivers_the_object`, `parts_are_part_size_and_each_is_signed_by_its_own_hash` |
+//! | `200` from `CompleteMultipartUpload` with an `<Error>` body | the class of its `<Code>` below, read at the status S3 answers that code with; a code with no row, or none, as `500` | AWS documents the error-in-`200` case | [CompleteMultipartUpload] | `a_200_complete_with_an_error_body_is_not_delivered` |
 //! | `301` `PermanentRedirect`, `307` `TemporaryRedirect`, any other `3xx` | `Refused` | the wrong region or endpoint: the same answer for every object; the error carries `x-amz-bucket-region` | [S3 errors] | `a_3xx_is_refused_and_names_the_buckets_region` |
 //! | `400` `RequestTimeout`, `IncompleteBody`, `BadDigest`, `XAmzContentSHA256Mismatch` | `Clean` | the body didn't arrive whole, so nothing was stored | [S3 errors]; `XAmzContentSHA256Mismatch` from [MinIO's errors] and [Ceph RGW's errors] | `a_body_that_didnt_arrive_whole_is_clean` |
 //! | `400` `ExpiredToken`, `TokenRefreshRequired` | `Clean`, after `Chain::forget` | the credentials expired; fresh ones will sign the retry | [S3 errors] | `an_expired_token_is_clean_and_forgets_the_chains_credentials` |
-//! | `400` `EntityTooLarge`, `413` | `Refused` | a body is at most about `part_size` plus one batch, a size the configuration sets, so the destination's limit is below it: configuration, not a batch | [S3 errors]; [RFC 9110] | `a_body_too_large_is_refused` |
+//! | `400` `EntityTooLarge`, `413` | `Refused` | every body is at most `part_size`, a size the configuration sets, so the destination's limit is below it: configuration, not a batch | [S3 errors]; [RFC 9110] | `a_body_too_large_is_refused` |
 //! | `400` `InvalidArgument`, `InvalidToken`, `AuthorizationHeaderMalformed`, `InvalidBucketName`, `InvalidEncryptionAlgorithmError`, `InvalidStorageClass`, `KeyTooLongError`, `InvalidRequest`; any `4xx` whose code starts `KMS.` | `Refused` | configuration: the same answer for every object | [S3 errors]; `KMS.*` from [AWS KMS's errors] and [MinIO's errors] | `a_configuration_code_is_refused` |
-//! | `400` `InvalidPart`, `InvalidPartOrder`, `EntityTooSmall` | `Clean` | the sink built a bad upload; nothing is visible yet, so the object starts again | [CompleteMultipartUpload] | multipart only |
+//! | `400` `InvalidPart`, `InvalidPartOrder`, `EntityTooSmall` | `Clean` | the sink built a bad upload; nothing is visible yet, so the object starts again | [CompleteMultipartUpload] | `a_bad_upload_is_clean_and_starts_the_object_again` |
 //! | `401`, `405`, `407`, any code | `Refused` | credentials, a method a proxy or store won't take, or a proxy's credentials: the shared HTTP default ([`crate::http::classify_status`]) | [RFC 9110] | `a_401_405_or_407_is_refused` |
 //! | `403`, any code | `Refused` | credentials or policy | [S3 errors] | `a_403_is_refused` |
 //! | `404` `NoSuchBucket`, and any other `404` | `Refused` | the bucket or endpoint is wrong | [S3 errors] | `a_404_is_refused` |
-//! | `404` `NoSuchUpload` | `Clean` | the upload was aborted underneath the sink; the object starts again | [S3 errors] | multipart only |
+//! | `404` `NoSuchUpload` | `Clean` | the upload was aborted underneath the sink; the object starts again, and the sink sends an abort for the old upload | [S3 errors] | `no_such_upload_starts_the_object_again_and_aborts_the_old_upload` |
 //! | `408` | `Ambiguous` | the shared default ([ADR `sink-fault-classes`](../../../../docs/adr/sink-fault-classes.md)'s "Amendment: 408 is `Ambiguous`") | [RFC 9110] | `a_408_is_ambiguous` |
 //! | `409` `OperationAborted` | `Clean` | a conflicting operation was in progress; nothing was stored | [S3 errors] | `a_409_operation_aborted_is_clean` |
 //! | `411` `MissingContentLength` | `Refused` | a proxy or store that won't take the request's framing | [S3 errors] | `a_411_is_refused` |
-//! | `429`; any `503` with an S3 XML `<Code>` (`SlowDown`, `ServiceUnavailable`, MinIO's `SlowDownWrite` and `SlowDownRead`) | `Clean` | the store refused the request before processing it; `PutObject` is atomic | [S3 errors]; [MinIO's errors] | `a_429_or_a_503_with_a_code_is_clean` |
+//! | `429`; any `503` with an S3 XML `<Code>` (`SlowDown`, `ServiceUnavailable`, MinIO's `SlowDownWrite` and `SlowDownRead`) | `Clean` | the store refused the request before processing it; `PutObject` and `UploadPart` are atomic | [S3 errors]; [MinIO's errors] | `a_429_or_a_503_with_a_code_is_clean` |
 //! | `503` with no S3 `<Code>` | `Ambiguous` | a load balancer's answer, which says nothing about the store: the shared default | [RFC 9110] | `a_503_with_no_code_is_ambiguous` |
 //! | `500` (`InternalError` or any other code), `502`, `504`, and any other `5xx` | `Ambiguous` | the request may have been applied; a retry rewrites the same key; the shared default | [S3 errors] | `a_5xx_is_ambiguous` |
 //! | `501` `NotImplemented` | `Refused` | the store lacks a feature the sink uses | [S3 errors] | `a_501_is_refused` |
 //! | any other `4xx` | `Rejected` | [ADR `sink-fault-classes`](../../../../docs/adr/sink-fault-classes.md)'s rule for an answer the sink can't attribute | | `any_other_4xx_is_rejected` |
 //! | connect failure; a dial `connect_timeout:` ended | `Clean` | nothing left the process: the shared HTTP driver's default ([`crate::http::classify_reqwest_error`]) | | `a_refused_or_stalled_dial_is_clean` |
 //! | request timeout, or another transport error after the connection opened | `Ambiguous` | the request may have been applied: the shared HTTP driver's default | | `a_request_timeout_is_ambiguous` |
+//!
+//! **Nothing is visible before completion.** An answer the table reads `Ambiguous` to
+//! `CreateMultipartUpload` or `UploadPart`, a timeout or another transport error included, is
+//! `Clean`: no object is visible at the key until `CompleteMultipartUpload` succeeds, so the
+//! request couldn't have stored a batch. Only `PutObject` and `CompleteMultipartUpload` can be
+//! `Ambiguous`, which keeps `at_most_once` from dropping an object that was never stored
+//! (`an_ambiguous_part_is_clean_and_an_ambiguous_complete_stays_ambiguous`). A
+//! `CreateMultipartUpload` `200` with no `<UploadId>`, and an `UploadPart` `200` with no `ETag`,
+//! are `Clean` too.
 //!
 //! `AccessControlListNotSupported` has no row: it answers a request carrying an ACL, and the sink
 //! sends none, so it falls to "any other `4xx`".
@@ -117,15 +147,18 @@
 //! **Retries are the loop's.** Every retryable class restarts the object from its head through
 //! the window protocol, holding no more than the head's pinned count (the "Full" bound above);
 //! the sink retries no request of its own. **Posture:** the default, `at_least_once`, because a retry rewrites the same key.
-//! Under `at_most_once` an `Ambiguous` `PutObject` drops every batch of its object, which may be
-//! stored.
+//! Under `at_most_once` an `Ambiguous` `PutObject` or `CompleteMultipartUpload` drops every batch
+//! of its object, which may be stored.
 //!
 //! ## Telemetry
 //!
-//! `logit.output.requests{op, class}` per request, `op` `put_object` and `class` the HTTP sinks'
-//! status bucket or `connect_error`/`network_error`; `logit.output.request.duration{op}`;
-//! `logit.output.objects` per object stored; and `logit.output.bytes` per compressed byte sent,
-//! resends included (`docs/design/internal-telemetry.md`). Loss is the runtime's to count.
+//! `logit.output.requests{op, class}` per request, `op` one of `put_object`, `create_upload`,
+//! `upload_part`, `complete_upload`, and `abort_upload`, and `class` the HTTP sinks' status bucket
+//! or `connect_error`/`network_error`; `logit.output.request.duration{op}`;
+//! `logit.output.objects` per object stored; `logit.output.parts` per `UploadPart` request;
+//! `logit.output.bytes` per compressed byte of a `PutObject` or `UploadPart` body sent, resends
+//! included; and `logit.output.uploads.abandoned{aborted}` per upload given up
+//! (`docs/design/internal-telemetry.md`). Loss is the runtime's to count.
 
 mod key;
 mod object;

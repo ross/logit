@@ -4198,21 +4198,29 @@ components:
 
 A key is `{prefix}{partition}{time}-{store id}-{first seq}.{ext}`, such as
 `syslog/dt=2026-10-30/hour=14/20261030T142501.123Z-6f1c…e09a-00000000000000000042.ndjson.gz`.
-Each object is written with one `PutObject` today, so an object also closes once its compressed
-bytes reach `part_size` (8 MiB by default; [known gaps](known-gaps/sinks.md)).
+An object whose compressed bytes pass `part_size` (8 MiB by default) is uploaded in parts of
+that size as it fills, and made visible whole when it closes; a smaller one is one `PutObject`. No
+request carries more than `part_size`, so set `timeout:` (default `60s`) long enough to send one
+part at your link's rate.
 
 **Partitions are ingest time.** `partition:` is formatted in UTC at the moment the object's first
 batch was staged, never from an event's own timestamp. A backlog replayed tomorrow lands under
 tomorrow's partition, and a query engine that prunes on `dt=` must allow for the lag between an
 event and its archive.
 
-**Give the bucket a lifecycle rule** that aborts incomplete multipart uploads after a day or so
-(`AbortIncompleteMultipartUpload`). A multipart upload `logit` abandons, at a crash or a restart,
-holds its parts, and S3 bills them until the rule removes them.
+**The bucket needs a lifecycle rule** that aborts incomplete multipart uploads after a day or so
+(`AbortIncompleteMultipartUpload`). Every object larger than `part_size` is a multipart upload,
+and one `logit` abandons holds its parts invisibly, billed until the rule removes them. The sink
+sends `AbortMultipartUpload` for an upload it gives up while running, once, and counts one that
+fails `logit.output.uploads.abandoned{aborted="false"}`; an upload open at a crash, a restart, or
+a shutdown the grace cut is never aborted. Without the rule those parts stay forever.
 
-**IAM permissions.** The sink needs `s3:PutObject` on `arn:aws:s3:::BUCKET/PREFIX*` and
-`s3:AbortMultipartUpload` on the same resource. Under `sse: {algorithm: aws_kms}` it also needs
-`kms:GenerateDataKey` and `kms:Decrypt` on the key. It never lists, reads, or deletes. With no
+**IAM permissions.** The sink needs `s3:PutObject` on `arn:aws:s3:::BUCKET/PREFIX*`, which also
+covers the multipart upload's create, part, and complete requests, and `s3:AbortMultipartUpload`
+on the same resource. Under `sse: {algorithm: aws_kms}` it also needs `kms:GenerateDataKey` and
+`kms:Decrypt` on the key: `kms:Decrypt` is what a multipart upload to an encrypted bucket uses.
+It never lists, reads, or deletes objects, and never lists an upload's parts
+(`s3:ListMultipartUploadParts` isn't needed). With no
 `credentials:` block, credentials come from the AWS default chain: the environment, a web
 identity token (EKS IRSA), the shared credentials and config files (static keys only), the
 container credentials endpoint (ECS, EKS Pod Identity), and the instance metadata service, in

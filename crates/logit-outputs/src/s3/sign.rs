@@ -9,7 +9,8 @@
 //!   and the canonical request encodes the decoded path the same way.
 //! - **SigV4 header auth.** Every header the sink sends but `Content-Length` and `Authorization`
 //!   is signed, `host` among them; `x-amz-content-sha256` is the body's hex SHA-256, signed as the
-//!   payload hash, and temporary credentials add `x-amz-security-token`.
+//!   payload hash, and temporary credentials add `x-amz-security-token`. The query is signed
+//!   decoded, a parameter with no value as `name=`, while the URL writes it as `?name`.
 
 use logit_aws::creds::Credentials;
 use logit_aws::sigv4::{uri_encode, AmzDate, Request, Signer};
