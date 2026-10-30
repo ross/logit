@@ -1,6 +1,6 @@
 ---
 created: 2026-10-13
-updated: 2026-10-23
+updated: 2026-10-30
 ---
 
 # Private attribute namespace: protocol carriers live under `_logit.<protocol>.`, and every other protocol's sink ignores them
@@ -75,6 +75,7 @@ By protocol, these move under `_logit.`:
 | InfluxDB | `influxdb.measurement` and the resource attributes `influxdb.org`, `influxdb.org_id`, and `influxdb.bucket`; string fields live under `field.<key>`, no longer a protocol segment (the 2026-10-22 amendment) |
 | syslog | `syslog.severity` |
 | OTLP | `otel.severity_number` and `otel.severity_text` |
+| Kafka | every `kafka.*` attribute `kafka_in` stamps: `topic`, `partition`, `offset`, `key`, `headers`, `timestamp`, and `timestamp_type` ([ADR `kafka-input`](kafka-input.md)) |
 
 These stay public:
 
@@ -115,7 +116,10 @@ attribute is data and renders like any other map key.
 Renders whose purpose is the whole event carry everything, private keys included:
 
 - `stdio_out` and `file_out`, under the human render, `format: json`, and `format: native`.
-- `kafka_out` under `format: json`, `msgpack`, and `native`.
+- `kafka_out` under `format: json`, `msgpack`, and `native`, less its own family's carriers:
+  it leaves every top-level `_logit.kafka.*` key out, so a record relayed from `kafka_in` doesn't
+  carry its source record's metadata into the new one
+  ([ADR `kafka-output`](kafka-output.md)).
 - The native wire: `logit_out`, `logit_in`, and the `buffer.disk:` spool.
 
 `kafka_out`'s `otlp_proto` and `otlp_json` formats render attributes as OTLP does, and follow the
