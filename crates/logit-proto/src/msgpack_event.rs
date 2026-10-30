@@ -21,10 +21,13 @@
 //! - Input is several values back to back, not lines; empty input is no batch.
 //!
 //! **Bounds**, checked before anything is allocated: an array's or a map's declared count must
-//! fit the bytes left (an entry takes at least one byte each), nesting stops at [`MAX_DEPTH`]
-//! (`serde_json`'s own limit, so a value one format reads the other does too), and the parsed
-//! trees of one input are charged to a [`DecodeBudget`], one tree node and each string's or
-//! `bin`'s length at a time. Each failure is `CodecError::Malformed` with its own text, or
+//! fit the bytes left (an entry takes at least one byte, a map entry two), nesting stops at
+//! [`MAX_DEPTH`] (`serde_json`'s own limit, so a value one format reads the other does too), and
+//! the parsed trees of one input are charged to a [`DecodeBudget`], one tree node and each
+//! string's or `bin`'s length at a time. A container reserves at most 4096 entries up front, as
+//! `crate::native`'s readers do: the count check caps one declared count at the bytes left, but a
+//! nest of containers each declaring that much would reserve it once per level, uncharged, before
+//! the budget sees an entry. Each failure is `CodecError::Malformed` with its own text, or
 //! `CodecError::BudgetExceeded`.
 
 use std::mem::size_of;
@@ -38,8 +41,12 @@ use crate::msgpack::{Reader, Type};
 use crate::native::DecodeBudget;
 use crate::CodecError;
 
-/// The deepest nesting of arrays and maps a value may have; the event map is depth 1.
+/// The nesting depth at which a value is refused. The event map is depth 1, so 127 nested arrays
+/// and maps read and a 128th doesn't, as `serde_json` reads a JSON line.
 pub const MAX_DEPTH: usize = 128;
+
+/// The most entries a container reserves before reading them.
+const MAX_RESERVE: usize = 4096;
 
 /// Reads `format: msgpack` values. Holds the last event's resource and scope, so events that
 /// repeat them share one `Arc`, across calls as within one.
@@ -115,7 +122,7 @@ fn read_node(
             check_depth(depth)?;
             let n = r.read_array_len()?;
             check_count(r, "an array", n, n)?;
-            let mut items = Vec::with_capacity(n);
+            let mut items = Vec::with_capacity(n.min(MAX_RESERVE));
             for _ in 0..n {
                 items.push(read_node(r, src, depth + 1, budget)?);
             }
@@ -125,7 +132,7 @@ fn read_node(
             check_depth(depth)?;
             let n = r.read_map_len()?;
             check_count(r, "a map", n, n.saturating_mul(2))?;
-            let mut entries = Vec::with_capacity(n);
+            let mut entries = Vec::with_capacity(n.min(MAX_RESERVE));
             for _ in 0..n {
                 if r.peek_type()? != Type::Str {
                     return Err(malformed(format!("a map key is a {}, not a str", r.peek_type()?)));
@@ -146,14 +153,14 @@ fn read_string(r: &mut Reader<'_>, budget: &DecodeBudget) -> Result<String, Code
 }
 
 fn check_depth(depth: usize) -> Result<(), CodecError> {
-    if depth > MAX_DEPTH {
-        return Err(malformed(format!("nesting deeper than {MAX_DEPTH}")));
+    if depth >= MAX_DEPTH {
+        return Err(malformed(format!("nesting reaches {MAX_DEPTH}")));
     }
     Ok(())
 }
 
 /// Refuses a declared count of `n` entries needing at least `least` bytes when fewer are left,
-/// before a `Vec` of `n` is allocated.
+/// before a `Vec` for them is allocated.
 fn check_count(r: &Reader<'_>, what: &str, n: usize, least: usize) -> Result<(), CodecError> {
     if least > r.remaining() {
         return Err(malformed(format!(
@@ -296,7 +303,7 @@ mod tests {
         deep.write_str("attributes");
         deep.write_map_len(1);
         deep.write_str("k");
-        for _ in 0..MAX_DEPTH {
+        for _ in 0..MAX_DEPTH - 2 {
             deep.write_array_len(1);
         }
         deep.write_nil();
@@ -319,7 +326,7 @@ mod tests {
             "truncated msgpack input",
             "timestamp is not a string",
             "declares 65535 entries with 1 bytes left",
-            "nesting deeper than 128",
+            "nesting reaches 128",
             "a value is a array, not a map",
             "a map key is a uint, not a str",
         ];
@@ -334,7 +341,7 @@ mod tests {
         shallow.write_str("attributes");
         shallow.write_map_len(1);
         shallow.write_str("k");
-        for _ in 0..MAX_DEPTH - 2 {
+        for _ in 0..MAX_DEPTH - 3 {
             shallow.write_array_len(1);
         }
         shallow.write_nil();
@@ -343,6 +350,74 @@ mod tests {
         let mut tail = truncated.as_slice().to_vec();
         tail.extend_from_slice(whole.as_slice());
         assert!(MsgpackEventDecoder::new().decode_batches(&Bytes::from(tail)).is_err());
+    }
+
+    #[test]
+    fn a_map_count_needs_two_bytes_an_entry() {
+        // 100 entries declared with 150 bytes left: enough for 100 one-byte values, not for
+        // 100 keys and values.
+        let mut w = Writer::new();
+        w.write_map_len(100);
+        for _ in 0..150 {
+            w.write_nil();
+        }
+        let got = error(&w);
+        assert!(got.contains("a map declares 100 entries with 150 bytes left"), "{got}");
+    }
+
+    #[test]
+    fn json_and_msgpack_refuse_the_same_depth() {
+        // The event map, its attributes map, and `arrays` more: `2 + arrays` containers.
+        let json = |arrays: usize| {
+            let line = format!(
+                "{{\"timestamp\":\"{T0}\",\"attributes\":{{\"k\":{}null{}}}}}",
+                "[".repeat(arrays),
+                "]".repeat(arrays),
+            );
+            EventJsonDecoder::new().decode_batches(line.as_bytes())
+        };
+        let msgpack = |arrays: usize| {
+            let mut w = Writer::new();
+            event(&mut w, None, 1, |w| {
+                w.write_str("k");
+                for _ in 0..arrays {
+                    w.write_array_len(1);
+                }
+                w.write_nil();
+            });
+            decode(&w)
+        };
+        for (arrays, reads) in [(MAX_DEPTH - 3, true), (MAX_DEPTH - 2, false)] {
+            assert_eq!(json(arrays).is_ok(), reads, "json, {} containers", arrays + 2);
+            assert_eq!(msgpack(arrays).is_ok(), reads, "msgpack, {} containers", arrays + 2);
+        }
+    }
+
+    #[test]
+    fn each_node_and_each_string_is_charged() {
+        let budget = || DecodeBudget::new(4096);
+        let refused = |w: &Writer| {
+            let bytes = Bytes::copy_from_slice(w.as_slice());
+            let got = MsgpackEventDecoder::new().decode_batches_with_budget(&bytes, &budget());
+            assert!(matches!(got, Err(CodecError::BudgetExceeded { limit: 4096 })), "{got:?}");
+            assert!(MsgpackEventDecoder::new().decode_batches(&bytes).is_ok());
+        };
+        // A thousand nils: one byte of input each, a tree node each.
+        let mut nodes = Writer::new();
+        event(&mut nodes, None, 1, |w| {
+            w.write_str("k");
+            w.write_array_len(1000);
+            for _ in 0..1000 {
+                w.write_nil();
+            }
+        });
+        refused(&nodes);
+        let mut string = Writer::new();
+        event(&mut string, None, 1, |w| {
+            w.write_str("k");
+            w.write_str(&"x".repeat(4096));
+        });
+        refused(&string);
     }
 
     #[test]
