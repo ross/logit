@@ -282,6 +282,10 @@ pub fn generate(testdata: &Path) -> std::io::Result<(Seeds, Vec<String>)> {
         add("forwarded", name.to_string(), bytes);
     }
 
+    for (name, bytes) in cri_lines() {
+        add("cri", name.to_string(), bytes);
+    }
+
     for (name, bytes) in authorization_headers() {
         add("http_auth", name.to_string(), bytes);
     }
@@ -410,6 +414,26 @@ fn forwarding_headers() -> Vec<(&'static str, Vec<u8>)> {
         ("real-ip", real(" 198.51.100.2 ")),
         ("real-ip-v6", real("2001:db8::1")),
     ]
+}
+
+/// CRI log lines from `logit_proto::cri`'s unit vectors: both runtimes' timestamp shapes, partial
+/// and full tags, and each malformed form.
+fn cri_lines() -> Vec<(&'static str, Vec<u8>)> {
+    let lines: [(&'static str, &[u8]); 12] = [
+        ("containerd-utc-full", b"2026-09-21T13:33:20.123456789Z stdout F hello world"),
+        ("containerd-no-fraction", b"2026-09-21T13:33:20Z stderr F x"),
+        ("containerd-local-offset", b"2026-09-21T09:33:20.123-04:00 stdout F x"),
+        ("crio-partial", b"2026-09-21T13:33:20.123456789+00:00 stderr P partial chunk"),
+        ("empty-content", b"2026-09-21T13:33:20Z stdout F "),
+        ("multi-tag", b"2026-09-21T13:33:20Z stdout P:F y"),
+        ("trailing-cr", b"2026-09-21T13:33:20Z stdout F a  b \r"),
+        ("bad-timestamp", b"yesterday stdout P body"),
+        ("bad-utf8-content", b"2026-09-21T13:33:20Z stdout F \xff\xfe\x00a"),
+        ("unknown-stream", b"2026-09-21T13:33:20Z stdin F x"),
+        ("missing-tag-space", b"2026-09-21T13:33:20Z stdout F"),
+        ("docker-json", br#"{"log":"x\n","stream":"stdout","time":"2026-09-21T13:33:20Z"}"#),
+    ];
+    lines.into_iter().map(|(name, line)| (name, line.to_vec())).collect()
 }
 
 /// `Authorization` header values from `logit_proto::auth`'s unit vectors, each behind the
@@ -1451,6 +1475,7 @@ mod tests {
             targets,
             [
                 "collectd",
+                "cri",
                 "forwarded",
                 "graphite_pickle",
                 "graphite_plaintext",
