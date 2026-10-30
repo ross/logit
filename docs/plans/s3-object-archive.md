@@ -121,8 +121,11 @@ each waiting on an observable through `logit_pipeline::test_util`:
   grace that passes during the head's own upload still cuts it;
 - a submit failure past the head makes the head's next `await_ack` fail without `HeadOnly`, and
   the loop resubmits from the head, the failed batch included;
-- pressure closes it in a memory store under `block` and under `drop_oldest`, and in a disk store
-  at `disk.max_bytes`; under `block` the waiting push completes once the window's batches commit;
+- pressure closes it in a memory store under `block` and in a disk store at `disk.max_bytes`, and
+  under `block` the waiting push completes once the window's batches commit; under `drop_oldest`
+  the batch a memory store accepts over its bound joins the window, which closes on the memory
+  bound;
+- a store held at its bound still fills each window with every batch it holds, in both stores;
 - a fault without `HeadOnly` reopens the window from the head without observing any batch again;
 - under `at_most_once`, a grace cut commits only the batches the sink says may have reached the
   destination, and the rest stay reserved; a sink keeping the default counts what

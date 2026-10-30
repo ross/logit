@@ -741,9 +741,10 @@ impl<T: Queued + Clone> BoundedQueue<T> {
     }
 
     /// Waits for the `n`-th item from the head, as [`BoundedQueue::peek_at`] returns it, until
-    /// `deadline`. Returns [`StoreWait::Pressure`] while the store-pressure signal is raised,
-    /// checked first, else the item once one is there, else [`StoreWait::Closed`] once the queue
-    /// is closed, else [`StoreWait::Deadline`] at `deadline`. Reserves items `0..=n` only when it
+    /// `deadline`. Returns the item once one is there, else [`StoreWait::Pressure`] while the
+    /// store-pressure signal is raised, else [`StoreWait::Closed`] once the queue is closed, else
+    /// [`StoreWait::Deadline`] at `deadline`. Pressure ends the wait, never the intake of an item
+    /// the queue already holds. Reserves items `0..=n` only when it
     /// returns the item. Cancellation-safe: a dropped wait leaves the queue as it found it.
     /// [`BoundedQueue::peek`]'s one-consumer rule applies.
     pub async fn wait_at(&self, n: usize, deadline: tokio::time::Instant) -> StoreWait<T> {
@@ -752,14 +753,14 @@ impl<T: Queued + Clone> BoundedQueue<T> {
             // lands after a check still wakes this wait.
             let notified = self.not_empty.notified();
             let raised = self.watch.pressure_raised();
-            if self.watch.under_pressure() {
-                return StoreWait::Pressure;
-            }
             {
                 let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 if let Some(item) = inner.peek_at(n) {
                     return StoreWait::Item(item.clone());
                 }
+            }
+            if self.watch.under_pressure() {
+                return StoreWait::Pressure;
             }
             if self.closed.load(Ordering::Acquire) {
                 return StoreWait::Closed;
@@ -1624,8 +1625,9 @@ mod tests {
     }
 
     /// Under `drop_oldest` with every batch reserved, a push is accepted over the bound: no drop
-    /// is counted, but the pressure signal is raised and wakes a wait. A commit back under the
-    /// bound clears it.
+    /// is counted, but the pressure signal is raised. A wait past the accepted batch ends on it,
+    /// while the batch itself is returned like any the queue holds. A commit back under the bound
+    /// clears the signal.
     #[tokio::test(start_paused = true)]
     async fn a_drop_oldest_push_accepted_over_the_bound_raises_pressure_until_a_commit() {
         let store = SinkStore::Memory(queue(2, u64::MAX, OverflowPolicy::DropOldest));
@@ -1634,12 +1636,14 @@ mod tests {
         }
         assert!(store.peek_at(1).await.is_some(), "both reserved");
         assert!(!store.under_pressure());
-        let (waited, ()) = tokio::join!(store.wait_at(2, far()), async {
+        let (waited, ()) = tokio::join!(store.wait_at(3, far()), async {
             tokio::task::yield_now().await;
             store.push((tiny_batch(), ctx())).await;
         });
         assert!(matches!(waited, StoreWait::Pressure), "{waited:?}");
         assert_eq!(store.queued(), 3, "accepted over the bound");
+        let held = store.wait_at(2, far()).await;
+        assert!(matches!(held, StoreWait::Item(_)), "a batch it holds isn't withheld: {held:?}");
         store.commit();
         assert!(store.under_pressure(), "still at the bound");
         store.commit();

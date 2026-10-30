@@ -1020,8 +1020,9 @@ unreliable, pick a policy deliberately instead of leaving the default.
 On a sink that collects batches into one upload, every batch in the open or uploading upload is
 held in the buffer. `drop_oldest` never sheds those, so it sheds the oldest batch behind them,
 which arrived after the upload closed: in effect the newest. A full buffer under any policy closes
-the open upload early, and `logit.component.window.closed{cause="pressure"}` counts each one. If
-that count climbs, raise the buffer's bounds.
+the open upload early: it takes every batch the buffer already holds, then closes instead of
+waiting for more, and `logit.component.window.closed{cause="pressure"}` counts each one. If that
+count climbs, raise the buffer's bounds.
 
 ### What to watch for sink buffering
 

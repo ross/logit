@@ -1325,10 +1325,10 @@ struct RoundEnv<'a> {
 ///
 /// A collecting sink's window (`Output::collecting`, `docs/adr/collecting-sink-window.md`)
 /// opens when a `collecting()` read after the head's submit returns `Some`. Before each later
-/// submit, the fill closes it once `collecting()` reads `None`, its deadline has passed, the
-/// staged batches reach `env.window_max_bytes`, or the store is under pressure; an empty
-/// `peek_at` waits on the store until an item, the deadline, pressure, the store closing, or the
-/// shutdown signal, and after the signal it doesn't wait. Each close is counted under its
+/// submit, the fill closes it once `collecting()` reads `None`, its deadline has passed, or the
+/// staged batches reach `env.window_max_bytes`. It takes every batch the store already holds;
+/// an empty `peek_at` waits on the store until an item, the deadline, store pressure, the store
+/// closing, or the shutdown signal, and after the signal it doesn't wait. Each close is counted under its
 /// [`WindowClose`] cause. A submit failure past the head ends the fill uncounted: the sink fails
 /// the head's answer, and the window reopens from the head.
 async fn window_round(
@@ -1481,9 +1481,10 @@ async fn collecting_next(
     if state.staged_bytes >= env.window_max_bytes {
         return Err(WindowClose::Memory);
     }
-    if store.under_pressure() {
-        return Err(WindowClose::Pressure);
-    }
+    // Pressure stops only the wait for new arrivals, inside `wait_at`. A batch the store holds
+    // grows neither store when the window takes it: a memory store already counts it, and the
+    // memory bound above bounds a disk store's read-ahead. Closing frees one slot, so a check
+    // here would make every window one batch under sustained overload.
     if let Some(item) = store.peek_at(position).await {
         return Ok(item);
     }
@@ -9458,13 +9459,19 @@ mod tests {
         }
     }
 
-    /// Store pressure closes a window: a `block` push waiting for room in a memory store and in a
-    /// disk store, and a `drop_oldest` push the memory store accepts over its bound with every
-    /// batch reserved. Batches 1 and 2 are staged before batch 3 is pushed into a store with room
-    /// for two. Each `block` push completes once the window's batches commit.
+    /// Store pressure closes a window that waits for its next batch: a `block` push waiting for
+    /// room in a memory store and in a disk store. Batches 1 and 2 are staged before batch 3 is
+    /// pushed into a store without room for it, and the waiting push completes once the window's
+    /// batches commit. `window_max_bytes` is the memory store's `max_bytes`, as `buffer.max_bytes`
+    /// sets both.
+    ///
+    /// Under `drop_oldest` the memory store accepts batch 3 over its bound, since every batch is
+    /// reserved, and the window takes it like any batch the store holds. The window then closes at
+    /// the memory bound, with the store one batch over its bound and nothing shed.
     #[tokio::test(start_paused = true)]
     async fn store_pressure_closes_a_collecting_window_in_each_store() {
         let one = one_event_batch(1.0).estimated_heap_bytes();
+        let max_bytes = 2 * one + one / 2;
         for case in ["memory block", "memory drop_oldest", "disk block"] {
             let (mut output, log) = collecting_output(Duration::from_secs(3600), 100);
             let registry = Registry::new();
@@ -9480,9 +9487,11 @@ mod tests {
                     .unwrap(),
                 ))),
                 "memory block" => {
-                    collecting_memory_store(1024, 2 * one, OverflowPolicy::Block, &telemetry)
+                    collecting_memory_store(1024, max_bytes, OverflowPolicy::Block, &telemetry)
                 }
-                _ => collecting_memory_store(1024, 2 * one, OverflowPolicy::DropOldest, &telemetry),
+                _ => {
+                    collecting_memory_store(1024, max_bytes, OverflowPolicy::DropOldest, &telemetry)
+                }
             };
             let (_shutdown_tx, shutdown_rx) = watch::channel(false);
             let producer = async {
@@ -9494,25 +9503,91 @@ mod tests {
                 wait_until("batch 3 staged", || log.has(&Col::Submit(3))).await;
                 store.close();
             };
+            let config = WriteLoopConfig {
+                window_max_bytes: max_bytes,
+                ..collecting_config(DeliveryPosture::AtLeastOnce)
+            };
+            run_collecting(&mut output, &store, telemetry, config, shutdown_rx, producer).await;
+            let closes: Vec<_> =
+                log.calls().into_iter().filter(|c| matches!(c, Col::Close(_))).collect();
+            let totals = Totals::of(registry.drain(0));
+            if case == "memory drop_oldest" {
+                assert_eq!(closes, vec![Col::Close(3)], "{case}");
+                assert_eq!(closed_by(&totals, "memory"), 1.0, "{case}");
+            } else {
+                assert_eq!(closes, vec![Col::Close(2), Col::Close(1)], "{case}");
+                assert_eq!(closed_by(&totals, "pressure"), 1.0, "{case}");
+                assert_eq!(closed_by(&totals, "closed"), 1.0, "{case}");
+            }
+            assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 3.0, "{case}");
+            assert_eq!(totals.sum("logit.component.batches.dropped", &[]), 0.0, "{case}");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// A producer pushes 40 batches back to back into a store with room for four, so a push
+    /// waits or sheds, and the store is at its bound, across every upload. Each window still
+    /// takes every batch the store holds: pressure stops only the wait for new arrivals, since
+    /// closing a window frees one slot and a check before intake would make each window one
+    /// batch.
+    #[tokio::test(start_paused = true)]
+    async fn a_store_held_at_its_bound_still_fills_each_window_with_every_ready_batch() {
+        for case in ["memory block", "memory drop_oldest", "disk block"] {
+            let (mut output, log) = collecting_output(Duration::from_secs(3600), 100);
+            output.upload = Upload::Takes(Duration::from_secs(1));
+            let registry = Registry::new();
+            let telemetry = registry.telemetry_for("out", "s3_out", "sink");
+            let dir = crate::disk_queue::test_support::scratch_dir("collecting-held-at-bound");
+            let store = match case {
+                "disk block" => Arc::new(SinkStore::Disk(Box::new(
+                    crate::disk_queue::DiskQueue::open(
+                        disk_store_config(&dir, 4 * one_counter_record_len()),
+                        telemetry.clone(),
+                        Diagnostics::new("out"),
+                    )
+                    .unwrap(),
+                ))),
+                "memory block" => {
+                    collecting_memory_store(4, u64::MAX, OverflowPolicy::Block, &telemetry)
+                }
+                _ => collecting_memory_store(4, u64::MAX, OverflowPolicy::DropOldest, &telemetry),
+            };
+            let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+            let producer = async {
+                for value in 1..=40 {
+                    push_value(&store, value).await;
+                    tokio::task::yield_now().await;
+                }
+                store.close();
+            };
             let config = collecting_config(DeliveryPosture::AtLeastOnce);
             run_collecting(&mut output, &store, telemetry, config, shutdown_rx, producer).await;
-            assert_eq!(
-                log.calls().iter().filter(|c| matches!(c, Col::Close(_))).collect::<Vec<_>>(),
-                vec![&Col::Close(2), &Col::Close(1)],
-                "{case}"
-            );
+            let closes: Vec<usize> = log
+                .calls()
+                .into_iter()
+                .filter_map(|c| match c {
+                    Col::Close(n) => Some(n),
+                    _ => None,
+                })
+                .collect();
+            let expected = match case {
+                // Everything but the first window and the last batch was evicted during the
+                // upload, never staged.
+                "memory drop_oldest" => vec![4, 1],
+                _ => vec![4; 10],
+            };
+            assert_eq!(closes, expected, "{case}");
             let totals = Totals::of(registry.drain(0));
-            assert_eq!(closed_by(&totals, "pressure"), 1.0, "{case}");
-            assert_eq!(closed_by(&totals, "closed"), 1.0, "{case}");
-            assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 3.0, "{case}");
-            assert_eq!(totals.sum("logit.component.buffer.batches.dropped", &[]), 0.0, "{case}");
+            let delivered = totals.sum("logit.component.batches.delivered", &[]);
+            assert_eq!(delivered, expected.iter().sum::<usize>() as f64, "{case}");
             std::fs::remove_dir_all(&dir).ok();
         }
     }
 
     /// `send.duration` records one sample per window, the head's close-to-answer time, and the
     /// `buffer_full` cause names no limit while a window collects and a concurrency of 1 while
-    /// its upload runs.
+    /// its upload runs. The second window collects after the first's owed answers were read at a
+    /// concurrency of 1, so its `None` shows the open window resets the limit.
     #[tokio::test(start_paused = true)]
     async fn send_duration_is_one_sample_per_window_and_the_buffer_full_cause_follows_the_upload() {
         let (mut output, log) = collecting_output(Duration::from_secs(10), 2);
@@ -9532,6 +9607,7 @@ mod tests {
             wait_until("batch 2 answered", || log.has(&Col::Ack(2))).await;
             push_value(&store, 3).await;
             wait_until("batch 3 staged", || log.has(&Col::Submit(3))).await;
+            causes.lock().unwrap().push(store.send_limit().cause());
             push_value(&store, 4).await;
             wait_until("the second window closed", || log.count(&Col::Close(2)) == 2).await;
             causes.lock().unwrap().push(store.send_limit().cause());
@@ -9545,6 +9621,7 @@ mod tests {
             vec![
                 None,
                 Some("; sending at its concurrency of 1, no send answered yet".to_string()),
+                None,
                 Some("; sending at its concurrency of 1, the last send took 2s".to_string()),
             ]
         );

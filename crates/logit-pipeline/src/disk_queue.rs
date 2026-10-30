@@ -1793,9 +1793,9 @@ impl DiskQueue {
     }
 
     /// Waits for the `n`-th record from the head, as [`DiskQueue::peek_at`] reads it, until
-    /// `deadline`: [`StoreWait::Pressure`] while the store-pressure signal is raised, checked
-    /// first, else the record once one is readable, else [`StoreWait::Closed`] once the queue is
-    /// closed, else [`StoreWait::Deadline`] at `deadline`. Reserves records `0..=n` only when it
+    /// `deadline`: the record once one is readable, else [`StoreWait::Pressure`] while the
+    /// store-pressure signal is raised, else [`StoreWait::Closed`] once the queue is closed, else
+    /// [`StoreWait::Deadline`] at `deadline`. Reserves records `0..=n` only when it
     /// returns the record. Cancellation-safe, as `peek_at` is: a read dropped mid-way caches
     /// nothing.
     pub async fn wait_at(&self, n: usize, deadline: tokio::time::Instant) -> StoreWait<StoreItem> {
@@ -1804,11 +1804,11 @@ impl DiskQueue {
             // lands after a check still wakes this wait.
             let notified = self.not_empty.notified();
             let raised = self.watch.pressure_raised();
-            if self.watch.under_pressure() {
-                return StoreWait::Pressure;
-            }
             if let Some(item) = self.peek_at(n).await {
                 return StoreWait::Item(item);
+            }
+            if self.watch.under_pressure() {
+                return StoreWait::Pressure;
             }
             if self.closed() {
                 return StoreWait::Closed;
@@ -4405,6 +4405,44 @@ mod tests {
         assert_eq!(list_segments(&dir).unwrap(), vec![1], "the consumed segment is reclaimed");
         let events = registry.drain(0);
         assert_eq!(metric_sum(&events, SINK_QUEUE_METRICS.items_dropped, None), 0.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `block` push that waited for room raises store pressure, and the spool it fills stays
+    /// at `max_bytes`, so the signal stays raised. A wait for a record the spool holds still
+    /// returns it, and only a wait past it ends on pressure.
+    #[tokio::test]
+    async fn wait_at_returns_a_record_it_holds_under_pressure_and_pressure_past_it() {
+        let dir = scratch_dir("wait-at-pressure");
+        let one = raw_record(&batch("a"), ctx()).len() as u64;
+        let mut cfg = config(dir.clone());
+        cfg.max_bytes = 2 * one;
+        cfg.segment_bytes = one;
+        let q = open_with(cfg);
+        for label in ["a", "b"] {
+            q.push((batch(label), ctx())).await;
+        }
+        let ((), ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(q.push((batch("c"), ctx())), async {
+                crate::test_util::wait_until("the push waits", || q.under_pressure()).await;
+                q.peek().await.expect("the head");
+                q.commit().expect("the head committed");
+            })
+        })
+        .await
+        .expect("the commit makes room for the push");
+        assert!(q.under_pressure(), "the push left the spool at its bound");
+
+        // A window takes records in order, so the head is read ahead first, as the loop reads it.
+        let (head, ..) = q.peek_at(0).await.expect("the head");
+        assert_eq!(marker_of(&head), "b");
+        let far = tokio::time::Instant::now() + Duration::from_secs(3600);
+        match q.wait_at(1, far).await {
+            StoreWait::Item((held, ..)) => assert_eq!(marker_of(&held), "c"),
+            other => panic!("a record the spool holds is returned under pressure: {other:?}"),
+        }
+        let past = q.wait_at(2, far).await;
+        assert!(matches!(past, StoreWait::Pressure), "{past:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
