@@ -3650,7 +3650,7 @@
               ]
             },
             "prefix": {
-              "description": "Prepended to every object key, as written: end it with `/` to make it a folder, such as `logs/`. Empty by default.",
+              "description": "Prepended to every object key, as written: end it with `/` to make it a folder, such as `logs/`. Empty by default. Neither it nor `partition` may make a `.` or `..` folder, which a URL would remove.",
               "default": "",
               "type": "string"
             },
@@ -6111,7 +6111,7 @@
           ]
         },
         {
-          "description": "One zstd frame per batch, which a zstd reader reads as one stream. The key ends `.zst`.",
+          "description": "One zstd frame per mebibyte of uncompressed data, which a zstd reader reads as one stream. The key ends `.zst`.",
           "type": "string",
           "enum": [
             "zstd"
