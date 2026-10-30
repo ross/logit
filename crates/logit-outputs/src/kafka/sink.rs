@@ -37,10 +37,11 @@
 //! | `logit.output.records.unkeyed` | records sent without a key because the configured key had no value: on their event, or under an OTLP format on the request's events or resource |
 //! | `logit.output.events.skipped{reason="no_log"}` | events `format: text` skipped for having no log record |
 //! | `logit.output.events.skipped{reason="no_payload"}` | events an OTLP format skipped for carrying no log, span, or metric |
+//! | `logit.output.attributes.normalized{reason="u64_as_double"}` | under an OTLP format, attribute values written as a double for being a `u64` above `i64::MAX`, on the events written and the batch's resource and scope |
 //! | `logit.output.metrics.omitted{reason="format"}`, `logit.output.spans.omitted{reason="format"}` | under `format: text`, the metric records and spans an event carries beside the log body its record holds, one per metric record and one per span |
 //! | `logit.output.metrics.skipped{metric_kind}`, `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}`, `logit.output.metrics.degraded{metric_kind}` | under an OTLP format, metrics the OTLP mapping skips, drops, or degrades (`logit_proto::otlp::metrics`), once per metric |
 //!
-//! `oversize`, `records.unkeyed`, `events.skipped`, `metrics.omitted`, `spans.omitted`, and the
+//! `oversize`, `records.unkeyed`, `events.skipped`, `attributes.normalized`, `metrics.omitted`, `spans.omitted`, and the
 //! OTLP mapping's counters are encode-side, counted once per batch; `requests` and `reconnects`
 //! count per attempt; the others follow the broker's answer, which a retry never meets twice for
 //! one partition batch. Each drop but `ambiguous_at_most_once` raises a
@@ -82,6 +83,7 @@ const RECORDS: &str = "logit.output.records";
 const RECORDS_DROPPED: &str = "logit.output.records.dropped";
 const RECORDS_UNKEYED: &str = "logit.output.records.unkeyed";
 const EVENTS_SKIPPED: &str = "logit.output.events.skipped";
+const ATTRIBUTES_NORMALIZED: &str = "logit.output.attributes.normalized";
 const METRICS_OMITTED: &str = "logit.output.metrics.omitted";
 const SPANS_OMITTED: &str = "logit.output.spans.omitted";
 
@@ -248,8 +250,8 @@ pub fn record_batches(
 
 /// Counts what one encode of a batch reports, but for the oversize drops, which the sink counts
 /// with a warning naming its `max_request_bytes`: the unkeyed records, the events `format: text`
-/// skips, the events an OTLP format skips for carrying no signal, and the metrics and spans it
-/// leaves beside a log body.
+/// skips, the events an OTLP format skips for carrying no signal and the `u64` attribute values
+/// it writes as a double, and the metrics and spans `format: text` leaves beside a log body.
 pub fn report_encode_stats(telemetry: &Telemetry, stats: &EncodeStats) {
     if stats.missing_key > 0 {
         telemetry.count(RECORDS_UNKEYED, stats.missing_key as f64, &[]);
@@ -259,6 +261,10 @@ pub fn report_encode_stats(telemetry: &Telemetry, stats: &EncodeStats) {
     }
     if stats.no_payload > 0 {
         telemetry.count(EVENTS_SKIPPED, stats.no_payload as f64, &[("reason", "no_payload")]);
+    }
+    if stats.u64_as_double > 0 {
+        let n = stats.u64_as_double as f64;
+        telemetry.count(ATTRIBUTES_NORMALIZED, n, &[("reason", "u64_as_double")]);
     }
     if stats.metrics_omitted > 0 {
         let n = stats.metrics_omitted as f64;

@@ -1071,4 +1071,100 @@ fn an_otlp_json_request_on_another_signals_topic_is_undecodable() {
     assert!(why.contains("logs request on topic \"metrics\", mapped to metrics"), "{why}");
     let (decoded, _) = decoder.decode("logs", 0, &kafka_record(1, records[0].0.clone()), 0);
     assert!(matches!(decoded, Decoded::Batches(_)), "{decoded:?}");
+    // The decoder reads the snake_case spelling too, so it's another signal's request as well.
+    let snake =
+        std::str::from_utf8(&records[0].0).unwrap().replace("resourceLogs", "resource_logs");
+    let (decoded, _) = decoder.decode("logs", 0, &kafka_record(2, Bytes::from(snake.clone())), 0);
+    assert!(matches!(decoded, Decoded::Batches(_)), "snake_case reads as logs: {decoded:?}");
+    let (decoded, _) = decoder.decode("metrics", 0, &kafka_record(3, Bytes::from(snake)), 0);
+    let Decoded::Undecodable(why) = decoded else { panic!("snake_case: {decoded:?}") };
+    assert!(why.contains("logs request"), "{why}");
+    // An empty list carried nothing.
+    for empty in [&br#"{"resourceLogs":[]}"#[..], br#"{"resource_logs":[]}"#] {
+        let record = kafka_record(4, Bytes::from_static(empty));
+        let (decoded, _) = decoder.decode("metrics", 0, &record, 0);
+        assert!(matches!(decoded, Decoded::Skipped("empty")), "{decoded:?}");
+    }
+}
+
+/// Reads `bytes` as `kafka_in` would read one fetch, through
+/// `decode_record_batches`, and returns its error text, or `None` when it reads.
+fn read_fetch(format: KafkaInFormat, bytes: Bytes) -> Option<String> {
+    let probe = TelemetryProbe::new();
+    let telemetry = probe.telemetry("in", "kafka_in", "listener");
+    super::decode_record_batches(format, "t", 0, &bytes, 1 << 20, 0, telemetry)
+        .err()
+        .map(|e| e.to_string())
+}
+
+fn encoded_batch(values: &[Option<&[u8]>]) -> Vec<u8> {
+    let records: Vec<_> = values.iter().map(|v| record(*v)).collect();
+    logit_proto::kafka::batch::encode(
+        &records,
+        logit_proto::kafka::batch::Stamp::NONE,
+        Compression::None,
+    )
+    .expect("encode")
+    .to_vec()
+}
+
+fn good_batch() -> Vec<u8> {
+    encoded_batch(&[Some(b"m")])
+}
+
+const TEXT: KafkaInFormat = KafkaInFormat::Text { batch: false };
+
+/// The transit spec's read-back fails on anything `kafka_in` would skip, drop, or omit, so a
+/// case can't pass by losing a record; a whole batch of good records reads.
+#[test]
+fn decode_record_batches_reads_a_whole_batch() {
+    assert_eq!(read_fetch(TEXT, Bytes::from(good_batch())), None);
+}
+
+#[test]
+fn decode_record_batches_fails_on_a_truncated_batch() {
+    let good = good_batch();
+    let err = read_fetch(TEXT, Bytes::copy_from_slice(&good[..good.len() - 1])).expect("fails");
+    assert!(err.contains("end inside"), "{err}");
+}
+
+#[test]
+fn decode_record_batches_fails_on_a_crc_corrupt_batch() {
+    let mut corrupt = good_batch();
+    let last = corrupt.len() - 1;
+    corrupt[last] ^= 0xff;
+    let err = read_fetch(TEXT, Bytes::from(corrupt)).expect("fails");
+    assert!(err.to_lowercase().contains("crc"), "{err}");
+}
+
+#[test]
+fn decode_record_batches_fails_on_a_tombstone() {
+    let err = read_fetch(TEXT, Bytes::from(encoded_batch(&[None]))).expect("fails");
+    assert!(err.contains("skipped"), "{err}");
+}
+
+#[test]
+fn decode_record_batches_fails_on_a_header_name_that_is_not_utf8() {
+    let headers: [Hdr; 1] = [(b"\xff", Some(b"v"))];
+    let batch = raw_batch(1_000, 1, &raw_record(0, None, b"m", &headers));
+    let err = read_fetch(TEXT, batch).expect("fails");
+    assert!(err.contains("header"), "{err}");
+}
+
+#[test]
+fn decode_record_batches_fails_on_an_undecodable_value() {
+    let batch = Bytes::from(encoded_batch(&[Some(b"not json")]));
+    let err = read_fetch(KafkaInFormat::Json, batch).expect("fails");
+    assert!(err.contains("doesn't decode"), "{err}");
+}
+
+/// `logit_proto::kafka::decode` stops short of a tail under 12 bytes without reporting it.
+#[test]
+fn decode_record_batches_fails_on_a_stray_tail_shorter_than_a_batch_header() {
+    for tail in 1..12 {
+        let mut stray = good_batch();
+        stray.extend(std::iter::repeat_n(0u8, tail));
+        let err = read_fetch(TEXT, Bytes::from(stray)).expect("fails");
+        assert!(err.contains("stray tail"), "{tail} bytes: {err}");
+    }
 }
