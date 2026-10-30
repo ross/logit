@@ -119,9 +119,9 @@ before it is in a batch `Fanout` accepted, and decodes every format `kafka_out` 
     `logit-kafka`, and a public `logit_aws::http` would put a generic HTTP client in a crate
     named for AWS. So `logit-kafka` holds its own TLS-less copy of those five helpers for
     `oauth.rs`, `logit-outputs::http` is unchanged, and `logit-aws` keeps #926's copy. Three
-    small copies is a cost this ADR accepts; a shared home (a `reqwest` helper module in
-    `logit-pipeline`, which already builds every `rustls::ClientConfig`) is the fix when a fourth
-    user appears, and the `logit-kafka` module doc says so.
+    small copies is a cost this ADR accepts; neither `logit-core` nor `logit-pipeline` depends
+    on `reqwest`, so a shared home is a small crate of its own, the fix when a fourth user
+    appears, and the `logit-kafka` module doc says so.
   - **Sequence arithmetic.** `producer::next_sequence`, which the fake broker also calls, is
     wrapping `i32` sequence arithmetic, a wire fact. It moves to `logit_proto::kafka` beside the
     record-batch codec, and `producer.rs` imports it from there.
