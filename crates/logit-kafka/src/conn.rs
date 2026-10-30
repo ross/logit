@@ -523,6 +523,18 @@ mod tests {
         assert!(err.to_string().contains("Produce v0 to v2"), "{err}");
     }
 
+    /// A required API the broker's answer omits altogether is an error, which `dial` classifies
+    /// `Refused`.
+    #[test]
+    fn a_broker_that_omits_a_required_api_is_refused() {
+        let err = negotiate(
+            &offered(&[(ApiKey::Produce, 0, 12), (ApiKey::InitProducerId, 0, 4)]),
+            PRODUCER,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("doesn't offer Metadata"), "{err}");
+    }
+
     fn metadata_request() -> kafka_protocol::messages::MetadataRequest {
         kafka_protocol::messages::MetadataRequest::default()
     }

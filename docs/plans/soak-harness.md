@@ -2693,7 +2693,7 @@ where it needs them, and a small check extension.
 16. **Kafka SASL re-authentication over hours (5da5ab8c), built in W17 for SCRAM.**
     `kafka-sasl-reauth` is `kafka-broker-restart` over SCRAM-SHA-512 to a broker whose SASL
     listener sets `connections.max.reauth.ms` to 30 s. Each session's end retires a connection
-    (`crates/logit-outputs/src/kafka/conn.rs`'s module doc), so the run redials at a steady
+    (`crates/logit-kafka/src/conn.rs`'s module doc), so the run redials at a steady
     rate, which `kafka_out` counts in `logit.output.reconnects` from W17 on and a `rate`
     expectation bounds. Rows: `ledger.topic`, `fd_slope`, duplicates per life, and
     `[[expect]]` on the redial rate, the `ambiguous` rate, `refused` attempts, and dropped
@@ -2710,7 +2710,7 @@ where it needs them, and a small check extension.
       clearing after each. Two corrections to the item as first planned:
       - The expired-token phase is `Clean`, not `Refused`. An endpoint that refuses the
         connection or times out is `Clean`
-        (`crates/logit-outputs/src/kafka/sasl/oauth.rs`'s module doc), and the sink never
+        (`crates/logit-kafka/src/sasl/oauth.rs`'s module doc), and the sink never
         sends a token it knows has expired, so the broker refuses nothing, and the run asserts
         no `refused` attempt.
       - The fallback covers a refused endpoint, not a hung one. A redial comes `timeout` before

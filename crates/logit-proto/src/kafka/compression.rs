@@ -16,9 +16,10 @@
 //! `crate::otlp::grpc::inflate_bounded` and `crate::prometheus::compression::decompress_bounded`
 //! are: it never produces more than one byte past the caller's bound, and that byte is the error.
 //! A Snappy block declares its length, so a block that would pass the bound is refused before it
-//! expands. A zstd frame's window isn't held to the bound, as `decompress_bounded` holds it,
-//! because the Java client's frames declare windows larger than their content; `ruzstd`'s default
-//! 128 MiB window limit caps that allocation.
+//! expands. `ruzstd` decodes until its ring buffer passes the frame's declared window before a
+//! reader sees a byte, so a streaming bound alone doesn't cap a zstd frame's memory. The window
+//! limit is `max(max, 8 MiB)`, as `logit-inputs`' zstd reader sets it, and a frame declaring more
+//! is [`TooLarge`]. The reference clients' frames declare a 2 MiB window.
 //!
 //! Snappy decompression reads both forms: a payload that opens with the xerial magic is
 //! xerial-framed (a 16-byte header, then raw blocks, each behind a big-endian `u32` length), and
@@ -29,6 +30,7 @@ use std::io::{Read, Write};
 use bytes::{BufMut, BytesMut};
 use kafka_protocol::records::Compression;
 use lz4_flex::frame::{BlockMode, BlockSize, FrameEncoder, FrameInfo};
+use ruzstd::decoding::errors::FrameDecoderError;
 
 /// Compresses `records`, a batch's encoded records section, into `out` under `codec`.
 pub fn compress(codec: Compression, records: &[u8], out: &mut BytesMut) -> anyhow::Result<()> {
@@ -96,8 +98,14 @@ pub fn decompress(codec: Compression, payload: &[u8], max: usize) -> anyhow::Res
         }
         Compression::Lz4 => read_bounded(lz4_flex::frame::FrameDecoder::new(payload), max)?,
         Compression::Zstd => {
-            let decoder = ruzstd::decoding::StreamingDecoder::new(payload)
-                .map_err(|err| anyhow::anyhow!("zstd frame header: {err}"))?;
+            let window = (max as u64).max(ZSTD_MIN_WINDOW);
+            let decoder =
+                match ruzstd::decoding::StreamingDecoder::new_with_max_window_size(payload, window)
+                {
+                    Ok(decoder) => decoder,
+                    Err(FrameDecoderError::WindowSizeTooBig { .. }) => return Err(too_large()),
+                    Err(err) => anyhow::bail!("zstd frame header: {err}"),
+                };
             read_bounded(decoder, max)?
         }
     };
@@ -106,6 +114,9 @@ pub fn decompress(codec: Compression, payload: &[u8], max: usize) -> anyhow::Res
     }
     Ok(out)
 }
+
+/// The smallest zstd window limit, so a small `max` still admits the reference clients' frames.
+const ZSTD_MIN_WINDOW: u64 = 8 << 20;
 
 /// Reads `reader` to its end or to `max + 1` bytes, whichever comes first.
 fn read_bounded(reader: impl Read, max: usize) -> anyhow::Result<Vec<u8>> {
@@ -272,6 +283,66 @@ mod tests {
     fn zstd_decodes_at_its_bound_and_refuses_one_byte_over() {
         let data = runs();
         assert_bounded_at(Compression::Zstd, &compressed(Compression::Zstd, &data), data.len());
+    }
+
+    /// A reader that counts the bytes it yields.
+    struct CountOut<R> {
+        inner: R,
+        yielded: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl<R: Read> Read for CountOut<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.yielded.set(self.yielded.get() + n);
+            Ok(n)
+        }
+    }
+
+    fn pulled(reader: impl Read, max: usize) -> usize {
+        let yielded = std::rc::Rc::new(std::cell::Cell::new(0));
+        let out = read_bounded(CountOut { inner: reader, yielded: yielded.clone() }, max).unwrap();
+        assert_eq!(out.len(), max + 1);
+        yielded.get()
+    }
+
+    #[test]
+    fn read_bounded_pulls_at_most_one_byte_past_the_bound() {
+        let data = vec![7u8; 10_000_000];
+        let max = 1000;
+        for codec in [Compression::Gzip, Compression::Lz4, Compression::Zstd] {
+            let payload = compressed(codec, &data);
+            let count = match codec {
+                Compression::Gzip => pulled(flate2::read::GzDecoder::new(&payload[..]), max),
+                Compression::Lz4 => pulled(lz4_flex::frame::FrameDecoder::new(&payload[..]), max),
+                _ => pulled(ruzstd::decoding::StreamingDecoder::new(&payload[..]).unwrap(), max),
+            };
+            assert!(count <= max + 1, "{codec:?} yielded {count} bytes");
+        }
+    }
+
+    /// A raw block whose varint declares 1 GiB over a tiny body is refused from the declared
+    /// length, before the output is sized.
+    #[test]
+    fn a_snappy_block_declaring_far_more_than_the_bound_is_refused_before_it_expands() {
+        let block = [0x80, 0x80, 0x80, 0x80, 0x04, 0x00];
+        let mut out = Vec::new();
+        let err = snappy_block(&mut out, &block, 1000).unwrap_err();
+        assert!(err.downcast_ref::<TooLarge>().is_some(), "{err:#}");
+        assert_eq!(out.capacity(), 0, "the output was sized");
+    }
+
+    /// A tiny frame declaring a 128 MiB window is refused at its header, before any decoding.
+    #[test]
+    fn a_zstd_frame_declaring_a_window_above_the_cap_is_too_large() {
+        // Magic, descriptor 0 (windowed, no content size), window descriptor 0x88: 128 MiB.
+        let frame = [0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x88, 0x01, 0x00, 0x00];
+        let err = decompress(Compression::Zstd, &frame, 1000).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<TooLarge>(),
+            Some(&TooLarge { codec: Compression::Zstd, max: 1000 }),
+            "{err:#}"
+        );
     }
 
     #[test]

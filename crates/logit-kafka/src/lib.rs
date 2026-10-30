@@ -12,10 +12,10 @@
 //! `kafka-input`](../../../docs/adr/kafka-input.md)'s "1. Code layout: `logit-kafka`, and the
 //! codec in `logit-proto`" has the reasons for each placement.
 //!
-//! Faults carry `logit_pipeline::Fault` classes: a connect, TLS, or `ApiVersions` failure is
-//! `Clean`, a broker without a required API version or a SASL refusal is `Refused`, and a
-//! request failure is `Clean` or `Ambiguous` by whether a byte of it could have left
-//! ([`conn::RequestError::fault`]).
+//! Faults carry `logit_pipeline::Fault` classes: a connect, TLS, or `ApiVersions` request failure
+//! is `Clean`; an `ApiVersions` error code, a broker without a required API version, or a SASL
+//! refusal is `Refused`; and a request failure is `Clean` or `Ambiguous` by whether a byte of it
+//! could have left ([`conn::RequestError::fault`]).
 
 pub mod conn;
 pub mod error;
