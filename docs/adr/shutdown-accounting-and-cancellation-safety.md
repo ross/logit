@@ -1,6 +1,6 @@
 ---
 created: 2026-09-26
-updated: 2026-10-13
+updated: 2026-10-29
 ---
 
 # Shutdown accounting and cancellation safety: every shutdown loss counted, and one table of cancellation points
@@ -495,9 +495,11 @@ amendment:
   instead of leaving it for a new file reusing the inode to resume from.
 
 The tail rows of `docs/design/pipeline-graph.md`'s "Cancellation points" table land with it.
-`docs/known-gaps/tailing.md` records that the checkpoint is at-least-once only up to the downstream
-in-memory queues, that the driver notices shutdown only between two files' reads, and that a
-rotated file still draining at shutdown whose new name matches no pattern is orphaned on restart.
+[ADR `tail-content-identity`](tail-content-identity.md), decision 1, records that the checkpoint
+is at-least-once only up to the downstream in-memory queues, a decided limit.
+`docs/known-gaps/tailing.md` records that the driver notices shutdown only between two files'
+reads, and that a rotated file still draining at shutdown whose new name matches no pattern is
+orphaned on restart.
 
 Tests, in `tail/driver.rs` unless noted. Paused tests run under `start_paused`: tokio 1.53.1 holds
 auto-advance while a blocking-pool task runs, so `tokio::fs` reads and checkpoint writes work there.

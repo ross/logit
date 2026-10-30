@@ -2221,6 +2221,12 @@ mod tests {
         assert_eq!(messages(&recv_events(&mut rx, 1).await), vec![format!("two-{padding}")]);
         std::fs::write(&log_path, complete("3")).unwrap();
         assert_eq!(messages(&recv_events(&mut rx, 1).await), vec!["3"]);
+        // A truncation a copy could claim is counted once two scans have offered it.
+        probe
+            .wait_for("the second truncation's line to be counted", |t| {
+                t.sum("logit.input.frames.dropped", &[("reason", "truncated")]) >= 2.0
+            })
+            .await;
         assert_eq!(probe.sum("logit.input.frames.dropped", &[("reason", "truncated")]), 2.0);
 
         running.stop().await;

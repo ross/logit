@@ -386,6 +386,24 @@ rotations, so the writer deleted files, and assert no checkpoint error and no go
 inode a deletion freed while the SUT was down can be reused by the writer's next file, and the
 restart then rejects the checkpoint entry whose head no longer matches.
 
+`tail-copytruncate` (15 minutes) runs `tail-rotate`'s pipeline against a writer that never
+rotates its file: `copytruncate` steps rotate it as logrotate's `copytruncate` does, to dated
+names (`app.log-01`, as `dateext` names them) that the SUT's `app.log*` pattern matches, four
+while the SUT runs, one inside a 60 s stop, and one inside a 90 s kill. Two `gzip` steps
+compress a copy the tailer has finished, as `delaycompress` does, and a `replace` inside the
+kill puts one finished copy's bytes back under a new inode, as a restore does. Each exercises a
+path of [ADR `tail-content-identity`](../../docs/adr/tail-content-identity.md): a copy claims
+the original's position, a rejected entry a copy claims isn't counted gone, and a compressed
+file is skipped. `ledger.wire` holds the shared directory's count, which reads a gzip file
+decompressed, to G less the lines the copytruncates lost, and widens the replay band below by
+those lines. It widens the band above by a copy's lines and its cut line only for a
+copytruncate while the SUT runs whose record shows bytes appended after the copy's last read,
+the ADR's residual for a copy shorter than what the tailer read, which is read from 0; any
+other copy must claim, so a read from 0 FAILs the row. Its expectations assert a claim after
+the stop and two after the kill (its copy's and the replace's), two rejected resumes, four
+truncations seen, two compressed files skipped, and none of a gone entry's bytes, an ambiguous
+claim, an invalid UTF-8 line, or a checkpoint error.
+
 `otlp-fan-out` (16 minutes) sends 500 OTLP log records a second with `otlp_out` over HTTP, 50
 to a request, into `otlp_in`, its source declared `wire = "http"`. Each record's body is four
 lines of InfluxDB line protocol, each point with its own tag value so none merge, and the SUT's
@@ -663,15 +681,21 @@ requires one completes the handshake and logs no `connection_error`.
 | `respond` | on a stand-in only: POSTs the step's cue to its control port, so it answers `status` (with an optional `body`) or `answer = "reset"`, storing the write when `apply` says to or, by default, when the status is `2xx`. With `count = N` the cue answers the next N writes and is then spent, and the stand-in answers its default again, so with several requests in flight a cue lands on one of them. Under the `datadog` shape a `2xx` can carry `series_errors = N`, a body naming the request's first N series dropped. `headers`, a table of header names to strings, replaces the response headers the stand-in adds itself | an empty cue, which restores the default answer |
 | `signal` | `docker kill -s HUP`, on a service that runs `logit`, with `signal = "HUP"`, the one signal it takes: the process reopens its file targets and reloads its TLS material | none |
 | `rename` | on the host, moves `path` to `to` inside `<run>/shared`, both bare names, refusing a `to` that exists. `path` is a `stdio_out` target in `/shared` in the config of the service the step is `on`, and a `signal` step on that service must start inside the rename's `for` | none |
+| `copytruncate` | on a file source's writer, does what logrotate's `copytruncate` does to `path` in `<run>/shared`: copies it to `to`, created empty and filled, and truncates `path` in place, so an `O_APPEND` writer goes on at offset 0. It records the lines copied and the lines written after the copy and before the truncate, which are in neither file (`lost_lines`). It runs in a one-shot container of the stand-in's Python image, as root, because the writer's files belong to its container's `logit` user | none |
+| `gzip` | on a file source's writer, compresses `path` into `to` and removes `path`, as `gzip` does, in the same container | none |
+| `replace` | on a file source's writer, writes `path`'s bytes to a dot-prefixed temporary name and renames it over `path`: the same content under a new inode, as a restore or a migration leaves it, in the same container | none |
 | `rotate` | issues `cert`'s next generation into `<run>/tls`, valid `days`, with a mismatched key under `broken = true`, and repoints its `live` link; records the new serial and `notAfter`. See [TLS certificates](#tls-certificates) | none |
 | `probe` | from the network namespace of the service it's `on`, handshakes with `127.0.0.1:<port>`, presenting the probe certificate, and records the served serial and `notAfter` and whether they verify against the CA for `cert`'s first DNS name | none |
 
 A `mark`, `exit`, or `respond` window is a fault window like any other, so the checks excuse
-what happens inside it. A `signal`, `rename`, `rotate`, or `probe` window excuses nothing: none
-can lose data, so every row judges straight through it, and only `[[expect]]`, `file.reopen`,
-`tls.served`, and `self_log`'s excusal of a broken rotation's failed reload read it. A `signal`
-or `probe` may start inside a `rename` or `rotate` on its own service, and no other step may
-overlap one of these on its service. None of these seven can go in a `[random]` schedule. A `respond` or a `stop` of
+what happens inside it. A `signal`, `rename`, `rotate`, `probe`, `copytruncate`, `gzip`, or
+`replace` window excuses nothing, so every row judges straight through it, and only `[[expect]]`,
+`file.reopen`, `tls.served`, and `self_log`'s excusal of a broken rotation's failed reload read
+it; `ledger.wire` takes a `copytruncate`'s lost and duplicated lines from its record instead (see
+[The checks](#the-checks)). A `signal` or `probe` may start inside a `rename` or `rotate` on its
+own service, and no other step may overlap one of these on its service. A `copytruncate` or a
+`gzip` runs once per run, since a second cycle's would find its `to` taken. None of these ten
+can go in a `[random]` schedule. A `respond` or a `stop` of
 a stand-in may name the `class` the sink must read its answers as (`clean`, `ambiguous`,
 `rejected`, or `refused`), which `ledger.standin` judges. Under the `datadog` and `influxdb`
 shapes every `respond` other than a `2xx` must name one, because its class is the only statement
@@ -982,7 +1006,9 @@ The loader refuses `sut_delta` beside `sut_aggregate`, `sut_script`, a hop, a `s
    `logit-soak-netem:local` from `netem/` (set `SOAK_SKIP_IMAGE=1` to reuse both), and validates
    the scenario's configs in `logit:soak`. `SOAK_SKIP_IMAGE=1` reuses whatever `logit:soak` is on
    the daemon, whichever tree built it; `provenance.txt` records the image id, so check it before
-   reading a run as evidence about a changed binary.
+   reading a run as evidence about a changed binary. `SOAK_IMAGE=<tag>` builds and runs another
+   tag, so a run from one checkout can't pick up an image another checkout's build tagged
+   `logit:soak` in the meantime.
 2. The driver refuses to start if the compose project already has containers, then brings the
    stack up with `docker compose up --wait`, which waits on each `logit` service's `logit ready`
    health check. For an external target it brings up no backend.
@@ -1087,7 +1113,12 @@ checkpoint and its unexported last drain interval, and a stopped life's split li
 file. While the writer deleted no file, G is held to the lines the driver counts in the shared
 directory at the end; once it deleted one, the count must not exceed G, the directory must hold
 the files the writer keeps, and no SUT fault may last long enough for the writer to delete a
-file the tailer hadn't read.
+file the tailer hadn't read. A `copytruncate` step's lost lines leave the count short of G by
+that many, plus at most one writer batch a step written between its last read and its
+truncate, and widen the band below; one while the SUT runs whose record shows bytes appended
+after the copy's last read widens it above by its copy's lines and its cut line, since a read of
+those bytes leaves the copy unable to claim, and it's read from 0. Every other copy adds nothing
+above.
 `ledger.wire` judges each source on its own, against the fault windows of its own
 generator and of every service that isn't a generator that affect its wire, and
 `ledger.intake` judges each listener's final life; each reports a line per source or listener
@@ -1358,7 +1389,8 @@ for = { min = "60s", max = "3m" }
 ## Long runs
 
 A scenario that sets `max_duration` refuses a longer `--duration`, because its thresholds or
-configs hold only that long; `tail-rotate`'s is 25 minutes. `tail-rotate-delete` has none:
+configs hold only that long; `tail-rotate`'s is 25 minutes, and `tail-copytruncate`'s is its
+own 15, since its steps run once per run. `tail-rotate-delete` has none:
 its writer's retention bounds both the shared directory and the tailer's descriptors.
 
 To run for hours, keep the driver alive when the terminal closes: a closed terminal sends
