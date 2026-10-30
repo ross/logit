@@ -500,7 +500,7 @@ config asked for never uses the word:
 | `*.skipped` | Nothing was there to carry, the operator chose to leave it out (`multi_value: skip`), or the destination format has no form for the kind. | `reason` or `metric_kind`. |
 | `*.degraded`, `*.truncated`, `*.normalized` | Delivered, but lossy, shortened, or rewritten. `metrics.normalized{reason="duplicate_timestamp"}` counts a state a sink left off beside an equal one it delivered, so nothing is lost. | `reason`, `metric_kind`, or `field`. |
 | `*.evicted`, `*.untracked` | An entry left a bounded bookkeeping table. No data was lost. | `reason` where more than one cause exists. |
-| `logit.input.batches.deferred` | A listener answered busy (`503`). The client keeps the data and retries, so this is back-pressure, not loss. | None. |
+| `logit.input.batches.deferred` | The source keeps the data and offers it again: a listener answered busy (`503`) and the client retries, or `kafka_in` left a batch uncommitted for the partition's next reader. This is back-pressure, not loss. | None. |
 | `logit.input.connections.rejected`, `logit.input.requests.rejected` | A listener refused a connection or request and told the peer, which still holds the data. | `reason`. |
 
 A `reason` value never contains `dropped`, so the word appears only in a loss metric's name. A
@@ -1600,6 +1600,21 @@ Kafka record is the unit.
 `Diagnostics` keys, each throttled: `records_dropped` (naming the topic, partition, and offset),
 `topic_missing`, `auth_failed`, `group_refused`, `not_authorized`, `unsupported_version`, and
 `broker_error` for any other code.
+
+The input itself (`crates/logit-inputs/src/kafka/`) counts what it does with the records the
+client hands it; the outcome table in its module doc is the canonical copy. Its `Fanout` counts
+`logit.component.batches.sent` and the rest of layer 2.
+
+| Name | Kind | Meaning |
+|---|---|---|
+| `logit.input.records.dropped{reason="undecodable"}` | count | a record whose value doesn't decode in `format:`, committed past |
+| `logit.input.records.skipped{reason="tombstone"\|"empty"}` | count | a record with a null value, or a `json` or `native` value holding no event, committed past |
+| `logit.input.headers.omitted{reason="invalid_name"}` | count | a header whose name isn't UTF-8, left out of `_logit.kafka.headers` on a record still delivered |
+| `logit.input.batches.dropped{reason="closed_consumer"}` | count | a batch no consumer directly downstream took; the input commits what came before it, leaves the group, and ends |
+| `logit.input.batches.deferred` | count | a batch not accepted by the drain deadline of a revoke or shutdown, and every batch behind it, or the batches behind a `closed_consumer` drop. Nothing past them is committed, so the next owner of the partition reads them again |
+
+Its own `Diagnostics` keys, throttled: `records_dropped` for an undecodable record, naming the
+topic, partition, and offset, and `closed_consumer`, naming the topic and partition.
 
 #### Transforms
 
