@@ -379,25 +379,27 @@ Recorded per workstream as each lands.
   request of several resources, so the test builds one by concatenating two protobuf requests. The
   OTLP encoder stamps a log with no observed time with the clock, so the split round trip sets one.
 - **W5**: `kafka_out` under an OTLP format dropped an event with no log, span, or metric uncounted;
-  it now counts `logit.output.events.skipped{reason="no_payload"}`, as `otlp_out` does. Its records
-  carry the time it encoded them as their timestamp, as the Collector's exporter's do, so item 13's
-  record-timestamp normalization now says so, and the transit driver restamps those timestamps with
-  the run's clock to keep the expectations stable. The cases are `kafka_out`'s records built from
-  the other sources' events, in every format and codec, the Java producer's and kcat's segments read
-  in place under `format: text`, and a hand-written OTLP case for the `otlp_out` normalizations no
-  producer case reaches (a finite last histogram bound, a `Timestamp` attribute, and a log with no
-  trace beside a span). Series that share a name across source cases pair wrongly in one case, so
-  `statsd/sub-millisecond`, `sub-millisecond-equal`, and `timestamped` are cases of their own. Under
-  `format: text` the class check skips metric records: the log and span rows' `beside` cells account
-  for them. The key-and-headers debt is the row `attributes/kafka_key_headers`, `lost` and uncounted
-  at `kafka_out`, the eleventh `UNCOUNTED_ALLOWED` entry. The `kafka_out` cells no flow reaches are
-  mostly OTLP-format attribute rows for other protocols' carriers, listed in
-  `spec/transit/coverage.md`. The `kafka_batch` and `msgpack_event` fuzz targets ran 120 s each with
-  no finding: `kafka_batch` 1.93 million runs, `msgpack_event` 5.17 million over 14 jobs, with no
-  out-of-memory or timeout. It also wrote a `u64` attribute above `i64::MAX` as a double uncounted,
-  which `otlp_out` counts as `logit.output.attributes.normalized{reason="u64_as_double"}`; it counts
-  it now. `logit_proto::kafka::decode` leaves a tail of fewer than 12 bytes unread without reporting
-  it, so the transit read-back fails unless the batch frames end where the bytes do.
+  it now counts `logit.output.events.skipped{reason="no_payload"}`, as `otlp_out` does. `kafka_out`
+  under an OTLP format also wrote a `u64` attribute above `i64::MAX` as a double uncounted; it now
+  counts `logit.output.attributes.normalized{reason="u64_as_double"}` for each one on an event that
+  reaches a request, and on the resource and scope when any record is written, as `otlp_out` does.
+  Its records carry the time it encoded them as their timestamp, as the Collector's exporter's do,
+  so item 13's record-timestamp normalization now says so, and the transit driver restamps those
+  timestamps with the run's clock to keep the expectations stable. The cases are `kafka_out`'s
+  records built from the other sources' events, in every format and codec, the Java producer's and
+  kcat's segments read in place under `format: text`, and a hand-written OTLP case for the
+  `otlp_out` normalizations no producer case reaches (a finite last histogram bound, a `Timestamp`
+  attribute, and a log with no trace beside a span). Series that share a name across source cases
+  pair wrongly in one case, so `statsd/sub-millisecond`, `sub-millisecond-equal`, and `timestamped`
+  are cases of their own. Under `format: text` the class check skips metric records: the log and
+  span rows' `beside` cells account for them. The key-and-headers debt is the row
+  `attributes/kafka_key_headers`, `lost` and uncounted at `kafka_out`, the eleventh
+  `UNCOUNTED_ALLOWED` entry. The `kafka_out` cells no flow reaches are mostly OTLP-format attribute
+  rows for other protocols' carriers, listed in `spec/transit/coverage.md`. The `kafka_batch` and
+  `msgpack_event` fuzz targets ran 120 s each with no finding: `kafka_batch` 1.93 million runs,
+  `msgpack_event` 5.17 million over 14 jobs, with no out-of-memory or timeout.
+  `logit_proto::kafka::decode` leaves a tail of fewer than 12 bytes unread without reporting it, so
+  the transit read-back fails unless the batch frames end where the bytes do.
 - **W6a**: Every consumer leg passed on both brokers, with no `kafka_in` bug and nothing in the
   ADR's protocol table contradicted. A broker restart within the session timeout doesn't cost a
   classic group its members: Apache Kafka 4.2.0 and Redpanda v26.2.3 both reload the group with

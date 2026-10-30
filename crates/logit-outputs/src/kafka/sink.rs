@@ -37,7 +37,7 @@
 //! | `logit.output.records.unkeyed` | records sent without a key because the configured key had no value: on their event, or under an OTLP format on the request's events or resource |
 //! | `logit.output.events.skipped{reason="no_log"}` | events `format: text` skipped for having no log record |
 //! | `logit.output.events.skipped{reason="no_payload"}` | events an OTLP format skipped for carrying no log, span, or metric |
-//! | `logit.output.attributes.normalized{reason="u64_as_double"}` | under an OTLP format, attribute values written as a double for being a `u64` above `i64::MAX`, on the events written and the batch's resource and scope |
+//! | `logit.output.attributes.normalized{reason="u64_as_double"}` | under an OTLP format, attribute values written as a double for being a `u64` above `i64::MAX`: on each event with a log, a span, or a metric the OTLP mapping keeps, and on the batch's resource and scope when any record was written |
 //! | `logit.output.metrics.omitted{reason="format"}`, `logit.output.spans.omitted{reason="format"}` | under `format: text`, the metric records and spans an event carries beside the log body its record holds, one per metric record and one per span |
 //! | `logit.output.metrics.skipped{metric_kind}`, `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}`, `logit.output.metrics.degraded{metric_kind}` | under an OTLP format, metrics the OTLP mapping skips, drops, or degrades (`logit_proto::otlp::metrics`), once per metric |
 //!
