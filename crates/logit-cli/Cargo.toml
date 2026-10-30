@@ -27,6 +27,8 @@ logit-pipeline.workspace = true
 logit-inputs.workspace = true
 logit-outputs.workspace = true
 logit-transforms.workspace = true
+# `kafka_in`'s consumer settings and SASL authenticator, built from config.
+logit-kafka.workspace = true
 # `build_spec` names `logit_proto::frame::Compression` (`to_native_compression`). Already a
 # transitive dependency via `logit-outputs`.
 logit-proto.workspace = true

@@ -4259,6 +4259,174 @@
           "additionalProperties": false
         },
         {
+          "description": "Consumes Apache Kafka topics as a member of a consumer group (Kafka 2.4 on, or anything that speaks the same protocol), alongside other `kafka_in` and Java consumers in the same group. A partition's offset is committed only once every record before it is in every component directly downstream, so a crash or a rebalance replays the records since the last commit rather than losing them; a record that can't be decoded is counted, dropped, and committed past, so it can't stop its partition. While the pipeline is full, no more is fetched: Kafka holds the backlog. Every event carries its record's topic, partition, offset, key, headers, and timestamp as private `_logit.kafka.*` attributes, which a `kafka_out` leaves out of what it writes.",
+          "type": "object",
+          "required": [
+            "brokers",
+            "format",
+            "group",
+            "topics",
+            "type"
+          ],
+          "properties": {
+            "assignment": {
+              "description": "How the group's leader shares out partitions: `range` (the default) or `roundrobin`. Every member of a group must offer the same one; a group with Java consumers at their defaults needs `range`.",
+              "default": "range",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/KafkaAssignment"
+                }
+              ]
+            },
+            "brokers": {
+              "description": "Bootstrap brokers, each a `host:port`. `logit` asks the first that answers for the cluster's brokers, then connects to each at the address the cluster advertises, so every advertised listener must be reachable from `logit`.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "buffer": true,
+            "client_id": {
+              "description": "The client id sent to every broker, which broker logs and quotas see. Defaults to `logit`.",
+              "default": "logit",
+              "type": "string"
+            },
+            "commit_interval": {
+              "description": "How often the offsets of records already sent downstream are committed. A crash replays what arrived since the last commit. Offsets are also committed at every rebalance and at shutdown. Defaults to `5s`; `0s` is rejected.",
+              "default": "5s",
+              "type": "string"
+            },
+            "drain_timeout": {
+              "description": "When the group rebalances, how long the batch being sent downstream may wait for room before it's given up. A batch given up is left uncommitted, counted `logit.input.batches.deferred`, and read again by whichever member gets its partition, so a short value costs duplicates, never data. Defaults to `5s`; `0s` is rejected, and it must be below `rebalance_timeout`. At shutdown, `receive.shutdown_grace` bounds it too.",
+              "default": "5s",
+              "type": "string"
+            },
+            "fetch": {
+              "description": "Each fetch's bounds: `min_bytes`, `max_bytes`, `max_partition_bytes`, and `max_wait`, the Java consumer's defaults when unset.",
+              "default": {
+                "max_bytes": "52428800",
+                "max_partition_bytes": "1048576",
+                "max_wait": "500ms",
+                "min_bytes": "1"
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/KafkaFetch"
+                }
+              ]
+            },
+            "format": {
+              "description": "What each record's value holds; required, since a topic's producer decides it. `json` reads the object `kafka_out` and `stdio_out` write under `format: json`, one per record or several as lines; `text` reads the value as one log message (any producer's lines; add a `json` transform for an application's JSON); `native` reads `kafka_out`'s `format: native` frames. `msgpack`, `otlp_proto`, and `otlp_json` are accepted here but not yet read: `logit run` refuses them at startup.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/KafkaFormat"
+                }
+              ]
+            },
+            "group": {
+              "description": "The consumer group to join. Members of one group share the topics' partitions, each partition read by one member, and resume from the group's committed offsets.",
+              "type": "string"
+            },
+            "heartbeat_interval": {
+              "description": "How often a heartbeat goes to the group coordinator, on its own task, so a slow pipeline never ends the session. Defaults to `3s`; it must be below `session_timeout`.",
+              "default": "3s",
+              "type": "string"
+            },
+            "isolation": {
+              "description": "`read_uncommitted` (the default) reads every record; `read_committed` reads only those of committed transactions, waiting at a transaction still open.",
+              "default": "read_uncommitted",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/KafkaIsolation"
+                }
+              ]
+            },
+            "max_batch_bytes": {
+              "description": "The most one record batch may decompress to. A batch over it is dropped and counted, and its offsets committed past. A byte-count string. Defaults to `\"64MiB\"`; `0` is rejected, as is a value that with `fetch.max_bytes` adds up to more than 2147483647 bytes.",
+              "default": "67108864",
+              "type": "string"
+            },
+            "rebalance_timeout": {
+              "description": "How long the coordinator waits for every member to rejoin when the group rebalances. Defaults to `5m`.",
+              "default": "5m",
+              "type": "string"
+            },
+            "receive": true,
+            "record": {
+              "description": "Under `format: text` only, how many logs one record holds: `event` (the default), the whole value as one log; or `batch`, one log per line, the form `kafka_out` writes under `format: text` and `record: batch`, with `\\n` and `\\\\` in a line read back as a newline and a backslash.",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/KafkaRecord"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "sasl": {
+              "description": "Authenticates every broker connection over SASL when present, with the same mechanisms and fields as `kafka_out`'s `sasl:`. A broker or token endpoint that refuses the credentials is retried with a backoff, never without them.",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/KafkaSasl"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "session_timeout": {
+              "description": "How long the group coordinator waits for a heartbeat before it removes this member and gives its partitions to another. The broker bounds it, from 6s to 30m by default. Defaults to `45s`; it must not be over `rebalance_timeout`.",
+              "default": "45s",
+              "type": "string"
+            },
+            "sources": true,
+            "start": {
+              "description": "Where a partition the group has no committed offset for starts: `latest` (the default), at the end of the log, or `earliest`, at its start. The group commits that position once the partition is first read, so a restart resumes there rather than starting again.",
+              "default": "latest",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/KafkaStart"
+                }
+              ]
+            },
+            "targets": true,
+            "timeout": {
+              "description": "Bounds each connect, TLS handshake, write, and wait for a broker's answer, and each OAuth token request; a fetch waits `fetch.max_wait` more, and a group join `rebalance_timeout` more. Defaults to `30s`; `0s` is rejected.",
+              "default": "30s",
+              "type": "string"
+            },
+            "tls": {
+              "description": "Turns on TLS to every broker when present, and makes it required: a `host:port` has no scheme to select TLS from, so even an empty `tls: {}` means TLS with the bundled Mozilla roots. Each broker's certificate is checked against the host it advertises, or against `server_name` when it's set.",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/TlsClientConfig"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "topics": {
+              "description": "The topics to read. A list of names, or under `format: otlp_proto` or `otlp_json` a map of signal to topic, `{logs: NAME, metrics: NAME, traces: NAME}`, where a signal left out isn't read. A topic is never created: one that doesn't exist yet is read once it appears, with a warning until then.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/KafkaInTopics"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "kafka_in"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
           "description": "Reads a file once, from start to end, and sends its events downstream, then stops. The file is an archive a `stdio_out` or `file_out` wrote, or events written by hand in the same form. Events keep the timestamps the file gives them. When every input has stopped, the process flushes its sinks and exits.\n\nA line or frame that can't be read is skipped and counted, and the rest of the file is still sent. There's no follow mode, no checkpoint, and no pacing: a restart reads the file from the start, and events go out as fast as the components downstream take them.",
           "type": "object",
           "required": [
@@ -4503,7 +4671,7 @@
           ]
         },
         "receive": {
-          "description": "Per-listener receive queue and batch assembly. A datagram listener (`collectd_in`, and `statsd_in`/`syslog_in`/`graphite_in`/`lines_in` under `transport: udp`) accepts every field; the same four under `transport: tcp`, `tail_in`, and `docker_in` accept only the batch-assembly fields and `shutdown_grace`; a non-default block on any other kind (`otlp_in`, `logit_in`, `prometheus_in`, `internal`, and `generate_in` included) is rejected.",
+          "description": "Per-listener receive queue and batch assembly. A datagram listener (`collectd_in`, and `statsd_in`/`syslog_in`/`graphite_in`/`lines_in` under `transport: udp`) accepts every field; the same four under `transport: tcp`, `tail_in`, and `docker_in` accept only the batch-assembly fields and `shutdown_grace`; `kafka_in` accepts `batch_max_events`, `batch_max_bytes`, and `shutdown_grace`; a non-default block on any other kind (`otlp_in`, `logit_in`, `prometheus_in`, `internal`, and `generate_in` included) is rejected.",
           "default": {
             "batch_flush_interval": "100ms",
             "batch_max_bytes": "1048576",
@@ -5111,6 +5279,25 @@
         }
       ]
     },
+    "KafkaAssignment": {
+      "description": "How the group's leader shares a `kafka_in` group's partitions among its members.",
+      "oneOf": [
+        {
+          "description": "Each topic's partitions in contiguous runs, the Java consumer's default.",
+          "type": "string",
+          "enum": [
+            "range"
+          ]
+        },
+        {
+          "description": "Every subscribed partition dealt to the members in turn.",
+          "type": "string",
+          "enum": [
+            "roundrobin"
+          ]
+        }
+      ]
+    },
     "KafkaCompression": {
       "description": "How `kafka_out` compresses a record batch.",
       "type": "string",
@@ -5121,6 +5308,33 @@
         "lz4",
         "zstd"
       ]
+    },
+    "KafkaFetch": {
+      "description": "The bounds of each fetch a `kafka_in` sends.",
+      "type": "object",
+      "properties": {
+        "max_bytes": {
+          "description": "The most data one fetch answer holds, across partitions. A byte-count string. Defaults to `\"50MiB\"`; `0` is rejected, and so is a value that with `max_batch_bytes` adds up to more than 2147483647 bytes, the most a fetch request can ask for.",
+          "default": "52428800",
+          "type": "string"
+        },
+        "max_partition_bytes": {
+          "description": "The most data one fetch answer holds for one partition, compressed, and so the most each partition holds in memory while its records wait to be sent downstream. A record batch larger than this is still read whole when it's the first in the answer. A byte-count string. Defaults to `\"1MiB\"`; `0` is rejected.",
+          "default": "1048576",
+          "type": "string"
+        },
+        "max_wait": {
+          "description": "How long a broker holds a fetch open waiting for `min_bytes`. Defaults to `500ms`; `0s` is rejected, and it must be below `timeout`.",
+          "default": "500ms",
+          "type": "string"
+        },
+        "min_bytes": {
+          "description": "The least data a broker gathers before it answers, unless `max_wait` passes first. A byte-count string. Defaults to `\"1\"`, an answer as soon as any record is there; `0` is rejected.",
+          "default": "1",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
     },
     "KafkaFormat": {
       "description": "What a `kafka_out` record's value holds.",
@@ -5133,7 +5347,7 @@
           ]
         },
         {
-          "description": "The log record's body as text: a string as it is, raw bytes as they are, a map or array as JSON, and nothing for an empty body. An event with no log record is skipped and counted. Under `record: batch`, the bodies joined by newlines, so a body that holds a newline reads as two.",
+          "description": "The log record's body as text: a string as it is, raw bytes as they are, a map or array as JSON, and nothing for an empty body. An event with no log record is skipped and counted. Under `record: batch`, the bodies one per line, joined by newlines with none after the last, each with a backslash written as `\\\\` and a newline as `\\n`, so a body that holds a newline stays one line.",
           "type": "string",
           "enum": [
             "text"
@@ -5165,6 +5379,44 @@
           "type": "string",
           "enum": [
             "otlp_json"
+          ]
+        }
+      ]
+    },
+    "KafkaInTopics": {
+      "description": "The topics a `kafka_in` reads: a list of names, or under `format: otlp_proto` or `otlp_json` a map of signal to topic, `{logs: NAME, metrics: NAME, traces: NAME}`.",
+      "anyOf": [
+        {
+          "description": "Topic names, each read in full.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        {
+          "description": "Each signal's topic under an OTLP `format:`: keys `logs`, `metrics`, and `traces`, each optional. A signal left out isn't read.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "KafkaIsolation": {
+      "description": "Which records a `kafka_in` reads from a topic that transactional producers write.",
+      "oneOf": [
+        {
+          "description": "Every record, including those of transactions still open or aborted.",
+          "type": "string",
+          "enum": [
+            "read_uncommitted"
+          ]
+        },
+        {
+          "description": "Only records of committed transactions, and none past the first transaction still open.",
+          "type": "string",
+          "enum": [
+            "read_committed"
           ]
         }
       ]
@@ -5215,7 +5467,7 @@
       ]
     },
     "KafkaRecord": {
-      "description": "How many events one `kafka_out` record holds.",
+      "description": "How many events one Kafka record holds: `kafka_out`'s `record:`, and `kafka_in`'s under `format: text`.",
       "oneOf": [
         {
           "description": "One record per event.",
@@ -5234,7 +5486,7 @@
       ]
     },
     "KafkaSasl": {
-      "description": "How `kafka_out` authenticates to each broker over SASL, chosen by `mechanism`. Give the password, token, or client secret with `!env` so it stays out of the config file.",
+      "description": "How `kafka_out` or `kafka_in` authenticates to each broker over SASL, chosen by `mechanism`. Give the password, token, or client secret with `!env` so it stays out of the config file.",
       "oneOf": [
         {
           "description": "`PLAIN`: the username and password as they are. Without `tls:`, they cross the network in clear, so use it only over TLS or on a network you trust.",
@@ -5388,6 +5640,25 @@
             }
           },
           "additionalProperties": false
+        }
+      ]
+    },
+    "KafkaStart": {
+      "description": "Where a `kafka_in` partition with no committed offset starts.",
+      "oneOf": [
+        {
+          "description": "At the end of the log: only records written after the group first reads the partition.",
+          "type": "string",
+          "enum": [
+            "latest"
+          ]
+        },
+        {
+          "description": "At the start of the log: every record the topic still retains.",
+          "type": "string",
+          "enum": [
+            "earliest"
+          ]
         }
       ]
     },
@@ -5738,7 +6009,7 @@
       ]
     },
     "ReceiveConfig": {
-      "description": "Per-listener receive queue and datagram-to-batch assembly. A datagram listener (`collectd_in`, and `statsd_in`/`syslog_in`/`graphite_in`/`lines_in` under `transport: udp`) accepts every field; the same four under `transport: tcp`, `tail_in`, and `docker_in` accept only the batch-assembly fields (`batch_max_events`, `batch_max_bytes`, `batch_flush_interval`) and `shutdown_grace`; a non-default block on any other kind is rejected. Every field defaults, so the block is never required. The defaults batch: `batch_max_events: 1000` and `batch_flush_interval: 100ms` mean a default-configured listener amortizes datagrams into batches (up to 1000 events, or up to 100ms of added latency before a send). For one send per datagram with no added latency, set `batch_max_events: 1`.",
+      "description": "Per-listener receive queue and datagram-to-batch assembly. A datagram listener (`collectd_in`, and `statsd_in`/`syslog_in`/`graphite_in`/`lines_in` under `transport: udp`) accepts every field; the same four under `transport: tcp`, `tail_in`, and `docker_in` accept only the batch-assembly fields (`batch_max_events`, `batch_max_bytes`, `batch_flush_interval`) and `shutdown_grace`; `kafka_in` accepts `batch_max_events`, `batch_max_bytes`, and `shutdown_grace`, and sends each fetch's records as they arrive, with no flush timer; a non-default block on any other kind is rejected. Every field defaults, so the block is never required. The defaults batch: `batch_max_events: 1000` and `batch_flush_interval: 100ms` mean a default-configured listener amortizes datagrams into batches (up to 1000 events, or up to 100ms of added latency before a send). For one send per datagram with no added latency, set `batch_max_events: 1`.",
       "type": "object",
       "properties": {
         "batch_flush_interval": {

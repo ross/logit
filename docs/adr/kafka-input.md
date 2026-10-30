@@ -256,11 +256,14 @@ from Redpanda at all.
   (default 64 MiB, item 10). One fetch request is bounded by `max_bytes`, and its answer is read
   under the Fetch cap, `max_bytes` plus `max_batch_bytes` plus 1 MiB, so the one batch KIP-74
   returns over `max_bytes` fits; every other answer is held to 64 MiB.
-- **Every send goes through `Fanout::send_with_deadline`**, which reserves a slot on every consumer
+- **Every send goes through `Fanout::send_resumable`**, which reserves a slot on every consumer
   before it sends, so a send that times out has sent nothing and none is dropped part way
   ([`fanout.rs`](../../crates/logit-pipeline/src/fanout.rs)'s module doc). While no revoke is
-  pending, a timeout retries the same batch; once one is pending, the deadline is the drain
-  deadline (item 8).
+  pending, the input offers the same batch in 250 ms attempts, reading the revoke and shutdown
+  signals between them; once one is pending, the deadline is the drain deadline (item 8). An
+  attempt that times out releases every slot it holds but keeps its wait queued on the consumer
+  it was parked on, so on a fan-in edge a peer that queued after `kafka_in` doesn't take the
+  freed slot first, and no reservation outlives its deadline.
 - **A closed consumer** ends the input as it ends `tail_in`: the batch no consumer took is counted
   `logit.input.batches.dropped{reason="closed_consumer"}` and not committed, the commit before it
   is made, and the member leaves the group so another member reads on.
@@ -322,7 +325,9 @@ A revoke, at every rebalance and at shutdown, runs in this order:
 1. Every fetch loop stops, and buffered records not yet in a batch are discarded; the next owner
    reads them.
 2. The batch in flight gets the drain deadline, `drain_timeout` (default 5 s, kept below
-   `rebalance_timeout` by graph rule 101; at shutdown also bounded by `shutdown_grace`). A batch
+   `rebalance_timeout` by graph rule 101). Shutdown caps it at the lesser of `drain_timeout` and
+   half of `shutdown_grace` from when shutdown is seen, over a revoke's drain already running,
+   so the other half is left for step 3 and LeaveGroup. A batch
    accepted by then advances the position. One that isn't is not sent, not committed, and counted
    `logit.input.batches.deferred`, with the batches decoded behind it.
 3. A synchronous commit of every revoked partition's position.
@@ -421,14 +426,14 @@ batch`.
 
 - **`record:` exists only under `format: text`**, default `event`, because only `text` can't tell a
   batch record from an event record by its bytes. The other formats read both forms.
-- **The `text` batch form changes in `kafka_out`.** Today it joins bodies with `\n` unescaped, so a
-  body that holds a newline reads as two ([ADR `kafka-output`](kafka-output.md), "Amendment: what
-  W3 settled", point 5). `logit` is pre-release, so the encoder changes rather than the pair
-  listing a normalization: under `record: batch`, each body escapes `\` as `\\` and LF as `\n`,
-  and the bodies are joined by LF with none after the last. `kafka_in` splits on LF and unescapes.
-  The escape works on bytes, so a body's UTF-8 validity and its `Str` or `Bytes` type survive. An
-  escaped form stays one line per body for a console consumer; a length prefix wouldn't. The
-  stream records it as a `kafka-output` amendment. `record: event` text is unchanged: the OTel
+- **A `text` batch record is escaped lines.** Under `record: batch`, `kafka_out` escapes each
+  body's `\` as `\\` and LF as `\n` and joins the bodies by LF with none after the last;
+  `kafka_in` splits on LF and unescapes ([ADR `kafka-output`](kafka-output.md), "Amendment: `text`
+  batch records escape newlines (2026-10-30)", which supersedes the unescaped join of its
+  "Amendment: what W3 settled", point 5). `logit` is pre-release, so the encoder escapes rather
+  than the pair listing a normalization. The escape works on bytes, so a body's UTF-8 validity and
+  its `Str` or `Bytes` type survive. An escaped form stays one line per body for a console
+  consumer; a length prefix wouldn't. `record: event` text is one body as it is: the OTel
   `kafkaexporter`'s `raw` encoding.
 - **`text` reads a third-party producer's lines.** Filebeat, Fluent Bit, and Vector write
   application JSON. That arrives as `format: text` plus a `json` transform, the stance of

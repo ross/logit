@@ -5,7 +5,7 @@
 //! | `format:` | `record: event` (default but for `native`) | `record: batch` (`native`'s default) |
 //! |---|---|---|
 //! | `json` | `crate::ndjson`'s object, without the newline | those objects as NDJSON, each line newline-terminated |
-//! | `text` | the log body: a `Str` or `Bytes` as it is, a `Map` or `Array` in `crate::ndjson`'s value form, a timestamp as RFC 3339, another scalar as its `Display` text, `Null` as nothing | those bodies joined by `\n`, with none after the last |
+//! | `text` | the log body: a `Str` or `Bytes` as it is, a `Map` or `Array` in `crate::ndjson`'s value form, a timestamp as RFC 3339, another scalar as its `Display` text, `Null` as nothing | those bodies, each with `\` escaped as `\\` and LF as `\n` (`logit_proto::kafka::text`), joined by LF with none after the last |
 //! | `msgpack` | `crate::msgpack`'s map | those maps back to back |
 //! | `native` | a `CODEC_BATCH` frame of a one-event batch under the batch's resource and scope | one `CODEC_BATCH` frame of the events |
 //! | `otlp_proto` | takes no `record:`: one signal's OTLP export request in protobuf, below | |
@@ -13,14 +13,15 @@
 //!
 //! `crate::ndjson`'s doc is the grammar of the JSON object and `crate::msgpack`'s the
 //! MessagePack value forms. A native frame is uncompressed: `compression:` compresses the record
-//! batch it travels in.
+//! batch it travels in. `json`, `msgpack`, and `native` leave out an event's top-level
+//! `_logit.kafka.*` attributes, the record metadata `kafka_in` carries
+//! (`docs/adr/kafka-input.md`, "12. Record metadata rides as private carriers").
 //!
 //! `format: text` counts an event it skips for having no log record in [`EncodeStats::no_log`],
 //! and the metrics and span an event whose body it writes leaves behind in
 //! [`EncodeStats::metrics_omitted`] and [`EncodeStats::spans_omitted`], at encode, so a record
 //! the producer later drops as oversize, or the broker rejects or names, has still counted them.
-//! An event dropped as `oversize` under `record: batch` counts only there. A text body that
-//! contains `\n` can't be told from two bodies in a batch record. What each log field, span, and
+//! An event dropped as `oversize` under `record: batch` counts only there. What each log field, span, and
 //! attribute becomes under `json` and `text` is the generated table under "What each log, span,
 //! and attribute becomes".
 //!
@@ -85,7 +86,8 @@
 //! canonical copy, by `script/transit docs`, and a test fails when they're stale: change the
 //! table there, not here. They cover `format: json` and `format: text`, the latter as each cell's
 //! `format: text` condition, and logs, spans, and attributes: the spec has no metric cells for
-//! `kafka_out`. No `kafka_in` exists, so "consumer" means the transit driver's reading of a record
+//! `kafka_out`. Until the spec gains a `kafka_in` source, "consumer" means the transit driver's
+//! reading of a record
 //! (`crates/logit-cli/src/transit/wire.rs`'s module doc): a `format: json` record through the
 //! event JSON reader, and a `format: text` record as one log whose message is the value.
 //!
@@ -285,10 +287,13 @@ use logit_core::{
     CountGate, Diagnostics, Event, EventBatch, Resource, Scope, Symbol, Telemetry, Value,
 };
 use logit_proto::frame::{write_frame, Compression};
+use logit_proto::kafka::text::escape_line_into;
 use logit_proto::msgpack::Writer;
-use logit_proto::native::{encode_events, CODEC_BATCH};
+use logit_proto::native::{encode_events_omitting, CODEC_BATCH};
 use logit_proto::otlp::{OtlpEncoder, OtlpRequest};
 use logit_proto::{FramedEncoder, MessageBuf, Signal};
+
+use super::CARRIER_PREFIX;
 
 /// What each record's key is. Mirrors `logit_config::KafkaKey`, which `logit-cli` converts.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -401,13 +406,16 @@ pub struct KafkaEncoder {
 struct Render {
     text: String,
     body: Vec<u8>,
+    /// `body` in the batch line form.
+    escaped: Vec<u8>,
     msgpack: Writer,
     msgpack_scratch: String,
 }
 
 impl Render {
     /// `event`'s value under `format`, or `None` for an event `format: text` skips. `newline`
-    /// ends a JSON object with `\n`, as an NDJSON line.
+    /// asks for the `record: batch` line form: a JSON object ends with `\n`, as an NDJSON line,
+    /// and a text body is escaped.
     fn value(
         &mut self,
         format: RecordFormat,
@@ -419,7 +427,8 @@ impl Render {
         match format {
             RecordFormat::Json => {
                 self.text.clear();
-                crate::ndjson::render_event(&mut self.text, resource, scope, event);
+                let omit = Some(CARRIER_PREFIX);
+                crate::ndjson::render_event(&mut self.text, resource, scope, event, omit);
                 if newline {
                     self.text.push('\n');
                 }
@@ -433,6 +442,7 @@ impl Render {
                     resource,
                     scope,
                     event,
+                    Some(CARRIER_PREFIX),
                 );
                 Some(self.msgpack.as_slice())
             }
@@ -440,7 +450,12 @@ impl Render {
                 let log = event.log.as_ref()?;
                 self.body.clear();
                 push_body(&mut self.body, &mut self.text, &log.message);
-                Some(&self.body)
+                if !newline {
+                    return Some(&self.body);
+                }
+                self.escaped.clear();
+                escape_line_into(&mut self.escaped, &self.body);
+                Some(&self.escaped)
             }
             RecordFormat::Native => unreachable!("native frames go through `native_frame`"),
             RecordFormat::OtlpProto | RecordFormat::OtlpJson => {
@@ -484,7 +499,8 @@ fn push_body(out: &mut Vec<u8>, text: &mut String, message: &Value) {
 
 /// One `CODEC_BATCH` frame of `events`, or `None` past the frame's own payload cap.
 fn native_frame(resource: &Resource, scope: Option<&Scope>, events: &[Event]) -> Option<Bytes> {
-    write_frame(CODEC_BATCH, Compression::None, &encode_events(resource, scope, events)).ok()
+    let payload = encode_events_omitting(resource, scope, events, CARRIER_PREFIX);
+    write_frame(CODEC_BATCH, Compression::None, &payload).ok()
 }
 
 fn millis(nanos: i64) -> i64 {
@@ -1081,7 +1097,8 @@ mod tests {
     /// `event`'s NDJSON object, the reference every format is decoded back against.
     fn ndjson(batch: &EventBatch, event: &Event) -> String {
         let mut line = String::new();
-        crate::ndjson::render_event(&mut line, &batch.resource, batch.scope.as_deref(), event);
+        let scope = batch.scope.as_deref();
+        crate::ndjson::render_event(&mut line, &batch.resource, scope, event, Some(CARRIER_PREFIX));
         line
     }
 
@@ -1340,6 +1357,107 @@ mod tests {
             &batch(AttrMap::new(), events.clone()),
         );
         assert_eq!(out.len(), 5, "8 bytes hold one body, not two and a newline");
+    }
+
+    /// An event carrying `kafka_in`'s record metadata and an ordinary attribute.
+    fn carrier_event(timestamp: i64) -> Event {
+        let mut event = log_event(timestamp, Value::str("m"));
+        event.attributes.insert("_logit.kafka.topic", "orders");
+        event.attributes.insert("_logit.kafka.offset", Value::I64(7));
+        event.attributes.insert("host", "web-1");
+        event
+    }
+
+    /// The top-level attribute keys of one decoded JSON or MessagePack object, or `None` when it
+    /// has no `attributes` key.
+    fn json_attribute_keys(line: &str) -> Option<Vec<String>> {
+        let object: serde_json::Value = serde_json::from_str(line).unwrap();
+        let attrs = object.get("attributes")?.as_object().unwrap();
+        Some(attrs.keys().cloned().collect())
+    }
+
+    fn msgpack_attribute_keys(tree: &crate::msgpack::tests::Tree) -> Option<Vec<String>> {
+        use crate::msgpack::tests::Tree;
+        let Tree::Map(top) = tree else { panic!("an event is a map") };
+        let (_, Tree::Map(attrs)) = top.iter().find(|(k, _)| k == "attributes")? else {
+            panic!("attributes is a map")
+        };
+        Some(attrs.iter().map(|(k, _)| k.clone()).collect())
+    }
+
+    /// `kafka_out` leaves `_logit.kafka.*` out of `json`, `msgpack`, and `native` records under
+    /// both record modes, and keeps every other attribute; an event whose only attributes are
+    /// carriers writes no `attributes` key.
+    #[test]
+    fn kafka_carriers_are_left_out_of_every_attribute_writing_format() {
+        let mut only_carriers = log_event(2_000_000, Value::str("c"));
+        only_carriers.attributes.insert("_logit.kafka.partition", Value::I64(0));
+        let b =
+            batch(AttrMap::new(), vec![carrier_event(0), carrier_event(1_000_000), only_carriers]);
+        let host = Some(vec!["host".to_string()]);
+        for record in [RecordMode::Event, RecordMode::Batch] {
+            let (out, _) = records(&mut encoder(RecordFormat::Json, record, usize::MAX), &b);
+            let lines: Vec<String> = out
+                .iter()
+                .flat_map(|(v, _)| {
+                    std::str::from_utf8(v).unwrap().lines().map(str::to_string).collect::<Vec<_>>()
+                })
+                .collect();
+            let keys: Vec<_> = lines.iter().map(|l| json_attribute_keys(l)).collect();
+            assert_eq!(keys, vec![host.clone(), host.clone(), None], "json, {record:?}");
+
+            let (out, _) = records(&mut encoder(RecordFormat::Msgpack, record, usize::MAX), &b);
+            let mut keys = Vec::new();
+            for (value, _) in &out {
+                let mut r = Reader::new(value);
+                while !r.is_empty() {
+                    keys.push(msgpack_attribute_keys(&read_tree(&mut r)));
+                }
+            }
+            assert_eq!(keys, vec![host.clone(), host.clone(), None], "msgpack, {record:?}");
+
+            let (out, _) = records(&mut encoder(RecordFormat::Native, record, usize::MAX), &b);
+            let attrs: Vec<AttrMap> =
+                native_events(&b, &out).into_iter().map(|e| e.attributes).collect();
+            let mut want = AttrMap::new();
+            want.insert("host", "web-1");
+            assert_eq!(attrs, vec![want.clone(), want, AttrMap::new()], "native, {record:?}");
+        }
+    }
+
+    /// Under `record: batch`, a text body's `\` and LF are escaped, so a body holding either
+    /// reads back as one body, a `Bytes` body stays bytes, and the budget measures the escaped
+    /// form. `record: event` writes each body as it is.
+    #[test]
+    fn a_text_batch_record_escapes_each_body() {
+        let bodies: [&[u8]; 4] = [b"two\nlines", b"back\\slash", b"raw\xff\n", b""];
+        let events: Vec<Event> = vec![
+            log_event(0, Value::str("two\nlines")),
+            log_event(1_000_000, Value::str("back\\slash")),
+            log_event(2_000_000, Value::Bytes(Bytes::from_static(b"raw\xff\n"))),
+            log_event(3_000_000, Value::Null),
+        ];
+        let b = batch(AttrMap::new(), events);
+
+        let (per_event, _) =
+            records(&mut encoder(RecordFormat::Text, RecordMode::Event, usize::MAX), &b);
+        let got: Vec<&[u8]> = per_event.iter().map(|(v, _)| &v[..]).collect();
+        assert_eq!(got, bodies);
+
+        let (out, _) = records(&mut encoder(RecordFormat::Text, RecordMode::Batch, usize::MAX), &b);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, b"two\\nlines\nback\\\\slash\nraw\xff\\n\n");
+        assert_eq!(logit_proto::kafka::text::unescape_lines(&out[0].0), bodies);
+
+        // Escaped, the bodies are 10, 11, 6, and 0 bytes: under a 10-byte budget the second is
+        // over alone, and the third and fourth share a record, 6 + 1 + 0 bytes.
+        let (out, stats) = records(&mut encoder(RecordFormat::Text, RecordMode::Batch, 10), &b);
+        assert_eq!(stats.oversize, 1);
+        let values: Vec<&[u8]> = out.iter().map(|(v, _)| &v[..]).collect();
+        assert_eq!(values, vec![&b"two\\nlines"[..], b"raw\xff\\n\n"]);
+        // The first body is 9 bytes as it is, so a 9-byte budget measuring that would keep it.
+        let (_, stats) = records(&mut encoder(RecordFormat::Text, RecordMode::Batch, 9), &b);
+        assert_eq!(stats.oversize, 2);
     }
 
     /// `native` under `record: batch` cuts the events into frames that each fit the budget and

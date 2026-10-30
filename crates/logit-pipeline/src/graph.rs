@@ -53,12 +53,14 @@
 //!     (`docs/adr/buffer-full-diagnostics.md`).
 //! 16. An `internal` `span_sample_rate` that is non-finite or outside `[0, 1]`: a typo, not a value
 //!     to clamp (NaN would keep every span).
-//! 17. A non-default `receive:` outside a datagram, stream, or tail listener (explicit predicates,
-//!     not [`Role`], so `internal`/`generate_in` are rejected too); on a stream or tail listener,
-//!     which has no receive queue, a queue field or `read_batch`, by name.
+//! 17. A non-default `receive:` outside a datagram, stream, or tail listener or `kafka_in`
+//!     (explicit predicates, not [`Role`], so `internal`/`generate_in` are rejected too); on a
+//!     stream or tail listener, which has no receive queue, a queue field or `read_batch`, by
+//!     name; on a `kafka_in`, those and `batch_flush_interval`, by name: Kafka holds its
+//!     backlog, and a fetch's records go out as they arrive (`docs/adr/kafka-input.md`, item 5).
 //! 18. A `receive.max_datagrams`/`max_bytes`/`read_batch` (datagram listeners) or
-//!     `batch_max_events`/`batch_max_bytes` (all three drivers) of `0`. `batch_flush_interval: 0s`
-//!     is legal ("no flush timer"); 57 owns `read_batch`'s upper end. A datagram listener's
+//!     `batch_max_events`/`batch_max_bytes` (all three drivers and `kafka_in`) of `0`.
+//!     `batch_flush_interval: 0s` is legal ("no flush timer"); 57 owns `read_batch`'s upper end. A datagram listener's
 //!     `receive.recover_below` outside `(0, 1)`, as rule 15 rejects `buffer.recover_below`.
 //! 19. A `trace_context` with an empty `trace_id`, `span_id`, or `flags` field name, after its
 //!     `format`'s defaults fill the absent ones: it could never match an attribute (`null`, not
@@ -355,6 +357,24 @@
 //!     whitespace: none could match a request's credential. Also a basic username containing
 //!     `:`, which RFC 7617 forbids and which would alias another entry's encoding. Empty lists
 //!     accept any request (`docs/adr/listener-authentication.md`).
+//! 100. A `kafka_in` with an empty `brokers` or an entry that isn't a `host:port`, a `tls` or
+//!      `sasl` failing 85's checks, an empty `group` or `client_id`, an empty `topics`, a topic
+//!      that isn't a legal Kafka topic name or that repeats, a `fetch` byte bound or
+//!      `max_batch_bytes` of `0`, a `fetch.min_bytes` over `fetch.max_bytes`, a
+//!      `fetch.max_bytes` plus `max_batch_bytes` over `i32::MAX`: the consumer reads a Fetch
+//!      answer under their sum plus 1 MiB and asks for it in the request's `i32` `max_bytes`
+//!      field. Also a `fetch.max_wait` not below `timeout`, or a
+//!      `fetch.max_wait`, `commit_interval`, `drain_timeout`, or `timeout` of `0s`
+//!      (`docs/adr/kafka-input.md`, item 14).
+//! 101. A `kafka_in` whose `heartbeat_interval` isn't below `session_timeout`, whose
+//!      `session_timeout` is over `rebalance_timeout`, or whose `drain_timeout` isn't below
+//!      `rebalance_timeout`: the session would lapse between heartbeats, the broker refuses the
+//!      join, or the coordinator removes the member mid-drain.
+//! 102. A `kafka_in` whose `topics:` shape doesn't match its `format:` (a map under
+//!      `otlp_proto` or `otlp_json`, a list under the others), an OTLP map with a key other than
+//!      `logs`, `metrics`, or `traces`, or one topic under two keys, or a `record` under any
+//!      format but `text`, the one format whose batch record can't be told from an event record
+//!      by its bytes.
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -442,7 +462,8 @@ pub fn role(kind: &ComponentKind) -> Role {
         | Internal { .. }
         | PrometheusIn { .. }
         | GenerateIn { .. }
-        | ReplayIn { .. } => Role::Listener,
+        | ReplayIn { .. }
+        | KafkaIn { .. } => Role::Listener,
         Lua { .. }
         | LuaFile { .. }
         | Aggregate { .. }
@@ -521,6 +542,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         PrometheusIn { .. } => "prometheus_in",
         GenerateIn { .. } => "generate_in",
         ReplayIn { .. } => "replay_in",
+        KafkaIn { .. } => "kafka_in",
         Lua { .. } => "lua",
         LuaFile { .. } => "lua_file",
         Aggregate { .. } => "aggregate",
@@ -701,6 +723,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::PrometheusOut { .. }
             | ComponentKind::GenerateIn { .. }
             | ComponentKind::ReplayIn { .. }
+            | ComponentKind::KafkaIn { .. }
             | ComponentKind::NullOut { .. }
             | ComponentKind::Target { .. }
             | ComponentKind::Route { .. }
@@ -733,7 +756,8 @@ pub struct ResolvedComponent {
     /// it is [`BufferConfig::default`] on any non-sink.
     pub buffer: BufferConfig,
     /// Per-listener receive config (`docs/adr/decoupled-listener-io.md`). Rule 17 guarantees it is
-    /// [`ReceiveConfig::default`] on anything but a datagram, stream, or tail listener.
+    /// [`ReceiveConfig::default`] on anything but a datagram, stream, or tail listener or
+    /// `kafka_in`.
     pub receive: ReceiveConfig,
 }
 
@@ -1349,15 +1373,40 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 17: `receive:` belongs to a datagram, stream, or tail listener only, tested by those
-    // predicates rather than `Role::Listener` so `internal`/`generate_in` are rejected. A stream or
-    // tail listener has no receive queue, so the queue fields and `read_batch` are rejected there
-    // by name, and the error says which field doesn't apply.
+    // Rule 17: `receive:` belongs to a datagram, stream, or tail listener or `kafka_in` only,
+    // tested by those predicates rather than `Role::Listener` so `internal`/`generate_in` are
+    // rejected. A stream or tail listener has no receive queue, so the queue fields and
+    // `read_batch` are rejected there by name, and the error says which field doesn't apply.
+    // `kafka_in` has no queue either (`docs/adr/kafka-input.md`, item 5), and no flush timer:
+    // a fetch's records go downstream as soon as they're cut into batches.
     for (id, component) in &components {
         if component.receive == ReceiveConfig::default() {
             continue;
         }
         if is_datagram_listener(&component.kind) {
+            continue;
+        }
+        if matches!(component.kind, ComponentKind::KafkaIn { .. }) {
+            let default = ReceiveConfig::default();
+            let r = &component.receive;
+            let unused = [
+                ("max_datagrams", r.max_datagrams != default.max_datagrams),
+                ("max_bytes", r.max_bytes != default.max_bytes),
+                ("overflow", r.overflow != default.overflow),
+                ("receive_buffer_bytes", r.receive_buffer_bytes != default.receive_buffer_bytes),
+                ("read_batch", r.read_batch != default.read_batch),
+                ("recover_below", r.recover_below != default.recover_below),
+                ("batch_flush_interval", r.batch_flush_interval != default.batch_flush_interval),
+            ];
+            if let Some((field, _)) = unused.iter().find(|(_, set)| *set) {
+                anyhow::bail!(
+                    "component '{id}': 'receive.{field}' doesn't apply to kafka_in -- it has no \
+                     receive queue, since Kafka holds the backlog and a full pipeline stops the \
+                     fetches, and it sends each fetch's records as they arrive, with nothing to \
+                     flush. Only receive.batch_max_events, batch_max_bytes, and shutdown_grace \
+                     apply"
+                );
+            }
             continue;
         }
         if is_tail_listener(&component.kind) || is_stream_listener(&component.kind) {
@@ -1405,7 +1454,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         anyhow::bail!(
             "component '{id}': 'receive' is only meaningful on a datagram, stream or tail \
              listener (statsd_in, lines_in, collectd_in, syslog_in, graphite_in, tail_in, \
-             docker_in), but \
+             docker_in) or kafka_in, but \
              '{id}' is a {}",
             role(&component.kind).as_str()
         );
@@ -1438,6 +1487,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         if is_datagram_listener(&component.kind)
             || is_tail_listener(&component.kind)
             || is_stream_listener(&component.kind)
+            || matches!(component.kind, ComponentKind::KafkaIn { .. })
         {
             if component.receive.batch_max_events == 0 {
                 anyhow::bail!(
@@ -3813,19 +3863,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         else {
             continue;
         };
-        if brokers.is_empty() {
-            anyhow::bail!(
-                "component '{id}': kafka_out 'brokers' is empty -- give at least one host:port \
-                 to bootstrap from"
-            );
-        }
-        for broker in brokers {
-            if !is_host_port(broker) {
-                anyhow::bail!(
-                    "component '{id}': kafka_out 'brokers' entry {broker:?} isn't a host:port"
-                );
-            }
-        }
+        check_kafka_brokers(id, "kafka_out", brokers)?;
         let otlp = matches!(
             format,
             logit_config::KafkaFormat::OtlpProto | logit_config::KafkaFormat::OtlpJson
@@ -3920,38 +3958,192 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                  was sent"
             );
         }
-        if let Some(tls) = tls {
-            if tls.cert_file.is_some() != tls.key_file.is_some() {
-                anyhow::bail!(
-                    "component '{id}': 'tls.cert_file' and 'tls.key_file' must both be set for \
-                     mutual TLS, or both omitted -- one alone can't be used"
-                );
-            }
-            if tls.insecure_skip_verify && tls.ca_file.is_some() {
-                anyhow::bail!(
-                    "component '{id}': 'tls.insecure_skip_verify' and 'tls.ca_file' can't both \
-                     be set -- 'insecure_skip_verify' trusts any certificate, which makes a \
-                     specific trusted CA meaningless"
-                );
-            }
+        check_kafka_tls_sasl(id, "kafka_out", tls.as_ref(), sasl.as_ref())?;
+    }
+
+    // Rule 100: `kafka_in`'s own bounds (`docs/adr/kafka-input.md`, item 14), with rule 85's
+    // broker, topic, TLS, and SASL checks. The consumer reads a Fetch answer under a cap of
+    // `fetch.max_bytes + max_batch_bytes + 1 MiB` and sends that sum in the request's `i32`
+    // `max_bytes` field, so the sum must fit it. A broker holds a fetch open for
+    // `max_wait`, so a `timeout` at or under it would fail every quiet fetch.
+    for (id, component) in &components {
+        let ComponentKind::KafkaIn {
+            brokers,
+            topics,
+            group,
+            client_id,
+            drain_timeout,
+            commit_interval,
+            fetch,
+            max_batch_bytes,
+            timeout,
+            tls,
+            sasl,
+            ..
+        } = &component.kind
+        else {
+            continue;
+        };
+        check_kafka_brokers(id, "kafka_in", brokers)?;
+        if group.is_empty() {
+            anyhow::bail!("component '{id}': kafka_in 'group' is empty -- name the group to join");
         }
-        if sasl.as_ref().and_then(|sasl| sasl.username()).is_some_and(str::is_empty) {
+        if client_id.is_empty() {
             anyhow::bail!(
-                "component '{id}': kafka_out 'sasl.username' is empty -- give the user the broker \
-                 knows these credentials by"
+                "component '{id}': kafka_in 'client_id' is empty -- omit it for 'logit', or name \
+                 this client"
             );
         }
-        if let Some(sasl) = sasl {
-            check_kafka_oauthbearer(id, sasl)?;
+        let named: Vec<&String> = match topics {
+            logit_config::KafkaInTopics::List(list) => list.iter().collect(),
+            logit_config::KafkaInTopics::Signals(map) => map.values().collect(),
+        };
+        if named.is_empty() {
+            anyhow::bail!("component '{id}': kafka_in 'topics' is empty -- name a topic to read");
         }
-        if let Some(logit_config::KafkaSasl::AwsMskIam { region: Some(region) }) = sasl {
-            if !is_aws_region(region) {
+        let mut seen = std::collections::HashSet::new();
+        for topic in named {
+            if !is_kafka_topic_name(topic) {
                 anyhow::bail!(
-                    "component '{id}': kafka_out 'sasl.region' ({region:?}) isn't an AWS region \
-                     -- give one such as 'us-east-1', or omit it to read the region from the \
-                     broker's MSK host name"
+                    "component '{id}': kafka_in 'topics' entry {topic:?} isn't a legal Kafka \
+                     topic name -- 1 to 249 characters of letters, digits, '.', '_', and '-', and \
+                     not '.' or '..'"
                 );
             }
+            // A map's repeat is rule 102's, whose message names the two signals.
+            let listed = matches!(topics, logit_config::KafkaInTopics::List(_));
+            if listed && !seen.insert(topic) {
+                anyhow::bail!(
+                    "component '{id}': kafka_in 'topics' names {topic:?} twice -- each topic is \
+                     read once"
+                );
+            }
+        }
+        for (field, value) in [
+            ("fetch.min_bytes", fetch.min_bytes),
+            ("fetch.max_bytes", fetch.max_bytes),
+            ("fetch.max_partition_bytes", fetch.max_partition_bytes),
+            ("max_batch_bytes", *max_batch_bytes),
+        ] {
+            if value == 0 {
+                anyhow::bail!("component '{id}': kafka_in '{field}' must be greater than 0");
+            }
+        }
+        if fetch.min_bytes > fetch.max_bytes {
+            anyhow::bail!(
+                "component '{id}': kafka_in 'fetch.min_bytes' is over 'fetch.max_bytes' -- a \
+                 broker could never gather the least it waits for"
+            );
+        }
+        if fetch.max_bytes.saturating_add(*max_batch_bytes) > i32::MAX as u64 {
+            anyhow::bail!(
+                "component '{id}': kafka_in 'fetch.max_bytes' plus 'max_batch_bytes' is over \
+                 2147483647 bytes, the most a Kafka fetch request can ask for"
+            );
+        }
+        for (field, value) in [
+            ("fetch.max_wait", fetch.max_wait),
+            ("commit_interval", *commit_interval),
+            ("drain_timeout", *drain_timeout),
+            ("timeout", *timeout),
+        ] {
+            if value.is_zero() {
+                anyhow::bail!("component '{id}': kafka_in '{field}: 0s' must be greater than 0");
+            }
+        }
+        if fetch.max_wait >= *timeout {
+            anyhow::bail!(
+                "component '{id}': kafka_in 'fetch.max_wait' must be below 'timeout' -- a broker \
+                 holds a fetch open that long, so the fetch would time out whenever the topic is \
+                 quiet"
+            );
+        }
+        check_kafka_tls_sasl(id, "kafka_in", tls.as_ref(), sasl.as_ref())?;
+    }
+
+    // Rule 101: `kafka_in`'s group timing (`docs/adr/kafka-input.md`, item 14). A heartbeat at
+    // or past the session timeout lets the session expire between beats. The broker refuses a
+    // JoinGroup whose session timeout is over its rebalance timeout, as the Java client does. A
+    // drain that outlasts the rebalance timeout lets the coordinator drop the member mid-drain.
+    for (id, component) in &components {
+        let ComponentKind::KafkaIn {
+            session_timeout,
+            heartbeat_interval,
+            rebalance_timeout,
+            drain_timeout,
+            ..
+        } = &component.kind
+        else {
+            continue;
+        };
+        if heartbeat_interval >= session_timeout {
+            anyhow::bail!(
+                "component '{id}': kafka_in 'heartbeat_interval' must be below 'session_timeout' \
+                 -- the session would expire between heartbeats"
+            );
+        }
+        if session_timeout > rebalance_timeout {
+            anyhow::bail!(
+                "component '{id}': kafka_in 'session_timeout' must not be over \
+                 'rebalance_timeout'"
+            );
+        }
+        if drain_timeout >= rebalance_timeout {
+            anyhow::bail!(
+                "component '{id}': kafka_in 'drain_timeout' must be below 'rebalance_timeout' -- \
+                 the coordinator would remove this member before its drain ended"
+            );
+        }
+    }
+
+    // Rule 102: `kafka_in`'s `topics:` shape and `record:` (`docs/adr/kafka-input.md`, items 11
+    // and 14). An OTLP request doesn't name its signal, so the topic does, and one topic can't
+    // carry two signals. Only `text` can't tell a batch record from an event record by its bytes.
+    for (id, component) in &components {
+        let ComponentKind::KafkaIn { topics, format, record, .. } = &component.kind else {
+            continue;
+        };
+        let otlp = matches!(
+            format,
+            logit_config::KafkaFormat::OtlpProto | logit_config::KafkaFormat::OtlpJson
+        );
+        match (topics, otlp) {
+            (logit_config::KafkaInTopics::List(_), true) => anyhow::bail!(
+                "component '{id}': kafka_in under 'format: otlp_proto' or 'otlp_json' needs \
+                 'topics' as a map of signal to topic, '{{logs: .., metrics: .., traces: ..}}' -- \
+                 a request doesn't name its signal, so its topic does"
+            ),
+            (logit_config::KafkaInTopics::Signals(_), false) => anyhow::bail!(
+                "component '{id}': kafka_in 'topics' is a map, which only 'format: otlp_proto' \
+                 or 'otlp_json' takes -- give a list of topic names"
+            ),
+            (logit_config::KafkaInTopics::Signals(map), true) => {
+                if let Some(key) =
+                    map.keys().find(|k| !matches!(k.as_str(), "logs" | "metrics" | "traces"))
+                {
+                    anyhow::bail!(
+                        "component '{id}': kafka_in 'topics' key {key:?} isn't a signal -- use \
+                         'logs', 'metrics', or 'traces'"
+                    );
+                }
+                let mut seen = std::collections::HashMap::new();
+                for (signal, topic) in map {
+                    if let Some(other) = seen.insert(topic, signal) {
+                        anyhow::bail!(
+                            "component '{id}': kafka_in 'topics' names {topic:?} for both \
+                             '{other}' and '{signal}' -- a request doesn't name its signal, so \
+                             each signal needs its own topic"
+                        );
+                    }
+                }
+            }
+            (logit_config::KafkaInTopics::List(_), false) => {}
+        }
+        if record.is_some() && *format != logit_config::KafkaFormat::Text {
+            anyhow::bail!(
+                "component '{id}': kafka_in 'record' applies to 'format: text' only -- the other \
+                 formats read an event record and a batch record alike; remove 'record'"
+            );
         }
     }
 
@@ -4708,9 +4900,73 @@ fn check_lua_vars(id: &str, vars: &logit_config::LuaVars) -> anyhow::Result<()> 
     walk_map(id, &mut "vars".to_string(), vars)
 }
 
+/// Rules 85 and 100's broker check: at least one entry, each a `host:port`.
+fn check_kafka_brokers(id: &str, kind: &str, brokers: &[String]) -> anyhow::Result<()> {
+    if brokers.is_empty() {
+        anyhow::bail!(
+            "component '{id}': {kind} 'brokers' is empty -- give at least one host:port to \
+             bootstrap from"
+        );
+    }
+    for broker in brokers {
+        if !is_host_port(broker) {
+            anyhow::bail!("component '{id}': {kind} 'brokers' entry {broker:?} isn't a host:port");
+        }
+    }
+    Ok(())
+}
+
+/// Rules 85 and 100's `tls` and `sasl` checks: rule 34's two TLS checks, since the block's
+/// presence turns TLS on; no empty SASL username, which every broker refuses; and the
+/// `oauthbearer` and `aws_msk_iam` shapes. No message prints a secret.
+fn check_kafka_tls_sasl(
+    id: &str,
+    kind: &str,
+    tls: Option<&logit_config::TlsClientConfig>,
+    sasl: Option<&logit_config::KafkaSasl>,
+) -> anyhow::Result<()> {
+    if let Some(tls) = tls {
+        if tls.cert_file.is_some() != tls.key_file.is_some() {
+            anyhow::bail!(
+                "component '{id}': 'tls.cert_file' and 'tls.key_file' must both be set for \
+                 mutual TLS, or both omitted -- one alone can't be used"
+            );
+        }
+        if tls.insecure_skip_verify && tls.ca_file.is_some() {
+            anyhow::bail!(
+                "component '{id}': 'tls.insecure_skip_verify' and 'tls.ca_file' can't both be \
+                 set -- 'insecure_skip_verify' trusts any certificate, which makes a specific \
+                 trusted CA meaningless"
+            );
+        }
+    }
+    let Some(sasl) = sasl else { return Ok(()) };
+    if sasl.username().is_some_and(str::is_empty) {
+        anyhow::bail!(
+            "component '{id}': {kind} 'sasl.username' is empty -- give the user the broker knows \
+             these credentials by"
+        );
+    }
+    check_kafka_oauthbearer(id, kind, sasl)?;
+    if let logit_config::KafkaSasl::AwsMskIam { region: Some(region) } = sasl {
+        if !is_aws_region(region) {
+            anyhow::bail!(
+                "component '{id}': {kind} 'sasl.region' ({region:?}) isn't an AWS region -- give \
+                 one such as 'us-east-1', or omit it to read the region from the broker's MSK \
+                 host name"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Rule 85's `sasl: {mechanism: oauthbearer}` checks. No message prints the token, the client
 /// secret, or an extension's value, and the endpoint goes through `redact::url`.
-fn check_kafka_oauthbearer(id: &str, sasl: &logit_config::KafkaSasl) -> anyhow::Result<()> {
+fn check_kafka_oauthbearer(
+    id: &str,
+    kind: &str,
+    sasl: &logit_config::KafkaSasl,
+) -> anyhow::Result<()> {
     let logit_config::KafkaSasl::OAuthBearer {
         token,
         token_endpoint,
@@ -4724,24 +4980,24 @@ fn check_kafka_oauthbearer(id: &str, sasl: &logit_config::KafkaSasl) -> anyhow::
     };
     match (token, token_endpoint) {
         (Some(_), Some(_)) => anyhow::bail!(
-            "component '{id}': kafka_out 'sasl' sets both 'token' and 'token_endpoint' -- give a \
+            "component '{id}': {kind} 'sasl' sets both 'token' and 'token_endpoint' -- give a \
              fixed token, or an endpoint to fetch one from, not both"
         ),
         (None, None) => anyhow::bail!(
-            "component '{id}': kafka_out 'sasl: {{mechanism: oauthbearer}}' needs 'token' or \
+            "component '{id}': {kind} 'sasl: {{mechanism: oauthbearer}}' needs 'token' or \
              'token_endpoint'"
         ),
         (Some(token), None) => {
             if !is_bearer_token(token) {
                 anyhow::bail!(
-                    "component '{id}': kafka_out 'sasl.token' is empty or holds a character a \
+                    "component '{id}': {kind} 'sasl.token' is empty or holds a character a \
                      bearer token can't carry -- letters, digits, '-', '.', '_', '~', '+', and \
                      '/', then any '=' padding"
                 );
             }
             if client_id.is_some() || client_secret.is_some() || scope.is_some() {
                 anyhow::bail!(
-                    "component '{id}': kafka_out 'sasl.client_id', 'client_secret', and 'scope' \
+                    "component '{id}': {kind} 'sasl.client_id', 'client_secret', and 'scope' \
                      are for 'token_endpoint', and a fixed 'token' never uses them -- remove them"
                 );
             }
@@ -4749,7 +5005,7 @@ fn check_kafka_oauthbearer(id: &str, sasl: &logit_config::KafkaSasl) -> anyhow::
         (None, Some(endpoint)) => {
             if !is_https_or_loopback_http(endpoint) {
                 anyhow::bail!(
-                    "component '{id}': kafka_out 'sasl.token_endpoint' ({endpoint:?}) must be \
+                    "component '{id}': {kind} 'sasl.token_endpoint' ({endpoint:?}) must be \
                      'https://', or 'http://' to a loopback address -- the client secret crosses \
                      it",
                     endpoint = redact::url(endpoint)
@@ -4757,7 +5013,7 @@ fn check_kafka_oauthbearer(id: &str, sasl: &logit_config::KafkaSasl) -> anyhow::
             }
             if client_id.as_deref().is_none_or(str::is_empty) || client_secret.is_none() {
                 anyhow::bail!(
-                    "component '{id}': kafka_out 'sasl.token_endpoint' needs 'client_id' and \
+                    "component '{id}': {kind} 'sasl.token_endpoint' needs 'client_id' and \
                      'client_secret'"
                 );
             }
@@ -4766,7 +5022,7 @@ fn check_kafka_oauthbearer(id: &str, sasl: &logit_config::KafkaSasl) -> anyhow::
     for (key, value) in extensions {
         if key.is_empty() || !key.bytes().all(|b| b.is_ascii_alphabetic()) || key == "auth" {
             anyhow::bail!(
-                "component '{id}': kafka_out 'sasl.extensions' key {key:?} must be letters only, \
+                "component '{id}': {kind} 'sasl.extensions' key {key:?} must be letters only, \
                  and not 'auth', which carries the token"
             );
         }
@@ -4774,7 +5030,7 @@ fn check_kafka_oauthbearer(id: &str, sasl: &logit_config::KafkaSasl) -> anyhow::
             || !value.bytes().all(|b| matches!(b, 0x21..=0x7e | b' ' | b'\t' | b'\r' | b'\n'))
         {
             anyhow::bail!(
-                "component '{id}': kafka_out 'sasl.extensions' value for {key:?} is empty or \
+                "component '{id}': {kind} 'sasl.extensions' value for {key:?} is empty or \
                  holds a character outside printable ASCII, space, tab, CR, and LF"
             );
         }
@@ -4782,7 +5038,7 @@ fn check_kafka_oauthbearer(id: &str, sasl: &logit_config::KafkaSasl) -> anyhow::
     Ok(())
 }
 
-/// Rule 85's `aws_msk_iam` region check: an AWS region's shape, a two-letter prefix, one or
+/// Rules 85 and 100's `aws_msk_iam` region check: an AWS region's shape, a two-letter prefix, one or
 /// more lowercase words, and a number, such as `us-east-1` or `us-gov-west-1`.
 fn is_aws_region(region: &str) -> bool {
     let parts: Vec<&str> = region.split('-').collect();
@@ -4825,7 +5081,7 @@ fn is_https_or_loopback_http(url: &str) -> bool {
     host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
-/// Rule 85's topic check: Kafka's `Topic.validate`.
+/// Rules 85 and 100's topic check: Kafka's `Topic.validate`.
 fn is_kafka_topic_name(topic: &str) -> bool {
     (1..=249).contains(&topic.len())
         && topic != "."
@@ -7765,6 +8021,286 @@ mod tests {
         }
         let err = datadog_in_err(kind);
         assert!(err.contains("'idle_timeout' must be greater than 0s"), "got: {err}");
+    }
+
+    // ---- rules 100 to 102: kafka_in --------------------------------------------------------
+
+    /// A `kafka_in` reading `logs` as `json`, with every optional field at its default.
+    fn kafka_in() -> ComponentKind {
+        ComponentKind::KafkaIn {
+            brokers: vec!["kafka:9092".to_string()],
+            topics: logit_config::KafkaInTopics::List(vec!["logs".to_string()]),
+            group: "g".to_string(),
+            format: logit_config::KafkaFormat::Json,
+            record: None,
+            client_id: "logit".to_string(),
+            start: Default::default(),
+            isolation: Default::default(),
+            assignment: Default::default(),
+            session_timeout: logit_config::default_kafka_in_session_timeout(),
+            heartbeat_interval: logit_config::default_kafka_in_heartbeat_interval(),
+            rebalance_timeout: logit_config::default_kafka_in_rebalance_timeout(),
+            drain_timeout: logit_config::default_kafka_in_drain_timeout(),
+            commit_interval: logit_config::default_kafka_in_commit_interval(),
+            fetch: Default::default(),
+            max_batch_bytes: logit_config::default_kafka_in_max_batch_bytes(),
+            timeout: logit_config::default_kafka_timeout(),
+            tls: None,
+            sasl: None,
+        }
+    }
+
+    fn kafka_in_with(edit: impl FnOnce(&mut ComponentKind)) -> ComponentKind {
+        let mut kind = kafka_in();
+        edit(&mut kind);
+        kind
+    }
+
+    fn kafka_in_result(kind: ComponentKind) -> anyhow::Result<Graph> {
+        resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]))
+    }
+
+    /// A map of signal to topic.
+    fn signal_topics(pairs: &[(&str, &str)]) -> logit_config::KafkaInTopics {
+        logit_config::KafkaInTopics::Signals(
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        )
+    }
+
+    #[test]
+    fn a_kafka_in_resolves_under_each_format_and_topics_shape() {
+        kafka_in_result(kafka_in()).expect("the defaults");
+        kafka_in_result(kafka_in_with(|k| {
+            if let ComponentKind::KafkaIn { format, record, .. } = k {
+                *format = logit_config::KafkaFormat::Text;
+                *record = Some(logit_config::KafkaRecord::Batch);
+            }
+        }))
+        .expect("record: batch under text");
+        kafka_in_result(kafka_in_with(|k| {
+            if let ComponentKind::KafkaIn { format, topics, .. } = k {
+                *format = logit_config::KafkaFormat::OtlpJson;
+                *topics = signal_topics(&[("logs", "l"), ("traces", "t")]);
+            }
+        }))
+        .expect("an OTLP map with a signal left out");
+        let graph = kafka_in_result(kafka_in()).unwrap();
+        assert_eq!(graph.components["in"].role(), Role::Listener);
+        assert_eq!(graph.components["in"].kind_name(), "kafka_in");
+    }
+
+    /// Rules 100, 101, and 102, one clause per case.
+    #[test]
+    fn rules_100_to_102_reject_each_kafka_in_misconfiguration() {
+        use logit_config::{KafkaFormat, KafkaInTopics, KafkaRecord, KafkaSasl, TlsClientConfig};
+        type Edit = Box<dyn FnOnce(&mut ComponentKind)>;
+        let edit = |f: fn(&mut ComponentKind)| -> Edit { Box::new(f) };
+        macro_rules! set {
+            ($($field:ident),+ => $body:block) => {
+                edit(|k| {
+                    if let ComponentKind::KafkaIn { $($field,)+ .. } = k $body
+                })
+            };
+        }
+        let cases: Vec<(&str, Edit)> = vec![
+            // Rule 100.
+            ("kafka_in 'brokers' is empty", set!(brokers => { brokers.clear(); })),
+            ("isn't a host:port", set!(brokers => { *brokers = vec!["kafka".into()]; })),
+            ("kafka_in 'group' is empty", set!(group => { group.clear(); })),
+            ("kafka_in 'client_id' is empty", set!(client_id => { client_id.clear(); })),
+            (
+                "kafka_in 'topics' is empty",
+                set!(topics => { *topics = KafkaInTopics::List(vec![]); }),
+            ),
+            (
+                "isn't a legal Kafka topic name",
+                set!(topics => { *topics = KafkaInTopics::List(vec!["a/b".into()]); }),
+            ),
+            (
+                "names \"a\" twice",
+                set!(topics => { *topics = KafkaInTopics::List(vec!["a".into(), "a".into()]); }),
+            ),
+            ("'fetch.min_bytes' must be greater than 0", set!(fetch => { fetch.min_bytes = 0; })),
+            ("'fetch.max_bytes' must be greater than 0", set!(fetch => { fetch.max_bytes = 0; })),
+            (
+                "'fetch.max_partition_bytes' must be greater than 0",
+                set!(fetch => { fetch.max_partition_bytes = 0; }),
+            ),
+            (
+                "'max_batch_bytes' must be greater than 0",
+                set!(max_batch_bytes => { *max_batch_bytes = 0; }),
+            ),
+            (
+                "'fetch.min_bytes' is over 'fetch.max_bytes'",
+                set!(fetch => { fetch.min_bytes = fetch.max_bytes + 1; }),
+            ),
+            (
+                "'fetch.max_bytes' plus 'max_batch_bytes' is over 2147483647 bytes",
+                set!(fetch => { fetch.max_bytes = i32::MAX as u64; }),
+            ),
+            ("'fetch.max_wait: 0s'", set!(fetch => { fetch.max_wait = Duration::ZERO; })),
+            (
+                "'commit_interval: 0s'",
+                set!(commit_interval => { *commit_interval = Duration::ZERO; }),
+            ),
+            ("'drain_timeout: 0s'", set!(drain_timeout => { *drain_timeout = Duration::ZERO; })),
+            ("'timeout: 0s'", set!(timeout => { *timeout = Duration::ZERO; })),
+            (
+                "'fetch.max_wait' must be below 'timeout'",
+                set!(fetch, timeout => { fetch.max_wait = *timeout; }),
+            ),
+            (
+                "'tls.cert_file' and 'tls.key_file' must both be set",
+                set!(tls => {
+                    *tls = Some(TlsClientConfig {
+                        cert_file: Some("c.pem".into()),
+                        ..Default::default()
+                    });
+                }),
+            ),
+            (
+                "kafka_in 'sasl.username' is empty",
+                set!(sasl => {
+                    *sasl = Some(KafkaSasl::Plain { username: String::new(), password: "p".into() });
+                }),
+            ),
+            (
+                "kafka_in 'sasl: {mechanism: oauthbearer}' needs 'token'",
+                set!(sasl => {
+                    *sasl = Some(KafkaSasl::OAuthBearer {
+                        token: None,
+                        token_endpoint: None,
+                        client_id: None,
+                        client_secret: None,
+                        scope: None,
+                        extensions: Default::default(),
+                    });
+                }),
+            ),
+            (
+                "kafka_in 'sasl.region'",
+                set!(sasl => {
+                    *sasl = Some(KafkaSasl::AwsMskIam { region: Some("mars".into()) });
+                }),
+            ),
+            // Rule 101.
+            (
+                "'heartbeat_interval' must be below 'session_timeout'",
+                set!(heartbeat_interval, session_timeout => {
+                    *heartbeat_interval = *session_timeout;
+                }),
+            ),
+            (
+                "'session_timeout' must not be over 'rebalance_timeout'",
+                set!(session_timeout, rebalance_timeout => {
+                    *session_timeout = *rebalance_timeout + Duration::from_secs(1);
+                }),
+            ),
+            (
+                "'drain_timeout' must be below 'rebalance_timeout'",
+                set!(drain_timeout, rebalance_timeout => { *drain_timeout = *rebalance_timeout; }),
+            ),
+            // Rule 102.
+            (
+                "needs 'topics' as a map of signal to topic",
+                set!(format => { *format = KafkaFormat::OtlpProto; }),
+            ),
+            (
+                "'topics' is a map, which only 'format: otlp_proto'",
+                set!(topics => { *topics = signal_topics(&[("logs", "l")]); }),
+            ),
+            (
+                "'topics' key \"spans\" isn't a signal",
+                set!(format, topics => {
+                    *format = KafkaFormat::OtlpJson;
+                    *topics = signal_topics(&[("spans", "s")]);
+                }),
+            ),
+            (
+                "names \"t\" for both 'logs' and 'traces'",
+                set!(format, topics => {
+                    *format = KafkaFormat::OtlpProto;
+                    *topics = signal_topics(&[("logs", "t"), ("traces", "t")]);
+                }),
+            ),
+            (
+                "kafka_in 'topics' is empty",
+                set!(format, topics => {
+                    *format = KafkaFormat::OtlpProto;
+                    *topics = signal_topics(&[]);
+                }),
+            ),
+            (
+                "'record' applies to 'format: text' only",
+                set!(record => { *record = Some(KafkaRecord::Event); }),
+            ),
+        ];
+        for (want, edit) in cases {
+            let err = expect_err(cfg(vec![
+                ("in", vec![], kafka_in_with(edit)),
+                ("out", vec!["in"], sink()),
+            ]));
+            assert!(err.contains("'in'") && err.contains(want), "want {want:?}, got: {err}");
+        }
+    }
+
+    /// Rule 17: `kafka_in` takes the batch bounds and `shutdown_grace`, and names every other
+    /// `receive:` field it refuses.
+    #[test]
+    fn rule_17_takes_kafka_in_batch_bounds_and_refuses_the_rest_by_name() {
+        let ok = ReceiveConfig {
+            batch_max_events: 10,
+            batch_max_bytes: 4096,
+            shutdown_grace: Duration::from_secs(9),
+            ..ReceiveConfig::default()
+        };
+        resolve(cfg_with_receive(vec![
+            ("in", vec![], kafka_in(), ok),
+            ("out", vec!["in"], sink(), ReceiveConfig::default()),
+        ]))
+        .expect("batch bounds and shutdown_grace apply");
+        for (field, receive) in [
+            ("max_datagrams", ReceiveConfig { max_datagrams: 4096, ..ReceiveConfig::default() }),
+            ("max_bytes", ReceiveConfig { max_bytes: 1024, ..ReceiveConfig::default() }),
+            (
+                "overflow",
+                ReceiveConfig {
+                    overflow: logit_config::OverflowPolicy::Block,
+                    ..ReceiveConfig::default()
+                },
+            ),
+            (
+                "receive_buffer_bytes",
+                ReceiveConfig { receive_buffer_bytes: Some(1 << 20), ..ReceiveConfig::default() },
+            ),
+            ("read_batch", ReceiveConfig { read_batch: 8, ..ReceiveConfig::default() }),
+            ("recover_below", ReceiveConfig { recover_below: 0.5, ..ReceiveConfig::default() }),
+            (
+                "batch_flush_interval",
+                ReceiveConfig { batch_flush_interval: Duration::ZERO, ..ReceiveConfig::default() },
+            ),
+        ] {
+            let err = expect_err(cfg_with_receive(vec![
+                ("in", vec![], kafka_in(), receive),
+                ("out", vec!["in"], sink(), ReceiveConfig::default()),
+            ]));
+            assert!(err.contains(&format!("'receive.{field}' doesn't apply to kafka_in")), "{err}");
+        }
+    }
+
+    /// Rule 18 covers `kafka_in`'s batch bounds.
+    #[test]
+    fn rule_18_rejects_a_zero_kafka_in_batch_bound() {
+        for (field, receive) in [
+            ("batch_max_events", ReceiveConfig { batch_max_events: 0, ..ReceiveConfig::default() }),
+            ("batch_max_bytes", ReceiveConfig { batch_max_bytes: 0, ..ReceiveConfig::default() }),
+        ] {
+            let err = expect_err(cfg_with_receive(vec![
+                ("in", vec![], kafka_in(), receive),
+                ("out", vec!["in"], sink(), ReceiveConfig::default()),
+            ]));
+            assert!(err.contains(&format!("'receive.{field}' must be at least 1")), "{err}");
+        }
     }
 
     // ---- rule 85: kafka_out ----------------------------------------------------------------

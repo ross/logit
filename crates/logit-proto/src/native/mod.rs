@@ -118,6 +118,26 @@ pub fn encode_batch(batch: &EventBatch) -> Bytes {
 /// `resource` and `scope`. `kafka_out` encodes a slice of a batch's events as one frame with it,
 /// without cloning them into a new [`EventBatch`].
 pub fn encode_events(resource: &Resource, scope: Option<&Scope>, events: &[Event]) -> Bytes {
+    encode_events_inner(resource, scope, events, None)
+}
+
+/// [`encode_events`] without each event's top-level attributes whose keys start with `omit`.
+/// `kafka_out` leaves its `_logit.kafka.*` carriers out this way.
+pub fn encode_events_omitting(
+    resource: &Resource,
+    scope: Option<&Scope>,
+    events: &[Event],
+    omit: &str,
+) -> Bytes {
+    encode_events_inner(resource, scope, events, Some(omit))
+}
+
+fn encode_events_inner(
+    resource: &Resource,
+    scope: Option<&Scope>,
+    events: &[Event],
+    omit: Option<&str>,
+) -> Bytes {
     let mut dict = DictBuilder::default();
 
     let mut resource_buf = BytesMut::new();
@@ -138,7 +158,7 @@ pub fn encode_events(resource: &Resource, scope: Option<&Scope>, events: &[Event
     let mut events_buf = BytesMut::new();
     write_uvarint(&mut events_buf, events.len() as u64);
     for event in events {
-        let body = record::write_event(&mut dict, event);
+        let body = record::write_event_omitting(&mut dict, event, omit);
         write_uvarint(&mut events_buf, body.len() as u64);
         events_buf.extend_from_slice(&body);
     }
@@ -536,6 +556,36 @@ mod tests {
     fn encoding_with_zstd_returns_unsupported_rather_than_panicking() {
         let mut encoder = NativeEncoder::new(Compression::Zstd);
         assert!(matches!(encoder.encode(&sample_batch()), Err(CodecError::Unsupported(_))));
+    }
+
+    #[test]
+    fn encode_events_omitting_leaves_out_the_prefixed_top_level_attributes() {
+        let mut nested = AttrMap::new();
+        nested.insert("_logit.kafka.inner", "kept");
+        let mut attrs = AttrMap::new();
+        attrs.insert("_logit.kafka.topic", "orders");
+        attrs.insert("host", "web-1");
+        attrs.insert("nested", Value::Map(Box::new(nested)));
+        let mut only_carriers = AttrMap::new();
+        only_carriers.insert("_logit.kafka.offset", Value::I64(7));
+        let events = vec![Event::empty(1, attrs.clone()), Event::empty(2, only_carriers)];
+        let resource = Resource::default();
+
+        let mut payload = encode_events_omitting(&resource, None, &events, "_logit.kafka.");
+        let decoded = decode_batch(&mut payload, &DecodeBudget::default()).unwrap();
+        let mut want = attrs;
+        want.remove("_logit.kafka.topic");
+        assert_eq!(decoded.events[0].attributes, want, "nested keys are kept");
+        assert!(decoded.events[1].attributes.is_empty());
+        // No attributes field and no dictionary entry: the payload of an attribute-less event.
+        assert_eq!(
+            encode_events_omitting(&resource, None, &events[1..], "_logit.kafka."),
+            encode_events(&resource, None, &[Event::empty(2, AttrMap::new())]),
+        );
+
+        let mut all = encode_events(&resource, None, &events);
+        let decoded = decode_batch(&mut all, &DecodeBudget::default()).unwrap();
+        assert_eq!(decoded.events, events, "encode_events keeps every attribute");
     }
 
     #[test]

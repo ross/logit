@@ -44,7 +44,7 @@
 //! `datadog_out`, `datadog_trace_out`, `graphite_out`, `syslog_out`, `splunk_hec_out`, and
 //! `kafka_out`); and a
 //! `kafka_out` `format:` other than `json` and `text`, whose records the driver has no reading
-//! of, since no `kafka_in` exists (`wire`'s module doc).
+//! of until the spec gains a `kafka_in` source (`wire`'s module doc).
 //!
 //! Exposition has no configured dialect: a scraper negotiates one, so the driver takes it as
 //! [`Options::dialect`], OpenMetrics by default, which is what a Prometheus scrape negotiates.

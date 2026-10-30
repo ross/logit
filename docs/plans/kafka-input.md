@@ -153,7 +153,7 @@ The protocol client, with no `Input` and no config: everything W3 drives.
   or dropped batch), each with its test, beside a pointer to `logit_kafka::consumer`'s table of
   broker outcomes (the ADR's item 9), the carriers, and the commit rule; `input.rs`, the `Input` with `run_until_shutdown` overridden for the item 8
   sequence; `decode.rs`, the `json`, `text` (both `record:` modes), and `native` decoders and the
-  carriers. Batches go through `Fanout::send_with_deadline` as item 5 describes.
+  carriers. Batches go through `Fanout::send_resumable` as item 5 describes.
 - **`kafka_out` changes.**
   - `format: text` under `record: batch` escapes `\` and LF, in `encode.rs` and its module doc.
     [ADR `kafka-output`](../adr/kafka-output.md) gets an amendment superseding "Amendment: what W3
@@ -318,7 +318,7 @@ soak harness share no file, and neither changes `kafka_in`.
 | W0 | `kin/w0` | `kin/w0: ADR and plan for kafka_in, a consumer-group client` | S | — | open |
 | W1 | `kin/w1` | `kin/w1: the logit-kafka crate, shared by kafka_out and kafka_in` | M | W0, the `s3` stream's `logit-aws` PR | open |
 | W2 | `kin/w2` | `kin/w2: the consumer core: group membership, assignors, offsets, and fetch` | L | W1 | open |
-| W3 | `kin/w3` | `kin/w3: kafka_in, with json, text, and native, and kafka_out's text batch escape` | L | W2 | not started |
+| W3 | `kin/w3` | `kin/w3: kafka_in, with json, text, and native, and kafka_out's text batch escape` | L | W2 | open |
 | W4 | `kin/w4` | `kin/w4: kafka_in's msgpack and OTLP formats` | M | W3 | not started |
 | W5 | `kin/w5` | `kin/w5: kafka_in in the transit spec, the eleventh lossless pair, and fuzz targets` | M | W4 | not started |
 | W6a | `kin/w6a` | `kin/w6a: kafka_in interop legs on Apache Kafka and Redpanda` | M | W5 | not started |
@@ -350,3 +350,18 @@ Recorded per workstream as each lands.
   inside `Consumer::next`, so the input calls it between batches. A dial failure carries the
   stage it failed in (`conn::DialStage`), which tags `broker.errors`. The outcome table is
   `crates/logit-kafka/src/consumer/mod.rs`'s module doc, not the input's.
+- **W3**: The input decodes a whole `Fetched`, then cuts it by `receive.batch_max_events` and
+  `batch_max_bytes` (record value bytes, a record never split), so every record's outcome is
+  counted before any batch goes out. To offer a batch again after a send slice,
+  `logit_pipeline::SendTimeout` now hands the batch back. The W4 formats are refused in
+  `logit-cli`'s registry when `logit run` builds the node, so `logit validate` accepts every
+  schema value. At shutdown the batch in flight waits the lesser of `drain_timeout` and half of
+  `receive.shutdown_grace`, leaving the other half for the commit and LeaveGroup. The batches
+  behind a `closed_consumer` drop count `batches.deferred`, since nothing past the dropped one is
+  committed. A `text` value is never `empty`: an empty value is a log with an empty message, as
+  `kafka_out` writes one. The `fetch` byte bounds are byte-count strings, as every other byte field
+  in the config is, so `min_bytes: 1` is written `"1"`. Rule 100 bounds `fetch.max_bytes` plus
+  `max_batch_bytes` by Fetch's `i32` `max_bytes` field, not by the connection's 64 MiB response
+  cap. A repeated header name can't come from `kafka-protocol`'s producer types, so the carrier
+  tests hand-build a record batch.
+

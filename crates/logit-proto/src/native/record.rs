@@ -22,7 +22,9 @@
 
 use crate::native::budget::DecodeBudget;
 use crate::native::dict::{Dict, DictBuilder};
-use crate::native::value::{read_attr_map, read_value, write_attr_map, write_value};
+use crate::native::value::{
+    read_attr_map, read_value, write_attr_map, write_attr_map_omitting, write_value,
+};
 use crate::native::varint::{
     read_ivarint, read_u8, read_uvarint, trailing_bytes, write_ivarint, write_uvarint,
 };
@@ -1172,10 +1174,31 @@ const FIELD_METRICS: u8 = 4;
 const FIELD_SPAN: u8 = 5;
 
 pub fn write_event(dict: &mut DictBuilder, event: &Event) -> BytesMut {
+    write_event_omitting(dict, event, None)
+}
+
+/// [`write_event`] without the event's top-level attributes whose keys start with `omit`; an
+/// event left with none writes no attributes field.
+pub fn write_event_omitting(dict: &mut DictBuilder, event: &Event, omit: Option<&str>) -> BytesMut {
     let mut out = BytesMut::new();
     write_field(&mut out, FIELD_TIMESTAMP, |buf| write_ivarint(buf, event.timestamp));
-    if !event.attributes.is_empty() {
-        write_field(&mut out, FIELD_ATTRIBUTES, |buf| write_attr_map(buf, dict, &event.attributes));
+    match omit {
+        None => {
+            if !event.attributes.is_empty() {
+                write_field(&mut out, FIELD_ATTRIBUTES, |buf| {
+                    write_attr_map(buf, dict, &event.attributes)
+                });
+            }
+        }
+        Some(prefix) => {
+            let attrs = &event.attributes;
+            if attrs.iter().any(|(key, _)| !logit_core::interner::resolve(key).starts_with(prefix))
+            {
+                write_field(&mut out, FIELD_ATTRIBUTES, |buf| {
+                    write_attr_map_omitting(buf, dict, attrs, prefix)
+                });
+            }
+        }
     }
     if let Some(log) = &event.log {
         write_field(&mut out, FIELD_LOG, |buf| write_log_record(buf, dict, log));

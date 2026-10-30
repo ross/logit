@@ -1,6 +1,6 @@
 ---
 created: 2026-10-23
-updated: 2026-10-23
+updated: 2026-10-30
 ---
 
 # Protocol knowledge stays in family: a component keys behavior on another component's internals only within a lossless family
@@ -51,7 +51,10 @@ and `datadog_trace_in` and `datadog_trace_out`. The `statsd` pair belongs to bot
 `logit_in`, with the `buffer.disk:` spool that records hop frames, are the native hop's family:
 `logit_in` keys its high-water marks and acknowledgments on `logit_out`'s sender identity and
 sequence
-([ADR `native-hop-identity-and-sequence`](native-hop-identity-and-sequence.md)). Inside a family
+([ADR `native-hop-identity-and-sequence`](native-hop-identity-and-sequence.md)). `kafka_in` and
+`kafka_out` are the **Kafka family** (2026-10-30): `kafka_out` leaves the `_logit.kafka.*`
+carriers `kafka_in` stamps out of what it writes ([ADR `kafka-input`](kafka-input.md),
+[ADR `kafka-output`](kafka-output.md)). Inside a family
 a component reads another member's carriers, wire-specific attribute names, and shared codec
 constants freely.
 
