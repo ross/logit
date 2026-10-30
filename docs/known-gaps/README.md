@@ -27,7 +27,7 @@ open: a deferred fix, a revisit trigger, unverified behavior, or residual lossle
 | [datadog.md](datadog.md) | `datadog_in`, `datadog_out`, `datadog_trace_in`, and `datadog_trace_out` |
 | [splunk.md](splunk.md) | `splunk_hec_in` and `splunk_hec_out` |
 | [influxdb.md](influxdb.md) | `influxdb_in` and `influxdb_out`: unsupported routes and what a carried bucket costs |
-| [kafka.md](kafka.md) | `kafka_out` |
+| [kafka.md](kafka.md) | `kafka_out` and `kafka_in` |
 | [syslog.md](syslog.md) | `syslog_in` and `syslog_out` |
 | [otlp.md](otlp.md) | `otlp_in` and `otlp_out` |
 | [prometheus.md](prometheus.md) | `prometheus_in` and `prometheus_out`, scrape and remote-write |

@@ -133,3 +133,38 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Consequence:** more connections and producer ids per sink than the Java client or the
     Collector's exporter uses for the same topics.
   - **Revisit trigger:** a multi-topic producer, which per-event topics need too.
+- **`kafka_in` speaks the classic group protocol only, with eager rebalancing.** It has no
+  KIP-848 (`group.protocol=consumer`) and no cooperative-sticky assignor ([ADR `kafka-input`](../adr/kafka-input.md), items 2 and 4).
+  - **Consequence:** every rebalance revokes every partition of every member, and the group stops
+    until all of them rejoin, for up to `drain_timeout` plus the join. A Java member configured
+    with `cooperative-sticky` alone can't share a group with `kafka_in`.
+  - **Workaround:** keep `drain_timeout` short, and give `logit` a group of its own.
+  - **Revisit trigger:** KIP-848, opt-in for Kafka 4.0 and later; Redpanda 26.2 doesn't serve it.
+- **`kafka_in` has no static membership.** It sends no `group.instance.id` ([ADR `kafka-input`](../adr/kafka-input.md), Consequences).
+  - **Consequence:** a restart rebalances the group twice, once as the member leaves and once as
+    it joins, so a rolling restart of `n` members rebalances `2n` times.
+  - **Revisit trigger:** rolling restarts whose rebalances cost an operator enough to matter.
+- **`kafka_in` sends full fetches only.** Every Fetch is a full request that opens no KIP-227
+  fetch session ([ADR `kafka-input`](../adr/kafka-input.md), item 7). The cost hasn't been measured with many partitions.
+  - **Consequence:** each Fetch names every partition the member reads from that broker, so a
+    member owning hundreds of partitions sends a larger request than the Java client would.
+  - **Revisit trigger:** a measurement showing full fetches cost enough to matter.
+- **`kafka_in` fetches from leaders only.** It has no rack-aware fetch from followers (KIP-392)
+  ([ADR `kafka-input`](../adr/kafka-input.md), Consequences).
+  - **Consequence:** in a cluster spread across zones, fetches cross zones when the leader is
+    elsewhere, which some clouds bill.
+  - **Revisit trigger:** a deployment where cross-zone fetch traffic costs enough to matter.
+- **`kafka_in` subscribes to named topics only.** `topics:` lists names; there's no
+  regular-expression subscription ([ADR `kafka-input`](../adr/kafka-input.md), Consequences).
+  - **Consequence:** a topic created after startup isn't read until the config names it.
+  - **Workaround:** list every topic, and restart to add one.
+  - **Revisit trigger:** an operator whose topics come and go by a naming pattern.
+- **A record relayed through `kafka_in` and `kafka_out` loses its key and headers.** `kafka_in`
+  keeps them as the `_logit.kafka.key` and `_logit.kafka.headers` carriers, and `kafka_out` leaves
+  every `_logit.kafka.*` carrier out and writes neither back ([ADR `kafka-input`](../adr/kafka-input.md), item 11).
+  - **Consequence:** the relayed record goes to the partition `kafka_out`'s own `key:` picks, with
+    its own `headers:`, so a consumer that partitions or routes on the source key or a header
+    sees neither.
+  - **Workaround:** a `set` or `lua` stage copies `_logit.kafka.key` to a public attribute that
+    `key: {attribute: ..}` names.
+  - **Revisit trigger:** `kafka_out` restoring both from the carriers.
