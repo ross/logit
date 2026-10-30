@@ -4727,8 +4727,10 @@ pub enum ComponentKind {
         /// `json` reads the object `kafka_out` and `stdio_out` write under `format: json`, one
         /// per record or several as lines; `text` reads the value as one log message (any
         /// producer's lines; add a `json` transform for an application's JSON); `native` reads
-        /// `kafka_out`'s `format: native` frames. `msgpack`, `otlp_proto`, and `otlp_json` are
-        /// accepted here but not yet read: `logit run` refuses them at startup.
+        /// `kafka_out`'s `format: native` frames; `msgpack` the `json` objects as MessagePack
+        /// maps, one or several per record. `otlp_proto` and `otlp_json` read one OTLP export
+        /// request per record, as the OpenTelemetry Collector's Kafka exporter writes it, and
+        /// take `topics:` as a map, since a request's signal is its topic's.
         format: KafkaFormat,
         /// Under `format: text` only, how many logs one record holds: `event` (the default),
         /// the whole value as one log; or `batch`, one log per line, the form `kafka_out`
