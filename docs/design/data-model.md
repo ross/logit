@@ -390,9 +390,10 @@ event attributes and a set of resource attributes:
 `docker_in`'s resource carries `container.id`, `container.name`, `container.image.name`,
 `container.image.tags` (a one-element array, absent for an untagged or digest reference), and `container.label.<key>` for
 every key named in its `labels:` config (opt-in, never every label; see the ADR's event/resource
-shape section). `docker_in` reads these from the sibling `config.v2.json` once per container, when
-it opens the log, and never re-reads them, so a `docker rename` after that point is not picked up,
-a known gap ([docs/known-gaps/tailing.md](../known-gaps/tailing.md)).
+shape section). `docker_in` reads these from the sibling `config.v2.json` and re-reads it on a
+poll tick when its stat changes, so a `docker rename` reaches the resource within one
+`poll_interval`
+([ADR `docker-container-identity-and-minimal-watches`](../adr/docker-container-identity-and-minimal-watches.md)).
 
 ### HTTP access-log names
 
