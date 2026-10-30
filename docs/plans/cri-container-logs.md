@@ -1,6 +1,6 @@
 ---
 created: 2026-10-29
-updated: 2026-10-29
+updated: 2026-10-30
 ---
 
 # Enabling plan: `cri_in` — Kubernetes container logs from `/var/log/pods`
@@ -37,8 +37,8 @@ Each workstream will be one PR on branch `cri/w<N>`, stacked on the one before i
 | WS | Branch | Scope | Depends on |
 |---|---|---|---|
 | W0 | `cri/w0` | the ADR and this plan; `docs/design/data-model.md`'s stale line on `docker_in`'s metadata refresh | — |
-| W1 | `cri/w1` | `logit_proto::cri`: the record parser and its timestamp (ADR section 3), a fuzz target, its seeds, and a `FUZZ_TARGETS` row in `script/unsafe-check` | W0 |
-| W2 | `cri/w2` | the `cri_in` kind: config and schema (section 11), the `Matcher` arm (section 2), `CriDecoder` and its factory with per-stream reassembly (section 4), the idle flush (section 5), event time (section 6), the path resource (section 7); the driver's per-decoder `\r` and UTF-8 choices and its idle-flush hook; graph rules and the registry arm; `AGENTS.md`, `docs/deploying.md` (mounts, privileges, and the ADR's documented limits with their workarounds), `docs/design/internal-telemetry.md`, `docs/design/data-model.md`; an example config | W1 |
+| W1 | `cri/w1`, #925 | `logit_proto::cri`: the record parser and its timestamp (ADR section 3), the `cri` fuzz target, its seeds, and a `FUZZ_TARGETS` row in `script/unsafe-check` | W0 |
+| W2 | `cri/w2` | the `cri_in` kind: config and schema (section 11), the `Matcher` arm (section 2), `CriDecoder` and its factory with per-stream reassembly (section 4), the idle flush (section 5), event time (section 6), the path resource (section 7); the driver changes in the ADR's "Implementation notes for W2" (the splitter-drop and idle-flush hooks, the per-decoder `\r` and UTF-8 choices, and the `envelope_cap` bound); graph rules (`is_tail_listener`, rules 28 and 62, and a shape rule) and the registry arm; `AGENTS.md`, `docs/deploying.md` (mounts, privileges, and the ADR's documented limits with their workarounds), `docs/design/internal-telemetry.md`, `docs/design/data-model.md`; an example config | W1 |
 | W3 | `cri/w3` | `container.id` from `containers_dir:` (section 8) | W2 |
 | W4 | `cri/w4` | cri-dockerd: the per-file format latch and the shared Docker decoder (section 9), with its `malformed` counter on `docker_in` too | W2 |
 | W5 | `cri/w5` | recorded fixtures from a real `kind` node (containerd), and from CRI-O where practical, through a new `script/record-fixtures cri` recipe, committed under `testdata/interop/cri/` and replayed by a test | W2 |
@@ -55,20 +55,24 @@ say so.
 
 - **W1, the parser.** Unit tests over committed literal records: containerd's variable-width and `Z`
   timestamps and CRI-O's 9-digit `+00:00` form; `P`, `F`, and `F:x` tags; empty content with its
-  trailing space; content ending in `\r`; a piece ending mid-UTF-8; and each malformed shape (no
-  stream, an unknown stream, an empty or unknown first tag, no space after the tag). The fuzz target
-  (`cri_line`) will feed arbitrary bytes and check that the parser never panics and that a parsed
-  record's content is a suffix of its input. Seeds will come from the unit literals and, once W5
-  lands, from the recorded files, through `fuzz/seedgen`.
+  trailing space; content ending in `\r`; a piece ending mid-UTF-8; an empty or unknown first tag
+  read as a full line, as the kubelet reads it; and each malformed shape (a missing field, an
+  unknown stream, no space after the tag). The fuzz target (`cri`) will feed arbitrary bytes and
+  check that the parser never panics and that a parsed record's content is a suffix of its input.
+  Seeds will come from the unit literals and, once W5 lands, from the recorded files, through
+  `fuzz/seedgen`.
 - **W2, the kind.** Decoder unit tests: per-stream reassembly with interleaved runs; the bound
-  checked before each append, with exact-at-cap kept and one-over dropped; a malformed record
-  flushing both streams; `reset` counting per held stream; the idle flush firing on the tick, not
-  before, and off under `0s`; event time from the first record and the `bad_time` fallback.
-  Driver-level tests on a scratch pods tree: discovery of both names and rejection of `.gz`, `.tmp`,
-  and malformed directory names; a rename rotation rebinding with no duplicate; a restart resuming
-  the rotated file from its checkpoint; the clean-stop hold. The driver's existing proptests
-  (`driver/verification.rs`, `docker_verification.rs`) will gain a `cri_in` model where the
-  reassembly differs from `docker_in`'s.
+  checked before each append, with exact-at-cap kept and one-over dropped; a record over the
+  splitter's bound dropping its stream's line through its `F`, counted once, under a small
+  `max_line_bytes` and under an unlimited containerd piece size; a malformed record flushing both
+  streams; `reset` counting per held stream; the idle flush firing on the tick only after a read
+  reached the file's end, never while unread bytes remain, and off under `0s`; event time from the
+  first record and the `bad_time` fallback. Driver-level tests on a scratch pods tree: discovery of
+  both names and rejection of `.gz`, `.tmp`, and malformed directory names; a rename rotation
+  rebinding with no duplicate; a restart resuming the rotated file from its checkpoint; the
+  clean-stop hold. The driver's existing proptests (`driver/verification.rs`,
+  `docker_verification.rs`) will gain a `cri_in` model where the reassembly differs from
+  `docker_in`'s.
 - **W3, `container.id`.** A scratch `containers_dir` of symlinks: a whole id, a cut name, a link
   made after the file is found, and a link removed while the file is still read, with the id kept.
 - **W4, cri-dockerd.** A pods-tree symlink into a scratch Docker container directory: the format
