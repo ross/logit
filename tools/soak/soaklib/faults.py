@@ -82,11 +82,14 @@ CUE_TIMEOUT_S = 10
 CERTS_ENTRYPOINT = "/certs.sh"
 TLS_GEN_KEY = "tls_gen"
 # The image a file operation runs in: the stand-in's (compose.yaml), so a run pulls one Python
-# image, and the source it runs there. A first run pulls the image inside the operation's
-# timeout.
+# image, and the source it runs there. The driver pulls the image before the schedule starts
+# (`ensure_fileops_image`): a pull inside a step could hold the tick past the driver's stall
+# bound, which ends the run. An operation's own timeout then covers a container start and a
+# copy of the writer's file.
 FILEOPS_IMAGE = "python:3.13.16-alpine3.24"
 FILEOPS_SOURCE = Path(fileops.__file__).read_text()
-FILEOPS_TIMEOUT_S = 180
+FILEOPS_TIMEOUT_S = 60
+FILEOPS_PULL_TIMEOUT_S = 600
 
 
 @dataclass
@@ -205,6 +208,16 @@ def rename_apply(ctx, step):
     except OSError as err:
         return {"rc": 1, "stderr": str(err)}
     return {"rc": 0, "stderr": "", "path": step.path, "to": step.to}
+
+
+def ensure_fileops_image(docker):
+    """`None` once `FILEOPS_IMAGE` is on the daemon, pulling it if it isn't, else why not."""
+    if docker.run(["image", "inspect", FILEOPS_IMAGE]).rc == 0:
+        return None
+    result = docker.run(["pull", FILEOPS_IMAGE], timeout=FILEOPS_PULL_TIMEOUT_S)
+    if result.rc != 0:
+        return f"pulling {FILEOPS_IMAGE} failed: {result.stderr.strip()[-500:]}"
+    return None
 
 
 def file_op_apply(ctx, step):
