@@ -610,6 +610,27 @@ async fn a_corrupt_batch_with_a_far_delta_skips_to_the_next_batch() {
     }
 }
 
+/// An answer cut inside the batch after a corrupt one still holds that batch's base offset in
+/// its first 12 bytes: the skip lands there, not on the high watermark.
+#[tokio::test]
+async fn a_corrupt_batch_before_a_cut_one_skips_to_the_cut_batchs_base() {
+    use logit_proto::kafka::batch::{encode, Stamp};
+    let cluster = cluster(1, &[0]).await;
+    let mut next = encode(&values(&["d"]), Stamp::NONE, Compression::None).unwrap().to_vec();
+    next[..8].copy_from_slice(&3i64.to_be_bytes());
+    let blob = [bad_delta(&["a", "b", "c"], 1_000).to_vec(), next[..40].to_vec()].concat();
+    cluster.state().append_raw("t", 0, Bytes::from(blob), 3);
+    cluster.state().append("t", 0, &values(&["d"]), Compression::None);
+    cluster.state().append("t", 0, &values(&["e"]), Compression::None);
+    let mut probe = TelemetryProbe::new();
+    let mut s = settings(&cluster, &["t"]);
+    // One stored entry per answer, so the cut batch is the last bytes of the first one.
+    s.fetch.max_partition_bytes = 1;
+    let mut c = consumer(&probe, "in", s);
+    assert_eq!(take(&mut c, 1).await, ["d"]);
+    assert_eq!(probe.sum("logit.input.records.dropped", &[("reason", "corrupt")]), 3.0);
+}
+
 /// With no batch after it in the answer, the skip ends at the high watermark, not at the
 /// offset the header names past the log end.
 #[tokio::test]
@@ -742,6 +763,29 @@ async fn an_answer_over_64_mib_holding_a_batch_under_max_batch_bytes_is_read() {
     let taken = take(&mut c, 2).await;
     assert_eq!(taken[0].len(), big.len());
     assert_eq!(taken[1], "small");
+}
+
+/// An answer over the Fetch cap can't be read past: the batch in it has no offsets to skip by,
+/// so the fetch backs off and asks again, counted and named.
+#[tokio::test]
+async fn an_answer_over_the_fetch_cap_backs_off_as_response_too_large() {
+    let cluster = cluster(1, &[0]).await;
+    let big = "x".repeat(2 << 20);
+    cluster.state().append("t", 0, &values(&[&big]), Compression::None);
+    let mut probe = TelemetryProbe::new();
+    let mut s = settings(&cluster, &["t"]);
+    s.fetch.max_bytes = 1024;
+    s.fetch.max_partition_bytes = 1024;
+    s.fetch.min_bytes = 1;
+    s.max_batch_bytes = 1024;
+    let mut c = consumer(&probe, "in", s);
+    let reading = tokio::spawn(async move { timeout(Duration::from_secs(60), c.next()).await });
+    wait_until("two refused answers", || errors(&mut probe, "fetch", "response_too_large") >= 2.0)
+        .await;
+    assert!(diagnostics(&mut probe, "response_too_large") >= 1.0);
+    assert_eq!(errors(&mut probe, "fetch", "transport"), 0.0);
+    assert!(fetches_at(&cluster, 0) >= 2);
+    reading.abort();
 }
 
 /// A batch of `records` whose attributes claim gzip over an uncompressed records section, its

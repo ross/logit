@@ -189,6 +189,23 @@ impl Versions {
     }
 }
 
+/// A response whose length prefix is over the cap its request was read under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResponseTooLarge {
+    pub api: ApiKey,
+    pub declared: usize,
+    pub cap: usize,
+}
+
+impl std::fmt::Display for ResponseTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { api, declared, cap } = self;
+        write!(f, "a {api:?} response declares {declared} bytes, over the {cap}-byte cap")
+    }
+}
+
+impl std::error::Error for ResponseTooLarge {}
+
 /// A failed request: the error, and whether any byte of it could have reached the broker.
 #[derive(Debug)]
 pub struct RequestError {
@@ -203,6 +220,12 @@ impl RequestError {
 
     fn sent(error: anyhow::Error) -> Self {
         Self { sent: true, error }
+    }
+
+    /// The response's declared length when it was over the request's cap. The connection's
+    /// framing is lost with it, and the same request draws the same answer again.
+    pub fn too_large(&self) -> Option<&ResponseTooLarge> {
+        self.error.downcast_ref()
     }
 
     /// `Clean` when nothing left, `Ambiguous` once anything may have.
@@ -526,9 +549,11 @@ impl Conn {
         let body = async {
             let len = self.stream.read_i32().await?;
             let len = usize::try_from(len)
-                .ok()
-                .filter(|&n| n <= max_response)
-                .ok_or_else(|| anyhow!("a {key:?} response declares {len} bytes"))?;
+                .map_err(|_| anyhow!("a {key:?} response declares {len} bytes"))?;
+            if len > max_response {
+                let err = ResponseTooLarge { api: key, declared: len, cap: max_response };
+                return Err(anyhow::Error::new(err));
+            }
             let mut body = vec![0; len];
             self.stream.read_exact(&mut body).await?;
             anyhow::Ok(Bytes::from(body))

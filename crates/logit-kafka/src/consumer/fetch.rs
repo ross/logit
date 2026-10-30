@@ -20,8 +20,10 @@
 //! - **Bad batches.** A CRC mismatch or an unparsable batch refetches the partition once from
 //!   the same offset; a second failure at the same batch skips it, counted
 //!   `records.dropped{reason="corrupt"}` per offset skipped. The skip ends at the next decoded
-//!   batch's base offset in the answer, else at the high watermark (the last stable offset under
-//!   `read_committed`), never at an offset the failed batch's header names. An oversize batch (`oversize`) and a magic 0 or 1
+//!   batch's base offset in the answer; else at the base offset in the first 12 bytes of a batch
+//!   the answer cut short, when it's above the failed batch's base and at or below the high
+//!   watermark; else at the high watermark (the last stable offset under `read_committed`). It
+//!   never ends at an offset the failed batch's header names. An oversize batch (`oversize`) and a magic 0 or 1
 //!   message set (`legacy_format`) are skipped at once. Each skip has a throttled diagnostic
 //!   naming the topic, partition, and offset.
 //! - **A loop's response is applied only to partitions still at the requested offset, led by
@@ -43,7 +45,7 @@ use tokio::time::Instant;
 
 use super::group::Failure;
 use super::offsets::{self, Tracker, EARLIEST, LATEST};
-use super::pool::{Link, Pool, Slot, Target};
+use super::pool::{CallError, Link, Pool, Slot, Target};
 use super::{
     intern, partition_code, Backoff, FetchBounds, Isolation, PartitionCode, TopicPartition,
 };
@@ -458,6 +460,19 @@ async fn fetch(
         .await;
     let response = match result {
         Ok((_, response)) => response,
+        // A batch the answer can't skip without reading: the same fetch draws the same answer.
+        Err(CallError::TooLarge(err)) => {
+            pool.counters.warn(
+                "response_too_large",
+                format_args!(
+                    "Kafka broker {node}: a Fetch answer declares {} bytes, over the {}-byte cap \
+                     of fetch.max_bytes plus max_batch_bytes plus 1 MiB; a record batch this \
+                     large holds its partition until max_batch_bytes is raised",
+                    err.declared, err.cap
+                ),
+            );
+            return Err(());
+        }
         Err(_) => {
             shared.lock().unwrap().refresh = true;
             return Err(());
@@ -578,9 +593,9 @@ pub(crate) struct Read {
 ///
 /// A corrupt batch's skip never trusts its header past the base offset, since the CRC covers
 /// `last_offset_delta` and `record_count`: it lands on the next entry's base offset when one
-/// follows in the blob, else on `end`, and counts the offsets it passes. A batch after it that the
-/// answer's byte limit cut short has no entry, so a skip to `end` passes it and every offset after
-/// it too, counted as corrupt.
+/// follows in the blob; else on the base offset of a batch the blob ends inside of, read from its
+/// first 12 bytes, when that is above the failed batch's base and at or below `end`; else on
+/// `end`. It counts the offsets it passes.
 pub(crate) fn read(
     blob: &Bytes,
     from: i64,
@@ -594,7 +609,8 @@ pub(crate) fn read(
     let mut pending = pending.into_iter().peekable();
     let mut aborting: HashSet<i64> = HashSet::new();
     let mut out = Read { position: from, ..Read::default() };
-    let entries = logit_proto::kafka::decode(blob, max_batch_bytes);
+    let decoded = logit_proto::kafka::decode(blob, max_batch_bytes);
+    let entries = decoded.entries;
     let bases: Vec<i64> = entries
         .iter()
         .map(|e| match e {
@@ -610,7 +626,13 @@ pub(crate) fn read(
                     out.corrupt_at = Some(err.base_offset);
                     return out;
                 }
-                let next = bases.get(i + 1).copied().unwrap_or(end).max(out.position + 1);
+                let base = err.base_offset;
+                let partial = decoded.partial_base.filter(|&b| b > base && b <= end);
+                let next = match bases.get(i + 1) {
+                    Some(&next) => next,
+                    None => partial.unwrap_or(end),
+                }
+                .max(out.position + 1);
                 out.dropped.push(("corrupt", next - out.position, err.base_offset));
                 out.position = next;
                 continue;
