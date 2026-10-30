@@ -1127,7 +1127,11 @@ An in-memory queue is lost on a restart, a `SIGKILL`, or a shutdown grace that e
 To keep it, add a `buffer.disk:` block, which replaces that sink's queue with a crash-recoverable
 spool on disk ([ADR `disk-backed-sink-buffer`](adr/disk-backed-sink-buffer.md)). A restart resumes
 delivery from the last persisted read cursor and replays at most the batches committed since the
-last checkpoint: at-least-once, the same trade `tail_in`'s checkpoint makes.
+last checkpoint: at-least-once, the same trade `tail_in`'s checkpoint makes. A `tail_in` or
+`docker_in` upstream needs one on each of its sinks to survive a clean restart without loss,
+because its checkpoint covers what reached its downstream inboxes, not what a sink delivered. A
+crash still loses checkpointed lines that hadn't reached a spool (see
+[Tailing files and Docker logs](#tailing-files-and-docker-logs)).
 
 **A crash replays a window, under either posture.** After a crash, the spool replays the batches
 that were in flight and every batch committed since the last cursor write. The cursor is written
@@ -2509,11 +2513,21 @@ time to trust; put a `timestamp` stage after the parser to resolve one from a pa
 the first scan with no checkpoint entry naming it. A file discovered later (a new log, a rotated
 one, a newly selected container) always starts at its beginning, since it has nothing "from before
 `logit` started" to skip. A checkpoint entry, when present, always wins over `read_from` for the
-file it names, provided the file still starts with the bytes `logit` read from it. A resume
-re-checks the file's first 256 bytes (fewer for a smaller offset) and its length. A file whose
-head changed, because a new file reused the inode or the file was rewritten while `logit` was
-down, starts at offset 0 instead; `logit.input.files.resume_rejected` and a `resume_rejected`
-diagnostic say so.
+file it names, provided the file still holds the bytes `logit` read from it. A resume re-checks
+the file's first 256 bytes, the 256 bytes before the offset (fewer of each for a smaller offset),
+and its length. A file that changed, because a new file reused the inode or the file was
+rewritten while `logit` was down, starts at offset 0 instead; `logit.input.files.resume_rejected`
+and a `resume_rejected` diagnostic say so. If no other file matches that entry by content (below), its
+unread bytes are counted `logit.input.bytes.dropped{reason="gone"}` with a `file_gone` diagnostic.
+
+**A file no entry names can claim one by its content.** A file whose inode no checkpoint entry
+names, but whose first bytes and the bytes before an entry's offset match that entry, resumes
+there, counted `logit.input.files.claimed`. That covers a restored backup or a volume moved to
+other storage, where every inode number changed, under either `read_from`, and a `copytruncate`
+copy (see "Rotation" below). A claim needs at least 64 bytes of head to compare, so a file
+shorter than that can't claim. When two files match one entry, or one file matches two, nothing
+is claimed and a `claim_ambiguous` diagnostic says so: each file starts where it would have,
+which duplicates rather than loses.
 
 **A checkpoint that exists but can't be used replays every file from its beginning.** If
 `checkpoint_path` is unreadable, empty, malformed, or from an unsupported version, or is missing
@@ -2539,6 +2553,20 @@ tracked files, and a pass reads at most 64 KiB per file, so a crash then replays
 `checkpoint_interval` or one 64 KiB chunk per file, whichever is more. This is a deliberate
 at-least-once boundary, the same trade `buffer:`'s sink-side retry makes: it bounds how much a
 crash can replay, and replay is always safe.
+
+**A tail source whose clean restart must not lose lines needs a `buffer.disk:` sink.** The
+checkpoint covers the lines handed to the tail source's downstream inboxes, not the lines a sink
+delivered. A sink with an in-memory queue that's still holding them when its
+`buffer.shutdown_grace` runs out drops them, counted
+`logit.component.batches.dropped{reason="shutdown"}`, and the restart resumes past them. Give
+every sink downstream of the tail source a `buffer.disk:` block (see
+[Durable buffering](#durable-buffering)): its spool keeps those batches across the restart.
+
+A spool doesn't make a crash lossless. A crash loses every line the last checkpoint covers that
+hadn't reached a sink's spool: lines in a transform's inbox, on an edge between components, or in
+an `aggregate` window. `logit` doesn't hold the checkpoint back until a sink delivers, because a
+stage such as `aggregate` emits batches that match no input batch
+([ADR `tail-content-identity`](adr/tail-content-identity.md), decision 1).
 
 **A file gone at a restart is counted as far as the checkpoint knew.** Each checkpoint entry
 records the file's length as `tail_in` last saw it. If a restart finds an entry's file under no
@@ -2648,9 +2676,25 @@ see [ADR
   tracked file's length shrinking under it. That's rare, but real for a tool that recreates a log
   file in place instead of renaming it away first. The file is reread from its start, and an
   unterminated line held from before the truncation is discarded and counted
-  `logit.input.frames.dropped{reason="truncated"}`. Under `docker_in`, each stream's held
-  reassembly is discarded and counted the same way, once with the unterminated line that
-  continues it.
+  `logit.input.frames.dropped{reason="truncated"}`. Under `docker_in`, each stream's held reassembly
+  is discarded and counted the same way, once with the unterminated line that continues it. The
+  bytes the last scan or read saw past the read offset, which no read reached, are counted
+  `logit.input.bytes.dropped{reason="truncated"}`. That count is usually `0` and is a floor: under
+  `copytruncate`, what's written after the last look exists only in the copy. Both drop counts wait,
+  since a copy a pattern matches may claim the file's state from before the truncation instead, and
+  then only the bytes seen past the copy's end are counted: they're recorded at the end of the
+  second scan that offers the truncated file's state to a claim, whether or not its listing failed,
+  or up to two scans later while a file waiting to claim it could still do so, or at a stop, and a
+  second truncation of the same file records the first's at once. **Treat any nonzero
+  `files.truncated` under `copytruncate` as possible loss**, unless a pattern also matches the copy
+  and `files.claimed` rose with it.
+- `logit.input.files.skipped{reason="compressed"}` and
+  `logit.component.diagnostics{key="compressed"}` (counts): a matched file that starts with a gzip,
+  zstd, xz, or bzip2 header, which `logit` closes without reading a line of it, counted once per
+  file per process, however often a scan finds it, renamed or not. It isn't loss: under a pattern
+  like `app.log*`, the compressed rotation's content was read under its uncompressed name before
+  the rotator compressed it. `logit` never decompresses a file. If a compressed file is the only copy of what
+  you need, decompress it to a path a pattern matches.
 - `logit.component.diagnostics{key="metadata_error"}` (`docker_in` only): a container's
   `config.v2.json` couldn't be read or parsed. That container's lines still flow, with a
   `container.id`-only resource instead of the full identity. A missing file is retried on every poll
@@ -2664,14 +2708,31 @@ see [ADR
   diagnostics name the container. **A deselection is process-local:** if `logit` restarts before the
   container is renamed back, the retained resume offset is lost.
 
-**Rotation.** Prefer rotating by rename (logrotate's `create` mode) over `copytruncate`. With
-`copytruncate` or `compress`, don't use a pattern that matches the rotated names: `app.log*` reads
-every `copytruncate` copy from its beginning, re-emitting the whole file each rotation, and reads a
-`.gz` as lines of binary. With an exact pattern (`app.log`), the writer must reopen its file on
-HUP within one `poll_interval` of the rename: the renamed file is read until it reaches its end at
-least one `poll_interval` after `logit` saw the rotation, and what the writer appends to it after
-that is lost. `copytruncate` under an exact
-pattern loses what was written after the last read and before the truncate.
+**Rotation.** Prefer rotating by rename (logrotate's `create` mode) over `copytruncate`. If you
+must use `copytruncate`, use a pattern that matches the rotated names (`app.log*`): the copy
+claims the original's position by content and resumes where `logit` stopped reading the
+original, so it delivers the lines written after the last read, a half-read line whole, and
+nothing twice ([ADR `tail-content-identity`](adr/tail-content-identity.md), decision 5). A copy
+found before the truncate waits up to two scans for it, and one found while still empty, as
+logrotate creates it, is read only once a scan has decided whether it claims. The claim needs the file to hold at
+least 64 bytes; a shorter file's copy is read from its beginning. A copy shorter than what
+`logit` read from the original (the writer appended between the copy and the truncate, and
+`logit` read it) can't claim, and is read from its beginning once its wait runs out. Under
+`compress`, a pattern that matches the rotated names is safe: each compressed file is skipped and
+counted `files.skipped{reason="compressed"}` (decision 2). With an exact pattern (`app.log`), the
+writer must reopen its file on HUP within one `poll_interval` of the rename: the renamed file is
+read until it reaches its end at least one `poll_interval` after `logit` saw the rotation, and
+what the writer appends to it after that is lost. `copytruncate` under an exact pattern loses
+what was written after the last read and before the truncate, a decided limit (decision 7): no
+pattern reaches the copy, so `logit` counts the truncation in `files.truncated` and the bytes it
+saw unread in `bytes.dropped{reason="truncated"}`.
+
+A `copytruncate` that the writer refills past `logit`'s read offset before the next size check (one
+`poll_interval`, or one wake) isn't detected while `logit` runs: it reads on from the old offset,
+and the refilled bytes before that offset aren't emitted. A restart catches it and replays the
+file, unless the refilled file starts with the same bytes `logit` recorded from the old file's head
+(up to 256), in which case those skipped bytes are lost. Rotating by rename has no such window
+([ADR `tail-content-identity`](adr/tail-content-identity.md), decision 8).
 
 ## Named time zones
 
