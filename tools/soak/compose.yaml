@@ -17,11 +17,12 @@
 #
 # `victoria-metrics` is in the `local` profile, which the driver enables for a local-target
 # scenario only, so an external target's stack runs without it. `kafka` is in the `kafka`
-# profile, which the driver enables for a Kafka-target scenario only, in place of `local`, and
-# `standin` is in the `standin` profile, for a stand-in-target scenario only.
+# profile, which the driver enables for a Kafka-target scenario, in place of `local`, and for a
+# scenario with a Kafka wire, beside it; `standin` is in the `standin` profile, for a
+# stand-in-target scenario only.
 #
 # Every service carries a `soak.role` label, `sut`, `generator`, `backend`, `broker` (the
-# Kafka target's broker), or `standin` (the stand-in target's destination), which is how the
+# Kafka broker), or `standin` (the stand-in target's destination), which is how the
 # driver and the checks know it. A scenario's
 # `compose =` override file is merged onto this one (`-f compose.yaml -f <override>`) and labels
 # any service it adds, such as a second backend.
