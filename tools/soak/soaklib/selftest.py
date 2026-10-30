@@ -14110,6 +14110,26 @@ def _cri_ledger():
                "lines/s x 2.5s of partial_timeout plus poll_interval" in tuned.lines,
                f"the pin's term reads the listener's partial_timeout and poll_interval, got "
                f"{tuned} {tuned.lines}")
+        # A killed life re-sends from the pin to the kill: at 200 lines/s, its 5 s
+        # checkpoint_interval's 1,000 lines and two 690-line reads plus the pin's 1,200, 3,580
+        # in all, above the stopped life's 1,201.
+        def killed(name, w_minus_g):
+            run_dir = _kill_run(tmp, name, every_window=False)
+            return {r.id: r for r in checks.run_all(_as_cri_wire(run_dir, w_minus_g=w_minus_g))}
+
+        kill_edge = killed("cri-kill-edge", 4_781)["ledger.wire"]
+        expect(kill_edge.status == checks.PASS
+               and "against the replay band [-1,000, 4,781]" in kill_edge.detail
+               and "life 1: [0, +1,200]: the other stream's lines after a held run's pin, 200 "
+               "lines/s x 6s of partial_timeout plus poll_interval" in kill_edge.lines
+               and any(line.startswith("life 1 (killed): [-1,000, +2,380]")
+                       for line in kill_edge.lines),
+               f"a killed life adds the pin's lines to its checkpoint interval's, got "
+               f"{kill_edge} {kill_edge.lines}")
+        kill_past = killed("cri-kill-past", 4_782)["ledger.wire"]
+        expect(kill_past.status == checks.FAIL and kill_past.detail.startswith(
+                   "W − S + F − G 4,782 is surplus, outside the replay band [-1,000, 4,781]"),
+               f"a line past a killed life's replay FAILs, got {kill_past}")
         unsplit = run("cri-no-splits", splits=1_300, write_splits=False)
         expect(unsplit["ledger.wire"].status == checks.FAIL
                and unsplit["ledger.wire"].detail.startswith(
