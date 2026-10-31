@@ -497,6 +497,12 @@ points the record left open.
 - **`prefix` and `partition` may not make a `.` or `..` segment**: a URL drops it, while SigV4
   for S3 signs the path as written, so every request would answer `SignatureDoesNotMatch`.
 
+  *Implementation note:* rule 100 also rejects an empty segment (a key that starts with `/`, a
+  `//`, or `%.f` between slashes, which formats to nothing at millisecond 0), because a layer
+  that collapses a doubled slash breaks the signature the same way. It checks `prefix` joined to
+  the formatted `partition`, so a `/` ending one and starting the other is caught. A trailing `/`
+  is not a segment: the file name follows it.
+
 ## Alternatives considered
 
 - **One object per batch** (the OTel exporter, Fluentd's chunk). Rejected: a batch is tens of

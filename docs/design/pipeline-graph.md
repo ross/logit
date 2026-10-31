@@ -516,7 +516,7 @@ a black hole counts what it discards as `events.discarded`.
 100. An `s3_out` with an empty `bucket`, `region`, or `storage_class`; an `endpoint` that isn't
      an `http://` or `https://` URL with a host and no path, query, fragment, or user info; a
      `partition` `jiff` can't format, or a `prefix` and `partition` whose longest key passes
-     S3's 1,024 bytes or that make a `.` or `..` path segment, which a URL drops; a `max_bytes`
+     S3's 1,024 bytes or that make an empty, `.`, or `..` path segment, which a URL layer can drop or collapse; a `max_bytes`
      of `0` or above 9,000 times `part_size`; a `part_size` outside 5 MiB to 5 GiB; a `max_age`, `timeout`, or `connect_timeout` of `0s`; an `sse`
      `kms_key_id` or `bucket_key` outside `aws_kms`, or an empty `kms_key_id`; `credentials`
      with an empty value; or a `tls` failing rule 24's checks, including a block under an
