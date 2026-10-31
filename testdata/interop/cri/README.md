@@ -14,9 +14,6 @@ images, and BusyBox, and deletes both clusters when it ends. See `../README.md` 
 corpus-wide rules. A re-run changes the pod uids, container ids, times, and the number of rotated
 files; the test reads those from the tree and doesn't pin them.
 
-The repository's `.gitignore` excludes `*.log`, so commit a new recording with
-`git add -f testdata/interop/cri`.
-
 ## Producers
 
 | Directory | Runtime | Node | Recorded |

@@ -1,6 +1,6 @@
 ---
 created: 2026-10-29
-updated: 2026-10-30
+updated: 2026-10-31
 ---
 
 # `cri_in`: Kubernetes container logs from `/var/log/pods`, on `tail_in`'s driver
@@ -215,7 +215,12 @@ streams inside a run. The state and its rules follow `DockerDecoder`'s:
   sent, replay too. A clean stop that keeps the run held re-sends at most about
   `partial_timeout` plus `poll_interval` of them, and a crash every one from the pin to the
   crash, up to about `checkpoint_interval` more, since the last interval write can still carry
-  the pin.
+  the pin. The `cri-rotate` soak scenario allows that replay only for a stop or kill that lands
+  while the pin is held, or for a kill while the last interval write still carries it, and
+  checks that one does. A rotation leaves the split line's head as a `P` at the renamed file's
+  end, so a stop or kill shortly after a rotation can leave the checkpoint pinned there; when
+  the next rotation compresses that file before the restart, `cri_in` counts the head's bytes
+  `gone`, as section 2 describes for any file rotated away while `logit` is down.
 - **Clean stop:** `hold_at_shutdown` is true, so an `Active` file's unterminated last record is
   never decoded at a clean stop; the checkpoint, when there is one, stays at its start. Its held
   runs are kept unemitted only when a checkpoint is configured, so the restart reads them whole;

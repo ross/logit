@@ -15,6 +15,8 @@ import sys
 import time
 from pathlib import Path
 
+from . import criwriter
+
 
 class Jsonl:
     """An append-only JSON-lines file, flushed per record so a killed driver leaves every record
@@ -252,12 +254,13 @@ def count_cri_lines(directory):
     `F` record however many `P` records it took, so `lines` counts the `F`s; `records` counts
     every record and `bytes` every byte, a gzip file's decompressed, since the kubelet's
     rotation compresses all but the newest rotated file. A record the writer never finished
-    has no newline and isn't counted. A `.tmp`, a compression in progress, is skipped."""
+    has no newline and isn't counted. A `.tmp`, a compression in progress, is skipped, and so
+    is the writer's dangle log (`criwriter.DANGLE_LOG`), which holds no CRI records."""
     files = lines = records = size = 0
     root = Path(directory)
     paths = sorted(path for path in root.rglob("*") if path.is_file()) if root.is_dir() else []
     for path in paths:
-        if path.name.endswith(".tmp"):
+        if path.name.endswith(".tmp") or path.name == criwriter.DANGLE_LOG:
             continue
         files += 1
         with open(path, "rb") as raw:
