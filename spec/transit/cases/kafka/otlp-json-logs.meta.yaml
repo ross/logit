@@ -1,0 +1,7 @@
+# kafka_out's records under format: otlp_json, compression: snappy, on its default logs topic:
+# one export request per batch of cases/otlp-logs/bodies.json, fields.json, and severity.json, each log
+# with no observed time given its timestamp as one, since the OTLP encoder would stamp the wall
+# clock.
+wire: otlp-json-logs.segment
+kafka: {format: otlp_json, topic: otlp_logs}
+exercises: [format_otlp_json, carriers, compression_snappy]

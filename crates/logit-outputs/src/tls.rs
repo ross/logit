@@ -1,10 +1,12 @@
-//! The pieces raw-TCP sinks share whether or not TLS is on: [`AsyncStream`], [`host_only`],
-//! [`poll_pending_close`], the one-poll probe a pooled sink runs on a reused connection before
-//! writing to it, and [`RecordsCertRequest`], which tells a dial whether the server asked for a
-//! client certificate.
+//! The pieces raw-TCP sinks share whether or not TLS is on: [`host_only`],
+//! [`poll_pending_close_or_alert`], and [`RecordsCertRequest`], which tells a dial whether the
+//! server asked for a client certificate.
 //!
 //! Every sink's `rustls::ClientConfig` comes from `logit_pipeline::tls::build_client_config`,
-//! which registers its files for reload; [`TlsClientSettings`] is re-exported from there.
+//! which registers its files for reload; [`TlsClientSettings`] is re-exported from there, and
+//! `AsyncStream`, `PendingClose`, and `poll_pending_close`, the one-poll probe a pooled sink runs
+//! on a reused connection before writing to it, are too, since `logit-kafka`'s broker connection
+//! shares them.
 
 use std::cell::Cell;
 use std::future::{poll_fn, Future};
@@ -16,16 +18,10 @@ use std::task::Poll;
 use rustls::client::ResolvesClientCert;
 use rustls::sign::CertifiedKey;
 use rustls::{AlertDescription, SignatureScheme};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, ReadBuf};
 
 pub use logit_pipeline::tls::TlsClientSettings;
-
-/// A plain `TcpStream` or a TLS-wrapped one, behind one object-safe trait, so a sink's connection
-/// field isn't generic (a generic field would make the sink type generic, which
-/// `logit-cli::pipeline::build_spec` would have to know about). Shared by every sink that dials a
-/// raw TCP connection that may be TLS-wrapped.
-pub(crate) trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncStream for T {}
+pub(crate) use logit_pipeline::tls::{poll_pending_close, AsyncStream, PendingClose};
 
 /// The host part of a bare `host:port` endpoint: the SNI `ServerName` for an endpoint with no
 /// scheme to parse (a URL endpoint gets this from `reqwest`/`hyper`). `rsplit_once`, so a
@@ -38,61 +34,6 @@ pub(crate) fn host_only(endpoint: &str) -> &str {
         .unwrap_or(endpoint)
         .trim_start_matches('[')
         .trim_end_matches(']')
-}
-
-/// What one poll of a pooled stream found ([`poll_pending_close`]'s answer).
-pub(crate) enum PendingClose {
-    /// Nothing readable now. Every protocol these sinks speak has a peer that is silent unless
-    /// answering, so this is the healthy case: write.
-    Open,
-    /// The peer closed its end (an immediate EOF), or the poll failed; either way the connection
-    /// is finished.
-    Eof,
-    /// The peer sent something unprompted: from `logit_in`, a `Reject{GOING_AWAY}` before a
-    /// graceful shutdown or idle close; a line-oriented receiver never sends anything. Either
-    /// way, don't write a batch into it.
-    Bytes(usize),
-}
-
-impl std::fmt::Display for PendingClose {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PendingClose::Open => f.write_str("still open"),
-            PendingClose::Eof => f.write_str("closed by the peer"),
-            PendingClose::Bytes(n) => write!(f, "carrying {n} unsolicited byte(s) from the peer"),
-        }
-    }
-}
-
-/// Polls `stream` for readability **once**, never waiting: the check a pooled sink runs on a
-/// *reused* connection before a send attempt's first write, so a batch isn't written into a socket
-/// the peer already closed (`docs/adr/idle-connection-timeout.md`'s "The client-side probe"
-/// section).
-///
-/// **One `poll_read`, because the probe must not wait.** The peers these sinks talk to are silent
-/// unless answering, so a healthy connection has nothing to read, and any wait, however short,
-/// would be added to every send. One poll answers from what has already arrived.
-///
-/// **What a `Pending` poll can move.** On a TLS stream, tokio-rustls reads whatever the socket
-/// holds into the session before it answers: part of a record, or whole records that carry no
-/// plaintext (the TLS 1.3 session tickets a server sends after the handshake). `Pending` then
-/// means no plaintext is ready, not that nothing was read. Nothing is lost: the session keeps
-/// those bytes, and [`PendingClose::Open`] keeps the stream and so the session, so a later read
-/// completes the record. A read future dropped mid-record loses nothing either, since the bytes
-/// belong to the session and not to the read call (`crate::stream_pins` pins both). The answers
-/// that may take plaintext off the stream ([`PendingClose::Eof`], [`PendingClose::Bytes`]) both
-/// drop the connection.
-///
-/// `?Sized` so `&mut *boxed_stream` (a `&mut dyn AsyncStream`) works like a `&mut TcpStream`.
-///
-/// Point-in-time only: a FIN arriving between this poll and the write is still missed
-/// (`Fault::Ambiguous` for `logit_out`, undetected for the line-oriented sinks). It catches the
-/// common case, a FIN already in this host's receive queue.
-pub(crate) async fn poll_pending_close<S: AsyncRead + Unpin + ?Sized>(
-    stream: &mut S,
-    buf: &mut [u8],
-) -> PendingClose {
-    poll_pending_close_or_alert(stream, buf).await.unwrap_or(PendingClose::Eof)
 }
 
 /// [`poll_pending_close`], except that a TLS alert from the peer is `Err` with the alert's

@@ -95,12 +95,14 @@
 //!
 //! Readers that mirror this grammar: `tools/shape-survey/summarize.py`,
 //! `tools/shape-survey/check_interop.py`, `tools/shape-survey/producers/oteldemo.sh`'s Python,
-//! `tools/splunk-interop/check.py`, `tools/victoria-interop/check.py`, and
-//! `tools/soak/soaklib/telemetry.py`. A change here is mirrored there.
+//! `tools/splunk-interop/check.py`, `tools/victoria-interop/check.py`,
+//! `tools/kafka-interop/check.py`, and `tools/soak/soaklib/telemetry.py`. A change here is
+//! mirrored there.
 //!
 //! One walker visits every field through [`TreeWriter`]: [`Json`] writes this grammar, and
 //! `crate::msgpack` writes the same object as MessagePack for `kafka_out`'s `format: msgpack`, so a
-//! change to the keys here changes that format too. [`Json`] writes straight into the caller's
+//! change to the keys here changes that format too. A caller may leave out the event's top-level
+//! attributes under a key prefix, which `kafka_out` does for its own `_logit.kafka.*` carriers. [`Json`] writes straight into the caller's
 //! `String` with `push_str`/`write!`: no per-field `String`, no serde (`docs/design/memory.md`).
 
 use base64::Engine;
@@ -117,20 +119,22 @@ use std::fmt::Write;
 /// Appends one JSON line per event of `batch` to `out`, in batch order. Never fails.
 pub fn render_ndjson(out: &mut String, batch: &EventBatch) {
     for event in &batch.events {
-        render_event(out, &batch.resource, batch.scope.as_deref(), event);
+        render_event(out, &batch.resource, batch.scope.as_deref(), event, None);
         out.push('\n');
     }
 }
 
 /// Appends one event's object, without the newline: the line [`render_ndjson`] writes, which
-/// `kafka_out`'s `format: json` sends as a record's value.
+/// `kafka_out`'s `format: json` sends as a record's value. `omit` leaves out the event's
+/// top-level attributes whose keys start with it.
 pub(crate) fn render_event(
     out: &mut String,
     resource: &Resource,
     scope: Option<&Scope>,
     event: &Event,
+    omit: Option<&str>,
 ) {
-    walk_event(&mut Json(out), resource, scope, event);
+    walk_event(&mut Json(out), resource, scope, event, omit);
 }
 
 /// Appends `value` in this grammar's value form: `kafka_out`'s `format: text` writes a map or
@@ -359,11 +363,14 @@ impl TreeWriter for Json<'_> {
     }
 }
 
+/// Writes one event's object. `omit` leaves out the event's top-level attributes whose keys start
+/// with it; nested maps, the resource's, and the scope's are written whole.
 pub(crate) fn walk_event<W: TreeWriter>(
     w: &mut W,
     resource: &Resource,
     scope: Option<&Scope>,
     event: &Event,
+    omit: Option<&str>,
 ) {
     let mut obj = w.open_map();
     w.key(&mut obj, "timestamp");
@@ -380,9 +387,27 @@ pub(crate) fn walk_event<W: TreeWriter>(
         w.key(&mut obj, "span");
         walk_span(w, event.timestamp, span);
     }
-    if !event.attributes.is_empty() {
-        w.key(&mut obj, "attributes");
-        walk_attrs(w, &event.attributes);
+    match omit {
+        None => {
+            if !event.attributes.is_empty() {
+                w.key(&mut obj, "attributes");
+                walk_attrs(w, &event.attributes);
+            }
+        }
+        Some(prefix) => {
+            if event.attributes.iter().any(|(key, _)| !resolve(key).starts_with(prefix)) {
+                w.key(&mut obj, "attributes");
+                let mut attrs = w.open_map();
+                for (key, value) in event.attributes.iter() {
+                    let key = resolve(key);
+                    if !key.starts_with(prefix) {
+                        w.attr_key(&mut attrs, key);
+                        walk_value(w, value);
+                    }
+                }
+                w.close_map(attrs);
+            }
+        }
     }
     if !resource.attributes.is_empty()
         || resource.schema_url.is_some()
@@ -423,7 +448,7 @@ pub(crate) fn walk_event<W: TreeWriter>(
         push_nonzero(w, &mut sc, "dropped_attributes_count", scope.dropped_attributes_count);
         w.close_map(sc);
     }
-    walk_types(w, &mut obj, resource, scope, event);
+    walk_types(w, &mut obj, resource, scope, event, omit);
     w.close_map(obj);
 }
 
@@ -882,8 +907,17 @@ impl<W: TreeWriter> Types<'_, '_, W> {
     }
 
     fn attrs(&mut self, path: &Path<'_>, attrs: &AttrMap) {
+        self.attrs_omitting(path, attrs, None);
+    }
+
+    /// [`Self::attrs`], skipping the keys that start with `omit`.
+    fn attrs_omitting(&mut self, path: &Path<'_>, attrs: &AttrMap, omit: Option<&str>) {
         for (key, value) in attrs.iter() {
-            self.value(&path.child(Seg::Key(resolve(key))), value);
+            let key = resolve(key);
+            if omit.is_some_and(|prefix| key.starts_with(prefix)) {
+                continue;
+            }
+            self.value(&path.child(Seg::Key(key)), value);
         }
     }
 }
@@ -894,6 +928,7 @@ fn walk_types<W: TreeWriter>(
     resource: &Resource,
     scope: Option<&Scope>,
     event: &Event,
+    omit: Option<&str>,
 ) {
     let mut t = Types { w, obj, table: None };
     if let Some(log) = &event.log {
@@ -930,7 +965,7 @@ fn walk_types<W: TreeWriter>(
             t.attrs(&links.child(Seg::Index(j)).child(Seg::Key("attributes")), &link.attributes);
         }
     }
-    t.attrs(&Path { parent: None, seg: Seg::Key("attributes") }, &event.attributes);
+    t.attrs_omitting(&Path { parent: None, seg: Seg::Key("attributes") }, &event.attributes, omit);
     let res = Path { parent: None, seg: Seg::Key("resource") };
     t.attrs(&res.child(Seg::Key("attributes")), &resource.attributes);
     if let Some(scope) = scope {
@@ -1018,6 +1053,26 @@ mod tests {
 
     fn render_events(events: Vec<Event>) -> String {
         render(&batch(events))
+    }
+
+    /// `stdio_out` writes `kafka_in`'s carriers, which only `kafka_out` leaves out.
+    #[test]
+    fn stdio_keeps_kafka_carriers() {
+        let attributes = attrs(&[("_logit.kafka.topic", Value::str("orders"))]);
+        assert_eq!(
+            render_events(vec![Event::empty(0, attributes.clone())]),
+            "{\"timestamp\":\"1970-01-01T00:00:00.000000000Z\",\
+             \"attributes\":{\"_logit.kafka.topic\":\"orders\"}}\n",
+        );
+        let mut omitted = String::new();
+        render_event(
+            &mut omitted,
+            &Resource::default(),
+            None,
+            &Event::empty(0, attributes),
+            Some("_logit.kafka."),
+        );
+        assert_eq!(omitted, "{\"timestamp\":\"1970-01-01T00:00:00.000000000Z\"}");
     }
 
     /// Interns `keys` in order, so a map built from them iterates in that order however the

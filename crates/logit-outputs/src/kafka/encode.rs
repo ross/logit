@@ -5,7 +5,7 @@
 //! | `format:` | `record: event` (default but for `native`) | `record: batch` (`native`'s default) |
 //! |---|---|---|
 //! | `json` | `crate::ndjson`'s object, without the newline | those objects as NDJSON, each line newline-terminated |
-//! | `text` | the log body: a `Str` or `Bytes` as it is, a `Map` or `Array` in `crate::ndjson`'s value form, a timestamp as RFC 3339, another scalar as its `Display` text, `Null` as nothing | those bodies joined by `\n`, with none after the last |
+//! | `text` | the log body: a `Str` or `Bytes` as it is, a `Map` or `Array` in `crate::ndjson`'s value form, a timestamp as RFC 3339, another scalar as its `Display` text, `Null` as nothing | those bodies, each with `\` escaped as `\\` and LF as `\n` (`logit_proto::kafka::text`), joined by LF with none after the last |
 //! | `msgpack` | `crate::msgpack`'s map | those maps back to back |
 //! | `native` | a `CODEC_BATCH` frame of a one-event batch under the batch's resource and scope | one `CODEC_BATCH` frame of the events |
 //! | `otlp_proto` | takes no `record:`: one signal's OTLP export request in protobuf, below | |
@@ -13,16 +13,21 @@
 //!
 //! `crate::ndjson`'s doc is the grammar of the JSON object and `crate::msgpack`'s the
 //! MessagePack value forms. A native frame is uncompressed: `compression:` compresses the record
-//! batch it travels in.
+//! batch it travels in. `json`, `msgpack`, and `native` leave out an event's top-level
+//! `_logit.kafka.*` attributes, the record metadata `kafka_in` carries
+//! (`docs/adr/kafka-input.md`, "12. Record metadata rides as private carriers").
 //!
 //! `format: text` counts an event it skips for having no log record in [`EncodeStats::no_log`],
 //! and the metrics and span an event whose body it writes leaves behind in
 //! [`EncodeStats::metrics_omitted`] and [`EncodeStats::spans_omitted`], at encode, so a record
 //! the producer later drops as oversize, or the broker rejects or names, has still counted them.
-//! An event dropped as `oversize` under `record: batch` counts only there. A text body that
-//! contains `\n` can't be told from two bodies in a batch record. What each log field, span, and
-//! attribute becomes under `json` and `text` is the generated table under "What each log, span,
-//! and attribute becomes".
+//! An event dropped as `oversize` under `record: batch` counts only there. An OTLP format counts
+//! an event with no log, span, or metric, which no request holds, in [`EncodeStats::no_payload`],
+//! and each attribute value it writes as a double, a `u64` above `i64::MAX`, in
+//! [`EncodeStats::u64_as_double`]: an event's when a log, a span, or a metric the mapping keeps
+//! carries it to a request, and the resource's and scope's when any record is written. What each metric kind, log field, span, and attribute
+//! becomes, in every format, is the generated table under "What each metric, log, span, and
+//! attribute becomes".
 //!
 //! Under `record: batch`, events go into a record in batch order until the next would push its
 //! value over the encoder's `budget`, which the sink sets so a value that fits never trips the
@@ -79,15 +84,12 @@
 //! encoder wrote it: a request holds many events, and one future-stamped event would otherwise
 //! lose the whole request to Kafka's rule against records stamped more than an hour ahead.
 //!
-//! # What each log, span, and attribute becomes
+//! # What each metric, log, span, and attribute becomes
 //!
 //! The tables below are generated from `kafka_out`'s column of `spec/transit/mapping.yaml`, the
 //! canonical copy, by `script/transit docs`, and a test fails when they're stale: change the
-//! table there, not here. They cover `format: json` and `format: text`, the latter as each cell's
-//! `format: text` condition, and logs, spans, and attributes: the spec has no metric cells for
-//! `kafka_out`. No `kafka_in` exists, so "consumer" means the transit driver's reading of a record
-//! (`crates/logit-cli/src/transit/wire.rs`'s module doc): a `format: json` record through the
-//! event JSON reader, and a `format: text` record as one log whose message is the value.
+//! table there, not here. They cover every `format:`, each condition a cell's `when:`, and
+//! "consumer" means `kafka_in` reading the record in the same format.
 //!
 //! <!-- transit:doc:kafka_out -->
 //!
@@ -95,113 +97,364 @@
 //!
 //! | Row | Class | Reason or counter | What a consumer sees |
 //! |---|---|---|---|
+//! | `sum/delta_monotonic`, under `format: otlp_proto` | exact | -- | As at otlp_out: An OTLP `Sum` with delta temporality and the monotonic flag. |
+//! | `sum/delta_monotonic`, under `format: otlp_json` | exact | -- | As at otlp_out: An OTLP `Sum` with delta temporality and the monotonic flag. |
+//! | `sum/delta_monotonic`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `sum/delta_nonmonotonic`, under `format: otlp_proto` | exact | -- | As at otlp_out: An OTLP `Sum` with delta temporality, not monotonic. |
+//! | `sum/delta_nonmonotonic`, under `format: otlp_json` | exact | -- | As at otlp_out: An OTLP `Sum` with delta temporality, not monotonic. |
+//! | `sum/delta_nonmonotonic`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `sum/cumulative_monotonic`, under `format: otlp_proto` | exact | -- | As at otlp_out: An OTLP `Sum` with cumulative temporality and the monotonic flag. |
+//! | `sum/cumulative_monotonic`, under `format: otlp_json` | exact | -- | As at otlp_out: An OTLP `Sum` with cumulative temporality and the monotonic flag. |
+//! | `sum/cumulative_monotonic`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `sum/cumulative_nonmonotonic`, under `format: otlp_proto` | exact | -- | As at otlp_out: An OTLP `Sum` with cumulative temporality, not monotonic. |
+//! | `sum/cumulative_nonmonotonic`, under `format: otlp_json` | exact | -- | As at otlp_out: An OTLP `Sum` with cumulative temporality, not monotonic. |
+//! | `sum/cumulative_nonmonotonic`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `sum/f64`, under `format: otlp_proto` | exact | -- | As at otlp_out: The data point's `as_double`. |
+//! | `sum/f64`, under `format: otlp_json` | exact | -- | As at otlp_out: The data point's `as_double`. |
+//! | `sum/f64`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `sum/i64`, under `format: otlp_proto` | exact | -- | As at otlp_out: The data point's `as_int`. |
+//! | `sum/i64`, under `format: otlp_json` | exact | -- | As at otlp_out: The data point's `as_int`. |
+//! | `sum/i64`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `sum/u64`, under `format: otlp_proto` | normalized | `u64_as_int`; `logit.output.metrics.normalized{reason=u64_as_double}` | As at otlp_out: OTLP has one signed integer, so a `u64` that fits an `int64` is `as_int` and reads back as an `i64`; one above `i64::MAX` is `as_double`, counted, and reads back as an `f64`. |
+//! | `sum/u64`, under `format: otlp_json` | normalized | `u64_as_int`; `logit.output.metrics.normalized{reason=u64_as_double}` | As at otlp_out: OTLP has one signed integer, so a `u64` that fits an `int64` is `as_int` and reads back as an `i64`; one above `i64::MAX` is `as_double`, counted, and reads back as an `f64`. |
+//! | `sum/u64`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `sum/bool`, under `format: otlp_proto` | normalized | `bool_value`; `logit.output.metrics.normalized{reason=bool_value}` | As at otlp_out: A boolean is `as_int` `1` or `0` and reads back as that integer. |
+//! | `sum/bool`, under `format: otlp_json` | normalized | `bool_value`; `logit.output.metrics.normalized{reason=bool_value}` | As at otlp_out: A boolean is `as_int` `1` or `0` and reads back as that integer. |
+//! | `sum/bool`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `gauge/f64`, under `format: otlp_proto` | exact | -- | As at otlp_out: An OTLP `Gauge`, `as_double`. |
+//! | `gauge/f64`, under `format: otlp_json` | exact | -- | As at otlp_out: An OTLP `Gauge`, `as_double`. |
+//! | `gauge/f64`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `gauge/i64`, under `format: otlp_proto` | exact | -- | As at otlp_out: An OTLP `Gauge`, `as_int`. |
+//! | `gauge/i64`, under `format: otlp_json` | exact | -- | As at otlp_out: An OTLP `Gauge`, `as_int`. |
+//! | `gauge/i64`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `gauge/u64`, under `format: otlp_proto` | normalized | `u64_as_int`; `logit.output.metrics.normalized{reason=u64_as_double}` | As at otlp_out: A `u64` that fits an `int64` is `as_int` and reads back as an `i64`; one above `i64::MAX` is `as_double`, counted, and reads back as an `f64`. |
+//! | `gauge/u64`, under `format: otlp_json` | normalized | `u64_as_int`; `logit.output.metrics.normalized{reason=u64_as_double}` | As at otlp_out: A `u64` that fits an `int64` is `as_int` and reads back as an `i64`; one above `i64::MAX` is `as_double`, counted, and reads back as an `f64`. |
+//! | `gauge/u64`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `gauge/bool`, under `format: otlp_proto` | normalized | `bool_value`; `logit.output.metrics.normalized{reason=bool_value}` | As at otlp_out: A boolean is `as_int` `1` or `0` and reads back as that integer. |
+//! | `gauge/bool`, under `format: otlp_json` | normalized | `bool_value`; `logit.output.metrics.normalized{reason=bool_value}` | As at otlp_out: A boolean is `as_int` `1` or `0` and reads back as that integer. |
+//! | `gauge/bool`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `gauge/negative`, under `format: otlp_proto` | exact | -- | As at otlp_out: A negative data point, written as is. |
+//! | `gauge/negative`, under `format: otlp_json` | exact | -- | As at otlp_out: A negative data point, written as is. |
+//! | `gauge/negative`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `gauge/prometheus_info`, under `format: otlp_proto` | normalized | `prometheus_info_sum` | As at otlp_out: A cumulative non-monotonic OTLP `Sum` named `<name>_info`, as the OTel Prometheus compatibility spec's Info section (marked Development) has it, read back as that sum. |
+//! | `gauge/prometheus_info`, under `format: otlp_json` | normalized | `prometheus_info_sum` | As at otlp_out: A cumulative non-monotonic OTLP `Sum` named `<name>_info`, as the OTel Prometheus compatibility spec's Info section (marked Development) has it, read back as that sum. |
+//! | `gauge/prometheus_info`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `gauge/prometheus_stateset`, under `format: otlp_proto` | normalized | `prometheus_stateset_sum` | As at otlp_out: A cumulative non-monotonic OTLP `Sum`, as the OTel Prometheus compatibility spec's StateSet section (marked Development) has it, read back as that sum. |
+//! | `gauge/prometheus_stateset`, under `format: otlp_json` | normalized | `prometheus_stateset_sum` | As at otlp_out: A cumulative non-monotonic OTLP `Sum`, as the OTel Prometheus compatibility spec's StateSet section (marked Development) has it, read back as that sum. |
+//! | `gauge/prometheus_stateset`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `gauge_delta/f64`, under `format: otlp_proto` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | As at otlp_out: An unresolved relative adjustment is dropped, with a throttled `gauge_delta_unresolved` warning; an `aggregate` upstream resolves it into a gauge. |
+//! | `gauge_delta/f64`, under `format: otlp_json` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | As at otlp_out: An unresolved relative adjustment is dropped, with a throttled `gauge_delta_unresolved` warning; an `aggregate` upstream resolves it into a gauge. |
+//! | `gauge_delta/f64`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `gauge_delta/i64`, under `format: otlp_proto` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | As at otlp_out: Dropped, as for a float adjustment. |
+//! | `gauge_delta/i64`, under `format: otlp_json` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | As at otlp_out: Dropped, as for a float adjustment. |
+//! | `gauge_delta/i64`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `gauge_delta/u64`, under `format: otlp_proto` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | As at otlp_out: Dropped, as for a float adjustment. |
+//! | `gauge_delta/u64`, under `format: otlp_json` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | As at otlp_out: Dropped, as for a float adjustment. |
+//! | `gauge_delta/u64`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `gauge_delta/bool`, under `format: otlp_proto` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | As at otlp_out: Dropped, as for a float adjustment. |
+//! | `gauge_delta/bool`, under `format: otlp_json` | dropped | `logit.output.metrics.dropped{reason=unresolved_gauge_delta}` | As at otlp_out: Dropped, as for a float adjustment. |
+//! | `gauge_delta/bool`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `samples`, under `format: otlp_proto` | degraded | `logit.output.metrics.degraded{metric_kind=samples}` | As at otlp_out: Sketched, each value weighted by its inverse sample rate, then written as the `distribution` row describes. |
+//! | `samples`, under `format: otlp_json` | degraded | `logit.output.metrics.degraded{metric_kind=samples}` | As at otlp_out: Sketched, each value weighted by its inverse sample rate, then written as the `distribution` row describes. |
+//! | `samples`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `set_members`, under `format: otlp_proto` | skipped | `logit.output.metrics.skipped{metric_kind=set_members}` | As at otlp_out: OTLP has no cardinality type, so set members aren't written, with a throttled `otlp_set_members_metric_skipped` warning. |
+//! | `set_members`, under `format: otlp_json` | skipped | `logit.output.metrics.skipped{metric_kind=set_members}` | As at otlp_out: OTLP has no cardinality type, so set members aren't written, with a throttled `otlp_set_members_metric_skipped` warning. |
+//! | `set_members`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `distribution`, under `format: otlp_proto` | degraded | `logit.output.metrics.degraded{metric_kind=distribution}` | As at otlp_out: An OTLP `Summary` of the sketch's `0` (its minimum), `0.5`, `0.75`, `0.9`, `0.95`, `0.99`, and `1` (its maximum) quantiles with its own count and sum; OTLP has no mergeable sketch. |
+//! | `distribution`, under `format: otlp_json` | degraded | `logit.output.metrics.degraded{metric_kind=distribution}` | As at otlp_out: An OTLP `Summary` of the sketch's `0` (its minimum), `0.5`, `0.75`, `0.9`, `0.95`, `0.99`, and `1` (its maximum) quantiles with its own count and sum; OTLP has no mergeable sketch. |
+//! | `distribution`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `set`, under `format: otlp_proto` | skipped | `logit.output.metrics.skipped{metric_kind=set}` | As at otlp_out: OTLP has no cardinality type, so a set estimate isn't written, with a throttled `otlp_set_metric_skipped` warning. |
+//! | `set`, under `format: otlp_json` | skipped | `logit.output.metrics.skipped{metric_kind=set}` | As at otlp_out: OTLP has no cardinality type, so a set estimate isn't written, with a throttled `otlp_set_metric_skipped` warning. |
+//! | `set`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `histogram/delta`, under `format: otlp_proto` | normalized | `inf_bucket` | As at otlp_out: An OTLP `Histogram` with delta temporality. OTLP requires an overflow count above the highest bound, so a histogram whose last bound is finite reads back with an empty `+Inf` bucket. |
+//! | `histogram/delta`, under `format: otlp_json` | normalized | `inf_bucket` | As at otlp_out: An OTLP `Histogram` with delta temporality. OTLP requires an overflow count above the highest bound, so a histogram whose last bound is finite reads back with an empty `+Inf` bucket. |
+//! | `histogram/delta`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `histogram/cumulative`, under `format: otlp_proto` | normalized | `inf_bucket` | As at otlp_out: An OTLP `Histogram` with cumulative temporality. OTLP requires an overflow count above the highest bound, so a histogram whose last bound is finite reads back with an empty `+Inf` bucket. |
+//! | `histogram/cumulative`, under `format: otlp_json` | normalized | `inf_bucket` | As at otlp_out: An OTLP `Histogram` with cumulative temporality. OTLP requires an overflow count above the highest bound, so a histogram whose last bound is finite reads back with an empty `+Inf` bucket. |
+//! | `histogram/cumulative`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `histogram/nan_bound`, under `format: otlp_proto` | degraded | `logit.output.metrics.degraded{reason=non_finite_component}` | As at otlp_out: OTLP bounds are finite, so a `NaN` bound's count joins the overflow bucket. `count` and every cumulative count are kept. |
+//! | `histogram/nan_bound`, under `format: otlp_json` | degraded | `logit.output.metrics.degraded{reason=non_finite_component}` | As at otlp_out: OTLP bounds are finite, so a `NaN` bound's count joins the overflow bucket. `count` and every cumulative count are kept. |
+//! | `histogram/nan_bound`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `histogram/neg_inf_bound`, under `format: otlp_proto` | degraded | `logit.output.metrics.degraded{reason=non_finite_component}` | As at otlp_out: OTLP bounds are finite, so a `-Inf` bound's count joins the first bucket. `count` and every cumulative count are kept. |
+//! | `histogram/neg_inf_bound`, under `format: otlp_json` | degraded | `logit.output.metrics.degraded{reason=non_finite_component}` | As at otlp_out: OTLP bounds are finite, so a `-Inf` bound's count joins the first bucket. `count` and every cumulative count are kept. |
+//! | `histogram/neg_inf_bound`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `histogram/gauge_histogram`, under `format: otlp_proto` | skipped | `logit.output.metrics.skipped{metric_kind=gauge_histogram}` | As at otlp_out: The OTel Prometheus compatibility spec drops a GaugeHistogram, since OTLP has no histogram that isn't a running count, so it isn't written, with a throttled `otlp_gauge_histogram_skipped` warning. |
+//! | `histogram/gauge_histogram`, under `format: otlp_json` | skipped | `logit.output.metrics.skipped{metric_kind=gauge_histogram}` | As at otlp_out: The OTel Prometheus compatibility spec drops a GaugeHistogram, since OTLP has no histogram that isn't a running count, so it isn't written, with a throttled `otlp_gauge_histogram_skipped` warning. |
+//! | `histogram/gauge_histogram`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `exponential_histogram/delta`, under `format: otlp_proto` | exact | -- | As at otlp_out: An OTLP `ExponentialHistogram`, field for field. |
+//! | `exponential_histogram/delta`, under `format: otlp_json` | exact | -- | As at otlp_out: An OTLP `ExponentialHistogram`, field for field. |
+//! | `exponential_histogram/delta`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `exponential_histogram/cumulative`, under `format: otlp_proto` | exact | -- | As at otlp_out: An OTLP `ExponentialHistogram`, field for field. |
+//! | `exponential_histogram/cumulative`, under `format: otlp_json` | exact | -- | As at otlp_out: An OTLP `ExponentialHistogram`, field for field. |
+//! | `exponential_histogram/cumulative`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `summary/delta`, under `format: otlp_proto` | dropped | `logit.output.metrics.dropped{reason=unresolved_delta}` | As at otlp_out: OTLP defines every summary as cumulative, so a delta one is dropped, with a throttled `delta_summary_unresolved` warning. |
+//! | `summary/delta`, under `format: otlp_json` | dropped | `logit.output.metrics.dropped{reason=unresolved_delta}` | As at otlp_out: OTLP defines every summary as cumulative, so a delta one is dropped, with a throttled `delta_summary_unresolved` warning. |
+//! | `summary/delta`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `summary/cumulative`, under `format: otlp_proto` | exact | -- | As at otlp_out: An OTLP `Summary`. |
+//! | `summary/cumulative`, under `format: otlp_json` | exact | -- | As at otlp_out: An OTLP `Summary`. |
+//! | `summary/cumulative`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `record/no_recorded_value`, under `format: otlp_proto` | exact | -- | As at otlp_out: The data point's `flags` carry `NO_RECORDED_VALUE`, and the point is kept. |
+//! | `record/no_recorded_value`, under `format: otlp_json` | exact | -- | As at otlp_out: The data point's `flags` carry `NO_RECORDED_VALUE`, and the point is kept. |
+//! | `record/no_recorded_value`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `record/no_recorded_value_delta_sum`, under `format: otlp_proto` | exact | -- | As at otlp_out: The data point's `flags` carry `NO_RECORDED_VALUE`, and the point is kept. |
+//! | `record/no_recorded_value_delta_sum`, under `format: otlp_json` | exact | -- | As at otlp_out: The data point's `flags` carry `NO_RECORDED_VALUE`, and the point is kept. |
+//! | `record/no_recorded_value_delta_sum`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `record/no_recorded_value_other_kind`, under `format: otlp_proto` | exact | -- | As at otlp_out: The data point's `flags` carry `NO_RECORDED_VALUE`, and the point is kept. |
+//! | `record/no_recorded_value_other_kind`, under `format: otlp_json` | exact | -- | As at otlp_out: The data point's `flags` carry `NO_RECORDED_VALUE`, and the point is kept. |
+//! | `record/no_recorded_value_other_kind`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `record/service_check`, under `format: otlp_proto` | exact | -- | As at otlp_out: The status gauge; the check's carriers aren't attributes. |
+//! | `record/service_check`, under `format: otlp_json` | exact | -- | As at otlp_out: The status gauge; the check's carriers aren't attributes. |
+//! | `record/service_check`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `record/sample_rate`, under `format: otlp_proto` | exact | -- | As at otlp_out: Each value is weighted by its inverse rate in the sketch the `samples` row describes. |
+//! | `record/sample_rate`, under `format: otlp_json` | exact | -- | As at otlp_out: Each value is weighted by its inverse rate in the sketch the `samples` row describes. |
+//! | `record/sample_rate`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `record/superseded`, under `format: otlp_proto` | exact | -- | As at otlp_out: Each record is its own data point. |
+//! | `record/superseded`, under `format: otlp_json` | exact | -- | As at otlp_out: Each record is its own data point. |
+//! | `record/superseded`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `record/same_instant`, under `format: otlp_proto` | exact | -- | As at otlp_out: Each record is its own data point. |
+//! | `record/same_instant`, under `format: otlp_json` | exact | -- | As at otlp_out: Each record is its own data point. |
+//! | `record/same_instant`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `record/same_instant_equal`, under `format: otlp_proto` | exact | -- | As at otlp_out: Each record is its own data point. |
+//! | `record/same_instant_equal`, under `format: otlp_json` | exact | -- | As at otlp_out: Each record is its own data point. |
+//! | `record/same_instant_equal`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `record/same_millisecond`, under `format: otlp_proto` | exact | -- | As at otlp_out: Each record is its own data point, at its own nanosecond. |
+//! | `record/same_millisecond`, under `format: otlp_json` | exact | -- | As at otlp_out: Each record is its own data point, at its own nanosecond. |
+//! | `record/same_millisecond`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `record/same_millisecond_equal`, under `format: otlp_proto` | exact | -- | As at otlp_out: Each record is its own data point, at its own nanosecond. |
+//! | `record/same_millisecond_equal`, under `format: otlp_json` | exact | -- | As at otlp_out: Each record is its own data point, at its own nanosecond. |
+//! | `record/same_millisecond_equal`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `record/non_finite`, under `format: otlp_proto` | exact | -- | As at otlp_out: The non-finite `as_double`. |
+//! | `record/non_finite`, under `format: otlp_json` | exact | -- | As at otlp_out: The non-finite `as_double`. |
+//! | `record/non_finite`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `log/dogstatsd_event`, under `format: text` | exact | -- | The event's text as the record's value; its title and the other `_logit.statsd.event.*` carriers are attributes, left off. |
-//! | `log/dogstatsd_event`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `log/dogstatsd_event`, under `format: otlp_proto` | exact | -- | As at otlp_out: An OTLP log record. Its `_logit.statsd.event.*` carriers aren't attributes; the `log` field rows have its fields. |
+//! | `log/dogstatsd_event`, under `format: otlp_json` | exact | -- | As at otlp_out: An OTLP log record. Its `_logit.statsd.event.*` carriers aren't attributes; the `log` field rows have its fields. |
+//! | `log/dogstatsd_event`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `log/plain`, under `format: text` | exact | -- | The log's message as the record's value, read back as one log per record. |
-//! | `log/plain`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `log/plain`, under `format: otlp_proto` | exact | -- | As at otlp_out: An OTLP log record; the `log` field rows have its fields. |
+//! | `log/plain`, under `format: otlp_json` | exact | -- | As at otlp_out: An OTLP log record; the `log` field rows have its fields. |
+//! | `log/plain`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `log/message_unsafe` | normalized | `message_as_text` | Under `format: text`, a message that isn't a string leaves as its text: a number or a boolean as its decimal or `true`/`false`, a timestamp as RFC 3339, no message as an empty record, and a map or array as its JSON text; each reads back as a string. `format: json` writes the message as it is. |
 //! | `log/structured_message`, under `format: text` | normalized | `message_as_text` | A `Map` or `Array` message leaves as its JSON text, which reads back as a string. |
-//! | `log/structured_message`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `log/structured_message`, under `format: otlp_proto` | exact | -- | As at otlp_out: A `kvlistValue` or `arrayValue` body. |
+//! | `log/structured_message`, under `format: otlp_json` | exact | -- | As at otlp_out: A `kvlistValue` or `arrayValue` body. |
+//! | `log/structured_message`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `log/bytes_message`, under `format: text` | normalized | `message_as_text` | A `Bytes` message leaves as its raw bytes, the record's value, which carries no type, so a consumer that reads values as text sees a UTF-8 one as a string. |
-//! | `log/bytes_message`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `log/bytes_message`, under `format: otlp_proto` | exact | -- | As at otlp_out: A `bytesValue` body. |
+//! | `log/bytes_message`, under `format: otlp_json` | exact | -- | As at otlp_out: A `bytesValue` body. |
+//! | `log/bytes_message`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `log/blank_message`, under `format: text` | normalized | `message_as_text` | An empty message leaves an empty record, and a log with no message one too, which reads back as the empty string. |
-//! | `log/blank_message`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `log/blank_message`, under `format: otlp_proto` | exact | -- | As at otlp_out: An empty string body, or a log record with no body. |
+//! | `log/blank_message`, under `format: otlp_json` | exact | -- | As at otlp_out: An empty string body, or a log record with no body. |
+//! | `log/blank_message`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `span/alone`, under `format: text` | skipped | `logit.output.events.skipped{reason=no_log}` | An event with no log has no `format: text` record. |
-//! | `span/alone`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `span/alone`, under `format: otlp_proto` | exact | -- | As at otlp_out: An OTLP span. |
+//! | `span/alone`, under `format: otlp_json` | exact | -- | As at otlp_out: An OTLP span. |
+//! | `span/alone`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `span/not_datadog_origin` | exact | -- | Nothing beyond the span's `span/alone`, `span/beside_log`, or `span/beside_metrics` outcome: only `datadog_out` gates a trace chunk. |
 //! | `span/needs_agent_processing` | exact | -- | Nothing beyond the span's `span/alone`, `span/beside_log`, or `span/beside_metrics` outcome: only `datadog_out` gates a trace chunk. |
 //! | `event/attributes_only`, under `format: text` | skipped | `logit.output.events.skipped{reason=no_log}` | An event with no log has no `format: text` record. |
-//! | `event/attributes_only`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `event/attributes_only`, under `format: otlp_proto` | skipped | `logit.output.events.skipped{reason=no_payload}` | As at otlp_out: An event with no metric, log, or span has no OTLP signal and isn't sent. |
+//! | `event/attributes_only`, under `format: otlp_json` | skipped | `logit.output.events.skipped{reason=no_payload}` | As at otlp_out: An event with no metric, log, or span has no OTLP signal and isn't sent. |
+//! | `event/attributes_only`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `event/string_only`, under `format: text` | skipped | `logit.output.events.skipped{reason=no_log}` | An InfluxDB point whose fields are all strings has no log, so it has no `format: text` record. |
-//! | `event/string_only`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `event/string_only`, under `format: otlp_proto` | skipped | `logit.output.events.skipped{reason=no_payload}` | As at otlp_out: An InfluxDB point whose fields are all strings has no OTLP signal and isn't sent, so its fields are lost. |
+//! | `event/string_only`, under `format: otlp_json` | skipped | `logit.output.events.skipped{reason=no_payload}` | As at otlp_out: An InfluxDB point whose fields are all strings has no OTLP signal and isn't sent, so its fields are lost. |
+//! | `event/string_only`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //!
 //! Per field of a record that reaches the wire, attribute shape, and payload beside metrics:
 //!
 //! | Row | Class | Reason or counter | What a consumer sees |
 //! |---|---|---|---|
+//! | `record/unit`, under `format: otlp_proto` | exact | -- | As at otlp_out: The `Metric`'s `unit`. |
+//! | `record/unit`, under `format: otlp_json` | exact | -- | As at otlp_out: The `Metric`'s `unit`. |
+//! | `record/unit`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `record/description`, under `format: otlp_proto` | exact | -- | As at otlp_out: The `Metric`'s `description`. |
+//! | `record/description`, under `format: otlp_json` | exact | -- | As at otlp_out: The `Metric`'s `description`. |
+//! | `record/description`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `record/start_timestamp`, under `format: otlp_proto` | exact | -- | As at otlp_out: The data point's `start_time_unix_nano`. |
+//! | `record/start_timestamp`, under `format: otlp_json` | exact | -- | As at otlp_out: The data point's `start_time_unix_nano`. |
+//! | `record/start_timestamp`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `record/exemplars`, under `format: otlp_proto` | exact | -- | As at otlp_out: The data point's exemplars. |
+//! | `record/exemplars`, under `format: otlp_json` | exact | -- | As at otlp_out: The data point's exemplars. |
+//! | `record/exemplars`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `record/exemplars_on_summary`, under `format: otlp_proto` | lost | structural | As at otlp_out: A `SummaryDataPoint` has no exemplars field, so a summary's exemplars are left off. |
+//! | `record/exemplars_on_summary`, under `format: otlp_json` | lost | structural | As at otlp_out: A `SummaryDataPoint` has no exemplars field, so a summary's exemplars are left off. |
+//! | `record/exemplars_on_summary`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `record/min_max`, under `format: otlp_proto` | exact | -- | As at otlp_out: The data point's `min` and `max`. |
+//! | `record/min_max`, under `format: otlp_json` | exact | -- | As at otlp_out: The data point's `min` and `max`. |
+//! | `record/min_max`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `attributes/string_value`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
-//! | `attributes/string_value`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/string_value`, under `format: otlp_proto` | exact | -- | As at otlp_out: A string attribute. |
+//! | `attributes/string_value`, under `format: otlp_json` | exact | -- | As at otlp_out: A string attribute. |
+//! | `attributes/string_value`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `attributes/host_beside_host_name`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
-//! | `attributes/host_beside_host_name`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/host_beside_host_name`, under `format: otlp_proto` | exact | -- | As at otlp_out: A string attribute. |
+//! | `attributes/host_beside_host_name`, under `format: otlp_json` | exact | -- | As at otlp_out: A string attribute. |
+//! | `attributes/host_beside_host_name`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `attributes/hostname`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
-//! | `attributes/hostname`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/hostname`, under `format: otlp_proto` | exact | -- | As at otlp_out: A log attribute. |
+//! | `attributes/hostname`, under `format: otlp_json` | exact | -- | As at otlp_out: A log attribute. |
+//! | `attributes/hostname`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `attributes/log_service`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
-//! | `attributes/log_service`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/log_service`, under `format: otlp_proto` | exact | -- | As at otlp_out: A log attribute. |
+//! | `attributes/log_service`, under `format: otlp_json` | exact | -- | As at otlp_out: A log attribute. |
+//! | `attributes/log_service`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `attributes/log_service_field`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
-//! | `attributes/log_service_field`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/log_service_field`, under `format: otlp_proto` | exact | -- | As at otlp_out: A log attribute. |
+//! | `attributes/log_service_field`, under `format: otlp_json` | exact | -- | As at otlp_out: A log attribute. |
+//! | `attributes/log_service_field`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `attributes/container_id`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
-//! | `attributes/container_id`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/container_id`, under `format: otlp_proto` | exact | -- | As at otlp_out: A string attribute. |
+//! | `attributes/container_id`, under `format: otlp_json` | exact | -- | As at otlp_out: A string attribute. |
+//! | `attributes/container_id`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `attributes/service_identity`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
-//! | `attributes/service_identity`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/service_identity`, under `format: otlp_proto` | exact | -- | As at otlp_out: A string attribute. |
+//! | `attributes/service_identity`, under `format: otlp_json` | exact | -- | As at otlp_out: A string attribute. |
+//! | `attributes/service_identity`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `attributes/service_tag`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
-//! | `attributes/service_tag`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/service_tag`, under `format: otlp_proto` | exact | -- | As at otlp_out: A string attribute. |
+//! | `attributes/service_tag`, under `format: otlp_json` | exact | -- | As at otlp_out: A string attribute. |
+//! | `attributes/service_tag`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `attributes/service_tag_beside_key`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
-//! | `attributes/service_tag_beside_key`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/service_tag_beside_key`, under `format: otlp_proto` | exact | -- | As at otlp_out: A string attribute. |
+//! | `attributes/service_tag_beside_key`, under `format: otlp_json` | exact | -- | As at otlp_out: A string attribute. |
+//! | `attributes/service_tag_beside_key`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `attributes/bool_value`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
-//! | `attributes/bool_value`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/bool_value`, under `format: otlp_proto` | exact | -- | As at otlp_out: A boolean attribute. |
+//! | `attributes/bool_value`, under `format: otlp_json` | exact | -- | As at otlp_out: A boolean attribute. |
+//! | `attributes/bool_value`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `attributes/number_value`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
-//! | `attributes/number_value`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/number_value`, under `format: otlp_proto` | normalized | `u64_as_int`; `logit.output.attributes.normalized{reason=u64_as_double}` | As at otlp_out: An integer or double attribute. A `u64` reads back as an `i64`, or, above `i64::MAX`, as a double, approximate beyond 2^53, counted once per such value. |
+//! | `attributes/number_value`, under `format: otlp_json` | normalized | `u64_as_int`; `logit.output.attributes.normalized{reason=u64_as_double}` | As at otlp_out: An integer or double attribute. A `u64` reads back as an `i64`, or, above `i64::MAX`, as a double, approximate beyond 2^53, counted once per such value. |
+//! | `attributes/number_value`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `attributes/array_value`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
-//! | `attributes/array_value`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/array_value`, under `format: otlp_proto` | exact | -- | As at otlp_out: An array attribute. |
+//! | `attributes/array_value`, under `format: otlp_json` | exact | -- | As at otlp_out: An array attribute. |
+//! | `attributes/array_value`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `attributes/map_value`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
-//! | `attributes/map_value`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/map_value`, under `format: otlp_proto` | exact | -- | As at otlp_out: A key-value list attribute. |
+//! | `attributes/map_value`, under `format: otlp_json` | exact | -- | As at otlp_out: A key-value list attribute. |
+//! | `attributes/map_value`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `attributes/bytes_value`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
-//! | `attributes/bytes_value`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/bytes_value`, under `format: otlp_proto` | exact | -- | As at otlp_out: A bytes attribute. |
+//! | `attributes/bytes_value`, under `format: otlp_json` | exact | -- | As at otlp_out: A bytes attribute. |
+//! | `attributes/bytes_value`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `attributes/timestamp_value`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
-//! | `attributes/timestamp_value`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/timestamp_value`, under `format: otlp_proto` | normalized | `timestamp_as_int` | As at otlp_out: OTLP has no timestamp value, so it's an integer of Unix nanoseconds. |
+//! | `attributes/timestamp_value`, under `format: otlp_json` | normalized | `timestamp_as_int` | As at otlp_out: OTLP has no timestamp value, so it's an integer of Unix nanoseconds. |
+//! | `attributes/timestamp_value`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `attributes/null_value`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
-//! | `attributes/null_value`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
-//! | `attributes/private_carrier`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
-//! | `attributes/private_carrier`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/null_value`, under `format: otlp_proto` | exact | -- | As at otlp_out: An `AnyValue` with no value set, read back as null. |
+//! | `attributes/null_value`, under `format: otlp_json` | exact | -- | As at otlp_out: An `AnyValue` with no value set, read back as null. |
+//! | `attributes/null_value`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `attributes/private_carrier` | normalized | `restamped` | kafka_out leaves `_logit.kafka.*` out of every record, and kafka_in stamps the relay's own record: its topic, its partition and offset where the relay's producer puts it, and the timestamp kafka_out gives it, the event's or under an OTLP format the time it encodes the request. A carrier reads back changed wherever the relay re-packs records. |
+//! | `attributes/kafka_key_headers` | lost | uncounted | `_logit.kafka.key` and `_logit.kafka.headers`, a record's key and headers, aren't written back: kafka_out takes a record's key and headers from its `key:` and `headers:` config. |
 //! | `attributes/prometheus_target`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
-//! | `attributes/prometheus_target`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/prometheus_target`, under `format: otlp_proto` | lost | structural | As at otlp_out: The scrape target is private and isn't an OTLP attribute, so it's left off. |
+//! | `attributes/prometheus_target`, under `format: otlp_json` | lost | structural | As at otlp_out: The scrape target is private and isn't an OTLP attribute, so it's left off. |
+//! | `attributes/prometheus_target`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `attributes/foreign_carrier`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
-//! | `attributes/foreign_carrier`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/foreign_carrier`, under `format: otlp_proto` | lost | structural | As at otlp_out: A `_logit.` carrier is private and isn't an OTLP attribute, so it's left off. The `_logit.prometheus.type` carrier changes nothing; the `family_type` row has the `_logit.metrics.type` values the sink reads. |
+//! | `attributes/foreign_carrier`, under `format: otlp_json` | lost | structural | As at otlp_out: A `_logit.` carrier is private and isn't an OTLP attribute, so it's left off. The `_logit.prometheus.type` carrier changes nothing; the `family_type` row has the `_logit.metrics.type` values the sink reads. |
+//! | `attributes/foreign_carrier`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `attributes/timestamped`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
-//! | `attributes/timestamped`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/timestamped`, under `format: otlp_proto` | lost | structural | As at otlp_out: The flag is private and isn't an OTLP attribute, so it's left off. The point's time carries the timestamp. |
+//! | `attributes/timestamped`, under `format: otlp_json` | lost | structural | As at otlp_out: The flag is private and isn't an OTLP attribute, so it's left off. The point's time carries the timestamp. |
+//! | `attributes/timestamped`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `attributes/rate`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
-//! | `attributes/rate`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/rate`, under `format: otlp_proto` | lost | structural | As at otlp_out: The flag is private and isn't an OTLP attribute, so it's left off. |
+//! | `attributes/rate`, under `format: otlp_json` | lost | structural | As at otlp_out: The flag is private and isn't an OTLP attribute, so it's left off. |
+//! | `attributes/rate`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `attributes/interval`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
-//! | `attributes/interval`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/interval`, under `format: otlp_proto` | lost | structural | As at otlp_out: The flag is private and isn't an OTLP attribute, so it's left off. |
+//! | `attributes/interval`, under `format: otlp_json` | lost | structural | As at otlp_out: The flag is private and isn't an OTLP attribute, so it's left off. |
+//! | `attributes/interval`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `attributes/rate_on_non_gauge`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
-//! | `attributes/rate_on_non_gauge`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/rate_on_non_gauge`, under `format: otlp_proto` | lost | structural | As at otlp_out: The flag is private and isn't an OTLP attribute, so it's left off. |
+//! | `attributes/rate_on_non_gauge`, under `format: otlp_json` | lost | structural | As at otlp_out: The flag is private and isn't an OTLP attribute, so it's left off. |
+//! | `attributes/rate_on_non_gauge`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `attributes/family_type`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
-//! | `attributes/family_type`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/family_type`, under `format: otlp_proto` | lost | structural | As at otlp_out: The flag is private and isn't an OTLP attribute, so it's left off. The sink reads it, writing an info or stateset gauge as a non-monotonic `Sum` and skipping a gauge histogram, by the `prometheus_info`, `prometheus_stateset`, and `gauge_histogram` rows. |
+//! | `attributes/family_type`, under `format: otlp_json` | lost | structural | As at otlp_out: The flag is private and isn't an OTLP attribute, so it's left off. The sink reads it, writing an info or stateset gauge as a non-monotonic `Sum` and skipping a gauge histogram, by the `prometheus_info`, `prometheus_stateset`, and `gauge_histogram` rows. |
+//! | `attributes/family_type`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `attributes/family_type_on_other_kind`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
-//! | `attributes/family_type_on_other_kind`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/family_type_on_other_kind`, under `format: otlp_proto` | lost | structural | As at otlp_out: The value names another kind, so it's ignored: the record keeps its own kind's OTLP type, and the flag is private and isn't an OTLP attribute. |
+//! | `attributes/family_type_on_other_kind`, under `format: otlp_json` | lost | structural | As at otlp_out: The value names another kind, so it's ignored: the record keeps its own kind's OTLP type, and the flag is private and isn't an OTLP attribute. |
+//! | `attributes/family_type_on_other_kind`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `attributes/interval_on_distribution`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
-//! | `attributes/interval_on_distribution`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/interval_on_distribution`, under `format: otlp_proto` | lost | structural | As at otlp_out: The flag is private and isn't an OTLP attribute, so it's left off. |
+//! | `attributes/interval_on_distribution`, under `format: otlp_json` | lost | structural | As at otlp_out: The flag is private and isn't an OTLP attribute, so it's left off. |
+//! | `attributes/interval_on_distribution`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `attributes/interval_on_histogram`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
-//! | `attributes/interval_on_histogram`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/interval_on_histogram`, under `format: otlp_proto` | lost | structural | As at otlp_out: The flag is private and isn't an OTLP attribute, so it's left off. |
+//! | `attributes/interval_on_histogram`, under `format: otlp_json` | lost | structural | As at otlp_out: The flag is private and isn't an OTLP attribute, so it's left off. |
+//! | `attributes/interval_on_histogram`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `attributes/resource_attribute`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the resource is left off. |
-//! | `attributes/resource_attribute`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/resource_attribute`, under `format: otlp_proto` | exact | -- | As at otlp_out: A resource attribute. |
+//! | `attributes/resource_attribute`, under `format: otlp_json` | exact | -- | As at otlp_out: A resource attribute. |
+//! | `attributes/resource_attribute`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `attributes/scope`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the scope is left off. |
-//! | `attributes/scope`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/scope`, under `format: otlp_proto` | exact | -- | As at otlp_out: The `InstrumentationScope` of the batch. |
+//! | `attributes/scope`, under `format: otlp_json` | exact | -- | As at otlp_out: The `InstrumentationScope` of the batch. |
+//! | `attributes/scope`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `attributes/datadog_carrier_log`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
-//! | `attributes/datadog_carrier_log`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/datadog_carrier_log`, under `format: otlp_proto` | lost | structural | As at otlp_out: A `_logit.` carrier is private and isn't an OTLP attribute, so it's left off. |
+//! | `attributes/datadog_carrier_log`, under `format: otlp_json` | lost | structural | As at otlp_out: A `_logit.` carrier is private and isn't an OTLP attribute, so it's left off. |
+//! | `attributes/datadog_carrier_log`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `attributes/severity_carrier_otel`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
-//! | `attributes/severity_carrier_otel`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/severity_carrier_otel`, under `format: otlp_proto` | exact | -- | As at otlp_out: The raw `severity_number` and `severity_text` the carriers hold, which otlp_in reads back into the same carriers beside the band's severity. |
+//! | `attributes/severity_carrier_otel`, under `format: otlp_json` | exact | -- | As at otlp_out: The raw `severity_number` and `severity_text` the carriers hold, which otlp_in reads back into the same carriers beside the band's severity. |
+//! | `attributes/severity_carrier_otel`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `attributes/severity_carrier_syslog`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
-//! | `attributes/severity_carrier_syslog`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
-//! | `attributes/span_numeric` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
-//! | `attributes/datadog_span_identity` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
-//! | `attributes/datadog_span_marks` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
-//! | `attributes/datadog_carrier_span` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
-//! | `attributes/datadog_tracer_resource` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
-//! | `attributes/datadog_tracer_headers` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
-//! | `attributes/datadog_agent_resource` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `attributes/severity_carrier_syslog`, under `format: otlp_proto` | lost | structural | As at otlp_out: A `_logit.` carrier is private and isn't an OTLP attribute, so it's left off and the severity reads back at band resolution. |
+//! | `attributes/severity_carrier_syslog`, under `format: otlp_json` | lost | structural | As at otlp_out: A `_logit.` carrier is private and isn't an OTLP attribute, so it's left off and the severity reads back at band resolution. |
+//! | `attributes/severity_carrier_syslog`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `attributes/span_numeric`, under `format: otlp_proto` | normalized | `u64_as_int`; `logit.output.attributes.normalized{reason=u64_as_double}` | As at otlp_out: An integer or double span attribute. A `u64` reads back as an `i64`, or, above `i64::MAX`, as a double, counted once per such value. |
+//! | `attributes/span_numeric`, under `format: otlp_json` | normalized | `u64_as_int`; `logit.output.attributes.normalized{reason=u64_as_double}` | As at otlp_out: An integer or double span attribute. A `u64` reads back as an `i64`, or, above `i64::MAX`, as a double, counted once per such value. |
+//! | `attributes/span_numeric`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `attributes/datadog_span_identity`, under `format: otlp_proto` | exact | -- | As at otlp_out: A string span attribute. |
+//! | `attributes/datadog_span_identity`, under `format: otlp_json` | exact | -- | As at otlp_out: A string span attribute. |
+//! | `attributes/datadog_span_identity`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `attributes/datadog_span_marks`, under `format: otlp_proto` | exact | -- | As at otlp_out: An ordinary span attribute: Datadog's internal mark leaves as an OTel attribute. |
+//! | `attributes/datadog_span_marks`, under `format: otlp_json` | exact | -- | As at otlp_out: An ordinary span attribute: Datadog's internal mark leaves as an OTel attribute. |
+//! | `attributes/datadog_span_marks`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `attributes/datadog_carrier_span`, under `format: otlp_proto` | lost | structural | As at otlp_out: OTLP has no field for a Datadog trace chunk's fields or a span's raw `error`, and a `_logit.` carrier is private, so it's left off. |
+//! | `attributes/datadog_carrier_span`, under `format: otlp_json` | lost | structural | As at otlp_out: OTLP has no field for a Datadog trace chunk's fields or a span's raw `error`, and a `_logit.` carrier is private, so it's left off. |
+//! | `attributes/datadog_carrier_span`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `attributes/datadog_tracer_resource`, under `format: otlp_proto` | lost | structural | As at otlp_out: OTLP has no field for a `TracerPayload`'s fields, and a `_logit.` carrier is private, so it's left off. |
+//! | `attributes/datadog_tracer_resource`, under `format: otlp_json` | lost | structural | As at otlp_out: OTLP has no field for a `TracerPayload`'s fields, and a `_logit.` carrier is private, so it's left off. |
+//! | `attributes/datadog_tracer_resource`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `attributes/datadog_tracer_headers`, under `format: otlp_proto` | lost | structural | As at otlp_out: OTLP has no field for a tracer request header, and a `_logit.` carrier is private, so it's left off. |
+//! | `attributes/datadog_tracer_headers`, under `format: otlp_json` | lost | structural | As at otlp_out: OTLP has no field for a tracer request header, and a `_logit.` carrier is private, so it's left off. |
+//! | `attributes/datadog_tracer_headers`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `attributes/datadog_agent_resource`, under `format: otlp_proto` | lost | structural | As at otlp_out: OTLP has no field for an `AgentPayload`'s fields, and a `_logit.` carrier is private, so it's left off. |
+//! | `attributes/datadog_agent_resource`, under `format: otlp_json` | lost | structural | As at otlp_out: OTLP has no field for an `AgentPayload`'s fields, and a `_logit.` carrier is private, so it's left off. |
+//! | `attributes/datadog_agent_resource`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
 //! | `attributes/syslog_header`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
-//! | `attributes/syslog_header`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/syslog_header`, under `format: otlp_proto` | normalized | `u64_as_int` | As at otlp_out: A string or integer attribute; `intValue` is signed, so a `u64` `syslog.facility` or `process.pid` reads back as an `i64`. |
+//! | `attributes/syslog_header`, under `format: otlp_json` | normalized | `u64_as_int` | As at otlp_out: A string or integer attribute; `intValue` is signed, so a `u64` `syslog.facility` or `process.pid` reads back as an `i64`. |
+//! | `attributes/syslog_header`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `attributes/syslog_msgid`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
-//! | `attributes/syslog_msgid`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/syslog_msgid`, under `format: otlp_proto` | exact | -- | As at otlp_out: A string attribute. |
+//! | `attributes/syslog_msgid`, under `format: otlp_json` | exact | -- | As at otlp_out: A string attribute. |
+//! | `attributes/syslog_msgid`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `attributes/syslog_sd`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
-//! | `attributes/syslog_sd`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/syslog_sd`, under `format: otlp_proto` | exact | -- | As at otlp_out: A key-value list attribute. |
+//! | `attributes/syslog_sd`, under `format: otlp_json` | exact | -- | As at otlp_out: A key-value list attribute. |
+//! | `attributes/syslog_sd`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `attributes/syslog_timestamp`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
-//! | `attributes/syslog_timestamp`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/syslog_timestamp`, under `format: otlp_proto` | normalized | `timestamp_as_int` | As at otlp_out: An RFC 3164 timestamp is a string attribute; OTLP has no timestamp value, so an RFC 5424 one is an integer of Unix nanoseconds. |
+//! | `attributes/syslog_timestamp`, under `format: otlp_json` | normalized | `timestamp_as_int` | As at otlp_out: An RFC 3164 timestamp is a string attribute; OTLP has no timestamp value, so an RFC 5424 one is an integer of Unix nanoseconds. |
+//! | `attributes/syslog_timestamp`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `attributes/host_name`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
-//! | `attributes/host_name`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/host_name`, under `format: otlp_proto` | exact | -- | As at otlp_out: A string attribute. |
+//! | `attributes/host_name`, under `format: otlp_json` | exact | -- | As at otlp_out: A string attribute. |
+//! | `attributes/host_name`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `attributes/splunk_envelope`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the attribute is left off, as every attribute is. |
-//! | `attributes/splunk_envelope`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `attributes/splunk_envelope`, under `format: otlp_proto` | exact | -- | As at otlp_out: A resource attribute. |
+//! | `attributes/splunk_envelope`, under `format: otlp_json` | exact | -- | As at otlp_out: A resource attribute. |
+//! | `attributes/splunk_envelope`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `attributes/syslog_facility` | exact | -- | `kafka_out` writes no attribute from a record's own fields or its config. |
 //! | `attributes/no_host` | exact | -- | `kafka_out` writes no attribute from a record's own fields or its config. |
 //! | `attributes/default_tag` | exact | -- | `kafka_out` writes no attribute from a record's own fields or its config. |
@@ -210,66 +463,156 @@
 //! | `attributes/span_kind` | exact | -- | `kafka_out` writes no attribute from a record's own fields or its config. |
 //! | `attributes/trace_id_high` | exact | -- | `kafka_out` writes no attribute from a record's own fields or its config. |
 //! | `log/severity`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the log's severity is left off. |
-//! | `log/severity`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `log/severity`, under `format: otlp_proto` | exact | -- | As at otlp_out: The band's `severity_number` and text, or the raw ones the `_logit.otel.severity_*` carriers hold, read back at band resolution. |
+//! | `log/severity`, under `format: otlp_json` | exact | -- | As at otlp_out: The band's `severity_number` and text, or the raw ones the `_logit.otel.severity_*` carriers hold, read back at band resolution. |
+//! | `log/severity`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `log/severity_unset`, under `format: text` | exact | -- | Nothing is written, and nothing reads back. |
-//! | `log/severity_unset`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `log/severity_unset`, under `format: otlp_proto` | exact | -- | As at otlp_out: `SEVERITY_NUMBER_UNSPECIFIED` and no text, read back as no severity. |
+//! | `log/severity_unset`, under `format: otlp_json` | exact | -- | As at otlp_out: `SEVERITY_NUMBER_UNSPECIFIED` and no text, read back as no severity. |
+//! | `log/severity_unset`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `log/body_format`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the log's body format is left off. |
-//! | `log/body_format`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `log/body_format`, under `format: otlp_proto` | exact | -- | As at otlp_out: OTLP has no body format, so it leaves as the `logit.body_format` attribute, which otlp_in reads back into the format. |
+//! | `log/body_format`, under `format: otlp_json` | exact | -- | As at otlp_out: OTLP has no body format, so it leaves as the `logit.body_format` attribute, which otlp_in reads back into the format. |
+//! | `log/body_format`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `log/event_name`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the log's event name is left off. |
-//! | `log/event_name`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `log/event_name`, under `format: otlp_proto` | exact | -- | As at otlp_out: The `LogRecord`'s `event_name`. |
+//! | `log/event_name`, under `format: otlp_json` | exact | -- | As at otlp_out: The `LogRecord`'s `event_name`. |
+//! | `log/event_name`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `log/observed_timestamp`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the log's observed time is left off. |
-//! | `log/observed_timestamp`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `log/observed_timestamp`, under `format: otlp_proto` | exact | -- | As at otlp_out: The `LogRecord`'s `observed_time_unix_nano`. |
+//! | `log/observed_timestamp`, under `format: otlp_json` | exact | -- | As at otlp_out: The `LogRecord`'s `observed_time_unix_nano`. |
+//! | `log/observed_timestamp`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `log/observed_timestamp_unset`, under `format: text` | exact | -- | Nothing is written, and nothing reads back. |
-//! | `log/observed_timestamp_unset`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `log/observed_timestamp_unset`, under `format: otlp_proto` | normalized | `observed_timestamp` | As at otlp_out: the sink stamps a log that has no observed time with the time it encodes the request, as `logs.proto` defines the field. |
+//! | `log/observed_timestamp_unset`, under `format: otlp_json` | normalized | `observed_timestamp` | As at otlp_out: the sink stamps a log that has no observed time with the time it encodes the request, as `logs.proto` defines the field. |
+//! | `log/observed_timestamp_unset`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `log/trace`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the log's trace and span ids are left off. |
-//! | `log/trace`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `log/trace`, under `format: otlp_proto` | exact | -- | As at otlp_out: The `LogRecord`'s `trace_id` and `span_id`. |
+//! | `log/trace`, under `format: otlp_json` | exact | -- | As at otlp_out: The `LogRecord`'s `trace_id` and `span_id`. |
+//! | `log/trace`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `log/trace_unset`, under `format: text` | exact | -- | Nothing is written, and nothing reads back. |
-//! | `log/trace_unset`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `log/trace_unset`, under `format: otlp_proto` | normalized | `trace_from_span` | As at otlp_out: A log with no trace on an event that carries a span leaves with the span's ids and flags `0`; without a span, the log leaves with no trace. |
+//! | `log/trace_unset`, under `format: otlp_json` | normalized | `trace_from_span` | As at otlp_out: A log with no trace on an event that carries a span leaves with the span's ids and flags `0`; without a span, the log leaves with no trace. |
+//! | `log/trace_unset`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `log/trace_flags`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the log's trace flags are left off. |
-//! | `log/trace_flags`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `log/trace_flags`, under `format: otlp_proto` | exact | -- | As at otlp_out: The low 8 bits of the `LogRecord`'s `flags`. |
+//! | `log/trace_flags`, under `format: otlp_json` | exact | -- | As at otlp_out: The low 8 bits of the `LogRecord`'s `flags`. |
+//! | `log/trace_flags`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `log/trace_beside_id_attribute`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the log's trace is left off, as `log/trace` has. |
-//! | `log/trace_beside_id_attribute`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `log/trace_beside_id_attribute`, under `format: otlp_proto` | exact | -- | As at otlp_out: The `LogRecord`'s trace, span ids, and flags, beside the attributes, as `log/trace` has. |
+//! | `log/trace_beside_id_attribute`, under `format: otlp_json` | exact | -- | As at otlp_out: The `LogRecord`'s trace, span ids, and flags, beside the attributes, as `log/trace` has. |
+//! | `log/trace_beside_id_attribute`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `log/dropped_attributes_count`, under `format: text` | lost | structural | A `format: text` record holds the log body alone, so the log's dropped-attribute count is left off. |
-//! | `log/dropped_attributes_count`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `log/dropped_attributes_count`, under `format: otlp_proto` | exact | -- | As at otlp_out: The `LogRecord`'s `dropped_attributes_count`. |
+//! | `log/dropped_attributes_count`, under `format: otlp_json` | exact | -- | As at otlp_out: The `LogRecord`'s `dropped_attributes_count`. |
+//! | `log/dropped_attributes_count`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `log/timestamp`, under `format: text` | normalized | `timestamp_precision` | The record's timestamp, in whole milliseconds. |
-//! | `log/timestamp`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `log/timestamp`, under `format: otlp_proto` | exact | -- | As at otlp_out: The `LogRecord`'s `time_unix_nano`. |
+//! | `log/timestamp`, under `format: otlp_json` | exact | -- | As at otlp_out: The `LogRecord`'s `time_unix_nano`. |
+//! | `log/timestamp`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `log/receipt_timestamp`, under `format: text` | normalized | `timestamp_precision` | The record's timestamp, the receipt time in whole milliseconds; the `syslog.timestamp` beside it is an attribute, left off. |
-//! | `log/receipt_timestamp`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `log/receipt_timestamp`, under `format: otlp_proto` | exact | -- | As at otlp_out: The `LogRecord`'s `time_unix_nano`, the time the log was received. |
+//! | `log/receipt_timestamp`, under `format: otlp_json` | exact | -- | As at otlp_out: The `LogRecord`'s `time_unix_nano`, the time the log was received. |
+//! | `log/receipt_timestamp`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `log/beside_metrics`, under `format: text` | exact | `logit.output.metrics.omitted{reason=format}` | The log's body as the record; the event's metrics are left off, counted. |
-//! | `log/beside_metrics`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
-//! | `span/name` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
-//! | `span/name_structured` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
-//! | `span/trace_id` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
-//! | `span/parent_span_id` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
-//! | `span/parent_unset` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
-//! | `span/kind` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
-//! | `span/status_error` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
-//! | `span/status_ok` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
-//! | `span/status_unset` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
-//! | `span/status_message` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
-//! | `span/timestamp` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
-//! | `span/end_timestamp` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
-//! | `span/end_before_start` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
-//! | `span/flags` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
-//! | `span/trace_state` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
-//! | `span/dropped_attributes_count` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
-//! | `span/dropped_events_count` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
-//! | `span/dropped_links_count` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
-//! | `span/events` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
-//! | `span/event_nested_attribute` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
-//! | `span/event_name_structured` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
-//! | `span/nested_bytes_attribute` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
-//! | `span/nested_u64_attribute` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
-//! | `span/nested_timestamp_attribute` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
-//! | `span/event_dropped_count` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
-//! | `span/links` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
-//! | `span/link_flags` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
-//! | `span/link_trace_state` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
-//! | `span/link_dropped_count` | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `log/beside_metrics`, under `format: otlp_proto` | exact | -- | As at otlp_out: An OTLP log record in the logs request, beside the metrics in theirs. |
+//! | `log/beside_metrics`, under `format: otlp_json` | exact | -- | As at otlp_out: An OTLP log record in the logs request, beside the metrics in theirs. |
+//! | `log/beside_metrics`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
+//! | `span/name`, under `format: otlp_proto` | exact | -- | As at otlp_out: The span's `name`. |
+//! | `span/name`, under `format: otlp_json` | exact | -- | As at otlp_out: The span's `name`. |
+//! | `span/name`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/name_structured`, under `format: otlp_proto` | lost | uncounted | As at otlp_out: OTLP's span `name` is a string, and a name that isn't a `Str` leaves as `""`, uncounted. |
+//! | `span/name_structured`, under `format: otlp_json` | lost | uncounted | As at otlp_out: OTLP's span `name` is a string, and a name that isn't a `Str` leaves as `""`, uncounted. |
+//! | `span/name_structured`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/trace_id`, under `format: otlp_proto` | exact | -- | As at otlp_out: The 16-byte `trace_id`. |
+//! | `span/trace_id`, under `format: otlp_json` | exact | -- | As at otlp_out: The 16-byte `trace_id`. |
+//! | `span/trace_id`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/parent_span_id`, under `format: otlp_proto` | exact | -- | As at otlp_out: The 8-byte `parent_span_id`. |
+//! | `span/parent_span_id`, under `format: otlp_json` | exact | -- | As at otlp_out: The 8-byte `parent_span_id`. |
+//! | `span/parent_span_id`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/parent_unset`, under `format: otlp_proto` | exact | -- | As at otlp_out: An empty `parent_span_id`, read back as no parent. |
+//! | `span/parent_unset`, under `format: otlp_json` | exact | -- | As at otlp_out: An empty `parent_span_id`, read back as no parent. |
+//! | `span/parent_unset`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/kind`, under `format: otlp_proto` | exact | -- | As at otlp_out: The `SpanKind`. |
+//! | `span/kind`, under `format: otlp_json` | exact | -- | As at otlp_out: The `SpanKind`. |
+//! | `span/kind`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/status_error`, under `format: otlp_proto` | exact | -- | As at otlp_out: `Status.code` `STATUS_CODE_ERROR`. |
+//! | `span/status_error`, under `format: otlp_json` | exact | -- | As at otlp_out: `Status.code` `STATUS_CODE_ERROR`. |
+//! | `span/status_error`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/status_ok`, under `format: otlp_proto` | exact | -- | As at otlp_out: `Status.code` `STATUS_CODE_OK`. |
+//! | `span/status_ok`, under `format: otlp_json` | exact | -- | As at otlp_out: `Status.code` `STATUS_CODE_OK`. |
+//! | `span/status_ok`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/status_unset`, under `format: otlp_proto` | exact | -- | As at otlp_out: `Status.code` `STATUS_CODE_UNSET`, read back as unset. |
+//! | `span/status_unset`, under `format: otlp_json` | exact | -- | As at otlp_out: `Status.code` `STATUS_CODE_UNSET`, read back as unset. |
+//! | `span/status_unset`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/status_message`, under `format: otlp_proto` | exact | -- | As at otlp_out: `Status.message`. |
+//! | `span/status_message`, under `format: otlp_json` | exact | -- | As at otlp_out: `Status.message`. |
+//! | `span/status_message`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/timestamp`, under `format: otlp_proto` | exact | -- | As at otlp_out: `start_time_unix_nano`. |
+//! | `span/timestamp`, under `format: otlp_json` | exact | -- | As at otlp_out: `start_time_unix_nano`. |
+//! | `span/timestamp`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/end_timestamp`, under `format: otlp_proto` | exact | -- | As at otlp_out: `end_time_unix_nano`. |
+//! | `span/end_timestamp`, under `format: otlp_json` | exact | -- | As at otlp_out: `end_time_unix_nano`. |
+//! | `span/end_timestamp`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/end_before_start`, under `format: otlp_proto` | exact | -- | As at otlp_out: `end_time_unix_nano` as it is, earlier than the start. |
+//! | `span/end_before_start`, under `format: otlp_json` | exact | -- | As at otlp_out: `end_time_unix_nano` as it is, earlier than the start. |
+//! | `span/end_before_start`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/flags`, under `format: otlp_proto` | exact | -- | As at otlp_out: The span's `flags`. |
+//! | `span/flags`, under `format: otlp_json` | exact | -- | As at otlp_out: The span's `flags`. |
+//! | `span/flags`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/trace_state`, under `format: otlp_proto` | exact | -- | As at otlp_out: The span's `trace_state`. |
+//! | `span/trace_state`, under `format: otlp_json` | exact | -- | As at otlp_out: The span's `trace_state`. |
+//! | `span/trace_state`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/dropped_attributes_count`, under `format: otlp_proto` | exact | -- | As at otlp_out: The span's `dropped_attributes_count`. |
+//! | `span/dropped_attributes_count`, under `format: otlp_json` | exact | -- | As at otlp_out: The span's `dropped_attributes_count`. |
+//! | `span/dropped_attributes_count`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/dropped_events_count`, under `format: otlp_proto` | exact | -- | As at otlp_out: The span's `dropped_events_count`. |
+//! | `span/dropped_events_count`, under `format: otlp_json` | exact | -- | As at otlp_out: The span's `dropped_events_count`. |
+//! | `span/dropped_events_count`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/dropped_links_count`, under `format: otlp_proto` | exact | -- | As at otlp_out: The span's `dropped_links_count`. |
+//! | `span/dropped_links_count`, under `format: otlp_json` | exact | -- | As at otlp_out: The span's `dropped_links_count`. |
+//! | `span/dropped_links_count`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/events`, under `format: otlp_proto` | exact | -- | As at otlp_out: Each span event's time, name, and attributes. |
+//! | `span/events`, under `format: otlp_json` | exact | -- | As at otlp_out: Each span event's time, name, and attributes. |
+//! | `span/events`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/event_nested_attribute`, under `format: otlp_proto` | exact | -- | As at otlp_out: A key-value list, array, or empty attribute of a span event, as OTLP writes any attribute. |
+//! | `span/event_nested_attribute`, under `format: otlp_json` | exact | -- | As at otlp_out: A key-value list, array, or empty attribute of a span event, as OTLP writes any attribute. |
+//! | `span/event_nested_attribute`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/event_name_structured`, under `format: otlp_proto` | lost | uncounted | As at otlp_out: OTLP's span event `name` is a string, and a name that isn't a `Str` leaves as `""`, uncounted. |
+//! | `span/event_name_structured`, under `format: otlp_json` | lost | uncounted | As at otlp_out: OTLP's span event `name` is a string, and a name that isn't a `Str` leaves as `""`, uncounted. |
+//! | `span/event_name_structured`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/nested_bytes_attribute`, under `format: otlp_proto` | exact | -- | As at otlp_out: A `bytesValue` attribute of a span event or link. |
+//! | `span/nested_bytes_attribute`, under `format: otlp_json` | exact | -- | As at otlp_out: A `bytesValue` attribute of a span event or link. |
+//! | `span/nested_bytes_attribute`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/nested_u64_attribute`, under `format: otlp_proto` | normalized | `u64_as_int` | As at otlp_out: A `u64` attribute of a span event or link reads back as an `i64`, or, above `i64::MAX`, as a double, approximate beyond 2^53 and uncounted. |
+//! | `span/nested_u64_attribute`, under `format: otlp_json` | normalized | `u64_as_int` | As at otlp_out: A `u64` attribute of a span event or link reads back as an `i64`, or, above `i64::MAX`, as a double, approximate beyond 2^53 and uncounted. |
+//! | `span/nested_u64_attribute`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/nested_timestamp_attribute`, under `format: otlp_proto` | normalized | `timestamp_as_int` | As at otlp_out: A timestamp attribute of a span event or link leaves as an `intValue` of Unix nanoseconds, read back as an `i64`. |
+//! | `span/nested_timestamp_attribute`, under `format: otlp_json` | normalized | `timestamp_as_int` | As at otlp_out: A timestamp attribute of a span event or link leaves as an `intValue` of Unix nanoseconds, read back as an `i64`. |
+//! | `span/nested_timestamp_attribute`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/event_dropped_count`, under `format: otlp_proto` | exact | -- | As at otlp_out: A span event's `dropped_attributes_count`. |
+//! | `span/event_dropped_count`, under `format: otlp_json` | exact | -- | As at otlp_out: A span event's `dropped_attributes_count`. |
+//! | `span/event_dropped_count`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/links`, under `format: otlp_proto` | exact | -- | As at otlp_out: Each link's ids and attributes. |
+//! | `span/links`, under `format: otlp_json` | exact | -- | As at otlp_out: Each link's ids and attributes. |
+//! | `span/links`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/link_flags`, under `format: otlp_proto` | exact | -- | As at otlp_out: A link's `flags`. |
+//! | `span/link_flags`, under `format: otlp_json` | exact | -- | As at otlp_out: A link's `flags`. |
+//! | `span/link_flags`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/link_trace_state`, under `format: otlp_proto` | exact | -- | As at otlp_out: A link's `trace_state`. |
+//! | `span/link_trace_state`, under `format: otlp_json` | exact | -- | As at otlp_out: A link's `trace_state`. |
+//! | `span/link_trace_state`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
+//! | `span/link_dropped_count`, under `format: otlp_proto` | exact | -- | As at otlp_out: A link's `dropped_attributes_count`. |
+//! | `span/link_dropped_count`, under `format: otlp_json` | exact | -- | As at otlp_out: A link's `dropped_attributes_count`. |
+//! | `span/link_dropped_count`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. A `format: text` record writes no span (`span/alone`), so no field of one is compared. |
 //! | `span/beside_log`, under `format: text` | lost | `logit.output.spans.omitted{reason=format}` | The record holds the log body alone, so the span beside it is left off, counted. |
-//! | `span/beside_log`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `span/beside_log`, under `format: otlp_proto` | exact | -- | As at otlp_out: The span in the traces request and the log in the logs request, each read back as an event of its own. |
+//! | `span/beside_log`, under `format: otlp_json` | exact | -- | As at otlp_out: The span in the traces request and the log in the logs request, each read back as an event of its own. |
+//! | `span/beside_log`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //! | `span/beside_metrics`, under `format: text` | lost | `logit.output.events.skipped{reason=no_log}` | An event with no log has no `format: text` record, so the span and its metrics are left off, counted once for the event. |
-//! | `span/beside_metrics`, otherwise | exact | -- | The event as `stdio_out`'s JSON object, read back whole by the event JSON reader. |
+//! | `span/beside_metrics`, under `format: otlp_proto` | exact | -- | As at otlp_out: An OTLP span in the traces request, beside the metrics in theirs. |
+//! | `span/beside_metrics`, under `format: otlp_json` | exact | -- | As at otlp_out: An OTLP span in the traces request, beside the metrics in theirs. |
+//! | `span/beside_metrics`, otherwise | exact | -- | Under `json`, `msgpack`, and `native`, the event whole, as `stdio_out`'s JSON object, its MessagePack map, or a native frame, read back whole by kafka_in. |
 //!
 //! <!-- transit:end -->
 
@@ -285,10 +628,14 @@ use logit_core::{
     CountGate, Diagnostics, Event, EventBatch, Resource, Scope, Symbol, Telemetry, Value,
 };
 use logit_proto::frame::{write_frame, Compression};
+use logit_proto::kafka::text::escape_line_into;
 use logit_proto::msgpack::Writer;
-use logit_proto::native::{encode_events, CODEC_BATCH};
+use logit_proto::native::{encode_events_omitting, CODEC_BATCH};
+use logit_proto::otlp::common::u64_as_double_count;
 use logit_proto::otlp::{OtlpEncoder, OtlpRequest};
 use logit_proto::{FramedEncoder, MessageBuf, Signal};
+
+use super::CARRIER_PREFIX;
 
 /// What each record's key is. Mirrors `logit_config::KafkaKey`, which `logit-cli` converts.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -368,6 +715,13 @@ pub struct EncodeStats {
     pub missing_key: usize,
     /// Events `format: text` skipped for having no log record.
     pub no_log: usize,
+    /// Events an OTLP format skipped for carrying no log, span, or metric, which no request
+    /// holds, as `otlp_out` skips one.
+    pub no_payload: usize,
+    /// Attribute values an OTLP format wrote as a double for being a `u64` above `i64::MAX`: on
+    /// each event with a log, a span, or a metric the OTLP mapping keeps, and on the batch's
+    /// resource and scope when any record was written, once per batch as `otlp_out` counts them.
+    pub u64_as_double: usize,
     /// Metric records `format: text` left out of a record it wrote from the event's log.
     pub metrics_omitted: usize,
     /// Spans `format: text` left out of a record it wrote from the event's log.
@@ -401,13 +755,16 @@ pub struct KafkaEncoder {
 struct Render {
     text: String,
     body: Vec<u8>,
+    /// `body` in the batch line form.
+    escaped: Vec<u8>,
     msgpack: Writer,
     msgpack_scratch: String,
 }
 
 impl Render {
     /// `event`'s value under `format`, or `None` for an event `format: text` skips. `newline`
-    /// ends a JSON object with `\n`, as an NDJSON line.
+    /// asks for the `record: batch` line form: a JSON object ends with `\n`, as an NDJSON line,
+    /// and a text body is escaped.
     fn value(
         &mut self,
         format: RecordFormat,
@@ -419,7 +776,8 @@ impl Render {
         match format {
             RecordFormat::Json => {
                 self.text.clear();
-                crate::ndjson::render_event(&mut self.text, resource, scope, event);
+                let omit = Some(CARRIER_PREFIX);
+                crate::ndjson::render_event(&mut self.text, resource, scope, event, omit);
                 if newline {
                     self.text.push('\n');
                 }
@@ -433,6 +791,7 @@ impl Render {
                     resource,
                     scope,
                     event,
+                    Some(CARRIER_PREFIX),
                 );
                 Some(self.msgpack.as_slice())
             }
@@ -440,7 +799,12 @@ impl Render {
                 let log = event.log.as_ref()?;
                 self.body.clear();
                 push_body(&mut self.body, &mut self.text, &log.message);
-                Some(&self.body)
+                if !newline {
+                    return Some(&self.body);
+                }
+                self.escaped.clear();
+                escape_line_into(&mut self.escaped, &self.body);
+                Some(&self.escaped)
             }
             RecordFormat::Native => unreachable!("native frames go through `native_frame`"),
             RecordFormat::OtlpProto | RecordFormat::OtlpJson => {
@@ -484,7 +848,8 @@ fn push_body(out: &mut Vec<u8>, text: &mut String, message: &Value) {
 
 /// One `CODEC_BATCH` frame of `events`, or `None` past the frame's own payload cap.
 fn native_frame(resource: &Resource, scope: Option<&Scope>, events: &[Event]) -> Option<Bytes> {
-    write_frame(CODEC_BATCH, Compression::None, &encode_events(resource, scope, events)).ok()
+    let payload = encode_events_omitting(resource, scope, events, CARRIER_PREFIX);
+    write_frame(CODEC_BATCH, Compression::None, &payload).ok()
 }
 
 fn millis(nanos: i64) -> i64 {
@@ -758,12 +1123,40 @@ impl KafkaEncoder {
     ) {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
         let timestamp = millis(i64::try_from(nanos).unwrap_or(i64::MAX));
+        for event in &batch.events {
+            if event.log.is_none() && event.span.is_none() && event.metrics.is_empty() {
+                stats.no_payload += 1;
+                continue;
+            }
+            let n = u64_as_double_count(&event.attributes);
+            if n > 0 && self.reaches_a_request(batch, event) {
+                stats.u64_as_double += n;
+            }
+        }
+        let records = out.len();
         for signal in SIGNALS {
             let groups = self.groups(signal, batch);
             for group in groups {
                 self.otlp_group(signal, batch, group, timestamp, out, stats);
             }
         }
+        // The resource and scope go out once per record but count once, as one batch's values.
+        if out.len() > records {
+            stats.u64_as_double += u64_as_double_count(&batch.resource.attributes)
+                + batch.scope.as_ref().map_or(0, |s| u64_as_double_count(&s.attributes));
+        }
+    }
+
+    /// Whether any of `event`'s signals maps to a record, as `otlp_out` decides an event's
+    /// attributes go out: a log or a span always does, and a metric only when the OTLP mapping
+    /// doesn't skip or drop it, which this probes with the gate muted so nothing counts twice.
+    fn reaches_a_request(&mut self, batch: &EventBatch, event: &Event) -> bool {
+        if event.log.is_some() || event.span.is_some() {
+            return true;
+        }
+        let (resource, scope) = (&batch.resource, batch.scope.as_deref());
+        let otlp = &mut self.otlp;
+        self.gate.muted(|| otlp.request(Signal::Metrics, resource, scope, [event]).is_some())
     }
 
     /// `signal`'s events of `batch`, grouped by their key: one group per trace id, in order of
@@ -1081,7 +1474,8 @@ mod tests {
     /// `event`'s NDJSON object, the reference every format is decoded back against.
     fn ndjson(batch: &EventBatch, event: &Event) -> String {
         let mut line = String::new();
-        crate::ndjson::render_event(&mut line, &batch.resource, batch.scope.as_deref(), event);
+        let scope = batch.scope.as_deref();
+        crate::ndjson::render_event(&mut line, &batch.resource, scope, event, Some(CARRIER_PREFIX));
         line
     }
 
@@ -1342,6 +1736,107 @@ mod tests {
         assert_eq!(out.len(), 5, "8 bytes hold one body, not two and a newline");
     }
 
+    /// An event carrying `kafka_in`'s record metadata and an ordinary attribute.
+    fn carrier_event(timestamp: i64) -> Event {
+        let mut event = log_event(timestamp, Value::str("m"));
+        event.attributes.insert("_logit.kafka.topic", "orders");
+        event.attributes.insert("_logit.kafka.offset", Value::I64(7));
+        event.attributes.insert("host", "web-1");
+        event
+    }
+
+    /// The top-level attribute keys of one decoded JSON or MessagePack object, or `None` when it
+    /// has no `attributes` key.
+    fn json_attribute_keys(line: &str) -> Option<Vec<String>> {
+        let object: serde_json::Value = serde_json::from_str(line).unwrap();
+        let attrs = object.get("attributes")?.as_object().unwrap();
+        Some(attrs.keys().cloned().collect())
+    }
+
+    fn msgpack_attribute_keys(tree: &crate::msgpack::tests::Tree) -> Option<Vec<String>> {
+        use crate::msgpack::tests::Tree;
+        let Tree::Map(top) = tree else { panic!("an event is a map") };
+        let (_, Tree::Map(attrs)) = top.iter().find(|(k, _)| k == "attributes")? else {
+            panic!("attributes is a map")
+        };
+        Some(attrs.iter().map(|(k, _)| k.clone()).collect())
+    }
+
+    /// `kafka_out` leaves `_logit.kafka.*` out of `json`, `msgpack`, and `native` records under
+    /// both record modes, and keeps every other attribute; an event whose only attributes are
+    /// carriers writes no `attributes` key.
+    #[test]
+    fn kafka_carriers_are_left_out_of_every_attribute_writing_format() {
+        let mut only_carriers = log_event(2_000_000, Value::str("c"));
+        only_carriers.attributes.insert("_logit.kafka.partition", Value::I64(0));
+        let b =
+            batch(AttrMap::new(), vec![carrier_event(0), carrier_event(1_000_000), only_carriers]);
+        let host = Some(vec!["host".to_string()]);
+        for record in [RecordMode::Event, RecordMode::Batch] {
+            let (out, _) = records(&mut encoder(RecordFormat::Json, record, usize::MAX), &b);
+            let lines: Vec<String> = out
+                .iter()
+                .flat_map(|(v, _)| {
+                    std::str::from_utf8(v).unwrap().lines().map(str::to_string).collect::<Vec<_>>()
+                })
+                .collect();
+            let keys: Vec<_> = lines.iter().map(|l| json_attribute_keys(l)).collect();
+            assert_eq!(keys, vec![host.clone(), host.clone(), None], "json, {record:?}");
+
+            let (out, _) = records(&mut encoder(RecordFormat::Msgpack, record, usize::MAX), &b);
+            let mut keys = Vec::new();
+            for (value, _) in &out {
+                let mut r = Reader::new(value);
+                while !r.is_empty() {
+                    keys.push(msgpack_attribute_keys(&read_tree(&mut r)));
+                }
+            }
+            assert_eq!(keys, vec![host.clone(), host.clone(), None], "msgpack, {record:?}");
+
+            let (out, _) = records(&mut encoder(RecordFormat::Native, record, usize::MAX), &b);
+            let attrs: Vec<AttrMap> =
+                native_events(&b, &out).into_iter().map(|e| e.attributes).collect();
+            let mut want = AttrMap::new();
+            want.insert("host", "web-1");
+            assert_eq!(attrs, vec![want.clone(), want, AttrMap::new()], "native, {record:?}");
+        }
+    }
+
+    /// Under `record: batch`, a text body's `\` and LF are escaped, so a body holding either
+    /// reads back as one body, a `Bytes` body stays bytes, and the budget measures the escaped
+    /// form. `record: event` writes each body as it is.
+    #[test]
+    fn a_text_batch_record_escapes_each_body() {
+        let bodies: [&[u8]; 4] = [b"two\nlines", b"back\\slash", b"raw\xff\n", b""];
+        let events: Vec<Event> = vec![
+            log_event(0, Value::str("two\nlines")),
+            log_event(1_000_000, Value::str("back\\slash")),
+            log_event(2_000_000, Value::Bytes(Bytes::from_static(b"raw\xff\n"))),
+            log_event(3_000_000, Value::Null),
+        ];
+        let b = batch(AttrMap::new(), events);
+
+        let (per_event, _) =
+            records(&mut encoder(RecordFormat::Text, RecordMode::Event, usize::MAX), &b);
+        let got: Vec<&[u8]> = per_event.iter().map(|(v, _)| &v[..]).collect();
+        assert_eq!(got, bodies);
+
+        let (out, _) = records(&mut encoder(RecordFormat::Text, RecordMode::Batch, usize::MAX), &b);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, b"two\\nlines\nback\\\\slash\nraw\xff\\n\n");
+        assert_eq!(logit_proto::kafka::text::unescape_lines(&out[0].0), bodies);
+
+        // Escaped, the bodies are 10, 11, 6, and 0 bytes: under a 10-byte budget the second is
+        // over alone, and the third and fourth share a record, 6 + 1 + 0 bytes.
+        let (out, stats) = records(&mut encoder(RecordFormat::Text, RecordMode::Batch, 10), &b);
+        assert_eq!(stats.oversize, 1);
+        let values: Vec<&[u8]> = out.iter().map(|(v, _)| &v[..]).collect();
+        assert_eq!(values, vec![&b"two\\nlines"[..], b"raw\xff\\n\n"]);
+        // The first body is 9 bytes as it is, so a 9-byte budget measuring that would keep it.
+        let (_, stats) = records(&mut encoder(RecordFormat::Text, RecordMode::Batch, 9), &b);
+        assert_eq!(stats.oversize, 2);
+    }
+
     /// `native` under `record: batch` cuts the events into frames that each fit the budget and
     /// hold as many events as do: one more would not fit.
     #[test]
@@ -1527,5 +2022,61 @@ mod tests {
                 .flat_map(str::split_whitespace)
                 .collect();
         assert_eq!(hex, committed, "commit the encoder's hex: {hex}");
+    }
+
+    /// An event with no log, span, or metric has no OTLP signal, so no request holds it: each
+    /// OTLP format counts it, as `otlp_out` does, and writes the other events.
+    #[test]
+    fn an_otlp_format_counts_an_event_with_no_payload() {
+        for format in [RecordFormat::OtlpProto, RecordFormat::OtlpJson] {
+            let b = batch(
+                AttrMap::new(),
+                vec![Event::empty(0, AttrMap::new()), log_event(1, Value::str("m"))],
+            );
+            let (out, stats) = records(&mut encoder(format, RecordMode::Request, usize::MAX), &b);
+            assert_eq!(stats.no_payload, 1, "{format:?}: the event with no payload");
+            assert_eq!(out.len(), 1, "{format:?}: one logs request");
+        }
+    }
+
+    /// A `u64` attribute above `i64::MAX` leaves an OTLP format as a double, counted once per
+    /// value on a written event and on the batch's resource, as `otlp_out` counts it; one on an
+    /// event no request holds isn't written, so it isn't counted.
+    #[test]
+    fn an_otlp_format_counts_a_u64_attribute_written_as_a_double() {
+        let big = |k: &str| {
+            let mut a = AttrMap::new();
+            a.insert(k, Value::U64(u64::MAX));
+            a
+        };
+        for format in [RecordFormat::OtlpProto, RecordFormat::OtlpJson] {
+            let mut log = log_event(1, Value::str("m"));
+            log.attributes = big("big");
+            let b = batch(big("res"), vec![log, Event::empty(0, big("unsent"))]);
+            let (_, stats) = records(&mut encoder(format, RecordMode::Request, usize::MAX), &b);
+            assert_eq!(stats.u64_as_double, 2, "{format:?}: the event's and the resource's");
+        }
+    }
+
+    /// An event whose only metric the OTLP mapping drops or skips reaches no request, so neither
+    /// its `u64` attribute nor the resource's counts, as `otlp_out` counts none of them.
+    #[test]
+    fn an_otlp_format_counts_no_u64_attribute_for_an_event_whose_metrics_all_drop() {
+        let big = |k: &str| {
+            let mut a = AttrMap::new();
+            a.insert(k, Value::U64(u64::MAX));
+            a
+        };
+        for format in [RecordFormat::OtlpProto, RecordFormat::OtlpJson] {
+            let mut e = Event::empty(1, big("big"));
+            e.metrics.push(logit_core::MetricRecord::new(
+                intern("adj"),
+                logit_core::MetricKind::GaugeDelta(1.0.into()),
+            ));
+            let b = batch(big("res"), vec![e]);
+            let (out, stats) = records(&mut encoder(format, RecordMode::Request, usize::MAX), &b);
+            assert_eq!(out.len(), 0, "{format:?}: the gauge delta is dropped");
+            assert_eq!(stats.u64_as_double, 0, "{format:?}: nothing reached the wire");
+        }
     }
 }

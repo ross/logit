@@ -1079,6 +1079,7 @@ dependencies = [
  "logit-config",
  "logit-core",
  "logit-inputs",
+ "logit-kafka",
  "logit-outputs",
  "logit-pipeline",
  "logit-proto",
@@ -1139,14 +1140,17 @@ dependencies = [
  "async-trait",
  "base64",
  "bytes",
+ "crc32c",
  "flate2",
  "form_urlencoded",
  "http",
  "http-body-util",
  "hyper",
  "hyper-util",
+ "kafka-protocol",
  "libc",
  "logit-core",
+ "logit-kafka",
  "logit-outputs",
  "logit-pipeline",
  "logit-proto",
@@ -1170,6 +1174,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "logit-kafka"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "bytes",
+ "crc32c",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "kafka-protocol",
+ "logit-aws",
+ "logit-core",
+ "logit-pipeline",
+ "logit-proto",
+ "reqwest",
+ "ring",
+ "rustls",
+ "rustls-pki-types",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+]
+
+[[package]]
 name = "logit-outputs"
 version = "0.1.0"
 dependencies = [
@@ -1189,10 +1220,10 @@ dependencies = [
  "logit-config",
  "logit-core",
  "logit-inputs",
+ "logit-kafka",
  "logit-pipeline",
  "logit-proto",
  "logit-script",
- "lz4_flex",
  "proptest",
  "prost",
  "reqwest",
@@ -1262,6 +1293,7 @@ dependencies = [
  "bytes",
  "crc32c",
  "flate2",
+ "kafka-protocol",
  "logit-core",
  "lz4_flex",
  "proptest",

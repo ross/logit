@@ -19,7 +19,5 @@
     {"sink":"kafka_out","row":"span/beside_metrics","cell":0,"observed":["lost"]},
     {"sink":"kafka_out","row":"span/needs_agent_processing","cell":0,"observed":[]}
   ],
-  "unspecified": [
-    {"sink":"kafka_out","row":"gauge/f64","reached_by":["datadog-traces-to-kafka-text × beside"]}
-  ]
+  "unspecified": []
 }

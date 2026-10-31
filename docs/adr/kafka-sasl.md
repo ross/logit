@@ -418,3 +418,13 @@ behavior, the tests, and the decisions above are unchanged. Two things follow:
 and the bounded body read from its `http` module, and the form URL encoder from
 `kafka/sasl/oauth.rs`. A change to a default in
 `logit-outputs` doesn't move the copies.
+
+## Amendment: the connection and SASL moved to `logit-kafka`
+
+`conn.rs` and `sasl/` (`msk_iam.rs` included) moved from `crates/logit-outputs/src/kafka/` to
+`crates/logit-kafka/src/`, so `kafka_in` shares them ([ADR `kafka-input`](kafka-input.md), item
+1). The decisions above are unchanged. A path above under `kafka/sasl/` or `kafka/conn.rs` now
+reads `crates/logit-kafka/src/`, and a test name `conn::` or `sasl::` now reads
+`logit_kafka::conn::` or `logit_kafka::sasl::`. `fault::code`, `fault::name`, and
+`fault::classify_sasl` are `logit_kafka::error`'s; `kafka_out`'s `fault` keeps the produce
+classes.

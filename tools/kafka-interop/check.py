@@ -20,7 +20,22 @@ script has already written, under /out (the run directory):
                                         prints the key last, and kcat prints the value's size
                                         and key length (`%S\t%K`, -1 for a null key)
     collector/<broker>/<name>.jsonl     what the Collector decoded, one OTLP/JSON request a line
-    exits.txt                           `<service> <exit code>` per leg and Collector
+    consume-<leg>-<broker>.jsonl        what a consumer leg's `kafka_in` read, `stdio_out`
+                                        `format: json`, `_logit.kafka.*` carriers included;
+                                        `relay-<broker>-sent.jsonl` and `-text-sent.jsonl` what
+                                        the relay leg's generators wrote
+    readback/<broker>/consume.offsets   kafka-get-offsets.sh for the consumer legs' topics, and
+    readback/<broker>/restart.offsets   for the broker-restart leg's
+    readback/<broker>/restart-after.offsets  for `restart` once both brokers were healthy
+                                        after the first restart
+    readback/<broker>/restart-committed.txt  kafka-consumer-groups.sh --describe of the
+                                        broker-restart leg's group before its first life stopped
+    readback/<broker>/group-mixed-console.tsv  the group-mixed leg's console consumer's records,
+                                        in the `.java.tsv` form
+    readback/<broker>/group-mixed.describe  kafka-consumer-groups.sh --describe --state and
+                                        --members, read while both members were in the group
+    exits.txt                           `<service> <exit code>` per leg and Collector, and
+                                        `<service>-life1` for a first life the script stopped
     redpanda-oidc.txt                   `ok` once Redpanda took OAUTHBEARER, else `failed`
     logs/<service>.log                  each service's log
 
@@ -69,8 +84,8 @@ class Record:
         return int(self.event()["attributes"]["seq"])
 
 
-def read_java(broker, topic):
-    path = OUT / "readback" / broker / f"{topic}.java.tsv"
+def read_java(broker, topic, path=None):
+    path = path or OUT / "readback" / broker / f"{topic}.java.tsv"
     records = []
     if not path.exists():
         return records
@@ -949,6 +964,596 @@ LEGS += [
 ]
 
 
+
+# ---- consumer legs -----------------------------------------------------------------------------
+#
+# Each `logit-in-*` leg's `kafka_in` writes what it read to /out as `stdio_out` `format: json`
+# lines (crates/logit-outputs/src/ndjson.rs's module doc is the grammar), each event carrying its
+# record's `_logit.kafka.*` carriers. `readback/<broker>/consume.offsets` and `restart.offsets`
+# hold the end offsets of the topics only consumer legs write.
+
+KAFKA_CARRIER = "_logit.kafka."
+CONSOLE_LINES = 50
+GROUP_RECORDS = 400
+GROUP_RATE = 10
+RESTART_RECORDS = 300
+RESTART_RATE = 5
+RESTART_PARTITIONS = 3
+# kafka_in's default `commit_interval`, in seconds.
+COMMIT_INTERVAL = 5
+RELAY_TICKS = 40
+RELAY_FORMATS = ("json", "msgpack", "native", "text", "otlp_proto", "otlp_json")
+RELAY_RECORDS = ("event", "batch")
+OTLP_SIGNALS = {"logs": "log", "metrics": "metrics", "spans": "span"}
+TXN_RECORDS = 100
+
+
+def consumed(name):
+    """The events a consumer leg wrote to /out/<name>.jsonl, or `None` without the file."""
+    path = OUT / f"{name}.jsonl"
+    if not path.exists():
+        return None
+    return [json.loads(line) for line in path.read_text(errors="replace").splitlines()
+            if line.strip()]
+
+
+def carrier(event, name):
+    return event.get("attributes", {}).get(KAFKA_CARRIER + name)
+
+
+def place(event):
+    """The `(topic, partition, offset)` of the record an event arrived in."""
+    return carrier(event, "topic"), carrier(event, "partition"), carrier(event, "offset")
+
+
+def without_carriers(event):
+    """The event with its `_logit.kafka.*` attributes and their `types` entries removed: what
+    the producing `logit` wrote, under ADR `kafka-input` item 13."""
+    event = json.loads(json.dumps(event))
+    attributes = {k: v for k, v in event.get("attributes", {}).items()
+                  if not k.startswith(KAFKA_CARRIER)}
+    types = {k: v for k, v in event.get("types", {}).items()
+             if not k.startswith("/attributes/" + KAFKA_CARRIER)}
+    event.pop("attributes", None)
+    event.pop("types", None)
+    if attributes:
+        event["attributes"] = attributes
+    if types:
+        event["types"] = types
+    return event
+
+
+def consume_offsets(broker, name="consume"):
+    """`{(topic, partition): end offset}` from `readback/<broker>/<name>.offsets`."""
+    path = OUT / "readback" / broker / f"{name}.offsets"
+    ends = {}
+    if path.exists():
+        for line in path.read_text().splitlines():
+            parts = line.strip().rsplit(":", 2)
+            if len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
+                ends[(parts[0], int(parts[1]))] = int(parts[2])
+    return ends
+
+
+def ms_floor(stamp):
+    """An RFC 3339 timestamp with nine fractional digits, cut to milliseconds."""
+    return stamp[:23] + "000000Z"
+
+
+def leg_consume_console(broker):
+    events = consumed(f"consume-console-{broker}")
+    if events is None:
+        return "FAIL", "the leg wrote no events"
+    ends = {p: end for (topic, p), end in consume_offsets(broker).items() if topic == "console"}
+    seen = {}
+    for event in events:
+        topic, partition, offset = place(event)
+        message = event.get("log", {}).get("message", "")
+        match = re.fullmatch(r"console line (\d+) é", message)
+        if topic != "console" or not match:
+            return "FAIL", f"an unexpected event: {json.dumps(event)[:300]}"
+        n = int(match.group(1))
+        want_headers = {"seq": str(n), "rep": ["a", "b"], "nil": None}
+        problems = []
+        if carrier(event, "key") != f"key-{n}":
+            problems.append(f"key {carrier(event, 'key')!r}")
+        if carrier(event, "headers") != want_headers:
+            problems.append(f"headers {carrier(event, 'headers')!r}")
+        if carrier(event, "timestamp_type") != "create_time":
+            problems.append(f"timestamp_type {carrier(event, 'timestamp_type')!r}")
+        if event.get("timestamp") != carrier(event, "timestamp"):
+            problems.append(f"timestamp {event.get('timestamp')} against the record's "
+                            f"{carrier(event, 'timestamp')}")
+        if event.get("types", {}).get("/attributes/_logit.kafka.timestamp") != "timestamp":
+            problems.append("the timestamp carrier isn't typed `timestamp`")
+        if event.get("log", {}).get("format") != "raw" or "severity" in event.get("log", {}) \
+                or "resource" in event:
+            problems.append(f"log {event.get('log')!r}, resource {event.get('resource')!r}")
+        if problems:
+            return "FAIL", f"line {n}: " + "; ".join(problems)
+        if n in seen:
+            return "FAIL", f"line {n} read twice, at {seen[n]} and {(partition, offset)}"
+        seen[n] = (partition, offset)
+    if set(seen) != set(range(CONSOLE_LINES)):
+        return "FAIL", f"read {len(seen)} of {CONSOLE_LINES} lines"
+    read = {}
+    for partition, offset in seen.values():
+        read.setdefault(partition, set()).add(offset)
+    gaps = {p: end for p, end in ends.items() if read.get(p, set()) != set(range(end))}
+    if not ends or gaps:
+        return "FAIL", f"offsets read don't match the end offsets {ends}: {sorted(read.items())}"
+    return "PASS", (f"{CONSOLE_LINES} lines on {len(ends)} partitions, each read once with its "
+                    "key, its `seq` and null `nil` headers, `rep`'s two values in order, and "
+                    "the record timestamp as the event's")
+
+
+def relay_received(broker):
+    events = consumed(f"consume-relay-{broker}")
+    by_topic = {}
+    for event in events or []:
+        by_topic.setdefault(carrier(event, "topic"), []).append(event)
+    return events is not None, by_topic
+
+
+def canonical(event):
+    return json.dumps(event, sort_keys=True)
+
+
+def multiset_problem(want, got):
+    """The first difference between two event lists compared as multisets, else `None`."""
+    counts = {}
+    for event in want:
+        counts[canonical(event)] = counts.get(canonical(event), 0) + 1
+    for event in got:
+        counts[canonical(event)] = counts.get(canonical(event), 0) - 1
+    missing = [k for k, n in counts.items() if n > 0]
+    extra = [k for k, n in counts.items() if n < 0]
+    if not missing and not extra:
+        return None
+    return (f"{sum(n for n in counts.values() if n > 0)} sent event(s) not read, "
+            f"{-sum(n for n in counts.values() if n < 0)} read event(s) not sent; "
+            f"first missing {missing[0][:400] if missing else '-'}; "
+            f"first extra {extra[0][:400] if extra else '-'}")
+
+
+def otlp_normalized(event, sent_log):
+    """A read OTLP event under the OTLP formats' own normalizations (crates/logit-proto/src/otlp's
+    mapping table): `kafka_out` stamps a log with no observed time with the time it encodes the
+    request, and the decoder writes the raw severity number and text into
+    `_logit.otel.severity_*` beside the band's severity."""
+    log = event.get("log")
+    if log is not None and sent_log is not None and "observed_timestamp" not in sent_log:
+        log.pop("observed_timestamp", None)
+    attributes = event.get("attributes", {})
+    for key in ("_logit.otel.severity_number", "_logit.otel.severity_text"):
+        attributes.pop(key, None)
+    if "attributes" in event and not attributes:
+        event.pop("attributes")
+    return event
+
+
+def leg_consume_relay(broker, fmt, codec):
+    ok, by_topic = relay_received(broker)
+    if not ok:
+        return "FAIL", "the leg wrote no events"
+    sent = consumed(f"relay-{broker}-sent")
+    sent_text = consumed(f"relay-{broker}-text-sent")
+    if not sent or not sent_text:
+        return "FAIL", "the generators wrote no events"
+    if len(sent) != 3 * RELAY_TICKS or len(sent_text) != RELAY_TICKS:
+        return "FAIL", f"the generators wrote {len(sent)} and {len(sent_text)} events"
+    summary = []
+    if fmt.startswith("otlp"):
+        # One read event per data point: the OTLP decoder makes an event of each.
+        points = []
+        for event in sent:
+            for metric in event.get("metrics", []):
+                points.append({**event, "metrics": [metric]})
+        for signal, field in OTLP_SIGNALS.items():
+            topic = f"relay-{fmt}-{codec}-{signal}"
+            want = points if signal == "metrics" else [e for e in sent if field in e]
+            sent_logs = {e["log"].get("message"): e["log"] for e in want if "log" in e}
+            got = []
+            for event in by_topic.get(topic, []):
+                bare = without_carriers(event)
+                message = bare.get("log", {}).get("message")
+                got.append(otlp_normalized(bare, sent_logs.get(message)))
+            problem = multiset_problem(want, got)
+            if problem:
+                return "FAIL", f"{topic}: {problem}"
+            summary.append(f"{signal} {len(got)}")
+        return "PASS", (f"{', '.join(summary)} events, each equal to what was sent, field for "
+                        "field, but for the OTLP formats' observed time and severity carriers")
+    for record in RELAY_RECORDS:
+        topic = f"relay-{fmt}-{record}-{codec}"
+        read = by_topic.get(topic, [])
+        if fmt != "text":
+            problem = multiset_problem(sent, [without_carriers(e) for e in read])
+            if problem:
+                return "FAIL", f"{topic}: {problem}"
+            records = len({place(e) for e in read})
+            summary.append(f"{record}: {len(read)} events in {records} records")
+            continue
+        # `text` carries the body alone, at the record's timestamp: the event's own, cut to
+        # milliseconds, under `record: event`, and the record's first event's under `batch`.
+        stamps = {e["log"]["message"]: e["timestamp"] for e in sent_text}
+        bodies = [e.get("log", {}).get("message") for e in read]
+        problem = multiset_problem([{"m": m} for m in stamps], [{"m": m} for m in bodies])
+        if problem:
+            return "FAIL", f"{topic}: {problem}"
+        first = {}
+        for event in read:
+            first.setdefault(place(event), event["log"]["message"])
+        for event in read:
+            bare = without_carriers(event)
+            record_stamp = ms_floor(stamps[first[place(event)]])
+            extra = {k: v for k, v in bare.items() if k not in ("timestamp", "log")}
+            if bare["timestamp"] != record_stamp or carrier(event, "timestamp") != record_stamp \
+                    or extra or bare["log"] != {"format": "raw",
+                                                "message": bare["log"]["message"]}:
+                return "FAIL", (f"{topic}: {json.dumps(event)[:400]} isn't the body alone at "
+                                f"{record_stamp}")
+        summary.append(f"{record}: {len(read)} logs in {len(first)} records")
+    return "PASS", "; ".join(summary) + (", each equal to what was sent, field for field" if
+                                          fmt != "text" else ", each body as sent at its "
+                                          "record's timestamp")
+
+
+def collector_read(broker, fmt):
+    events = consumed(f"consume-collector-{broker}")
+    if events is None:
+        return None
+    prefix = f"collector-{fmt}-"
+    return [e for e in events if (carrier(e, "topic") or "").startswith(prefix)]
+
+
+def leg_consume_collector(broker, fmt):
+    events = collector_read(broker, fmt)
+    if events is None:
+        return "FAIL", "the leg wrote no events"
+    logs, spans, points = {}, {}, {}
+    for event in events:
+        attributes = event.get("attributes", {})
+        seq = attributes.get("seq")
+        signal = carrier(event, "topic").rsplit("-", 1)[1]
+        service = event.get("resource", {}).get("attributes", {}).get("service.name")
+        if service != "kafka-interop-otlp" or attributes.get("leg") != "otlp" \
+                or not isinstance(seq, int):
+            return "FAIL", f"an event without the leg's resource or attributes: {json.dumps(event)[:300]}"
+        if signal == "logs":
+            log = event.get("log", {})
+            trace = otlp_trace_id(seq) if otlp_log_has_trace(seq) else None
+            if log.get("message") != f"otlp log {seq}" or log.get("severity") != "info" \
+                    or log.get("trace_id") != trace \
+                    or log.get("span_id") != (otlp_span_id(seq) if trace else None):
+                return "FAIL", f"log seq {seq}: {log}"
+            logs[seq] = logs.get(seq, 0) + 1
+        elif signal == "spans":
+            span = event.get("span", {})
+            error = seq % 5 == 0
+            if span.get("name") != f"otlp-span-{seq}" or span.get("trace_id") != otlp_trace_id(seq) \
+                    or span.get("span_id") != otlp_span_id(seq) or span.get("kind") != "server" \
+                    or span.get("status") != ("error" if error else "unset") \
+                    or span.get("status_message") != ("boom" if error else None) \
+                    or [e.get("name") for e in span.get("events", [])] != ["retry"]:
+                return "FAIL", f"span seq {seq}: {span}"
+            spans[seq] = spans.get(seq, 0) + 1
+        else:
+            for metric in event.get("metrics", []):
+                name = metric.get("name")
+                want = {
+                    "otlp_delta_sum": {"kind": "sum", "value": 1.0, "temporality": "delta",
+                                       "monotonic": True},
+                    "otlp_cumulative_sum": {"kind": "sum", "value": float(seq + 1),
+                                            "temporality": "cumulative"},
+                    "otlp_gauge": {"kind": "gauge", "value": seq * 0.5, "unit": "By",
+                                   "description": "a gauge"},
+                    "otlp_hist": {"kind": "histogram", "temporality": "delta",
+                                  "buckets": [{"bound": 1.0, "count": 1},
+                                              {"bound": 5.0, "count": seq % 3},
+                                              {"bound": "inf", "count": 2}],
+                                  "sum": float(10 + seq)},
+                    "otlp_exphist": {"kind": "exponential_histogram", "scale": 0,
+                                     "temporality": "delta", "count": 4, "zero_count": 1,
+                                     "positive": {"offset": 0, "counts": [1, 2]}, "sum": 7.0},
+                }.get(name)
+                if want is None or any(metric.get(k) != v for k, v in want.items()):
+                    return "FAIL", f"{name} seq {seq}: {metric}"
+                points[(name, seq)] = points.get((name, seq), 0) + 1
+    detail = (f"{len(logs)} logs, {len(spans)} spans, and {len(points)} data points read; "
+              f"{sum(logs.values()) + sum(spans.values()) + sum(points.values()) - len(logs) - len(spans) - len(points)} "
+              "read more than once")
+    if set(logs) != set(range(OTLP_TICKS)) or set(spans) != set(range(OTLP_TICKS)) \
+            or len(points) != OTLP_TICKS * len(OTLP_METRICS):
+        return "FAIL", f"want {OTLP_TICKS} of each signal and {OTLP_TICKS * len(OTLP_METRICS)} points; {detail}"
+    return "PASS", detail + ", each field as the tick number implies"
+
+
+def ownership(members, topic, ends):
+    """Judges a group's reads of `topic` from each member's events: `(missing, duplicates,
+    switches, per_member)`. `missing` are offsets below a partition's end no member read;
+    `duplicates` the reads beyond the first of an offset; `switches` per partition, how often its
+    reads change member in offset order, skipping an offset two members read."""
+    readers = {}
+    reads = 0
+    per_member = {}
+    for member, events in members.items():
+        for event in events:
+            t, partition, offset = place(event)
+            if t != topic:
+                continue
+            readers.setdefault((partition, offset), []).append(member)
+            per_member[member] = per_member.get(member, 0) + 1
+            reads += 1
+    missing = sum(1 for (t, p), end in ends.items() if t == topic
+                  for o in range(end) if (p, o) not in readers)
+    switches = {}
+    for (t, partition), end in ends.items():
+        if t != topic:
+            continue
+        owners = [readers[(partition, o)][0] for o in range(end)
+                  if len(set(readers.get((partition, o), []))) == 1]
+        switches[partition] = sum(1 for a, b in zip(owners, owners[1:]) if a != b)
+    return missing, reads - len(readers), switches, per_member
+
+
+def seqs_read(members):
+    seqs = set()
+    for events in members.values():
+        for event in events:
+            seq = event.get("attributes", {}).get("seq")
+            if seq is not None:
+                seqs.add(int(seq))
+    return seqs
+
+
+def judge_group(broker, topic, members, max_switches, max_duplicates, extra=""):
+    if any(events is None for events in members.values()):
+        return "FAIL", f"a member wrote no events: {sorted(m for m, e in members.items() if e is None)}"
+    ends = {k: v for k, v in consume_offsets(broker).items() if k[0] == topic}
+    if not ends:
+        return "FAIL", f"no end offsets read for {topic}"
+    missing, duplicates, switches, per_member = ownership(members, topic, ends)
+    seqs = seqs_read(members)
+    detail = (f"reads per member {per_member}, {duplicates} offset(s) read twice, member changes "
+              f"per partition {dict(sorted(switches.items()))}, {len(seqs)} of {GROUP_RECORDS} "
+              f"records{extra}")
+    if missing or seqs != set(range(GROUP_RECORDS)):
+        return "FAIL", f"{missing} offset(s) below the end offsets read by no member; {detail}"
+    if any(n > max_switches for n in switches.values()):
+        return "FAIL", (f"a partition changed member more than {max_switches} time(s), so two "
+                        f"members read it in one generation; {detail}")
+    if duplicates > max_duplicates:
+        return "FAIL", f"over {max_duplicates} offset(s) read twice; {detail}"
+    if len([m for m, n in per_member.items() if n]) != len(members):
+        return "FAIL", f"a member read nothing; {detail}"
+    return "PASS", detail
+
+
+def leg_consume_group_join(broker):
+    members = {m: consumed(f"consume-group-join-{m}-{broker}") for m in ("a", "b")}
+    # Every rebalance commits the revoked partitions' positions before the rejoin, so the member
+    # that joins later reads on from there: no offset is read twice.
+    return judge_group(broker, "group-join", members, 1, 0)
+
+
+def leg_consume_group_kill(broker):
+    members = {m: consumed(f"consume-group-kill-{m}-{broker}") for m in ("a", "b")}
+    # `b` dies between commits, so `a` reads again what `b` read after its last commit: up to one
+    # commit interval of records, plus one second of slack for the fetch in flight. A line `b`
+    # read but hadn't written out at the kill is missing unless `a` reads it again, so a record
+    # `b` committed before writing it fails the leg.
+    bound = GROUP_RATE * (COMMIT_INTERVAL + 1)
+    # A partition can move twice: to `b` when it joins beside `a`, and back once `b` is gone.
+    status, detail = judge_group(broker, "group-kill", members, 2, bound)
+    events = telemetry("in-group-kill-a", broker)
+    lost = telemetry_sum(events, "logit.input.rebalances", component="member")
+    return status, f"{detail}; member a's rebalances {lost}"
+
+
+def group_strategy(broker):
+    path = OUT / "readback" / broker / "group-mixed.describe"
+    text = path.read_text(errors="replace") if path.exists() else ""
+    # `--state` prints GROUP, COORDINATOR (ID), ASSIGNMENT-STRATEGY, STATE, and #MEMBERS; the
+    # coordinator column holds a space, so the state is found by name.
+    states = ("Stable", "PreparingRebalance", "CompletingRebalance", "Empty", "Dead")
+    for line in text.splitlines():
+        fields = line.split()
+        if fields and fields[0] == "consume-group-mixed":
+            for i, field in enumerate(fields[2:], 2):
+                if field in states and i + 1 < len(fields):
+                    return fields[i - 1], field, fields[i + 1], text
+    return None, None, None, text
+
+
+def console_reads(broker):
+    """The console consumer's records of `group-mixed` as events with carriers."""
+    path = OUT / "readback" / broker / "group-mixed-console.tsv"
+    if not path.exists():
+        return None
+    events = []
+    for record in read_java(broker, "group-mixed", path):
+        event = json.loads(record.value)
+        event.setdefault("attributes", {}).update({
+            KAFKA_CARRIER + "topic": "group-mixed", KAFKA_CARRIER + "partition": record.partition,
+            KAFKA_CARRIER + "offset": record.offset})
+        events.append(event)
+    return events
+
+
+def leg_consume_group_mixed(broker):
+    strategy, state, size, text = group_strategy(broker)
+    if strategy != "range" or size != "2":
+        return "FAIL", (f"the group's assignment strategy is {strategy!r} with {size} members "
+                        f"(state {state!r}), want range with 2: {text.strip()[-300:]!r}")
+    members = {"kafka_in": consumed(f"consume-group-mixed-{broker}"),
+               "console": console_reads(broker)}
+    # Partitions move to the console consumer when it joins and back when it leaves.
+    bound = GROUP_RATE * (COMMIT_INTERVAL + 1)
+    return judge_group(broker, "group-mixed", members, 2, bound,
+                       extra=f"; the group's strategy {strategy} while both were members")
+
+
+def leg_consume_restart(broker):
+    events = consumed(f"consume-restart-{broker}")
+    if events is None:
+        return "FAIL", "the leg wrote no events"
+    ends = {k: v for k, v in consume_offsets(broker, "restart").items() if k[0] == "restart"}
+    after = {k: v for k, v in consume_offsets(broker, "restart-after").items()
+              if k[0] == "restart"}
+    committed = restart_committed(broker)
+    tele = telemetry("in-restart", broker)
+    deferred = telemetry_sum(tele, "logit.input.batches.deferred", component="member")
+    resets = telemetry_sum(tele, "logit.input.offsets.reset", component="member",
+                           reason="no_commit")
+    rebalances = {reason: telemetry_sum(tele, "logit.input.rebalances", component="member",
+                                        reason=reason)
+                  for reason in ("start", "rebalance", "membership_lost", "metadata")}
+    rebalances = {k: v for k, v in rebalances.items() if v}
+    commits = {cls: telemetry_sum(tele, "logit.input.commits", component="member",
+                                  **{"class": cls}) for cls in ("ok", "error", "fenced")}
+    errors = telemetry_sum(tele, "logit.input.broker.errors", component="member")
+    missing, duplicates, _switches, _ = ownership({"member": events}, "restart", ends)
+    seqs = seqs_read({"member": events})
+    detail = (f"{len(events)} events for {len(seqs)} of {RESTART_RECORDS} records, {duplicates} "
+              f"offset(s) read twice, offsets.reset{{reason=no_commit}} {resets}, rebalances "
+              f"{rebalances}, commits {commits}, broker.errors {errors}, batches.deferred {deferred}, "
+              f"end offsets after the first restart {dict(sorted((p, o) for (_, p), o in after.items()))}, "
+              f"committed before the stop {dict(sorted(committed.items()))}")
+    if not ends:
+        return "FAIL", "no end offsets read for restart"
+    if missing or seqs != set(range(RESTART_RECORDS)):
+        return "FAIL", f"{missing} offset(s) below the end offsets never read; {detail}"
+    if resets != RESTART_PARTITIONS:
+        return "FAIL", (f"want start: used once per partition ({RESTART_PARTITIONS}), so the "
+                        f"second life resumed from the commits; {detail}")
+    if rebalances.get("start") != 2 or set(rebalances) != {"start"}:
+        return "FAIL", (f"want two joins counted `start`, one per process life, and no other "
+                        f"join; {detail}")
+    if not errors:
+        return "FAIL", f"no broker error counted, so the restart never reached the member; {detail}"
+    # The first life read past the restart: before the script stopped it, the group had committed
+    # past the end offsets the topic had once both brokers were healthy again, on every partition,
+    # which only a fetch made after the restart can do.
+    if len(after) != RESTART_PARTITIONS:
+        return "FAIL", f"no end offsets read after the first restart; {detail}"
+    behind = sorted(p for (_, p), end in after.items() if committed.get(p, -1) <= end)
+    if behind:
+        return "FAIL", (f"the first life committed nothing past the restart on partition(s) "
+                        f"{behind}; {detail}")
+    # With no rejoin and no deferred batch, the second life resumes from the first life's final
+    # commit, made on its way out, so nothing is read twice.
+    bound = RESTART_RATE * (COMMIT_INTERVAL + 1) if deferred else 0
+    if duplicates > bound:
+        return "FAIL", f"over {bound} offset(s) read twice; {detail}"
+    return "PASS", detail
+
+
+def restart_committed(broker):
+    """`{partition: committed offset}` from the `consume-restart` group's describe, taken before
+    the script stopped the first life."""
+    path = OUT / "readback" / broker / "restart-committed.txt"
+    committed = {}
+    if path.exists():
+        for line in path.read_text(errors="replace").splitlines():
+            cols = line.split()
+            if (len(cols) >= 4 and cols[:2] == ["consume-restart", "restart"]
+                    and cols[2].isdigit() and cols[3].isdigit()):
+                committed[int(cols[2])] = int(cols[3])
+    return committed
+
+
+def leg_consume_auth(broker, component, topic, events_wanted=SASL_EVENTS):
+    events = consumed(f"consume-auth-{broker}")
+    if events is None:
+        return "FAIL", "the leg wrote no events"
+    read = [e for e in events if carrier(e, "topic") == topic]
+    seqs = [int(e["attributes"]["seq"]) for e in read]
+    if sorted(seqs) != list(range(events_wanted)):
+        return "FAIL", (f"read {len(seqs)} events for {len(set(seqs))} of {events_wanted} "
+                        f"records of {topic}")
+    tele = telemetry("in-auth", broker)
+    errors = telemetry_sum(tele, "logit.input.broker.errors", component=component)
+    return "PASS", f"{len(read)} events, each record once; broker.errors {errors}"
+
+
+def leg_consume_oauth(broker):
+    gap = redpanda_oidc_gap(broker)
+    if gap:
+        return gap
+    events = consumed(f"consume-oauth-{broker}")
+    if events is None:
+        return "FAIL", "the leg wrote no events"
+    seqs = [int(e["attributes"]["seq"]) for e in events if carrier(e, "topic") == "oauth-cc"]
+    tokens = token_requests(f"{broker}-consume-oauth-cc")
+    detail = f"{len(seqs)} events for {len(set(seqs))} of {OAUTH_CC_EVENTS} records; tokens fetched {tokens}"
+    if sorted(seqs) != list(range(OAUTH_CC_EVENTS)):
+        return "FAIL", detail
+    if tokens < 2:
+        return "FAIL", f"want at least 2 tokens fetched, so a redial took a new one; {detail}"
+    return "PASS", detail
+
+
+def leg_consume_read_committed(broker):
+    committed = consumed(f"consume-txn-committed-{broker}")
+    uncommitted = consumed(f"consume-txn-uncommitted-{broker}")
+    if committed is None or uncommitted is None:
+        return "FAIL", "a member wrote no events"
+    want = {f"{'committed' if t % 2 == 0 else 'aborted'} {t} {r}"
+            for t in range(10) for r in range(10)}
+    want_committed = {m for m in want if m.startswith("committed")}
+    read_c = [e.get("log", {}).get("message") for e in committed]
+    read_u = [e.get("log", {}).get("message") for e in uncommitted]
+    tele = telemetry("in-txn", broker)
+    aborted = telemetry_sum(tele, "logit.input.records.skipped", component="committed",
+                            reason="aborted")
+    detail = (f"read_committed read {len(read_c)}, read_uncommitted {len(read_u)}; "
+              f"records.skipped{{reason=aborted}} {aborted}")
+    if sorted(read_c) != sorted(want_committed):
+        return "FAIL", f"read_committed didn't read the 50 committed records once each; {detail}"
+    if sorted(read_u) != sorted(want):
+        return "FAIL", f"read_uncommitted didn't read all {TXN_RECORDS} records once each; {detail}"
+    if aborted != TXN_RECORDS // 2:
+        return "FAIL", f"want the 50 aborted records counted skipped; {detail}"
+    return "PASS", detail
+
+
+LEGS += [
+    ("consume-console", "kafka-console-producer.sh keys and headers read as format: text",
+     leg_consume_console),
+]
+LEGS += [(f"consume-relay-{f}-{c}", f"kafka_out to kafka_in, format: {f}, compression: {c}",
+          lambda b, f=f, c=c: leg_consume_relay(b, f, c))
+         for f in RELAY_FORMATS for c in CODECS]
+LEGS += [
+    ("consume-collector-proto", "the Collector's kafkaexporter otlp_proto read by kafka_in",
+     lambda b: leg_consume_collector(b, "proto")),
+    ("consume-collector-json", "the Collector's kafkaexporter otlp_json read by kafka_in",
+     lambda b: leg_consume_collector(b, "json")),
+    ("consume-group-join", "a second member joins: every record read, no partition shared",
+     leg_consume_group_join),
+    ("consume-group-kill", "a member killed: the other reads on from its last commit",
+     leg_consume_group_kill),
+    ("consume-group-mixed", "kafka_in and kafka-console-consumer.sh in one group pick range",
+     leg_consume_group_mixed),
+    ("consume-broker-restart", "broker restarts: the member reads through one and resumes from "
+     "its commit after another",
+     leg_consume_restart),
+    ("consume-tls", "kafka_in over server TLS", lambda b: leg_consume_auth(b, "tls", "tls", TLS_EVENTS)),
+    ("consume-mtls", "kafka_in over mutual TLS", lambda b: leg_consume_auth(b, "mtls", "mtls", TLS_EVENTS)),
+    ("consume-sasl-plain", "kafka_in with SASL PLAIN over SASL_SSL",
+     lambda b: leg_consume_auth(b, "sasl_plain", "sasl-plain")),
+    ("consume-sasl-scram512", "kafka_in with SASL SCRAM-SHA-512 over SASL_SSL",
+     lambda b: leg_consume_auth(b, "sasl_scram512", "sasl-scram512")),
+    ("consume-oauth-cc", "kafka_in with OAUTHBEARER client credentials, past a token's expiry",
+     leg_consume_oauth),
+    ("consume-read-committed", "read_committed skips aborted transactions, read_uncommitted doesn't",
+     leg_consume_read_committed),
+]
+
+# The member the group-kill leg kills with SIGKILL, which exits 137.
+KILLED = {"logit-in-group-kill-b-kafka", "logit-in-group-kill-b-redpanda"}
+
 # ---- main --------------------------------------------------------------------------------------
 
 
@@ -963,7 +1568,8 @@ def main():
                 result, detail = "FAIL", f"{type(err).__name__}: {err}"
             results.append({"leg": name, "broker": broker, "title": title, "result": result,
                             "detail": detail})
-    bad_exits = {leg: code for leg, code in codes.items() if code != "0"}
+    bad_exits = {leg: code for leg, code in codes.items()
+                 if code != ("137" if leg in KILLED else "0")}
     if bad_exits:
         results.append({"leg": "exits", "broker": "-", "title": "every leg's process exited 0",
                         "result": "FAIL", "detail": str(bad_exits)})

@@ -1,0 +1,7 @@
+# kafka_out's records under format: json, record: batch, compression: gzip: the events of
+# cases/otlp/sums.json, gauges.json, histograms.json, exponential-histograms.json, and
+# summary.json, cases/otlp-logs/bodies.json and fields.json, cases/otlp-traces/fields.json, and
+# cases/statsd-logs/event.json and payload-less.json, as NDJSON lines packed into records, in one record batch.
+wire: json-batch.segment
+kafka: {format: json}
+exercises: [format_json_batch, carriers, compression_gzip]

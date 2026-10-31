@@ -1,6 +1,6 @@
 ---
 created: 2026-09-29
-updated: 2026-10-29
+updated: 2026-10-30
 ---
 
 # Delivery semantics: at-least-once per hop, duplicates absorbed by the data model, and an effectively-once native hop
@@ -10,7 +10,8 @@ Accepted. Superseded in part on 2026-10-01 by [ADR `native-hop-send-window`](nat
 item 7's last line, "`window` stays 1". Amended on 2026-10-04: the W3 amendment's open per-edge
 `on_full` policy is closed as not planned. Amended on 2026-10-05 by [ADR `native-hop-ack-status`](native-hop-ack-status.md): item 3's native-hop
 exception gains a second case, a frame `logit_in` refuses by name, and the pair leads the hop
-payload rather than riding in the trailer.
+payload rather than riding in the trailer. Amended on 2026-10-30: `kafka_in`'s commit past a
+dropped record is a third exception to item 3.
 
 ## Context
 
@@ -97,12 +98,13 @@ ahead of the sink.
 
 [Narrowed for the native hop by "Amendment: W4 decisions (2026-10-01)": `logit_in` also
 acknowledges a frame at or below its sender's high-water mark, with no forward. See also
-"Amendment: a rejected `Ack` (2026-10-05)".]
+"Amendment: a rejected `Ack` (2026-10-05)" and "Amendment: `kafka_in` commits past a dropped
+record (2026-10-30)".]
 
 An acknowledgment from a `logit` input means the batch is in every open downstream inbox of
 that process, and in at least one. It says nothing about a sink. This is `logit_in`'s `Ack`, an
-HTTP listener's success status, `splunk_hec_in`'s `/ack` answer of `true`, and the offset
-`tail_in` and `docker_in` checkpoint.
+HTTP listener's success status, `splunk_hec_in`'s `/ack` answer of `true`, the offset
+`tail_in` and `docker_in` checkpoint, and the offset `kafka_in` commits.
 
 A closed consumer is outside the promise: `Fanout` skips it and counts `closed_consumer`, and
 the batch is still acknowledged if another consumer took it. An input doesn't acknowledge a
@@ -628,3 +630,15 @@ where item 5 says its series route skips one. A delta `Summary`, which only that
 adds `.count` and `.sum` series `count` points, which overwrite at their `(series, timestamp)`
 as every other `count` point does.
 
+## Amendment: `kafka_in` commits past a dropped record (2026-10-30)
+
+`kafka_in`'s acknowledgment is the offset it commits ([ADR `kafka-input`](kafka-input.md)), and
+it commits a partition's offset only once every record before it is in a batch every open
+downstream inbox accepted. A record it drops is the third exception to item 3, beside
+`logit_in`'s two: it commits past a record whose value doesn't decode in `format:`
+(`logit.input.records.dropped{reason="undecodable"}`), and past the records the consumer client
+drops (`corrupt`, `oversize`, `legacy_format`, `retention`), with no forward. Kafka has no
+negative acknowledgment, and leaving the offset behind such a record would hold the partition
+forever, re-reading a record that fails the same way each time. The drop is counted, so the loss
+is visible as item 2's permitted loss is. A batch no consumer took is not an exception: as item
+3 says, `kafka_in` doesn't commit it, and stops.

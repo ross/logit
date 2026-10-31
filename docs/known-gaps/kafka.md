@@ -133,3 +133,67 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Consequence:** more connections and producer ids per sink than the Java client or the
     Collector's exporter uses for the same topics.
   - **Revisit trigger:** a multi-topic producer, which per-event topics need too.
+- **`kafka_in` speaks the classic group protocol only, with eager rebalancing.** It has no
+  KIP-848 (`group.protocol=consumer`) and no cooperative-sticky assignor ([ADR `kafka-input`](../adr/kafka-input.md), items 2 and 4).
+  - **Consequence:** every rebalance revokes every partition of every member, and the group stops
+    until all of them rejoin, for up to `drain_timeout` plus the join. A Java member configured
+    with `cooperative-sticky` alone can't share a group with `kafka_in`.
+  - **Workaround:** keep `drain_timeout` short, and give `logit` a group of its own.
+  - **Revisit trigger:** KIP-848, opt-in for Kafka 4.0 and later; Redpanda 26.2 doesn't serve it.
+- **`kafka_in` has no static membership.** It sends no `group.instance.id` ([ADR `kafka-input`](../adr/kafka-input.md), Consequences).
+  - **Consequence:** a restart rebalances the group twice, once as the member leaves and once as
+    it joins, so a rolling restart of `n` members rebalances `2n` times.
+  - **Revisit trigger:** rolling restarts whose rebalances cost an operator enough to matter.
+- **`kafka_in` sends full fetches only.** Every Fetch is a full request that opens no KIP-227
+  fetch session ([ADR `kafka-input`](../adr/kafka-input.md), item 7). The cost hasn't been measured with many partitions.
+  - **Consequence:** each Fetch names every partition the member reads from that broker, so a
+    member owning hundreds of partitions sends a larger request than the Java client would.
+  - **Revisit trigger:** a measurement showing full fetches cost enough to matter.
+- **`kafka_in` fetches from leaders only.** It has no rack-aware fetch from followers (KIP-392)
+  ([ADR `kafka-input`](../adr/kafka-input.md), Consequences).
+  - **Consequence:** in a cluster spread across zones, fetches cross zones when the leader is
+    elsewhere, which some clouds bill.
+  - **Revisit trigger:** a deployment where cross-zone fetch traffic costs enough to matter.
+- **`kafka_in` subscribes to named topics only.** `topics:` lists names; there's no
+  regular-expression subscription ([ADR `kafka-input`](../adr/kafka-input.md), Consequences).
+  - **Consequence:** a topic created after startup isn't read until the config names it.
+  - **Workaround:** list every topic, and restart to add one.
+  - **Revisit trigger:** an operator whose topics come and go by a naming pattern.
+- **A record relayed through `kafka_in` and `kafka_out` loses its key and headers.** `kafka_in`
+  keeps them as the `_logit.kafka.key` and `_logit.kafka.headers` carriers, and `kafka_out` leaves
+  every `_logit.kafka.*` carrier out and writes neither back ([ADR `kafka-input`](../adr/kafka-input.md), item 11). The transit spec reads it as `attributes/kafka_key_headers`, `lost` and uncounted at `kafka_out`.
+  - **Consequence:** the relayed record goes to the partition `kafka_out`'s own `key:` picks, with
+    its own `headers:`, so a consumer that partitions or routes on the source key or a header
+    sees neither.
+  - **Workaround:** a `set` or `lua` stage copies `_logit.kafka.key` to a public attribute that
+    `key: {attribute: ..}` names.
+  - **Revisit trigger:** `kafka_out` restoring both from the carriers.
+- **`kafka_in` can't skip a record batch larger than its Fetch cap.** The consumer reads a Fetch
+  answer of at most `fetch.max_bytes` plus `max_batch_bytes` plus 1 MiB. An answer over that is
+  refused before any of it is read, so no batch header in it is seen and there is no offset to
+  skip to; the next fetch from the same offset draws the same answer
+  ([ADR `kafka-input`](../adr/kafka-input.md), item 9). Any batch whose stored bytes pass the
+  cap does this, compressed or not. Each broker's fetch loop asks for all its ready partitions
+  in one request, so the refusal holds every partition that broker leads for this consumer, not
+  only the one holding the batch.
+  - **Consequence:** those partitions hold at their offsets, counting
+    `logit.input.broker.errors{api="fetch", error="response_too_large"}` with a throttled
+    `response_too_large` diagnostic on every fetch, and none of their later records are read.
+  - **Workaround:** raise `max_batch_bytes` above the batch's size.
+  - **Revisit trigger:** a reader that skips a frame by its batch header alone, without holding
+    the whole answer. Fetching that broker's partitions one per request after a refusal, so
+    only the partition holding the batch stays held, is the open remedy short of that.
+- **`kafka_in` skips a corrupt batch to the high watermark when nothing verified follows it.**
+  A batch that fails its CRC twice, or doesn't decompress or parse, gives no trustworthy length
+  or last offset. The skip lands on an offset above the corrupt batch's base and at or below the
+  high watermark: the next batch in the answer whose CRC passes, else the base offset in the
+  first 12 bytes of a batch the answer cut short. When neither falls in that range even after a
+  refetch with `max_batch_bytes` of room for that partition, the skip lands on the high
+  watermark, or the last stable offset under `read_committed`
+  ([ADR `kafka-input`](../adr/kafka-input.md), item 9).
+  - **Consequence:** every record between the corrupt batch and the high watermark is counted
+    `logit.input.records.dropped{reason="corrupt"}` and not read, good batches included, when no
+    batch after the corrupt one starts within `max_batch_bytes` of it.
+  - **Workaround:** none in `logit`; a log with corrupt batches needs repair at the broker.
+  - **Revisit trigger:** a reader that can probe offsets past a corrupt batch, such as one
+    ListOffsets or fetch per candidate offset, or a report of this loss in practice.

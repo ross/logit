@@ -8,6 +8,9 @@ description = "Per-protocol listeners implementing logit-pipeline's Input trait.
 
 [dependencies]
 logit-core.workspace = true
+# kafka_in's broker connection, SASL, and error codes, shared with kafka_out
+# (docs/adr/kafka-input.md, item 1).
+logit-kafka.workspace = true
 logit-pipeline.workspace = true
 logit-proto.workspace = true
 anyhow.workspace = true
@@ -78,6 +81,13 @@ logit-transforms.workspace = true
 # `internal.rs`'s tests drive `logit_core::TelemetryLayer` through a real `tracing` event, which
 # needs a subscriber; the library never installs one.
 tracing-subscriber.workspace = true
+# kafka_in's tests run the real input against the in-process fake broker.
+logit-kafka = { workspace = true, features = ["test-util"] }
+# kafka_in's tests hand-build a record batch with repeated and non-UTF-8 header names, which
+# `logit_proto::kafka::batch::encode` can't write, and seal it with its CRC.
+crc32c.workspace = true
+# The fake broker takes `kafka-protocol`'s `Compression` and `ApiKey`.
+kafka-protocol.workspace = true
 # `test-util` (`tokio::time::pause`/`start_paused`) for `internal.rs`'s shutdown-drain tests,
 # which advance a 60s drain interval by hand. Declared here, not inherited from a sibling, because
 # `cargo test -p logit-inputs` builds this package's feature set alone.

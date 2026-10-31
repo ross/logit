@@ -13,7 +13,7 @@
 //! | `samples`, `set_members`, `distribution`, `set` | none | record |
 //! | `record` | `no_recorded_value`, `no_recorded_value_delta_sum`, `no_recorded_value_other_kind`, `service_check`, `name_unsafe`, `exemplar_key_unsafe`, `exemplar_key_unsafe_histogram`, `sample_rate`, `non_finite`, `superseded`, `same_instant`, `same_instant_equal`, `same_millisecond`, `same_millisecond_equal` | record |
 //! | `record` | `unit`, `description`, `start_timestamp`, `exemplars`, `exemplars_on_summary`, `unit_on_distribution`, `min_max`, `sample_rate_unweighted` | field |
-//! | `attributes` | `string_value`, `bool_value`, `number_value`, `array_value`, `map_value`, `bytes_value`, `timestamp_value`, `null_value`, `private_carrier`, `prometheus_target` (`_logit.prometheus.target`, at every sink), `foreign_carrier`, `timestamped` (`_logit.metrics.closed: "timestamped"`, at every sink), `rate` and `rate_on_non_gauge` (`_logit.metrics.type: "rate"` on a gauge and on any other metric kind, at every sink), `family_type` and `family_type_on_other_kind` (`_logit.metrics.type: "info"` or `"stateset"` on a gauge and `"gaugehistogram"` on a histogram, and any of the three on another metric kind, at every sink), `interval`, `interval_on_distribution`, and `interval_on_histogram` (`_logit.metrics.interval` on a metric record, on a `samples`, `distribution`, or delta `exponential_histogram`, and on a delta `histogram`, at every sink), `datadog_carrier_log`, `severity_carrier_otel` (`_logit.otel.severity_number` and `_logit.otel.severity_text`, ahead of the private and foreign carrier rows), `severity_carrier_syslog` (`_logit.syslog.severity`, beside it), `span_numeric` (a span's `I64`, `U64`, or `F64` event attribute), `datadog_span_identity` (a span's `service.name`, `resource.name`, or `span.type` event attribute), `datadog_span_marks` (a span's `_top_level`, `_sampling_priority_v1`, `_dd.*`, or `span.kind` event attribute), `datadog_carrier_span` (a span's `_logit.datadog.chunk.*` or `_logit.datadog.span.error`), `datadog_tracer_resource` (a span's `_logit.datadog.tracer.*` resource attribute a payload field carries), `datadog_tracer_headers` (one only a tracer request header carries), `datadog_agent_resource` (a span's `_logit.datadog.agent.*` resource attribute), each ahead of the carrier and value rows, `syslog_header`, `syslog_msgid`, `syslog_sd`, `syslog_timestamp`, `host_name` (a log's event attribute `syslog_out` writes as a header field, by key), `splunk_envelope` (`com.splunk.source`, `.sourcetype`, or `.index` on the resource, the HEC envelope), `sd_id_collision`, `sd_name_unsafe`, and `sd_empty_array` (a log's attribute `syslog_out`'s `structured_data:` leaves out of its SD-ELEMENT), `resource_attribute`, `scope` | field |
+//! | `attributes` | `string_value`, `bool_value`, `number_value`, `array_value`, `map_value`, `bytes_value`, `timestamp_value`, `null_value`, `private_carrier`, `kafka_key_headers` (`_logit.kafka.key` and `_logit.kafka.headers`, in place of `private_carrier` at `kafka_out`), `prometheus_target` (`_logit.prometheus.target`, at every sink), `foreign_carrier`, `timestamped` (`_logit.metrics.closed: "timestamped"`, at every sink), `rate` and `rate_on_non_gauge` (`_logit.metrics.type: "rate"` on a gauge and on any other metric kind, at every sink), `family_type` and `family_type_on_other_kind` (`_logit.metrics.type: "info"` or `"stateset"` on a gauge and `"gaugehistogram"` on a histogram, and any of the three on another metric kind, at every sink), `interval`, `interval_on_distribution`, and `interval_on_histogram` (`_logit.metrics.interval` on a metric record, on a `samples`, `distribution`, or delta `exponential_histogram`, and on a delta `histogram`, at every sink), `datadog_carrier_log`, `severity_carrier_otel` (`_logit.otel.severity_number` and `_logit.otel.severity_text`, ahead of the private and foreign carrier rows), `severity_carrier_syslog` (`_logit.syslog.severity`, beside it), `span_numeric` (a span's `I64`, `U64`, or `F64` event attribute), `datadog_span_identity` (a span's `service.name`, `resource.name`, or `span.type` event attribute), `datadog_span_marks` (a span's `_top_level`, `_sampling_priority_v1`, `_dd.*`, or `span.kind` event attribute), `datadog_carrier_span` (a span's `_logit.datadog.chunk.*` or `_logit.datadog.span.error`), `datadog_tracer_resource` (a span's `_logit.datadog.tracer.*` resource attribute a payload field carries), `datadog_tracer_headers` (one only a tracer request header carries), `datadog_agent_resource` (a span's `_logit.datadog.agent.*` resource attribute), each ahead of the carrier and value rows, `syslog_header`, `syslog_msgid`, `syslog_sd`, `syslog_timestamp`, `host_name` (a log's event attribute `syslog_out` writes as a header field, by key), `splunk_envelope` (`com.splunk.source`, `.sourcetype`, or `.index` on the resource, the HEC envelope), `sd_id_collision`, `sd_name_unsafe`, and `sd_empty_array` (a log's attribute `syslog_out`'s `structured_data:` leaves out of its SD-ELEMENT), `resource_attribute`, `scope` | field |
 //! | `attributes` | `no_host`, `default_tag` (`syslog_out`'s RFC 3164 fallback TAG), `log_status`, `log_severity_fields`, `span_kind`, `trace_id_high`, `syslog_facility` (a record `datadog_out`, `syslog_out`, or `splunk_hec_out` writes an attribute for from the record's own fields or the sink's config) | field |
 //! | `log` | `dogstatsd_event`, `plain` (each on an event with no metrics), `message_unsafe` (a message the sink's encoder rewrites), `structured_message` (a `Map` or `Array` message), `bytes_message`, `blank_message` (an empty message, or none) | record |
 //! | `log` | `severity`, `severity_unset`, `body_format`, `event_name`, `observed_timestamp`, `observed_timestamp_unset`, `trace`, `trace_unset`, `trace_flags`, `trace_beside_id_attribute`, `dropped_attributes_count`, `timestamp`, `receipt_timestamp` (a field of any log, beside metrics or not, [`LOG_FIELDS`]) | field |
@@ -100,22 +100,28 @@ use std::path::Path;
 /// `structural`. The first three entries are the rule in ADR `telemetry-loss-vocabulary`'s
 /// amendment "an ignored signal, and a format the config selects": a sink that writes the signals
 /// it carries ignores a signal it has no wire for, uncounted, so `log/beside_metrics`,
-/// `span/beside_log`, and `span/beside_metrics` match at any sink. The next two are a sink
-/// finding: `otlp_out` writes a span or span event name that isn't a `Str` as `""`, uncounted.
-/// The third from last is a `_logit.datadog.*` carrier `datadog_out`'s log, event,
+/// `span/beside_log`, and `span/beside_metrics` match at any sink. The next four are a sink
+/// finding: the OTLP encoder writes a span or span event name that isn't a `Str` as `""`,
+/// uncounted, at `otlp_out` and at `kafka_out` under an OTLP format.
+/// The next is a `_logit.datadog.*` carrier `datadog_out`'s log, event,
 /// service-check, and trace routes have no field for, left off where its metrics routes count
-/// one. The last
+/// one. The next
 /// two follow the first three's rule at `datadog_trace_out`, whose one signal is spans: a log or a
-/// gauge beside a span is ignored, uncounted.
-const UNCOUNTED_ALLOWED: [(&str, Option<&str>, Option<&str>); 8] = [
+/// gauge beside a span is ignored, uncounted. The last is a relayed record's key and headers,
+/// which `kafka_out` writes from its config and never from the `_logit.kafka.*` carriers: the
+/// pair's residual debt (`docs/known-gaps/kafka.md`), not a loss of any one record.
+const UNCOUNTED_ALLOWED: [(&str, Option<&str>, Option<&str>); 11] = [
     ("log", Some("beside_metrics"), None),
     ("span", Some("beside_log"), None),
     ("span", Some("beside_metrics"), None),
     ("span", Some("name_structured"), Some("otlp_out")),
     ("span", Some("event_name_structured"), Some("otlp_out")),
+    ("span", Some("name_structured"), Some("kafka_out")),
+    ("span", Some("event_name_structured"), Some("kafka_out")),
     ("attributes", Some("datadog_carrier_log"), Some("datadog_out")),
     ("log", None, Some("datadog_trace_out")),
     ("gauge", None, Some("datadog_trace_out")),
+    ("attributes", Some("kafka_key_headers"), Some("kafka_out")),
 ];
 
 /// Whether the cell of `sink` in row `kind`/`feature` may be `uncounted` ([`UNCOUNTED_ALLOWED`]).
@@ -200,6 +206,7 @@ const KINDS: [(&str, &[&str]); 15] = [
             "timestamp_value",
             "null_value",
             "private_carrier",
+            "kafka_key_headers",
             "prometheus_target",
             "foreign_carrier",
             "timestamped",

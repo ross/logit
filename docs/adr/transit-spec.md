@@ -1,6 +1,6 @@
 ---
 created: 2026-10-19
-updated: 2026-10-28
+updated: 2026-10-30
 ---
 
 # Transit spec: a mapping table under `spec/transit/` is the canonical statement of every cross-protocol transition, checked by flows and rendered into the docs
@@ -265,9 +265,11 @@ have one case. The `tlog` stream fills that in, and settles these:
    record's own fields, and the field rows take the union: `syslog_out`'s, `splunk_hec_out`'s,
    and `datadog_out`'s. `no_host` reaches every sink that fills a host.
 7. **Three log columns join `otlp_out` and `datadog_out`**: `syslog_out`, `splunk_hec_out`, and
-   `kafka_out` under `format: json` and `format: text`. With no `kafka_in`, the driver reads
-   `kafka_out` back through `EventJsonDecoder`, or as one `Raw` log per record under
-   `format: text`.
+   `kafka_out` under `format: json` and `format: text`. The driver read `kafka_out` back through
+   `EventJsonDecoder`, or as one `Raw` log per record under `format: text`, until `kafka_in`
+   became a source; it now reads every format back through `kafka_in`'s decoding
+   ([ADR `lossless-transit`](lossless-transit.md)'s "Amendment: an eleventh like pair
+   (2026-10-30)").
 8. **`syslog_out`'s drop of unopted attributes** is `lost, structural` under RFC 3164, where the
    wire has no slot, and `lost, uncounted` under RFC 5424 without `structured_data:`, where the
    slot exists and the loss is real. The missing counter is a sink finding.

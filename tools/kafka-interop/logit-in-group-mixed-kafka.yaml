@@ -1,0 +1,49 @@
+# The group-mixed leg of `script/kafka-interop` against Apache Kafka 4.2.0: a `kafka_in` member and
+# a `kafka-console-consumer.sh` share the group `consume-group-mixed` on the 6-partition
+# `group-mixed` topic. This member starts with the legs and also writes 400 records keyed by `seq`,
+# 10 a second; the script runs the console consumer from 5 s to 45 s in and reads the group's
+# assignment strategy with `kafka-consumer-groups.sh` while both are members. The Java consumer
+# offers `range` and `cooperative-sticky`, and `kafka_in` offers `range`, so the group picks
+# `range`.
+admin: { bind: 127.0.0.1:9600 }
+
+components:
+  load:
+    type: generate_in
+    count: 400
+    rate: 10
+    batch: 5
+    event:
+      log: "group-mixed {seq}"
+      attributes: { seq: "{seq}" }
+
+  produce:
+    type: kafka_out
+    sources: [load]
+    brokers: ["kafka:9092"]
+    topic: group-mixed
+    key: { attribute: seq }
+
+  member:
+    type: kafka_in
+    brokers: ["kafka:9092"]
+    topics: [group-mixed]
+    group: consume-group-mixed
+    format: json
+    start: earliest
+    session_timeout: 10s
+    heartbeat_interval: 1s
+    rebalance_timeout: 20s
+
+  read:
+    type: stdio_out
+    sources: [member]
+    target: /out/consume-group-mixed-kafka.jsonl
+    format: json
+
+  self: { type: internal, interval: 1s, span_sample_rate: 0.0, logs: off }
+  telemetry:
+    type: stdio_out
+    sources: [self]
+    target: /out/in-group-mixed-kafka-telemetry.log
+    format: json

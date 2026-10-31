@@ -1,0 +1,42 @@
+# The system under test in `script/soak`'s kafka-consume-broker-restart scenario: `kafka_in`
+# consumes the generator's topic as the one member of its group, each record one `soak_records`
+# increment in a 10 s cumulative aggregate, sent as remote-write 1.0 (zstd) to VictoriaMetrics
+# from a disk spool. Its `internal` telemetry goes to stdout as NDJSON for the harness to read;
+# `script/soak` runs it with `--log-format json`.
+admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
+components:
+  consume:
+    type: kafka_in
+    brokers: ["kafka:9092"]
+    topics: [soak-in]
+    group: soak
+    format: json
+    # The group has no commit at its first join, and the generator may have produced by then:
+    # `earliest` reads those records rather than skipping them.
+    start: earliest
+    # Under the scenario's 40 s pause of the broker, so the coordinator expires the member when
+    # the broker resumes, and under the 30 s kill, so the dead member's session has expired
+    # before the restarted one joins.
+    session_timeout: 10s
+    heartbeat_interval: 2s
+    commit_interval: 5s
+  # Drops the `_logit.kafka.*` carriers, offset included, which would otherwise make every
+  # record its own series. No record carries `id`: no labels.
+  labels: { type: keep, sources: [consume], fields: [id] }
+  window:
+    type: aggregate
+    sources: [labels]
+    interval: 10s
+    temporality: cumulative
+    series_retention: 360           # a fault must never evict a series
+  victoria_metrics:
+    type: prometheus_out
+    sources: [window]
+    endpoint: http://victoria-metrics:8428/api/v1/write
+    version: 1
+    compression: zstd
+    # A disk spool keeps the sink's queue through a kill, so the egress band covers only
+    # `aggregate`'s window, as for spool-kill-replay.
+    buffer: { disk: { path: /tmp/soak-spool } }
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }

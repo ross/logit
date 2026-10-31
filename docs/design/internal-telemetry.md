@@ -502,7 +502,7 @@ config asked for never uses the word:
 | `*.skipped` | Nothing was there to carry, the operator chose to leave it out (`multi_value: skip`), or the destination format has no form for the kind. | `reason` or `metric_kind`. |
 | `*.degraded`, `*.truncated`, `*.normalized` | Delivered, but lossy, shortened, or rewritten. `metrics.normalized{reason="duplicate_timestamp"}` counts a state a sink left off beside an equal one it delivered, so nothing is lost. | `reason`, `metric_kind`, or `field`. |
 | `*.evicted`, `*.untracked` | An entry left a bounded bookkeeping table. No data was lost. | `reason` where more than one cause exists. |
-| `logit.input.batches.deferred` | A listener answered busy (`503`). The client keeps the data and retries, so this is back-pressure, not loss. | None. |
+| `logit.input.batches.deferred` | The source keeps the data and offers it again: a listener answered busy (`503`) and the client retries, or `kafka_in` left a batch uncommitted for the partition's next reader. This is back-pressure, not loss. | None. |
 | `logit.input.connections.rejected`, `logit.input.requests.rejected` | A listener refused a connection or request and told the peer, which still holds the data. | `reason`. |
 
 A `reason` value never contains `dropped`, so the word appears only in a loss metric's name. A
@@ -1584,6 +1584,45 @@ those values as *fields*, not as a rendered message.
 `Diagnostics` keys: `bad_line` (a refused JSON line, with its line number), `bad_frame` (a skipped
 frame, with its byte offset), `truncated` (the file ends inside a frame), `bad_compression` (a gzip or zstd stream that could not be finished), and `closed_consumer`.
 
+##### `kafka_in`
+
+`crates/logit-kafka/src/consumer/`, [ADR `kafka-input`](../adr/kafka-input.md). The consumer-group
+client counts these; the outcome table in its module doc says which broker answer counts what. A
+Kafka record is the unit.
+
+| Name | Kind | Meaning |
+|---|---|---|
+| `logit.input.records` / `.record.bytes` | count | data records handed to the input, and their value bytes, plus every record a skip below counts; a buffered record a revoke discards isn't counted |
+| `logit.input.records.dropped{reason="corrupt"\|"oversize"\|"legacy_format"\|"retention"}` | count | a skipped batch's records: a CRC mismatch twice at one batch, or records that don't decompress or parse (`corrupt`), records decompressing past `max_batch_bytes` (`oversize`), a magic 0 or 1 message set, one per offset (`legacy_format`), or the offsets retention deleted below a position before they were read (`retention`) |
+| `logit.input.records.skipped{reason="aborted"}` | count | under `read_committed`, records of an aborted transaction; control records aren't counted |
+| `logit.input.partitions` | gauge | partitions assigned, on every assignment |
+| `logit.input.lag{topic, partition}` | gauge | the high watermark, or under `read_committed` the last stable offset, less the position, from each Fetch answer |
+| `logit.input.rebalances{reason="start"\|"rebalance"\|"membership_lost"\|"metadata"}` | count | each completed join |
+| `logit.input.commits{class="ok"\|"error"\|"fenced"}` | count | each OffsetCommit |
+| `logit.input.offsets.reset{reason="no_commit"\|"out_of_range"}` | count | a partition starting with no committed offset, or moved after `OFFSET_OUT_OF_RANGE` |
+| `logit.input.broker.errors{api, error}` | count | each broker error code, by its snake_case Kafka name, or `transport`, `tls`, `sasl`, or `unsupported_version` for a failed dial or request, `response_too_large` for an answer over its request's cap (Fetch's `fetch.max_bytes` plus `max_batch_bytes` plus 1 MiB, 64 MiB for any other API), or `malformed` for a Metadata answer with a partition index outside its entries |
+| `logit.input.reconnects` | count | a redial of a connection the consumer dialed before |
+
+`Diagnostics` keys, each throttled: `records_dropped` (naming the topic, partition, and offset),
+`topic_missing`, `auth_failed`, `group_refused`, `not_authorized`, `unsupported_version`,
+`response_too_large` (naming `max_batch_bytes`), and `broker_error` for any other code.
+
+The input itself (`crates/logit-inputs/src/kafka/`) counts what it does with the records the
+client hands it; the outcome table in its module doc is the canonical copy. Its `Fanout` counts
+`logit.component.batches.sent` and the rest of layer 2.
+
+| Name | Kind | Meaning |
+|---|---|---|
+| `logit.input.records.dropped{reason="undecodable"}` | count | a record whose value doesn't decode in `format:`, committed past |
+| `logit.input.records.skipped{reason="tombstone"\|"empty"}` | count | a record with a null value, or a `json`, `msgpack`, or `native` value or an OTLP request holding no event, committed past |
+| `logit.input.metrics.skipped{metric_kind, reason}`, `logit.input.metrics.degraded{reason}` | count | under `format: otlp_proto` or `otlp_json`, what the OTLP codec counts, as on `otlp_in`: a metric with no data skipped, a histogram whose count isn't its buckets' sum degraded |
+| `logit.input.headers.omitted{reason="invalid_name"}` | count | a header whose name isn't UTF-8, left out of `_logit.kafka.headers` on a record still delivered |
+| `logit.input.batches.dropped{reason="closed_consumer"}` | count | a batch no consumer directly downstream took; the input commits what came before it, leaves the group, and ends |
+| `logit.input.batches.deferred` | count | a batch not accepted by the drain deadline of a revoke or shutdown, and every batch behind it, or the batches behind a `closed_consumer` drop. Nothing past them is committed, so the next owner of the partition reads them again |
+
+Its own `Diagnostics` keys, throttled: `records_dropped` for an undecodable record, naming the
+topic, partition, and offset, and `closed_consumer`, naming the topic and partition.
+
 #### Transforms
 
 ##### `route`
@@ -2036,7 +2075,7 @@ decision 1). For `statsd_out`, `syslog_out`, `graphite_out`, `collectd_out`, `in
 
 | Class | Counts | Counters |
 |---|---|---|
-| Encode-side | once per batch, however many attempts the runtime makes | `batch.bytes`; `messages.dropped` for a reason the encoder decided; `tags.omitted`, `tags.normalized`, `messages.skipped`, `messages.normalized`, `messages.truncated`, `fields.omitted`, `events.skipped`, `events.dropped`, `structured_data.omitted`; the codec counters of `statsd_out`, `graphite_out`, `collectd_out`, `otlp_out`, `prometheus_out`, `splunk_hec_out`, `datadog_out`, and `datadog_trace_out` (`metrics.dropped`, `metrics.skipped`, `metrics.degraded`, `metrics.normalized`, `attributes.normalized`, `identity.sanitized`, `labels.omitted`, `labels.normalized`, `spans.degraded`, `stats.dropped`, `stats.degraded`); `splunk_hec_out`'s `records.dropped{reason="oversize"}` for an object over `max_body_bytes`; `datadog_out`'s `records.dropped{reason="stale"\|"too_many_tags"\|"needs_agent_processing"\|"not_datadog_origin"}` and its `too_many_tags` diagnostic; both Datadog sinks' `records.dropped{reason="oversize"}` for an event too large to send alone; `influxdb_out`'s `metrics.dropped{reason="no_bucket"}` and its `no_bucket` diagnostic, for a batch it never sends; `kafka_out`'s `records.dropped{reason="oversize"}`, `records.unkeyed`, `events.skipped{reason="no_log"}`, `metrics.omitted{reason="format"}`, `spans.omitted{reason="format"}`, its `oversize` diagnostic, and under `format: otlp_proto` the OTLP codec's `metrics.skipped`, `metrics.dropped`, and `metrics.degraded`; `file.rotations` and `file.reopens`; and every `logit.component.diagnostics` count an encoder emits, `datadog_trace_out`'s `bad_header` included |
+| Encode-side | once per batch, however many attempts the runtime makes | `batch.bytes`; `messages.dropped` for a reason the encoder decided; `tags.omitted`, `tags.normalized`, `messages.skipped`, `messages.normalized`, `messages.truncated`, `fields.omitted`, `events.skipped`, `events.dropped`, `structured_data.omitted`; the codec counters of `statsd_out`, `graphite_out`, `collectd_out`, `otlp_out`, `prometheus_out`, `splunk_hec_out`, `datadog_out`, and `datadog_trace_out` (`metrics.dropped`, `metrics.skipped`, `metrics.degraded`, `metrics.normalized`, `attributes.normalized`, `identity.sanitized`, `labels.omitted`, `labels.normalized`, `spans.degraded`, `stats.dropped`, `stats.degraded`); `splunk_hec_out`'s `records.dropped{reason="oversize"}` for an object over `max_body_bytes`; `datadog_out`'s `records.dropped{reason="stale"\|"too_many_tags"\|"needs_agent_processing"\|"not_datadog_origin"}` and its `too_many_tags` diagnostic; both Datadog sinks' `records.dropped{reason="oversize"}` for an event too large to send alone; `influxdb_out`'s `metrics.dropped{reason="no_bucket"}` and its `no_bucket` diagnostic, for a batch it never sends; `kafka_out`'s `records.dropped{reason="oversize"}`, `records.unkeyed`, `events.skipped{reason="no_log"}`, `metrics.omitted{reason="format"}`, `spans.omitted{reason="format"}`, its `oversize` diagnostic, and under `format: otlp_proto` or `otlp_json` `events.skipped{reason="no_payload"}`, `attributes.normalized{reason="u64_as_double"}`, and the OTLP codec's `metrics.skipped`, `metrics.dropped`, and `metrics.degraded`; `file.rotations` and `file.reopens`; and every `logit.component.diagnostics` count an encoder emits, `datadog_trace_out`'s `bad_header` included |
 | Transport | once per attempt | `requests`, `request.duration`, `request.bytes`, `reconnects`, and what the attempt sent or had accepted: `messages`, `datagrams`, `datapoints`, `samples`, `records` |
 | Kernel or destination verdict, and packer backstop | once per attempt that meets it | `messages.dropped{reason="oversize_datagram"}`, from `EMSGSIZE` or from the packer's skip of an entry over the cap; `splunk_hec_out`'s `records.dropped{reason="invalid_event"}`, its `records.dropped{reason="oversize"}` from Splunk Cloud's oversize answer, `requests.rejected`, and `acks`; `datadog_out`'s `records.dropped{route="series", reason="rejected"}` from a series `202`'s body; `prometheus_out`'s `samples.dropped{reason="not_written"}` from a 2.0 receiver's written count; the Datadog sinks' `records.dropped{reason="oversize"}` for a request answered `413`; `otlp_out`'s `records.dropped{signal, reason="rejected"\|"ambiguous_at_most_once"}`, from a `partial_success` (`rejected` only) or a verdict that names a signal, and the Datadog sinks' `records.dropped{route, reason="rejected"\|"ambiguous_at_most_once"}` for a request answered with a verdict that names it (counted even when the send ends `Ok`); `kafka_out`'s `records.dropped{reason="rejected"\|"invalid_timestamp"\|"invalid_record"\|"ambiguous_at_most_once"}` for a partition batch; and the diagnostics a verdict raises (`remote_write_rejected`, `remote_write_version_unsupported`, `remote_write_samples_not_written`, `remote_write_samples_written_unreadable`, `otlp_partial_success`, `signal_rejected`, `invalid_event`, `token_rejected`, `request_refused`, `request_rejected`, `api_key_rejected`, `series_rejected`, `ack_unsupported`, `ack_timeout`, `oversize` for Splunk Cloud's answer, and `kafka_out`'s `rejected`, `invalid_timestamp`, and `invalid_record`). `otlp_out`, `datadog_out`, `datadog_trace_out`, and `kafka_out` meet each of their verdicts at most once per batch, because a retry never resends a signal, request, or partition batch the destination settled; only `splunk_hec_out` and the datagram sinks meet one again on a retry |
 
@@ -2517,6 +2556,8 @@ spans, or metrics it holds.
 | `logit.output.records.dropped{reason="ambiguous_at_most_once"}` | count | records left unsettled when `at_most_once` drops a batch after an `Ambiguous` attempt, or drops an `Ambiguous` partition batch before retrying a `Refused` one |
 | `logit.output.records.unkeyed` | count | records sent without a key because the configured `key:` had no value on their event, or under `format: otlp_proto` or `otlp_json` on their request's events or resource, once per batch |
 | `logit.output.events.skipped{reason="no_log"}` | count | events `format: text` skipped for having no log record, once per batch |
+| `logit.output.events.skipped{reason="no_payload"}` | count | under `format: otlp_proto` or `otlp_json`, events with no log, span, or metric, which no request holds, once per batch |
+| `logit.output.attributes.normalized{reason="u64_as_double"}` | count | under `format: otlp_proto` or `otlp_json`, attribute values (nested ones included) that are a `U64` above `i64::MAX`, written as a double: on each event with a log, a span, or a metric the OTLP mapping keeps, and on the batch's resource and scope when any record was written; once per value, once per batch, as `otlp_out` counts them |
 | `logit.output.metrics.omitted{reason="format"}`, `logit.output.spans.omitted{reason="format"}` | count | under `format: text`, the metric records and spans left out of a record that carries their event's log body, one per metric record and one per span, once per batch; counted at encode, so a record later dropped (`oversize`, `rejected`, or named by the broker) has still counted them |
 | `logit.output.metrics.skipped{metric_kind}`, `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}`, `logit.output.metrics.degraded{metric_kind}`, `logit.output.metrics.degraded{reason="non_finite_component"}` | count | under `format: otlp_proto` or `otlp_json`, metrics the OTLP codec skips, drops, or degrades, as `otlp_out` counts them, once per batch |
 

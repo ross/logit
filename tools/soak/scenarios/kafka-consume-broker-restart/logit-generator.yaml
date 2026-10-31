@@ -1,0 +1,25 @@
+# The load source in `script/soak`'s kafka-consume-broker-restart scenario: 1,000 counter
+# increments a second, each one JSON record that `kafka_out` produces to the stack's broker, which
+# the system under test consumes. Its `internal` telemetry goes to stdout as NDJSON, so the
+# harness reads the records the broker accepted.
+admin: { bind: 127.0.0.1:9600 }
+components:
+  load:
+    type: generate_in               # unbounded
+    rate: 1000
+    batch: 100
+    event:
+      metric: { name: soak_records, kind: sum, value: 1 }
+  produce:
+    type: kafka_out
+    sources: [load]
+    brokers: ["kafka:9092"]
+    topic: soak-in                  # the SUT's `kafka_in` topic, created by the override
+    format: json
+    record: event                   # one event per record: the ledger's unit
+    # Idempotent and `acks: all` by default. A 10 s bound, under the scenario's 40 s pause of
+    # the broker, turns the pause into `Ambiguous` attempts the broker deduplicates when they
+    # are resent, so the topic holds each record once.
+    timeout: 10s
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }

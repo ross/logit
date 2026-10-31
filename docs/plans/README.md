@@ -12,6 +12,7 @@ branches and PRs are its record. See [Branches and PR titles](../../AGENTS.md#br
 |---|---|---|
 | [Enabling plan: an S3 object-archive sink — one object per window, delivered at completion](s3-object-archive.md) | 2026-10-30 | 2026-10-30 |
 | [Enabling plan: `cri_in` — Kubernetes container logs from `/var/log/pods`](cri-container-logs.md) | 2026-10-29 | 2026-10-30 |
+| [Enabling plan: `kafka_in` — a consumer-group client and the eleventh lossless pair](kafka-input.md) | 2026-10-29 | 2026-10-29 |
 | [Enabling plan: per-sink request concurrency — several batches in flight, each settled on its own](sink-request-concurrency.md) | 2026-10-25 | 2026-10-25 |
 | [Enabling plan: the remaining common keys — service, deployment, container, and process identity](common-keys.md) | 2026-10-24 | 2026-10-24 |
 | [Enabling plan: protocol knowledge stays in family — the remaining cross-family reads](protocol-knowledge-stays-in-family.md) | 2026-10-23 | 2026-10-23 |

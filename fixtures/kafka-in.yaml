@@ -1,0 +1,43 @@
+# Kafka records in, one block per event out: `kafka_in` (docs/adr/kafka-input.md) reading the
+# `logs` topic `fixtures/kafka-out.yaml` produces to on the dev stack's broker (`compose.yaml`'s
+# `kafka` service), as the JSON objects `kafka_out`'s `format: json` writes, and printing each
+# event with its `_logit.kafka.*` record metadata.
+#
+#   kafka:9092, topic logs --> kafka_in --> stdio_out
+#
+# Start the broker, which `script/server` doesn't, run `fixtures/kafka-out.yaml` and send it a
+# few lines as its header says, then run this config in the dev container on the compose network.
+# Every event arrives once; stop and start this config and it reads on from its committed offset.
+components:
+  kafka:
+    type: kafka_in
+    brokers: ["kafka:9092"]
+    topics: [logs]
+    group: logit-fixture             # required; every member of one group shares the partitions
+    format: json                     # required: json | text | msgpack | native, as kafka_out
+                                     # wrote them; kafka-in-otlp.yaml reads the OTLP formats
+    start: earliest                  # read what was produced before the group's first run
+    # record: event                  # format: text only; batch reads kafka_out's batch records
+    # isolation: read_uncommitted    # the default; read_committed skips aborted transactions
+    # assignment: range              # the default; roundrobin
+    # session_timeout: 45s           # the default
+    # heartbeat_interval: 3s         # the default; below session_timeout
+    # rebalance_timeout: 5m          # the default
+    # drain_timeout: 5s              # the default; below rebalance_timeout
+    # commit_interval: 5s            # the default; a crash re-reads about this much
+    # fetch: {min_bytes: "1", max_bytes: 50MiB, max_partition_bytes: 1MiB, max_wait: 500ms}
+    # max_batch_bytes: 64MiB         # the default; a record batch decompressing past it is dropped
+    # timeout: 30s                   # the default
+    # tls: {}                        # turns TLS on, as for kafka_out
+    # sasl:                          # as for kafka_out; the dev broker doesn't need it
+    #   mechanism: scram_sha_512
+    #   username: logit
+    #   password: !env KAFKA_PASSWORD
+    receive:
+      batch_max_events: 1000         # the default; a batch's bound in events
+      # batch_max_bytes: 1MiB        # the default; in record value bytes
+      # shutdown_grace: 5s           # the default; half of it bounds the drain at shutdown
+
+  out:
+    type: stdio_out
+    sources: [kafka]

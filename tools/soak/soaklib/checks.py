@@ -114,7 +114,7 @@ from pathlib import Path
 from . import collect, faults, standin, telemetry, topic, vm
 from .scenario import (CRI_WIRE, DEFAULT_RSS_SETTLE_S, DEFAULT_WIRE, EXPECT_REDUCERS, FILE_WIRE,
                        FILE_WIRES, EXTERNAL_TARGET, GENERATOR_ROLE,
-                       HTTP_WIRE, KAFKA_TARGET, SCRAPE_WIRE, LOCAL_TARGET, LOGIT_ROLES, NO_WINDOW_ACTIONS,
+                       HTTP_WIRE, KAFKA_TARGET, KAFKA_WIRE, SCRAPE_WIRE, LOCAL_TARGET, LOGIT_ROLES, NO_WINDOW_ACTIONS,
                        IDP_ROLE, RUN_WINDOW, SHARED_DIR, SHARED_MOUNT, STANDIN_ROLE, STANDIN_TARGET,
                        SUT_CONFIG_ENV, SUT_CONFIG_KEY, SUT_SERVICE, TARGET_SPLIT,
                        component_blocks, config_env,
@@ -130,7 +130,7 @@ _ORDER = {PASS: 0, SKIP: 0, WARN: 1, FAIL: 2}
 TLS_RELOAD_FAILED_KEY = "tls_reload_failed"
 TLS_RELOADED_KEY = "tls_reloaded"
 # The self-log key of a failed OAUTHBEARER token refresh that kept the cached token
-# (crates/logit-outputs/src/kafka/sasl/oauth.rs, `Endpoint::token`).
+# (crates/logit-kafka/src/sasl/oauth.rs, `Endpoint::token`).
 TOKEN_REFRESH_FAILED_KEY = "token_refresh_failed"
 
 
@@ -254,6 +254,7 @@ class Fault:
     affects_tcp_ingress: bool = False
     affects_file_ingress: bool = False
     affects_http_ingress: bool = False
+    affects_kafka_ingress: bool = False
     # A partition's `{network: IP address}` before its disconnect and after its reconnect.
     ips: object = None
     ips_after: object = None
@@ -444,6 +445,7 @@ class RunData:
             affects_tcp_ingress=apply.get("affects_tcp_ingress", False),
             affects_file_ingress=apply.get("affects_file_ingress", False),
             affects_http_ingress=apply.get("affects_http_ingress", False),
+            affects_kafka_ingress=apply.get("affects_kafka_ingress", False),
             ips=apply.get("ips"), ips_after=(revert or {}).get("ips_after"),
             signal=apply.get("signal"), path=apply.get("path"), to=apply.get("to"),
             applied=apply.get("finished_at"),
@@ -1403,7 +1405,7 @@ DEFAULT_HOP_WINDOW = 32
 DEFAULT_CHECKPOINT_INTERVAL_S = 1.0
 
 # The listener symbols the ledger keeps per listener, each also summed over the listeners.
-LISTENER_SYMBOLS = ("W", "K", "D_tel", "D_shutdown", "B", "E", "X", "F", "Y")
+LISTENER_SYMBOLS = ("W", "K", "D_tel", "D_shutdown", "B", "E", "X", "F", "Y", "Q")
 
 
 @dataclass(frozen=True)
@@ -1412,8 +1414,10 @@ class Wire:
     sink's counter for G; `w`, the listener's counter for W; `k`, its kernel drops, or None where
     the wire has none; `counted`, the `logit.input.frames.dropped` reasons that lose a line
     before W counts it, F, counted wire loss; `b_frames`, the `frames.dropped` reasons in B,
-    lines W counted and the listener then refused; and `split`, the `(name, attrs)` counter of
-    the events W counts past one per line, S, or None where the wire has none."""
+    lines W counted and the listener then refused; `b_counters`, counters whose every reason
+    is in B too: on a Kafka wire, the records W counted and the listener dropped or skipped;
+    and `split`, the `(name, attrs)` counter of the events W counts past one per line, S, or
+    None where the wire has none."""
 
     label: str
     g: str
@@ -1421,6 +1425,7 @@ class Wire:
     k: object
     counted: tuple
     b_frames: tuple
+    b_counters: tuple = ()
     split: object = None
 
 
@@ -1446,10 +1451,28 @@ WIRES = {
     "http": Wire("HTTP", "logit.component.events.delivered", "logit.component.events.sent",
                  None, (), ()),
     "scrape": Wire("scrape", "logit.component.events.sent", "logit.input.samples", None, (), ()),
+    "kafka": Wire("Kafka", "logit.output.records", "logit.input.records", None, (), (),
+                  ("logit.input.records.dropped", "logit.input.records.skipped")),
     "cri": Wire("CRI file", "logit.component.events.delivered", "logit.component.events.sent",
                 None, ("oversize", "truncated", "malformed"), (),
-                ("logit.input.frames.truncated", {"reason": "partial_timeout"})),
+                split=("logit.input.frames.truncated", {"reason": "partial_timeout"})),
 }
+# A Kafka wire's G is the records the writer's `kafka_out` saw the broker accept, and W the
+# records the consumer counted when fetched: those it handed `kafka_in`, a record that won't
+# decode or holds no event included (B), and those the client dropped or skipped itself
+# (`corrupt`, `oversize`, `legacy_format`, `retention`, `aborted`, also B). A fetched record
+# the client buffered and discarded at a revoke is counted again when it is read again, a W
+# surplus the band doesn't model. The broker keeps every record,
+# so a replay is surplus and only a deficit is loss: `ledger.wire` judges the run's W − G
+# against `Ledger.kafka_band`. A batch the listener deferred at a revoke or shutdown is in W
+# and never sent, and is read again: Q, `logit.input.batches.deferred`, bounds its records at
+# `batch_max_events` each, since the wire's records carry one event each.
+KAFKA_DEFERRED = "logit.input.batches.deferred"
+KAFKA_REBALANCES = "logit.input.rebalances"
+# `kafka_in`'s `commit_interval` and `fetch.max_partition_bytes` when the config names none
+# (crates/logit-config, `KafkaIn` and `KafkaFetch`).
+DEFAULT_KAFKA_COMMIT_INTERVAL_S = 5.0
+DEFAULT_KAFKA_MAX_PARTITION_BYTES = MIB
 # A `cri` wire's G is logical lines, the `F` records `criwriter.py` finished, and its W is
 # `cri_in`'s events sent, not `logit.input.lines`, which counts each `P` and `F` record. A line
 # leaves as two events when its run is held past `partial_timeout` (a stall, or a run split at a
@@ -1801,6 +1824,17 @@ class Ledger:
             one["F"] = _summed({reason: sut.counter_by_life("logit.input.frames.dropped",
                                                             component=listener, reason=reason)
                                 for reason in wire.counted})
+            if wire.b_counters:
+                one["B"] = _summed({"B": one["B"], **{
+                    name: sut.counter_by_life(name, component=listener)
+                    for name in wire.b_counters}})
+            # On a Kafka wire, Q: the batches the listener deferred, which it reads again; and
+            # the memberships it lost, each of which replays what it read after its last commit.
+            kafka = wire is WIRES[KAFKA_WIRE]
+            one["Q"] = (sut.counter_by_life(KAFKA_DEFERRED, component=listener) if kafka
+                        else {})
+            one["lost"] = (sut.counter_by_life(KAFKA_REBALANCES, component=listener,
+                                               reason="membership_lost") if kafka else {})
             one["E"] = sut.counter_by_life("logit.component.events.sent", component=listener)
             # Events the listener counted as sent and then dropped, every reason: a batch sent
             # into the inbox of a node that has failed is `closed_consumer`.
@@ -2074,6 +2108,7 @@ class Ledger:
         # `NODE_RESIDUAL_BATCHES`, plus a script's, in batches of the largest `batch_max_events`.
         text = self._sut_config_text(self.inn.service)
         self.R, parts, largest = 0, [], 0
+        self.batch_max = {}
         for listener in self.listeners:
             # Only a UDP listener has a receive queue; a stream connection's flow control is
             # its backpressure.
@@ -2082,6 +2117,7 @@ class Ledger:
                              or DEFAULT_MAX_DATAGRAMS)
             batch_max = (component_int(text, listener, "batch_max_events")
                          or DEFAULT_BATCH_MAX_EVENTS)
+            self.batch_max[listener] = batch_max
             largest = max(largest, batch_max)
             batches = (LISTENER_RESIDUAL_BATCHES
                        + NODE_RESIDUAL_BATCHES * len(self.transforms.get(listener, [])))
@@ -2634,6 +2670,114 @@ class Ledger:
         one_low, one_high, one_lines = self.copytruncate_band(listeners, counted)
         return low + one_low, high + one_high, lines + one_lines
 
+    def deferred(self, life, listeners=None):
+        """The most records the batches the Kafka wire's listeners (or `listeners`) deferred in
+        `life` hold, Q at each listener's `batch_max_events`. Each is in W and never sent, and
+        the listener reads it again."""
+        return sum(self.per[listener]["Q"].get(life, 0)
+                   * self.batch_max.get(listener, DEFAULT_BATCH_MAX_EVENTS)
+                   for listener in (self.listeners if listeners is None else listeners)
+                   if listener in self.per)
+
+    def deferred_text(self, life):
+        """Q in `life` and the records it can hold, as text, or "" when nothing was deferred."""
+        batches = sum(self.per[listener]["Q"].get(life, 0) for listener in self.listeners
+                      if listener in self.per)
+        if not batches:
+            return ""
+        return (f"Q {_n(batches)} deferred batch(es), up to {_n(self.deferred(life))} records "
+                "read again")
+
+    def kafka_band(self, listeners):
+        """`(low, high, lines)`: the range a Kafka wire's W − G may take over the run, summed
+        per ingress SUT life, for the consumers `listeners`, with one line per life that widens
+        it. The broker keeps every record, and a consumer reads again from its group's last
+        commit, so what one life read and didn't commit is counted again by the next read of it.
+
+        - A killed life, above, replays the records it read after its last commit: its rate
+          over its last drain interval x `commit_interval`, plus one fetch, the records one
+          partition's answer can hold (`kafka_fetch`) that the consumer handed the listener and
+          the kill caught. Below, it loses the counts of the records it read after its last
+          drain, which a commit after that drain can carry past: the same rate x its drain
+          interval. A killed life with one drain has no drain interval, and every record it read
+          can be after its last commit, so its allowance is that drain's W above, plus one
+          fetch, and the same W below.
+        - Each membership the life lost (`logit.input.rebalances{reason="membership_lost"}`)
+          replays the same as a kill, above, at the life's peak rate over a drain interval: the
+          records accepted after the last commit that landed, a fenced commit's among them, and
+          a fetch a resumed broker answered before the member learned it was gone.
+        - Each batch the life deferred at a revoke or at shutdown is read again: Q at
+          `batch_max_events`, above (`deferred`).
+
+        A clean stop commits before it leaves the group, and adds nothing else."""
+        inn = self.inn
+        text = self._sut_config_text(inn.service)
+        commit = max((component_duration(text, listener, "commit_interval")
+                      or DEFAULT_KAFKA_COMMIT_INTERVAL_S) for listener in listeners)
+        fetch = sum(self.kafka_fetch(listener)[0] for listener in listeners)
+        low = high = 0
+        lines = []
+        for life in inn.lives:
+            drains = self.ingress.life_drains(life)
+            read = {}
+            for listener in listeners:
+                for ts, value, point_life in self.ingress.counter_points(
+                        self.wires[listener].w, component=listener):
+                    if point_life == life:
+                        read[ts] = read.get(ts, 0) + value
+            gaps = [b - a for a, b in zip(drains, drains[1:])]
+            interval = statistics.median(gaps) if gaps else 0.0
+            last = read.get(drains[-1], 0) if drains else 0
+            rate = last / gaps[-1] if gaps and gaps[-1] > 0 else 0.0
+            peak = max((read.get(b, 0) / (b - a) for a, b in zip(drains, drains[1:]) if b > a),
+                       default=0.0)
+            below = above = 0
+            why = []
+            if life in inn.killed and life != inn.final:
+                if len(drains) == 1:
+                    below, above = last, last + fetch
+                    why.append(f"killed with one drain, so its W of {_n(last)} records can all "
+                               f"replay, plus one fetch of {_n(fetch)}, above, and its W below")
+                else:
+                    below = round(rate * interval)
+                    above = round(rate * commit) + fetch
+                    why.append(f"killed: {rate:,.0f} records/s x a {interval:g}s drain interval "
+                               f"below; x a {commit:g}s commit_interval plus one fetch of "
+                               f"{_n(fetch)} above")
+            lost = sum(self.per[listener]["lost"].get(life, 0) for listener in listeners)
+            if lost:
+                each = round(peak * commit) + fetch
+                above += lost * each
+                why.append(f"{_n(lost)} membership(s) lost, each {peak:,.0f} records/s at the "
+                           f"life's peak x a {commit:g}s commit_interval plus one fetch of "
+                           f"{_n(fetch)}, above")
+            deferred = self.deferred(life, listeners)
+            if deferred:
+                above += deferred
+                why.append(f"{self.deferred_text(life)}, above")
+            if why:
+                lines.append(f"life {life}: [{_n(-below)}, +{_n(above)}]: " + "; ".join(why))
+            low -= below
+            high += above
+        return low, high, lines
+
+    def kafka_fetch(self, listener):
+        """`(records, text)`: the records one partition's fetch answer can hand `listener`:
+        its `fetch.max_partition_bytes` over the run's mean record value bytes
+        (`logit.input.record.bytes` over `logit.input.records`). A value is smaller than its
+        record on the wire, so this overstates the count; 0 when no record was read."""
+        text = self._sut_config_text(self.inn.service)
+        cap = (_component_size(text, listener, "max_partition_bytes")
+               or DEFAULT_KAFKA_MAX_PARTITION_BYTES)
+        records = sum(self.per[listener]["W"].values()) if listener in self.per else 0
+        value_bytes = sum(self.ingress.counter_by_life("logit.input.record.bytes",
+                                                       component=listener).values())
+        if not records or not value_bytes:
+            return 0, "no records read"
+        mean = value_bytes / records
+        return (math.ceil(cap / mean),
+                f"{_n(cap)} bytes over {mean:,.0f} value bytes a record")
+
     def copytruncate_band(self, listeners, counted):
         """`(low, high, lines)`: what the file sources' `copytruncate` steps add to the replay
         band of `listeners`, from the ADR `tail-content-identity` residuals.
@@ -2749,6 +2893,10 @@ class Ledger:
             gap += self.residual(life, sinks)
         if gap == 0:
             return PASS, "ok", gap
+        # A deferred batch is in W and never reaches `aggregate`, so only an earlier life's
+        # residual can hold its records; in the final life it can't explain Ab − V.
+        if life != self.final and 0 < gap <= self.deferred(life):
+            return PASS, "deferred", gap
         if gap > 0 and (sum(self.drop_credit(life, sinks).values()) > 0
                         or self.record_drops(life, sinks)):
             return PASS, "counted", gap
@@ -3482,6 +3630,8 @@ def _wire_one(data, led, source, instances=None):
     udp = wire_name == DEFAULT_WIRE
     if wire_name in FILE_WIRES:
         return _file_wire_one(data, led, source)
+    if wire_name == KAFKA_WIRE:
+        return _kafka_wire_one(data, led, source)
     if wire_name == SCRAPE_WIRE:
         return _scrape_wire_one(data, led, source)
     stats = led.gen_stats[service]
@@ -3896,6 +4046,60 @@ def _file_wire_end(data, led, source, W, F, G, problems, lines, w_text, over_tex
     return status, detail, lines
 
 
+def _kafka_wire_one(data, led, source):
+    """`(status, detail, lines)` of `ledger.wire` for a Kafka source. The broker holds every
+    record the writer's `kafka_out` saw accepted (G) until the consumer reads it, so a drain
+    interval's gap is lag, not loss: the runs are reported, and the row judges the run's W − G
+    against `Ledger.kafka_band`, a deficit below it uncounted loss and a surplus above it
+    replays the band doesn't explain. The end sequence's wait for every partition's lag to
+    read 0 (`kafka_caught_up`) is reported beside it, and a wait that ended short of 0 FAILs
+    the row with it, since W can then fall short with nothing lost."""
+    service, listener = source.get("service"), source.get("sut_listener")
+    stats = led.gen_stats[service]
+    W = sum(led.per[listener]["W"].values())
+    G = stats["G"]
+    status = PASS
+    problems, lines = [], []
+    caught = data.phases.get("kafka_caught_up")
+    if caught is None:
+        problems.append("precondition: no kafka_caught_up phase, so nothing shows the consumer "
+                        "read to the end of the topic")
+    elif not caught.get("reached"):
+        problems.append(f"the consumer's lag never read 0 on every partition at the end: "
+                        f"{caught.get('lags')}")
+    runs = []
+    for start, end, kind, label, g, wk, _ in _wire_buckets(data, led, source):
+        if runs and runs[-1][2] == kind and runs[-1][3] == label:
+            runs[-1][1] = end
+            runs[-1][4] += g
+            runs[-1][5] += wk
+        else:
+            runs.append([start, end, kind, label, g, wk])
+    for start, end, kind, label, g, wk in runs:
+        lines.append(f"[{data.offset(start)}, {data.offset(end)}] {kind} ({label}): "
+                     f"G {_n(round(g))}, W {_n(wk)}, gap {_n(round(g - wk))}")
+    low, high, band_lines = led.kafka_band([listener])
+    lines += band_lines
+    fetch, fetch_text = led.kafka_fetch(listener)
+    lines.append(f"one fetch: {_n(fetch)} records ({fetch_text})")
+    over = W - G
+    if not low <= over <= high:
+        what = "uncounted loss" if over < low else "surplus"
+        problems.insert(0, f"W − G {_n(over)} is {what}, outside the replay band "
+                           f"[{_n(low)}, {_n(high)}]")
+    if problems:
+        status = FAIL
+    lines = problems + lines
+    wait = ("" if not caught else
+            f"; the consumer {'read every partition to its end' if caught.get('reached') else 'stopped short'}"
+            f" at the end, lag {caught.get('lags')}")
+    detail = (f"G {_n(G)} records accepted vs W {_n(W)} read: W − G {_n(over)} against the "
+              f"replay band [{_n(low)}, {_n(high)}]" + wait)
+    if status != PASS:
+        detail = f"{lines[0]}; {detail}"
+    return status, detail, lines
+
+
 # `criwriter.py`'s own counters on its sink: rotations, the finished lines in the files its
 # rotations removed, and the lines it split at a stall or a rotation.
 CRI_ROTATIONS = "soak.writer.rotations"
@@ -4037,7 +4241,12 @@ def check_ledger_intake(data):
         name = f" {listener}" if len(led.listeners) > 1 else ""
         w_text = "W + Y − D" if led.wires[listener] is WIRES[SCRAPE_WIRE] else "W − D"
         part = f"final life {life}{name}: {w_text} {_n(lhs)} vs E + B {_n(rhs)}"
-        if lhs != rhs:
+        # The same slack, under the same guard, as `ledger.summary`'s: none across a hop.
+        deferred = led.deferred(life, [listener]) if led.hop is None else 0
+        if 0 < lhs - rhs <= deferred:
+            parts.append(part + f", the {_n(lhs - rhs)} between them within the deferred "
+                                f"batches' {_n(deferred)} records, read again")
+        elif lhs != rhs:
             status = FAIL
             # A listener off its balance leads the detail.
             parts.insert(0, part + f", off by {_n(lhs - rhs)}")
@@ -4081,9 +4290,11 @@ def check_ledger_intake(data):
                 if not ok:
                     status = FAIL
                 continue
-            ok = 0 <= residual <= bound
+            deferred = led.deferred(earlier) if led.hop is None else 0
+            ok = 0 <= residual <= bound + deferred
             parts.append(f"{label}life {earlier}: {text} {_n(residual)} "
-                         f"{'within' if ok else 'outside'} [0, {name}]")
+                         f"{'within' if ok else 'outside'} [0, {name}"
+                         + (f" + Q's {_n(deferred)} records" if deferred else "") + "]")
             if not ok:
                 status = FAIL
     mismatches = [m for m in map(led.datagram_mismatch, led.inn.lives) if m]
@@ -4694,14 +4905,21 @@ def check_ledger_summary(data):
         terms.append(("A − Δ_disc − Ab", g("Ad", life) - g("Ab", life)))
     else:
         terms.append(("A − Ab", g("A", life) - g("Ab", life)))
-    shown = [f"{name} {_n(value)}" for name, value in terms]
     uncounted_egress = False
     faults = []
+    shown = [f"{name} {_n(value)}" for name, value in terms]
+    # A batch the Kafka listener deferred is in W and in neither E nor B, so the final life's
+    # intake term may hold up to Q's records, as `ledger.intake` allows.
+    excused = 0
+    deferred = led.deferred(first) if led.hop is None else 0
+    if 0 < terms[0][1] <= deferred:
+        excused = terms[0][1]
+        shown[0] += f" within the deferred batches' {_n(deferred)} records"
     if data.external:
-        judged = sum(value for _, value in terms)
+        judged = sum(value for _, value in terms) - excused
         shown.append(f"{led.ab_text} − V SKIP ({NO_BACKEND})")
     else:
-        judged = sum(value for _, value in terms)
+        judged = sum(value for _, value in terms) - excused
         for _, sinks in led.egress_groups():
             _, verdict, egress_gap = led.egress(life, sinks)
             counted = verdict == "counted"
@@ -4750,7 +4968,7 @@ def check_ledger_summary(data):
         bound_status, bound_text = _end_to_end(data, led)
         status = worst([status, bound_status])
         wire += f"; {bound_text}"
-    if led.hop is None and any(source_wire(source) in FILE_WIRES + (HTTP_WIRE,)
+    if led.hop is None and any(source_wire(source) in FILE_WIRES + (HTTP_WIRE, KAFKA_WIRE)
                                for source in led.sources):
         bound_status, bound_text = _end_to_end(data, led)
         status = worst([status, bound_status])
@@ -5030,7 +5248,8 @@ def _summary_targeted(data, led):
     if led.gens and not data.external:
         read = sum(led.W.values()) + sum(led.K.values()) + sum(led.F.values())
         detail += f"; wire G − (W + K + F) {_n(led.G - read)} over the run; ledger.wire's"
-    if any(source_wire(source) in FILE_WIRES + (HTTP_WIRE,) for source in led.sources):
+    if any(source_wire(source) in FILE_WIRES + (HTTP_WIRE, KAFKA_WIRE)
+           for source in led.sources):
         bound_status, bound_text = _end_to_end(data, led)
         status = worst([status, bound_status])
         detail += f"; {bound_text}"
@@ -5126,6 +5345,12 @@ def _end_to_end(data, led):
     files = [source.get("sut_listener") for source in led.sources
              if source_wire(source) in FILE_WIRES]
     replay = led.replay_band(files)[1] if files else 0
+    # A Kafka wire's consumers read again what they hadn't committed, so V may exceed G by the
+    # Kafka band's upper edge the same way.
+    kafkas = [source.get("sut_listener") for source in led.sources
+              if source_wire(source) == KAFKA_WIRE]
+    replay += led.kafka_band(kafkas)[1] if kafkas else 0
+    files = files + kafkas
     # On a `cri` wire each split line's second event reaches `aggregate` too.
     splits = sum(sum(led.per[listener]["S"].values()) for listener in files)
     limit = led.G - counted + partial + resent + replay + splits
@@ -5149,6 +5374,8 @@ def _end_to_end(data, led):
                           * led.gen_stats[service]["batch"])
             if source_wire(source) in FILE_WIRES:
                 share += led.replay_band([listener])[1] + sum(one["S"].values())
+            if source_wire(source) == KAFKA_WIRE:
+                share += led.kafka_band([listener])[1]
             limit += led.through(listener, share, lives)
         bound = f"({bound}) carried through the chains"
         carried = f", carried through the chains' fan_out and discards to {_n(limit)}"

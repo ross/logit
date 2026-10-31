@@ -1,0 +1,49 @@
+# The group-join leg of `script/kafka-interop` against Apache Kafka 4.2.0: two `kafka_in` members of
+# the group `consume-group-join` on the 6-partition `group-join` topic. Member `a` (this file is
+# `logit-in-group-join-a-*`) starts with the legs and also writes 400 records keyed by `seq`, 10 a
+# second; member `b` (`logit-in-group-join-b-*`) starts 20 s later, so the group rebalances with
+# records still arriving. check.py reads both members' events and judges, from the carriers'
+# partition and offset, that every record was read, none twice, and that no partition changed
+# member more than once.
+admin: { bind: 127.0.0.1:9600 }
+
+components:
+  load:
+    type: generate_in
+    count: 400
+    rate: 10
+    batch: 5
+    event:
+      log: "group-join {seq}"
+      attributes: { seq: "{seq}" }
+
+  produce:
+    type: kafka_out
+    sources: [load]
+    brokers: ["kafka:9092"]
+    topic: group-join
+    key: { attribute: seq }
+
+  member:
+    type: kafka_in
+    brokers: ["kafka:9092"]
+    topics: [group-join]
+    group: consume-group-join
+    format: json
+    start: earliest
+    session_timeout: 10s
+    heartbeat_interval: 1s
+    rebalance_timeout: 20s
+
+  read:
+    type: stdio_out
+    sources: [member]
+    target: /out/consume-group-join-a-kafka.jsonl
+    format: json
+
+  self: { type: internal, interval: 1s, span_sample_rate: 0.0, logs: off }
+  telemetry:
+    type: stdio_out
+    sources: [self]
+    target: /out/in-group-join-a-kafka-telemetry.log
+    format: json

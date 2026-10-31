@@ -27,6 +27,9 @@ KCAT_IMAGE="edenhill/kcat:1.7.1"
 PYTHON_IMAGE="python:3.12-slim"
 COLLECTOR_IMAGE="otel/opentelemetry-collector-contrib:0.162.0@sha256:39923a8e431bd1f57be82411999d389fcfe40857492e4365456d97a4c1f74be6"
 OAUTH_IMAGE="ghcr.io/navikt/mock-oauth2-server:6.0.2"
+# The broker image's runtime is a JRE with no compiler, so `Txn.java` compiles here and runs on
+# the broker image's JRE beside its client libraries.
+JDK_IMAGE="eclipse-temurin:21.0.10_7-jdk@sha256:e58e492628c1428ceb838afc1a1b8762673d5eaa09296f560c363daea0fdcf3b"
 BROKERS=(kafka redpanda)
 # Each topic and its partition count, created on both brokers before any leg starts.
 TOPICS=(parity-logit:6 parity-java:6 codec-none:1 codec-gzip:1 codec-snappy:1 codec-lz4:1
@@ -37,6 +40,24 @@ TOPICS=(parity-logit:6 parity-java:6 codec-none:1 codec-gzip:1 codec-snappy:1 co
     big-logs:1 big-metrics:1 big-spans:1 exporter-default:6 exporter-murmur2:6
     otlpjson-logs:1 otlpjson-metrics:1 otlpjson-spans:1 jsonbig-logs:6 jsonbig-metrics:1
     jsonbig-spans:6)
+# The topics only the consumer legs read, created beside TOPICS but never read back record by
+# record: check.py reads what each `kafka_in` wrote, and their end offsets.
+CODECS=(none gzip snappy lz4 zstd)
+CONSUME_TOPICS=(console:3 txn:1 group-join:6 group-kill:6 group-mixed:6 restart:3
+    collector-proto-logs:1 collector-proto-metrics:1 collector-proto-spans:1
+    collector-json-logs:1 collector-json-metrics:1 collector-json-spans:1)
+for codec in "${CODECS[@]}"; do
+    for format in json msgpack native text; do
+        CONSUME_TOPICS+=("relay-${format}-event-${codec}:1" "relay-${format}-batch-${codec}:1")
+    done
+    for format in otlp_proto otlp_json; do
+        for signal in logs metrics spans; do
+            CONSUME_TOPICS+=("relay-${format}-${codec}-${signal}:1")
+        done
+    done
+done
+# The consumer topics whose end offsets check.py reads, as a kafka-get-offsets.sh pattern.
+CONSUME_OFFSETS='^(console|txn|group-join|group-kill|group-mixed)$'
 # The topics that hold OTLP requests, protobuf bytes a tab-separated reader can't carry. Their
 # read-back prints each record's partition, offset, timestamp, key, and value size, and no value.
 BINARY_TOPICS=(otlp_logs otlp_metrics otlp_spans keyed-logs keyed-metrics keyed-spans big-logs
@@ -49,14 +70,39 @@ NETEM_FOR=8
 # How long the legs run, from their start, before the script stops them: the longest leg's 40 s
 # of sending, and time for its retries after the fault.
 LEGS_WINDOW=75
+# The group legs' steps, in seconds from the legs' start: the console consumer of the
+# `group-mixed` leg runs from MIXED_AT for MIXED_FOR, the late member joins and the killed one
+# dies at GROUP_AT, and the mixed group's assignment is read at DESCRIBE_AT, while both of its
+# members are in it.
+MIXED_AT=5
+MIXED_FOR=40
+GROUP_AT=20
+DESCRIBE_AT=25
+# The broker-restart legs run after the others: each broker restarts RESTART_AT seconds after
+# they start with the member reading, and again once the member has stopped, and the legs stop
+# RESTART_WINDOW seconds after they start.
+RESTART_AT=20
+RESTART_WINDOW=110
+# How long, after the first restart, the members may take to commit past the end offsets the
+# topic had when it began.
+RESTART_READ_TIMEOUT=90
+RESTART_SECOND_LIFE=30
+# The legs the script starts at a step of its own rather than with the others.
+LATE_LEGS=(logit-in-group-join-b-kafka logit-in-group-join-b-redpanda)
+KILLED_LEGS=(logit-in-group-kill-b-kafka logit-in-group-kill-b-redpanda)
+RESTART_MEMBERS=(logit-in-restart-kafka logit-in-restart-redpanda)
+RESTART_LEGS=("${RESTART_MEMBERS[@]}" logit-in-restart-produce-kafka logit-in-restart-produce-redpanda)
 
 RUN_DIR="${KAFKA_INTEROP_OUT:-${ROOT}/perf/results/kafka-interop}/$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "${RUN_DIR}/logs" "${RUN_DIR}/tls" "${RUN_DIR}/redpanda" "${RUN_DIR}/readback" \
+    "${RUN_DIR}/readback/kafka" "${RUN_DIR}/readback/redpanda" "${RUN_DIR}/java/lib" \
     "${RUN_DIR}/collector/kafka" "${RUN_DIR}/collector/redpanda"
 # The image's unprivileged `logit` user, the Kafka image's `appuser`, and Redpanda's `redpanda`
 # each have an unrelated uid, and so does the Collector's; world-writable lets each write here.
 chmod 777 "${RUN_DIR}" "${RUN_DIR}/tls" "${RUN_DIR}/redpanda" "${RUN_DIR}/readback" \
-    "${RUN_DIR}/collector" "${RUN_DIR}/collector/kafka" "${RUN_DIR}/collector/redpanda"
+    "${RUN_DIR}/readback/kafka" "${RUN_DIR}/readback/redpanda" "${RUN_DIR}/java" \
+    "${RUN_DIR}/java/lib" "${RUN_DIR}/collector" "${RUN_DIR}/collector/kafka" \
+    "${RUN_DIR}/collector/redpanda"
 
 # `--env-file` rather than the environment: `sudo` resets the environment, and `$DOCKER` is
 # `sudo docker` by default.
@@ -99,6 +145,70 @@ collect_logs() {
 
 container() {
     ki_compose ps -a -q "$1"
+}
+
+# in_list <item> <list...>: whether the item is one of the list.
+in_list() {
+    local item="$1" candidate
+    shift
+    for candidate in "$@"; do
+        [ "${candidate}" = "${item}" ] && return 0
+    done
+    return 1
+}
+
+# Restarts both brokers with `docker restart`, which keeps each container's log directory and so
+# the groups' committed offsets, and waits for both to report healthy again.
+restart_brokers() {
+    local broker id n
+    for broker in "${BROKERS[@]}"; do
+        ${DOCKER} restart -t 30 "$(container "${broker}")" >/dev/null
+    done
+    for broker in "${BROKERS[@]}"; do
+        id="$(container "${broker}")"
+        for n in $(seq 1 90); do
+            [ "$(${DOCKER} inspect -f '{{.State.Health.Status}}' "${id}")" = healthy ] && break
+            [ "${n}" -eq 90 ] && {
+                echo "kafka-interop: ${broker} didn't come back healthy after its restart" >&2
+                return 1
+            }
+            sleep 2
+        done
+    done
+}
+
+# stop_legs <leg...>: SIGTERM each leg, which drains its sinks and writes its last telemetry,
+# and appends its exit code to exits.txt.
+stop_legs() {
+    stop_legs_as "" "$@"
+}
+
+# stop_legs_as <life> <leg...>: stop_legs, recording each code under `<leg>-<life>` when <life>
+# is set, for a leg the script starts again.
+stop_legs_as() {
+    local life="$1" leg id
+    shift
+    for leg in "$@"; do
+        id="$(container "${leg}")"
+        ${DOCKER} stop -t 30 "${id}" >/dev/null
+        echo "${leg}${life:+-${life}} $(${DOCKER} inspect -f '{{.State.ExitCode}}' "${id}")" \
+            >>"${RUN_DIR}/exits.txt"
+    done
+}
+
+# committed_past <broker>: whether the `consume-restart` group has committed past
+# restart-after.offsets on every partition of `restart`, leaving the last describe in
+# restart-committed.txt for check.py.
+committed_past() {
+    local out="${RUN_DIR}/readback/$1"
+    kafka_tool kafka-consumer-groups.sh --bootstrap-server "$1:9092" --describe \
+        --group consume-restart >"${out}/restart-committed.txt" 2>>"${RUN_DIR}/logs/readback.log" ||
+        return 1
+    awk 'FNR == NR { split($0, f, ":"); if (f[1] == "restart") { after[f[2]] = f[3]; n++ }; next }
+        $1 == "consume-restart" && $2 == "restart" && $4 ~ /^[0-9]+$/ && ($3 in after) &&
+            $4 > after[$3] { past++ }
+        END { exit !(n > 0 && past == n) }' \
+        "${out}/restart-after.offsets" "${out}/restart-committed.txt"
 }
 
 # netem set|clear <broker> [<ip>]: tools/kafka-interop/netem-drop.sh in the broker's network
@@ -185,6 +295,9 @@ ${DOCKER} run --rm -e BROKER=kafka -v "${TOOLS_DIR}/collector.yaml:/collector.ya
     exit 1
 }
 
+# Pulled before provenance.txt is written, which reads its digest.
+${DOCKER} image inspect "${JDK_IMAGE}" >/dev/null 2>&1 || ${DOCKER} pull -q "${JDK_IMAGE}" >/dev/null
+
 say "generating a private CA and certificates into ${RUN_DIR}/tls"
 make_tls
 # `rpk redpanda start` rewrites its config file, so Redpanda gets a writable copy.
@@ -222,7 +335,7 @@ ki_compose up -d --wait --wait-timeout 180 kafka redpanda >/dev/null
     echo "repo: $(git -C "${ROOT}" rev-parse HEAD) ($(git -C "${ROOT}" status --porcelain | wc -l) modified path(s))"
     echo "docker: $(${DOCKER} version --format '{{.Server.Version}}' 2>/dev/null || echo unknown)"
     echo "logit image: $(${DOCKER} image inspect -f '{{.Id}}' "${IMAGE}")"
-    for image in "${KAFKA_IMAGE}" "redpandadata/redpanda:v26.2.3" "${KCAT_IMAGE}" "${OAUTH_IMAGE}" "${COLLECTOR_IMAGE%%@*}"; do
+    for image in "${KAFKA_IMAGE}" "redpandadata/redpanda:v26.2.3" "${KCAT_IMAGE}" "${OAUTH_IMAGE}" "${COLLECTOR_IMAGE%%@*}" "${JDK_IMAGE}"; do
         echo "${image}: $(${DOCKER} image inspect -f '{{index .RepoDigests 0}}' "${image}" 2>/dev/null || echo unknown)"
     done
     echo "redpanda version: $(ki_compose exec -T redpanda rpk version 2>/dev/null | head -1)"
@@ -270,11 +383,17 @@ else
     say "Redpanda refused OAUTHBEARER; see logs/redpanda-oidc-setup.log"
 fi
 
+# rpk creates every topic of one partition count in one call, against either broker; a
+# kafka-topics.sh call per topic starts a JVM per topic.
 say "creating topics on both brokers"
 for broker in "${BROKERS[@]}"; do
-    for entry in "${TOPICS[@]}"; do
-        kafka_tool kafka-topics.sh --bootstrap-server "${broker}:9092" --create --if-not-exists \
-            --topic "${entry%%:*}" --partitions "${entry##*:}" --replication-factor 1 >/dev/null
+    for partitions in $(printf '%s\n' "${TOPICS[@]}" "${CONSUME_TOPICS[@]}" | cut -d: -f2 | sort -u); do
+        names=()
+        for entry in "${TOPICS[@]}" "${CONSUME_TOPICS[@]}"; do
+            [ "${entry##*:}" = "${partitions}" ] && names+=("${entry%%:*}")
+        done
+        ki_compose exec -T redpanda rpk topic create "${names[@]}" -p "${partitions}" -r 1 \
+            -X "brokers=${broker}:9092" >>"${RUN_DIR}/logs/topics.log" 2>&1
     done
 done
 
@@ -287,6 +406,37 @@ for broker in "${BROKERS[@]}"; do
             --topic parity-java --reader-property parse.key=true --reader-property key.separator=: \
             >>"${RUN_DIR}/logs/java-producer.log" 2>&1
 done
+
+# The `consume-console` leg's records: 50 lines into a 3-partition topic, each with a key, a
+# `seq` header, `rep` twice, and `nil` with a null value (the console producer's `null.marker`).
+say "producing the console leg's records with kafka-console-producer.sh"
+for broker in "${BROKERS[@]}"; do
+    for n in $(seq 0 49); do
+        printf 'seq:%s,rep:a,rep:b,nil:NULL\tkey-%s\tconsole line %s \xc3\xa9\n' "${n}" "${n}" "${n}"
+    done | kafka_tool kafka-console-producer.sh --bootstrap-server "${broker}:9092" \
+        --topic console --reader-property parse.key=true --reader-property parse.headers=true \
+        --reader-property null.marker=NULL >>"${RUN_DIR}/logs/java-producer.log" 2>&1
+done
+
+# The `consume-read-committed` leg's transactions, from Txn.java: compiled against the broker
+# image's client in the pinned JDK image, then run on the broker image's own JRE and libraries.
+say "writing the read-committed leg's transactions with Txn.java"
+# `set -e` is off inside a subshell on the left of `||`, so each step exits on its own failure.
+(
+    ${DOCKER} run --rm -v "${RUN_DIR}/java/lib:/dst:z" --entrypoint bash "${KAFKA_IMAGE}" -c \
+        'cp /opt/kafka/libs/kafka-clients-*.jar /dst/' || exit 1
+    ${DOCKER} run --rm -v "${TOOLS_DIR}/Txn.java:/src/Txn.java:ro,z" -v "${RUN_DIR}/java:/java:z" \
+        "${JDK_IMAGE}" javac -cp '/java/lib/*' -d /java /src/Txn.java || exit 1
+    for broker in "${BROKERS[@]}"; do
+        ${DOCKER} run --rm --network "${NETWORK}" -v "${RUN_DIR}/java:/java:ro,z" \
+            --entrypoint java "${KAFKA_IMAGE}" -cp '/opt/kafka/libs/*:/java' Txn "${broker}:9092" txn \
+            || exit 1
+    done
+) >"${RUN_DIR}/logs/txn-producer.log" 2>&1 || {
+    cat "${RUN_DIR}/logs/txn-producer.log" >&2
+    echo "kafka-interop: Txn.java failed" >&2
+    exit 1
+}
 
 # The OAUTHBEARER legs' fixed token, fetched last so it outlives their sending by far.
 say "fetching the OAUTHBEARER legs' fixed token"
@@ -301,15 +451,37 @@ print(json.load(urllib.request.urlopen(request, timeout=10))["access_token"])
 echo "KAFKA_INTEROP_OAUTH_TOKEN=${token}" >>"${ENV_FILE}"
 
 LEGS=()
+START_LEGS=()
 for config in "${TOOLS_DIR}"/logit-*.yaml; do
     name="$(basename "${config}" .yaml)"
+    in_list "${name}" "${RESTART_LEGS[@]}" && continue
     LEGS+=("${name}")
+    in_list "${name}" "${LATE_LEGS[@]}" || START_LEGS+=("${name}")
 done
 COLLECTORS=(collector-kafka collector-redpanda)
-say "starting ${#LEGS[@]} legs and ${#COLLECTORS[@]} Collectors"
-ki_compose up -d --no-deps "${LEGS[@]}" "${COLLECTORS[@]}" >/dev/null
+say "starting ${#START_LEGS[@]} legs and ${#COLLECTORS[@]} Collectors"
+ki_compose up -d --no-deps "${START_LEGS[@]}" "${COLLECTORS[@]}" >/dev/null
+elapsed=0
 
-sleep "${NETEM_AT}"
+# The `group-mixed` leg's Java member: a console consumer in the group, run in the `kafka`
+# container until `timeout` stops it, which closes the consumer: it commits and leaves.
+sleep "${MIXED_AT}"
+elapsed=${MIXED_AT}
+say "starting the group-mixed leg's kafka-console-consumer.sh for ${MIXED_FOR}s"
+MIXED_PIDS=()
+for broker in "${BROKERS[@]}"; do
+    ki_compose exec -T kafka timeout "${MIXED_FOR}" /opt/kafka/bin/kafka-console-consumer.sh \
+        --bootstrap-server "${broker}:9092" --topic group-mixed --group consume-group-mixed \
+        --from-beginning --formatter-property print.timestamp=true \
+        --formatter-property print.partition=true --formatter-property print.offset=true \
+        --formatter-property print.key=true \
+        >"${RUN_DIR}/readback/${broker}/group-mixed-console.tsv" \
+        2>>"${RUN_DIR}/logs/group-mixed-console.log" </dev/null &
+    MIXED_PIDS+=($!)
+done
+
+sleep $((NETEM_AT - elapsed))
+elapsed=${NETEM_AT}
 for broker in "${BROKERS[@]}"; do
     ip="$(${DOCKER} inspect -f "{{(index .NetworkSettings.Networks \"${NETWORK}\").IPAddress}}" \
         "$(container "logit-dedup-${broker}")")"
@@ -317,21 +489,41 @@ for broker in "${BROKERS[@]}"; do
     netem set "${broker}" "${ip}"
 done
 sleep "${NETEM_FOR}"
+elapsed=$((NETEM_AT + NETEM_FOR))
 for broker in "${BROKERS[@]}"; do
     netem clear "${broker}"
 done
 say "netem cleared"
 
+sleep $((GROUP_AT - elapsed))
+elapsed=${GROUP_AT}
+say "starting the group-join legs' second member and killing the group-kill legs' second member"
+ki_compose up -d --no-deps "${LATE_LEGS[@]}" >/dev/null
+for leg in "${KILLED_LEGS[@]}"; do
+    ${DOCKER} kill "$(container "${leg}")" >/dev/null
+done
+
+sleep $((DESCRIBE_AT - elapsed))
+elapsed=${DESCRIBE_AT}
+say "reading the group-mixed leg's group"
+for broker in "${BROKERS[@]}"; do
+    kafka_tool kafka-consumer-groups.sh --bootstrap-server "${broker}:9092" --describe \
+        --group consume-group-mixed --state >"${RUN_DIR}/readback/${broker}/group-mixed.describe" \
+        2>>"${RUN_DIR}/logs/readback.log" || true
+    kafka_tool kafka-consumer-groups.sh --bootstrap-server "${broker}:9092" --describe \
+        --group consume-group-mixed --members >>"${RUN_DIR}/readback/${broker}/group-mixed.describe" \
+        2>>"${RUN_DIR}/logs/readback.log" || true
+done
+
 # Every leg sends for at most 40 s. `internal` runs until a signal, so no leg ends on its own:
 # stop each with SIGTERM once the window has passed, which drains its sinks and writes its last
-# telemetry.
-sleep $((LEGS_WINDOW - NETEM_AT - NETEM_FOR))
+# telemetry. The killed members exit 137, which check.py expects.
+sleep $((LEGS_WINDOW - elapsed))
 say "stopping the legs"
 : >"${RUN_DIR}/exits.txt"
-for leg in "${LEGS[@]}"; do
-    id="$(container "${leg}")"
-    ${DOCKER} stop -t 30 "${id}" >/dev/null
-    echo "${leg} $(${DOCKER} inspect -f '{{.State.ExitCode}}' "${id}")" >>"${RUN_DIR}/exits.txt"
+stop_legs "${LEGS[@]}"
+for pid in "${MIXED_PIDS[@]}"; do
+    wait "${pid}" || true
 done
 # The legs have finished, so the Collectors have read every record. A SIGTERM flushes their file
 # exporters and the `kafka` exporters' queues before the topics are read back.
@@ -390,6 +582,61 @@ for codec in none gzip snappy lz4 zstd; do
     ki_compose exec -T redpanda rpk topic consume "codec-${codec}" -X brokers=redpanda:9092 \
         -o start -n 100 -f 'offset: %o compression: %a{compression}\n' \
         >"${RUN_DIR}/readback/redpanda/codec-${codec}.batches" 2>>"${RUN_DIR}/logs/readback.log" || true
+done
+
+say "reading the consumer legs' end offsets"
+for broker in "${BROKERS[@]}"; do
+    kafka_tool kafka-get-offsets.sh --bootstrap-server "${broker}:9092" \
+        --topic "${CONSUME_OFFSETS}" >"${RUN_DIR}/readback/${broker}/consume.offsets" \
+        2>>"${RUN_DIR}/logs/readback.log" || true
+done
+
+# The broker-restart legs, alone, so the restarts reach no other leg. The first restart comes
+# with each member reading; the second while the member is stopped, so its next start reads the
+# group's commit back from a broker that restarted since it was made.
+say "starting the broker-restart legs"
+started=$(date +%s)
+ki_compose up -d --no-deps "${RESTART_LEGS[@]}" >/dev/null
+sleep "${RESTART_AT}"
+say "restarting both brokers with the members reading"
+restart_brokers
+# The first life must read past the restart: wait until each member's group has committed past
+# the end offsets the topic had once both brokers were healthy again, on every partition, then
+# stop it. A member keeps reading and committing until its own broker goes down, so only a fetch
+# made after the restart can commit past offsets read after it.
+for broker in "${BROKERS[@]}"; do
+    kafka_tool kafka-get-offsets.sh --bootstrap-server "${broker}:9092" --topic restart \
+        >"${RUN_DIR}/readback/${broker}/restart-after.offsets" 2>>"${RUN_DIR}/logs/readback.log"
+done
+say "waiting for the broker-restart members to commit past the restart"
+deadline=$(($(date +%s) + RESTART_READ_TIMEOUT))
+pending=("${BROKERS[@]}")
+while [ "${#pending[@]}" -gt 0 ] && [ "$(date +%s)" -lt "${deadline}" ]; do
+    still=()
+    for broker in "${pending[@]}"; do
+        committed_past "${broker}" || still+=("${broker}")
+    done
+    pending=("${still[@]}")
+    [ "${#pending[@]}" -gt 0 ] && sleep 2
+done
+[ "${#pending[@]}" -gt 0 ] && say "no commit past the restart from: ${pending[*]}"
+say "stopping the broker-restart members, then restarting both brokers again"
+stop_legs_as life1 "${RESTART_MEMBERS[@]}"
+restart_brokers
+say "starting the broker-restart members again"
+for leg in "${RESTART_MEMBERS[@]}"; do
+    ${DOCKER} start "$(container "${leg}")" >/dev/null
+done
+# The second life reads the rest of the topic: what remains of the window, and at least
+# RESTART_SECOND_LIFE seconds.
+remaining=$((RESTART_WINDOW - ($(date +%s) - started)))
+[ "${remaining}" -lt "${RESTART_SECOND_LIFE}" ] && remaining="${RESTART_SECOND_LIFE}"
+sleep "${remaining}"
+say "stopping the broker-restart legs"
+stop_legs "${RESTART_LEGS[@]}"
+for broker in "${BROKERS[@]}"; do
+    kafka_tool kafka-get-offsets.sh --bootstrap-server "${broker}:9092" --topic restart \
+        >"${RUN_DIR}/readback/${broker}/restart.offsets" 2>>"${RUN_DIR}/logs/readback.log" || true
 done
 
 collect_logs

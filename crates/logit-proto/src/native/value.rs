@@ -15,6 +15,7 @@
 //! non-goal: `docs/adr/deployment-threat-model.md`'s non-goals amendment.
 
 use bytes::{Buf, Bytes, BytesMut};
+use logit_core::interner::resolve;
 use logit_core::{AttrMap, Symbol, Value};
 
 use crate::native::dict::{Dict, DictBuilder};
@@ -186,6 +187,22 @@ fn read_value_at(bytes: &mut Bytes, dict: &Dict, depth: usize) -> Result<Value, 
 pub fn write_attr_map(out: &mut BytesMut, dict: &mut DictBuilder, map: &AttrMap) {
     write_uvarint(out, map.len() as u64);
     for (key, value) in map.iter() {
+        write_uvarint(out, dict.intern(key) as u64);
+        write_value(out, dict, value);
+    }
+}
+
+/// [`write_attr_map`] without the entries whose keys start with `omit`. It counts the kept
+/// entries in a first pass, since the count leads the map.
+pub fn write_attr_map_omitting(
+    out: &mut BytesMut,
+    dict: &mut DictBuilder,
+    map: &AttrMap,
+    omit: &str,
+) {
+    let kept = |key: &Symbol| !resolve(*key).starts_with(omit);
+    write_uvarint(out, map.iter().filter(|(key, _)| kept(key)).count() as u64);
+    for (key, value) in map.iter().filter(|(key, _)| kept(key)) {
         write_uvarint(out, dict.intern(key) as u64);
         write_value(out, dict, value);
     }

@@ -11,7 +11,7 @@
 # every redial fetches one. When the fetch fails and the cached token hasn't expired, the dial
 # uses it and the sink warns `token_refresh_failed`; once the token has expired, the dial fails
 # `Clean` and the sink holds its queue until the endpoint is back
-# (crates/logit-outputs/src/kafka/sasl/oauth.rs's module doc). The sink never sends a token it
+# (crates/logit-kafka/src/sasl/oauth.rs's module doc). The sink never sends a token it
 # knows has expired, so the broker refuses nothing.
 #
 # `logit` and `idp` share the network namespace of a holder, `sut-net`, because `kafka_out` takes

@@ -216,7 +216,8 @@ pub struct Component {
     /// Per-listener receive queue and batch assembly. A datagram listener (`collectd_in`, and
     /// `statsd_in`/`syslog_in`/`graphite_in`/`lines_in` under `transport: udp`) accepts every
     /// field; the same four under `transport: tcp`, `tail_in`, `docker_in`, and `cri_in` accept
-    /// only the batch-assembly fields and `shutdown_grace`; a non-default block on any other kind
+    /// only the batch-assembly fields and `shutdown_grace`; `kafka_in` accepts `batch_max_events`,
+    /// `batch_max_bytes`, and `shutdown_grace`; a non-default block on any other kind
     /// (`otlp_in`, `logit_in`, `prometheus_in`, `internal`, and `generate_in` included) is
     /// rejected.
     #[serde(default)]
@@ -1169,8 +1170,9 @@ pub enum KafkaFormat {
     Json,
     /// The log record's body as text: a string as it is, raw bytes as they are, a map or array
     /// as JSON, and nothing for an empty body. An event with no log record is skipped and
-    /// counted. Under `record: batch`, the bodies joined by newlines, so a body that holds a
-    /// newline reads as two.
+    /// counted. Under `record: batch`, the bodies one per line, joined by newlines with none
+    /// after the last, each with a backslash written as `\\` and a newline as `\n`, so a body
+    /// that holds a newline stays one line.
     Text,
     /// The same object as `json`, key for key, as MessagePack, except that raw bytes are a
     /// MessagePack `bin` and NaN and the infinities are floats. Under `record: batch`, the
@@ -1206,7 +1208,8 @@ pub struct KafkaTopics {
     pub traces: Option<String>,
 }
 
-/// How many events one `kafka_out` record holds.
+/// How many events one Kafka record holds: `kafka_out`'s `record:`, and `kafka_in`'s under
+/// `format: text`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum KafkaRecord {
@@ -1216,6 +1219,132 @@ pub enum KafkaRecord {
     /// event too large to fit alone is dropped, counted. A batch record has no key, and its
     /// timestamp is its first event's.
     Batch,
+}
+
+/// The topics a `kafka_in` reads: a list of names, or under `format: otlp_proto` or `otlp_json`
+/// a map of signal to topic, `{logs: NAME, metrics: NAME, traces: NAME}`.
+// `Deserialize` is written by hand so a value of the wrong shape names both forms; an untagged
+// derive would only say it matched no variant. Which form a `format:` needs is checked at
+// validation, where the message can name the format.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(untagged)]
+pub enum KafkaInTopics {
+    /// Topic names, each read in full.
+    List(Vec<String>),
+    /// Each signal's topic under an OTLP `format:`: keys `logs`, `metrics`, and `traces`, each
+    /// optional. A signal left out isn't read.
+    Signals(std::collections::BTreeMap<String, String>),
+}
+
+impl<'de> Deserialize<'de> for KafkaInTopics {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = KafkaInTopics;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(
+                    "a list of topic names, or under format: otlp_proto or otlp_json a map of \
+                     logs, metrics, and traces to topic names",
+                )
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                seq: A,
+            ) -> Result<KafkaInTopics, A::Error> {
+                Vec::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))
+                    .map(KafkaInTopics::List)
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<KafkaInTopics, A::Error> {
+                std::collections::BTreeMap::deserialize(
+                    serde::de::value::MapAccessDeserializer::new(map),
+                )
+                .map(KafkaInTopics::Signals)
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+/// Where a `kafka_in` partition with no committed offset starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum KafkaStart {
+    /// At the end of the log: only records written after the group first reads the partition.
+    #[default]
+    Latest,
+    /// At the start of the log: every record the topic still retains.
+    Earliest,
+}
+
+/// Which records a `kafka_in` reads from a topic that transactional producers write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum KafkaIsolation {
+    /// Every record, including those of transactions still open or aborted.
+    #[default]
+    ReadUncommitted,
+    /// Only records of committed transactions, and none past the first transaction still open.
+    ReadCommitted,
+}
+
+/// How the group's leader shares a `kafka_in` group's partitions among its members.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum KafkaAssignment {
+    /// Each topic's partitions in contiguous runs, the Java consumer's default.
+    #[default]
+    Range,
+    /// Every subscribed partition dealt to the members in turn.
+    Roundrobin,
+}
+
+/// The bounds of each fetch a `kafka_in` sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct KafkaFetch {
+    /// The least data a broker gathers before it answers, unless `max_wait` passes first. A
+    /// byte-count string. Defaults to `"1"`, an answer as soon as any record is there; `0` is
+    /// rejected.
+    #[serde(with = "human_bytes")]
+    #[schemars(with = "String")]
+    pub min_bytes: u64,
+    /// The most data one fetch answer holds, across partitions. A byte-count string. Defaults
+    /// to `"50MiB"`; `0` is rejected, and so is a value that with `max_batch_bytes` adds up to
+    /// more than 2147483647 bytes, the most a fetch request can ask for.
+    #[serde(with = "human_bytes")]
+    #[schemars(with = "String")]
+    pub max_bytes: u64,
+    /// The most data one fetch answer holds for one partition, compressed, and so the most each
+    /// partition holds in memory while its records wait to be sent downstream. A record batch
+    /// larger than this is still read whole when it's the first in the answer. A byte-count
+    /// string. Defaults to `"1MiB"`; `0` is rejected.
+    #[serde(with = "human_bytes")]
+    #[schemars(with = "String")]
+    pub max_partition_bytes: u64,
+    /// How long a broker holds a fetch open waiting for `min_bytes`. Defaults to `500ms`; `0s`
+    /// is rejected, and it must be below `timeout`.
+    #[serde(with = "humantime_serde_duration")]
+    #[schemars(with = "String")]
+    pub max_wait: Duration,
+}
+
+impl Default for KafkaFetch {
+    /// The Java consumer's `fetch.min.bytes`, `fetch.max.bytes`, `max.partition.fetch.bytes`,
+    /// and `fetch.max.wait.ms`.
+    fn default() -> Self {
+        Self {
+            min_bytes: 1,
+            max_bytes: 50 * 1024 * 1024,
+            max_partition_bytes: 1024 * 1024,
+            max_wait: Duration::from_millis(500),
+        }
+    }
 }
 
 /// How `kafka_out` compresses a record batch.
@@ -1321,7 +1450,7 @@ pub enum KafkaAcks {
     None,
 }
 
-/// How `kafka_out` authenticates to each broker over SASL, chosen by `mechanism`. Give the
+/// How `kafka_out` or `kafka_in` authenticates to each broker over SASL, chosen by `mechanism`. Give the
 /// password, token, or client secret with `!env` so it stays out of the config file.
 // `Debug` is written by hand so no secret reaches a log line or an error.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -4797,6 +4926,126 @@ pub enum ComponentKind {
         #[serde(default)]
         resource: std::collections::BTreeMap<String, String>,
     },
+    /// Consumes Apache Kafka topics as a member of a consumer group (Kafka 2.4 on, or anything
+    /// that speaks the same protocol), alongside other `kafka_in` and Java consumers in the same
+    /// group. A partition's offset is committed only once every record before it is in every
+    /// component directly downstream, so a crash or a rebalance replays the records since the
+    /// last commit rather than losing them; a record that can't be decoded is counted, dropped,
+    /// and committed past, so it can't stop its partition. While the pipeline is full, no more
+    /// is fetched: Kafka holds the backlog. Every event carries its record's topic, partition,
+    /// offset, key, headers, and timestamp as private `_logit.kafka.*` attributes, which a
+    /// `kafka_out` leaves out of what it writes.
+    KafkaIn {
+        /// Bootstrap brokers, each a `host:port`. `logit` asks the first that answers for the
+        /// cluster's brokers, then connects to each at the address the cluster advertises, so
+        /// every advertised listener must be reachable from `logit`.
+        brokers: Vec<String>,
+        /// The topics to read. A list of names, or under `format: otlp_proto` or `otlp_json` a
+        /// map of signal to topic, `{logs: NAME, metrics: NAME, traces: NAME}`, where a signal
+        /// left out isn't read. A topic is never created: one that doesn't exist yet is read
+        /// once it appears, with a warning until then.
+        topics: KafkaInTopics,
+        /// The consumer group to join. Members of one group share the topics' partitions, each
+        /// partition read by one member, and resume from the group's committed offsets.
+        group: String,
+        /// What each record's value holds; required, since a topic's producer decides it.
+        /// `json` reads the object `kafka_out` and `stdio_out` write under `format: json`, one
+        /// per record or several as lines; `text` reads the value as one log message (any
+        /// producer's lines; add a `json` transform for an application's JSON); `native` reads
+        /// `kafka_out`'s `format: native` frames; `msgpack` the `json` objects as MessagePack
+        /// maps, one or several per record. `otlp_proto` and `otlp_json` read one OTLP export
+        /// request per record, as the OpenTelemetry Collector's Kafka exporter writes it, and
+        /// take `topics:` as a map, since a request's signal is its topic's.
+        format: KafkaFormat,
+        /// Under `format: text` only, how many logs one record holds: `event` (the default),
+        /// the whole value as one log; or `batch`, one log per line, the form `kafka_out`
+        /// writes under `format: text` and `record: batch`, with `\n` and `\\` in a line read
+        /// back as a newline and a backslash.
+        #[serde(default)]
+        record: Option<KafkaRecord>,
+        /// The client id sent to every broker, which broker logs and quotas see. Defaults to
+        /// `logit`.
+        #[serde(default = "default_kafka_in_client_id")]
+        client_id: String,
+        /// Where a partition the group has no committed offset for starts: `latest` (the
+        /// default), at the end of the log, or `earliest`, at its start. The group commits that
+        /// position once the partition is first read, so a restart resumes there rather than
+        /// starting again.
+        #[serde(default)]
+        start: KafkaStart,
+        /// `read_uncommitted` (the default) reads every record; `read_committed` reads only
+        /// those of committed transactions, waiting at a transaction still open.
+        #[serde(default)]
+        isolation: KafkaIsolation,
+        /// How the group's leader shares out partitions: `range` (the default) or
+        /// `roundrobin`. Every member of a group must offer the same one; a group with Java
+        /// consumers at their defaults needs `range`.
+        #[serde(default)]
+        assignment: KafkaAssignment,
+        /// How long the group coordinator waits for a heartbeat before it removes this member
+        /// and gives its partitions to another. The broker bounds it, from 6s to 30m by
+        /// default. Defaults to `45s`; it must not be over `rebalance_timeout`.
+        #[serde(default = "default_kafka_in_session_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        session_timeout: Duration,
+        /// How often a heartbeat goes to the group coordinator, on its own task, so a slow
+        /// pipeline never ends the session. Defaults to `3s`; it must be below
+        /// `session_timeout`.
+        #[serde(
+            default = "default_kafka_in_heartbeat_interval",
+            with = "humantime_serde_duration"
+        )]
+        #[schemars(with = "String")]
+        heartbeat_interval: Duration,
+        /// How long the coordinator waits for every member to rejoin when the group rebalances.
+        /// Defaults to `5m`.
+        #[serde(default = "default_kafka_in_rebalance_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        rebalance_timeout: Duration,
+        /// When the group rebalances, how long the batch being sent downstream may wait for
+        /// room before it's given up. A batch given up is left uncommitted, counted
+        /// `logit.input.batches.deferred`, and read again by whichever member gets its
+        /// partition, so a short value costs duplicates, never data. Defaults to `5s`; `0s` is
+        /// rejected, and it must be below `rebalance_timeout`. At shutdown, `receive.shutdown_grace`
+        /// bounds it too.
+        #[serde(default = "default_kafka_in_drain_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        drain_timeout: Duration,
+        /// How often the offsets of records already sent downstream are committed. A crash
+        /// replays what arrived since the last commit. Offsets are also committed at every
+        /// rebalance and at shutdown. Defaults to `5s`; `0s` is rejected.
+        #[serde(default = "default_kafka_in_commit_interval", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        commit_interval: Duration,
+        /// Each fetch's bounds: `min_bytes`, `max_bytes`, `max_partition_bytes`, and `max_wait`,
+        /// the Java consumer's defaults when unset.
+        #[serde(default)]
+        fetch: KafkaFetch,
+        /// The most one record batch may decompress to. A batch over it is dropped and
+        /// counted, and its offsets committed past. A byte-count string. Defaults to
+        /// `"64MiB"`; `0` is rejected, as is a value that with `fetch.max_bytes` adds up to
+        /// more than 2147483647 bytes.
+        #[serde(default = "default_kafka_in_max_batch_bytes", with = "human_bytes")]
+        #[schemars(with = "String")]
+        max_batch_bytes: u64,
+        /// Bounds each connect, TLS handshake, write, and wait for a broker's answer, and each
+        /// OAuth token request; a fetch waits `fetch.max_wait` more, and a group join
+        /// `rebalance_timeout` more. Defaults to `30s`; `0s` is rejected.
+        #[serde(default = "default_kafka_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        timeout: Duration,
+        /// Turns on TLS to every broker when present, and makes it required: a `host:port` has
+        /// no scheme to select TLS from, so even an empty `tls: {}` means TLS with the bundled
+        /// Mozilla roots. Each broker's certificate is checked against the host it advertises,
+        /// or against `server_name` when it's set.
+        #[serde(default)]
+        tls: Option<TlsClientConfig>,
+        /// Authenticates every broker connection over SASL when present, with the same
+        /// mechanisms and fields as `kafka_out`'s `sasl:`. A broker or token endpoint that
+        /// refuses the credentials is retried with a backoff, never without them.
+        #[serde(default)]
+        sasl: Option<KafkaSasl>,
+    },
     /// Reads a file once, from start to end, and sends its events downstream, then stops. The
     /// file is an archive a `stdio_out` or `file_out` wrote, or events written by hand in the
     /// same form. Events keep the timestamps the file gives them. When every input has stopped,
@@ -5523,6 +5772,37 @@ pub fn default_kafka_max_request_bytes() -> u64 {
 /// Mirrors `logit_outputs::kafka::DEFAULT_TIMEOUT`, kept in sync by hand.
 pub fn default_kafka_timeout() -> Duration {
     Duration::from_secs(30)
+}
+
+/// `kafka_in`'s default `client_id:`.
+fn default_kafka_in_client_id() -> String {
+    "logit".to_string()
+}
+
+/// `kafka_in`'s timing and size defaults (`docs/adr/kafka-input.md`, item 14). Mirror
+/// `logit_kafka::consumer::ConsumerSettings::new`, kept in sync by hand.
+pub fn default_kafka_in_session_timeout() -> Duration {
+    Duration::from_secs(45)
+}
+
+pub fn default_kafka_in_heartbeat_interval() -> Duration {
+    Duration::from_secs(3)
+}
+
+pub fn default_kafka_in_rebalance_timeout() -> Duration {
+    Duration::from_secs(300)
+}
+
+pub fn default_kafka_in_drain_timeout() -> Duration {
+    Duration::from_secs(5)
+}
+
+pub fn default_kafka_in_commit_interval() -> Duration {
+    Duration::from_secs(5)
+}
+
+pub fn default_kafka_in_max_batch_bytes() -> u64 {
+    64 * 1024 * 1024
 }
 
 /// Mirrors `logit_outputs::s3::DEFAULT_PARTITION`, kept in sync by hand.
@@ -6363,7 +6643,9 @@ pub enum DeliveryPosture {
 /// and `statsd_in`/`syslog_in`/`graphite_in`/`lines_in` under `transport: udp`) accepts every
 /// field; the same four under `transport: tcp`, `tail_in`, `docker_in`, and `cri_in` accept only the
 /// batch-assembly fields (`batch_max_events`, `batch_max_bytes`, `batch_flush_interval`) and
-/// `shutdown_grace`; a non-default block on any other kind is rejected. Every field defaults, so
+/// `shutdown_grace`; `kafka_in` accepts `batch_max_events`, `batch_max_bytes`, and
+/// `shutdown_grace`, and sends each fetch's records as they arrive, with no flush timer; a
+/// non-default block on any other kind is rejected. Every field defaults, so
 /// the block is never required. The defaults batch: `batch_max_events: 1000` and
 /// `batch_flush_interval: 100ms` mean a default-configured listener amortizes datagrams into
 /// batches (up to 1000 events, or up to 100ms of added latency before a send). For one send per
@@ -11104,6 +11386,105 @@ mod tests {
             }
             other => panic!("expected PrometheusIn, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn kafka_in_takes_the_consumer_defaults() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "kafka_in", "brokers": ["k:9092"], "topics": ["logs"], "group": "g",
+                "format": "json"}"#,
+        )
+        .unwrap();
+        let ComponentKind::KafkaIn {
+            topics,
+            record,
+            client_id,
+            start,
+            isolation,
+            assignment,
+            session_timeout,
+            heartbeat_interval,
+            rebalance_timeout,
+            drain_timeout,
+            commit_interval,
+            fetch,
+            max_batch_bytes,
+            timeout,
+            tls,
+            sasl,
+            ..
+        } = component.kind
+        else {
+            panic!("expected KafkaIn");
+        };
+        assert_eq!(topics, KafkaInTopics::List(vec!["logs".into()]));
+        assert_eq!(record, None);
+        assert_eq!(client_id, "logit");
+        assert_eq!((start, isolation), (KafkaStart::Latest, KafkaIsolation::ReadUncommitted));
+        assert_eq!(assignment, KafkaAssignment::Range);
+        assert_eq!(session_timeout, Duration::from_secs(45));
+        assert_eq!(heartbeat_interval, Duration::from_secs(3));
+        assert_eq!(rebalance_timeout, Duration::from_secs(300));
+        assert_eq!(drain_timeout, Duration::from_secs(5));
+        assert_eq!(commit_interval, Duration::from_secs(5));
+        assert_eq!(fetch, KafkaFetch::default());
+        assert_eq!(fetch.max_bytes, 50 << 20);
+        assert_eq!(max_batch_bytes, 64 << 20);
+        assert_eq!(timeout, Duration::from_secs(30));
+        assert!(tls.is_none() && sasl.is_none());
+    }
+
+    #[test]
+    fn kafka_in_reads_every_field() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "kafka_in", "brokers": ["k:9092"], "group": "g", "format": "otlp_proto",
+                "topics": {"logs": "l", "traces": "t"}, "client_id": "c", "start": "earliest",
+                "isolation": "read_committed", "assignment": "roundrobin",
+                "session_timeout": "10s", "heartbeat_interval": "1s", "rebalance_timeout": "1m",
+                "drain_timeout": "2s", "commit_interval": "1s", "max_batch_bytes": "1MiB",
+                "timeout": "5s", "fetch": {"min_bytes": "2", "max_bytes": "8MiB",
+                "max_partition_bytes": "256KiB", "max_wait": "100ms"}, "tls": {},
+                "sasl": {"mechanism": "plain", "username": "u", "password": "p"},
+                "receive": {"batch_max_events": 10}}"#,
+        )
+        .unwrap();
+        assert_eq!(component.receive.batch_max_events, 10);
+        let ComponentKind::KafkaIn { topics, fetch, isolation, assignment, .. } = component.kind
+        else {
+            panic!("expected KafkaIn");
+        };
+        let KafkaInTopics::Signals(map) = topics else { panic!("a map") };
+        assert_eq!(map.len(), 2);
+        assert_eq!(map["logs"], "l");
+        assert_eq!(fetch.max_partition_bytes, 256 << 10);
+        assert_eq!(fetch.max_wait, Duration::from_millis(100));
+        assert_eq!(isolation, KafkaIsolation::ReadCommitted);
+        assert_eq!(assignment, KafkaAssignment::Roundrobin);
+    }
+
+    #[test]
+    fn kafka_in_requires_format_and_rejects_an_unknown_field_or_a_scalar_topics() {
+        let parse = |json: &str| serde_json::from_str::<Component>(json);
+        assert!(
+            parse(r#"{"type": "kafka_in", "brokers": [], "topics": [], "group": "g"}"#).is_err()
+        );
+        assert!(parse(
+            r#"{"type": "kafka_in", "brokers": [], "topics": [], "group": "g", "format": "json",
+                "topic": "t"}"#
+        )
+        .is_err());
+        let err = parse(
+            r#"{"type": "kafka_in", "brokers": [], "topics": "logs", "group": "g",
+                "format": "json"}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("a list of topic names"), "{err}");
+        assert!(parse(
+            r#"{"type": "kafka_in", "brokers": [], "topics": [], "group": "g", "format": "json",
+                "fetch": {"min_wait": "1s"}}"#
+        )
+        .is_err());
     }
 
     #[test]

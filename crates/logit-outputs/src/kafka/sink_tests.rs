@@ -130,7 +130,13 @@ async fn a_record_carries_the_events_json_key_headers_and_timestamp() {
             .find(|r| r.key.as_deref() == Some(key.as_bytes()))
             .unwrap_or_else(|| panic!("{key} on partition {partition}"));
         let mut want = String::new();
-        crate::ndjson::render_event(&mut want, &input.resource, None, e);
+        crate::ndjson::render_event(
+            &mut want,
+            &input.resource,
+            None,
+            e,
+            Some(crate::kafka::CARRIER_PREFIX),
+        );
         assert_eq!(record.value.as_deref(), Some(want.as_bytes()));
         assert_eq!(record.timestamp, TS / 1_000_000);
         let headers: Vec<(&str, &[u8])> = record

@@ -8,6 +8,10 @@
 # `partition_traces_by_id` does: one with the exporter's default partitioner and one with the
 # `murmur2` hasher. check.py compares the partition each trace id lands on from `kafka_out` with
 # the partition from each exporter.
+#
+# The `proto` and `json` pipelines also feed `kafka/out-proto` and `kafka/out-json`, which write
+# what the receivers decoded back to Kafka in the same encoding, one topic per signal, for the
+# `consume-collector-*` legs' `kafka_in` (logit-in-collector-*.yaml) to read.
 receivers:
   kafka/proto:
     brokers: ["${env:BROKER}:9092"]
@@ -79,13 +83,25 @@ exporters:
       sticky_key:
         hasher: murmur2
 
+  kafka/out-proto:
+    brokers: ["${env:BROKER}:9092"]
+    logs: { topic: collector-proto-logs, encoding: otlp_proto }
+    metrics: { topic: collector-proto-metrics, encoding: otlp_proto }
+    traces: { topic: collector-proto-spans, encoding: otlp_proto }
+
+  kafka/out-json:
+    brokers: ["${env:BROKER}:9092"]
+    logs: { topic: collector-json-logs, encoding: otlp_json }
+    metrics: { topic: collector-json-metrics, encoding: otlp_json }
+    traces: { topic: collector-json-spans, encoding: otlp_json }
+
 service:
   telemetry:
     metrics: { level: none }
   pipelines:
-    logs/proto: { receivers: [kafka/proto], exporters: [file/proto-logs] }
-    metrics/proto: { receivers: [kafka/proto], exporters: [file/proto-metrics] }
-    traces/proto: { receivers: [kafka/proto], exporters: [file/proto-traces] }
+    logs/proto: { receivers: [kafka/proto], exporters: [file/proto-logs, kafka/out-proto] }
+    metrics/proto: { receivers: [kafka/proto], exporters: [file/proto-metrics, kafka/out-proto] }
+    traces/proto: { receivers: [kafka/proto], exporters: [file/proto-traces, kafka/out-proto] }
     logs/keyed: { receivers: [kafka/keyed], exporters: [file/keyed-logs] }
     metrics/keyed: { receivers: [kafka/keyed], exporters: [file/keyed-metrics] }
     traces/keyed:
@@ -94,9 +110,9 @@ service:
     logs/big: { receivers: [kafka/big], exporters: [file/big-logs] }
     metrics/big: { receivers: [kafka/big], exporters: [file/big-metrics] }
     traces/big: { receivers: [kafka/big], exporters: [file/big-traces] }
-    logs/json: { receivers: [kafka/json], exporters: [file/json-logs] }
-    metrics/json: { receivers: [kafka/json], exporters: [file/json-metrics] }
-    traces/json: { receivers: [kafka/json], exporters: [file/json-traces] }
+    logs/json: { receivers: [kafka/json], exporters: [file/json-logs, kafka/out-json] }
+    metrics/json: { receivers: [kafka/json], exporters: [file/json-metrics, kafka/out-json] }
+    traces/json: { receivers: [kafka/json], exporters: [file/json-traces, kafka/out-json] }
     logs/jsonbig: { receivers: [kafka/jsonbig], exporters: [file/jsonbig-logs] }
     metrics/jsonbig: { receivers: [kafka/jsonbig], exporters: [file/jsonbig-metrics] }
     traces/jsonbig: { receivers: [kafka/jsonbig], exporters: [file/jsonbig-traces] }

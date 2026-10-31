@@ -1,6 +1,6 @@
 ---
 created: 2026-10-13
-updated: 2026-10-28
+updated: 2026-10-30
 ---
 
 # Telemetry loss vocabulary: any nonzero `*.dropped` is loss, and intended outcomes use other words
@@ -390,6 +390,28 @@ In the transit spec, the ignored-signal rule is the `log/beside_metrics` and `sp
 `syslog_out`'s attribute cells from `lost, uncounted` to `lost, structural`
 ([ADR `transit-spec`](transit-spec.md)'s "Amendment: sink fixes (2026-10-28)").
 
+## Amendment (2026-10-30): `kafka_in` defers to the partition's next reader
+
+`input.batches.deferred` meant a listener answered busy (`503`) and the client keeps the data and
+retries. It now means **the source keeps the data and offers it again**, which also covers
+`kafka_in` ([ADR `kafka-input`](kafka-input.md)): a batch not accepted by the drain deadline of a
+revoke or shutdown, with every batch behind it, and the batches behind a `closed_consumer` drop.
+`kafka_in` commits nothing past them, so Kafka keeps them and the partition's next reader, this
+member after a rejoin or another one, reads them again. That's back-pressure, not loss, for the
+same reason a `503` is, so the name stays outside `*.dropped`.
+
+`kafka_in`'s other outcomes take existing words:
+
+| Outcome | Counted as |
+|---|---|
+| A record whose value doesn't decode in `format:` | `input.records.dropped{reason="undecodable"}`: malformed input, committed past |
+| A record with a null value, or a `json` or `native` value holding no event | `input.records.skipped{reason="tombstone"\|"empty"}`: nothing was there to carry |
+| A header whose name isn't UTF-8 | `input.headers.omitted{reason="invalid_name"}`: a piece of a delivered record |
+| A batch no consumer directly downstream took | `input.batches.dropped{reason="closed_consumer"}`, as every other listener counts it |
+
+[internal-telemetry.md](../design/internal-telemetry.md#loss-vocabulary)'s "Loss vocabulary" row
+for `input.batches.deferred` carries the wider meaning.
+
 ## Migration record
 The classification of every `*.dropped`, `*.skipped`, `*.degraded`, `*.truncated`, and loss-related
 `*.rejected` name and reason that existed on 2026-10-13, verified against the emit sites in
@@ -407,6 +429,7 @@ row reading "unchanged" keeps its name and every reason listed.
 | network listeners | `input.connections.rejected` (`limit`, `proxy_header`) | unchanged |
 | HTTP listeners | `input.requests.rejected` (every reason) | unchanged |
 | `datadog_in`, `datadog_trace_in`, `splunk_hec_in` | `input.batches.dropped` (`busy`) | `input.batches.deferred` (untagged) |
+| `kafka_in` | none: the component postdates this record | `input.batches.deferred` (untagged), for a batch left uncommitted at a revoke's or shutdown's drain deadline; this record's 2026-10-30 amendment |
 | HTTP listeners, `tail_in`, `docker_in`, `logit_in` | `input.batches.dropped` (`closed_consumer`, `rejected`) | unchanged |
 | `splunk_hec_in` | `input.acks.dropped` (`expired`) | `input.acks.evicted` (`expired`) |
 | `splunk_hec_in` | `input.acks.dropped` (`evicted`: ids evicted with their channel) | `input.acks.evicted` (`channel`) |

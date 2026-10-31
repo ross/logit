@@ -8,6 +8,9 @@ publish = false
 # sanitizer and it runs on stable too.
 [dependencies]
 bytes = "1"
+crc32c = "0.6"
 flate2 = "1"
+kafka-protocol = { version = "=0.18.0", default-features = false, features = ["client", "broker"] }
 logit-core = { path = "../../crates/logit-core" }
 logit-proto = { path = "../../crates/logit-proto" }
+serde_json = "1"

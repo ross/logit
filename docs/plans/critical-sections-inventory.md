@@ -297,7 +297,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [RT-14](#rt-14--graph-rules-the-runtime-assumes-cycle-detection-target-arity-slot-order) | P1 | Graph rules the runtime *assumes* (cycle detection, target arity, slot order) | `crates/logit-pipeline/src/graph.rs` (`topological_order`, `targets_of`, `resolve`) | unreviewed |
 | [WIRE-04](#wire-04--bare-and-hop-batch-framing-and-the-mandatory-trailer) | P1 | Bare and hop batch framing and the mandatory trailer | `crates/logit-proto/src/native/mod.rs` (`decode_batch`, `decode_hop_batch`, `CODEC_HOP_BATCH`) | unreviewed |
 | [WIRE-07](#wire-07--logit_in-accept-loop-connection-cap-bounded-tls-accept-live-connection-accounting) | P1 | `logit_in` accept loop: connection cap, bounded TLS accept, live-connection accounting | `crates/logit-inputs/src/logit.rs` (`Input::run`, `run_until_shutdown`, `reject_or_serve`) | findings → #377 |
-| [WIRE-09](#wire-09--pooled-connection-close-probe-stream-erasure-and-sni-derivation) | P1 | Pooled-connection close probe, stream erasure, and SNI derivation | `crates/logit-outputs/src/tls.rs` (`AsyncStream`, `PendingClose`, `poll_pending_close`, `host_only`) | findings → #450 |
+| [WIRE-09](#wire-09--pooled-connection-close-probe-stream-erasure-and-sni-derivation) | P1 | Pooled-connection close probe, stream erasure, and SNI derivation | `crates/logit-pipeline/src/tls.rs` (`AsyncStream`, `PendingClose`, `poll_pending_close`), `crates/logit-outputs/src/tls.rs` (`host_only`) | findings → #450 |
 | [WIRE-12](#wire-12--otlp_out-grpc-round-trip-over-a-pooled-hyper-utilhyper-rustls-client-and-the-fault-table) | P1 | `otlp_out` gRPC round trip over a pooled hyper-util/hyper-rustls client, and the fault table | `crates/logit-outputs/src/otlp.rs` (`send_http`, `send_grpc`, `grpc_roundtrip`) | unreviewed |
 | [WIRE-13](#wire-13--tls-configuration-construction-private-ca-mtls-and-insecure_skip_verify) | P1 | TLS configuration construction: private CA, mTLS, and `insecure_skip_verify` | `crates/logit-inputs/src/tls.rs` (`build_server_config`, `apply_client_tls`) | unreviewed |
 | [WIRE-14](#wire-14--prometheus_in-scrape-loop-per-tick-fan-out-per-target-body-cap-outcome-bookkeeping) | P1 | `prometheus_in` scrape loop: per-tick fan-out, per-target body cap, outcome bookkeeping | `crates/logit-inputs/src/prometheus.rs` (`PrometheusInput::tick`, `scrape_target`, `MAX_SCRAPE_BYTES`) | unreviewed |
@@ -331,7 +331,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [XFORM-08](#xform-08--logfmtrs--kv-parsing-hand-rolled-tokenizers) | P1 | logfmt.rs / kv parsing: hand-rolled tokenizers | `crates/logit-proto/src/message/logfmt.rs` (`scan_quoted`, `parse_logfmt`, `parse_kv`) | reviewed @5566667e |
 | [XFORM-09](#xform-09--trace_contextrs-timing-resolution-and-skew-arithmetic) | P1 | trace_context.rs: timing resolution and skew arithmetic | `crates/logit-transforms/src/trace_context.rs` (`timing_nanos`, `f64_seconds_to_nanos`, `quantity`) | unreviewed |
 | [SINK-02](#sink-02--tcpdialconnect--per-phase-connecthandshake-timeouts-and-reconnect-accounting) | P1 | `TcpDial::connect` — per-phase connect/handshake timeouts and reconnect accounting | `crates/logit-outputs/src/stream.rs` (`connect`, `handshake`) | findings → #451 |
-| [SINK-03](#sink-03--poll_pending_close--the-one-poll-half-open-probe-shared-by-every-pooled-sink) | P1 | `poll_pending_close` — the one-poll half-open probe shared by every pooled sink | `crates/logit-outputs/src/tls.rs` (`poll_pending_close`) | findings → #450 |
+| [SINK-03](#sink-03--poll_pending_close--the-one-poll-half-open-probe-shared-by-every-pooled-sink) | P1 | `poll_pending_close` — the one-poll half-open probe shared by every pooled sink | `crates/logit-pipeline/src/tls.rs` (`poll_pending_close`) | findings → #450 |
 | [SINK-06](#sink-06--encode-side-stats-emitted-per-send-attempt--retry-inflation-and-the-cancelled-attempt-hole) | P1 | Encode-side stats emitted per `send` attempt — retry inflation and the cancelled-attempt hole | `crates/logit-outputs/src/accounting.rs` (`BatchAccounting`) | findings → #454, #455, #456 |
 | [SINK-07](#sink-07--statsd-line-level-drop-rules-indivisible-entries-oversize-whole-drop-and-the-multi-value-timer) | P1 | statsd line-level drop rules: indivisible entries, oversize-whole-drop, and the multi-value timer | `crates/logit-outputs/src/statsd.rs` (`push_line`) | unreviewed |
 | [SINK-08](#sink-08--influxdb_outsend--one-shot-http-attempt-fault-classification-and-its-own-reqwest-client) | P1 | `influxdb_out::send` — one-shot HTTP attempt, fault classification, and its own `reqwest` client | `crates/logit-outputs/src/influxdb.rs` (`InfluxDbOutput::send`, `classify_transport_error`) | unreviewed (error-body read bounded in #332) |
@@ -4811,8 +4811,8 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
 ---
 
 ### WIRE-09 — Pooled-connection close probe, stream erasure, and SNI derivation
-- **Location:** `crates/logit-outputs/src/tls.rs` (`AsyncStream`, `host_only`,
-  `PendingClose`, `poll_pending_close`); callers in
+- **Location:** `crates/logit-pipeline/src/tls.rs` (`AsyncStream`, `PendingClose`,
+  `poll_pending_close`) and `crates/logit-outputs/src/tls.rs` (`host_only`); callers in
   `crates/logit-outputs/src/logit.rs`'s `Output::send` (the reused-connection probe) and (out of area, same helper)
   `crates/logit-outputs/src/syslog.rs`
 - **What it does:** Before the first write of a `send` on a *reused* connection, polls the stream
@@ -5728,7 +5728,7 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   table. `influxdb_out` deliberately keeps its own copy and, per the module doc of
   `crates/logit-outputs/src/http.rs`, **does not get `build_client`'s redirect-off policy** —
   worth a look from whoever surveys `influxdb_out`.
-- `crates/logit-outputs/src/tls.rs`'s `AsyncStream`, `host_only`, and `poll_pending_close` are
+- `crates/logit-pipeline/src/tls.rs`'s `AsyncStream` and `poll_pending_close`, and `crates/logit-outputs/src/tls.rs`'s `host_only`, are
   shared by `logit_out` and `syslog_out` (and the probe concept by every pooled sink);
   `crates/logit-inputs/src/tls.rs`'s `build_server_config` by `otlp_in` and `logit_in`, and
   `apply_client_tls` by `prometheus_in`.
@@ -7818,7 +7818,7 @@ Test-module boundaries: `statsd.rs`, `syslog.rs`, `graphite.rs`, `collectd.rs`, 
 ---
 
 ### SINK-03 — `poll_pending_close` — the one-poll half-open probe shared by every pooled sink
-- **Location:** `crates/logit-outputs/src/tls.rs` (`PendingClose`, `poll_pending_close`);
+- **Location:** `crates/logit-pipeline/src/tls.rs` (`PendingClose`, `poll_pending_close`);
   callers: the probe arm of `send_tcp` in `statsd.rs`, `syslog.rs`, `graphite.rs` (and
   `logit.rs`, another agent's area).
 - **What it does:** Wraps a single `AsyncRead::poll_read` in `poll_fn`, mapping `Pending` → still

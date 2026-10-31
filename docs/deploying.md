@@ -4217,10 +4217,12 @@ at the cluster's IAM bootstrap port (`9098` inside AWS, `9198` for public access
 
 `record: event` sends one event per record, with the event's timestamp as `CreateTime`.
 `record: batch` packs as many of a batch's events into each record as fit under
-`max_request_bytes`: NDJSON lines for `json`, bodies joined by newlines for `text` (so a body
-that holds a newline reads as two), maps back to back for `msgpack`, and one frame for `native`.
-A `text` body is joined with no escaping, so to keep a multiline body such as a stack trace in
-one piece use `record: event`, or `format: json`, whose lines escape the newline. Finding how many
+`max_request_bytes`: NDJSON lines for `json`, one body per line for `text`, maps back to back
+for `msgpack`, and one frame for `native`. A `text` batch record escapes each body's backslashes
+as `\\` and newlines as `\n`, so a multiline body such as a stack trace stays one line and
+`kafka_in` reads it back whole; a consumer other than `kafka_in` has to undo the escape itself
+([ADR `kafka-output`](adr/kafka-output.md)'s "Amendment: `text` batch records escape newlines
+(2026-10-30)"). Finding how many
 `native` events fit a record takes several trial encodes, about twice the logarithm of the event
 count per record, so keep upstream batches under `max_request_bytes` where you can, or raise the cap
 ([ADR `kafka-output`](adr/kafka-output.md)'s "Amendment: what W3 settled").
@@ -4318,8 +4320,150 @@ accepted, `logit.output.records.dropped{reason}`, `logit.output.records.unkeyed`
 `format: text`, `logit.output.events.skipped{reason="no_log"}` and the `metrics.omitted` and
 `spans.omitted` counts, and under `format: otlp_proto` or `otlp_json`,
 `logit.output.metrics.skipped`, `logit.output.metrics.dropped`, and
-`logit.output.metrics.degraded` for metrics OTLP can't carry as they are.
+`logit.output.metrics.degraded` for metrics OTLP can't carry as they are,
+`logit.output.events.skipped{reason="no_payload"}` for events with no log, span, or metric, and
+`logit.output.attributes.normalized{reason="u64_as_double"}` for `u64` attribute values written as
+a double, each once per batch.
 `docs/design/internal-telemetry.md`'s `kafka_out` section has every counter.
+
+## `kafka_in`: consuming from Kafka
+
+`kafka_in` reads Kafka topics as a member of a consumer group, with the Java consumer's group
+protocol and defaults, and sends each record downstream as events. It reads what `kafka_out`
+writes under each of its formats: `json`, `text`, `msgpack`, `native`, `otlp_proto`, and
+`otlp_json`. Like `kafka_out`, it speaks the protocol from Kafka 2.4 on.
+[`fixtures/kafka-in.yaml`](../fixtures/kafka-in.yaml) reads back what
+[`fixtures/kafka-out.yaml`](../fixtures/kafka-out.yaml) produces.
+
+```yaml
+components:
+  kafka:
+    type: kafka_in
+    brokers: ["kafka-1:9092", "kafka-2:9092"]
+    topics: [logs]
+    group: logit-logs          # required; every member of one group shares the partitions
+    format: json               # required: json | text | msgpack | native | otlp_proto | otlp_json
+    # record: event            # format: text only; batch reads kafka_out's text batch records
+    # start: latest            # where a partition with no committed offset starts; earliest
+    # isolation: read_uncommitted  # read_committed skips aborted transactions
+    # assignment: range        # range | roundrobin
+    # session_timeout: 45s
+    # heartbeat_interval: 3s
+    # rebalance_timeout: 5m
+    # drain_timeout: 5s
+    # commit_interval: 5s
+    # fetch: {min_bytes: "1", max_bytes: 50MiB, max_partition_bytes: 1MiB, max_wait: 500ms}
+    # max_batch_bytes: 64MiB
+    # tls: {}                  # as kafka_out's
+    # sasl: {...}              # as kafka_out's: every mechanism
+```
+
+Every event carries its record's metadata as private attributes: `_logit.kafka.topic`,
+`partition`, `offset`, `key` (absent for a null key), `headers` (a map; a repeated header name
+holds an array of its values), `timestamp` (absent when the record has none), and
+`timestamp_type`. No sink renders them as tags, and `kafka_out` leaves them out of what it
+writes, so a record relayed through `logit` doesn't keep its source record's key or headers. A
+Lua script or a `set` reads them by name.
+
+**Topologies.** `kafka_out` to Kafka to `kafka_in` carries events between `logit` nodes with
+Kafka holding the backlog: use `format: native` for no loss, or `json` when other consumers read
+the topic too. To read a topic a third-party producer writes, such as JSON log lines from an
+application or a log shipper, use `format: text` and parse the message downstream:
+
+```yaml
+components:
+  app_logs:
+    type: kafka_in
+    brokers: ["kafka:9092"]
+    topics: [app-logs]
+    group: logit-app-logs
+    format: text           # each record's value is one log's message
+  parse:
+    type: json
+    sources: [app_logs]
+```
+
+`format: json` reads only `logit`'s own event objects, the ones `stdio_out`'s `format: json`
+writes, and drops anything else as `logit.input.records.dropped{reason="undecodable"}`.
+`format: msgpack` reads the same objects as `kafka_out` writes them in MessagePack.
+
+**OTLP from the Collector's Kafka exporter.** The OpenTelemetry Collector's `kafkaexporter`
+writes one OTLP export request per record, each signal to its own topic: `otlp_spans`,
+`otlp_metrics`, and `otlp_logs` by default. `kafka_out` under `format: otlp_proto` or
+`otlp_json` writes the same. Under either format, `kafka_in` takes `topics:` as a map from signal
+to topic and decodes each record as its topic's signal:
+
+```yaml
+components:
+  collector:
+    type: kafka_in
+    brokers: ["kafka:9092"]
+    topics: {logs: otlp_logs, metrics: otlp_metrics, traces: otlp_spans}
+    group: logit-otlp
+    format: otlp_proto     # or otlp_json, for an exporter set to `encoding: otlp_json`
+```
+
+Give each signal its own topic. A protobuf request doesn't name its signal, and the exporter
+writes no `otelcol.signal` header by default, so the topic is the only signal there is: two
+signals on one topic fail `logit validate`. A request read as the wrong signal, such as a logs
+request on the topic mapped to `metrics`, is dropped and counted
+`logit.input.records.dropped{reason="undecodable"}`. A signal left out of the map isn't read. A
+request holding several resources is delivered as one batch per resource, and its record is
+committed once every one of them is accepted.
+[`fixtures/kafka-in-otlp.yaml`](../fixtures/kafka-in-otlp.yaml) reads what
+[`fixtures/kafka-otlp.yaml`](../fixtures/kafka-otlp.yaml) produces.
+
+**What a commit means, and what a crash costs.** `kafka_in` commits a partition's offset only
+once every record before it is in a batch every downstream component accepted into its inbox. It
+commits every `commit_interval`, before each rebalance, and at shutdown. A record it can't decode
+is dropped, counted, and committed past, since a record that fails the same way on every read
+would otherwise hold its partition forever. Two consequences:
+
+- After a crash, the group's next reader replays every record since the last commit: up to about
+  `commit_interval` of traffic, sent twice. Whether a destination absorbs the duplicate depends
+  on its data model ([ADR `delivery-semantics`](adr/delivery-semantics.md), item 5); lower `commit_interval` to shrink the window at the cost of
+  more commit requests.
+- Accepted into an inbox isn't delivered. Events committed and still in memory downstream, in
+  channels or a sink's memory queue, are lost in a crash. A sink's `buffer.disk:` keeps what
+  reached that sink's queue.
+
+**A blocked pipeline holds the partitions, not the data.** When downstream stops accepting,
+`kafka_in` offers the batch in flight again until it's taken and reads nothing further. Kafka
+keeps the backlog, so nothing is lost; `logit.input.lag` grows, and the member keeps
+heartbeating, so the group doesn't move its partitions. Alert on lag, not on a drop count.
+
+**Sizing `drain_timeout` and `rebalance_timeout`.** A rebalance revokes every partition of every
+member, and the group waits for every member to rejoin, up to `rebalance_timeout`. While a revoke
+is pending, the batch in flight gets `drain_timeout` to be accepted; past that it and the
+batches behind it are counted `logit.input.batches.deferred`, left uncommitted, and read again by
+the partition's next owner. So:
+
+- A short `drain_timeout` keeps a rebalance fast for the whole group when one member's pipeline
+  is slow, at the cost of re-reading the deferred batches. A long one stalls every member's
+  rebalance by up to that long.
+- `drain_timeout` must be below `rebalance_timeout`, or the coordinator removes the member while
+  it drains; `logit validate` checks it. Leave `rebalance_timeout` at its 5 minutes unless the
+  group has members that need longer to rejoin.
+- At shutdown the batch in flight gets the lesser of `drain_timeout` and half of
+  `receive.shutdown_grace`, which leaves the other half for the commit and the LeaveGroup. Raise
+  `receive.shutdown_grace` along with `drain_timeout`.
+
+`receive:` takes `batch_max_events` and `batch_max_bytes`, which bound a batch in events and in
+record value bytes (a record is never split), and `shutdown_grace`; `logit validate` rejects its
+other fields, since Kafka holds the backlog a receive queue would.
+
+**Mixed groups with Java consumers.** `kafka_in` speaks the classic group protocol with Java's
+`range` and `roundrobin` assignors and their wire format, so a Java consumer can share a group
+with it. Java 4.x offers `[range, cooperative-sticky]` by default, so a group of both uses
+`range` with eager rebalancing. A Java member configured with `cooperative-sticky` alone shares
+no assignor with `kafka_in`, and its join fails with `INCONSISTENT_GROUP_PROTOCOL`. `kafka_in`
+doesn't speak the newer consumer group protocol, Java's `group.protocol=consumer`
+([known gaps](known-gaps/kafka.md)). Give `logit` a group of its own unless you're moving a
+group's work between the two.
+
+**Topics aren't created.** `kafka_in` never asks the broker to create a topic. A missing one
+logs a `topic_missing` warning, gets no partitions, and is picked up when a metadata refresh,
+every 5 minutes, finds it; create topics before pointing `kafka_in` at them.
 
 ## `s3_out`: archiving to S3
 

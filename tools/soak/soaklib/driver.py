@@ -57,6 +57,10 @@ needs at the code:
   has no backend, so its end sequence waits for the sink's queue to empty; after the SUT stops,
   it reads the target's topic back from the broker into `kafka-topic.ndjson` (topic.py), the
   ledger's V.
+- A scenario with a `kafka` wire runs the same `kafka` profile beside `local`: its generator
+  produces to the broker and its SUT consumes from it. Once the generators stop, the end sequence
+  waits until the consuming listeners' `logit.input.lag` reads 0 on every partition
+  (`kafka_caught_up`) before it waits on the sinks.
 - A stand-in target (`[target] kind = "standin"`) runs the `standin` compose profile, the scripted
   destination with the role `standin`, in place of `local`. Its control port is published like a
   backend's and re-read after any revert of a fault on it; a `respond` step POSTs its cue there.
@@ -152,9 +156,13 @@ SINK_DRAIN_TAIL_LINES = 400
 TAIL_CATCHUP_BOUND_S = 180
 TAIL_CATCHUP_EVERY_S = 5
 TAIL_STALL_READS = 4
+# How long the end sequence waits for a Kafka wire's consumers to read to the end of every
+# partition they hold, and how often it reads their lag.
+KAFKA_CATCHUP_BOUND_S = 180
+KAFKA_CATCHUP_EVERY_S = 5
 DEFAULT_AGGREGATE_INTERVAL_S = checks.DEFAULT_AGGREGATE_INTERVAL_S
 # The compose profile holding the backends, enabled for a local target only, and the one holding
-# the `kafka` broker, enabled for a Kafka target only.
+# the `kafka` broker, enabled for a Kafka target or a Kafka wire.
 LOCAL_PROFILE = "local"
 KAFKA_PROFILE = "kafka"
 STANDIN_PROFILE = "standin"
@@ -204,14 +212,16 @@ def interrupt_on_signals():
 
 
 def profiles_for(scenario):
-    """The compose profiles a scenario's stack runs: its target's backend, if it has one."""
+    """The compose profiles a scenario's stack runs: its target's backend, if it has one, and
+    the broker for a Kafka target or a Kafka wire."""
+    profiles = []
     if scenario.has_vm:
-        return [LOCAL_PROFILE]
-    if scenario.kafka:
-        return [KAFKA_PROFILE]
+        profiles.append(LOCAL_PROFILE)
+    if scenario.runs_broker:
+        profiles.append(KAFKA_PROFILE)
     if scenario.standin:
-        return [STANDIN_PROFILE]
-    return []
+        profiles.append(STANDIN_PROFILE)
+    return profiles
 
 
 def exit_code(results, ended=None):
@@ -432,7 +442,7 @@ class Run:
                 _print(f"soak: {problem}")
                 return 2
         images = ([self.image, NETEM_IMAGE] + ([VM_IMAGE] if self.has_vm else [])
-                  + ([KAFKA_IMAGE] if self.kafka else [])
+                  + ([KAFKA_IMAGE] if self.scenario.runs_broker else [])
                   + ([STANDIN_IMAGE] if self.standin or self.scenario.cri_sources else [])
                   + ([faults.FILEOPS_IMAGE] if file_steps and not self.standin else []))
         collect.provenance(self.run_dir, self.root.parent.parent, self.docker,
@@ -741,6 +751,7 @@ class Run:
                        stderr=result.stderr.strip())
 
         self.wait_tailed()
+        self.wait_consumed()
         if self.scenario.overlap is not None:
             self.stop_instances(self.scenario.suts)
         else:
@@ -950,6 +961,43 @@ class Run:
             time.sleep(TAIL_CATCHUP_EVERY_S)
         self.phase("tail_caught_up", reached=False, held=False, w=w, reads=reads,
                    bound_s=TAIL_CATCHUP_BOUND_S, **caught)
+
+    def wait_consumed(self):
+        """For a Kafka wire: waits, bounded at `KAFKA_CATCHUP_BOUND_S`, until every partition a
+        consuming listener reports `logit.input.lag` for reads 0 in a point exported after the
+        wait began (phase `kafka_caught_up`). The generators have stopped, so the high
+        watermarks hold, and lag 0 everywhere means the listeners have read every record the
+        broker accepted. Each poll reads the newest `SINK_DRAIN_TAIL_LINES` of the ingress SUT's
+        stdout, which a run in progress hasn't collected yet."""
+        listeners = [source["sut_listener"] for source in self.scenario.kafka_sources]
+        if not listeners:
+            return
+        service = scenario_mod.SUT_SERVICE
+        began = _now()
+        deadline = began + KAFKA_CATCHUP_BOUND_S
+        polls, lags = 0, {}
+        while _now() < deadline:
+            polls += 1
+            result = self.docker.logs_tail(self.ids[service], SINK_DRAIN_TAIL_LINES,
+                                           timeout=POLL_TIMEOUT_S)
+            tel = telemetry.parse_ndjson(result.stdout.splitlines())
+            newest = {}
+            for listener in listeners:
+                for point in tel.matching("logit.input.lag", component=listener):
+                    key = (f"{listener} {point.attributes.get('topic')}"
+                           f"/{point.attributes.get('partition')}")
+                    if key not in newest or point.ts >= newest[key][0]:
+                        newest[key] = (point.ts, point.value)
+            lags = {key: value for key, (ts, value) in sorted(newest.items())}
+            fresh = all(ts > began for ts, _ in newest.values())
+            if newest and fresh and all(value == 0 for value in lags.values()):
+                self.phase("kafka_caught_up", reached=True, polls=polls,
+                           waited_s=round(_now() - began, 3), lags=lags)
+                return
+            time.sleep(KAFKA_CATCHUP_EVERY_S)
+        self.phase("kafka_caught_up", reached=False, polls=polls,
+                   bound_s=KAFKA_CATCHUP_BOUND_S, lags=lags)
+        self.say(f"a consumer's lag didn't reach 0 within {KAFKA_CATCHUP_BOUND_S}s: {lags}")
 
     def aggregate_interval(self):
         """The `aggregate` window of the SUT service holding `sut_aggregate`, in seconds, or
