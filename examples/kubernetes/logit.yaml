@@ -1,0 +1,57 @@
+# Every container's log on a Kubernetes node, read from the files the kubelet writes under
+# /var/log/pods and sent to Loki over OTLP. Run one logit per node as a DaemonSet; README.md has
+# the manifest.
+#
+#   containerd / CRI-O / cri-dockerd log files -> pods (cri_in) -> not_system -> node -> loki_out
+#
+# Each event is one line a container wrote, with its own timestamp, `log.iostream` (stdout or
+# stderr), and the pod and container it came from as resource attributes: k8s.namespace.name,
+# k8s.pod.name, k8s.pod.uid, k8s.container.name, and k8s.container.restart_count. When the
+# kubelet's link in /var/log/containers names the container, the resource also has container.id.
+#
+# NODE_NAME comes from the downward API (spec.nodeName). Check this file with
+# `NODE_NAME=x logit validate logit.yaml`.
+
+# Without this, logit's own hostname is the pod's name, which changes on every rollout.
+hostname: !env NODE_NAME
+
+# /readyz and /healthz for the DaemonSet's probes.
+admin:
+  bind: 0.0.0.0:9600
+
+components:
+  # Reads /var/log/pods, mounted read-only from the node, and takes container.id from the links in
+  # /var/log/containers, also mounted read-only. On a cri-dockerd node, each file there links to
+  # Docker's log, so /var/lib/docker/containers is mounted read-only at the same path too. Lines a container wrote in pieces (a long line,
+  # or a write the runtime read in two) arrive as one event.
+  #
+  # The checkpoint must be on a hostPath, not in the pod: a new pod then resumes where the old
+  # one stopped, instead of skipping what was written in between.
+  pods:
+    type: cri_in
+    checkpoint_path: /var/lib/logit/cri.checkpoint
+
+  # cri_in follows every container on the node. Narrow it here, by namespace or pod name.
+  not_system:
+    type: drop_attributes
+    sources: [pods]
+    resource:
+      k8s.namespace.name: kube-system
+
+  # The file path names no node, so stamp it.
+  node:
+    type: set
+    sources: [not_system]
+    resource:
+      k8s.node.name: !env NODE_NAME
+
+  loki_out:
+    type: otlp_out
+    sources: [node]
+    protocol: http
+    endpoint: http://loki.monitoring:3100/otlp
+    # A disk spool on the same hostPath keeps what Loki hasn't taken across a restart. The
+    # checkpoint only covers what reached this sink's queue.
+    buffer:
+      disk:
+        path: /var/lib/logit/spool/loki_out

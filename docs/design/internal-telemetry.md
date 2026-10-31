@@ -72,7 +72,9 @@ Inputs fall into three categories:
   attached rather than manufacturing one.
 - **Genuine self-claim.** `internal`.
 - **Discovered facts.** `docker_in` stamps `container.*` (id, name, image, opt-in labels), read
-  locally off the container's own `config.v2.json`. These are facts about where the data came
+  locally off the container's own `config.v2.json`, and `cri_in` stamps `k8s.*` (namespace, pod
+  name and uid, container name, restart count), read off the kubelet's log path, and `container.id`,
+  read off the name of the kubelet's symlink to the file. These are facts about where the data came
   from, with the same standing `syslog_in`'s parsed hostname has, not an assertion `logit` makes up.
   `internal`'s `host.name` is the same kind of fact, about where `logit` itself runs.
   `docker_in` still never claims `service.name`/`service.namespace` on the operator's behalf. That
@@ -576,8 +578,9 @@ receive and processing side from their own loops, which already see every batch 
 | `logit.component.events.copied` | count | `run_router` (`route_batch`) and `run_route_signals` (`route_signals_batch`): one per delivery past an event's first, for an event a `route` list sends to several destinations, or a `route_signals` sends whole (`strip: false`) or splits into parts (`strip: true`, one per part past the first). Counted on the shared-`Arc` path too, so it counts deliveries, not deep clones. Untagged, and recorded only when nonzero |
 | `logit.component.events.dropped{reason="script_error"}` | count | `run_lua`, one per event whose `process()` call raised an error: that event is lost. Counted beside `errors{reason="process"}` |
 | `logit.component.flush.events` / `.flush.duration` | count / timing | a flush-bearing node's `flush()` |
-| `logit.component.send.duration` | timing | one delivery attempt, `deliver_with_retry` (`write_loop`); for a sink with a send window above 1, one windowed round (the fill and the head's acknowledgment wait), `deliver_window`, except on a sink that times each batch (`Output::send_duration_per_batch`: every sink on the HTTP slot helper, which is `influxdb_out`, `prometheus_out`'s remote-write sender, `otlp_out`, `datadog_out`, `datadog_trace_out`, and `splunk_hec_out`), where it's one sample per answer to the oldest batch: that batch's requests, from the first one's send to the last one's response (`Output::answered_send_duration`) |
+| `logit.component.send.duration` | timing | one delivery attempt, `deliver_with_retry` (`write_loop`); for a sink with a send window above 1, one windowed round (the fill and the head's acknowledgment wait), `deliver_window`, except on a sink that times each batch (`Output::send_duration_per_batch`: `s3_out`, and every sink on the HTTP slot helper, which is `influxdb_out`, `prometheus_out`'s remote-write sender, `otlp_out`, `datadog_out`, `datadog_trace_out`, and `splunk_hec_out`), where it's one sample per answer to the oldest batch: that batch's requests, from the first one's send to the last one's response (`Output::answered_send_duration`); for `s3_out`, from its object's close to the answer, and none for the batches behind the head, whose answers its object's answer settled |
 | `logit.component.retries` | count | a retried delivery attempt or windowed round, `deliver_with_retry` or `deliver_window` (`write_loop`) |
+| `logit.component.window.closed{cause}` | count | `window_round` (`write_loop`), once per window a collecting sink keeps open across arrivals ([ADR `collecting-sink-window`](../adr/collecting-sink-window.md)), by what closed it: `full` (the sink takes no more, or the window reached a memory store's `max_batches`), `deadline`, `pressure` (a push found no room in the sink's buffer), `memory` (the staged batches reached `buffer.max_bytes`), `closed` (the buffer closed), or `shutdown`. A window a submit failure ends isn't counted: it's reopened from its head. Closes on `pressure` mean the buffer is too small for the window. `s3_out` is the one sink that collects |
 | `logit.component.errors` | count | `Output::send` failed (any attempt), or a Lua script error |
 | `logit.component.diagnostics{key=...}` | count | every `Diagnostics::warn_throttled` occurrence, throttled or not |
 | `logit.script.vm.memory` | gauge | `run_lua`, once per batch — the strongest signal a stateful script is leaking Lua-side state |
@@ -751,7 +754,7 @@ datagram passes through.
 | `logit.component.receive.push.blocked` | gauge | `1` while a `Block`-policy push waits for room, re-written every 500 ms of the wait; `0` once the wait ends for any reason |
 | `logit.component.receive.latency` | timing | arrival (`Datagram::received_at`) → dequeue, per datagram — the number that says whether event timestamps are trustworthy under load |
 | `logit.component.datagrams.dropped{reason=...}` / `logit.component.bytes.dropped{reason=...}` | count | `reason` one of `overflow_oldest`/`overflow_newest` (`ReceiveQueue` eviction); `truncated`: a datagram longer than the 65,507-byte receive slot, which the kernel cut short (`MSG_TRUNC`), so the read half counts it and never queues it (**IPv6 or `AF_UNIX`, and Linux-only:** 65,507 is IPv4's maximum payload, and a `recv_from` build can't see the cut); or `shutdown`: datagrams read but never decoded because the listener stopped (a batch the read half never queued, a popped batch the decode half never decoded, or what the receive queue still held when the grace backstop dropped the listener). With these, `logit.input.datagrams` equals the `receive.latency` sample count plus every reason's drops. `shutdown` counts reach only a dedicated `internal` pipeline (see "With a dedicated pipeline, `internal` drains last"); with a mixed one they land after `internal`'s final drain. The listener also logs each at `warn` (see `docs/known-gaps/intake.md`) |
-| `logit.component.receive.flushed{reason=...}` | count | `reason` one of `max_events`/`max_bytes`/`interval`/`resource_change`/`shutdown`/`closed` — a `BatchAccumulator` emission. `closed` is **a single tracked file or connection** ending and flushing its own accumulator on the way out: a `tail_in`/`docker_in` file that rotated away or was removed, or a `graphite_in` TCP connection the client closed or reset, or that was dropped for an oversize frame — in every case while the listener itself keeps running. `shutdown` is the whole component stopping. An ordinary client disconnect is `closed`, never `shutdown`. |
+| `logit.component.receive.flushed{reason=...}` | count | `reason` one of `max_events`/`max_bytes`/`interval`/`resource_change`/`shutdown`/`closed` — a `BatchAccumulator` emission. `closed` is **a single tracked file or connection** ending and flushing its own accumulator on the way out: a `tail_in`/`docker_in`/`cri_in` file that rotated away or was removed, or a `graphite_in` TCP connection the client closed or reset, or that was dropped for an oversize frame — in every case while the listener itself keeps running. `shutdown` is the whole component stopping. An ordinary client disconnect is `closed`, never `shutdown`. |
 | `logit.input.frames.dropped{reason="undecodable"}` | count | a datagram the decoder rejected whole (the `bad_datagram` diagnostic). It was dequeued, so it has its `receive.latency` sample and sits outside the identity above |
 | `logit.input.reads` | count | read syscalls the listener made — one per `recvmmsg(2)` batch on Linux, one per `recv_from` elsewhere. Exists to be a denominator: `logit.input.datagrams / logit.input.reads` is the **mean fill** of the syscall batch, the only number that says whether `receive.read_batch` is doing anything. A fill pinned at `read_batch` means the knob is the limit and raising it may help; a fill near 1 means datagrams arrive one at a time and the knob is irrelevant at any setting |
 | `logit.input.receive_buffer.bytes` | gauge | granted `SO_RCVBUF` after any kernel clamp — the kernel's `sk_rcvbuf`, which on Linux is double what was requested. Emitted at bind *and* re-emitted on every kernel sample below (see "Why a constant is re-emitted") |
@@ -1415,11 +1418,12 @@ header name and the reason appear in the message text, never the value), `reques
 rejection except `unknown_route` and `method`; the peer address appears in the message text only,
 never a tag, and a token never appears at all), `busy` (a `503`), and `closed_consumer` (a `503`).
 
-##### `tail_in` and `docker_in`
+##### `tail_in`, `docker_in`, and `cri_in`
 
-`crates/logit-inputs/src/tail/driver.rs`, `docker.rs`: one shared `Tailer<D, F>` driver.
-[ADR `file-tailing-and-docker-json-logs`](../adr/file-tailing-and-docker-json-logs.md) and
-[ADR `docker-container-identity-and-minimal-watches`](../adr/docker-container-identity-and-minimal-watches.md).
+`crates/logit-inputs/src/tail/driver.rs`, `docker.rs`, `cri.rs`: one shared `Tailer<D, F>` driver.
+[ADR `file-tailing-and-docker-json-logs`](../adr/file-tailing-and-docker-json-logs.md),
+[ADR `docker-container-identity-and-minimal-watches`](../adr/docker-container-identity-and-minimal-watches.md),
+and [ADR `cri-container-logs`](../adr/cri-container-logs.md).
 
 A tailed file has no `ReceiveQueue` for the layer-2 table to instrument, so the driver records its
 own read-side counters:
@@ -1432,8 +1436,9 @@ own read-side counters:
 | `logit.input.bytes.dropped{reason="truncated"}` | count | at a truncation, the bytes the last size observation (a scan's `stat`, an `fstat`, or a read to the end) saw past the read offset, which no read reached; recorded only when nonzero. A floor, usually `0`: what was written after that observation, before the truncate, isn't seen, and under `copytruncate` survives only in the copy. The unterminated line held from before the truncation was already read, so it's in `frames.dropped{reason="truncated"}` and not here. Recorded with that `frames.dropped` point: they're recorded at the end of the second scan that offers the truncated file's state to a claim, whether or not its listing failed, or up to two scans later while a file waiting to claim it could still do so, or at a stop, and a second truncation of the same file records the first's at once. If a new file claims the truncated file's state first (`.files.claimed`), only the bytes past the larger of the copy's length and the pre-truncation read offset are recorded, since they're in neither file, and the `frames.dropped` point isn't; a crash before then records neither. A file whose head is under 64 bytes can't be claimed, so its truncation records both at once. See [ADR `tail-content-identity`](../adr/tail-content-identity.md), decisions 5 and 7 |
 | `.files.claimed` | count | a file no checkpoint entry names that resumed at a candidate's position by content: an unspent checkpoint entry whose inode is gone (a restored backup, a migrated volume), an entry its own inode rejected (a `copytruncate` while `logit` was down), a truncated file's state from before the truncation (a `copytruncate` copy), or a tracked file at its line boundary (a plain copy). Decision 5 of the same ADR |
 | `.files.skipped{reason="compressed"}` | count | a matched file whose first bytes are a gzip, zstd, xz, or bzip2 magic, closed before any line of it is emitted. Once per inode per process: it's never counted again. A later scan leaves it closed while its path and size are unchanged, and sniffs it again, uncounted, after a rename or a size change (a compressor still writing, or a recycled inode). It's forgotten once its path is gone. A file shorter than a magic it could open (an empty one included) stays open and unread until its bytes decide. Not loss: under a pattern that matches rotated names, the content was read under its uncompressed name. Decision 2 of the same ADR |
-| `logit.input.frames.dropped{reason="oversize"\|"truncated"}` | count | `oversize`: a line over `max_line_bytes`, dropped whole by the line splitter, or under `docker_in` a reassembled message over it, dropped whole by the decoder (each with the `long_line` diagnostic), once each time it's read, so again after a restart; `truncated`: what an in-place truncation discards, the unterminated line held from before it, or under `docker_in` each stream's held reassembly, counted once with the unterminated line that continues it |
-| `.scan.errors{op="read_dir"\|"stat"}` | count | the number of failed listings, or failed `stat`s, in one `scan`, recorded once per scan per operation that had one. A failure retires no tracked file it may name: `read_dir` is a pattern's directory, `stat` a matched path (or `docker_in`'s container directory) that failed with anything but `NotFound` or `NotADirectory`. A missing directory is not an error. The rule's canonical table is `crates/logit-inputs/src/tail/pattern.rs`'s module doc. See [ADR `tail-discovery-failure-and-resume-identity`](../adr/tail-discovery-failure-and-resume-identity.md), decision 1 |
+| `logit.input.frames.dropped{reason="oversize"\|"truncated"\|"malformed"}` | count | `oversize`: a line over `max_line_bytes`, dropped whole by the line splitter, or under `docker_in` and `cri_in` a reassembled message over it, dropped whole by the decoder (each with the `long_line` diagnostic), once each time it's read, so again after a restart. Under `cri_in`, a record over the splitter's bound, `envelope_cap(max_line_bytes)`, drops its stream's line through its `F` and counts it once, with the decoder's other `oversize` drops, unless its leading bytes don't parse, when the driver counts it as for the other kinds. Under `docker_in`, and for a cri-dockerd file under `cri_in`, an envelope over that bound can't name its stream, so each stream's held reassembly is discarded and counted once, and the drop counts once of its own only when neither stream held or was dropping a line; `truncated`: what an in-place truncation discards, the unterminated line held from before it, or under `docker_in` and `cri_in` each stream's held reassembly, counted once with the unterminated line that continues it; `malformed`: under `cri_in`, a record with a missing field or an unknown stream, and under `docker_in` and for a cri-dockerd file, a json-file entry that isn't JSON or names an unknown stream, beside the `bad_line` diagnostic |
+| `logit.input.frames.truncated{reason="partial_timeout"}` | count | `cri_in` only: a held run of `P` records, or a cri-dockerd file's held fragment, delivered as it stands because its stream had no record for `partial_timeout` while the reader was at the file's end. Not loss: the run is delivered, and a later continuation is delivered as a second event |
+| `.scan.errors{op="read_dir"\|"stat"}` | count | the number of failed listings, or failed `stat`s, in one `scan`, recorded once per scan per operation that had one. A failure retires no tracked file it may name: `read_dir` is a pattern's directory, or under `cri_in` a pod or container directory, whose failure keeps the files beneath it and no others, `stat` a matched path (or `docker_in`'s container directory) that failed with anything but `NotFound` or `NotADirectory`. A missing directory is not an error. The rule's canonical table is `crates/logit-inputs/src/tail/pattern.rs`'s module doc. See [ADR `tail-discovery-failure-and-resume-identity`](../adr/tail-discovery-failure-and-resume-identity.md), decision 1 |
 | `.files.resume_rejected` | count | a resume refused, so the file starts at `0` instead: the file is shorter than the recorded head, its head bytes or the bytes before the offset hash differently, or the offset is past its length. The fingerprint and marker come from a checkpoint entry or a de-selection retention. Decision 2 of [ADR `tail-discovery-failure-and-resume-identity`](../adr/tail-discovery-failure-and-resume-identity.md) and decision 4 of [ADR `tail-content-identity`](../adr/tail-content-identity.md) |
 | `logit.input.bytes.dropped{reason="gone"}` | count | bytes a checkpoint entry recorded as unread (its `len` less its resume `offset`) when a restart's scan finds the entry's file under no path, removed or renamed out of every pattern before it was read to its end, or rejects the entry on its own inode and no new file matches it by content (decision 6 of ADR `tail-content-identity`; one whose head is under 64 bytes is never matched, so a copy that replays it doesn't stop the count). Counted once, by the first checkpoint write without the entry that lands, so a process that ends before that write leaves it for the next one to count; an entry whose path a failed listing covers waits for a listing that succeeds. Not counted for a stored path no current pattern covers (a `paths:` change, not loss). Exact only when no line was held or being dropped at the stop and a scan or a read to the end saw the file's final size. It includes bytes read after a held or dropping line's start (an oversize line's prefix, already counted in `frames.dropped{reason="oversize"}`, and under `docker_in` the other stream's delivered entries), misses appends nothing observed, and after a kill is approximate either way. See the same ADR's 2026-10-18 amendment and `docs/known-gaps/tailing.md` |
 | `logit.input.batches.dropped{reason="closed_consumer"}` | count | every batch no consumer took, the refused one included. The driver then stops writing the checkpoint, which stays at the last one written (at or before the last line a consumer took), and stops. Not disjoint from `logit.component.batches.sent`: the refused batch is also counted there and once per consumer in `logit.component.events.dropped{reason="closed_consumer"}`; batches after it that were never offered appear only here. |
@@ -1442,7 +1447,7 @@ own read-side counters:
 | `.watch.wakes{source="inotify"\|"poll"}` | count | which wake source fired |
 | `.watch.overflows` | count | the `inotify` queue overflowing into a full rescan |
 | `.watch.watches` | gauge | sampled alongside `.files.open`. See below. |
-| `.files.identity_changed` | count | `docker_in` only: `config.v2.json`'s own stat changed and the rebuilt resource differs in value, so the decoder's `Arc` was swapped |
+| `.files.identity_changed` | count | `docker_in`: `config.v2.json`'s own stat changed and the rebuilt resource differs in value, so the decoder's `Arc` was swapped. `cri_in`: a file's `container.id` found after the file was first read |
 | `.files.deselected` | count | `docker_in` only: a tracked container renamed out of `containers:`, closed rather than kept flowing |
 
 `.watch.watches` counts the watched directory plus one entry per currently-open file. It reports
@@ -1455,7 +1460,7 @@ the property the minimal-watch-set design is for.
 
 | Key | Meaning |
 |---|---|
-| `bad_line` / `long_line` / `invalid_utf8` | A line that wouldn't decode, exceeded `max_line_bytes`, or needed a lossy UTF-8 conversion. |
+| `bad_line` / `long_line` / `invalid_utf8` | A line that wouldn't decode, exceeded `max_line_bytes`, or needed a lossy UTF-8 conversion. Under `cri_in`, `invalid_utf8` is checked once over a reassembled line, not per record. |
 | `open_error` / `read_error` | A file this driver is trying to track. |
 | `renamed` | A same-inode rebind following a *file* rename. Not the same as `docker_in`'s `container_renamed`, which is the same file with a new identity. |
 | `scan_error` | A `scan`'s `read_dir` or `stat` failed, carrying the first failing path, its error, and how many failed in that scan. One per `.scan.errors` point. |
@@ -1469,7 +1474,8 @@ the property the minimal-watch-set design is for.
 | `watch_error` | The one-shot cases: `auto` falling back to polling; a *file* watch that failed, which isn't retried (the file is still tailed, at `poll_interval`); or the `inotify` wake source itself becoming unusable, after which the listener runs poll-only. |
 | `watch_dir_error` | A directory watch that failed, carrying the errno. Its own key because it's retried, and so re-counted, on every later `scan` while the directory is missing, and `warn_throttled` logs a key only at powers of two of its count. Sharing a key would silence the one-shot cases above. |
 | `metadata_error` | `docker_in` only: `config.v2.json` missing or unparseable. Degrades to a `container.id`-only resource rather than refusing to tail. A missing file is retried on every poll tick; one that exists but won't parse is retried on its next stat change, because the stat cache caches a failed read the same way it caches a successful one. Diagnosed again only once it recovers or the stat changes, not once per tick. |
-| `bad_time` | `docker_in` only: the envelope's own `time` field didn't parse. Falls back to read time. |
+| `container_id_error` | `cri_in` only: `containers_dir` couldn't be listed or one of its links read, for a reason other than the directory not existing. Keeps the ids already read and counts nothing: no data is lost, only an attribute. A missing `containers_dir` raises nothing. |
+| `bad_time` | `docker_in` and `cri_in`: the envelope's `time` field, or the CRI record's timestamp, didn't parse. Falls back to read time. |
 | `container_renamed` | `docker_in` only, `Diagnostics::info` rather than `warn_throttled`, because a rename is normal operation: the container's identity changed and the decoder's resource was swapped. |
 | `container_deselected` | `docker_in` only, `Diagnostics::info`: a tracked container renamed out of the configured selection stopped flowing. Its offset is retained in memory only, not across a restart. |
 
@@ -1572,11 +1578,11 @@ those values as *fields*, not as a rendered message.
 |---|---|---|
 | `logit.input.lines` / `.line.bytes` | count | every non-blank `format: json` line read, a refused one included |
 | `logit.input.frames` / `.frame.bytes` | count | every `format: native` frame that passes its CRC, before it's decoded |
-| `logit.input.frames.dropped{reason}` | count | a skipped line or frame: `undecodable` for a JSON line, and `magic`, `version`, `too_large`, `crc`, `codec`, `decode_budget`, `malformed`, or `truncated` for a frame. The module doc's table says what each covers |
+| `logit.input.frames.dropped{reason}` | count | a skipped line or frame: `undecodable` for a JSON line, and `magic`, `version`, `too_large`, `crc`, `codec`, `decode_budget`, `malformed`, or `truncated` for a frame, and `decompress` for a compressed file the decoder could not finish. The module doc's table says what each covers |
 | `logit.input.batches.dropped{reason="closed_consumer"}` | count | a batch no consumer took, after which the read stops |
 
 `Diagnostics` keys: `bad_line` (a refused JSON line, with its line number), `bad_frame` (a skipped
-frame, with its byte offset), `truncated` (the file ends inside a frame), and `closed_consumer`.
+frame, with its byte offset), `truncated` (the file ends inside a frame), `bad_compression` (a gzip or zstd stream that could not be finished), and `closed_consumer`.
 
 ##### `kafka_in`
 
@@ -2560,6 +2566,27 @@ spans, or metrics it holds.
 the broker's error code name and message. The broker settles a
 partition batch once per `logit` batch, and a retry never resends a settled one, so every count
 but `requests` and `reconnects` is met once per batch.
+
+##### `s3_out`
+
+`crates/logit-outputs/src/s3/`, [ADR `s3-object-archive`](../adr/s3-object-archive.md),
+decision 8. Every count is per request or per object: the json and native encoders count nothing,
+so the sink holds no `BatchAccounting` gate, and loss is the runtime's to count.
+
+| Name | Kind | Meaning |
+|---|---|---|
+| `logit.output.requests{op, class}` | count | one per request; `op` is `put_object`, `create_upload`, `upload_part`, `complete_upload`, or `abort_upload`, and `class` the status class (`status_class`), `connect_error` for a failed dial (a dial `connect_timeout:` ended included), or `network_error` for any other transport error or a timeout |
+| `logit.output.request.duration{op}` | timer | one sample per request that returned, answered or failed; a request the shutdown grace cancels records none |
+| `logit.output.objects` | count | one per object stored |
+| `logit.output.parts` | count | one per `UploadPart` request, answered or not; a `PutObject` counts none |
+| `logit.output.bytes` | count | the compressed bytes of every `PutObject` and `UploadPart` body sent, resends included; a failed dial sent none |
+| `logit.output.uploads.abandoned{aborted}` | count | one per multipart upload the sink gave up while running, after a failed part or completion, or one a cancelled call left: `aborted="true"` when its `AbortMultipartUpload` succeeded or found the upload gone, `"false"` when it failed and the bucket's lifecycle rule must remove the parts. An upload open at a crash or a cut shutdown isn't counted |
+
+The window's own `logit.component.window.closed{cause}`, and `send.duration` measured from an
+object's close to its answer, are layer 2's
+([ADR `collecting-sink-window`](../adr/collecting-sink-window.md), decision 4). No
+`Diagnostics` key: a failed request's error carries the bucket, the key, the status, and S3's
+`<Code>` and `<Message>`, never a credential.
 
 ##### `logit_out`
 

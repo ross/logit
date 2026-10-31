@@ -1,6 +1,6 @@
 ---
 created: 2026-10-08
-updated: 2026-10-29
+updated: 2026-10-30
 ---
 
 # A soak harness: real containers over ordinary config, one-shot netem, and a reset-aware ledger as the loss oracle
@@ -838,3 +838,31 @@ must read as `ambiguous` at its `ack_timeout`. A poll is no write: it spends no 
 holds no samples. `after = K` lets K writes through before a cue answers, so a busy `503` lands
 on a batch's second body, after its first was accepted.
 [`docs/plans/soak-harness.md`](../plans/soak-harness.md), "Stand-in targets", has the rules.
+
+## Amendment: a `cri` wire judges logical lines from a writer of the harness's own (2026-10-30)
+
+`cri_in` reads a kubelet pod log tree in the CRI format, which no `logit` sink writes: a line split
+into 16 KiB `P` pieces and an `F`, interleaved streams, a short `P` whose `F` follows seconds later,
+as CRI-O's conmon writes a partial write (containerd writes a `P` only at 16 KiB or at a reopen),
+and the kubelet's rotation, which renames the live file to a dated name, has the runtime reopen it,
+and gzips the older rotated files. So a `cri` source's generator is
+`tools/soak/soaklib/criwriter.py`, a stdlib writer run in the stand-in's Python image with a JSON
+config. It reports on stdout in `internal`'s NDJSON grammar, so every row reads it as it reads a
+`logit` writer, without a second telemetry reader. Its config is named `*.json`, so
+`script/validate` never reads it as a `logit` config, and `load()` checks it with the writer's own
+rules.
+
+G is the logical lines it finished, one per `F` record. W is `cri_in`'s
+`logit.component.events.sent`, not `logit.input.lines`, which counts each record. A run held past
+`partial_timeout` leaves as two events, and `cri_in` counts each such flush once in
+`logit.input.frames.truncated{reason="partial_timeout"}`, S, so `ledger.wire` judges W − S + F − G
+against the replay band, and the end-to-end bound adds S. That holds while every flushed run's rest
+arrives, which the writer guarantees by finishing every line before it exits; a container exit
+mid-line, whose head never gets its rest, is left out of the writer for that reason. `cri_in` pins a
+file's checkpoint at a held run's first record, after which it has sent the other stream's lines, so
+a stop or a kill while a run is held replays them: on a `cri` wire each stopped and killed life
+widens the band above by its rate times `partial_timeout` plus `poll_interval`. The end count reads
+the tree's `F` records, gzip files decompressed, and that count plus the lines the writer's
+rotations removed, which it reports, must equal G. `cri_in` never reads a `.gz`, so a SUT down
+across two rotations, or paused across three, loses a file's unread tail, and the row FAILs such a
+window as the scenario's fault.
