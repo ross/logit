@@ -2162,7 +2162,7 @@ fn kafka_in_settings(
         }
         logit_config::KafkaFormat::Msgpack => KafkaInFormat::Msgpack,
         logit_config::KafkaFormat::OtlpProto | logit_config::KafkaFormat::OtlpJson => {
-            // Rule 102 admits only these keys, each topic once.
+            // Rule 103 admits only these keys, each topic once.
             let logit_config::KafkaInTopics::Signals(map) = topics else {
                 anyhow::bail!("component '{id}': kafka_in under an OTLP format needs a topics map")
             };
