@@ -1,6 +1,7 @@
 /target
 .env
 *.log
+!/testdata/interop/cri/**/*.log
 __pycache__/
 
 # tools/* are each their own standalone [workspace] (never a member of the root one -- see
