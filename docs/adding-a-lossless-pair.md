@@ -119,11 +119,13 @@ there.
   `Vec::with_capacity` from a wire count has been a blocking finding more than once; clamp to a
   constant and let the budget charge the rest.
 - Tests: a fixed-point suite, `crates/logit-proto/tests/<proto>_fixed_point.rs` (one per payload
-  family where the protocol has several, as Datadog's are), asserting `decode -> encode -> decode`
-  equality over hand-built bodies that exercise every survey feature; a robustness section in
-  `crates/logit-proto/tests/robustness.rs` that pins the worst-case allocation under a hostile
-  length; and an interop test, `crates/logit-proto/tests/<proto>_interop.rs`, that decodes the
-  recorded corpus and asserts identifiable values, never whole-file bytes.
+  family where the protocol has several, as Datadog's are; statsd and syslog assert theirs in the
+  round trip instead), asserting `decode -> encode -> decode` equality over hand-built bodies that
+  exercise every survey feature; a robustness section in `crates/logit-proto/tests/robustness.rs`
+  that pins the worst-case allocation under a hostile length; and an interop test that decodes the
+  recorded corpus and asserts identifiable values, never whole-file bytes:
+  `crates/logit-proto/tests/<proto>_interop.rs` where the pair has one, otherwise the pair's round
+  trip.
 - A fuzz target: `fuzz/fuzz_targets/<proto>.rs`, a `[[bin]]` in `fuzz/Cargo.toml`, a row in
   `script/unsafe-check`'s `FUZZ_TARGETS` table with its `max_len` and allocation limit, a seed
   source in `fuzz/seedgen`, the regenerated `fuzz/seeds/<target>/`, and a bullet in
