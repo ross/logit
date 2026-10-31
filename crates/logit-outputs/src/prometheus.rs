@@ -671,6 +671,20 @@ impl Output for PrometheusOutput {
         }
     }
 
+    fn collecting(&self) -> Option<tokio::time::Instant> {
+        match self {
+            PrometheusOutput::Expose(output) => output.collecting(),
+            PrometheusOutput::Send(output) => output.collecting(),
+        }
+    }
+
+    fn reached_destination(&self, left_the_process: usize) -> usize {
+        match self {
+            PrometheusOutput::Expose(output) => output.reached_destination(left_the_process),
+            PrometheusOutput::Send(output) => output.reached_destination(left_the_process),
+        }
+    }
+
     fn send_duration_per_batch(&self) -> bool {
         match self {
             PrometheusOutput::Expose(output) => output.send_duration_per_batch(),

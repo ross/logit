@@ -21,6 +21,7 @@ pub mod ndjson;
 pub mod null;
 pub mod otlp;
 pub mod prometheus;
+pub mod s3;
 pub mod splunk;
 pub mod statsd;
 pub mod stdio;

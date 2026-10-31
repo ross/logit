@@ -1,7 +1,8 @@
 //! Rotation-, truncation-, and checkpoint-aware file tailing into log events. [`TailInput`]
-//! (`tail_in`) emits one raw log event per line; `crate::docker`'s `docker_in` runs the same
-//! [`driver::Tailer`] with a json-file envelope decoder in place of [`line::LineDecoder`]. See
-//! `docs/adr/file-tailing-and-docker-json-logs.md`.
+//! (`tail_in`) emits one raw log event per line; `crate::docker`'s `docker_in` and `crate::cri`'s
+//! `cri_in` run the same [`driver::Tailer`] with their own decoders in place of
+//! [`line::LineDecoder`]. See `docs/adr/file-tailing-and-docker-json-logs.md` and
+//! `docs/adr/cri-container-logs.md`.
 //!
 //! **No receive queue.** A datagram listener needs a `ReceiveQueue`
 //! (`docs/adr/decoupled-listener-io.md`) because a kernel socket buffer can't be asked to wait. A
@@ -18,13 +19,14 @@ mod line_verification;
 mod pattern;
 mod watch;
 
-#[cfg(test)]
-pub(crate) use line::LineSplitter;
 pub use line::{LineDecoder, TailDecoder};
+#[cfg(test)]
+pub(crate) use line::{LineSplitter, Split};
+pub(crate) use pattern::{is_container_dir, log_restart_count, name_of, pod_dir_parts};
 pub use pattern::{PathPattern, Scan};
 
-// `pub(crate)` so `crate::docker` can build `docker_in` on the same driver.
-pub(crate) use driver::{DecoderFactory, Refresh, Tailer};
+// `pub(crate)` so `crate::docker` and `crate::cri` can build their kinds on the same driver.
+pub(crate) use driver::{ensure_utf8, DecoderFactory, Refresh, Tailer};
 use logit_core::{Diagnostics, Resource, Telemetry};
 use logit_pipeline::Fanout;
 use std::path::PathBuf;

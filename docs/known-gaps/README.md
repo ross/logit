@@ -32,6 +32,6 @@ open: a deferred fix, a revisit trigger, unverified behavior, or residual lossle
 | [otlp.md](otlp.md) | `otlp_in` and `otlp_out` |
 | [prometheus.md](prometheus.md) | `prometheus_in` and `prometheus_out`, scrape and remote-write |
 | [sinks.md](sinks.md) | `file_out` and `stdio_out`, the stream sinks' uncounted unacknowledged bytes, the multi-request sinks' retry memory, and kept-alive connections a destination closed first; `influxdb_out`'s gaps are in [influxdb.md](influxdb.md), [mappings.md](mappings.md), and [prometheus.md](prometheus.md) |
-| [tailing.md](tailing.md) | `tail_in`, `docker_in`, and `replay_in` |
+| [tailing.md](tailing.md) | `tail_in`, `docker_in`, `cri_in`, and `replay_in` |
 | [transforms.md](transforms.md) | predicates and `sample`, `shape`, `aggregate`, `cumulative_to_delta`, `http_access` and the access-log servers, and Lua |
 | [telemetry.md](telemetry.md) | internal telemetry, internal spans, self-logging, and the load-test harness |
