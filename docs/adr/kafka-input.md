@@ -325,7 +325,7 @@ A revoke, at every rebalance and at shutdown, runs in this order:
 1. Every fetch loop stops, and buffered records not yet in a batch are discarded; the next owner
    reads them.
 2. The batch in flight gets the drain deadline, `drain_timeout` (default 5 s, kept below
-   `rebalance_timeout` by graph rule 101). Shutdown caps it at the lesser of `drain_timeout` and
+   `rebalance_timeout` by graph rule 102). Shutdown caps it at the lesser of `drain_timeout` and
    half of `shutdown_grace` from when shutdown is seen, over a revoke's drain already running,
    so the other half is left for step 3 and LeaveGroup. A batch
    accepted by then advances the position. One that isn't is not sent, not committed, and counted
@@ -446,7 +446,7 @@ batch`.
   topic is the only signal there is. Unlike `kafka_out`'s, the map has no defaults: a key left out
   isn't subscribed, because `kafka_in` can't tell which signals a pipeline wants, and subscribing
   a missing `otlp_metrics` would hold a missing-topic diagnostic forever. Two signals on one topic
-  are rejected (graph rule 102), since a protobuf request doesn't name its signal. The other
+  are rejected (graph rule 103), since a protobuf request doesn't name its signal. The other
   formats take `topics:` as a list of names.
 - **Timestamps.** Under `text`, the event's timestamp is the record's, at millisecond precision;
   a record with no timestamp (`-1`) takes the read time. Under every other format, the payload's
@@ -541,16 +541,16 @@ kafka:
 
 Graph rules, numbered from the next free one:
 
-- **Rule 100**: a `kafka_in` with an empty `brokers` or an entry that isn't `host:port`, a bad
+- **Rule 101**: a `kafka_in` with an empty `brokers` or an entry that isn't `host:port`, a bad
   `tls` or `sasl` (rule 85's helpers, shared), an empty `group` or `client_id`, an empty `topics`,
   a topic that isn't a legal Kafka name or that repeats, a `fetch` bound of 0, a `min_bytes` over
   `max_bytes`, a `fetch.max_bytes` plus `max_batch_bytes` that doesn't fit Fetch's i32 `max_bytes`
   field, a `max_wait` not below `timeout`, or a `max_batch_bytes`, `commit_interval`, `drain_timeout`, or
   `timeout` of 0.
-- **Rule 101**: a `kafka_in` whose `heartbeat_interval` isn't below `session_timeout`, whose
+- **Rule 102**: a `kafka_in` whose `heartbeat_interval` isn't below `session_timeout`, whose
   `session_timeout` is over `rebalance_timeout`, or whose `drain_timeout` isn't below
   `rebalance_timeout`.
-- **Rule 102**: a `kafka_in` whose `topics:` shape doesn't match its `format:` (a map under the OTLP
+- **Rule 103**: a `kafka_in` whose `topics:` shape doesn't match its `format:` (a map under the OTLP
   formats, a list under the others), an OTLP map with a key other than `logs`, `metrics`, or
   `traces`, no key, or one topic under two keys, or a `record:` under any format but `text`.
 - **Rule 17** gains `kafka_in` beside the stream and tail listeners (item 5).

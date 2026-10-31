@@ -140,9 +140,9 @@ The protocol client, with no `Input` and no config: everything W3 drives.
   ADR's item 14 with its operator doc comment, `deny_unknown_fields`, the `topics:` list-or-map
   type, `record:` reused from `kafka_out`, `TlsClientConfig` and `KafkaSasl` shared;
   `script/schema`.
-- **Graph rules.** Rules 100, 101, and 102 in `crates/logit-pipeline/src/graph.rs` (its module
+- **Graph rules.** Rules 101, 102, and 103 in `crates/logit-pipeline/src/graph.rs` (its module
   doc's "Validation rules" is the canonical list), reusing rule 85's broker, topic, TLS, and SASL
-  helpers, and rule 17's predicates extended to `kafka_in`. Rule 100 also rejects a
+  helpers, and rule 17's predicates extended to `kafka_in`. Rule 101 also rejects a
   `fetch.max_bytes` plus `max_batch_bytes` that doesn't fit Fetch's i32 `max_bytes` field: the
   consumer reads a Fetch answer under that sum plus 1 MiB.
   [docs/design/pipeline-graph.md](../design/pipeline-graph.md)'s "Validation" mirrors them. A test
@@ -361,7 +361,7 @@ Recorded per workstream as each lands.
   behind a `closed_consumer` drop count `batches.deferred`, since nothing past the dropped one is
   committed. A `text` value is never `empty`: an empty value is a log with an empty message, as
   `kafka_out` writes one. The `fetch` byte bounds are byte-count strings, as every other byte field
-  in the config is, so `min_bytes: 1` is written `"1"`. Rule 100 bounds `fetch.max_bytes` plus
+  in the config is, so `min_bytes: 1` is written `"1"`. Rule 101 bounds `fetch.max_bytes` plus
   `max_batch_bytes` by Fetch's `i32` `max_bytes` field, not by the connection's 64 MiB response
   cap. A repeated header name can't come from `kafka-protocol`'s producer types, so the carrier
   tests hand-build a record batch.

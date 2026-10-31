@@ -2178,7 +2178,7 @@ fn kafka_in_settings(
         logit_config::KafkaInTopics::List(list) => list.clone(),
         logit_config::KafkaInTopics::Signals(map) => map.values().cloned().collect(),
     };
-    // Rule 100 keeps `fetch.max_bytes` plus `max_batch_bytes` within `i32`; a larger
+    // Rule 101 keeps `fetch.max_bytes` plus `max_batch_bytes` within `i32`; a larger
     // `max_partition_bytes` saturates.
     let bytes = |n: u64| i32::try_from(n).unwrap_or(i32::MAX);
     let mut consumer = ConsumerSettings::new(brokers.clone(), group, topics);

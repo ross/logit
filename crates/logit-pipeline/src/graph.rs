@@ -4004,7 +4004,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         check_kafka_tls_sasl(id, "kafka_out", tls.as_ref(), sasl.as_ref())?;
     }
 
-    // Rule 100: `kafka_in`'s own bounds (`docs/adr/kafka-input.md`, item 14), with rule 85's
+    // Rule 101: `kafka_in`'s own bounds (`docs/adr/kafka-input.md`, item 14), with rule 85's
     // broker, topic, TLS, and SASL checks. The consumer reads a Fetch answer under a cap of
     // `fetch.max_bytes + max_batch_bytes + 1 MiB` and sends that sum in the request's `i32`
     // `max_bytes` field, so the sum must fit it. A broker holds a fetch open for
@@ -4053,7 +4053,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                      not '.' or '..'"
                 );
             }
-            // A map's repeat is rule 102's, whose message names the two signals.
+            // A map's repeat is rule 103's, whose message names the two signals.
             let listed = matches!(topics, logit_config::KafkaInTopics::List(_));
             if listed && !seen.insert(topic) {
                 anyhow::bail!(
@@ -4104,7 +4104,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         check_kafka_tls_sasl(id, "kafka_in", tls.as_ref(), sasl.as_ref())?;
     }
 
-    // Rule 101: `kafka_in`'s group timing (`docs/adr/kafka-input.md`, item 14). A heartbeat at
+    // Rule 102: `kafka_in`'s group timing (`docs/adr/kafka-input.md`, item 14). A heartbeat at
     // or past the session timeout lets the session expire between beats. The broker refuses a
     // JoinGroup whose session timeout is over its rebalance timeout, as the Java client does. A
     // drain that outlasts the rebalance timeout lets the coordinator drop the member mid-drain.
@@ -4139,7 +4139,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 102: `kafka_in`'s `topics:` shape and `record:` (`docs/adr/kafka-input.md`, items 11
+    // Rule 103: `kafka_in`'s `topics:` shape and `record:` (`docs/adr/kafka-input.md`, items 11
     // and 14). An OTLP request doesn't name its signal, so the topic does, and one topic can't
     // carry two signals. Only `text` can't tell a batch record from an event record by its bytes.
     for (id, component) in &components {
@@ -8269,7 +8269,7 @@ mod tests {
         assert!(err.contains("'idle_timeout' must be greater than 0s"), "got: {err}");
     }
 
-    // ---- rules 100 to 102: kafka_in --------------------------------------------------------
+    // ---- rules 101 to 103: kafka_in --------------------------------------------------------
 
     /// A `kafka_in` reading `logs` as `json`, with every optional field at its default.
     fn kafka_in() -> ComponentKind {
@@ -8335,9 +8335,9 @@ mod tests {
         assert_eq!(graph.components["in"].kind_name(), "kafka_in");
     }
 
-    /// Rules 100, 101, and 102, one clause per case.
+    /// Rules 101, 102, and 103, one clause per case.
     #[test]
-    fn rules_100_to_102_reject_each_kafka_in_misconfiguration() {
+    fn rules_101_to_103_reject_each_kafka_in_misconfiguration() {
         use logit_config::{KafkaFormat, KafkaInTopics, KafkaRecord, KafkaSasl, TlsClientConfig};
         type Edit = Box<dyn FnOnce(&mut ComponentKind)>;
         let edit = |f: fn(&mut ComponentKind)| -> Edit { Box::new(f) };
@@ -8349,7 +8349,7 @@ mod tests {
             };
         }
         let cases: Vec<(&str, Edit)> = vec![
-            // Rule 100.
+            // Rule 101.
             ("kafka_in 'brokers' is empty", set!(brokers => { brokers.clear(); })),
             ("isn't a host:port", set!(brokers => { *brokers = vec!["kafka".into()]; })),
             ("kafka_in 'group' is empty", set!(group => { group.clear(); })),
@@ -8429,7 +8429,7 @@ mod tests {
                     *sasl = Some(KafkaSasl::AwsMskIam { region: Some("mars".into()) });
                 }),
             ),
-            // Rule 101.
+            // Rule 102.
             (
                 "'heartbeat_interval' must be below 'session_timeout'",
                 set!(heartbeat_interval, session_timeout => {
@@ -8446,7 +8446,7 @@ mod tests {
                 "'drain_timeout' must be below 'rebalance_timeout'",
                 set!(drain_timeout, rebalance_timeout => { *drain_timeout = *rebalance_timeout; }),
             ),
-            // Rule 102.
+            // Rule 103.
             (
                 "needs 'topics' as a map of signal to topic",
                 set!(format => { *format = KafkaFormat::OtlpProto; }),
