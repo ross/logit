@@ -197,18 +197,18 @@ stop_legs_as() {
 }
 
 # committed_past <broker>: whether the `consume-restart` group has committed past
-# restart-before.offsets on every partition of `restart`, leaving the last describe in
+# restart-after.offsets on every partition of `restart`, leaving the last describe in
 # restart-committed.txt for check.py.
 committed_past() {
     local out="${RUN_DIR}/readback/$1"
     kafka_tool kafka-consumer-groups.sh --bootstrap-server "$1:9092" --describe \
         --group consume-restart >"${out}/restart-committed.txt" 2>>"${RUN_DIR}/logs/readback.log" ||
         return 1
-    awk 'FNR == NR { split($0, f, ":"); if (f[1] == "restart") { before[f[2]] = f[3]; n++ }; next }
-        $1 == "consume-restart" && $2 == "restart" && $4 ~ /^[0-9]+$/ && ($3 in before) &&
-            $4 > before[$3] { past++ }
+    awk 'FNR == NR { split($0, f, ":"); if (f[1] == "restart") { after[f[2]] = f[3]; n++ }; next }
+        $1 == "consume-restart" && $2 == "restart" && $4 ~ /^[0-9]+$/ && ($3 in after) &&
+            $4 > after[$3] { past++ }
         END { exit !(n > 0 && past == n) }' \
-        "${out}/restart-before.offsets" "${out}/restart-committed.txt"
+        "${out}/restart-after.offsets" "${out}/restart-committed.txt"
 }
 
 # netem set|clear <broker> [<ip>]: tools/kafka-interop/netem-drop.sh in the broker's network
@@ -598,14 +598,16 @@ say "starting the broker-restart legs"
 started=$(date +%s)
 ki_compose up -d --no-deps "${RESTART_LEGS[@]}" >/dev/null
 sleep "${RESTART_AT}"
-for broker in "${BROKERS[@]}"; do
-    kafka_tool kafka-get-offsets.sh --bootstrap-server "${broker}:9092" --topic restart \
-        >"${RUN_DIR}/readback/${broker}/restart-before.offsets" 2>>"${RUN_DIR}/logs/readback.log"
-done
 say "restarting both brokers with the members reading"
 restart_brokers
 # The first life must read past the restart: wait until each member's group has committed past
-# the end offsets the topic had before the restart, on every partition, then stop it.
+# the end offsets the topic had once both brokers were healthy again, on every partition, then
+# stop it. A member keeps reading and committing until its own broker goes down, so only a fetch
+# made after the restart can commit past offsets read after it.
+for broker in "${BROKERS[@]}"; do
+    kafka_tool kafka-get-offsets.sh --bootstrap-server "${broker}:9092" --topic restart \
+        >"${RUN_DIR}/readback/${broker}/restart-after.offsets" 2>>"${RUN_DIR}/logs/readback.log"
+done
 say "waiting for the broker-restart members to commit past the restart"
 deadline=$(($(date +%s) + RESTART_READ_TIMEOUT))
 pending=("${BROKERS[@]}")

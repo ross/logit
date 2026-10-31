@@ -26,7 +26,8 @@ script has already written, under /out (the run directory):
                                         the relay leg's generators wrote
     readback/<broker>/consume.offsets   kafka-get-offsets.sh for the consumer legs' topics, and
     readback/<broker>/restart.offsets   for the broker-restart leg's
-    readback/<broker>/restart-before.offsets  for `restart` before the first broker restart
+    readback/<broker>/restart-after.offsets  for `restart` once both brokers were healthy
+                                        after the first restart
     readback/<broker>/restart-committed.txt  kafka-consumer-groups.sh --describe of the
                                         broker-restart leg's group before its first life stopped
     readback/<broker>/group-mixed-console.tsv  the group-mixed leg's console consumer's records,
@@ -1398,7 +1399,7 @@ def leg_consume_restart(broker):
     if events is None:
         return "FAIL", "the leg wrote no events"
     ends = {k: v for k, v in consume_offsets(broker, "restart").items() if k[0] == "restart"}
-    before = {k: v for k, v in consume_offsets(broker, "restart-before").items()
+    after = {k: v for k, v in consume_offsets(broker, "restart-after").items()
               if k[0] == "restart"}
     committed = restart_committed(broker)
     tele = telemetry("in-restart", broker)
@@ -1417,8 +1418,8 @@ def leg_consume_restart(broker):
     detail = (f"{len(events)} events for {len(seqs)} of {RESTART_RECORDS} records, {duplicates} "
               f"offset(s) read twice, offsets.reset{{reason=no_commit}} {resets}, rebalances "
               f"{rebalances}, commits {commits}, broker.errors {errors}, batches.deferred {deferred}, "
-              f"end offsets before the first restart {sorted(before.values())}, committed before "
-              f"the stop {sorted(committed.values())}")
+              f"end offsets after the first restart {dict(sorted((p, o) for (_, p), o in after.items()))}, "
+              f"committed before the stop {dict(sorted(committed.items()))}")
     if not ends:
         return "FAIL", "no end offsets read for restart"
     if missing or seqs != set(range(RESTART_RECORDS)):
@@ -1432,10 +1433,11 @@ def leg_consume_restart(broker):
     if not errors:
         return "FAIL", f"no broker error counted, so the restart never reached the member; {detail}"
     # The first life read past the restart: before the script stopped it, the group had committed
-    # past the end offsets the topic had when the brokers went down, on every partition.
-    if len(before) != RESTART_PARTITIONS:
-        return "FAIL", f"no end offsets read before the first restart; {detail}"
-    behind = sorted(p for (_, p), end in before.items() if committed.get(p, -1) <= end)
+    # past the end offsets the topic had once both brokers were healthy again, on every partition,
+    # which only a fetch made after the restart can do.
+    if len(after) != RESTART_PARTITIONS:
+        return "FAIL", f"no end offsets read after the first restart; {detail}"
+    behind = sorted(p for (_, p), end in after.items() if committed.get(p, -1) <= end)
     if behind:
         return "FAIL", (f"the first life committed nothing past the restart on partition(s) "
                         f"{behind}; {detail}")
