@@ -366,8 +366,9 @@
 //!      passes S3's 1,024 bytes or that make an empty, `.`, or `..` segment; a `max_bytes` of
 //!      `0` or above 9,000 times `part_size`, which would pass S3's 10,000 parts; a `part_size`
 //!      outside S3's 5 MiB to 5 GiB; a `max_age`, `timeout`, or `connect_timeout` of `0s`; an
-//!      `sse` `kms_key_id` or `bucket_key` outside `aws_kms`, or an empty `kms_key_id`; `credentials` with an empty value; or a `tls` failing
-//!      rule 24's checks, a block under an `http://` `endpoint` included
+//!      `sse` `kms_key_id` or `bucket_key` outside `aws_kms`, or an empty `kms_key_id`;
+//!      `credentials` with an empty value; or a `tls` failing rule 24's checks, a block under an
+//!      `http://` `endpoint` included
 //!      (`docs/adr/s3-object-archive.md`, decision 7).
 //! 101. A `kafka_in` with an empty `brokers` or an entry that isn't a `host:port`, a `tls` or
 //!      `sasl` failing 85's checks, an empty `group` or `client_id`, an empty `topics`, a topic
