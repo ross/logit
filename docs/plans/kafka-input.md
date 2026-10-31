@@ -403,8 +403,10 @@ Recorded per workstream as each lands.
 - **W6a**: Every consumer leg passed on both brokers, with no `kafka_in` bug and nothing in the
   ADR's protocol table contradicted. A broker restart within the session timeout doesn't cost a
   classic group its members: Apache Kafka 4.2.0 and Redpanda v26.2.3 both reload the group with
-  its offsets, so the member read through the restart with no rejoin, and the leg restarts the
-  broker a second time with the member stopped to show a later life resuming from the commit.
+  its offsets, so the member read through the restart with no rejoin and committed past the
+  topic's end offsets at the restart on every partition before the leg stopped it. The leg then
+  restarts the broker a second time with the member stopped to show a later life resuming from
+  the commit.
   Java 4.2's console consumer and `kafka_in` settle on `range` on both brokers, and each side's
   revoke commits before the rejoin, so partitions move with nothing read twice. Both brokers name
   the aborted transactions under `read_committed`, Redpanda included. The OTLP formats' relay

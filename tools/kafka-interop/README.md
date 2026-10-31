@@ -19,7 +19,7 @@ test depends on it running. A run takes about 10 minutes once the images are bui
 | `kafka` | `apache/kafka:4.2.0` | single-node KRaft broker, started on `kafka-server.properties` |
 | `redpanda` | `redpandadata/redpanda:v26.2.3` | single-node Redpanda in `dev-container` mode, started on `redpanda.yaml` |
 | `oauth` | `ghcr.io/navikt/mock-oauth2-server:6.0.2`, pinned by digest | the OAuth 2.0 server the OAUTHBEARER legs fetch tokens from and both brokers validate them against |
-| `collector-<broker>` | `otel/opentelemetry-collector-contrib:0.162.0`, pinned by digest | one per broker, started on `collector.yaml`: `kafkareceiver`s on the OTLP legs' topics, each pipeline ending in a `file` exporter that writes OTLP/JSON to the run directory's `collector/<broker>/`, and `kafkaexporter`s that re-key the `keyed` traces |
+| `collector-<broker>` | `otel/opentelemetry-collector-contrib:0.162.0`, pinned by digest | one per broker, started on `collector.yaml`: `kafkareceiver`s on the OTLP legs' topics, each pipeline ending in a `file` exporter that writes OTLP/JSON to the run directory's `collector/<broker>/`, `kafkaexporter`s that re-key the `keyed` traces, and `kafka/out-proto` and `kafka/out-json`, which write what the Collector decoded back to Kafka as `collector-{proto,json}-{logs,metrics,spans}` for the `consume-collector-*` legs |
 | `logit-<leg>-<broker>` | `logit:kafka-interop`, built from the current tree | one per `logit-<leg>-<broker>.yaml`, and one per `logit-in-<leg>-<broker>.yaml` |
 
 Each broker has five client listeners: plain on `:9092`, TLS on `:9093`, mutual TLS, which
@@ -52,7 +52,7 @@ The legs, each run against both brokers:
 | `timestamp` | `logit-timestamp-*.yaml` | in each batch of 10, the event stamped at 2100-01-01 is dropped and counted as `invalid_timestamp`, and the other nine land |
 
 The consumer legs, each run against both brokers. Every `kafka_in` starts at `earliest` in a
-group of its own, and writes each event it reads, with its `_logit.kafka.*` carriers, to a
+group of its own, except the group legs' members, which share one, and writes each event it reads, with its `_logit.kafka.*` carriers, to a
 `stdio_out` `format: json` file in the run directory, which `check.py` reads:
 
 | Leg | Config | What it checks |
@@ -63,7 +63,7 @@ group of its own, and writes each event it reads, with its `_logit.kafka.*` carr
 | `consume-group-join` | `logit-in-group-join-{a,b}-*.yaml` | member `a` writes 400 records keyed by `seq` to a 6-partition topic and reads it; member `b` joins 20 s later. Every offset is read, no offset is read twice, and no partition changes member more than once in offset order |
 | `consume-group-kill` | `logit-in-group-kill-{a,b}-*.yaml` | both members start together and the script kills `b` with SIGKILL 20 s in. Every offset is read, `a` reads again at most a commit interval of what `b` had read, and no partition changes member more than twice: to `b` at its join, and back after its session expires |
 | `consume-group-mixed` | `logit-in-group-mixed-*.yaml` | `kafka_in` and a `kafka-console-consumer.sh` share one group. `kafka-consumer-groups.sh --describe --state`, read while both are members, shows two members and the `range` strategy, and their reads together cover every offset, with no partition changing member more than twice |
-| `consume-broker-restart` | `logit-in-restart-*.yaml`, `logit-in-restart-produce-*.yaml` | runs alone after the other legs: 300 records at 5 a second. The broker restarts 20 s in with the member reading; then the member stops, which commits and leaves, the broker restarts again, and the member starts once more. Every offset is read, at most a commit interval is read twice, the member counted the outage in `broker.errors`, and `start:` resolved once per partition only (`offsets.reset{reason="no_commit"}` 3 over two `start` joins), so the second life resumed from the commit that outlived both restarts |
+| `consume-broker-restart` | `logit-in-restart-*.yaml`, `logit-in-restart-produce-*.yaml` | runs alone after the other legs: 300 records at 5 a second. The broker restarts 20 s in with the member reading, and the member's group commits past the end offsets the topic had at the restart on every partition, read from `kafka-consumer-groups.sh --describe`; then the member stops, which commits and leaves, the broker restarts again, and the member starts once more. Every offset is read, the member counted the outage in `broker.errors` and joined only at its two starts, and `start:` resolved once per partition only (`offsets.reset{reason="no_commit"}` 3), so the second life resumed from the commit that outlived both restarts. Nothing is read twice unless the member counted a rejoin or a deferred batch, and then at most a commit interval |
 | `consume-tls`, `consume-mtls`, `consume-sasl-plain`, `consume-sasl-scram512` | `logit-in-auth-*.yaml` | the `tls`, `mtls`, `sasl-plain`, and `sasl-scram512` topics read over the listener and credentials their producing sink used, each record once |
 | `consume-oauth-cc` | `logit-in-oauth-*.yaml` | the `oauth-cc` topic read through the client-credentials grant for the whole run, past the first token's life, with at least two tokens fetched for the member's own `scope` |
 | `consume-read-committed` | `logit-in-txn-*.yaml`, `Txn.java` | a transactional Java producer writes 10 transactions of 10 records, committing the even ones and aborting the odd ones. Under `read_committed`, `kafka_in` reads the 50 committed records once each and counts the 50 aborted ones `records.skipped{reason="aborted"}`; under `read_uncommitted` it reads all 100 |
@@ -94,7 +94,7 @@ has one such bound for every listener, so its SCRAM and PLAIN sinks redial every
 `oauth_cc` sink asks for a `scope` that names its broker, and `oauth` logs every token request's
 body at `DEBUG`, so `check.py` counts each sink's tokens in `logs/oauth.log`.
 OAUTHBEARER is a Redpanda Enterprise feature, which a new cluster's 30-day trial license covers;
-if Redpanda refuses the settings, `logs/redpanda-oidc-setup.log` says why and its three
+if Redpanda refuses the settings, `logs/redpanda-oidc-setup.log` says why and its four
 OAUTHBEARER rows read `GAP`. The OAUTHBEARER legs run in `oauth`'s network namespace, so their
 token endpoint is `http://127.0.0.1`, which `token_endpoint` allows over plain HTTP.
 
@@ -150,9 +150,13 @@ At 20 events a second nothing drops, and a drop would show as a missing item.
    file format, so rpk reports each record's batch codec as Redpanda serves it on a fetch. Both
    brokers keep the producer's codec (`compression.type: producer`, the default).
 7. Reads the consumer topics' end offsets, then runs the broker-restart legs alone. 20 s after
-   they start it restarts both brokers with `docker restart`, which keeps each container's log
-   directory, and waits for both to report healthy; then it stops the members, restarts both
-   brokers again, starts the members again, and stops the legs 110 s after they started.
+   they start it reads the `restart` topic's end offsets, restarts both brokers with
+   `docker restart`, which keeps each container's log directory, and waits for both to report
+   healthy. It then polls each member's group with `kafka-consumer-groups.sh --describe` until
+   the group has committed past those end offsets on every partition, for up to 90 s, and stops
+   the members, recording their exit codes as `<leg>-life1`. It restarts both brokers again,
+   starts the members again, and stops the legs 110 s after they started, or 30 s after the
+   second start when that's later.
 8. Runs `check.py` with `python3 -I` in a `python:3.12-slim` container. `check.py` reads only the
    run directory.
 9. Clears the netem rules and tears the project down (`down -v --remove-orphans`) on every
@@ -186,7 +190,8 @@ A run writes `perf/results/kafka-interop/<timestamp>/` (gitignored, or under
 | `readback/<broker>/codec-<c>.batches` | each codec topic's stored codec: `kafka-dump-log.sh` output for Kafka, one `offset: <o> compression: <c>` line per record for Redpanda |
 | `<leg>-<broker>-telemetry.log` | each leg's `internal` telemetry, `stdio_out` `format: json`; a consumer leg's is `in-<leg>-<broker>-telemetry.log` |
 | `consume-<leg>-<broker>.jsonl` | what each consumer leg's `kafka_in` read, `stdio_out` `format: json`, carriers included; `relay-<broker>-sent.jsonl` and `relay-<broker>-text-sent.jsonl` hold what the relay leg's generators wrote |
-| `readback/<broker>/consume.offsets`, `restart.offsets` | `kafka-get-offsets.sh` for the topics the consumer legs read |
+| `readback/<broker>/consume.offsets`, `restart.offsets`, `restart-before.offsets` | `kafka-get-offsets.sh` for the topics the consumer legs read, and for `restart` before the first broker restart |
+| `readback/<broker>/restart-committed.txt` | the `consume-restart` group's last `kafka-consumer-groups.sh --describe` before the script stopped its first life |
 | `readback/<broker>/group-mixed-console.tsv`, `group-mixed.describe` | the `group-mixed` leg's console consumer's records, and `kafka-consumer-groups.sh --describe --state` and `--members` |
 | `redpanda-oidc.txt` | `ok` once Redpanda took the OAUTHBEARER settings, else `failed` |
 | `exits.txt`, `timeline.log`, `netem.log` | each leg's exit code, the run's phases, and the qdiscs and filters each netem step set |
@@ -197,7 +202,7 @@ A run writes `perf/results/kafka-interop/<timestamp>/` (gitignored, or under
 ### 2026-10-30: the consumer legs
 
 Against `apache/kafka:4.2.0` and `redpandadata/redpanda:v26.2.3`
-(`perf/results/kafka-interop/20261030T190239Z/`), from `kin/w6a` with `kin/w5` merged: 133 of 134 rows
+(`perf/results/kafka-interop/20261031T035242Z/`), from `kin/w6a` with `kin/w6b` merged: 133 of 134 rows
 `PASS`, the one `GAP` Redpanda's `timestamp` row the run below records, no `FAIL`, and no
 `kafka_in` bug. The consumer legs' rows:
 
@@ -206,10 +211,10 @@ Against `apache/kafka:4.2.0` and `redpandadata/redpanda:v26.2.3`
 | `consume-console` | `PASS`: 50 lines on 3 partitions, each once, with its key, its headers (`rep`'s two values as an array in order, `nil` null), and the record timestamp as the event's | `PASS`, the same |
 | `consume-relay-<format>-<codec>`, 30 rows | `PASS` each: `json`, `msgpack`, and `native`, 120 events under `record: event` (120 records) and `batch` (4), each equal to what was sent; `text`, 40 bodies under each mode, each at its record's timestamp; `otlp_proto` and `otlp_json`, 40 logs, 200 points, and 40 spans, equal but for the OTLP normalizations | `PASS` each, the same |
 | `consume-collector-proto`, `consume-collector-json` | `PASS` each: 160 logs, 160 spans, and 800 data points, none read twice, every field as sent | `PASS`, the same |
-| `consume-group-join` | `PASS`: 400 records read by `a` 321 and `b` 79, none twice, three partitions moving once | `PASS`: `a` 320, `b` 80, none twice |
-| `consume-group-kill` | `PASS`: 11 offsets read twice, inside the 60 a commit interval allows; every partition changed member once | `PASS`: 14 offsets read twice; five partitions changed member once |
-| `consume-group-mixed` | `PASS`: two members under `range` while both were in; `kafka_in` 237 and the console consumer 163 records, none twice | `PASS`: `kafka_in` 230, the console consumer 170 |
-| `consume-broker-restart` | `PASS`: 300 records, none twice, `offsets.reset{reason="no_commit"}` 3 over two lives, 11 broker errors and 2 failed commits counted, their positions sent with the next commit | `PASS`, 3 broker errors and no failed commit |
+| `consume-group-join` | `PASS`: 400 records read by `a` 330 and `b` 70, none twice, three partitions moving once | `PASS`: `a` 325, `b` 75, none twice |
+| `consume-group-kill` | `PASS`: 23 offsets read twice, inside the 60 a commit interval allows; every partition changed member once | `PASS`: 6 offsets read twice; every partition changed member once |
+| `consume-group-mixed` | `PASS`: two members under `range` while both were in; `kafka_in` 242 and the console consumer 158 records, none twice | `PASS`: `kafka_in` 230, the console consumer 170 |
+| `consume-broker-restart` | `PASS`: 300 records, none twice, joins only the two `start`s, `offsets.reset{reason="no_commit"}` 3, no deferred batch; the first life committed 60, 45, and 45 on partitions 0 to 2 before its stop, past the 51, 33, and 26 they ended at when the brokers went down; 11 broker errors and 1 failed commit counted, its positions sent with the next commit | `PASS`: the same, committing 62, 45, and 48 past 51, 35, and 29, with 5 broker errors and no failed commit |
 | `consume-tls`, `consume-mtls`, `consume-sasl-plain`, `consume-sasl-scram512` | `PASS` each: 50 records, each once | `PASS` each, the same |
 | `consume-oauth-cc` | `PASS`: 60 records over 75 s, 3 tokens fetched | `PASS`, the same |
 | `consume-read-committed` | `PASS`: 50 records under `read_committed`, 50 counted `aborted`; 100 under `read_uncommitted` | `PASS`, the same |
@@ -221,9 +226,11 @@ What the run showed:
   row `FAIL`, checked offline by rerunning `check.py` over an edited copy of the run directory.
 - **A broker restart doesn't cost a member its group.** On both brokers the member read through
   the first restart with no rejoin: its only joins were the two `start` ones, one per process
-  life. Both brokers reload a classic group's members with its offsets, and the restart took less
-  than the 45 s session. The second life, started after a second restart, read each partition on
-  from the commit its shutdown made, with nothing read twice.
+  life. The restart took 8 s, less than the 45 s session, and 3 s after both brokers were healthy
+  again each group had committed past the restart's end offsets on every partition, so the
+  first life read on past the restart in the group it already had. The second life, started
+  after a second restart, read each partition on from the commit its shutdown made, with nothing
+  read twice.
 - **Java's console consumer and `kafka_in` agree on `range`.** Each broker reported the strategy
   `range` with two members, three partitions each, and the partitions moved to the console
   consumer at its join and back at its leave with nothing read twice, so each side's revoke

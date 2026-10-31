@@ -3,8 +3,8 @@
 # `logit-in-group-join-a-*`) starts with the legs and also writes 400 records keyed by `seq`, 10 a
 # second; member `b` (`logit-in-group-join-b-*`) starts 20 s later, so the group rebalances with
 # records still arriving. check.py reads both members' events and judges, from the carriers'
-# partition and offset, that every record was read and no partition was read by both members in one
-# generation.
+# partition and offset, that every record was read, none twice, and that no partition changed
+# member more than once.
 admin: { bind: 127.0.0.1:9600 }
 
 components:

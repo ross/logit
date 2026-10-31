@@ -3,8 +3,8 @@
 # (`logit-in-group-kill-a-*`) also writes 400 records keyed by `seq`, 10 a second; the script kills
 # member `b` (`logit-in-group-kill-b-*`) with SIGKILL 20 s in, so it neither commits nor leaves, and
 # `a` takes its partitions once the coordinator expires its 10 s session. check.py judges that every
-# record was read, `a` reading `b`'s partitions from `b`'s last commit, and that no partition was
-# read by both members in one generation.
+# record was read, that `a` read again at most a commit interval of what `b` had read, and that no
+# partition changed member more than twice.
 admin: { bind: 127.0.0.1:9600 }
 
 components:
