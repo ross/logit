@@ -1,0 +1,15 @@
+# Reads one decompressed `native` object back for `script/s3-interop`, with the object's timestamps,
+# into `stdio_out`'s `format: json`. `check.py` counts the events the file holds.
+admin: { bind: 127.0.0.1:9600 }
+
+components:
+  replay:
+    type: replay_in
+    path: !env S3_INTEROP_REPLAY_PATH
+    format: native
+
+  out:
+    type: stdio_out
+    sources: [replay]
+    target: !env S3_INTEROP_REPLAY_OUT
+    format: json

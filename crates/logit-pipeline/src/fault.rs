@@ -76,7 +76,7 @@ pub mod sites {
     pub const SPOOL_CURSOR: &str = "spool.cursor";
     /// The disk spool's directory: its creation, its lock file, and its `fsync`.
     pub const SPOOL_DIR: &str = "spool.dir";
-    /// A `tail_in`/`docker_in` checkpoint file.
+    /// A tail listener's checkpoint file.
     pub const TAIL_CHECKPOINT: &str = "tail.checkpoint";
     /// `file_out`'s active file.
     pub const FILE_OUT_ACTIVE: &str = "file_out.active";
@@ -84,10 +84,10 @@ pub mod sites {
     pub const FILE_OUT_STAGING: &str = "file_out.staging";
     /// `file_out`'s retained `.N` files.
     pub const FILE_OUT_RETAINED: &str = "file_out.retained";
-    /// `tail_in`/`docker_in` discovery: a pattern directory's listing, a discovered path's stat,
+    /// Tail listener discovery: a pattern directory's listing, a discovered path's stat,
     /// and the open of a file about to be tracked, with its head read for a resume.
     pub const TAIL_SCAN: &str = "tail.scan";
-    /// `tail_in`/`docker_in` reading a tracked file's next chunk.
+    /// A tail listener reading a tracked file's next chunk.
     pub const TAIL_READ: &str = "tail.read";
 }
 

@@ -1,6 +1,6 @@
 ---
 created: 2026-09-09
-updated: 2026-10-18
+updated: 2026-10-30
 ---
 
 # Disk-backed durable buffering for a sink's delivery queue
@@ -47,7 +47,9 @@ older ones are on disk, and makes "what survives a crash" depend on timing. Vect
 buffer is memory *or* disk) is the precedent. `buffer.max_batches`/`max_bytes` are rejected when
 non-default alongside `buffer.disk` (graph rule 35) — a knob that would silently do nothing is a
 config error, the same reasoning rule 33 already applies to `stdio_out`/`file_out`'s
-`compression:`.
+`compression:`. [Amended on 2026-10-30: on a collecting sink, `buffer.max_bytes` beside `disk:`
+bounds the open window's decoded batches; see "Amendment: `buffer.max_bytes` bounds a collecting
+sink's window beside `disk:` (2026-10-30)", below.]
 
 **What is persisted.** One record per batch: `[TraceContext: 16-byte trace_id, 8-byte
 span_id][native frame]`. The context rides inline so a batch replayed within the same process
@@ -540,3 +542,25 @@ repairs.
 - **The sink identity across a restart.** Like `buffer.disk.replayed`, a `disk_torn` drop settles
   a batch an earlier process received, so a per-process identity adds it to the received side:
   `received + replayed + disk_torn = delivered + dropped + queued`.
+
+## Amendment: `buffer.max_bytes` bounds a collecting sink's window beside `disk:` (2026-10-30)
+
+[ADR `collecting-sink-window`](collecting-sink-window.md) lets a sink keep a window open across
+arrivals, and its decision 2 closes that window once the staged batches'
+`EventBatch::estimated_heap_bytes` reach `buffer.max_bytes`. Under a disk store that bound does
+something: `DiskQueue::peek_at` keeps every record it reads ahead decoded until it's committed,
+and a disk store's `max_in_flight` is unbounded, so without it an open window would hold every
+staged batch on the heap.
+
+- **Graph rule 35 will accept a non-default `buffer.max_bytes` beside `disk:` on a collecting
+  sink** (`s3_out`, the first), where it bounds the window's decoded batches and nothing else.
+  `disk.max_bytes` stays the spool's bound. On every other sink the rule is unchanged, since there
+  the field would do nothing.
+- **The default applies too.** A disk-backed collecting sink whose operator never set
+  `buffer.max_bytes` has its windows bounded at the default 64 MiB of decoded batches.
+- **`buffer.max_batches`** stays rejected beside `disk:` on every sink.
+- **What changes with the code (W2 of [the s3 plan](../plans/s3-object-archive.md)).**
+  `BufferConfig.disk`'s and `DiskBufferConfig.max_bytes`'s field docs, which today say the disk
+  bound replaces `buffer.max_bytes`; `graph.rs`'s rule 35 doc and
+  [`docs/design/pipeline-graph.md`](../design/pipeline-graph.md)'s rule table; and
+  `schema/logit.schema.json` through `script/schema`.

@@ -1,0 +1,6 @@
+kind v0.33.0 go1.26.7 linux/amd64
+node image kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+Kubernetes v1.37.0
+containerd github.com/containerd/containerd/v2 v2.3.4 db8809540e1a7a9da5d518876894933ff55692ab
+crictl version 1.36.0
+docker.io/library/busybox                       1.37.0               a7dbc319b1438       30ecbe1509090       2.22MB

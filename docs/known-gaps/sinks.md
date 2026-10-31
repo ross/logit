@@ -1,4 +1,4 @@
-# Known gaps: File and stdio sinks
+# Known gaps: File, stdio, and other sinks
 
 Entry format and the other areas: [the known-gaps index](README.md).
 
@@ -16,7 +16,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Retention and compression:** retention is a plain `max_files` count, with no age-based
     eviction. Compression is `format: native`'s `compression: lz4` or nothing: `format: human` and
     `format: json` have no compression option, and nothing compresses already-rotated files after
-    the fact. Both are left to an external tool. A gzipped JSON archive also has no reader
+    the fact. Both are left to an external tool. A gzip or zstd archive replays through `replay_in`
     ([`replay_in`'s gaps](tailing.md#replay_in)).
   - **Format:** `stdio_out` shares `format:` (`human`, ADR `human-render-block-format`; `json`,
     ADR `stream-json-format`; or `native`, ADR `file-output-native-format`) and `message:`. A
