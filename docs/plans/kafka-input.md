@@ -59,8 +59,8 @@ stub as `logit_aws::test_stub` behind a `test-util` feature.
   - The HTTP helpers `sasl/oauth.rs` uses, as a TLS-less copy in `logit-kafka`'s own `http.rs`
     (the ADR's item 1 says why neither `logit-outputs::http`, whose `build_client` takes the
     sinks' `rustls::ClientConfig`, nor `logit-aws`'s private copy is its home). `logit-outputs::http`
-    keeps its TLS-taking `build_client` and `client_builder` and loses `try_read_body_bytes`;
-    `logit-aws` is unchanged by this bullet.
+    keeps its TLS-taking `build_client`, `client_builder`, and `try_read_body_bytes`, which
+    `s3_out` calls; `logit-aws` is unchanged by this bullet.
   - `FakeStream`, `ReadStep`, and `WriteStep` from `crates/logit-outputs/src/test_support.rs`,
     behind `test-util`; `test_support` re-exports them so `stream.rs`' and the other sinks' tests
     resolve unchanged.
@@ -327,8 +327,9 @@ Recorded per workstream as each lands.
   classic group APIs at Kafka 2.4's versions or above (JoinGroup v0 to v6, SyncGroup v0 to v4,
   Fetch v4 to v13), checked with `kafka-broker-api-versions.sh`. `kafka-protocol`'s `Record`
   collapses repeated header names, so W2 decodes records itself.
-- **W1**: `kafka_out`'s `http::try_read_body_bytes` had no caller once `oauth.rs` moved, so it
-  left `logit-outputs`; `build_client` and `client_builder` stay. `prometheus::compression::decompress_bounded`
+- **W1**: `kafka_out`'s `http::try_read_body_bytes` had no caller in `logit-outputs` once
+  `oauth.rs` moved, but `s3_out` now calls it, so it stays there beside `logit-kafka`'s TLS-less
+  copy, with `build_client` and `client_builder`. `prometheus::compression::decompress_bounded`
   refuses a zstd frame whose declared window exceeds the bound, and the reference clients' corpus
   frames declare a 2 MiB window (descriptor `0x58`), so `logit_proto::kafka`'s zstd decompressor
   streams through a `take(max + 1)` under a window limit of `max(max, 8 MiB)` instead of reusing
