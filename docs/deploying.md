@@ -4509,8 +4509,9 @@ event and its archive.
 
 **Keys can't hold an empty, `.`, or `..` folder.** `logit validate` rejects a `prefix` and
 `partition` that can make a key starting with `/`, a `//`, or a `/./` or `/../`, because a proxy
-or URL layer can collapse them and break the request signature. End `prefix` in `/` or start
-`partition` with `/`, never both. A `%.f` between slashes (`x/%.f/`) formats to nothing at
+or URL layer can collapse them and break the request signature. Put one `/` between the two:
+end `prefix` in `/` and start `partition` without one, or start `partition` with `/` after a
+non-empty `prefix` that doesn't end in one. A `%.f` between slashes (`x/%.f/`) formats to nothing at
 millisecond 0 and leaves an empty folder, so keep it beside other text in the folder.
 
 **The bucket needs a lifecycle rule** that aborts incomplete multipart uploads after a day or so
