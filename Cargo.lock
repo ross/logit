@@ -1227,6 +1227,7 @@ dependencies = [
  "ring",
  "rustls",
  "rustls-pki-types",
+ "ruzstd",
  "serde",
  "serde_json",
  "snap",
