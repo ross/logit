@@ -71,7 +71,7 @@ use crate::buffer_full::{Bound, FullLabels, FullWatch, Waiting, WatchConfig};
 use crate::fanout::{BatchContext, TraceContext};
 use crate::fault::{sites, Op, Point};
 use crate::fault_io;
-use crate::queue::{Numbering, OverflowPolicy, StoreItem, SINK_QUEUE_METRICS};
+use crate::queue::{Numbering, OverflowPolicy, StoreItem, StoreWait, SINK_QUEUE_METRICS};
 use logit_core::{Diagnostics, EventBatch, Telemetry};
 use logit_proto::frame::{self, Compression};
 use logit_proto::native::{self, SeqId};
@@ -955,6 +955,11 @@ impl DiskQueue {
         self.watch.finish();
     }
 
+    /// See `SinkStore::under_pressure`.
+    pub fn under_pressure(&self) -> bool {
+        self.watch.under_pressure()
+    }
+
     /// See `SinkStore::send_limit`.
     pub(crate) fn send_limit(&self) -> &crate::buffer_full::SendLimit {
         self.watch.send_limit()
@@ -1135,7 +1140,8 @@ impl DiskQueue {
             return;
         }
         self.not_empty.notify_one();
-        self.after_change();
+        let utilization = self.after_change();
+        self.watch.ease_pressure(utilization);
     }
 
     /// Takes the active segment's write handle out of the state until the guard drops.
@@ -1783,6 +1789,38 @@ impl DiskQueue {
                 None
             }
             ReadOutcome::Unavailable => None,
+        }
+    }
+
+    /// Waits for the `n`-th record from the head, as [`DiskQueue::peek_at`] reads it, until
+    /// `deadline`: the record once one is readable, else [`StoreWait::Pressure`] while the
+    /// store-pressure signal is raised, else [`StoreWait::Closed`] once the queue is closed, else
+    /// [`StoreWait::Deadline`] at `deadline`. Reserves records `0..=n` only when it
+    /// returns the record. Cancellation-safe, as `peek_at` is: a read dropped mid-way caches
+    /// nothing.
+    pub async fn wait_at(&self, n: usize, deadline: tokio::time::Instant) -> StoreWait<StoreItem> {
+        loop {
+            // Both registered before the checks they guard, so a push, a close, or a raise that
+            // lands after a check still wakes this wait.
+            let notified = self.not_empty.notified();
+            let raised = self.watch.pressure_raised();
+            if let Some(item) = self.peek_at(n).await {
+                return StoreWait::Item(item);
+            }
+            if self.watch.under_pressure() {
+                return StoreWait::Pressure;
+            }
+            if self.closed() {
+                return StoreWait::Closed;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return StoreWait::Deadline;
+            }
+            tokio::select! {
+                () = notified => {}
+                () = raised => {}
+                () = tokio::time::sleep_until(deadline) => return StoreWait::Deadline,
+            }
         }
     }
 
@@ -4367,6 +4405,44 @@ mod tests {
         assert_eq!(list_segments(&dir).unwrap(), vec![1], "the consumed segment is reclaimed");
         let events = registry.drain(0);
         assert_eq!(metric_sum(&events, SINK_QUEUE_METRICS.items_dropped, None), 0.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `block` push that waited for room raises store pressure, and the spool it fills stays
+    /// at `max_bytes`, so the signal stays raised. A wait for a record the spool holds still
+    /// returns it, and only a wait past it ends on pressure.
+    #[tokio::test]
+    async fn wait_at_returns_a_record_it_holds_under_pressure_and_pressure_past_it() {
+        let dir = scratch_dir("wait-at-pressure");
+        let one = raw_record(&batch("a"), ctx()).len() as u64;
+        let mut cfg = config(dir.clone());
+        cfg.max_bytes = 2 * one;
+        cfg.segment_bytes = one;
+        let q = open_with(cfg);
+        for label in ["a", "b"] {
+            q.push((batch(label), ctx())).await;
+        }
+        let ((), ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(q.push((batch("c"), ctx())), async {
+                crate::test_util::wait_until("the push waits", || q.under_pressure()).await;
+                q.peek().await.expect("the head");
+                q.commit().expect("the head committed");
+            })
+        })
+        .await
+        .expect("the commit makes room for the push");
+        assert!(q.under_pressure(), "the push left the spool at its bound");
+
+        // A window takes records in order, so the head is read ahead first, as the loop reads it.
+        let (head, ..) = q.peek_at(0).await.expect("the head");
+        assert_eq!(marker_of(&head), "b");
+        let far = tokio::time::Instant::now() + Duration::from_secs(3600);
+        match q.wait_at(1, far).await {
+            StoreWait::Item((held, ..)) => assert_eq!(marker_of(&held), "c"),
+            other => panic!("a record the spool holds is returned under pressure: {other:?}"),
+        }
+        let past = q.wait_at(2, far).await;
+        assert!(matches!(past, StoreWait::Pressure), "{past:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

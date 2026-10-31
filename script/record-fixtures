@@ -4,7 +4,8 @@
 #              graphite-p0, graphite-py2, graphite-dropwizard, one capture each), prometheus,
 #              prometheus-scrape, vmagent, statsd, datadog (= datadog-agent, datadog-tracer,
 #              datadog-dogstatsd-unix), splunk (= splunk-otel, splunk-docker, splunk-sc4s,
-#              splunk-java, then check_splunk_capture.py), influxdb, kafka
+#              splunk-java, then check_splunk_capture.py), influxdb, kafka, cri
+#              (= cri-containerd, a kind node, then cri-crio, a minikube node: each's pod log tree)
 #   With no arguments, records every producer in `all` below.
 #
 # Captures wire traffic from real third-party producers into testdata/interop/, so decoders are
@@ -78,6 +79,11 @@ cleanup() {
     # so a run that dies mid-capture doesn't leave one behind.
     [ -n "${PROM_CFG_DIR}" ] && rm -rf "${PROM_CFG_DIR}"
     [ -n "${DD_CONF_DIR}" ] && rm -rf "${DD_CONF_DIR}"
+    cri_teardown
+    # minikube run through sudo leaves root-owned files behind.
+    if [ -n "${CRI_WORK}" ]; then
+        rm -rf "${CRI_WORK}" 2>/dev/null || sudo rm -rf "${CRI_WORK}"
+    fi
     return 0
 }
 
@@ -1190,10 +1196,181 @@ record_kafka() {
     rm -rf "${work}"
 }
 
+# ---- cri: the kubelet's pod log files, written by containerd and CRI-O -----------------------------
+
+# Pinned: kind's release notes name the node image each kind release was built with, and minikube
+# picks its Kubernetes and CRI-O versions per release.
+KIND_VERSION="v0.33.0"
+KIND_SHA256_AMD64="aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d"
+KIND_NODE_IMAGE="kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5"
+MINIKUBE_VERSION="v1.39.0"
+MINIKUBE_SHA256_AMD64="b738496da01be06bbaf80c688f57ce25acd3849fbb518155f3a88e03ef555aa4"
+CRI_CLUSTER="logit-record-cri"
+CRI_NODE="${CRI_CLUSTER}-control-plane"
+CRIO_PROFILE="logit-record-crio"
+CRI_WORK="" # set by the recorders, removed by cleanup()
+
+# cri_as_root <command...>: runs a pinned binary as root when $DOCKER needs sudo, since kind and
+# minikube drive the same docker daemon.
+cri_as_root() {
+    if [ "${DOCKER}" = "sudo docker" ]; then
+        sudo env MINIKUBE_HOME="${CRI_WORK}/mk" "$@"
+    else
+        env MINIKUBE_HOME="${CRI_WORK}/mk" "$@"
+    fi
+}
+
+# cri_fetch <name> <url> <sha256>: downloads a binary into $CRI_WORK and checks its digest.
+cri_fetch() {
+    [ -n "${CRI_WORK}" ] || CRI_WORK="$(mktemp -d)"
+    curl -fsSL -o "${CRI_WORK}/$1" "$2"
+    echo "$3  ${CRI_WORK}/$1" | sha256sum --check --quiet
+    chmod +x "${CRI_WORK}/$1"
+}
+
+# cri_wait <seconds> <what> <command...>: polls until the command succeeds, or fails.
+cri_wait() {
+    local limit="$1" what="$2" waited=0
+    shift 2
+    until "$@" >/dev/null 2>&1; do
+        if [ "${waited}" -ge "${limit}" ]; then
+            echo "record-fixtures: timed out after ${limit}s waiting for ${what}" >&2
+            return 1
+        fi
+        sleep 2
+        waited=$((waited + 2))
+    done
+}
+
+# cri_teardown: deletes both clusters' node containers. Safe to call twice.
+cri_teardown() {
+    if [ -n "${CRI_WORK}" ] && [ -x "${CRI_WORK}/kind" ]; then
+        cri_as_root "${CRI_WORK}/kind" delete cluster --name "${CRI_CLUSTER}" >/dev/null 2>&1 || true
+    fi
+    if [ -n "${CRI_WORK}" ] && [ -x "${CRI_WORK}/minikube" ]; then
+        cri_as_root "${CRI_WORK}/minikube" delete -p "${CRIO_PROFILE}" >/dev/null 2>&1 || true
+    fi
+    ${DOCKER} rm -f -v "${CRI_NODE}" "${CRIO_PROFILE}" >/dev/null 2>&1 || true
+    # minikube keeps a named volume for its node, which `rm -v` leaves.
+    ${DOCKER} volume rm "${CRIO_PROFILE}" "${CRI_NODE}" >/dev/null 2>&1 || true
+    ${DOCKER} network rm "${CRIO_PROFILE}" >/dev/null 2>&1 || true
+}
+
+# cri_record_tree <node container> <kubectl path in the node> <out dir> <version command>:
+# runs the pods in tools/record-fixtures/cri/ on a node whose kubelet is already set to rotate at
+# 24 KiB every 3 s, and copies the kubelet's /var/log/pods tree and a manifest of its
+# /var/log/containers symlinks into <out dir>.
+cri_record_tree() {
+    local node="$1" kubectl_bin="$2" out="$3" versions="$4"
+    local cri_dir="${TOOLS_DIR}/cri" pods="/var/log/pods" rot_dir edge_dir
+    local kubectl=(${DOCKER} exec "${node}" "${kubectl_bin}" --kubeconfig /etc/kubernetes/admin.conf)
+
+    ${DOCKER} cp "${cri_dir}/pods.yaml" "${node}:/etc/logit-pods.yaml"
+    cri_wait 120 "the API server" "${kubectl[@]}" get nodes
+    # A new namespace's default service account takes a moment, and apply is idempotent.
+    cri_wait 120 "the pods to apply" "${kubectl[@]}" apply -f /etc/logit-pods.yaml
+    # Placing the manifest is all a static pod takes; the kubelet watches the directory.
+    ${DOCKER} cp "${cri_dir}/static-pod.yaml" "${node}:/etc/kubernetes/manifests/static-hello.yaml"
+
+    # The kubelet's container GC removes an older dead attempt's directory within a minute of the
+    # next attempt, so a loop in the node copies edge's files and symlink names as they appear.
+    ${DOCKER} exec -d "${node}" sh -c '
+        mkdir -p /snap
+        while :; do
+            for d in /var/log/pods/cri-fixture_edge_*/writer; do
+                [ -d "$d" ] || continue
+                dest="/snap/$(basename "$(dirname "$d")")/writer"
+                mkdir -p "$dest" && cp -a "$d/." "$dest/"
+            done
+            for f in /var/log/containers/*_cri-fixture_*; do
+                [ -L "$f" ] && echo "$(basename "$f") -> $(readlink "$f")" >> /snap/symlinks.raw
+            done
+            sleep 0.5
+        done'
+
+    # `edge` ends its first run on an unterminated line, restarts, and ends its second the same way.
+    cri_wait 300 "edge's restarted run to write 1.log" \
+        ${DOCKER} exec "${node}" sh -c "grep -q 'second run dangling' /snap/cri-fixture_edge_*/writer/1.log"
+    cri_wait 300 "rotator to finish" \
+        sh -c "[ \"\$(${DOCKER} exec ${node} ${kubectl_bin} --kubeconfig /etc/kubernetes/admin.conf -n cri-fixture get pod rotator -o jsonpath='{.status.phase}')\" = Succeeded ]"
+    cri_wait 120 "the static pod's log" \
+        ${DOCKER} exec "${node}" sh -c "ls ${pods}/cri-fixture_static-hello-*/hello/0.log"
+    # The kubelet gzips a rotated file on the rotation after its rename, so a .gz means two ran.
+    rot_dir="$(${DOCKER} exec "${node}" sh -c "echo ${pods}/cri-fixture_rotator_*/spin")"
+    if ! ${DOCKER} exec "${node}" sh -c "ls ${rot_dir}/0.log.*.gz" >/dev/null 2>&1; then
+        echo "record-fixtures: the kubelet never gzipped a rotated file of ${rot_dir}" >&2
+        return 1
+    fi
+    edge_dir="$(${DOCKER} exec "${node}" sh -c "echo /snap/cri-fixture_edge_*/writer")"
+    ${DOCKER} exec "${node}" sh -c "ls -l ${rot_dir} ${edge_dir}" | sed 's/^/  [node] /'
+
+    rm -rf "${out}"
+    mkdir -p "${out}"
+    # Everything but edge comes from /var/log/pods; edge comes from the copy loop's /snap.
+    ${DOCKER} exec "${node}" sh -c \
+        "cd ${pods} && tar -cf - \$(ls -d cri-fixture_* | grep -v '^cri-fixture_edge_')" \
+        | tar -x -C "${out}" --no-same-owner --one-top-level=pods
+    ${DOCKER} exec "${node}" sh -c "cd /snap && tar -cf - cri-fixture_edge_*" \
+        | tar -x -C "${out}/pods" --no-same-owner
+    ${DOCKER} exec "${node}" sh -c 'sort -u /snap/symlinks.raw' | LC_ALL=C sort > "${out}/symlinks.txt"
+    {
+        eval "${versions}"
+        ${DOCKER} exec "${node}" sh -c '(kubelet --version || /var/lib/minikube/binaries/*/kubelet --version); crictl --version; crictl images --digests | grep busybox'
+    } > "${out}/versions.txt" 2>&1
+    sed 's/^/  [versions] /' "${out}/versions.txt"
+    chmod -R u+rwX,go+rX "${out}"
+}
+
+# A kind node: containerd and a real kubelet.
+record_cri_containerd() {
+    echo "== recording: containerd in a kind ${KIND_VERSION} node (${KIND_NODE_IMAGE%%@*}) =="
+    if [ "$(uname -m)" != "x86_64" ]; then
+        echo "record-fixtures: cri pins linux-amd64 binaries; add the arm64 digests to record elsewhere" >&2
+        return 1
+    fi
+    cri_fetch kind "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64" \
+        "${KIND_SHA256_AMD64}"
+    cri_teardown
+    cri_as_root "${CRI_WORK}/kind" create cluster --name "${CRI_CLUSTER}" --image "${KIND_NODE_IMAGE}" \
+        --config "${TOOLS_DIR}/cri/kind-config.yaml" --kubeconfig "${CRI_WORK}/kubeconfig" --wait 180s
+    cri_record_tree "${CRI_NODE}" kubectl "${OUT_ROOT}/cri/containerd" \
+        "echo \"kind ${KIND_VERSION}\"; echo \"node image ${KIND_NODE_IMAGE}\"; ${DOCKER} exec ${CRI_NODE} containerd --version"
+    cri_teardown
+}
+
+# A minikube node: CRI-O and a real kubelet. The kubelet's rotation settings are
+# KubeletConfiguration fields, so they are appended to the node's config and the kubelet restarted.
+record_cri_crio() {
+    echo "== recording: CRI-O in a minikube ${MINIKUBE_VERSION} node =="
+    if [ "$(uname -m)" != "x86_64" ]; then
+        echo "record-fixtures: cri pins linux-amd64 binaries; add the arm64 digests to record elsewhere" >&2
+        return 1
+    fi
+    local force=()
+    [ "${DOCKER}" = "sudo docker" ] && force=(--force)
+    cri_fetch minikube "https://github.com/kubernetes/minikube/releases/download/${MINIKUBE_VERSION}/minikube-linux-amd64" \
+        "${MINIKUBE_SHA256_AMD64}"
+    cri_teardown
+    cri_as_root "${CRI_WORK}/minikube" start -p "${CRIO_PROFILE}" --driver=docker \
+        --container-runtime=cri-o --memory=2g --wait=apiserver,system_pods "${force[@]}"
+    ${DOCKER} exec "${CRIO_PROFILE}" sh -c \
+        "printf 'containerLogMaxSize: 24Ki\ncontainerLogMonitorInterval: 3s\n' >> /var/lib/kubelet/config.yaml && systemctl restart kubelet"
+    local kubectl_bin
+    kubectl_bin="$(${DOCKER} exec "${CRIO_PROFILE}" sh -c 'echo /var/lib/minikube/binaries/*/kubectl')"
+    cri_record_tree "${CRIO_PROFILE}" "${kubectl_bin}" "${OUT_ROOT}/cri/crio" \
+        "echo \"minikube ${MINIKUBE_VERSION}\"; ${DOCKER} exec ${CRIO_PROFILE} crio --version | head -2"
+    cri_teardown
+}
+
+record_cri() {
+    record_cri_containerd
+    record_cri_crio
+}
+
 # ---- entry point ----------------------------------------------------------------------------------
 
 all=(logger python-syslog-handler rsyslog rsyslog-tcp collectd otlp graphite prometheus
-    prometheus-scrape vmagent statsd datadog splunk influxdb kafka)
+    prometheus-scrape vmagent statsd datadog splunk influxdb kafka cri)
 
 producers=("$@")
 if [ "${#producers[@]}" -eq 0 ]; then
@@ -1229,6 +1406,9 @@ for p in "${producers[@]}"; do
     splunk) record_splunk ;;
     influxdb) record_influxdb ;;
     kafka) record_kafka ;;
+    cri) record_cri ;;
+    cri-containerd) record_cri_containerd ;;
+    cri-crio) record_cri_crio ;;
     datadog)
         record_datadog_dogstatsd_unix
         record_datadog_tracer

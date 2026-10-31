@@ -1,0 +1,37 @@
+# The zstd leg of `script/s3-interop`: 1,000 events as zstd-compressed JSON lines. `check.py`
+# runs `zstd -t` on each object and checks the lines.
+admin: { bind: 127.0.0.1:9600 }
+
+components:
+  load:
+    type: generate_in
+    count: 1000
+    rate: 250
+    batch: 50
+    event:
+      log: "zstd {seq}"
+      attributes: { seq: "{seq}" }
+
+  archive:
+    type: s3_out
+    sources: [load]
+    bucket: !env S3_INTEROP_BUCKET
+    region: !env S3_INTEROP_REGION
+    endpoint: !env S3_INTEROP_ENDPOINT
+    path_style: !env S3_INTEROP_PATH_STYLE
+    prefix: !env S3_INTEROP_PREFIX
+    max_age: 5s
+    credentials:
+      access_key_id: !env S3_INTEROP_ACCESS_KEY
+      secret_access_key: !env S3_INTEROP_SECRET_KEY
+    compression: zstd
+    buffer:
+      retry_max_delay: 2s
+      shutdown_grace: 30s
+
+  self: { type: internal, interval: 1s, span_sample_rate: 0.0 }
+  telemetry:
+    type: stdio_out
+    sources: [self]
+    target: !env S3_INTEROP_TELEMETRY
+    format: json

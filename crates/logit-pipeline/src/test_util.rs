@@ -376,6 +376,32 @@ pub async fn drive_write_loop_until<O: crate::Output + Send>(
     shutdown_dropped.load(Ordering::Relaxed)
 }
 
+/// Runs the write loop over `store` beside `producer`, which pushes into the store while the
+/// loop runs and closes it, until both finish: for a test whose batches arrive during a window.
+/// Panics if they're still running after [`RECV_TIMEOUT`].
+pub async fn drive_write_loop_over<O: crate::Output + Send>(
+    output: &mut O,
+    store: Arc<crate::SinkStore>,
+    config: crate::WriteLoopConfig,
+    telemetry: Telemetry,
+    producer: impl std::future::Future<Output = ()>,
+) {
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let shutdown_dropped = AtomicU64::new(0);
+    let write = crate::runtime::write_loop(
+        "out".to_string(),
+        output,
+        store,
+        telemetry,
+        config,
+        shutdown_rx,
+        &shutdown_dropped,
+    );
+    tokio::time::timeout(RECV_TIMEOUT, async { tokio::join!(producer, write) })
+        .await
+        .unwrap_or_else(|_| panic!("write_loop still running after {RECV_TIMEOUT:?}"));
+}
+
 static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// A new, empty directory at `{tmp}/logit-test-{label}-{pid}-{seq}`. A leftover directory at that
