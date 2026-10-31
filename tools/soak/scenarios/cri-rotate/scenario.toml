@@ -6,7 +6,11 @@
 # reopen, gzip the older rotated file, keep five files) with a line split across each rename,
 # and restarts the container into `1.log` once. `ledger.wire` judges `cri_in`'s events less its
 # `partial_timeout` flushes against the writer's finished lines, inside the replay band, and
-# holds the writer to the finished lines left on disk. The schema is
+# holds the writer to the finished lines left on disk. The writer logs each stall's window, and
+# the band allows a held run's replay only for a stop, restart, or kill inside one. Its 29 s
+# stall period (cri-writer.json) puts at least one of the cycle's four at +75 s, +150 s,
+# +210 s, and +285 s inside a stall of 9 s plus a 1 s poll, whatever the writer's start offset,
+# which `cri.dangles` checks; moving those steps can break that. The schema is
 # docs/plans/soak-harness.md's "The scenario schema".
 
 name = "cri-rotate"
@@ -62,7 +66,7 @@ for = "35s"
 
 # A clean stop writes a final checkpoint and keeps each held run unsent, pinned at its first
 # record: the restart reads it whole, so it doesn't split, but the other stream's lines after the
-# pin replay, which the cri wire's replay band allows.
+# pin replay, which the cri wire's replay band allows when the stop lands inside a stall.
 [[step]]
 at = "1m15s"
 action = "stop"
@@ -91,8 +95,9 @@ on = "logit"
 for = "35s"
 
 # Each stall and each rotation's split line leaves a run that only `partial_timeout` sends:
-# about 16 stalls and 13 rotations in a default run. A run held across a SUT stop can complete
-# before the restart reads it, so the floor is well below their sum.
+# about 21 stalls and 13 rotations in a default run, a rotation inside a stall splitting
+# nothing. A run held across a SUT stop can complete before the restart reads it, so the floor
+# is well below their sum.
 [[expect]]
 name = "partial-timeout-flushes"
 service = "logit"

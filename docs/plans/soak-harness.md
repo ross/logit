@@ -1,6 +1,6 @@
 ---
 created: 2026-10-08
-updated: 2026-10-29
+updated: 2026-10-31
 ---
 
 # Enabling plan: a soak harness — faults on a timeline, a watchdog, and a loss ledger
@@ -1343,6 +1343,16 @@ The rows:
     again as its remainder (docs/known-gaps/tailing.md, "`tail_in` splits a line held
     unterminated at a clean stop into two events"); nothing replays, since shutdown writes a
     final checkpoint;
+  - on a `cri` wire, a stopped or killed life whose stop, restart, or kill landed inside a
+    window in which `criwriter.py` held a stdout line open as a `P` (its dangle log,
+    `<run>/shared/criwriter-dangles.jsonl`, with the `F` taken as read up to one
+    `poll_interval` late): above, the lines the writer finished in that window, capped at the
+    life's rate × (`partial_timeout` + `poll_interval`). `cri_in` pins the file's checkpoint at
+    the held run's first record after sending the other stream's lines past it, and the restart
+    reads them again. Two windows at one end add both, each capped: the writer holds one line
+    open at a time, so their sum bounds either pin. An end in no window adds nothing; an `exit`,
+    or every life of a run with no dangle log, takes the cap. The writer and the fault driver
+    read the same host clock. `cri.dangles` reports whether any end landed inside a window;
   - the final life adds nothing: the end sequence waits until the tailers have read what the
     writer wrote (§5);
   - a `copytruncate` step (`Ledger.copytruncate_band`): below, its `lost_lines`, which a tailer
@@ -1592,6 +1602,11 @@ The rows:
   against what the instances' socket closes could discard. Under `[overlap]` the per-life rows
   judge each instance on its own lives and the wire, `progress`, and `recovery` judge them
   together; §8e has the rules.
+- `cri.dangles`, on a `cri` source only, else SKIP: one line per SUT life a stop, restart, or
+  kill ended, saying whether it landed inside one of the writer's dangles (`ledger.wire`'s
+  held-pin term). It PASSes when at least one did; it WARNs when none did, as `recovery` does
+  with no fault to judge, since the run never exercised a held pin, and when the run has no
+  dangle log.
 - `file.reopen.<step>` (W12c), one row per `rename` step, else one `file.reopen` row that
   SKIPs: a rename moves a `stdio_out` file target's `path` to `to`, and the first SIGHUP on
   its service starting inside its window makes the target reopen. The reopen is lazy, at the

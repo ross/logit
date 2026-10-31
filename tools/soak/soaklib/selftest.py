@@ -188,7 +188,9 @@ decompressed, a `.tmp` and an unfinished record skipped), criwriter.py's config 
 short run of it (the kubelet's names, compression, removal, a restart into `1.log`, and its
 counts against the tree), the loader's rules for the wire and the writer's config, and over
 synthetic runs `ledger.wire` judging W − S + F − G, the end count plus the removed lines held to
-G, the end-to-end bound widened by S, and the rotation guard for a stop.
+G, the end-to-end bound widened by S, the rotation guard for a stop, the held-pin term from the
+writer's dangle log (a stop or kill inside a dangle allowed its lines up to the cap, one outside
+allowed none, a run with no log given the cap), and `cri.dangles` both ways.
 
 For `[tls]`, `rotate`, and `probe`, it covers every validation rule (the table's keys, names,
 DNS names, and usages; the keys each step takes; a rotate's certificate read by its service's
@@ -14614,6 +14616,128 @@ def _cri_ledger():
                f"three rotations in a pause FAIL, got {thrice['ledger.wire']}")
 
 
+def _dangle_log(run_dir, dangles):
+    """Writes criwriter.py's dangle log into `run_dir`'s shared directory: one open and, unless
+    its close is None, one close per `(opened, closed, lines)`, offsets from T0, the open at 1,000
+    lines and the close `lines` later."""
+    shared = run_dir / scenario.SHARED_DIR
+    shared.mkdir(exist_ok=True)
+    records = []
+    for opened, closed, lines in dangles:
+        records.append({"event": criwriter.DANGLE_OPEN, "at": T0 + opened, "lines": 1_000,
+                        "stream": "stdout"})
+        if closed is not None:
+            records.append({"event": criwriter.DANGLE_CLOSE, "at": T0 + closed,
+                            "lines": 1_000 + lines, "stream": "stdout"})
+    (shared / criwriter.DANGLE_LOG).write_text("".join(json.dumps(r) + "\n" for r in records))
+    return run_dir
+
+
+def _cri_dangles():
+    """The `cri` wire's pin term from the writer's dangle log: a SUT stop or kill inside a
+    dangle allows that dangle's lines, capped at partial_timeout + poll_interval of lines, one
+    outside every dangle allows none, and `cri.dangles` PASSes when a stop or kill landed
+    inside one and WARNs when none did or the run has no log. Life 0 of the stop fixture ends at
+    +101 at 200 lines/s, so the cap is 1,200 and the stop's split line adds 1."""
+    with tempfile.TemporaryDirectory() as tmp:
+        def run(name, dangles, w_minus_g=0):
+            run_dir = _ledger_run(tmp, name, shutdown_drops=0, life0_extra=0, v0_extra=0)
+            _as_cri_wire(run_dir, w_minus_g=w_minus_g)
+            if dangles is not None:
+                _dangle_log(run_dir, dangles)
+            return {r.id: r for r in checks.run_all(run_dir)}
+
+        inside = run("dangle-inside", [(30, 42, 900), (95, 107, 400)], w_minus_g=401)
+        wire = inside["ledger.wire"]
+        expect(wire.status == checks.PASS
+               and "against the replay band [0, 401]" in wire.detail
+               and "life 0: [0, +400]: the other stream's lines after a held run's pin, its "
+               "stop at +101s inside the dangle +95s to +107s of 400 lines, each capped at "
+               "1,200, 200 lines/s x 6s of partial_timeout plus poll_interval" in wire.lines,
+               f"a stop inside a dangle allows the dangle's lines, got {wire} {wire.lines}")
+        past = run("dangle-inside-past", [(95, 107, 400)], w_minus_g=402)["ledger.wire"]
+        expect(past.status == checks.FAIL and past.detail.startswith(
+                   "W − S + F − G 402 is surplus, outside the replay band [0, 401]"),
+               f"a line past the dangle's lines FAILs, got {past}")
+        capped = run("dangle-capped", [(95, 107, 5_000)], w_minus_g=1_202)["ledger.wire"]
+        expect(capped.status == checks.FAIL and capped.detail.startswith(
+                   "W − S + F − G 1,202 is surplus, outside the replay band [0, 1,201]"),
+               f"a dangle's lines are capped at the pin's, got {capped}")
+        # The tailer reads a close up to one poll_interval late, so a dangle that closed 0.5 s
+        # before the stop's apply still pins; one that closed 1.5 s before doesn't.
+        late = run("dangle-late-close", [(88, 100.5, 300)], w_minus_g=301)["ledger.wire"]
+        expect(late.status == checks.PASS and "[0, 301]" in late.detail,
+               f"a dangle closed within a poll of the stop pins, got {late}")
+        early = run("dangle-early-close", [(88, 99.5, 300)], w_minus_g=2)["ledger.wire"]
+        expect(early.status == checks.FAIL and early.detail.startswith(
+                   "W − S + F − G 2 is surplus, outside the replay band [0, 1]"),
+               f"a dangle closed more than a poll before the stop pins nothing, got {early}")
+        unclosed = run("dangle-unclosed", [(95, None, 0)], w_minus_g=1_201)["ledger.wire"]
+        expect(unclosed.status == checks.PASS and "[0, 1,201]" in unclosed.detail,
+               f"a dangle the log never closes takes the cap, got {unclosed}")
+        outside = run("dangle-outside", [(30, 42, 900), (60, 72, 900)], w_minus_g=2)
+        wire = outside["ledger.wire"]
+        expect(wire.status == checks.FAIL
+               and wire.detail.startswith(
+                   "W − S + F − G 2 is surplus, outside the replay band [0, 1]")
+               and "life 0: [0, +0]: no held run's pin, no writer dangle open at its stop at "
+               "+101s" in wire.lines,
+               f"a stop outside every dangle allows no pin's lines, got {wire} {wire.lines}")
+        expect(run("dangle-outside-edge", [(60, 72, 900)], w_minus_g=1)["ledger.wire"].status
+               == checks.PASS, "a stop outside every dangle still allows its split line")
+
+        row = inside["cri.dangles"]
+        expect(row.status == checks.PASS
+               and row.detail.startswith("1 of 1 SUT stop(s), kill(s), and restart(s) landed "
+                                         "inside one of the writer's 2 dangle(s)")
+               and row.lines == ["life 0: its stop at +101s landed inside the dangle +95s to "
+                                 "+107s of 400 lines"],
+               f"cri.dangles PASSes a stop inside a dangle, got {row} {row.lines}")
+        row = outside["cri.dangles"]
+        expect(row.status == checks.WARN
+               and row.detail.startswith("0 of 1 SUT stop(s)")
+               and "the replay band's pin term went unexercised" in row.detail
+               and row.lines == ["life 0: its stop at +101s landed outside every dangle"],
+               f"cri.dangles WARNs when no stop landed inside a dangle, got {row} {row.lines}")
+        none = run("dangle-no-log", None)
+        expect(none["cri.dangles"].status == checks.WARN
+               and none["cri.dangles"].detail.startswith("no dangle log (shared/"
+                                                         "criwriter-dangles.jsonl)")
+               and none["ledger.wire"].status == checks.PASS
+               and "no dangle log (shared/criwriter-dangles.jsonl), so every stopped and "
+               "killed life takes the pin's cap" in none["ledger.wire"].lines,
+               f"a run with no dangle log WARNs the row and gives the band the cap, got "
+               f"{none['cri.dangles']} {none['ledger.wire'].lines}")
+        plain = {r.id: r for r in checks.run_all(
+            _ledger_run(tmp, "dangle-udp", shutdown_drops=0, life0_extra=0, v0_extra=0))}
+        expect(plain["cri.dangles"].status == checks.SKIP,
+               f"cri.dangles SKIPs a run with no cri source, got {plain['cri.dangles']}")
+
+        # The kill fixture: life 0 stopped at +101, life 1 killed at +203 with its checkpoint
+        # interval's 1,000 lines and two 690-line reads, 2,380, above.
+        def killed(name, w_minus_g):
+            run_dir = _kill_run(tmp, name, every_window=False)
+            _as_cri_wire(run_dir, w_minus_g=w_minus_g)
+            _dangle_log(run_dir, [(198, 210, 300)])
+            return {r.id: r for r in checks.run_all(run_dir)}
+
+        kill = killed("dangle-kill", 2_681)
+        expect(kill["ledger.wire"].status == checks.PASS
+               and "against the replay band [-1,000, 2,681]" in kill["ledger.wire"].detail
+               and "life 0: [0, +0]: no held run's pin, no writer dangle open at its stop at "
+               "+101s" in kill["ledger.wire"].lines,
+               f"a kill inside a dangle adds its lines to the checkpoint's, and a stop outside "
+               f"adds none, got {kill['ledger.wire']} {kill['ledger.wire'].lines}")
+        expect(killed("dangle-kill-past", 2_682)["ledger.wire"].status == checks.FAIL,
+               "a line past the killed life's dangle and checkpoint FAILs")
+        row = kill["cri.dangles"]
+        expect(row.status == checks.PASS and row.detail.startswith("1 of 2 SUT stop(s)")
+               and row.lines == ["life 0: its stop at +101s landed outside every dangle",
+                                 "life 1: its kill at +203s landed inside the dangle +198s to "
+                                 "+210s of 300 lines"],
+               f"cri.dangles reports each life's end, got {row} {row.lines}")
+
+
 def run(root, quiet=False):
     """Returns 0 when every expectation holds, else prints the failures and returns 1."""
     root = Path(root)
@@ -14635,7 +14759,7 @@ def run(root, quiet=False):
                      _sources_ledger, _source_rules, _fanin_driver, _tcp_ledger, _tcp_rules,
                      _http_ledger, _http_rules, _file_ledger, _file_rules,
                      _kafka_wire_ledger, _kafka_wire_rules,
-                     _cri_count, _cri_writer, _cri_rules, _cri_ledger,
+                     _cri_count, _cri_writer, _cri_rules, _cri_ledger, _cri_dangles,
                      _file_ops, _file_action_rules, _copytruncate_ledger, _two_sut_rules,
                      _two_sut_driver, _two_sut_checks, _relay_rules, _relay_driver,
                      _relay_checks, _per_service, _slope_edges,

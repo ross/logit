@@ -21,7 +21,7 @@ branches and PRs are its record. See [Branches and PR titles](../../AGENTS.md#br
 | [Enabling plan: OTLP metric kinds into `datadog_out`, and a `cumulative_to_delta` transform](ddotlp.md) | 2026-10-20 | 2026-10-20 |
 | [Enabling plan: a transit spec — reference inputs, flows, and a mapping table that generates the docs](transit-spec.md) | 2026-10-19 | 2026-10-28 |
 | [Enabling plan: native encode without per-field scratch buffers](native-encode-allocations.md) | 2026-10-15 | 2026-10-15 |
-| [Enabling plan: a soak harness — faults on a timeline, a watchdog, and a loss ledger](soak-harness.md) | 2026-10-08 | 2026-10-18 |
+| [Enabling plan: a soak harness — faults on a timeline, a watchdog, and a loss ledger](soak-harness.md) | 2026-10-08 | 2026-10-31 |
 | [Research note: live reload, socket handover, and what each deployment world needs](live-reload-and-socket-handover.md) | 2026-10-05 | 2026-10-07 |
 | [Enabling plan: SigNoz — OTLP-native, verified, no new kind](signoz-relay.md) | 2026-09-24 | 2026-09-24 |
 | [Enabling plan: OpenSearch — SS4O documents over `_bulk`](opensearch-relay.md) | 2026-09-24 | 2026-10-05 |
