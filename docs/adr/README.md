@@ -10,6 +10,9 @@ the same date, write the record, then add a row here.
 
 | ADR | Created | Updated |
 |---|---|---|
+| [`s3_out`: one object per time and size window, delivered at completion, under a key its first batch names](s3-object-archive.md) | 2026-10-30 | 2026-10-30 |
+| [Collecting sink window: a windowed sink keeps its window open across arrivals until its own bound, a deadline, store pressure, or shutdown closes it](collecting-sink-window.md) | 2026-10-30 | 2026-10-30 |
+| [`cri_in`: Kubernetes container logs from `/var/log/pods`, on `tail_in`'s driver](cri-container-logs.md) | 2026-10-29 | 2026-10-30 |
 | [`kafka_in`: a pure-Rust consumer-group client on `kafka-protocol`, committing an offset once its records are in every downstream inbox](kafka-input.md) | 2026-10-29 | 2026-10-29 |
 | [Tail content identity: the inode stays primary, content claims an unmatched inode, and what a restart or rotation still loses is decided or counted](tail-content-identity.md) | 2026-10-29 | 2026-10-29 |
 | [Listener authentication: static bearer and basic credentials on the HTTP listeners, and a proxy for everything else](listener-authentication.md) | 2026-10-25 | 2026-10-25 |
@@ -25,7 +28,7 @@ the same date, write the record, then add a row here.
 | [`datadog_out` maps OTLP metric kinds as Datadog's OTel exporter does, statelessly](datadog-otlp-metric-mapping.md) | 2026-10-20 | 2026-10-23 |
 | [`cumulative_to_delta`: a stateful transform that turns cumulative sums, histograms, and summaries into deltas](cumulative-to-delta-transform.md) | 2026-10-20 | 2026-10-25 |
 | [`influxdb_out` writes histograms and summaries in Telegraf's `prometheus-v1` shape](influxdb-histogram-summary-shape.md) | 2026-10-20 | 2026-10-21 |
-| [`replay_in`: a finite input that reads a `format: json` or `format: native` file once and ends](replay-input.md) | 2026-10-19 | 2026-10-19 |
+| [`replay_in`: a finite input that reads a `format: json` or `format: native` file once and ends](replay-input.md) | 2026-10-19 | 2026-10-30 |
 | [Transit spec: a mapping table under `spec/transit/` is the canonical statement of every cross-protocol transition, checked by flows and rendered into the docs](transit-spec.md) | 2026-10-19 | 2026-10-28 |
 | [`route_signals`: a native signal router that splits a mixed event into one part per target](route-signals.md) | 2026-10-16 | 2026-10-23 |
 | [LuaJIT's trace compiler is off by default, and `jit: true` turns it on per component](lua-jit-opt-in.md) | 2026-10-16 | 2026-10-25 |
@@ -58,7 +61,7 @@ the same date, write the record, then add a row here.
 | [Listener peer address: opt-in `network.peer.*` on the shared drivers, and PROXY protocol on TCP](listener-peer-address.md) | 2026-10-05 | 2026-10-18 |
 | [`lines_in`: a plain-lines listener that emits one raw log event per line and parses nothing](plain-lines-listener.md) | 2026-10-05 | 2026-10-05 |
 | [Native hop ack status: the sender pair leads the hop payload, and a rejected `Ack` settles one frame by name](native-hop-ack-status.md) | 2026-10-04 | 2026-10-25 |
-| [Sink fault classes: a rejected batch drops, a refused destination holds, and the process never exits for a sink](sink-fault-classes.md) | 2026-10-04 | 2026-10-26 |
+| [Sink fault classes: a rejected batch drops, a refused destination holds, and the process never exits for a sink](sink-fault-classes.md) | 2026-10-04 | 2026-10-30 |
 | [jiff is the one calendar implementation, behind the codecs' strict RFC 5424 contract](jiff-for-calendar-time.md) | 2026-10-04 | 2026-10-04 |
 | [`timestamp`: resolving `event.timestamp` from an attribute, with jiff for calendar time](timestamp-transform.md) | 2026-10-04 | 2026-10-18 |
 | [Lua refusals: `Event.new` raises a refusal from a Lua shim, not as an mlua callback error](lua-refusals-raised-from-lua.md) | 2026-10-03 | 2026-10-03 |
@@ -120,7 +123,7 @@ the same date, write the record, then add a row here.
 | [Native transport: handshake, implicit sequencing, and per-batch acknowledgement](native-transport-handshake-and-ack.md) | 2026-09-09 | 2026-10-25 |
 | [`tracing` for self-logging, with `Diagnostics` as its producer](tracing-for-self-logging.md) | 2026-09-09 | 2026-09-09 |
 | [A top-level `admin:` block, not a component, for readiness/liveness](admin-readiness-endpoint.md) | 2026-09-09 | 2026-10-25 |
-| [Disk-backed durable buffering for a sink's delivery queue](disk-backed-sink-buffer.md) | 2026-09-09 | 2026-10-18 |
+| [Disk-backed durable buffering for a sink's delivery queue](disk-backed-sink-buffer.md) | 2026-09-09 | 2026-10-30 |
 | [`stdio_out`/`file_out` gain a `native` wire-format option](file-output-native-format.md) | 2026-09-09 | 2026-10-21 |
 | [`file_out`: a rotating file sink, sharing `stdio_out`'s implementation](rotating-file-output.md) | 2026-09-08 | 2026-10-25 |
 | [Native wire format encoding: hand-rolled, not `rkyv` or a `serde`/`postcard` derive](native-wire-format-encoding.md) | 2026-09-08 | 2026-09-25 |
@@ -128,7 +131,7 @@ the same date, write the record, then add a row here.
 | [`logfmt` and `kv`: the de-facto key=value parsers, and why they stay two kinds](logfmt-and-kv-parsing.md) | 2026-09-07 | 2026-10-21 |
 | [`regex`: named captures into attributes, and taking the `regex` crate](regex-transform.md) | 2026-09-07 | 2026-10-21 |
 | [`csv`: positional columns from config, not a header row, and no type coercion](csv-positional-columns.md) | 2026-09-07 | 2026-10-21 |
-| [`tail_in`: generic file tailing, and `docker_in` on top of it for Docker's json-file logs](file-tailing-and-docker-json-logs.md) | 2026-09-06 | 2026-10-29 |
+| [`tail_in`: generic file tailing, and `docker_in` on top of it for Docker's json-file logs](file-tailing-and-docker-json-logs.md) | 2026-09-06 | 2026-10-30 |
 | [`trace_context` grows a `span:` block, and a native `traceparent` parser](trace-context-span-lifting.md) | 2026-09-04 | 2026-10-18 |
 | [TLS for `otlp_out`/`otlp_in`, and a pooled gRPC client to carry it](otlp-tls-and-pooled-grpc-client.md) | 2026-09-03 | 2026-10-25 |
 | [`scale`: unit conversion by constant factor, and why it stays out of `kv_metrics`](scale-transform.md) | 2026-09-03 | 2026-10-21 |

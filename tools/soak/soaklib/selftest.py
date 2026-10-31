@@ -183,6 +183,13 @@ none in a `[random]` schedule), `count_lines` reading a gzip file decompressed, 
 batch a step unrecorded allowed, and the replay band's terms for a step while the tailer runs and
 while the SUT is down.
 
+For a `cri` wire, it covers `count_cri_lines` (one line per `F` at any depth, a gzip file
+decompressed, a `.tmp` and an unfinished record skipped), criwriter.py's config rules and a
+short run of it (the kubelet's names, compression, removal, a restart into `1.log`, and its
+counts against the tree), the loader's rules for the wire and the writer's config, and over
+synthetic runs `ledger.wire` judging W − S + F − G, the end count plus the removed lines held to
+G, the end-to-end bound widened by S, and the rotation guard for a stop.
+
 For `[tls]`, `rotate`, and `probe`, it covers every validation rule (the table's keys, names,
 DNS names, and usages; the keys each step takes; a rotate's certificate read by its service's
 config, outside a comment, its days rising, once per run; a probe of a server certificate inside
@@ -231,8 +238,8 @@ import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import (checks, collect, docker, driver, faults, otlp, report, sampling, scenario, standin,
-               telemetry,
+from . import (checks, collect, criwriter, docker, driver, faults, otlp, report, sampling,
+               scenario, standin, telemetry,
                topic, vm)
 
 _FAILURES = []
@@ -14225,6 +14232,340 @@ def _copytruncate_ledger():
                f"more than a batch a step unrecorded FAILs, got {past}")
 
 
+def _cri_record(stream, tag, content):
+    return f"2026-10-08T12:00:00.5Z {stream} {tag} {content}\n".encode()
+
+
+def _cri_count():
+    """`collect.count_cri_lines` counts a line once at its `F`, however many `P`s it took, at
+    any depth, in a gzip file decompressed, and skips a `.tmp` and an unfinished record."""
+    with tempfile.TemporaryDirectory() as tmp:
+        logs = Path(tmp) / "ns_pod_uid" / "app"
+        logs.mkdir(parents=True)
+        (logs / "0.log").write_bytes(
+            _cri_record("stdout", "P", "a") + _cri_record("stderr", "F", "b")
+            + _cri_record("stdout", "F", "c") + b"2026-10-08T12:00:01Z stdout F unfinished")
+        (logs / "0.log.20261008-120000.gz").write_bytes(gzip.compress(
+            _cri_record("stdout", "F", "d") + _cri_record("stderr", "F:x", "e")))
+        (logs / "0.log.20261008-115900.gz.tmp").write_bytes(_cri_record("stdout", "F", "f"))
+        (logs / "1.log").write_bytes(b"")
+        counted = collect.count_cri_lines(tmp)
+        expect(counted["files"] == 3 and counted["lines"] == 4 and counted["records"] == 5,
+               f"count_cri_lines counts F records over the tree, got {counted}")
+        expect(collect.count_cri_lines(Path(tmp) / "missing") == {
+                   "files": 0, "lines": 0, "records": 0, "bytes": 0},
+               "count_cri_lines counts nothing in a missing directory")
+
+
+def _cri_writer():
+    """criwriter.py's config rules, and a short run of it: rotated names, compressed and
+    removed files, a restart into `1.log`, and its counts, the finished lines on disk plus the
+    lines removed equal to its G. Its rotations come once a wall-clock second at most, since the
+    kubelet's rotated names are per second, so the run rotates `0.log` at least four times
+    before its restart: the fourth, with four files kept, removes a compressed file."""
+    base = {"root": "/shared", "namespace": "soak", "pod": "writer", "uid": "u",
+            "container": "app", "input": "load", "sink": "pods", "rate": 400, "batch": 20,
+            "interval_s": 0.2, "stderr_share": 0.3, "long_every": 50,
+            "long_bytes": [20000, 40000], "dangle_every_s": 0.7, "dangle_s": 0.3,
+            "rotate_every_s": 0.4, "max_files": 4, "restart_after_s": 4.6, "seed": 7}
+    expect(criwriter.validate(base) == [], f"the base writer config is valid, got "
+                                           f"{criwriter.validate(base)}")
+    for change, problem in (({"rate": 0}, "`rate` and `batch` must be positive"),
+                            ({"max_files": 1}, "`max_files` must be at least 2"),
+                            ({"long_bytes": [100, 200]}, "`long_bytes` must be [low, high]"),
+                            ({"dangle_s": 0.7}, "`dangle_s` must be below `dangle_every_s`"),
+                            ({"seed": "1"}, "`seed` has the wrong type"),
+                            ({"extra": 1}, "unknown key `extra`")):
+        problems = criwriter.validate({**base, **change})
+        expect(any(problem in p for p in problems),
+               f"criwriter refuses {change} with {problem!r}, got {problems}")
+    expect(criwriter.validate({k: v for k, v in base.items() if k != "uid"}) == [
+               "missing `uid`"], "criwriter refuses a config missing a key")
+    expect(criwriter.cri_time(1_791_460_800_500_000_000) == "2026-10-08T12:00:00.5Z"
+           and criwriter.cri_time(1_791_460_800_000_000_000) == "2026-10-08T12:00:00Z",
+           "criwriter writes containerd's time, its fraction's trailing zeros trimmed")
+    with tempfile.TemporaryDirectory() as tmp:
+        config = {**base, "root": tmp}
+        out = io.StringIO()
+        ends = [time.monotonic() + 5.4]
+        removed_paths, remove = [], os.remove
+
+        def recorded(path):
+            removed_paths.append(str(path))
+            remove(path)
+
+        os.remove = recorded
+        try:
+            with contextlib.redirect_stdout(out):
+                criwriter.Writer(config).run(lambda: time.monotonic() >= ends[0])
+        finally:
+            os.remove = remove
+        tel = telemetry.parse_ndjson(out.getvalue().splitlines())
+
+        def total(name, component="pods"):
+            return sum(tel.counter_by_life(name, component=component).values())
+
+        g = total("logit.component.events.delivered")
+        removed = total(checks.CRI_REMOVED)
+        counted = collect.count_cri_lines(tmp)
+        expect(g > 0 and counted["lines"] + removed == g,
+               f"the writer's finished lines on disk plus those removed equal G, got G {g}, "
+               f"removed {removed}, {counted}")
+        expect(total(checks.CRI_ROTATIONS) >= 2 and removed > 0
+               and total(checks.CRI_SPLIT) >= 2,
+               f"a short run rotates, removes, and splits lines, got "
+               f"{total(checks.CRI_ROTATIONS)} {removed} {total(checks.CRI_SPLIT)}")
+        expect(total("logit.component.batches.sent", "load") > 0 and tel.drains,
+               "the writer reports its input's batches and an uptime per drain")
+        app = Path(tmp) / "soak_writer_u" / "app"
+        names = sorted(path.name for path in app.iterdir())
+        expect("0.log" in names and "1.log" in names
+               and all(re.fullmatch(r"[01]\.log(\.\d{8}-\d{6}(\.gz)?)?", n) for n in names)
+               and sum(n.startswith("1.log.") and not n.endswith(".gz") for n in names) <= 1,
+               f"the writer keeps the kubelet's names, one uncompressed rotated file, got "
+               f"{names}")
+        for live in ("0.log", "1.log"):
+            rotated = [n for n in names if n.startswith(live + ".")]
+            expect(not rotated or (not rotated[-1].endswith(".gz")
+                                   and all(n.endswith(".gz") for n in rotated[:-1])),
+                   f"{live}'s newest rotated file stays uncompressed and every older one is "
+                   f"compressed, as the kubelet leaves them, got {rotated}")
+        expect(any(n.endswith(".gz") for n in names)
+               and any(p.endswith(".gz") for p in removed_paths),
+               f"the run compresses files and a rotation removes a compressed one, got {names}, "
+               f"removed {removed_paths}")
+
+
+def _cri_rules(root):
+    """A `cri` wire's listener is a `cri_in`, and its writer's config is criwriter.py's JSON,
+    naming the source's ids and `/shared`; a `cri` source shares the directory with no other
+    file source; and the shipped cri-rotate loads as one."""
+    shipped = scenario.load(root / "scenarios" / "cri-rotate" / "scenario.toml")
+    expect([source["wire"] for source in shipped.file_sources] == ["cri"]
+           and shipped.cri_sources == shipped.file_sources,
+           f"cri-rotate's one source is a cri wire, got {shipped.file_sources}")
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp) / "cri-rotate"
+        shutil.copytree(root / "scenarios" / "cri-rotate", base)
+        toml, writer = base / "scenario.toml", base / "cri-writer.json"
+        pristine_toml, pristine_writer = toml.read_text(), writer.read_text()
+
+        def refused(what, wanted, toml_edit=None, writer_edit=None):
+            toml.write_text(toml_edit(pristine_toml) if toml_edit else pristine_toml)
+            writer.write_text(writer_edit(pristine_writer) if writer_edit else pristine_writer)
+            try:
+                scenario.load(toml)
+                expect(False, f"{what} loads")
+            except scenario.ScenarioError as err:
+                expect(any(wanted in p for p in err.problems),
+                       f"{what} is refused with {wanted!r}, got {err.problems}")
+
+        refused("a cri_in under a file wire", "`wire` is file, but `sut_listener` 'pods' is "
+                "a cri_in with no transport:, a cri listener",
+                toml_edit=lambda t: t.replace('wire = "cri"', 'wire = "file"'))
+        refused("a writer config that isn't JSON", "cri-writer.json isn't JSON",
+                writer_edit=lambda t: t.replace("{", "", 1))
+        refused("a writer config criwriter refuses", "cri-writer.json: `rate` and `batch` "
+                "must be positive", writer_edit=lambda t: t.replace('"rate": 500', '"rate": 0'))
+        refused("a writer sink the source doesn't name", "`generator_sink` must be the "
+                "writer's `sink`, 'other'",
+                writer_edit=lambda t: t.replace('"sink": "pods"', '"sink": "other"'))
+        refused("a writer root off the shared mount", "`root` must be /shared",
+                writer_edit=lambda t: t.replace('"root": "/shared"', '"root": "/var/log"'))
+        (base / "writer.yaml").write_text(pristine_writer)
+        refused("a cri writer config not named .json", "named *.json, and writer.yaml isn't",
+                toml_edit=lambda t: t.replace('"cri-writer.json"', '"writer.yaml"'))
+        refused("a second file source beside a cri one", "a `cri` source shares "
+                "`<run>/shared` with no other file source",
+                toml_edit=lambda t: t.replace(
+                    'generator = "cri-writer.json"',
+                    'generator = "cri-writer.json"\ngenerator-two = "cri-writer.json"')
+                + '\n[[ledger.source]]\nservice = "generator-two"\ngenerator_input = "load"\n'
+                'generator_sink = "pods"\nsut_listener = "two"\nwire = "file"\n')
+
+
+def _as_cri_wire(run_dir, w_minus_g=0, splits=0, write_splits=True, removed=0,
+                 counted=True, rotations=None, sut_config=None, sut_lines=()):
+    """Turns a ledger fixture into a `cri`-wire run in place: W is the listener's events sent,
+    S `splits` of them counted in `frames.truncated{reason="partial_timeout"}` (unless
+    `write_splits` is false), G the writer's `events.delivered`, set so the run's W − S − G is
+    `w_minus_g`, and `removed` of G's lines removed by its rotations. `counted` records the
+    `shared_counted` phase with G less `removed` (a dict replaces it). `rotations` is
+    `{offset: n}` of the writer's own rotation counter. `sut_config` is the SUT config text,
+    and `sut_lines` more SUT NDJSON lines."""
+    stdout = run_dir / "logs" / "logit.stdout"
+    out, w = [], 0
+    for line in stdout.read_text().splitlines():
+        record = json.loads(line)
+        metric = record["metrics"][0]
+        if (metric["name"] == "logit.component.events.sent"
+                and record["attributes"].get("component") == "in"):
+            w += metric["value"]
+        out.append(line)
+    out += list(sut_lines)
+    if write_splits and splits:
+        out.append(_line(_stamp(T0 + 200), "logit.input.frames.truncated", "sum", splits,
+                         component="in", attrs={"reason": "partial_timeout"}))
+    stdout.write_text("\n".join(out) + "\n")
+    g = w - splits - w_minus_g
+    gen_path = run_dir / "logs" / "generator.stdout"
+    gen, first = [], True
+    for line in gen_path.read_text().splitlines():
+        record = json.loads(line)
+        name = record["metrics"][0]["name"]
+        if name == "logit.output.datagrams":
+            continue
+        if name == "logit.output.messages":
+            record["metrics"][0]["name"] = "logit.component.events.delivered"
+            record["metrics"][0]["value"] = g if first else 0
+            first = False
+        gen.append(json.dumps(record))
+    if removed:
+        gen.append(_line(_stamp(T0 + 250), checks.CRI_REMOVED, "sum", removed, component="out"))
+    for offset, n in (rotations or {}).items():
+        gen.append(_line(_stamp(T0 + offset), checks.CRI_ROTATIONS, "sum", n, component="out"))
+    gen_path.write_text("\n".join(gen) + "\n")
+    if counted:
+        phase = (counted if isinstance(counted, dict)
+                 else {"files": 4, "lines": g - removed, "records": g, "bytes": g * 95})
+        with open(run_dir / "timeline.jsonl", "a") as timeline:
+            timeline.write(json.dumps(_phase("shared_counted", 301, **phase)) + "\n")
+            timeline.write(json.dumps(_phase("tail_caught_up", 302, reached=True, w=w - splits,
+                                             g=g, reads=2)) + "\n")
+    resolved_path = run_dir / "scenario.resolved.json"
+    resolved = json.loads(resolved_path.read_text())
+    resolved["ledger"]["source"] = [{**resolved["ledger"]["source"][0], "wire": "cri"}]
+    if sut_config is not None:
+        (run_dir / "configs").mkdir(exist_ok=True)
+        (run_dir / "configs" / "sut.yaml").write_text(sut_config)
+        resolved["configs"] = {**(resolved.get("configs") or {}), "sut": "sut.yaml"}
+    resolved_path.write_text(json.dumps(resolved))
+    return run_dir
+
+
+def _cri_ledger():
+    """The ledger on a `cri` source: W from the listener's events sent less S, its
+    `partial_timeout` flushes, against the writer's finished lines, held to the shared
+    directory's count plus the lines its rotations removed; the replay band widened by the
+    other stream's lines a held run's pin replays; the end-to-end bound widened by S; and the
+    writer's rotations inside a SUT down window guarded."""
+    pause = [_action("apply", "c0s2", "pause", "logit", 200, 201),
+             _action("revert", "c0s2", "pause", "logit", 230, 230)]
+    with tempfile.TemporaryDirectory() as tmp:
+        def run(name, timeline_extra=(), **kwargs):
+            # W is the listener's events sent, so no line is read and unsent at a stop.
+            run_dir = _ledger_run(tmp, name, shutdown_drops=0, life0_extra=0, v0_extra=0,
+                                  timeline_extra=timeline_extra)
+            return {r.id: r for r in checks.run_all(_as_cri_wire(run_dir, **kwargs))}
+
+        clean = run("cri-clean", splits=12, removed=4_000)
+        for row in ("ledger.wire", "ledger.intake", "ledger.edge", "ledger.egress",
+                    "ledger.summary", "drops"):
+            expect(clean[row].status == checks.PASS,
+                   f"{row} PASSes the balanced cri-wire fixture, got {clean[row]}")
+        wire = clean["ledger.wire"].detail
+        expect(wire.startswith("G 53,988 (shared directory: 49,988 lines in 4 files, the "
+                               "writer's rotations having removed 4,000) vs W 54,000 − S 12 + "
+                               "counted 0: W − S + F − G 0 against the replay band [0, 1,201]"),
+               f"a cri source reads events sent less S, got {wire}")
+        wire_lines = clean["ledger.wire"].lines
+        expect("life 0: [0, +1,200]: the other stream's lines after a held run's pin, 200 "
+               "lines/s x 6s of partial_timeout plus poll_interval" in wire_lines
+               and any("G 53,988, W 53,988, counted 0, gap 0" in line for line in wire_lines),
+               f"a stopped life's band adds a pin's lines at the defaults, and the runs read W "
+               f"less S, got {wire_lines}")
+        summary = clean["ledger.summary"].detail
+        expect("+ S 55,201" in summary and "plus S 12, the split lines' second events" in summary,
+               f"the end-to-end bound adds S, got {summary}")
+        # The band's top is the pin's 1,200 lines plus the stop's one split line.
+        expect(run("cri-pin-edge", w_minus_g=1_201)["ledger.wire"].status == checks.PASS,
+               "a stop's replay up to the pin's lines and a split line passes")
+        past = run("cri-pin-past", w_minus_g=1_202)["ledger.wire"]
+        expect(past.status == checks.FAIL and past.detail.startswith(
+                   "W − S + F − G 1,202 is surplus, outside the replay band [0, 1,201]"),
+               f"a line past the pin's replay FAILs, got {past}")
+        tuned = run("cri-pin-config", w_minus_g=502, sut_config=(
+            "components:\n  in:\n    type: cri_in\n    partial_timeout: 2s\n"
+            "    poll_interval: 500ms\n"))["ledger.wire"]
+        expect(tuned.status == checks.FAIL
+               and tuned.detail.startswith(
+                   "W − S + F − G 502 is surplus, outside the replay band [0, 501]")
+               and "life 0: [0, +500]: the other stream's lines after a held run's pin, 200 "
+               "lines/s x 2.5s of partial_timeout plus poll_interval" in tuned.lines,
+               f"the pin's term reads the listener's partial_timeout and poll_interval, got "
+               f"{tuned} {tuned.lines}")
+        # A killed life re-sends from the pin to the kill: at 200 lines/s, its 5 s
+        # checkpoint_interval's 1,000 lines and two 690-line reads plus the pin's 1,200, 3,580
+        # in all, above the stopped life's 1,201.
+        def killed(name, w_minus_g):
+            run_dir = _kill_run(tmp, name, every_window=False)
+            return {r.id: r for r in checks.run_all(_as_cri_wire(run_dir, w_minus_g=w_minus_g))}
+
+        kill_edge = killed("cri-kill-edge", 4_781)["ledger.wire"]
+        expect(kill_edge.status == checks.PASS
+               and "against the replay band [-1,000, 4,781]" in kill_edge.detail
+               and "life 1: [0, +1,200]: the other stream's lines after a held run's pin, 200 "
+               "lines/s x 6s of partial_timeout plus poll_interval" in kill_edge.lines
+               and any(line.startswith("life 1 (killed): [-1,000, +2,380]")
+                       for line in kill_edge.lines),
+               f"a killed life adds the pin's lines to its checkpoint interval's, got "
+               f"{kill_edge} {kill_edge.lines}")
+        kill_past = killed("cri-kill-past", 4_782)["ledger.wire"]
+        expect(kill_past.status == checks.FAIL and kill_past.detail.startswith(
+                   "W − S + F − G 4,782 is surplus, outside the replay band [-1,000, 4,781]"),
+               f"a line past a killed life's replay FAILs, got {kill_past}")
+        unsplit = run("cri-no-splits", splits=1_300, write_splits=False)
+        expect(unsplit["ledger.wire"].status == checks.FAIL
+               and unsplit["ledger.wire"].detail.startswith(
+                   "W − S + F − G 1,300 is surplus, outside the replay band [0, 1,201]"),
+               f"split events no S counts are a surplus, got {unsplit['ledger.wire']}")
+        dropped = [_line(_stamp(T0 + 210), "logit.input.frames.dropped", "sum", 5,
+                         component="in", attrs={"reason": reason})
+                   for reason in ("oversize", "truncated", "malformed")]
+        counted = run("cri-counted", w_minus_g=-15, sut_lines=dropped)["ledger.wire"]
+        expect(counted.status == checks.PASS and "+ counted 15:" in counted.detail,
+               f"a cri listener's oversize, truncated, and malformed drops are counted F, got "
+               f"{counted}")
+        lost = run("cri-lost", splits=12, w_minus_g=-1)
+        expect(lost["ledger.wire"].status == checks.FAIL
+               and lost["ledger.wire"].detail.startswith(
+                   "W − S + F − G -1 is uncounted loss"),
+               f"a line never sent FAILs, got {lost['ledger.wire']}")
+        short = run("cri-short", removed=10, counted={"files": 4, "lines": 54_000,
+                                                      "records": 60_000, "bytes": 1})
+        expect(short["ledger.wire"].status == checks.FAIL
+               and "precondition: the shared directory holds 54,000 finished line(s) and the "
+               "writer's rotations removed 10, but the writer's events.delivered is 54,000"
+               in short["ledger.wire"].detail,
+               f"a count off G less the removed lines FAILs, got {short['ledger.wire']}")
+        # The stop runs +101 to +131, widened by the writer's 5 s drains: one rotation in it
+        # compresses only a file read to its end, and a second the live file's unread tail.
+        once = run("cri-rotated-once", rotations={110: 1, 160: 1})
+        expect(once["ledger.wire"].status == checks.PASS,
+               f"one rotation in a stop passes, got {once['ledger.wire']}")
+        twice = run("cri-rotated-twice", rotations={105: 1, 130: 1})
+        expect(twice["ledger.wire"].status == checks.FAIL
+               and twice["ledger.wire"].detail.startswith(
+                   "the writer rotated 2 time(s) while the SUT was down (stop [+101s, +131s]), "
+                   "enough to compress a file it hadn't read: 2 rotation(s) in a stop trip the "
+                   "guard"),
+               f"two rotations in a stop FAIL, got {twice['ledger.wire']}")
+        # The pause runs +200 to +230, widened by the drains: a paused tailer keeps reading the
+        # files it holds open, so two rotations pass, and a third compresses the file the first
+        # created, which the tailer never opened.
+        paused = run("cri-paused-twice", timeline_extra=pause, rotations={205: 1, 225: 1})
+        expect(paused["ledger.wire"].status == checks.PASS,
+               f"two rotations in a pause pass, got {paused['ledger.wire']}")
+        thrice = run("cri-paused-thrice", timeline_extra=pause,
+                     rotations={200: 1, 215: 1, 230: 1})
+        expect(thrice["ledger.wire"].status == checks.FAIL
+               and thrice["ledger.wire"].detail.startswith(
+                   "the writer rotated 3 time(s) while the SUT was down (pause [+200s, +230s]), "
+                   "enough to compress a file it hadn't read: 3 rotation(s) in a pause trip the "
+                   "guard"),
+               f"three rotations in a pause FAIL, got {thrice['ledger.wire']}")
+
+
 def run(root, quiet=False):
     """Returns 0 when every expectation holds, else prints the failures and returns 1."""
     root = Path(root)
@@ -14246,6 +14587,7 @@ def run(root, quiet=False):
                      _sources_ledger, _source_rules, _fanin_driver, _tcp_ledger, _tcp_rules,
                      _http_ledger, _http_rules, _file_ledger, _file_rules,
                      _kafka_wire_ledger, _kafka_wire_rules,
+                     _cri_count, _cri_writer, _cri_rules, _cri_ledger,
                      _file_ops, _file_action_rules, _copytruncate_ledger, _two_sut_rules,
                      _two_sut_driver, _two_sut_checks, _relay_rules, _relay_driver,
                      _relay_checks, _per_service, _slope_edges,
@@ -14273,6 +14615,7 @@ def run(root, quiet=False):
                               _expected_event_rules,
                               _shipped, _roles, _sink_rules, _driver_roles, _source_rules,
                               _fanin_driver, _tcp_rules, _http_rules, _file_rules, _kafka_wire_rules,
+                              _cri_rules,
                               _two_sut_rules,
                               _two_sut_driver, _file_action_rules, _relay_rules, _relay_driver,
                               _rss_settle_rules, _expected_rules, _standin_codec, _standin_server,

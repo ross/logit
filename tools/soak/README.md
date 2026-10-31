@@ -446,6 +446,26 @@ the stop and two after the kill (its copy's and the replace's), two rejected res
 truncations seen, two compressed files skipped, and none of a gone entry's bytes, an ambiguous
 claim, an invalid UTF-8 line, or a checkpoint error.
 
+`cri-rotate` (10 minutes 10 seconds) has `soaklib/criwriter.py`, a stdlib Python writer in the
+stand-in's image, write one container's log into a kubelet pod log tree under `<run>/shared`
+(`<namespace>_<pod>_<uid>/app/0.log`) in the CRI format: 500 lines a second, stdout and
+stderr interleaved, every hundredth line 20 to 50 KB long and split into 16 KiB `P` pieces with
+a stderr line between two of them, and every 37 s a stdout line stalled for 12 s after a short
+`P`, longer than `cri_in`'s 5 s `partial_timeout`. A short `P` is CRI-O's conmon's form of a
+partial write; containerd writes a `P` only at 16 KiB or at a reopen. Every 45 s it rotates as
+the kubelet does: it removes the oldest rotated files past three, keeping five files in all,
+gzips every uncompressed rotated file, renames the live file
+to `0.log.<YYYYMMDD-HHMMSS>`, writes a line's head to the renamed file as a `P`, and reopens,
+the head's `F` starting the new file. At 330 s it restarts the container into `1.log`. It
+reports in `internal`'s NDJSON grammar, so the ledger reads its G as a `logit` writer's. The SUT
+reads the tree with `cri_in` (a checkpoint, `read_from: beginning`), and a `set` gives every
+event one resource, so the restart count doesn't start a second series. The source declares
+`wire = "cri"`. Its 7-minute 10-second cycle pauses the SUT, stops it, restarts it, and kills it
+twice, each for at most 35 s, so a window holds at most one rotation. Its expectations assert
+at least 10 `partial_timeout` flushes, no frame dropped, rotations seen, and no resume rejected
+or checkpoint failed. It has no `max_duration`: the writer's retention bounds its files and
+the tailer's descriptors.
+
 `otlp-fan-out` (16 minutes) sends 500 OTLP log records a second with `otlp_out` over HTTP, 50
 to a request, into `otlp_in`, its source declared `wire = "http"`. Each record's body is four
 lines of InfluxDB line protocol, each point with its own tag value so none merge, and the SUT's
@@ -1174,17 +1194,19 @@ over the source's `wire`: `udp`, the default, one line per datagram; `tcp`, LF-t
 on one connection; `file`, lines the SUT tails from a file the generator writes; or `http`,
 requests to `influxdb_in`, `otlp_in`, `splunk_hec_in`, `datadog_in`, or `prometheus_in`'s
 remote-write receiver from `influxdb_out`, `otlp_out`, `splunk_hec_out`, `datadog_out`, or
-`prometheus_out`; or `scrape`, `prometheus_in` scraping a generator's `prometheus_out`
-exposition; or `kafka`, a generator's `kafka_out` producing to the stack's broker and the SUT's
-`kafka_in` consuming the topic. The loader checks the wire against the listener's `type:` and `transport:` in
-the SUT config, or for `prometheus_in`, which has no `transport:`, against its mode: `bind:` is
-the receiver, an HTTP listener, and `scrape_targets:` a scrape listener. On a file, HTTP, or
-scrape wire it also checks the generator sink's kind, on a scrape wire a `prometheus_out` with
-`bind:`, and on a Kafka wire a `kafka_out` writing one of the `kafka_in`'s `topics:` in its
-`format:`, read from `start: earliest`. Each wire has its own symbols: G is the generator sink's
-`output.messages` (its `events.delivered` on a file or HTTP wire, its `output.records` on a
-Kafka wire), W the listener's `input.datagrams`, `input.frames`, `input.lines`,
-`input.records` on Kafka, or on HTTP `events.sent`, and on TCP F
+`prometheus_out`; `scrape`, `prometheus_in` scraping a generator's `prometheus_out`
+exposition; `kafka`, a generator's `kafka_out` producing to the stack's broker and the SUT's
+`kafka_in` consuming the topic; or `cri`, a kubelet pod log tree `cri_in` reads, which
+`criwriter.py` writes. The loader checks the wire against the listener's `type:` and
+`transport:` in the SUT config, or for `prometheus_in`, which has no `transport:`, against its
+mode: `bind:` is the receiver, an HTTP listener, and `scrape_targets:` a scrape listener. On a
+file, HTTP, or scrape wire it also checks the generator sink's kind, on a scrape wire a
+`prometheus_out` with `bind:`, on a Kafka wire a `kafka_out` writing one of the `kafka_in`'s
+`topics:` in its `format:`, read from `start: earliest`, and on a `cri` wire the writer's JSON
+config, whose `input` and `sink` are the source's ids. Each wire has its own symbols: G is the
+generator sink's `output.messages` (its `events.delivered` on a file or HTTP wire, its
+`output.records` on a Kafka wire), W the listener's `input.datagrams`, `input.frames`,
+`input.lines`, `input.records` on Kafka, or on HTTP `events.sent`, and on TCP F
 counts the lines the listener's framer dropped before W counted them (`frames.dropped`),
 counted wire loss. On HTTP G counts only the points the listener answered with a success, so
 the row compares it with W less X, the events of a batch refused with `503` because no
@@ -1237,6 +1259,24 @@ Ab − V. The end sequence waits, once the generators stop,
 until the SUT's `logit.input.lag` reads 0 on every partition (`kafka_caught_up` in
 `timeline.jsonl`), and the row FAILs a wait that ended short. `ledger.summary`'s end-to-end
 bound adds the band's upper edge, since a replayed record reaches VictoriaMetrics again.
+
+A `cri` wire is a file wire whose writer is `criwriter.py` and whose files hold CRI records. G
+is the logical lines the writer finished, one per `F` record, and W is `cri_in`'s
+`logit.component.events.sent`, not `logit.input.lines`, which counts every `P` and `F` record.
+A line leaves as two events when its run waits past `partial_timeout`, a stall or a head left
+in a renamed file, and `cri_in` counts each such flush in
+`logit.input.frames.truncated{reason="partial_timeout"}`, S. The row judges W − S + F − G
+against the replay band, which holds while every flushed run's rest arrives, as the writer
+finishes every line before it exits, and the end-to-end bound adds S. `cri_in` pins a file's
+checkpoint at a held run's first record while it has already sent the other stream's lines
+after it, so a stop or a kill while a run is held replays those lines: on a `cri` wire every
+stopped and killed life widens the band above by its rate over its last drain interval times
+`partial_timeout` plus `poll_interval`. The driver counts the
+`F` records in the tree, gzip files decompressed, and that count plus the lines the writer's
+rotations removed (`soak.writer.lines.removed`) must equal G. A rotation gzips every rotated
+file but the one it renames, and `cri_in` never reads a `.gz`, so the row FAILs a SUT stop,
+kill, restart, or `exit` holding two writer rotations, or a pause holding three, enough to
+compress a file the tailer hadn't finished.
 
 A scrape wire is a pull of running totals, so it's judged in value, not in lines. G is the
 increments the generator's `generate_in` sent per generator life, less what the
@@ -1533,8 +1573,8 @@ for = { min = "60s", max = "3m" }
 
 A scenario that sets `max_duration` refuses a longer `--duration`, because its thresholds or
 configs hold only that long; `tail-rotate`'s is 25 minutes, and `tail-copytruncate`'s is its
-own 15, since its steps run once per run. `tail-rotate-delete` has none:
-its writer's retention bounds both the shared directory and the tailer's descriptors.
+own 15, since its steps run once per run. `tail-rotate-delete` and `cri-rotate` have none:
+each writer's retention bounds both the shared directory and the tailer's descriptors.
 
 To run for hours, keep the driver alive when the terminal closes: a closed terminal sends
 SIGHUP, which ends the schedule, collects, and tears down, so an unprotected 8-hour run stops at

@@ -1495,7 +1495,7 @@ Area: `crates/logit-inputs/src/tail/{driver,watch,checkpoint,line,pattern,mod}.r
 `crates/logit-inputs/src/docker.rs`.
 Governing ADRs: [`docs/adr/file-tailing-and-docker-json-logs.md`](../adr/file-tailing-and-docker-json-logs.md)
 and its partial supersession [`docs/adr/docker-container-identity-and-minimal-watches.md`](../adr/docker-container-identity-and-minimal-watches.md).
-Telemetry contract: [`docs/design/internal-telemetry.md`](../design/internal-telemetry.md#tail_in-and-docker_in).
+Telemetry contract: [`docs/design/internal-telemetry.md`](../design/internal-telemetry.md#tail_in-docker_in-and-cri_in).
 Documented deliberate gaps: [`docs/known-gaps/tailing.md`](../known-gaps/tailing.md).
 
 Third-party crates actually in play here: `tokio` (fs, `AsyncFd`, `select!`, `watch`), `bytes`,
@@ -2296,7 +2296,7 @@ scratch-dir test helper are all hand-rolled (ADR "Alternatives considered").
   (`logit.component.receive.flushed{reason}`); `crates/logit-inputs/src/tail/checkpoint.rs`
   (`CheckpointStore::write`: `logit.input.checkpoint.writes`); diagnostics keys throughout.
 - **What it does:** The only externally visible account of what this listener read, dropped, and
-  rotated. Contract documented at [`docs/design/internal-telemetry.md`](../design/internal-telemetry.md#tail_in-and-docker_in).
+  rotated. Contract documented at [`docs/design/internal-telemetry.md`](../design/internal-telemetry.md#tail_in-docker_in-and-cri_in).
 - **Why sensitive:** accounting (these counters are how an operator detects the loss modes the
   other entries describe); hot-path (two counter calls per line in `read_one`).
 - **Invariants to verify:**

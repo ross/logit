@@ -1,6 +1,6 @@
 ---
 created: 2026-10-04
-updated: 2026-10-26
+updated: 2026-10-30
 ---
 
 # Sink fault classes: a rejected batch drops, a refused destination holds, and the process never exits for a sink
@@ -187,6 +187,13 @@ and in an amendment to the sink's own record:
   server failure stays `Ambiguous` where the OTLP specification says not to retry it
   (`crates/logit-outputs/src/otlp.rs`, "Response classes"; "Amendment: `otlp_out` departs from the
   OTLP specification's non-retryable list (2026-10-04)", below).
+- `s3_out`: a `3xx`, a size limit, `411`, the `400` codes that name configuration, and a `KMS.*`
+  code under any `4xx` are `Refused`, since no S3 answer names one batch; a body that didn't
+  arrive whole, an expired token, a bad upload the sink assembled, `404` `NoSuchUpload`, `409`
+  `OperationAborted`, `429`, and a `503` carrying an S3 code are `Clean`, as is an `Ambiguous`
+  answer to a request that can't make an object visible
+  (`crates/logit-outputs/src/s3/mod.rs`, "Response classes"; "Amendment: `s3_out`'s departures
+  from the status-only default (2026-10-30)", below).
 
 Sinks with no application response (`syslog_out`, `statsd_out`, `graphite_out`, `collectd_out`,
 `file_out`, `stdio_out`) classify by I/O error alone: a connect failure is `Clean`, a mid-write
@@ -521,3 +528,33 @@ reports it is `buffer_full` once the queue fills.
 A runtime backstop timeout above every sink's own was declined. Each sink's timeout is set per
 component, so a backstop above it needs a graph rule tying the two, for a case the per-sink rule
 already covers.
+
+## Amendment: `s3_out`'s departures from the status-only default (2026-10-30)
+
+[ADR `s3-object-archive`](s3-object-archive.md) decides `s3_out`, which stores many batches as
+one object and counts them delivered only once the object is complete. Its response-class table
+is `crates/logit-outputs/src/s3/mod.rs`'s module doc, "Response classes". It departs from this
+record's status-only default in four directions:
+
+- **`Refused` where the default drops.** A `3xx` (the sink follows no redirect, and a wrong
+  region or endpoint answers every object alike), `413` and `400` `EntityTooLarge` (a body's size
+  is set by configuration: every body is at most `part_size`, so a smaller limit is
+  configuration), `411`, and the `400` codes that name configuration and a `KMS.*` code under any
+  `4xx`. `401`, `405`, and `407` keep the default `Refused`. S3 never interprets an object's
+  content, so no S3 answer names one batch.
+- **`Clean` where the default drops or doubts.** A `400` whose body never arrived whole, an
+  expired token (after a credential refresh), a bad upload the sink assembled, a `409`
+  `OperationAborted`, a `404` `NoSuchUpload`, a `429`, and any `503` carrying an S3 error code.
+  A `503` with no S3 code keeps the default `Ambiguous`.
+- **Nothing is visible before completion.** An `Ambiguous` answer to a request that can't make an
+  object visible, `CreateMultipartUpload` or `UploadPart`, is `Clean`.
+- **A `200` isn't always success.** A `CompleteMultipartUpload` `200` with an `<Error>` body takes
+  the class of its code.
+
+An S3 `4xx` the sink doesn't list stays `Rejected`, this record's rule for an answer a sink can't
+attribute; the s3 ADR states what that costs.
+
+**Consequence.** A destination that answers a redirect, a size limit, or a configuration code
+holds the sink's queue, announced by `logit.component.retrying`, where the default would have
+dropped a batch per attempt; the operator fixes `region:`, `endpoint:`, `part_size`, or the
+bucket, and the held objects go through.

@@ -244,3 +244,42 @@ def count_lines(directory):
                 lines += block.count(b"\n")
                 size += len(block)
     return {"files": files, "lines": lines, "bytes": size}
+
+
+def count_cri_lines(directory):
+    """`{files, lines, records, bytes}` over every regular file under `directory`, at any depth:
+    a `cri` wire's pod log tree, counted outside both processes. A logical line ends in one
+    `F` record however many `P` records it took, so `lines` counts the `F`s; `records` counts
+    every record and `bytes` every byte, a gzip file's decompressed, since the kubelet's
+    rotation compresses all but the newest rotated file. A record the writer never finished
+    has no newline and isn't counted. A `.tmp`, a compression in progress, is skipped."""
+    files = lines = records = size = 0
+    root = Path(directory)
+    paths = sorted(path for path in root.rglob("*") if path.is_file()) if root.is_dir() else []
+    for path in paths:
+        if path.name.endswith(".tmp"):
+            continue
+        files += 1
+        with open(path, "rb") as raw:
+            packed = raw.read(2) == GZIP_MAGIC
+            raw.seek(0)
+            handle = gzip.GzipFile(fileobj=raw) if packed else raw
+            rest = b""
+            while True:
+                block = handle.read(1 << 20)
+                if not block:
+                    break
+                size += len(block)
+                chunk = rest + block
+                if b"\n" not in chunk:
+                    rest = chunk
+                    continue
+                complete, _, rest = chunk.rpartition(b"\n")
+                for record in complete.split(b"\n"):
+                    records += 1
+                    # `<time> <stream> <tag> <content>`: the tag is the third field, `F` or
+                    # `P`, with any later tags after a `:`.
+                    fields = record.split(b" ", 3)
+                    if len(fields) > 2 and fields[2].split(b":")[0] == b"F":
+                        lines += 1
+    return {"files": files, "lines": lines, "records": records, "bytes": size}
