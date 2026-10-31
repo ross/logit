@@ -3,15 +3,17 @@
 A lossless pair is a `<proto>_in` listener and a `<proto>_out` sink for one wire protocol, built so
 that `<proto>_in -> <proto>_out` hands a consumer of that protocol what the producer sent, modulo a
 named list of normalizations ([ADR `lossless-transit`](adr/lossless-transit.md)). Eleven pairs
-exist. This guide is the order of work that has landed them, the files each step touches, and the check
-that fails when a step is missed. It's written for a contributor adding the twelfth. For a sink or
-listener with no partner (`s3_out`, `cri_in`), the per-layer sections still apply; skip the pair
-round trip and the like-pair flows.
+exist. This guide is the order of work that has landed them, the files each step touches, and the
+check that fails when a step is missed. It's written for a contributor adding the twelfth. For a
+sink or listener with no partner (`s3_out`, `cri_in`), the per-layer sections still apply; skip the
+pair round trip and the like-pair flows.
 
-The one thing to take away: "lossless" is a property proven by tests at four layers, not a design
-claim. A pair is done when the fixed-point test, the pair round trip, the transit spec's like-pair
-flows, and a run against the real system all agree, and every degradation the pair can't avoid is
-counted and written down.
+The one thing to take away: "lossless" is a property proven by tests, not a design claim. A pair is
+done when its fixed-point test, its round trip through the real listener and sink, the transit
+spec's like-pair flows, and a run against the real system agree, and every degradation the pair
+can't avoid is counted and written down. Not every pair has every layer: `kafka_in -> kafka_out`
+has no fixed-point test or round trip of its own, and its like-pair check is the `kafka-relay-*`
+flows plus `script/kafka-interop`. A layer a pair skips is a decision the plan records.
 
 ## Before any code
 
@@ -20,8 +22,9 @@ counted and written down.
    the same PR as the ADR, because the fixed-point corpus is built from that list.
 2. **Check what's decided.** [`docs/adr/README.md`](adr/README.md) and
    [`docs/known-gaps/`](known-gaps/README.md) may already hold a decision or a deliberate limit for
-   this protocol. The relay ADRs for Datadog, Splunk, and InfluxDB each have a "Verified
-   destination behavior" section; read the nearest one before designing a response-class table.
+   this protocol. The Datadog and Splunk relay ADRs each have a "Verified destination behavior"
+   section and InfluxDB's a "Verified `influxd` behavior" section; read the nearest one before
+   designing a response-class table.
 3. **Pick a stream key** (`[a-z0-9-]`, not in use) and plan the workstreams. See
    [Branches and PR titles](../AGENTS.md#branches-and-pr-titles) for the branch and title forms.
 4. **W0 is an ADR and a plan**, nothing else. The ADR is copied from
@@ -32,20 +35,21 @@ counted and written down.
 The ADR has to settle these, each as a sentence a reviewer can answer yes or no to:
 
 - **The mapping.** Every wire field to its home on `Event`: a typed field, a public attribute, or a
-  private `_logit.<proto>.*` carrier ([ADR `private-attribute-namespace`](adr/private-attribute-namespace.md)).
-  A fact only the pair's own family reads is a carrier. A fact another component must act on is a
-  `_logit.metrics.*` flag ([ADR `metric-flags`](adr/metric-flags.md)), never a carrier read across
-  families ([ADR `protocol-knowledge-stays-in-family`](adr/protocol-knowledge-stays-in-family.md)).
-  The sender's host goes on `host.name` ([ADR `process-hostname`](adr/process-hostname.md)).
+  private `_logit.<proto>.*` carrier ([ADR
+  `private-attribute-namespace`](adr/private-attribute-namespace.md)). A fact only the pair's own
+  family reads is a carrier. A fact another component must act on is a `_logit.metrics.*` flag ([ADR
+  `metric-flags`](adr/metric-flags.md)), never a carrier read across families ([ADR
+  `protocol-knowledge-stays-in-family`](adr/protocol-knowledge-stays-in-family.md)). The sender's
+  host goes on `host.name` ([ADR `process-hostname`](adr/process-hostname.md)).
 - **The permitted normalizations**, as a numbered list. This list is what the fixed-point test
   asserts against, so it has to be complete before the test is written. Expect review to find a
   row the code performs that the list doesn't name.
 - **What the model can't carry.** A wire feature `Event` has no home for is tracked debt in
   `docs/known-gaps/<proto>.md`, not an accepted codec limit.
 - **The acknowledgment rule.** What the listener's acknowledgment means, which is "in every
-  downstream inbox", never "delivered" ([ADR `delivery-semantics`](adr/delivery-semantics.md), item 3).
-  If the wire can't express a negative acknowledgment, the exception is an amendment to that ADR,
-  as `kafka_in`'s commit past a dropped record is.
+  downstream inbox", never "delivered" ([ADR `delivery-semantics`](adr/delivery-semantics.md), item
+  3). If the wire can't express a negative acknowledgment, the exception is an amendment to that
+  ADR, as `kafka_in`'s commit past a dropped record is.
 - **The sink's posture and response-class table.** Which responses are `Clean`, `Ambiguous`,
   `Rejected`, and `Refused` ([ADR `sink-fault-classes`](adr/sink-fault-classes.md)), whether a
   duplicate is absorbed at the destination, and the transport timeout that bounds every attempt.
@@ -53,8 +57,9 @@ The ADR has to settle these, each as a sentence a reviewer can answer yes or no 
   into a `MessageBuf`, [ADR `framed-encoder`](adr/framed-encoder.md)), or `SignalEncoder` (one
   payload per signal). The choice follows where the wire's batch edges fall, not convenience.
 - **What's shared.** Code a second kind will need (a broker connection, an auth scheme, a signing
-  implementation) goes in its own crate from the start. `logit-kafka` and `logit-aws` each exist
-  because a sink's module turned out to be a listener's dependency too.
+  implementation) goes in its own crate from the start. `logit-kafka` exists because a sink's
+  module turned out to be a listener's dependency too, and `logit-aws` because a second sink
+  needed `kafka_out`'s signing.
 - **Where the pair stops.** Which real systems the harness verifies against, and which topologies
   are out of scope. A leg that no run has verified is marked unverified in the docs, never implied.
 
@@ -65,7 +70,7 @@ paragraph (stacked PRs, review before fix rounds, the test-reverted rule, the pr
 ## The workstreams that have worked
 
 Every pair has landed through a shape like this, stacked as one `gh stack` with each PR based on
-the one before it. Sizes are from the `kafka_in` plan.
+its parent workstream's branch. The rows are the shape, not any one stream's split.
 
 | Workstream | Contents | Depends on |
 |---|---|---|
@@ -83,7 +88,7 @@ separate workstreams because each is a review in its own right; a listener and s
 the shape review rounds multiply on. When the sink already exists and holds the encoder, W2 is its
 move into `logit-proto` beside the new decoder, as `influxdb_out`'s was.
 
-Review runs on each PR before its fix rounds, from the reviewer session, and the stack is brought
+Review runs on each PR before its fix rounds, and the stack is brought
 up to date with `main` by merging, never rebasing. A merge of `main` can move a graph rule number
 out from under the branch (`s3_out` took rule 100 while `kafka_in` held it); the renumber touches
 `graph.rs`, the registry's comments, the ADR, the plan, and
@@ -103,18 +108,22 @@ there.
 ### Codec (`crates/logit-proto/src/<proto>/`)
 
 - The decoder implements `logit_proto::Decoder`, or, where records arrive through a client rather
-  than a socket, a function the listener calls (`kafka_in`'s `decode_record_batches`). It never
-  summarizes: raw timer values and set members stay raw until an `aggregate` decides.
+  than a socket, the listener decodes them itself over the codec here (`kafka_in`'s
+  `decode_record_batches` in `crates/logit-inputs/src/kafka/decode.rs` reads `logit_proto::kafka`'s
+  batch codec). It never summarizes: raw timer values and set members stay raw until an
+  `aggregate` decides.
 - The encoder implements one of the three shapes. A `FramedEncoder` counts every per-message drop.
 - `mod.rs`'s doc is the canonical copy of the mapping table, the permitted-normalization list, and
   a "Deviations from <reference>" section. Every other document summarizes it and links to it.
 - Every length read from the wire is bounded before anything is reserved from it. A
   `Vec::with_capacity` from a wire count has been a blocking finding more than once; clamp to a
   constant and let the budget charge the rest.
-- Tests: a fixed-point suite, `crates/logit-proto/tests/<proto>_fixed_point.rs`, over a corpus
-  that exercises every survey feature; a robustness section in
-  `crates/logit-proto/tests/robustness.rs` that pins the worst-case allocation under a hostile length; and an interop test that decodes
-  the recorded corpus and asserts identifiable values, never whole-file bytes.
+- Tests: a fixed-point suite, `crates/logit-proto/tests/<proto>_fixed_point.rs` (one per payload
+  family where the protocol has several, as Datadog's are), asserting `decode -> encode -> decode`
+  equality over hand-built bodies that exercise every survey feature; a robustness section in
+  `crates/logit-proto/tests/robustness.rs` that pins the worst-case allocation under a hostile
+  length; and an interop test, `crates/logit-proto/tests/<proto>_interop.rs`, that decodes the
+  recorded corpus and asserts identifiable values, never whole-file bytes.
 - A fuzz target: `fuzz/fuzz_targets/<proto>.rs`, a `[[bin]]` in `fuzz/Cargo.toml`, a row in
   `script/unsafe-check`'s `FUZZ_TARGETS` table with its `max_len` and allocation limit, a seed
   source in `fuzz/seedgen`, the regenerated `fuzz/seeds/<target>/`, and a bullet in
@@ -126,7 +135,8 @@ there.
 ### Config (`crates/logit-config/src/lib.rs`)
 
 - One `ComponentKind` variant per kind, deriving `Serialize + Deserialize + JsonSchema`, with
-  `deny_unknown_fields` on every fixed-key struct ([ADR `config-yaml-jsonschema`](adr/config-yaml-jsonschema.md)).
+  `deny_unknown_fields` on every fixed-key struct ([ADR
+  `config-yaml-jsonschema`](adr/config-yaml-jsonschema.md)).
 - Field docs are operator docs: they render into `schema/logit.schema.json`, so no rule numbers,
   ADR paths, or cross-references.
 - TLS and auth keys on a two-mode kind are prefixed by the mode they serve, as the Prometheus kinds'
@@ -139,15 +149,16 @@ there.
 
 - Implements `logit_pipeline::Input`. `bind` opens the socket in the pre-pass; `run` never binds.
 - Acknowledges a batch only once it's in every downstream inbox, through `Fanout`'s
-  deadline-carrying sends, and never acknowledges a batch no consumer took. An HTTP listener answers a bounded wait
-  with the protocol's busy status and counts `input.batches.deferred`.
+  deadline-carrying sends, and never acknowledges a batch no consumer took. An HTTP listener answers
+  a bounded wait with the protocol's busy status and counts `input.batches.deferred`.
 - A loss is `*.dropped` with a `reason`; an outcome the config asked for is `discarded`, `skipped`,
   `omitted`, or `evicted` ([ADR `telemetry-loss-vocabulary`](adr/telemetry-loss-vocabulary.md)).
   A loss reported only by a diagnostic gets a counter beside it.
 - Takes the shared blocks where they apply: `receive:` on a datagram listener, `peer:` and
   `proxy_protocol:` on a socket listener, `forwarded:` and the family-prefixed `bind_auth:` on an
   HTTP listener, `tls:` through `logit_pipeline::tls` so the reloader covers it.
-- Never prints its config, or any struct that could hold a `!env`-inlined secret, in an error or log.
+- Never prints its config, or any struct that could hold a `!env`-inlined secret, in an error or
+  log.
 - Tests wait on observables through `logit_pipeline::test_util`, never a sleep
   ([ADR `test-timing-and-observables`](adr/test-timing-and-observables.md)).
 - Registration: the kind arm in `crates/logit-cli/src/pipeline.rs`, a graph rule in
@@ -172,16 +183,21 @@ there.
   A counter that fires for an event no request writes is the same bug from the other side.
 - A destination limit that's measured and detectable is pre-filtered and counted, not sent to fail.
 - A cross-protocol degradation (a kind the wire can't carry) is counted `degraded` or `skipped`,
-  named in the module doc, and given a row in [`docs/known-gaps/mappings.md`](known-gaps/mappings.md)
-  through the transit spec's generated region, never silently.
+  named in the module doc, and given a row in
+  [`docs/known-gaps/mappings.md`](known-gaps/mappings.md) through the transit spec's generated
+  region, never silently.
 - The same registration list as the listener: registry arm, graph rule and test, rule row, fixture.
 
 ### Pair round trip
 
-`crates/logit-cli/tests/<proto>_pair_round_trip.rs` runs the recorded corpus through the real
-listener decoder, the real sink encoder, and back, asserting equality modulo the ADR's list. Along
-with the fixed-point test it's the only enforcement of "lossless" outside the transit spec, and
-it's where a normalization the ADR didn't name shows up first.
+`crates/logit-cli/tests/<proto>_pair_round_trip.rs` (the four newest pairs) or
+`<proto>_round_trip.rs` (the older ones) decodes a hand-written body onto the codec's fixed point,
+sends it through the real sink over a socket into the real listener, and asserts the batch that
+arrives equals the one that left, modulo the ADR's list. Three of the four `_pair_` tests run sink
+to listener; `datadog_trace_pair_round_trip.rs` runs listener, sink, and listener. For statsd and
+syslog this test is also where the fixed point is asserted. Along with the fixed-point test it's
+the only enforcement of "lossless" outside the transit spec, and it's where a normalization the
+ADR didn't name shows up first.
 
 ### Transit spec (`spec/transit/`, `crates/logit-cli/src/transit/`)
 
@@ -189,21 +205,23 @@ it's where a normalization the ADR didn't name shows up first.
 "Adding a case", and "Adding a flow" are the procedure; what follows is what a pair adds and what
 fails without it.
 
-- **A source** is a directory `spec/transit/cases/<proto>/` with a `features/<proto>.yaml`, a
-  `.meta.yaml` per case naming the wire file and the features it exercises, and a decode arm in
-  `spec.rs`'s `decode_wire` keyed on the directory name before its first `-`. A case that reads
+- **A source** is `spec/transit/features/<proto>.yaml`, a directory `spec/transit/cases/<proto>/`
+  with a `.meta.yaml` per case naming the wire file and the features it exercises, and a decode arm
+  in `spec.rs`'s `decode_wire` keyed on the directory name before its first `-`. A case that reads
   third-party bytes points its `wire:` at `testdata/interop/`. The `.json` beside each case is
   generated; `script/transit gen` rewrites it and `transit::spec::cases` fails when it's stale.
-- **A sink column** is the sink's name in `mapping.yaml`'s `sinks:` list, a cell in every row
-  (class, operator sentence, reason, counter), a `SinkEncoder` arm in `wire.rs` with the pair's own
-  decoder as the read-back, and the sink's file and protocol name in `docs.rs`'s `FILES` and
-  `PROTOCOLS`. The sink's module doc gets a region opened by `<!-- transit:doc:<sink> -->` and
-  `mappings.md` one opened by `<!-- transit:gaps:<sink> -->`, each closed by `<!-- transit:end -->`;
-  `script/transit docs` fills them and `transit::docs::transit_docs` fails on a missing or stale region.
-- **The like-pair flows** are `flows/<proto>-relay*.yaml`, one per sink mode that changes the
-  outcome, each registered in `spec.rs`'s `flow_tests!` list; `check_cases` fails naming the
-  flow and the line to add. Every cross-protocol flow into the new sink changes its expected and
-  ledger files too, so the diff is large and generated.
+- **A sink column** is the sink's name in `mapping.yaml`'s `sinks:` list, a cell in every row a
+  record can reach the sink through (class, operator sentence, reason, counter), an arm in
+  `crates/logit-cli/src/pipeline.rs`'s `sink_encoder` (and a `SinkEncoder` variant if no shape
+  fits), a read-back arm in `transit/wire.rs` with the pair's own decoder, and the sink's file and
+  protocol name in `docs.rs`'s `FILES` and `PROTOCOLS`. The sink's module doc gets a region opened
+  by `<!-- transit:doc:<sink> -->` and `mappings.md` one opened by `<!-- transit:gaps:<sink> -->`,
+  each closed by `<!-- transit:end -->`; `script/transit docs` fills them and
+  `transit::docs::transit_docs` fails on a missing or stale region.
+- **The like-pair flows** are `flows/<proto>-relay*.yaml` or `<proto>-to-<proto>*.yaml`, one per
+  sink mode that changes the outcome, each registered in `spec.rs`'s `flow_tests!` list;
+  `check_cases` fails naming the flow and the line to add. Every cross-protocol flow into the new
+  sink changes its expected and ledger files too, so the diff is large and generated.
 - **The class check** fails a flow where an observed outcome differs from the cell's class, or a
   counter moved that no reached cell names. `coverage.md` lists the cells no flow reaches; a cell
   with no case is a feature the spec doesn't yet cover.
@@ -212,10 +230,12 @@ fails without it.
 
 ### Recorded corpus (`testdata/interop/<proto>/`)
 
-`script/record-fixtures <proto>` runs real clients in pinned images and writes what they sent, with
-a README naming each image, its digest, the date, and what each file holds
-([`testdata/interop/README.md`](../testdata/interop/README.md)). A new producer is a
-`record_<proto>()` function and an entry in the script's `all` list. Record a corpus before writing
+`script/record-fixtures <proto>` runs real clients and writes what they sent, with a README naming
+each producer and version, its invocation, the date, and the construct each file exercises
+([`testdata/interop/README.md`](../testdata/interop/README.md)'s "Producer conventions"); run a
+client from an image pinned by tag and digest where one exists. A new producer is a
+`record_<proto>()` function, an entry in the script's `all` list, and an arm in its dispatch
+`case`; a name in `all` with no arm exits with "unknown producer". Record a corpus before writing
 the decoder's edge cases, not after: a recurring blocking finding is a reference client doing
 something the ADR said it wouldn't. Nothing fails if a corpus goes unused, so the tests that read
 it are written in the same PR. A capture that fingerprints the recording machine is a finding;
@@ -223,26 +243,31 @@ check the bytes before committing them.
 
 ### Interop harness (`tools/<proto>-interop/`)
 
-The shape every harness shares: `script/<proto>-interop` on the host driving docker, a
-`compose.yaml` with images pinned by tag and digest and no host ports, one `logit-<leg>.yaml` per
-leg, a stdlib-only `check.py` printing one `PASS`/`GAP`/`FAIL` row per leg, a README with a
-"Recorded run" section, and runs under `perf/results/<proto>-interop/<timestamp>/`. A `GAP` is a
-difference a known-gaps entry records. Each leg config joins `script/validate` and the shipped-config
-test only if its directory is in both globs and the file is named `logit-*.yaml`; a leg with no
-`check.py` row has no verdict and nothing says so. The harness is out of CI, and the PR body
-carries the run's row counts.
+What a new harness should have, as `tools/s3-interop/` does: `script/<proto>-interop` on the host
+driving docker, a `compose.yaml` with images pinned by tag and digest and no host ports, one
+`logit-<leg>.yaml` per leg, a stdlib-only `check.py` printing one `PASS`/`GAP`/`FAIL` row per leg, a
+README with a "Recorded run" section, and runs under `perf/results/<proto>-interop/<timestamp>/`. A
+`GAP` is a difference the README or a known-gaps entry records. The older harnesses differ in
+details (some pin tags only; splunk-interop adds a `SENT` verdict for a stack with no search API).
+Each leg config joins `script/validate` and the shipped-config test only if its directory is in both
+globs and the file is named `logit-*.yaml`; a leg with no `check.py` row has no verdict and nothing
+says so. The harness is out of CI, and the PR body carries the run's row counts.
 
 ### Soak (`tools/soak/`)
 
 A pair that ingests over a wire the harness doesn't judge yet adds a `wire = "<name>"`:
-`WIRES` and `LISTENER_WIRES` in `scenario.py`, a `Wire` entry in `checks.py`'s `WIRES` with the
-G, W, and counted-loss counters and the replay band a killed life is allowed, an ingress predicate
-in `faults.py`, and an end-of-run wait in `driver.py` where the wire is pull-style. A sink whose
-response-class table the harness should cue adds a `[target] shape` in `tools/soak/standin/` with
-a vectors file and a body codec in `soaklib/standin.py`, and a `standin-<proto>` scenario whose
-`respond` steps walk every row of the table naming the class each must read; AGENTS.md's invariant
-list makes that scenario part of the table's contract. Every self-test function is added to the
-tuple in `selftest.py`, or it never runs. `script/soak self-test` is the only check, and it's manual.
+`WIRES` and `LISTENER_WIRES` in `scenario.py`; a `Wire` entry in `checks.py`'s `WIRES` (the G and W
+counters, kernel drops, and the counted and B frame-drop reasons) and, where a killed life can
+replay, a band on `Ledger` beside `replay_band`; an ingress predicate in `faults.py`; and an
+end-of-run wait in `driver.py` where the wire is pull-style. A sink whose response-class table the
+harness should cue adds a shape to `soaklib/standin.py`'s `SHAPES`, its answers in
+`tools/soak/standin/standin.py`, a body codec in `soaklib/standin.py`, a vectors file under
+`standin/` where the codec has published test bytes, and a `standin-<proto>` scenario whose
+`respond` steps walk every row of the table naming the class each must read. That scenario becomes
+part of the table's contract once the sink is added to the response-class invariant in AGENTS.md's
+"Invariants a reviewer checks first", so edit that list in the same PR. Every self-test function
+is added to the tuple in `selftest.py`, or it never runs. The self-test is the only check: it runs
+before every `script/soak run` and never in CI.
 
 ### Docs sweep
 
@@ -260,14 +285,15 @@ The files that have described every pair, each hand-maintained:
 - `docs/design/data-model.md`'s "Well-known attribute names": every new carrier and public key.
 - `docs/known-gaps/<proto>.md`, indexed from `known-gaps/README.md`: the residual debt by the
   plan's closing assessment.
-- The ADR index's `updated` date on every ADR the pair amends.
+- The `updated` date in the frontmatter of every ADR the pair amends, and its index row, which
+  the frontmatter orders.
 
 The relative links in all of them are checked by `doc_links.rs`; nothing checks the counts.
 
 ## What review finds
 
-A catalogue of 203 findings across the pair streams, ranked. The first two categories are 70 of them,
-most in files the diff didn't touch.
+A catalogue of 203 findings across the pair streams, ranked. The first two categories are 70 of
+them, most in files the diff didn't touch.
 
 1. **Stale prose** (48): a doc, module doc, or comment that still describes the behavior before the
    change. The sweep before each PR is a grep for every statement of the old behavior, including
