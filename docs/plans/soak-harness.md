@@ -506,9 +506,9 @@ for = "5s"
 listener and `aggregate`, and adds the script hop to the ledger ("The ledger and identities").
 
 **Compose overrides, service roles, and sinks (W7b).** Every compose service carries a
-`soak.role` label: `sut`, `generator`, `backend`, `broker` (a Kafka target's broker; see
-"Kafka targets"), `standin` (W9a, a stand-in target's destination; see "Stand-in
-targets"), `idp` (W19, a token endpoint the SUT reaches on loopback; see "A token endpoint in
+`soak.role` label: `sut`, `generator`, `backend`, `broker` (a Kafka target's or a Kafka
+wire's broker; see "Kafka targets"), `standin` (W9a, a stand-in target's destination; see
+"Stand-in targets"), `idp` (W19, a token endpoint the SUT reaches on loopback; see "A token endpoint in
 the SUT's namespace"), or `netns` (W12b, a namespace holder: a rolling overlap's, see "Rolling
 overlap", or from W19 the one `logit` and an `idp` share). The harness knows a service by its role, never its name. Its ingress SUT is `logit`,
 and from W10a an override can add further SUT services (see "Several SUT services").

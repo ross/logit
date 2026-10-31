@@ -32,10 +32,10 @@ the scripted stand-in destination, the `standin` service, in the same place: its
 no backend, `respond` steps tell it what to answer, and the ledger's V is what its record says it
 stored (docs/plans/soak-harness.md's "Stand-in targets").
 
-Services are known by role, from each compose service's `soak.role` label: `sut` (a `logit`
-under test), `generator`, `backend`, `broker` (a Kafka target's broker), `standin` (a
-stand-in target's destination), `idp` (a token endpoint the SUT reaches on loopback), or `netns`
-(a namespace holder: a rolling overlap's, or the one `logit` and an `idp` share). A scenario may
+Services are known by role, from each compose service's `soak.role` label: `sut` (a `logit` under
+test), `generator`, `backend`, `broker` (a Kafka target's or a Kafka wire's broker), `standin` (a
+stand-in target's destination), `idp` (a token endpoint the SUT reaches on loopback), or `netns` (a
+namespace holder: a rolling overlap's, or the one `logit` and an `idp` share). A scenario may
 add services with a `compose` override file, a second generator or a second SUT included, so the
 role map comes from the merged compose config,
 which only the driver can read (`docker compose config`). `load()` checks what needs no service
@@ -58,8 +58,9 @@ from . import topic as topic_mod
 
 # The compose label naming a service's role, and the roles. A `sut` and a `generator` run
 # `logit`; a `backend` stores what a sink delivers and answers the checks' queries; a `broker`
-# is a Kafka target's broker, which the driver reads the topic back from; a `standin` is a stand-in
-# target's scripted destination, which answers as `respond` steps cue it and records each request.
+# is a Kafka target's or a Kafka wire's broker, which the driver reads a target's topic back from
+# and a wire's consumer lag from; a `standin` is a stand-in target's scripted destination, which
+# answers as `respond` steps cue it and records each request.
 ROLE_LABEL = "soak.role"
 SUT_ROLE, GENERATOR_ROLE, BACKEND_ROLE, BROKER_ROLE = "sut", "generator", "backend", "broker"
 STANDIN_ROLE = "standin"
