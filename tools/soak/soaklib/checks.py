@@ -4106,7 +4106,8 @@ def check_ledger_intake(data):
         name = f" {listener}" if len(led.listeners) > 1 else ""
         w_text = "W + Y − D" if led.wires[listener] is WIRES[SCRAPE_WIRE] else "W − D"
         part = f"final life {life}{name}: {w_text} {_n(lhs)} vs E + B {_n(rhs)}"
-        deferred = led.deferred(life, [listener])
+        # The same slack, under the same guard, as `ledger.summary`'s: none across a hop.
+        deferred = led.deferred(life, [listener]) if led.hop is None else 0
         if 0 < lhs - rhs <= deferred:
             parts.append(part + f", the {_n(lhs - rhs)} between them within the deferred "
                                 f"batches' {_n(deferred)} records, read again")

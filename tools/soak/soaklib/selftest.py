@@ -7791,8 +7791,22 @@ def _kafka_wire_ledger():
                    f"{row} FAILs a final life one record past its deferred batch, got "
                    f"{over[row]}")
         surplus = final_rows("kafka-final-deferred-surplus", -500)
-        expect(surplus["ledger.intake"].status == checks.FAIL,
-               f"E + B above W − D isn't a deferred batch, got {surplus['ledger.intake']}")
+        for row in ("ledger.intake", "ledger.summary"):
+            expect(surplus[row].status == checks.FAIL,
+                   f"{row}: E + B above W − D isn't a deferred batch, got {surplus[row]}")
+
+        # Across a native hop, a deferred batch in the ingress SUT's final life excuses nothing:
+        # not even its 10 records, `logit`'s `batch_max_events`, which a run with no hop allows.
+        hop_base = {r.id: r for r in checks.run_all(_kafka_hop_run(tmp, "kafka-hop", 0))}
+        for row in ("ledger.intake", "ledger.summary"):
+            expect(hop_base[row].status == checks.PASS,
+                   f"{row} PASSes a Kafka wire across a hop, got {hop_base[row]}")
+        hopped = {r.id: r for r in checks.run_all(_kafka_hop_run(tmp, "kafka-hop-deferred",
+                                                                 10))}
+        for row in ("ledger.intake", "ledger.summary"):
+            expect(hopped[row].status == checks.FAIL
+                   and "within the deferred batches'" not in hopped[row].detail,
+                   f"{row} takes no deferred slack across a hop, got {hopped[row]}")
 
         # A deferred batch never reaches `aggregate`, so it can't excuse the final life's
         # Ab − V.
@@ -8646,6 +8660,40 @@ def _tcp_hop_run(tmp, name, extra, ambiguous_at=None):
     rewrite(run_dir / "logs" / "generator.stdout", gen)
     resolved = json.loads((run_dir / "scenario.resolved.json").read_text())
     resolved["ledger"]["source"] = [{**resolved["ledger"]["source"][0], "wire": "tcp"}]
+    (run_dir / "scenario.resolved.json").write_text(json.dumps(resolved))
+    return run_dir
+
+
+def _kafka_hop_run(tmp, name, unsent):
+    """`_two_sut_run`'s unkilled one-life hop run with its one source on a Kafka wire: `logit`
+    counts `input.records` in place of datagrams, the generator's `output.messages` become its
+    `kafka_out`'s `output.records`, and `logit`'s one life, its final, defers one batch at
+    +250 holding `unsent` records it read and never sent."""
+    run_dir = _two_sut_run(tmp, name, kill_on=None, collector_lives=1)
+    path = run_dir / "logs" / "logit.stdout"
+    out = []
+    for line in path.read_text().splitlines():
+        record = json.loads(line)
+        if record["metrics"][0]["name"] == "logit.input.datagrams":
+            record["metrics"][0]["name"] = "logit.input.records"
+        out.append(json.dumps(record))
+    stamp = _stamp(T0 + 248)
+    out.append(_line(stamp, "logit.input.batches.deferred", "sum", 1, component="in"))
+    out.append(_line(stamp, "logit.input.records", "sum", unsent, component="in"))
+    path.write_text("\n".join(out) + "\n")
+    path = run_dir / "logs" / "generator.stdout"
+    out = []
+    for line in path.read_text().splitlines():
+        record = json.loads(line)
+        name = record["metrics"][0]["name"]
+        if name == "logit.output.datagrams":
+            continue
+        if name == "logit.output.messages":
+            record["metrics"][0]["name"] = "logit.output.records"
+        out.append(json.dumps(record))
+    path.write_text("\n".join(out) + "\n")
+    resolved = json.loads((run_dir / "scenario.resolved.json").read_text())
+    resolved["ledger"]["source"] = [{**resolved["ledger"]["source"][0], "wire": "kafka"}]
     (run_dir / "scenario.resolved.json").write_text(json.dumps(resolved))
     return run_dir
 
