@@ -26,7 +26,7 @@
 use super::checkpoint::{
     marker, CheckpointStore, FileId, Head, Loaded, Persisted, Retained, Source, HEAD_BYTES,
 };
-use super::line::{LineSplitter, TailDecoder};
+use super::line::{LineSplitter, Split, TailDecoder};
 use super::pattern::PathPattern;
 use super::TailConfig;
 use bytes::{BufMut, Bytes, BytesMut};
@@ -277,7 +277,8 @@ pub(super) struct Listing {
     /// Paths a pattern may name that couldn't be checked: a pattern's `Scan::unknown`, and a
     /// matched path whose `stat` failed other than as absent.
     pub unknown: HashSet<PathBuf>,
-    /// Every pattern whose listing failed.
+    /// Every pattern whose listing failed, and every directory below a pattern's own whose listing
+    /// failed (`cri_in`'s walk): each covers the paths its pattern covers under its `dir`.
     pub failed: Vec<FailedListing>,
     /// How many paths went into `unknown`: the `op="stat"` count.
     pub stat_errors: usize,
@@ -290,7 +291,10 @@ impl Listing {
     /// covers it.
     pub fn listed(&self, patterns: &[PathPattern], path: &Path) -> bool {
         !self.unknown.contains(path)
-            && !self.failed.iter().any(|f| patterns[f.pattern].covers(path))
+            && !self
+                .failed
+                .iter()
+                .any(|f| patterns[f.pattern].covers(path) && path.starts_with(&f.dir))
     }
 
     /// The inode of every discovered path.
@@ -496,6 +500,10 @@ struct TrackedFile<D> {
     /// Whether a scan after `draining_scan` completed with a listing that could have named this
     /// file's path, and so could have rebound it. `Tailer::reap_drained` requires it.
     rescanned: bool,
+    /// A read reached the file's end while the decoder held a line, and no read since returned
+    /// bytes: the file is a candidate for [`Tailer::flush_idle`]. Kept only for a decoder with
+    /// [`TailDecoder::FLUSHES_IDLE`].
+    at_end: bool,
 }
 
 impl<D> TrackedFile<D> {
@@ -624,9 +632,9 @@ pub(crate) struct Tailer<D: TailDecoder, F: DecoderFactory<D>> {
     /// is freed once every event slicing it is gone, so one event can hold up to
     /// [`READ_CHUNK_BYTES`] of earlier reads alive with it.
     read_buf: BytesMut,
-    /// `read_one`'s split lines with their start offsets, empty between calls; kept for its
-    /// capacity.
-    lines: Vec<(Bytes, u64)>,
+    /// `read_one`'s split lines and dropped lines with their start offsets, empty between calls;
+    /// kept for its capacity.
+    lines: Vec<(Piece, u64)>,
     /// `read_one`'s decoded events, emptied by every `BatchAccumulator::absorb`; kept for its
     /// capacity.
     scratch: Vec<Event>,
@@ -805,6 +813,9 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                     self.count_wake("poll");
                     next_poll = tokio::time::Instant::now() + self.config.poll_interval;
                     self.scan(false, &mut watcher).await;
+                    if D::FLUSHES_IDLE {
+                        self.flush_idle(&sink).await;
+                    }
                 }
                 Outcome::Flush => {
                     self.flush_all(&sink, FlushReason::Interval).await;
@@ -1722,6 +1733,13 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                         listing.first_stat_error.get_or_insert((path.clone(), err));
                     }
                     listing.unknown.extend(scan.unknown);
+                    listing.failed.extend(
+                        scan.failed_dirs.into_iter().map(|(dir, error)| FailedListing {
+                            pattern,
+                            dir,
+                            error,
+                        }),
+                    );
                 }
                 Err(error) => listing.failed.push(FailedListing {
                     pattern,
@@ -1896,7 +1914,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
         // that's gone, and would otherwise be spliced onto, or swallow, the new first line. The
         // decoder gets the same reset for its own cross-line state (`docker_in`'s partial-entry
         // reassembly); see `TailDecoder::reset`.
-        tracked.splitter = LineSplitter::new(max_line_bytes);
+        tracked.splitter = new_splitter::<D>(max_line_bytes);
         tracked.decoder.reset();
         tracked.held_from = None;
         tracked.head.clear();
@@ -2114,13 +2132,16 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 return;
             }
         }
-        let decoder = match self.factory.open(&path) {
+        let mut decoder = match self.factory.open(&path) {
             Ok(d) => d,
             Err(err) => {
                 self.diag.warn_throttled("open_error", format!("{}: {err}", path.display()));
                 return;
             }
         };
+        if sniffed {
+            decoder.file_head(&head);
+        }
         // A failure is non-fatal (the file relies on `poll_interval`) but diagnosed: at scale
         // it's `ENOSPC` against `fs.inotify.max_user_watches`, and this diagnostic is the only
         // sign. Registered once per tracked inode and never retried (`docs/known-gaps/tailing.md`).
@@ -2139,7 +2160,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             file,
             offset,
             last_len: len,
-            splitter: LineSplitter::new(self.config.max_line_bytes),
+            splitter: new_splitter::<D>(self.config.max_line_bytes),
             decoder,
             accumulator: BatchAccumulator::new(batching.max_events, batching.max_bytes),
             state: FileState::Active,
@@ -2159,6 +2180,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             draining_since: None,
             draining_scan: 0,
             rescanned: false,
+            at_end: false,
         };
         if let Some(off) = rejected {
             self.telemetry.count("logit.input.files.resume_rejected", 1.0, &[]);
@@ -2295,10 +2317,16 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                         shrank = true;
                     } else {
                         tracked.last_len = tracked.offset;
+                        if D::FLUSHES_IDLE && tracked.decoder.holds_entry() {
+                            tracked.at_end = true;
+                        }
                     }
                     0
                 }
-                Ok(n) => n,
+                Ok(n) => {
+                    tracked.at_end = false;
+                    n
+                }
                 Err(err) => {
                     self.diag
                         .warn_throttled("read_error", format!("{}: {err}", tracked.path.display()));
@@ -2329,6 +2357,7 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             match sniff(&tracked.head) {
                 Sniff::Text => {
                     tracked.sniffed = true;
+                    tracked.decoder.file_head(&tracked.head);
                     self.skipped.remove(&id);
                 }
                 Sniff::Undecided => {
@@ -2350,18 +2379,20 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             }
         }
 
-        // Each line with the file offset it starts at, for `TrackedFile::held_from`.
+        // Each line, and each line the splitter dropped, with the file offset it starts at, for
+        // `TrackedFile::held_from` and `TailDecoder::line_dropped`.
         let mut lines = std::mem::take(&mut self.lines);
-        let dropped = {
+        {
             let tracked = match self.files.get_mut(&id) {
                 Some(t) => t,
                 None => return false,
             };
             let chunk_start = tracked.offset;
             let partial_start = chunk_start - tracked.splitter.pending_bytes();
-            let stats = tracked.splitter.push(bytes.clone(), |line, start| {
-                let start = start.map_or(partial_start, |i| chunk_start + i as u64);
-                lines.push((line, start));
+            let at = |start: Option<usize>| start.map_or(partial_start, |i| chunk_start + i as u64);
+            tracked.splitter.push_split(bytes.clone(), |item| match item {
+                Split::Line(line, start) => lines.push((Piece::Line(line), at(start))),
+                Split::Dropped { head, start } => lines.push((Piece::Dropped(head), at(start))),
             });
             tracked.offset += n as u64;
             // The marker bytes. A boundary moves only to the byte after a newline in this chunk, so
@@ -2388,20 +2419,6 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                 tracked.boundary_tail.clone_from(&tracked.window);
                 tracked.boundary_at = boundary;
             }
-            stats.dropped_lines
-        };
-        if dropped > 0 {
-            self.telemetry.count(
-                "logit.input.frames.dropped",
-                f64::from(dropped),
-                &[("reason", "oversize")],
-            );
-        }
-        for _ in 0..dropped {
-            self.diag.warn_throttled(
-                "long_line",
-                "a line exceeded the line-length bound and was dropped whole",
-            );
         }
 
         let mut scratch = std::mem::take(&mut self.scratch);
@@ -2423,18 +2440,58 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
     }
 
     /// `read_one`'s decode half: decodes `lines` into `scratch` and absorbs each line's events
-    /// into the file's accumulator, emitting at a bound. Stops at a refused emit
-    /// ([`Tailer::untaken`]). Returns `false` if the file stopped being tracked.
+    /// into the file's accumulator, emitting at a bound. Offers each dropped line to
+    /// [`TailDecoder::line_dropped`] in sequence, and counts it
+    /// `logit.input.frames.dropped{reason="oversize"}` with a `long_line` unless the decoder took
+    /// it. Stops at a refused emit ([`Tailer::untaken`]). Returns `false` if the file stopped being
+    /// tracked.
     async fn decode_lines(
         &mut self,
         id: FileId,
-        lines: &mut Vec<(Bytes, u64)>,
+        lines: &mut Vec<(Piece, u64)>,
         scratch: &mut Vec<Event>,
         read_at: i64,
         sink: &Fanout,
     ) -> bool {
-        for (line, line_start) in lines.drain(..) {
-            let line = ensure_utf8(line, &mut self.diag);
+        let mut pieces = lines.drain(..);
+        for (piece, line_start) in pieces.by_ref() {
+            let line = match piece {
+                Piece::Line(line) => line,
+                Piece::Dropped(head) => {
+                    let Some(tracked) = self.files.get_mut(&id) else { return false };
+                    if !tracked.decoder.line_dropped(&head, line_start, scratch) {
+                        self.telemetry.count(
+                            "logit.input.frames.dropped",
+                            1.0,
+                            &[("reason", "oversize")],
+                        );
+                        self.diag.warn_throttled(
+                            "long_line",
+                            "a line exceeded the line-length bound and was dropped whole",
+                        );
+                    }
+                    // As after a line: the drop can start or end a held run.
+                    if !tracked.decoder.holds_entry() {
+                        tracked.held_from = None;
+                    } else if tracked.held_from.is_none() {
+                        tracked.held_from = Some(line_start);
+                    }
+                    if scratch.is_empty() {
+                        continue;
+                    }
+                    let resource = tracked.decoder.resource();
+                    if let Some((batch, reason)) =
+                        tracked.accumulator.absorb(resource, None, scratch)
+                    {
+                        if !emit(sink, &self.telemetry, batch, reason).await {
+                            self.untaken = true;
+                            break;
+                        }
+                    }
+                    continue;
+                }
+            };
+            let line = if D::LOSSY_UTF8 { ensure_utf8(line, &mut self.diag) } else { line };
             let Some(tracked) = self.files.get_mut(&id) else { return false };
             self.telemetry.count("logit.input.lines", 1.0, &[]);
             self.telemetry.count("logit.input.line.bytes", line.len() as f64, &[]);
@@ -2459,6 +2516,18 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
                     self.untaken = true;
                     break;
                 }
+            }
+        }
+        // A refused emit stops decoding, so the decoder never sees a drop the splitter reported
+        // after it. Each is counted here so none goes uncounted; one the decoder would have folded
+        // into a drop it already counted is counted twice.
+        for (piece, _) in pieces {
+            if let Piece::Dropped(_) = piece {
+                self.telemetry.count("logit.input.frames.dropped", 1.0, &[("reason", "oversize")]);
+                self.diag.warn_throttled(
+                    "long_line",
+                    "a line exceeded the line-length bound and was dropped whole",
+                );
             }
         }
         true
@@ -2567,6 +2636,56 @@ impl<D: TailDecoder, F: DecoderFactory<D>> Tailer<D, F> {
             }
             if let Some(cp) = &mut self.checkpoint {
                 cp.mark_dirty();
+            }
+        }
+    }
+
+    /// The poll tick's [`TailDecoder::flush_idle`] pass, for a decoder with
+    /// [`TailDecoder::FLUSHES_IDLE`] (`docs/adr/cri-container-logs.md`, section 5). A file is
+    /// offered only while it's at its end ([`TrackedFile::at_end`]) and its handle's length shows
+    /// nothing unread; a file with unread bytes is left for `drain`, which reads them. So a reader
+    /// that is behind never flushes a held line whose end is already in the file. Stops at a
+    /// refused emit ([`Tailer::untaken`]).
+    async fn flush_idle(&mut self, sink: &Fanout) {
+        let now = tokio::time::Instant::now();
+        let ids: Vec<FileId> = self
+            .files
+            .iter()
+            .filter(|(_, f)| f.at_end && f.state != FileState::Deselected)
+            .map(|(id, _)| *id)
+            .collect();
+        let mut scratch = Vec::new();
+        for id in ids {
+            let Some(tracked) = self.files.get_mut(&id) else { continue };
+            match tracked.file.metadata().await {
+                Ok(meta) if meta.len() == tracked.offset => {}
+                // Unread bytes, a truncation `drain`'s length check handles, or an `fstat` that
+                // says nothing: not idle.
+                _ => continue,
+            }
+            let was_pinned = tracked.held_from.is_some();
+            tracked.decoder.flush_idle(now, &mut scratch);
+            if !tracked.decoder.holds_entry() {
+                tracked.held_from = None;
+                tracked.at_end = false;
+            }
+            // Releasing the pin moves the persisted offset even when nothing is emitted (an idle
+            // flush that only ends an oversize drop), and an interval write skips a clean store.
+            if was_pinned != tracked.held_from.is_some() || !scratch.is_empty() {
+                if let Some(cp) = &mut self.checkpoint {
+                    cp.mark_dirty();
+                }
+            }
+            if scratch.is_empty() {
+                continue;
+            }
+            let resource = tracked.decoder.resource();
+            if let Some((batch, reason)) = tracked.accumulator.absorb(resource, None, &mut scratch)
+            {
+                if !emit(sink, &self.telemetry, batch, reason).await {
+                    self.untaken = true;
+                    return;
+                }
             }
         }
     }
@@ -2738,7 +2857,7 @@ async fn close_decoder<D: TailDecoder>(
     let partial_start = tracked.offset - tracked.splitter.pending_bytes();
     let partial = if hold_partial { None } else { tracked.splitter.take_partial() };
     if let Some(partial) = partial {
-        let partial = ensure_utf8(partial, diag);
+        let partial = if D::LOSSY_UTF8 { ensure_utf8(partial, diag) } else { partial };
         // Offered to the decoder like any line `read_one` splits, so counted the same way.
         telemetry.count("logit.input.lines", 1.0, &[]);
         telemetry.count("logit.input.line.bytes", partial.len() as f64, &[]);
@@ -2973,9 +3092,21 @@ fn file_gone_message(path: &Path, id: FileId, offset: u64, unread: u64) -> Strin
     )
 }
 
+/// One item `read_one` hands `decode_lines`: a split line, or the head of a line the splitter
+/// dropped.
+enum Piece {
+    Line(Bytes),
+    Dropped(Bytes),
+}
+
+/// A file's splitter, with `D`'s `\r` and drop-head choices.
+fn new_splitter<D: TailDecoder>(max_line_bytes: usize) -> LineSplitter {
+    LineSplitter::with_options(max_line_bytes, D::STRIPS_CR, D::KEEPS_DROP_HEADS)
+}
+
 /// Lossily converts (and diagnoses `invalid_utf8`) a line that isn't UTF-8, upholding
 /// `Value::Str`'s invariant for every [`TailDecoder`].
-fn ensure_utf8(line: Bytes, diag: &mut Diagnostics) -> Bytes {
+pub(crate) fn ensure_utf8(line: Bytes, diag: &mut Diagnostics) -> Bytes {
     match std::str::from_utf8(&line) {
         Ok(_) => line,
         Err(_) => {
@@ -5329,6 +5460,70 @@ mod tests {
         append(&path, b"two\n");
         assert_eq!(tick(&mut tailer, false).await, vec!["two"], "no replay after recovery");
         assert_eq!(scan_errors(&mut probe, "read_dir"), 1.0, "the clean scan counts nothing");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Under the pods layout, a pod directory whose listing failed retires no file beneath it,
+    /// although `root` itself listed.
+    #[tokio::test]
+    async fn a_failed_pod_directory_listing_keeps_the_file_beneath_it() {
+        let root = scratch_dir("scan-pod-dir-fails");
+        let pod = root.join("default_web-0_0123-abcd");
+        std::fs::create_dir_all(pod.join("nginx")).unwrap();
+        let path = pod.join("nginx").join("0.log");
+        std::fs::write(&path, b"one\n").unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut tailer =
+            probed_tailer(vec![PathPattern::pod_logs(&root)], ReadFrom::Beginning, &probe);
+        assert_eq!(tick(&mut tailer, true).await, vec!["one"]);
+
+        let scope = fault::scope(&pod);
+        scope.fail(READ_DIR, errno::EACCES);
+        assert!(tick(&mut tailer, false).await.is_empty());
+        assert_eq!(state_of(&tailer, &path), Some(FileState::Active));
+        assert_eq!(scan_errors(&mut probe, "read_dir"), 1.0);
+        drop(scope);
+
+        append(&path, b"two\n");
+        assert_eq!(tick(&mut tailer, false).await, vec!["two"], "no replay after recovery");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `tail_in`'s decoder keeps [`TailDecoder::STRIPS_CR`]'s default: a CRLF line loses its
+    /// `\r`.
+    #[tokio::test]
+    async fn a_crlf_line_loses_its_cr_under_tail_in() {
+        let dir = scratch_dir("tail-crlf");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"one\r\n").unwrap();
+        let probe = TelemetryProbe::new();
+        let mut tailer =
+            probed_tailer(vec![PathPattern::new(dir.join("*.log"))], ReadFrom::Beginning, &probe);
+        assert_eq!(tick(&mut tailer, true).await, vec!["one"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A refused emit stops decoding, and a splitter drop reported after it in the same read is
+    /// still counted.
+    #[tokio::test]
+    async fn a_splitter_drop_after_a_refused_emit_is_counted() {
+        let dir = scratch_dir("tail-drop-after-refusal");
+        let path = dir.join("app.log");
+        std::fs::write(&path, b"first\nthis line is over the bound\n").unwrap();
+        let mut probe = TelemetryProbe::new();
+        let mut config = fast_config(ReadFrom::Beginning);
+        config.max_line_bytes = 8;
+        config.batching.max_events = 1;
+        let mut tailer = Tailer::new(vec![PathPattern::new(&path)], LineFactory, config)
+            .with_telemetry(probe.telemetry("tail_in", "tail_in", "listener"));
+        let (fanout, rx) = fanout_channel(1);
+        drop(rx);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut watcher = crate::tail::watch::Watcher::Poll;
+        tailer.scan(true, &mut watcher).await;
+        let _ = tailer.drain(&fanout, &shutdown_rx, &mut watcher, no_timer_due()).await;
+        assert!(tailer.untaken);
+        assert_eq!(probe.sum("logit.input.frames.dropped", &[("reason", "oversize")]), 1.0);
         std::fs::remove_dir_all(&dir).ok();
     }
 

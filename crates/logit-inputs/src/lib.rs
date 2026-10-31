@@ -14,6 +14,7 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 pub mod collectd;
+pub mod cri;
 pub mod datadog;
 pub mod datadog_trace;
 pub mod docker;
@@ -33,6 +34,7 @@ pub mod peer;
 mod procstat;
 pub mod prometheus;
 pub mod replay;
+mod replay_decompress;
 pub mod splunk;
 pub mod statsd;
 pub mod syslog;

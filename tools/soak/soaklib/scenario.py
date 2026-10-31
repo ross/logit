@@ -53,6 +53,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import criwriter
 from . import standin as standin_mod
 from . import topic as topic_mod
 
@@ -262,9 +263,9 @@ FAN_OUT_KIND = "line_protocol"
 MERGE_KIND = "dedup_timestamps"
 # The wires a source's lines can cross into the SUT, each with its own ledger symbols
 # (checks.py's `WIRES`): datagrams, a TCP stream of LF-terminated lines, a file the SUT tails,
-# HTTP requests a listener answers, an exposition a listener scrapes, or a Kafka topic a
-# listener consumes.
-WIRES = ("udp", "tcp", "file", "http", "scrape", "kafka")
+# HTTP requests a listener answers, an exposition a listener scrapes, a Kafka topic a listener
+# consumes, or a kubelet pod log tree `cri_in` tails, which `criwriter.py` writes.
+WIRES = ("udp", "tcp", "file", "http", "scrape", "kafka", "cri")
 DEFAULT_WIRE = "udp"
 # `rss_settle` when a scenario doesn't set it, and for a run directory recorded before the key:
 # how long past `recovery_bound` `rss_slope` keeps excusing a fault, while the allocator returns
@@ -272,6 +273,12 @@ DEFAULT_WIRE = "udp"
 # `recovery_bound` that a settle window wouldn't swallow.
 DEFAULT_RSS_SETTLE_S = 0.0
 FILE_WIRE = "file"
+# A file wire whose writer is `criwriter.py` and whose files hold CRI records: its G is logical
+# lines, which `collect.count_cri_lines` counts on disk.
+CRI_WIRE = "cri"
+# The wires whose tailer reads files from `<run>/shared` and whose ledger row is
+# `ledger.wire`'s replay band.
+FILE_WIRES = (FILE_WIRE, CRI_WIRE)
 HTTP_WIRE = "http"
 SCRAPE_WIRE = "scrape"
 KAFKA_WIRE = "kafka"
@@ -301,6 +308,7 @@ LISTENER_WIRES = {
     "collectd_in": ("udp", {}),
     "tail_in": ("file", {}),
     "docker_in": ("file", {}),
+    "cri_in": ("cri", {}),
     "influxdb_in": ("http", {}),
     "otlp_in": ("http", {}),
     "splunk_hec_in": ("http", {}),
@@ -724,9 +732,14 @@ class Scenario:
 
     @property
     def file_sources(self):
-        """The `[[ledger.source]]` tables whose `wire` is `file`, which the driver gives a
-        shared directory and waits on at the end."""
-        return [source for source in self.sources if source.get("wire") == FILE_WIRE]
+        """The `[[ledger.source]]` tables whose `wire` is `file` or `cri`, which the driver
+        gives a shared directory and waits on at the end."""
+        return [source for source in self.sources if source.get("wire") in FILE_WIRES]
+
+    @property
+    def cri_sources(self):
+        """The `[[ledger.source]]` tables whose `wire` is `cri`."""
+        return [source for source in self.sources if source.get("wire") == CRI_WIRE]
 
     @property
     def uses_shared_dir(self):
@@ -1586,11 +1599,16 @@ def _writer_problems(ledger, configs, directory):
     """What a source's `generator_sink` breaks against its generator's config: on a `file`
     wire it must be a `file_out`, on an `http` wire one of `HTTP_WRITER_KINDS`, and on a
     `scrape` wire a `SCRAPE_WRITER_KIND` exposing on `bind:`; on any other wire it must be
-    neither a `file_out` nor an HTTP writer, because each reads G from its own counter."""
+    neither a `file_out` nor an HTTP writer, because each reads G from its own counter. On a
+    `cri` wire the generator is `criwriter.py`, whose config is JSON (`_cri_writer_problems`)."""
     sources = ledger.get("source")
     if not isinstance(sources, list) or not isinstance(configs, dict):
         return []
     problems = []
+    wires = [source.get("wire") for source in sources if isinstance(source, dict)]
+    if CRI_WIRE in wires and (wires.count(CRI_WIRE) > 1 or FILE_WIRE in wires):
+        problems.append("a `cri` source shares `<run>/shared` with no other file source: the "
+                        "end count reads the whole directory as one writer's pod log tree")
     for index, source in enumerate(sources):
         if not isinstance(source, dict):
             continue
@@ -1601,6 +1619,13 @@ def _writer_problems(ledger, configs, directory):
                 or not (directory / name).is_file()):
             continue
         text = (directory / name).read_text()
+        if source.get("wire") == CRI_WIRE:
+            problems += _cri_writer_problems(source, name, text, f"ledger.source {index + 1}")
+            continue
+        if name.endswith(".json"):
+            problems.append(f"ledger.source {index + 1}: {name} is a CRI writer's config, "
+                            "which only a `cri` wire runs")
+            continue
         for sink in sinks:
             kind = None
             for block in component_blocks(text, sink):
@@ -1698,6 +1723,31 @@ def _kafka_wire_problems(ledger, configs, directory, sut_text):
             if wrote != read:
                 problems.append(f"{where}: `generator_sink` {sink!r} writes format {wrote}, "
                                 f"and `sut_listener` {listener!r} reads {read}")
+    return problems
+
+
+def _cri_writer_problems(source, name, text, where):
+    """What a `cri` source's writer config breaks: it must be `criwriter.py`'s JSON
+    (`criwriter.validate`), named `*.json` so `script/validate` never reads it as a `logit`
+    config, with its `input` and `sink` the source's `generator_input` and `generator_sink`,
+    since the ledger reads G under those component ids."""
+    if not name.endswith(".json"):
+        return [f"{where}: a `cri` wire's generator config is criwriter.py's JSON, named "
+                f"*.json, and {name} isn't"]
+    try:
+        config = json.loads(text)
+    except ValueError as err:
+        return [f"{where}: {name} isn't JSON: {err}"]
+    problems = [f"{where}: {name}: {problem}" for problem in criwriter.validate(config)]
+    if problems:
+        return problems
+    for key, writer_key in (("generator_input", "input"), ("generator_sink", "sink")):
+        if source_ids(source, key) != [config[writer_key]]:
+            problems.append(f"{where}: `{key}` must be the writer's `{writer_key}`, "
+                            f"{config[writer_key]!r}")
+    if config["root"] != SHARED_MOUNT:
+        problems.append(f"{where}: {name}'s `root` must be {SHARED_MOUNT}, where the override "
+                        "mounts `<run>/shared`, which the driver counts at the end")
     return problems
 
 

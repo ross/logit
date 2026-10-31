@@ -417,6 +417,14 @@ Listener authentication adds one more:
   survives a flipped scheme case and surrounding whitespace and that a client's own spelling of
   each configured credential is accepted.
 
+The CRI container log reader adds one more:
+
+- `cri`: one container log line through `logit_proto::cri::parse`, with oracles that the content
+  is the input's tail, that the three fields before it are separated by single spaces and name
+  the stream and the first tag (`P` is partial, anything else full), and that the timestamp reads
+  the same through `parse_rfc3339_to_nanos`. Its seeds are constructed lines in both runtimes'
+  shapes and each malformed form.
+
 The `kafka_in` consumer adds two more:
 
 - `kafka_batch`: a Fetch response's records blob through `logit_proto::kafka::decode`, every

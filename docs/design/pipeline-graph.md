@@ -242,7 +242,7 @@ literal argument string.
 
 | Kind class | `sources` | May be another component's source |
 |---|---|---|
-| Listener (`statsd_in`, `lines_in`, `collectd_in`, `graphite_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `logit_in`, `internal`, `prometheus_in`, `generate_in`, `replay_in`) | must be empty | required (≥1 consumer) |
+| Listener (`statsd_in`, `lines_in`, `collectd_in`, `graphite_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `cri_in`, `logit_in`, `internal`, `prometheus_in`, `generate_in`, `replay_in`) | must be empty | required (≥1 consumer) |
 | Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `has_stale`, `drop_stale`, `cumulative_to_delta`, `dedup_timestamps`, `keep_values`, `bucket`, `logfmt`, `kv`, `regex`, `shape`, `flatten`, `line_protocol`, `http_access`, `sample`, `timestamp`, `route`, `route_signals`) | ≥1 required | required (≥1 consumer), except `route_signals`, which must have none (rule 92) |
 | Sink (`influxdb_out`, `stdio_out`, `file_out`, `otlp_out`, `datadog_out`, `datadog_trace_out`, `splunk_hec_out`, `kafka_out`, `syslog_out`, `logit_out`, `statsd_out`, `collectd_out`, `graphite_out`, `prometheus_out`, `null_out`) | ≥1 required | must not be |
 | Target (`target`) | must be empty | required (≥1 consumer), and ≥1 directing router (rule 49) |
@@ -373,16 +373,21 @@ a black hole counts what it discards as `events.discarded`.
 24. An inconsistent `otlp_out` `tls:`, or one under a non-`https://` endpoint.
 25. A `trace_context` `span:` with an empty `name` or a `0s` `max_skew`.
 26. A `tail_in` `paths` entry that is empty or has a `*` outside the final path component.
-27. A `docker_in` with an empty or duplicate entry or an empty `root`.
-28. A `tail_in`/`docker_in` `poll_interval`, `checkpoint_interval`, or `max_line_bytes` of `0`.
+27. A `docker_in` with an empty or duplicate entry or an empty `root`, or a `cri_in` with an empty
+    `root` or `containers_dir`.
+28. A `tail_in`/`docker_in`/`cri_in` `poll_interval`, `checkpoint_interval`, or `max_line_bytes`
+    of `0`.
 29. A `file_out` `rotate.max_bytes`/`max_files` of `0`, or a `max_files` above 1000
     (`logit_config::MAX_ROTATE_FILES`).
 31. A `regex` with an empty `field`, or a `pattern` that fails to compile.
 32. A `csv` with an empty or duplicate column name, or an unusable `delimiter`.
 33. A `stdio_out`/`file_out` `compression:` outside `format: native`.
 34. An inconsistent `logit_out` `tls:`, or a `logit_in` `max_frame_bytes` of `0` or above 64 MiB.
-35. A `buffer.disk:` beside a non-default in-memory bound, a bad disk bound, or a shared
-    `disk.path`.
+35. A `buffer.disk:` beside a non-default `buffer.max_batches`, or beside a non-default
+    `buffer.max_bytes` on a sink that doesn't collect windows; a bad disk bound; or a shared
+    `disk.path`. On a collecting sink, `buffer.max_bytes` bounds the window's decoded batches
+    ([ADR `collecting-sink-window`](../adr/collecting-sink-window.md)); `s3_out` is the one kind
+    that collects.
 36. A `has_attributes`/`drop_attributes` with an empty key, a non-finite value, or a presence key
     repeated or also named in the same side's map.
 37. A `has_provenance`/`drop_provenance` with an empty or repeated entry. An id isn't checked
@@ -428,7 +433,7 @@ a black hole counts what it discards as `events.discarded`.
     route rule, or a `max_length` key it never caps.
 61. A `sample` rate that is non-finite or outside `[0, 1]`, an empty field name, a malformed
     `always_keep`, or `missing:` without `key:`.
-62. Two `tail_in`/`docker_in` components sharing a `checkpoint_path`, or one whose
+62. Two `tail_in`/`docker_in`/`cri_in` components sharing a `checkpoint_path`, or one whose
     `checkpoint_path` is another's `<checkpoint_path>.tmp`.
 63. A `datadog_in` with an empty `bind`, or an `api_keys` entry that is empty or has surrounding
     whitespace.
@@ -508,16 +513,24 @@ a black hole counts what it discards as `events.discarded`.
 99. An `otlp_in` `auth`, or a `prometheus_in` or `prometheus_out` `bind_auth`, with an empty bearer
     token, username, or password, a bearer token with leading or trailing whitespace, or a basic
     username containing `:`.
-100. A `kafka_in` with an empty `brokers` or an entry that isn't a `host:port`, a `tls` or `sasl`
+100. An `s3_out` with an empty `bucket`, `region`, or `storage_class`; an `endpoint` that isn't
+     an `http://` or `https://` URL with a host and no path, query, fragment, or user info; a
+     `partition` `jiff` can't format, or a `prefix` and `partition` whose longest key passes
+     S3's 1,024 bytes or that make a `.` or `..` path segment, which a URL drops; a `max_bytes`
+     of `0` or above 9,000 times `part_size`; a `part_size` outside 5 MiB to 5 GiB; a `max_age`, `timeout`, or `connect_timeout` of `0s`; an `sse`
+     `kms_key_id` or `bucket_key` outside `aws_kms`, or an empty `kms_key_id`; `credentials`
+     with an empty value; or a `tls` failing rule 24's checks, including a block under an
+     `http://` `endpoint` ([ADR `s3-object-archive`](../adr/s3-object-archive.md), decision 7).
+101. A `kafka_in` with an empty `brokers` or an entry that isn't a `host:port`, a `tls` or `sasl`
      failing 85's checks, an empty `group` or `client_id`, an empty `topics`, a topic that isn't a
      legal Kafka topic name or that repeats, a `fetch` byte bound or `max_batch_bytes` of `0`, a
      `fetch.min_bytes` over `fetch.max_bytes`, a `fetch.max_bytes` plus `max_batch_bytes` over
      2147483647 (the Fetch request's `max_bytes` field), a `fetch.max_wait` not below `timeout`,
      or a `fetch.max_wait`, `commit_interval`, `drain_timeout`, or `timeout` of `0s`.
-101. A `kafka_in` whose `heartbeat_interval` isn't below `session_timeout`, whose
+102. A `kafka_in` whose `heartbeat_interval` isn't below `session_timeout`, whose
      `session_timeout` is over `rebalance_timeout`, or whose `drain_timeout` isn't below
      `rebalance_timeout`.
-102. A `kafka_in` whose `topics:` shape doesn't match its `format:` (a map under `otlp_proto` or
+103. A `kafka_in` whose `topics:` shape doesn't match its `format:` (a map under `otlp_proto` or
      `otlp_json`, a list under the others), an OTLP map with a key other than `logs`, `metrics`,
      or `traces` or one topic under two keys, or a `record` under any format but `text`.
 
@@ -823,10 +836,12 @@ A bare file name is under `crates/logit-pipeline/src/` or `crates/logit-inputs/s
 | `runtime.rs`, `run_input` | `biased`: the listener's `run_until_shutdown`, then the grace backstop (`unconstrained`) | The backstop winning drops the listener's future: whatever it held undelivered at the deadline | A loss bounded by `shutdown_grace`, and the listener's own counters cover what it drops (the UDP listener's rows). `biased` means a listener result ready in the same wake as the backstop, an `Err` included, is returned, not discarded. `unconstrained` keeps a listener that spends its whole coop budget on every poll from deferring the backstop: `Sleep::poll_elapsed` and `wait_for` spend that budget too, so without it the backstop would find none left on every wake |
 | `runtime.rs`, `run_output` (`already_finished`) | `write_loop`, `drain_inbox` | `write_loop` finishing first drops `drain_inbox` mid-`recv` or mid-`push` | `drain_inbox` leaves the batch it was pushing in `in_hand` and unread batches in the inbox, and `run_output`'s sweep takes both. `drain_inbox` finishing first drops nothing: `write_loop` is then awaited to the end |
 | `runtime.rs`, `run_output` (sweep) | `timeout_at(SWEEP_DRAIN_TIMEOUT, inbox.recv())` on the closed inbox | The timeout firing drops a `recv` waiting on an upstream permit still reserved | The inbox is closed first, so a later send fails upstream as `events.dropped{reason="closed_consumer"}`, and a listener with an acknowledgement also refuses that batch to its client. Every batch the sweep takes counts `batches.received`, then is spooled (`Disk`) or counted `dropped{reason="shutdown"}` (`Memory`). The bound covers only `recv`, never a disk `push`. A permit held past the bound is an uncounted exception (`docs/known-gaps/runtime.md`, "Pipeline runtime and graph") |
-| `runtime.rs`, `write_loop` (`NextBatch`) | Unbiased: `store.peek()`, the grace arm (`unconstrained`) | The grace winning drops `peek` | `peek` reserves the head only in the poll that returns it, so a dropped `peek` reserved nothing, and neither arm needs priority. The queue is left for `finish_and_flush`. `unconstrained` keeps a sibling arm inside this `select!` that spends the coop budget from deferring the grace arm. It doesn't guard against `drain_inbox` in `run_output`'s unbiased outer `select!`: a `select!` polls no arm once the budget is spent, so a wake that polls `drain_inbox` first can leave the grace arm unpolled, and the deadline anchors within a few wakes of the signal, not one |
+| `runtime.rs`, `write_loop` (`NextBatch`) | Unbiased: `store.peek()`, the grace arm (`unconstrained`), disabled for a round that starts with a collecting sink's owed count (the `collecting_next` row) | The grace winning drops `peek` | `peek` reserves the head only in the poll that returns it, so a dropped `peek` reserved nothing, and neither arm needs priority. The queue is left for `finish_and_flush`. `unconstrained` keeps a sibling arm inside this `select!` that spends the coop budget from deferring the grace arm. It doesn't guard against `drain_inbox` in `run_output`'s unbiased outer `select!`: a `select!` polls no arm once the budget is spent, so a wake that polls `drain_inbox` first can leave the grace arm unpolled, and the deadline anchors within a few wakes of the signal, not one |
 | `runtime.rs`, `write_loop` (`DeliverStep`) | `biased`: `deliver_with_retry` (or `deliver_window`, next rows), then the grace arm (`unconstrained`) | The grace winning drops an in-flight `Output::send` or a backoff sleep | A cut-off send is `Fault::Ambiguous`: at-least-once leaves it queued, at-most-once commits it and counts `dropped{reason="shutdown"}`, and the span is tagged `fault=ambiguous`. A backoff sleep leaves the batch queued. A head left reserved is committed and counted by `SinkStore::finish` (`Memory`) or persisted at the read cursor (`Disk`). `biased` counts a send completing in the same wake as the deadline as delivered. Because the deliver arm is always polled first, `deliver_with_retry` checks the anchored deadline before every attempt and returns `Delivery::GraceExpired`, with no send started and the batch uncommitted, once it has passed: a batch reaching this step after the deadline, or a backoff ending at it, never starts a send the grace would then read as cut off. `unconstrained` has the same reach as in the `NextBatch` row |
-| `runtime.rs`, `write_loop` (`DeliverStep`, windowed) | `biased`: `deliver_window`, then the grace arm (`unconstrained`) | The grace winning drops an in-flight `Output::submit` or `Output::await_ack`, a `SinkStore::peek_at`, or a backoff sleep | Every batch submitted and unacknowledged, plus one whose submit was cut off, is `Fault::Ambiguous`, counted from `write_loop`'s `InFlight`: at-least-once leaves them reserved, and at-most-once commits each and counts it `dropped{reason="shutdown"}`, the span tagged `fault=ambiguous`. A head waiting out its backoff or mid-resubmit after a `HeadOnly` fault counts with the batches behind it, since `InFlight` keeps counting it. A dropped `peek_at` reserves nothing past what it returned. `deliver_window` checks the anchored deadline before every round, as `deliver_with_retry` does before every attempt; a `Delivery::GraceExpired` with batches submitted is treated as a cut |
+| `runtime.rs`, `write_loop` (`DeliverStep`, windowed) | `biased`: `deliver_window`, then the grace arm (`unconstrained`), disabled for a round that starts with a collecting sink's owed count (the `collecting_next` row) | The grace winning drops an in-flight `Output::submit` or `Output::await_ack`, a `SinkStore::peek_at`, or a backoff sleep | Every batch submitted and unacknowledged, plus one whose submit was cut off, is `Fault::Ambiguous`, counted from `write_loop`'s `InFlight`: at-least-once leaves them reserved, and at-most-once commits each and counts it `dropped{reason="shutdown"}`, the span tagged `fault=ambiguous`. A head waiting out its backoff or mid-resubmit after a `HeadOnly` fault counts with the batches behind it, since `InFlight` keeps counting it. A dropped `peek_at` reserves nothing past what it returned. `deliver_window` checks the anchored deadline before every round, as `deliver_with_retry` does before every attempt; a `Delivery::GraceExpired` with batches submitted is treated as a cut |
 | `runtime.rs`, `deliver_window` (`window_round`) | None: no runtime timeout wraps the head's `Output::submit`, the head's resubmit after a retryable `HeadOnly` fault, a later submit, or `await_ack`; the sink's own transport timeout (`request_timeout`) bounds each | Only the shutdown grace drops an in-flight `submit` (the windowed `DeliverStep` row) | A cancelled `submit` means the sink dropped its connection (the `Output::submit` contract), and a cancelled `await_ack` on a sink using the HTTP slot helper aborts every request task it holds (`crates/logit-outputs/src/http.rs`, "Concurrency"). No acknowledgment can be lost when nothing else was outstanding. A retryable fault retries the head until it succeeds, so a round can last as long as the destination keeps making progress; only the shutdown grace cuts one short. A fault marked `HeadOnly` is the head's alone: a retryable one resubmits the head alone with the batches behind it still in flight, and `Rejected`, or `Ambiguous` under at-most-once, drops the head alone ([ADR `sink-request-concurrency`](../adr/sink-request-concurrency.md), decision 2) |
+| `runtime.rs`, `collecting_next` | Unbiased: `SinkStore::wait_at`, the shutdown signal's `wait_for` | The signal winning drops a `wait_at` | A collecting sink's open window waits here for its next batch ([ADR `collecting-sink-window`](../adr/collecting-sink-window.md), decision 2). `wait_at` reserves nothing unless it returns a batch, so a dropped wait leaves the store as it found it, and the window closes with `cause="shutdown"` and uploads with the whole grace ahead of it. The grace arms above still cut the head's round, the upload included, and the sink says through `Output::reached_destination` how many of its batches a cut counts. A round that starts with the sink's `window()` at an owed count, after the head's answer, skips `deliver_window`'s grace check and both grace arms: the sink answers each owed batch at once, and each counts delivered before the grace is honored |
+| `queue.rs` and `disk_queue.rs`, `wait_at` | Unbiased: the store's `not_empty` notification, the pressure signal's notification, `sleep_until(deadline)` | Any winner drops the other two | Every `Notified` is created before the checks it guards, so a push, a close, or a raise between a check and the wait still wakes it. An item at the position is returned before pressure is read, so pressure ends only a wait for an item not yet there. `not_empty` stores a permit when no wait is registered, and the pressure notification wakes every `Notified` created before the raise. A memory store's `peek_at` reserves only in the lock that returns the batch; a disk store's caches a read only when its position is unchanged once the read completes |
 | `runtime.rs`, `run_transform` | `timeout(wait, inbox.recv())` until the next flush deadline | The timeout firing drops a pending `recv` | `mpsc::Receiver::recv` is cancel-safe: a dropped `recv` takes nothing off the channel, and the next iteration receives it |
 | `runtime.rs`, `revoke_lua_io` | `timeout(REVOKE_DRAIN_TIMEOUT, ..)` around a `recv` loop on the closed inbox, awaited by `watch_lua_thread` on a wedge and through `block_on` by `run_lua` on a failed loop | The timeout firing drops a `recv` waiting on an upstream permit still reserved | Every batch received counts `dropped{reason="shutdown"}` under the Lua node's id. A permit held past the bound is a named uncounted exception (ADR `shutdown-accounting-and-cancellation-safety`, decision 1; `docs/known-gaps/transforms.md`, "Lua") |
 | `runtime.rs`, `deliver_with_retry` | None: no runtime timeout wraps `Output::send`; the sink's own transport timeout bounds each attempt, and the grace arm of the `DeliverStep` row is the only canceller | The shutdown grace drops an in-flight `Output::send` | The attempt is `Fault::Ambiguous` and counted `logit.component.errors`. A sink's own state after a dropped `send` is the sink's to keep consistent, and each family's is pinned by a test ([ADR `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md)): `stdio_out` and `file_out` can leave a torn line (`docs/known-gaps/sinks.md`); the pooled stream sinks (`statsd_out`, `syslog_out`, `graphite_out`) leave a partial frame at the peer, drop the connection, and leave the pool empty so the next `send` dials fresh, and a line-stream peer may keep a truncated last line; `logit_out` leaves a truncated frame the peer can't forward, with its connection dropped; the datagram sinks keep the datagrams already sent, and the counts of the cancelled attempt are lost (`docs/known-gaps/intake.md`, "UDP intake") |
@@ -926,7 +941,7 @@ topology, not a rare one, with these consequences:
 consumers or all closed. That answers the input's half. An acknowledging listener refuses, or
 doesn't acknowledge, a batch its direct consumers have all closed: `logit_in` answers
 `GOING_AWAY`, the HTTP listeners answer `503` (gRPC `UNAVAILABLE`, `splunk_hec_in` `503` code 9
-or `500` code 8), and `tail_in` and `docker_in` freeze their checkpoint and stop. A sink closing
+or `500` code 8), and `tail_in`, `docker_in`, and `cri_in` freeze their checkpoint and stop. A sink closing
 behind an open transform is still acknowledged. Propagating the closure as a shutdown signal
 stays open and isn't built.
 

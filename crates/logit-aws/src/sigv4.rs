@@ -170,8 +170,9 @@ fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> hmac::K
     hmac::Key::new(hmac::HMAC_SHA256, &key)
 }
 
-/// SigV4's URI encoding of one name, value, or path segment.
-pub(crate) fn uri_encode(value: &str) -> String {
+/// SigV4's URI encoding of one name, value, or path segment. S3 encodes a request path once, with
+/// this, where other services encode it twice, so an S3 caller writes its URL's path in this form.
+pub fn uri_encode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for b in value.bytes() {
         match b {

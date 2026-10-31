@@ -592,12 +592,13 @@ sut_transforms = ["parse", "labels", "count", "metrics_only"]   # optional, in o
   `SOAK_GENERATOR_CONFIG` for `generator`, `SOAK_GENERATOR_LINES_CONFIG` for
   `generator-lines`. An override's generator mounts its own variable at `/config.yaml`.
 - `wire`, optional (W11a), is `udp` (the default), `tcp`, `file`, `http` (W14), `scrape`
-  (W25), or `kafka` (the kafka-input plan's W6b): what the
+  (W25), `kafka` (the kafka-input plan's W6b), or `cri` (`cri-rotate`, ADR amendment of
+  2026-10-30): what the
   source's lines cross into the SUT, which picks the ledger's symbols for it (§6). `load()`
   reads the SUT config and checks the source's `sut_listener` against it: a component of a kind
   and `transport:` the ledger has a wire for (`scenario.LISTENER_WIRES`: `statsd_in` and
   `syslog_in` UDP unless `transport: tcp`, `lines_in` and `graphite_in` TCP unless
-  `transport: udp`, `collectd_in` UDP, `tail_in` and `docker_in` file, `influxdb_in`,
+  `transport: udp`, `collectd_in` UDP, `tail_in` and `docker_in` file, `cri_in` cri, `influxdb_in`,
   `otlp_in`, `splunk_hec_in`, and `datadog_in` HTTP, `kafka_in` Kafka), or of a kind and mode
   (`scenario.LISTENER_MODES`: `prometheus_in` HTTP on `bind:`, and scrape on
   `scrape_targets:`), whose wire is the source's. A listener the config lacks, a kind,
@@ -1104,7 +1105,7 @@ and takes the worst status; `report.py` is unchanged.
 | G | per source (W8b), its generator's `logit.output.messages{component=<generator_sink>}`; precondition: equals that sink's `logit.output.datagrams`. On a Kafka wire, the writer's `logit.output.records`, the records the broker accepted |
 | W | per listener (W8b), SUT `logit.input.datagrams{component=<sut_listener>}`. On a Kafka wire, `logit.input.records`, the records the consumer counted when fetched |
 | K | per listener, SUT `logit.input.kernel.dropped` |
-| F | per listener, SUT `logit.input.frames.dropped`: on a TCP wire (W11a) under the framer's reasons, `truncated`, `oversize`, `drained`, and `malformed`; on a file wire (W11b) under `oversize` and `truncated`; else 0 |
+| F | per listener, SUT `logit.input.frames.dropped`: on a TCP wire (W11a) under the framer's reasons, `truncated`, `oversize`, `drained`, and `malformed`; on a file wire (W11b) under `oversize` and `truncated`; on a `cri` wire under `oversize`, `truncated`, and `malformed`; else 0 |
 | D | per listener, SUT `logit.component.datagrams.dropped` under every reason, from telemetry; the listener's stderr shutdown lines only cross-check its `shutdown` part, and a killed life counts none |
 | B | per listener, SUT `logit.input.messages.dropped{reason=malformed}` plus `logit.input.frames.dropped{reason=undecodable}` plus `logit.input.frames.dropped{reason=oversize}` (W8b): a line the decoder refused, a datagram it refused whole, and a line over `lines_in`'s `max_line_bytes`, which its decoder drops with a throttled diagnostic and no decoder error. Each is 0 on a listener with no such rule. On a Kafka wire, `logit.input.records.dropped` and `logit.input.records.skipped` under every reason, the client's own drops (`corrupt`, `oversize`, `legacy_format`, `retention`, `aborted`) included |
 | Q | on a Kafka wire, per listener, SUT `logit.input.batches.deferred`: batches deferred at a revoke or shutdown, each in W, in neither E nor B, and read again, up to `batch_max_events` records each; else 0 |

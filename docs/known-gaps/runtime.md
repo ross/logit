@@ -44,7 +44,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - Listeners that assemble batches bound them by config through a `BatchAccumulator` under
     `receive.batch_max_events`/`batch_max_bytes`: a UDP listener
     ([ADR `decoupled-listener-io`](../adr/decoupled-listener-io.md)), each connection on the TCP
-    stream driver (`crates/logit-inputs/src/tcp.rs`), and each file `tail_in`/`docker_in` tracks.
+    stream driver (`crates/logit-inputs/src/tcp.rs`), and each file `tail_in`/`docker_in`/`cri_in`
+    tracks.
   - A listener that receives a whole batch per request or frame (`otlp_in`, `logit_in`) passes on
     what the sender sent.
   - A transform's outbound batch has no bound at all, and nothing in the config says so.
