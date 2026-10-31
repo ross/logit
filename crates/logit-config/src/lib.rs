@@ -4346,15 +4346,17 @@ pub enum ComponentKind {
         #[serde(default)]
         path_style: Option<bool>,
         /// Prepended to every object key, as written: end it with `/` to make it a folder, such
-        /// as `logs/`. Empty by default. Neither it nor `partition` may make a `.` or `..` folder,
-        /// which a URL would remove.
+        /// as `logs/`. Empty by default. Neither it nor `partition` may make an empty, `.`, or `..`
+        /// folder (a key that starts with `/`, a `//`, or a `/./`), which a URL layer can
+        /// collapse.
         #[serde(default)]
         prefix: String,
         /// A strftime pattern formatted in UTC at the time the object's first batch was staged,
         /// placed after `prefix`. It's the time `logit` wrote the object, not any event's own
         /// time. Defaults to `dt=%Y-%m-%d/hour=%H/`, the Hive-style layout query engines read as
         /// partitions. The longest key `prefix` and `partition` can produce must fit S3's
-        /// 1,024-byte limit.
+        /// 1,024-byte limit, and no folder in it may be empty, `.`, or `..`; a `%.f` between
+        /// slashes formats to nothing at millisecond 0, so it leaves an empty folder.
         #[serde(default = "default_s3_partition")]
         partition: String,
         /// How each object is written: `json` (the default), one JSON object per event per line

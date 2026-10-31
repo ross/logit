@@ -363,11 +363,12 @@
 //! 100. An `s3_out` with an empty `bucket`, `region`, or `storage_class`; an `endpoint` that
 //!      isn't an `http://` or `https://` URL with a host and no path, query, fragment, or user
 //!      info; a `partition` jiff can't format, or a `prefix` and `partition` whose longest key
-//!      passes S3's 1,024 bytes or that make a `.` or `..` segment; a `max_bytes` of `0` or
-//!      above 9,000 times `part_size`, which would pass S3's 10,000 parts; a `part_size` outside
-//!      S3's 5 MiB to 5 GiB; a `max_age`, `timeout`, or `connect_timeout` of `0s`; an `sse` `kms_key_id` or `bucket_key` outside
-//!      `aws_kms`, or an empty `kms_key_id`; `credentials` with an empty value; or a `tls` failing
-//!      rule 24's checks, a block under an `http://` `endpoint` included
+//!      passes S3's 1,024 bytes or that make an empty, `.`, or `..` segment; a `max_bytes` of
+//!      `0` or above 9,000 times `part_size`, which would pass S3's 10,000 parts; a `part_size`
+//!      outside S3's 5 MiB to 5 GiB; a `max_age`, `timeout`, or `connect_timeout` of `0s`; an
+//!      `sse` `kms_key_id` or `bucket_key` outside `aws_kms`, or an empty `kms_key_id`;
+//!      `credentials` with an empty value; or a `tls` failing rule 24's checks, a block under an
+//!      `http://` `endpoint` included
 //!      (`docs/adr/s3-object-archive.md`, decision 7).
 //! 101. A `kafka_in` with an empty `brokers` or an entry that isn't a `host:port`, a `tls` or
 //!      `sasl` failing 85's checks, an empty `group` or `client_id`, an empty `topics`, a topic
@@ -5200,10 +5201,11 @@ fn validate_s3_out(id: &str, kind: &ComponentKind) -> anyhow::Result<()> {
             "component '{id}': s3_out 'partition' isn't a pattern jiff can format: {err}"
         )
     })?;
-    if probe.dot_segment {
+    if probe.bad_segment {
         anyhow::bail!(
-            "component '{id}': s3_out 'prefix' and 'partition' can make a key with a '.' or '..' \
-             segment -- a URL drops it, so the key the sink signs isn't the one it sends"
+            "component '{id}': s3_out 'prefix' and 'partition' can make a key with an empty, '.', \
+             or '..' segment (a leading '/', a '//', or a '/./') -- a URL layer can collapse it, \
+             so the key the sink signs isn't the one it sends"
         );
     }
     let longest = probe.longest;
@@ -5309,17 +5311,18 @@ fn check_s3_endpoint(endpoint: &str) -> Result<(), &'static str> {
 struct PartitionProbe {
     /// The most bytes `partition` formats to.
     longest: usize,
-    /// Whether `prefix` and a formatted `partition` make a `.` or `..` path segment.
-    dot_segment: bool,
+    /// Whether `prefix` and a formatted `partition` make an empty, `.`, or `..` path segment.
+    bad_segment: bool,
 }
 
 /// Formats `partition` in UTC at one instant per month and weekday in year 9999, the longest
 /// year jiff formats, at the last millisecond of a day, so month and weekday names and every
 /// numeric field are at their widest. It formats each day again at millisecond 0, where `%.f`
-/// writes nothing and can leave a bare `.`. Each result follows `prefix` to find a dot segment:
-/// every `/`-ended segment, since the key's own tail follows the last one.
+/// writes nothing and can leave a bare `.` or an empty segment. Each result follows `prefix` to
+/// find an empty, `.`, or `..` segment: every `/`-ended segment, a leading empty one included,
+/// since the key's own tail follows the last one and a trailing `/` is not a segment.
 fn probe_partition(prefix: &str, partition: &str) -> Result<PartitionProbe, jiff::Error> {
-    let mut probe = PartitionProbe { longest: 0, dot_segment: false };
+    let mut probe = PartitionProbe { longest: 0, bad_segment: false };
     for month in 1..=12 {
         for day in 20..=26 {
             for nanos in [999_000_000, 0] {
@@ -5331,7 +5334,8 @@ fn probe_partition(prefix: &str, partition: &str) -> Result<PartitionProbe, jiff
                 let path = format!("{prefix}{formatted}");
                 let mut segments: Vec<&str> = path.split('/').collect();
                 segments.pop();
-                probe.dot_segment |= segments.iter().any(|segment| matches!(*segment, "." | ".."));
+                probe.bad_segment |=
+                    segments.iter().any(|segment| matches!(*segment, "" | "." | ".."));
             }
         }
     }
@@ -9491,6 +9495,9 @@ mod tests {
             r#""credentials": {"access_key_id": "a", "secret_access_key": "s"}"#,
             r#""partition": "%A/%B/%s/""#,
             r#""prefix": "logs/.hidden/a..b/", "partition": "x/.""#,
+            r#""prefix": "logs/", "partition": "dt=%Y/""#,
+            r#""prefix": "", "partition": "dt=%Y/""#,
+            r#""prefix": "logs", "partition": "%.f/""#,
         ] {
             resolve(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], s3_out(extra))]))
                 .unwrap_or_else(|err| panic!("{extra}: {err}"));
@@ -9522,12 +9529,17 @@ mod tests {
             (r#""endpoint": "https://minio?x=1""#.into(), "has a path, query, or fragment"),
             (r#""partition": "dt=%""#.into(), "isn't a pattern jiff can format"),
             (long_prefix, "can make a 1025-byte key"),
-            (r#""prefix": "./logs/""#.into(), "'.' or '..' segment"),
-            (r#""prefix": "logs/../""#.into(), "'.' or '..' segment"),
-            (r#""prefix": "logs/.", "partition": "./""#.into(), "'.' or '..' segment"),
-            (r#""partition": "%Y/../""#.into(), "'.' or '..' segment"),
-            (r#""partition": ".%.f/""#.into(), "'.' or '..' segment"),
-            (r#""partition": "%Y/.%.f/""#.into(), "'.' or '..' segment"),
+            (r#""prefix": "./logs/""#.into(), "empty, '.', or '..' segment"),
+            (r#""prefix": "logs/../""#.into(), "empty, '.', or '..' segment"),
+            (r#""prefix": "logs/.", "partition": "./""#.into(), "empty, '.', or '..' segment"),
+            (r#""partition": "%Y/../""#.into(), "empty, '.', or '..' segment"),
+            (r#""partition": ".%.f/""#.into(), "empty, '.', or '..' segment"),
+            (r#""partition": "%Y/.%.f/""#.into(), "empty, '.', or '..' segment"),
+            (r#""prefix": "logs/", "partition": "/dt=%Y/""#.into(), "empty, '.', or '..' segment"),
+            (r#""partition": "a//b/""#.into(), "empty, '.', or '..' segment"),
+            (r#""prefix": "a//""#.into(), "empty, '.', or '..' segment"),
+            (r#""partition": "x/%.f/""#.into(), "empty, '.', or '..' segment"),
+            (r#""prefix": "", "partition": "/dt=%Y/""#.into(), "empty, '.', or '..' segment"),
             (r#""part_size": "5242879""#.into(), "S3 takes parts from"),
             (r#""part_size": "5121MiB""#.into(), "S3 takes parts from"),
             (r#""max_bytes": "0""#.into(), "'max_bytes' is 0"),

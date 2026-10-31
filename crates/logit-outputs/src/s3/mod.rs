@@ -57,7 +57,8 @@
 //! before it, so an attempt that lands late loses nothing; the count only falls
 //! (`docs/adr/s3-object-archive.md`, decision 3). A shorter retry, or a head dropped `Rejected`,
 //! moves batches an earlier attempt may have stored to the next object, where they're stored
-//! twice. A key holds no configuration value but `prefix` and `partition`.
+//! twice. A key holds no configuration value but `prefix` and `partition`, and graph validation
+//! (rule 100) rejects a pair that can make an empty, `.`, or `..` segment before the file name.
 //!
 //! ## Requests
 //!
