@@ -1436,4 +1436,6 @@ framed message per record into a `logit_proto::MessageBuf`, with per-message dro
 one pair outside all of these, by design — its ADR says why.) A new native transform implements
 `logit_pipeline::Transform`, following `logit-transforms::Aggregator`. A new router implements
 `logit_pipeline::Router` (`crates/logit-pipeline/src/router.rs`), following
-`logit-transforms::Route` ([ADR `target-components`](docs/adr/target-components.md)).
+`logit-transforms::Route` ([ADR `target-components`](docs/adr/target-components.md)). The order of
+work for a new `_in`/`_out` pair, the files each layer touches, and the check that fails when a
+step is missed are in [docs/adding-a-lossless-pair.md](docs/adding-a-lossless-pair.md).
