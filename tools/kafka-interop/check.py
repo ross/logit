@@ -26,11 +26,15 @@ script has already written, under /out (the run directory):
                                         the relay leg's generators wrote
     readback/<broker>/consume.offsets   kafka-get-offsets.sh for the consumer legs' topics, and
     readback/<broker>/restart.offsets   for the broker-restart leg's
+    readback/<broker>/restart-before.offsets  for `restart` before the first broker restart
+    readback/<broker>/restart-committed.txt  kafka-consumer-groups.sh --describe of the
+                                        broker-restart leg's group before its first life stopped
     readback/<broker>/group-mixed-console.tsv  the group-mixed leg's console consumer's records,
                                         in the `.java.tsv` form
     readback/<broker>/group-mixed.describe  kafka-consumer-groups.sh --describe --state and
                                         --members, read while both members were in the group
-    exits.txt                           `<service> <exit code>` per leg and Collector
+    exits.txt                           `<service> <exit code>` per leg and Collector, and
+                                        `<service>-life1` for a first life the script stopped
     redpanda-oidc.txt                   `ok` once Redpanda took OAUTHBEARER, else `failed`
     logs/<service>.log                  each service's log
 
@@ -1335,8 +1339,9 @@ def leg_consume_group_join(broker):
 def leg_consume_group_kill(broker):
     members = {m: consumed(f"consume-group-kill-{m}-{broker}") for m in ("a", "b")}
     # `b` dies between commits, so `a` reads again what `b` read after its last commit: up to one
-    # commit interval of records, plus one second of slack for the fetch in flight. `b`'s output
-    # file can lose its last lines at the kill, which only shrinks the count.
+    # commit interval of records, plus one second of slack for the fetch in flight. A line `b`
+    # read but hadn't written out at the kill is missing unless `a` reads it again, so a record
+    # `b` committed before writing it fails the leg.
     bound = GROUP_RATE * (COMMIT_INTERVAL + 1)
     # A partition can move twice: to `b` when it joins beside `a`, and back once `b` is gone.
     status, detail = judge_group(broker, "group-kill", members, 2, bound)
@@ -1393,7 +1398,11 @@ def leg_consume_restart(broker):
     if events is None:
         return "FAIL", "the leg wrote no events"
     ends = {k: v for k, v in consume_offsets(broker, "restart").items() if k[0] == "restart"}
+    before = {k: v for k, v in consume_offsets(broker, "restart-before").items()
+              if k[0] == "restart"}
+    committed = restart_committed(broker)
     tele = telemetry("in-restart", broker)
+    deferred = telemetry_sum(tele, "logit.input.batches.deferred", component="member")
     resets = telemetry_sum(tele, "logit.input.offsets.reset", component="member",
                            reason="no_commit")
     rebalances = {reason: telemetry_sum(tele, "logit.input.rebalances", component="member",
@@ -1407,7 +1416,9 @@ def leg_consume_restart(broker):
     seqs = seqs_read({"member": events})
     detail = (f"{len(events)} events for {len(seqs)} of {RESTART_RECORDS} records, {duplicates} "
               f"offset(s) read twice, offsets.reset{{reason=no_commit}} {resets}, rebalances "
-              f"{rebalances}, commits {commits}, broker.errors {errors}")
+              f"{rebalances}, commits {commits}, broker.errors {errors}, batches.deferred {deferred}, "
+              f"end offsets before the first restart {sorted(before.values())}, committed before "
+              f"the stop {sorted(committed.values())}")
     if not ends:
         return "FAIL", "no end offsets read for restart"
     if missing or seqs != set(range(RESTART_RECORDS)):
@@ -1415,14 +1426,39 @@ def leg_consume_restart(broker):
     if resets != RESTART_PARTITIONS:
         return "FAIL", (f"want start: used once per partition ({RESTART_PARTITIONS}), so the "
                         f"second life resumed from the commits; {detail}")
-    if rebalances.get("start") != 2:
-        return "FAIL", f"want two joins counted `start`, one per process life; {detail}"
+    if rebalances.get("start") != 2 or set(rebalances) != {"start"}:
+        return "FAIL", (f"want two joins counted `start`, one per process life, and no other "
+                        f"join; {detail}")
     if not errors:
         return "FAIL", f"no broker error counted, so the restart never reached the member; {detail}"
-    bound = RESTART_RATE * (COMMIT_INTERVAL + 1)
+    # The first life read past the restart: before the script stopped it, the group had committed
+    # past the end offsets the topic had when the brokers went down, on every partition.
+    if len(before) != RESTART_PARTITIONS:
+        return "FAIL", f"no end offsets read before the first restart; {detail}"
+    behind = sorted(p for (_, p), end in before.items() if committed.get(p, -1) <= end)
+    if behind:
+        return "FAIL", (f"the first life committed nothing past the restart on partition(s) "
+                        f"{behind}; {detail}")
+    # With no rejoin and no deferred batch, the second life resumes from the first life's final
+    # commit, made on its way out, so nothing is read twice.
+    bound = RESTART_RATE * (COMMIT_INTERVAL + 1) if deferred else 0
     if duplicates > bound:
-        return "FAIL", f"over {bound} offset(s) read twice, more than a commit interval; {detail}"
+        return "FAIL", f"over {bound} offset(s) read twice; {detail}"
     return "PASS", detail
+
+
+def restart_committed(broker):
+    """`{partition: committed offset}` from the `consume-restart` group's describe, taken before
+    the script stopped the first life."""
+    path = OUT / "readback" / broker / "restart-committed.txt"
+    committed = {}
+    if path.exists():
+        for line in path.read_text(errors="replace").splitlines():
+            cols = line.split()
+            if (len(cols) >= 4 and cols[:2] == ["consume-restart", "restart"]
+                    and cols[2].isdigit() and cols[3].isdigit()):
+                committed[int(cols[2])] = int(cols[3])
+    return committed
 
 
 def leg_consume_auth(broker, component, topic, events_wanted=SASL_EVENTS):

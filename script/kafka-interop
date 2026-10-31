@@ -83,6 +83,10 @@ DESCRIBE_AT=25
 # RESTART_WINDOW seconds after they start.
 RESTART_AT=20
 RESTART_WINDOW=110
+# How long, after the first restart, the members may take to commit past the end offsets the
+# topic had when it began.
+RESTART_READ_TIMEOUT=90
+RESTART_SECOND_LIFE=30
 # The legs the script starts at a step of its own rather than with the others.
 LATE_LEGS=(logit-in-group-join-b-kafka logit-in-group-join-b-redpanda)
 KILLED_LEGS=(logit-in-group-kill-b-kafka logit-in-group-kill-b-redpanda)
@@ -176,12 +180,35 @@ restart_brokers() {
 # stop_legs <leg...>: SIGTERM each leg, which drains its sinks and writes its last telemetry,
 # and appends its exit code to exits.txt.
 stop_legs() {
-    local leg id
+    stop_legs_as "" "$@"
+}
+
+# stop_legs_as <life> <leg...>: stop_legs, recording each code under `<leg>-<life>` when <life>
+# is set, for a leg the script starts again.
+stop_legs_as() {
+    local life="$1" leg id
+    shift
     for leg in "$@"; do
         id="$(container "${leg}")"
         ${DOCKER} stop -t 30 "${id}" >/dev/null
-        echo "${leg} $(${DOCKER} inspect -f '{{.State.ExitCode}}' "${id}")" >>"${RUN_DIR}/exits.txt"
+        echo "${leg}${life:+-${life}} $(${DOCKER} inspect -f '{{.State.ExitCode}}' "${id}")" \
+            >>"${RUN_DIR}/exits.txt"
     done
+}
+
+# committed_past <broker>: whether the `consume-restart` group has committed past
+# restart-before.offsets on every partition of `restart`, leaving the last describe in
+# restart-committed.txt for check.py.
+committed_past() {
+    local out="${RUN_DIR}/readback/$1"
+    kafka_tool kafka-consumer-groups.sh --bootstrap-server "$1:9092" --describe \
+        --group consume-restart >"${out}/restart-committed.txt" 2>>"${RUN_DIR}/logs/readback.log" ||
+        return 1
+    awk 'FNR == NR { split($0, f, ":"); if (f[1] == "restart") { before[f[2]] = f[3]; n++ }; next }
+        $1 == "consume-restart" && $2 == "restart" && $4 ~ /^[0-9]+$/ && ($3 in before) &&
+            $4 > before[$3] { past++ }
+        END { exit !(n > 0 && past == n) }' \
+        "${out}/restart-before.offsets" "${out}/restart-committed.txt"
 }
 
 # netem set|clear <broker> [<ip>]: tools/kafka-interop/netem-drop.sh in the broker's network
@@ -268,6 +295,9 @@ ${DOCKER} run --rm -e BROKER=kafka -v "${TOOLS_DIR}/collector.yaml:/collector.ya
     exit 1
 }
 
+# Pulled before provenance.txt is written, which reads its digest.
+${DOCKER} image inspect "${JDK_IMAGE}" >/dev/null 2>&1 || ${DOCKER} pull -q "${JDK_IMAGE}" >/dev/null
+
 say "generating a private CA and certificates into ${RUN_DIR}/tls"
 make_tls
 # `rpk redpanda start` rewrites its config file, so Redpanda gets a writable copy.
@@ -305,7 +335,7 @@ ki_compose up -d --wait --wait-timeout 180 kafka redpanda >/dev/null
     echo "repo: $(git -C "${ROOT}" rev-parse HEAD) ($(git -C "${ROOT}" status --porcelain | wc -l) modified path(s))"
     echo "docker: $(${DOCKER} version --format '{{.Server.Version}}' 2>/dev/null || echo unknown)"
     echo "logit image: $(${DOCKER} image inspect -f '{{.Id}}' "${IMAGE}")"
-    for image in "${KAFKA_IMAGE}" "redpandadata/redpanda:v26.2.3" "${KCAT_IMAGE}" "${OAUTH_IMAGE}" "${COLLECTOR_IMAGE%%@*}" "${JDK_IMAGE%%@*}"; do
+    for image in "${KAFKA_IMAGE}" "redpandadata/redpanda:v26.2.3" "${KCAT_IMAGE}" "${OAUTH_IMAGE}" "${COLLECTOR_IMAGE%%@*}" "${JDK_IMAGE}"; do
         echo "${image}: $(${DOCKER} image inspect -f '{{index .RepoDigests 0}}' "${image}" 2>/dev/null || echo unknown)"
     done
     echo "redpanda version: $(ki_compose exec -T redpanda rpk version 2>/dev/null | head -1)"
@@ -391,15 +421,16 @@ done
 # The `consume-read-committed` leg's transactions, from Txn.java: compiled against the broker
 # image's client in the pinned JDK image, then run on the broker image's own JRE and libraries.
 say "writing the read-committed leg's transactions with Txn.java"
+# `set -e` is off inside a subshell on the left of `||`, so each step exits on its own failure.
 (
-    set -e
     ${DOCKER} run --rm -v "${RUN_DIR}/java/lib:/dst:z" --entrypoint bash "${KAFKA_IMAGE}" -c \
-        'cp /opt/kafka/libs/kafka-clients-*.jar /dst/'
+        'cp /opt/kafka/libs/kafka-clients-*.jar /dst/' || exit 1
     ${DOCKER} run --rm -v "${TOOLS_DIR}/Txn.java:/src/Txn.java:ro,z" -v "${RUN_DIR}/java:/java:z" \
-        "${JDK_IMAGE}" javac -cp '/java/lib/*' -d /java /src/Txn.java
+        "${JDK_IMAGE}" javac -cp '/java/lib/*' -d /java /src/Txn.java || exit 1
     for broker in "${BROKERS[@]}"; do
         ${DOCKER} run --rm --network "${NETWORK}" -v "${RUN_DIR}/java:/java:ro,z" \
-            --entrypoint java "${KAFKA_IMAGE}" -cp '/opt/kafka/libs/*:/java' Txn "${broker}:9092" txn
+            --entrypoint java "${KAFKA_IMAGE}" -cp '/opt/kafka/libs/*:/java' Txn "${broker}:9092" txn \
+            || exit 1
     done
 ) >"${RUN_DIR}/logs/txn-producer.log" 2>&1 || {
     cat "${RUN_DIR}/logs/txn-producer.log" >&2
@@ -567,19 +598,38 @@ say "starting the broker-restart legs"
 started=$(date +%s)
 ki_compose up -d --no-deps "${RESTART_LEGS[@]}" >/dev/null
 sleep "${RESTART_AT}"
+for broker in "${BROKERS[@]}"; do
+    kafka_tool kafka-get-offsets.sh --bootstrap-server "${broker}:9092" --topic restart \
+        >"${RUN_DIR}/readback/${broker}/restart-before.offsets" 2>>"${RUN_DIR}/logs/readback.log"
+done
 say "restarting both brokers with the members reading"
 restart_brokers
-say "stopping the broker-restart members, then restarting both brokers again"
-for leg in "${RESTART_MEMBERS[@]}"; do
-    ${DOCKER} stop -t 30 "$(container "${leg}")" >/dev/null
+# The first life must read past the restart: wait until each member's group has committed past
+# the end offsets the topic had before the restart, on every partition, then stop it.
+say "waiting for the broker-restart members to commit past the restart"
+deadline=$(($(date +%s) + RESTART_READ_TIMEOUT))
+pending=("${BROKERS[@]}")
+while [ "${#pending[@]}" -gt 0 ] && [ "$(date +%s)" -lt "${deadline}" ]; do
+    still=()
+    for broker in "${pending[@]}"; do
+        committed_past "${broker}" || still+=("${broker}")
+    done
+    pending=("${still[@]}")
+    [ "${#pending[@]}" -gt 0 ] && sleep 2
 done
+[ "${#pending[@]}" -gt 0 ] && say "no commit past the restart from: ${pending[*]}"
+say "stopping the broker-restart members, then restarting both brokers again"
+stop_legs_as life1 "${RESTART_MEMBERS[@]}"
 restart_brokers
 say "starting the broker-restart members again"
 for leg in "${RESTART_MEMBERS[@]}"; do
     ${DOCKER} start "$(container "${leg}")" >/dev/null
 done
+# The second life reads the rest of the topic: what remains of the window, and at least
+# RESTART_SECOND_LIFE seconds.
 remaining=$((RESTART_WINDOW - ($(date +%s) - started)))
-[ "${remaining}" -gt 0 ] && sleep "${remaining}"
+[ "${remaining}" -lt "${RESTART_SECOND_LIFE}" ] && remaining="${RESTART_SECOND_LIFE}"
+sleep "${remaining}"
 say "stopping the broker-restart legs"
 stop_legs "${RESTART_LEGS[@]}"
 for broker in "${BROKERS[@]}"; do
