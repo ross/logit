@@ -8,6 +8,10 @@
 //! - **`native`**: the bare `CODEC_BATCH` frames a `format: native` stream sink writes. One frame
 //!   is one batch, cut at `batch` events.
 //!
+//! **Compression.** A file starting with gzip's (`1f 8b`) or zstd's (`28 b5 2f fd`) magic is
+//! decompressed as it's read, for either format, with no config field. Every gzip member and
+//! every zstd frame is read (a skippable frame's magic also selects zstd). [`crate::replay_decompress`] holds the decoders and the bounds.
+//!
 //! Timestamps are the file's. Nothing is stamped on the way in: no peer, no receive time.
 //!
 //! **Ending.** At the end of the file [`Input::run`] returns `Ok(())` and drops its `Fanout`, so
@@ -30,6 +34,10 @@
 //! | `decode_budget` | a batch that would decode past its budget |
 //! | `malformed` | any other frame or batch that doesn't parse, a CRC-valid body that doesn't decompress or uses a compression this build doesn't decode among them |
 //! | `truncated` | a frame whose declared length runs past the end of the file |
+//! | `decompress` | a compressed file the decoder couldn't finish: a cut or corrupt stream, a zstd checksum mismatch, or a zstd window over the cap. What was decompressed before the fault is read, and the read ends |
+//!
+//! `decompress` has the `bad_compression` diagnostic. A stream cut mid-line or mid-frame also
+//! counts that line or frame under its own reason, so one cut file counts twice.
 //!
 //! Each native fault but `truncated` has the `bad_frame` diagnostic, with the frame's byte
 //! offset. A frame that passes its CRC and then fails is skipped by its length. After a header
@@ -62,6 +70,8 @@ use logit_proto::CodecError;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
+
+use crate::replay_decompress::{self as decompress, Compression as FileCompression};
 
 const FRAMES_DROPPED: &str = "logit.input.frames.dropped";
 
@@ -343,6 +353,46 @@ impl ReplayInput {
         Ok(())
     }
 
+    /// Reads `file` through the decompression its first bytes name, if any.
+    async fn read_file(&mut self, mut file: tokio::fs::File, sink: &Fanout) -> anyhow::Result<()> {
+        let mut head = [0u8; 4];
+        let mut have = 0;
+        while have < head.len() {
+            match file.read(&mut head[have..]).await? {
+                0 => break,
+                n => have += n,
+            }
+        }
+        // The sniffed bytes go back in front of the stream, because a pipe can't seek.
+        let compression = FileCompression::sniff(&head[..have]);
+        let head = std::io::Cursor::new(head[..have].to_vec());
+        if compression == FileCompression::None {
+            return self.read_stream(AsyncReadExt::chain(head, file), sink).await;
+        }
+        let source = std::io::Read::chain(head, file.into_std().await);
+        let mut decompressing = decompress::spawn(source, compression);
+        let result = self.read_stream(&mut decompressing.output, sink).await;
+        if let Some(why) = decompressing.finish().await {
+            self.telemetry.count(FRAMES_DROPPED, 1.0, &[("reason", "decompress")]);
+            self.diag.warn_throttled(
+                "bad_compression",
+                format_args!("stopped reading {}: {why}", self.path.display()),
+            );
+        }
+        result
+    }
+
+    async fn read_stream<R: AsyncRead + Unpin>(
+        &mut self,
+        reader: R,
+        sink: &Fanout,
+    ) -> anyhow::Result<()> {
+        match self.format {
+            ReplayFormat::Json => self.run_json(reader, sink).await,
+            ReplayFormat::Native => self.run_native(reader, sink).await,
+        }
+    }
+
     fn truncated(&mut self, offset: u64, have: usize) {
         self.telemetry.count(FRAMES_DROPPED, 1.0, &[("reason", "truncated")]);
         self.diag.warn_throttled(
@@ -427,10 +477,7 @@ impl Input for ReplayInput {
         self.bind().await?;
         let file = self.file.take().expect("bind opened the file");
         let path = self.path.display().to_string();
-        let result = match self.format {
-            ReplayFormat::Json => self.run_json(file, &sink).await,
-            ReplayFormat::Native => self.run_native(file, &sink).await,
-        };
+        let result = self.read_file(file, &sink).await;
         result.map_err(|e| e.context(format!("reading {path}")))
     }
 }
@@ -444,7 +491,9 @@ mod tests {
     };
     use logit_core::{Event, Resource};
     use logit_outputs::stdio::StreamEncoder;
-    use logit_pipeline::test_util::{fanout_channel, recv_batch, scratch_dir, TelemetryProbe};
+    use logit_pipeline::test_util::{
+        fanout_channel, recv_batch, scratch_dir, TelemetryProbe, RECV_TIMEOUT,
+    };
     use logit_proto::frame::{write_frame, Compression};
     use logit_proto::Encoder;
 
@@ -754,6 +803,275 @@ mod tests {
         assert_eq!(shape(&out.batches), [("web".into(), 1)]);
         assert_eq!(dropped(&mut out.probe), [("crc", 1.0), ("malformed", 1.0)]);
         assert_eq!(out.probe.sum("logit.input.frames", &[]), 2.0);
+    }
+
+    const ZSTD_MAGIC_BYTES: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(data).expect("gzip a chunk");
+        encoder.finish().expect("finish a gzip member")
+    }
+
+    fn zstd(data: &[u8]) -> Vec<u8> {
+        ruzstd::encoding::compress_to_vec(data, ruzstd::encoding::CompressionLevel::Fastest)
+    }
+
+    /// Every event of `written`, in order, whatever the batch cuts.
+    fn events(batches: &[EventBatch]) -> Vec<&Event> {
+        batches.iter().flat_map(|b| &b.events).collect()
+    }
+
+    fn sum_decompress(probe: &mut TelemetryProbe) -> f64 {
+        probe.poll().sum(FRAMES_DROPPED, &[("reason", "decompress")])
+    }
+
+    /// A gzip file reads as the plain file does, for each format.
+    #[tokio::test]
+    async fn a_gzip_file_replays_as_the_plain_file_does() {
+        let written = three_runs();
+        let json = replay(&gzip(&json_lines(&written)), ReplayFormat::Json, 1000).await;
+        let plain = replay(&json_lines(&written), ReplayFormat::Json, 1000).await;
+        assert_eq!(shape(&json.batches), shape(&plain.batches));
+        assert_eq!(events(&json.batches), events(&plain.batches));
+        let native =
+            replay(&gzip(&native_frames(&written, Compression::None)), ReplayFormat::Native, 1000)
+                .await;
+        assert_eq!(events(&native.batches), events(&plain.batches));
+    }
+
+    /// A writer may append gzip members to one file; every member is read.
+    #[tokio::test]
+    async fn concatenated_gzip_members_all_replay() {
+        let written = three_runs();
+        let mut bytes = Vec::new();
+        for batch in &written {
+            bytes.extend_from_slice(&gzip(&json_lines(std::slice::from_ref(batch))));
+        }
+        let mut out = replay(&bytes, ReplayFormat::Json, 1000).await;
+        assert_eq!(shape(&out.batches), [("web".into(), 5), ("db".into(), 1), ("web".into(), 1)]);
+        assert_eq!(sum_decompress(&mut out.probe), 0.0);
+    }
+
+    /// A writer may emit one zstd frame per batch; every frame is read, and a skippable frame
+    /// between them is stepped over.
+    #[tokio::test]
+    async fn concatenated_zstd_frames_all_replay() {
+        let written = three_runs();
+        let mut bytes = Vec::new();
+        for batch in &written {
+            bytes.extend_from_slice(&zstd(&json_lines(std::slice::from_ref(batch))));
+            bytes.extend_from_slice(&0x184D_2A50u32.to_le_bytes());
+            bytes.extend_from_slice(&3u32.to_le_bytes());
+            bytes.extend_from_slice(b"abc");
+        }
+        let mut out = replay(&bytes, ReplayFormat::Json, 1000).await;
+        assert_eq!(shape(&out.batches), [("web".into(), 5), ("db".into(), 1), ("web".into(), 1)]);
+        assert_eq!(sum_decompress(&mut out.probe), 0.0);
+    }
+
+    #[tokio::test]
+    async fn a_zstd_native_file_replays() {
+        let written = three_runs();
+        let mut bytes = Vec::new();
+        for batch in &written {
+            bytes.extend_from_slice(&zstd(&native_frames(
+                std::slice::from_ref(batch),
+                Compression::Lz4,
+            )));
+        }
+        let mut out = replay(&bytes, ReplayFormat::Native, 1000).await;
+        assert_eq!(
+            events(&out.batches),
+            written.iter().flat_map(|b| &b.events).collect::<Vec<_>>()
+        );
+        assert_eq!(out.probe.sum("logit.input.frames", &[]), 3.0);
+        assert_eq!(sum_decompress(&mut out.probe), 0.0);
+    }
+
+    /// A body larger than the pipe, so the thread blocks on the reader and resumes.
+    #[tokio::test]
+    async fn a_compressed_body_larger_than_the_pipe_replays_whole() {
+        let batch = EventBatch {
+            resource: resource("web"),
+            scope: None,
+            events: (0..20_000).map(|i| log_event(i, "a message of ordinary length")).collect(),
+        };
+        let lines = json_lines(std::slice::from_ref(&batch));
+        assert!(lines.len() > 1 << 20);
+        for bytes in [gzip(&lines), zstd(&lines)] {
+            let out = replay(&bytes, ReplayFormat::Json, 1000).await;
+            assert_eq!(events(&out.batches).len(), 20_000);
+        }
+    }
+
+    /// A gzip file cut short delivers what it held, counts one `decompress`, and ends.
+    #[tokio::test]
+    async fn a_truncated_gzip_file_is_counted_and_ends() {
+        let written = three_runs();
+        let lines = json_lines(&written);
+        let mut bytes = gzip(&lines);
+        bytes.truncate(bytes.len() - 12);
+        let mut out = replay(&bytes, ReplayFormat::Json, 1000).await;
+        assert!(events(&out.batches).len() < 7);
+        assert_eq!(sum_decompress(&mut out.probe), 1.0);
+    }
+
+    /// Bytes after a zstd magic that aren't a frame, and a second frame whose header is cut,
+    /// are each one `decompress`; the frame before them is delivered.
+    #[tokio::test]
+    async fn a_corrupt_zstd_stream_is_counted_and_ends() {
+        let written = three_runs();
+        let first = zstd(&json_lines(&written[..1]));
+
+        let mut garbage = ZSTD_MAGIC_BYTES.to_vec();
+        garbage.extend_from_slice(&[0xff; 64]);
+        let mut out = replay(&garbage, ReplayFormat::Json, 1000).await;
+        assert!(out.batches.is_empty());
+        assert_eq!(sum_decompress(&mut out.probe), 1.0);
+
+        let mut cut = first.clone();
+        cut.extend_from_slice(&zstd(&json_lines(&written[1..2]))[..3]);
+        let mut out = replay(&cut, ReplayFormat::Json, 1000).await;
+        assert_eq!(shape(&out.batches), [("web".into(), 5)]);
+        assert_eq!(sum_decompress(&mut out.probe), 1.0);
+
+        let mut torn = zstd(&json_lines(&written));
+        torn.truncate(torn.len() / 2);
+        let mut out = replay(&torn, ReplayFormat::Json, 1000).await;
+        assert_eq!(sum_decompress(&mut out.probe), 1.0);
+    }
+
+    /// A file that starts like neither magic is read as plain text.
+    #[tokio::test]
+    async fn a_short_file_is_read_as_plain() {
+        let out = replay(b"\x1f", ReplayFormat::Json, 1000).await;
+        assert!(out.batches.is_empty());
+    }
+
+    fn skippable(total: usize) -> Vec<u8> {
+        let mut out = 0x184D_2A50u32.to_le_bytes().to_vec();
+        out.extend_from_slice(&((total - 8) as u32).to_le_bytes());
+        out.resize(total, 0);
+        out
+    }
+
+    /// Where the decoder's `BufReader` refills: its first fill is the 4 sniffed bytes, and the
+    /// next 8 KiB fill ends at 4 + 8192. A frame starting 1 to 3 bytes before this offset has its
+    /// header split across two fills.
+    const READ_EDGE: usize = 4 + 8192;
+
+    /// A skippable frame ending 2 bytes short of the read buffer's edge, then a data frame.
+    #[tokio::test]
+    async fn a_zstd_frame_header_split_across_a_buffer_edge_is_read() {
+        let written = three_runs();
+        let mut bytes = skippable(READ_EDGE - 2);
+        bytes.extend_from_slice(&zstd(&json_lines(&written[..1])));
+        bytes.extend_from_slice(&zstd(&json_lines(&written[1..2])));
+        let mut out = replay(&bytes, ReplayFormat::Json, 1000).await;
+        assert_eq!(shape(&out.batches), [("web".into(), 5), ("db".into(), 1)]);
+        assert_eq!(sum_decompress(&mut out.probe), 0.0);
+    }
+
+    /// A data frame ending 2 bytes short of the edge, then more frames.
+    #[tokio::test]
+    async fn a_zstd_data_frame_ending_at_a_buffer_edge_is_followed() {
+        let written = three_runs();
+        let first = zstd(&json_lines(&written[..1]));
+        let mut bytes = skippable(READ_EDGE - 2 - first.len());
+        bytes.extend_from_slice(&first);
+        assert_eq!(bytes.len(), READ_EDGE - 2);
+        bytes.extend_from_slice(&zstd(&json_lines(&written[1..2])));
+        bytes.extend_from_slice(&zstd(&json_lines(&written[2..])));
+        let mut out = replay(&bytes, ReplayFormat::Json, 1000).await;
+        assert_eq!(shape(&out.batches), [("web".into(), 5), ("db".into(), 1), ("web".into(), 1)]);
+        assert_eq!(sum_decompress(&mut out.probe), 0.0);
+    }
+
+    /// A named pipe can't seek, and the sniffed bytes can't be read again, so the file is read
+    /// forward only. Plain and gzip both go through the pipe.
+    #[tokio::test]
+    async fn a_named_pipe_replays_plain_and_compressed() {
+        let written = three_runs();
+        for bytes in [json_lines(&written), gzip(&json_lines(&written))] {
+            let fifo = scratch_dir("replay-fifo").join("pipe");
+            let made = std::process::Command::new("mkfifo").arg(&fifo).status().expect("mkfifo");
+            assert!(made.success());
+            let writer = {
+                let fifo = fifo.clone();
+                std::thread::spawn(move || std::fs::write(fifo, bytes).expect("write the pipe"))
+            };
+            let probe = TelemetryProbe::new();
+            let mut input = ReplayInput::new(fifo, ReplayFormat::Json, 1000)
+                .with_telemetry(probe.telemetry("replay", "replay_in", "listener"));
+            input.bind().await.expect("bind opens the pipe");
+            let (fanout, mut rx) = fanout_channel(1024);
+            input.run(fanout).await.expect("a pipe replays");
+            let mut batches = Vec::new();
+            while !rx.is_empty() {
+                batches.push(recv_batch(&mut rx).await);
+            }
+            assert_eq!(shape(&batches), [("web".into(), 5), ("db".into(), 1), ("web".into(), 1)]);
+            writer.join().expect("the writer finishes");
+        }
+    }
+
+    /// `ruzstd` writes a content checksum; a flipped checksum byte is one `decompress`.
+    #[tokio::test]
+    async fn a_zstd_checksum_mismatch_is_counted() {
+        let mut bytes = zstd(&json_lines(&three_runs()));
+        *bytes.last_mut().unwrap() ^= 0xff;
+        let mut out = replay(&bytes, ReplayFormat::Json, 1000).await;
+        assert_eq!(sum_decompress(&mut out.probe), 1.0);
+    }
+
+    /// A single-segment frame whose content size, and so window, is one byte over the cap, with a
+    /// valid body: only the window cap refuses it.
+    #[tokio::test]
+    async fn a_zstd_frame_declaring_a_window_over_the_cap_is_refused() {
+        const BLOCK: usize = 128 * 1024;
+        let size = 64 * 1024 * 1024 + 1;
+        let mut bytes = ZSTD_MAGIC_BYTES.to_vec();
+        bytes.push(0xe0);
+        bytes.extend_from_slice(&(size as u64).to_le_bytes());
+        let mut left = size;
+        while left > 0 {
+            let n = left.min(BLOCK);
+            left -= n;
+            // Last-block bit, block type 1 (RLE), and the regenerated size.
+            let header = (u32::from(left == 0)) | (1 << 1) | ((n as u32) << 3);
+            bytes.extend_from_slice(&header.to_le_bytes()[..3]);
+            bytes.push(b'x');
+        }
+        let mut out = replay(&bytes, ReplayFormat::Json, 1000).await;
+        assert!(out.batches.is_empty());
+        assert_eq!(sum_decompress(&mut out.probe), 1.0);
+    }
+
+    /// A consumer that is gone ends the read, and the decoder thread blocked on a full pipe with
+    /// it.
+    #[tokio::test]
+    async fn a_closed_consumer_ends_a_compressed_replay() {
+        let batch = EventBatch {
+            resource: resource("web"),
+            scope: None,
+            events: (0..20_000).map(|i| log_event(i, "a message of ordinary length")).collect(),
+        };
+        let lines = json_lines(std::slice::from_ref(&batch));
+        for bytes in [gzip(&lines), zstd(&lines)] {
+            let dir = scratch_dir("replay-closed");
+            let path = dir.join("events");
+            std::fs::write(&path, bytes).expect("write the file");
+            let mut input = ReplayInput::new(path, ReplayFormat::Json, 10);
+            input.bind().await.expect("bind opens the file");
+            let (fanout, rx) = fanout_channel(1);
+            drop(rx);
+            tokio::time::timeout(RECV_TIMEOUT, input.run(fanout))
+                .await
+                .expect("run returns once no consumer takes a batch")
+                .expect("a closed consumer is not an error");
+        }
     }
 
     #[tokio::test]

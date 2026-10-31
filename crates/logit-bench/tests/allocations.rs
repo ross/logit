@@ -26,6 +26,7 @@ use logit_core::{
 };
 use logit_outputs::influxdb::InfluxLineEncoder;
 use logit_outputs::kafka::{KafkaEncoder, RecordFormat, RecordKey, RecordMode};
+use logit_outputs::s3::{ObjectCompression, ObjectFormat, StagedObject};
 use logit_outputs::statsd::{Format as StatsdFormat, StatsdEncoder};
 use logit_outputs::stdio::{EventDump, Format};
 use logit_outputs::syslog::{Format as SyslogFormat, SyslogEncoder};
@@ -3341,6 +3342,96 @@ fn stdio_json_encode_100_events() {
     let (result, stats) = measure(|| dump.encode(&batch));
     assert!(!result.expect("should encode").is_empty());
     expect_allocs("stdio_out: encode 100 events as json", stats, 2);
+}
+
+/// `s3_out` staging one 100-event nginx batch into an open object, warm: the batch encoded,
+/// compressed into the body, and hashed (`logit_outputs::s3::StagedObject::stage`). The object
+/// was opened and one batch staged before the measurement, so the reused encode buffer and the
+/// body have their capacity; what's left is each compressor's own per-batch cost.
+fn s3_stage(format: ObjectFormat, compression: ObjectCompression) -> Stats {
+    let mut object = StagedObject::new(format, compression, 8 * 1024 * 1024);
+    let batch = fixtures::nginx_batch(100);
+    object.stage(&batch).expect("should stage");
+    let ((), stats) = measure(|| object.stage(&batch).expect("should stage"));
+    assert_eq!(object.batches(), 2);
+    stats
+}
+
+/// `format: json`, `compression: gzip`: 0. The lines render into the object's reused `String`
+/// and `flate2` deflates them into the body's `Vec`, whose growth is a reallocation.
+#[test]
+fn s3_stage_json_gzip() {
+    expect_allocs(
+        "s3_out: stage json+gzip",
+        s3_stage(ObjectFormat::Json, ObjectCompression::Gzip),
+        0,
+    );
+}
+
+/// `format: json`, `compression: zstd`, a stage that doesn't fill the chunk: 0. The lines are
+/// copied into the object's reused chunk buffer, uncompressed.
+#[test]
+fn s3_stage_json_zstd() {
+    expect_allocs(
+        "s3_out: stage json+zstd",
+        s3_stage(ObjectFormat::Json, ObjectCompression::Zstd),
+        0,
+    );
+}
+
+/// `format: json`, `compression: zstd`, the stage that fills the chunk: 582.
+/// `ruzstd` has no reusable compressor, so each frame builds its own match tables and block
+/// buffers, once per `ZSTD_CHUNK_BYTES` of input rather than per batch. Nine 100-event batches
+/// (108,300 bytes of lines each) stay under the 1 MiB chunk, and the tenth fills it.
+#[test]
+fn s3_stage_json_zstd_filling_a_chunk() {
+    let mut object =
+        StagedObject::new(ObjectFormat::Json, ObjectCompression::Zstd, 8 * 1024 * 1024);
+    let batch = fixtures::nginx_batch(100);
+    for _ in 0..9 {
+        object.stage(&batch).expect("should stage");
+    }
+    let before = object.compressed_bytes();
+    let ((), stats) = measure(|| object.stage(&batch).expect("should stage"));
+    assert_eq!(before, 0, "nine batches stay in the chunk");
+    assert!(object.compressed_bytes() > 0, "the tenth compresses a frame");
+    expect_allocs("s3_out: stage json+zstd, filling a chunk", stats, 582);
+}
+
+/// `format: json`, `compression: none`: 0, the rendered lines appended to the body.
+#[test]
+fn s3_stage_json_none() {
+    expect_allocs(
+        "s3_out: stage json+none",
+        s3_stage(ObjectFormat::Json, ObjectCompression::None),
+        0,
+    );
+}
+
+/// `format: json`, `compression: none`, the stage that fills a part: 3. Parts of 150,000 bytes
+/// take one 100-event batch's 108,300 bytes of lines, so the second batch fills the first part:
+/// its hash's hex `String`, the first slot of the queue of cut parts, and the next part's buffer
+/// for the rest of the batch. Paid once per `part_size` of compressed body, not per batch.
+#[test]
+fn s3_stage_json_none_filling_a_part() {
+    let mut object = StagedObject::new(ObjectFormat::Json, ObjectCompression::None, 150_000);
+    let batch = fixtures::nginx_batch(100);
+    object.stage(&batch).expect("should stage");
+    let ((), stats) = measure(|| object.stage(&batch).expect("should stage"));
+    assert_eq!(object.cut_parts(), 1, "the second batch fills the first part");
+    expect_allocs("s3_out: stage json+none, filling a part", stats, 3);
+}
+
+/// `format: native`, `compression: gzip`: 2010, `NativeEncoder::encode`'s cost for a
+/// 100-event frame, as `kafka_out`'s `format: native`, `record: batch` row pays it; the deflate
+/// stream adds nothing.
+#[test]
+fn s3_stage_native_gzip() {
+    expect_allocs(
+        "s3_out: stage native+gzip",
+        s3_stage(ObjectFormat::Native, ObjectCompression::Gzip),
+        2010,
+    );
 }
 
 /// `syslog_out` encoding 100 nginx events as RFC 5424: 100, one per event, from
