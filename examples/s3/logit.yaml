@@ -1,0 +1,49 @@
+# Archives every syslog line and every OTLP log record to S3 as gzipped JSON lines, one object
+# per five minutes or 32 MiB, whichever comes first:
+#
+#   hosts -> syslog_in :5140/udp ----\
+#   apps  -> otlp_in :4318/http -> logs -> archive (s3_out)
+#
+# Objects land under logs/dt=YYYY-MM-DD/hour=HH/, the hour `logit` wrote them, not the hour of
+# the events inside. `replay_in` reads an object back once it's downloaded and decompressed.
+#
+# Before running it:
+#   - give the bucket a lifecycle rule that aborts incomplete multipart uploads after a day;
+#   - grant s3:PutObject and s3:AbortMultipartUpload on arn:aws:s3:::my-log-archive/logs/*;
+#   - make credentials available: the environment, ~/.aws, or the instance or task role.
+
+admin:
+  bind: 0.0.0.0:9600
+
+components:
+  syslog_in:
+    type: syslog_in
+    bind: 0.0.0.0:5140
+
+  otlp_in:
+    type: otlp_in
+    bind: 0.0.0.0:4318
+    protocol: http
+
+  # Only logs go to the archive: OTLP metrics and traces arriving here are discarded.
+  logs:
+    type: keep_signals
+    sources: [syslog_in, otlp_in]
+    signals: [logs]
+
+  archive:
+    type: s3_out
+    sources: [logs]
+    bucket: my-log-archive
+    region: us-east-1
+    prefix: logs/
+    buffer:
+      # The batches of an open object wait here until it's stored, so a restart replays them
+      # into a new object instead of losing them.
+      disk:
+        path: /var/lib/logit/archive
+      # Above the object's 32 MiB: this counts decoded events, which take several times the
+      # space of their JSON lines, and an object closes early when it fills.
+      max_bytes: 256MiB
+      # Long enough to upload the last object at shutdown.
+      shutdown_grace: 60s

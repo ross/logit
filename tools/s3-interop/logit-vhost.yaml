@@ -1,0 +1,37 @@
+# The virtual-hosted leg of `script/s3-interop`: 500 events with the bucket in the host name
+# (`<bucket>.<endpoint host>`) rather than the path. Only `<bucket>.<endpoint host>` resolves on
+# the stack's network, so a sink that sent a path-style request could not connect (compose.yaml).
+admin: { bind: 127.0.0.1:9600 }
+
+components:
+  load:
+    type: generate_in
+    count: 500
+    rate: 250
+    batch: 50
+    event:
+      log: "vhost {seq}"
+      attributes: { seq: "{seq}" }
+
+  archive:
+    type: s3_out
+    sources: [load]
+    bucket: !env S3_INTEROP_BUCKET
+    region: !env S3_INTEROP_REGION
+    endpoint: !env S3_INTEROP_VHOST_ENDPOINT
+    path_style: false
+    prefix: !env S3_INTEROP_PREFIX
+    max_age: 5s
+    credentials:
+      access_key_id: !env S3_INTEROP_ACCESS_KEY
+      secret_access_key: !env S3_INTEROP_SECRET_KEY
+    buffer:
+      retry_max_delay: 2s
+      shutdown_grace: 30s
+
+  self: { type: internal, interval: 1s, span_sample_rate: 0.0 }
+  telemetry:
+    type: stdio_out
+    sources: [self]
+    target: !env S3_INTEROP_TELEMETRY
+    format: json

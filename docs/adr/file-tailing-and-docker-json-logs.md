@@ -1,6 +1,6 @@
 ---
 created: 2026-09-06
-updated: 2026-10-29
+updated: 2026-10-30
 ---
 
 # `tail_in`: generic file tailing, and `docker_in` on top of it for Docker's json-file logs
@@ -668,3 +668,13 @@ a truncation counts the bytes the tailer knew it hadn't read. A checkpoint entry
 marker. `tailid/w1` and `tailid/w2` implement those decisions. That ADR's decision 1 also
 records the shutdown
 loss in the 2026-09-26 amendment as a decided limit.
+
+## Amendment: a rejected entry is counted, and a splitter drop ends both streams' reassembly (2026-10-30)
+
+[ADR `cri-container-logs`](cri-container-logs.md), section 9, shares `DockerDecoder` with `cri_in`
+for cri-dockerd's files and changes it for `docker_in` too. A rejected json-file entry counts
+`logit.input.frames.dropped{reason="malformed"}` beside `bad_line`. An envelope the line splitter
+drops reaches the decoder through the driver's splitter-drop hook, and since its stream is
+unknown, the decoder discards and counts each stream's held fragment and ends any drop in
+progress, so no message is joined across the dropped entry. The fragments after it can still leave
+as a line without its head; that section has the counting rule and its limits.

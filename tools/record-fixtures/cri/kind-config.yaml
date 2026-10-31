@@ -1,0 +1,13 @@
+# One control-plane node, with the kubelet set to rotate a container's log after 24 KiB and to
+# check every 3 s (the kubelet's minimum), so the recording sees the kubelet rename a live file,
+# gzip the previous rename, and reopen the log through containerd.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: KubeletConfiguration
+        containerLogMaxSize: 24Ki
+        containerLogMaxFiles: 5
+        containerLogMonitorInterval: 3s

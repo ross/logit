@@ -78,10 +78,11 @@
 //! 26. A `tail_in` `paths` entry that is empty or has a `*` outside the final path component, which
 //!     the tail matcher never expands (`check_tail_glob`). No `paths` is legal and tails nothing.
 //! 27. A `docker_in` with an empty `containers`/`labels` entry, a duplicate `containers` entry, or
-//!     an empty `root`. No `containers` without `discover: true` is legal and follows nothing.
-//! 28. A `tail_in`/`docker_in` `poll_interval`, `checkpoint_interval`, or `max_line_bytes` of `0`:
-//!     a busy loop, a checkpoint write every tick, or every line dropped. 26-28 are
-//!     `docs/adr/file-tailing-and-docker-json-logs.md`'s.
+//!     an empty `root`. No `containers` without `discover: true` is legal and follows nothing. A
+//!     `cri_in` with an empty `root` or `containers_dir` (`docs/adr/cri-container-logs.md`).
+//! 28. A `tail_in`/`docker_in`/`cri_in` `poll_interval`, `checkpoint_interval`, or
+//!     `max_line_bytes` of `0`: a busy loop, a checkpoint write every tick, or every line
+//!     dropped. 26-28 are `docs/adr/file-tailing-and-docker-json-logs.md`'s.
 //! 29. A `file_out` `rotate.max_bytes` or `max_files` of `0`, or a `max_files` above
 //!     `logit_config::MAX_ROTATE_FILES`. `max_files` counts the active file, so `0` is a bound no
 //!     file could meet; the sink would clamp it to `1`, which truncates in place. A `rotate:` with
@@ -97,9 +98,11 @@
 //! 34. A `logit_out` `tls:` failing 24's two consistency checks (no scheme check: the endpoint is a
 //!     bare `host:port`); a `logit_in` `max_frame_bytes` of `0` or above
 //!     `MAX_SANE_UNCOMPRESSED_LEN`, which the frame reader enforces regardless.
-//! 35. A `buffer.disk:` alongside a non-default `buffer.max_batches`/`max_bytes` (disk replaces
-//!     them), a disk bound of `0` or with `segment_bytes > max_bytes`, or two sinks sharing a
-//!     literal `disk.path` (`docs/adr/disk-backed-sink-buffer.md`).
+//! 35. A `buffer.disk:` alongside a non-default `buffer.max_batches`, or a non-default
+//!     `buffer.max_bytes` on a sink that doesn't collect windows (disk replaces them; on a
+//!     collecting sink, `s3_out`, `max_bytes` bounds the window's decoded batches), a disk bound
+//!     of `0` or with `segment_bytes > max_bytes`, or two sinks sharing a literal `disk.path`
+//!     (`docs/adr/disk-backed-sink-buffer.md` and its 2026-10-30 amendment).
 //! 36. A `has_attributes`/`drop_attributes` with an empty key, a non-finite value, or a presence
 //!     key repeated or also named in the same side's map. Nothing configured is legal: zero pairs
 //!     match vacuously, so `has_*` forwards every event and `drop_*` discards every one
@@ -198,7 +201,7 @@
 //!     naming both or neither side, or with a non-finite value; or `missing:` without `key:`.
 //!     `rate: 1` keeps every event, and `rate: 0` keeps only what `always_keep` flags or
 //!     `missing: keep` keeps (`docs/adr/consistent-sampling-component.md`).
-//! 62. Two `tail_in`/`docker_in` components sharing a literal `checkpoint_path`, or one whose
+//! 62. Two `tail_in`/`docker_in`/`cri_in` components sharing a literal `checkpoint_path`, or one whose
 //!     `checkpoint_path` is another's `<checkpoint_path>.tmp`: each would overwrite, or truncate
 //!     and rename away, the other's offsets (`docs/adr/file-tailing-and-docker-json-logs.md`).
 //! 63. A `datadog_in` with an empty `bind`, or an `api_keys` entry that is empty or has leading or
@@ -355,6 +358,15 @@
 //!     whitespace: none could match a request's credential. Also a basic username containing
 //!     `:`, which RFC 7617 forbids and which would alias another entry's encoding. Empty lists
 //!     accept any request (`docs/adr/listener-authentication.md`).
+//! 100. An `s3_out` with an empty `bucket`, `region`, or `storage_class`; an `endpoint` that
+//!      isn't an `http://` or `https://` URL with a host and no path, query, fragment, or user
+//!      info; a `partition` jiff can't format, or a `prefix` and `partition` whose longest key
+//!      passes S3's 1,024 bytes or that make a `.` or `..` segment; a `max_bytes` of `0` or
+//!      above 9,000 times `part_size`, which would pass S3's 10,000 parts; a `part_size` outside
+//!      S3's 5 MiB to 5 GiB; a `max_age`, `timeout`, or `connect_timeout` of `0s`; an `sse` `kms_key_id` or `bucket_key` outside
+//!      `aws_kms`, or an empty `kms_key_id`; `credentials` with an empty value; or a `tls` failing
+//!      rule 24's checks, a block under an `http://` `endpoint` included
+//!      (`docs/adr/s3-object-archive.md`, decision 7).
 //!
 //! Not validated: that a `by: {provenance: ..}` route key names a component in this graph. Like
 //! 37's ids, it may name a component relayed from another process. Nor is `keep`'s empty `fields`:
@@ -438,6 +450,7 @@ pub fn role(kind: &ComponentKind) -> Role {
         | InfluxDbIn { .. }
         | TailIn { .. }
         | DockerIn { .. }
+        | CriIn { .. }
         | LogitIn { .. }
         | Internal { .. }
         | PrometheusIn { .. }
@@ -484,6 +497,7 @@ pub fn role(kind: &ComponentKind) -> Role {
         | DatadogTraceOut { .. }
         | SplunkHecOut { .. }
         | KafkaOut { .. }
+        | S3Out { .. }
         | LogitOut { .. }
         | StdioOut { .. }
         | FileOut { .. }
@@ -516,6 +530,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         InfluxDbIn { .. } => "influxdb_in",
         TailIn { .. } => "tail_in",
         DockerIn { .. } => "docker_in",
+        CriIn { .. } => "cri_in",
         LogitIn { .. } => "logit_in",
         Internal { .. } => "internal",
         PrometheusIn { .. } => "prometheus_in",
@@ -562,6 +577,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         DatadogTraceOut { .. } => "datadog_trace_out",
         SplunkHecOut { .. } => "splunk_hec_out",
         KafkaOut { .. } => "kafka_out",
+        S3Out { .. } => "s3_out",
         LogitOut { .. } => "logit_out",
         StdioOut { .. } => "stdio_out",
         FileOut { .. } => "file_out",
@@ -649,6 +665,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::InfluxDbIn { .. }
             | ComponentKind::TailIn { .. }
             | ComponentKind::DockerIn { .. }
+            | ComponentKind::CriIn { .. }
             | ComponentKind::Internal { .. }
             | ComponentKind::PrometheusIn { .. }
             | ComponentKind::Lua { .. }
@@ -690,6 +707,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::DatadogTraceOut { .. }
             | ComponentKind::SplunkHecOut { .. }
             | ComponentKind::KafkaOut { .. }
+            | ComponentKind::S3Out { .. }
             | ComponentKind::StdioOut { .. }
             | ComponentKind::FileOut { .. }
             | ComponentKind::SyslogOut { .. }
@@ -1405,7 +1423,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         anyhow::bail!(
             "component '{id}': 'receive' is only meaningful on a datagram, stream or tail \
              listener (statsd_in, lines_in, collectd_in, syslog_in, graphite_in, tail_in, \
-             docker_in), but \
+             docker_in, cri_in), but \
              '{id}' is a {}",
             role(&component.kind).as_str()
         );
@@ -1492,12 +1510,26 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 27, `cri_in`'s part: an empty `root` or `containers_dir` would resolve to the working
+    // directory.
+    for (id, component) in &components {
+        if let ComponentKind::CriIn { root, containers_dir, .. } = &component.kind {
+            if root.is_empty() {
+                anyhow::bail!("component '{id}': 'root' must not be empty");
+            }
+            if containers_dir.is_empty() {
+                anyhow::bail!("component '{id}': 'containers_dir' must not be empty");
+            }
+        }
+    }
+
     // Rule 28: a tail listener's knobs must be positive: `0` would busy-loop (`poll_interval`),
     // checkpoint every tick (`checkpoint_interval`), or drop every line (`max_line_bytes`).
     for (id, component) in &components {
         let tail_options = match &component.kind {
             ComponentKind::TailIn { tail, .. } => Some(tail),
             ComponentKind::DockerIn { tail, .. } => Some(tail),
+            ComponentKind::CriIn { tail, .. } => Some(tail),
             _ => None,
         };
         if let Some(tail) = tail_options {
@@ -1799,15 +1831,24 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
 
     // Rule 35: `buffer.disk:` (`docs/adr/disk-backed-sink-buffer.md`). Disk replaces the in-memory
     // bound rather than sizing alongside it, so a non-default `max_batches`/`max_bytes` beside it
-    // would be ignored. Zero disk bounds are impossible. Two sinks sharing a literal `disk.path`
+    // would be ignored, except `max_bytes` on a sink that collects windows, where it bounds the
+    // window's decoded batches (`collects_windows`). Zero disk bounds are impossible. Two sinks sharing a literal `disk.path`
     // would corrupt each other's spool; `DiskQueue::open`'s exclusive lock catches an aliased path
     // (`./spool` vs `spool`), since this function never resolves paths. Sorted as `(path, id)` so
     // entries sharing a path are adjacent.
     let mut disk_paths: Vec<(&str, &str)> = Vec::new();
     for (id, component) in &components {
         let Some(disk) = &component.buffer.disk else { continue };
-        if component.buffer.max_batches != BufferConfig::default().max_batches
-            || component.buffer.max_bytes != BufferConfig::default().max_bytes
+        let max_bytes_set = component.buffer.max_bytes != BufferConfig::default().max_bytes;
+        if collects_windows(&component.kind) {
+            if component.buffer.max_batches != BufferConfig::default().max_batches {
+                anyhow::bail!(
+                    "component '{id}': 'buffer.max_batches' is ignored once 'buffer.disk' is set \
+                     -- disk replaces the in-memory bound; tune 'buffer.disk.max_bytes' instead"
+                );
+            }
+        } else if component.buffer.max_batches != BufferConfig::default().max_batches
+            || max_bytes_set
         {
             anyhow::bail!(
                 "component '{id}': 'buffer.max_batches'/'buffer.max_bytes' are ignored once \
@@ -3138,7 +3179,9 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     let mut checkpoint_paths: Vec<(&str, &str)> = components
         .iter()
         .filter_map(|(id, component)| match &component.kind {
-            ComponentKind::TailIn { tail, .. } | ComponentKind::DockerIn { tail, .. } => {
+            ComponentKind::TailIn { tail, .. }
+            | ComponentKind::DockerIn { tail, .. }
+            | ComponentKind::CriIn { tail, .. } => {
                 tail.checkpoint_path.as_deref().map(|path| (path, id.as_str()))
             }
             _ => None,
@@ -4129,6 +4172,13 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
+    // Rule 100: `s3_out` (`docs/adr/s3-object-archive.md`, decision 7).
+    for (id, component) in &components {
+        if let ComponentKind::S3Out { .. } = &component.kind {
+            validate_s3_out(id, &component.kind)?;
+        }
+    }
+
     // Rule 94: `cumulative_to_delta` (`docs/adr/cumulative-to-delta-transform.md`). Both bounds
     // are impossible at `0`: a zero `max_staleness` evicts every series at the next batch, so no
     // point is ever differenced, and the transform would clamp a zero `max_series` to `1`.
@@ -4846,6 +4896,199 @@ fn check_recover_below(id: &str, block: &str, value: f64) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// S3's part bounds, and the most parts `max_bytes` may need: 9,000 leaves room under S3's
+/// 10,000 for compression overhead on incompressible data and the batch that crosses `max_bytes`.
+const S3_MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
+const S3_MAX_PART_SIZE: u64 = 5 * 1024 * 1024 * 1024;
+const S3_MAX_BYTES_PARTS: u64 = 9_000;
+
+/// Rule 100's checks on one `s3_out`. A bucket name is checked only for being empty: S3's naming
+/// rules and those of S3-compatible stores differ, and a name the store refuses holds the sink
+/// with `InvalidBucketName`.
+fn validate_s3_out(id: &str, kind: &ComponentKind) -> anyhow::Result<()> {
+    let ComponentKind::S3Out {
+        bucket,
+        region,
+        endpoint,
+        prefix,
+        partition,
+        max_bytes,
+        max_age,
+        part_size,
+        storage_class,
+        sse,
+        credentials,
+        timeout,
+        connect_timeout,
+        tls,
+        ..
+    } = kind
+    else {
+        return Ok(());
+    };
+    for (field, value) in [("bucket", Some(bucket)), ("region", Some(region))]
+        .into_iter()
+        .chain([("storage_class", storage_class.as_ref())])
+    {
+        if value.is_some_and(|v| v.is_empty()) {
+            anyhow::bail!("component '{id}': s3_out '{field}' is empty");
+        }
+    }
+    if let Some(endpoint) = endpoint {
+        if let Err(why) = check_s3_endpoint(endpoint) {
+            anyhow::bail!("component '{id}': s3_out 'endpoint' ({}) {why}", redact::url(endpoint));
+        }
+    }
+    let probe = probe_partition(prefix, partition).map_err(|err| {
+        anyhow::anyhow!(
+            "component '{id}': s3_out 'partition' isn't a pattern jiff can format: {err}"
+        )
+    })?;
+    if probe.dot_segment {
+        anyhow::bail!(
+            "component '{id}': s3_out 'prefix' and 'partition' can make a key with a '.' or '..' \
+             segment -- a URL drops it, so the key the sink signs isn't the one it sends"
+        );
+    }
+    let longest = probe.longest;
+    let key = prefix.len() + longest + logit_config::S3_KEY_TAIL_BYTES;
+    if key > logit_config::S3_MAX_KEY_BYTES {
+        anyhow::bail!(
+            "component '{id}': s3_out 'prefix' and 'partition' can make a {key}-byte key -- S3 \
+             takes at most {} bytes, and the rest of a key takes {}",
+            logit_config::S3_MAX_KEY_BYTES,
+            logit_config::S3_KEY_TAIL_BYTES
+        );
+    }
+    if !(S3_MIN_PART_SIZE..=S3_MAX_PART_SIZE).contains(part_size) {
+        anyhow::bail!(
+            "component '{id}': s3_out 'part_size' is {part_size} bytes -- S3 takes parts from \
+             5 MiB to 5 GiB"
+        );
+    }
+    if *max_bytes == 0 || *max_bytes > part_size.saturating_mul(S3_MAX_BYTES_PARTS) {
+        anyhow::bail!(
+            "component '{id}': s3_out 'max_bytes' is {max_bytes} -- it must be above 0 and at \
+             most {S3_MAX_BYTES_PARTS} times 'part_size', so an object stays under S3's 10,000 \
+             parts"
+        );
+    }
+    for (field, value) in
+        [("max_age", max_age), ("timeout", timeout), ("connect_timeout", connect_timeout)]
+    {
+        if value.is_zero() {
+            anyhow::bail!("component '{id}': s3_out '{field}' is 0s -- it must be above 0s");
+        }
+    }
+    if let Some(sse) = sse {
+        let kms = sse.algorithm == logit_config::S3SseAlgorithm::AwsKms;
+        if !kms && (sse.kms_key_id.is_some() || sse.bucket_key.is_some()) {
+            anyhow::bail!(
+                "component '{id}': s3_out 'sse.kms_key_id' and 'sse.bucket_key' apply only to \
+                 'algorithm: aws_kms'"
+            );
+        }
+        if sse.kms_key_id.as_deref().is_some_and(str::is_empty) {
+            anyhow::bail!("component '{id}': s3_out 'sse.kms_key_id' is empty");
+        }
+    }
+    if let Some(credentials) = credentials {
+        if credentials.access_key_id.is_empty()
+            || credentials.secret_access_key.is_empty()
+            || credentials.session_token.as_deref().is_some_and(str::is_empty)
+        {
+            anyhow::bail!(
+                "component '{id}': s3_out 'credentials' has an empty value -- an 'access_key_id' \
+                 and 'secret_access_key', and a 'session_token' when one is set, must not be empty"
+            );
+        }
+    }
+    if tls.cert_file.is_some() != tls.key_file.is_some() {
+        anyhow::bail!(
+            "component '{id}': 'tls.cert_file' and 'tls.key_file' must both be set for mutual \
+             TLS, or both omitted -- one alone can't be used"
+        );
+    }
+    if tls.insecure_skip_verify && tls.ca_file.is_some() {
+        anyhow::bail!(
+            "component '{id}': 'tls.insecure_skip_verify' and 'tls.ca_file' can't both be set -- \
+             'insecure_skip_verify' trusts any certificate, which makes a specific trusted CA \
+             meaningless"
+        );
+    }
+    if let Some(endpoint) = endpoint {
+        if !tls.is_empty() && !endpoint.to_ascii_lowercase().starts_with("https://") {
+            anyhow::bail!(
+                "component '{id}': 'tls' is set, but 'endpoint' ({}) isn't 'https://' -- TLS is \
+                 selected by the endpoint's scheme, so a 'tls:' block here would have no effect",
+                redact::url(endpoint)
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Why an `s3_out` `endpoint` can't be used, if it can't: the sink appends the bucket and key to
+/// it, so it must be a scheme and a host with nothing after them but an optional `/`.
+fn check_s3_endpoint(endpoint: &str) -> Result<(), &'static str> {
+    let lower = endpoint.to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix("http://").or_else(|| lower.strip_prefix("https://"))
+    else {
+        return Err("isn't an http:// or https:// URL");
+    };
+    let authority = rest.strip_suffix('/').unwrap_or(rest);
+    if authority.is_empty() {
+        return Err("names no host");
+    }
+    if authority.contains('@') {
+        return Err("carries user info -- give credentials in 'credentials'");
+    }
+    if authority.contains(['/', '?', '#']) {
+        return Err("has a path, query, or fragment -- give the store's base URL alone");
+    }
+    Ok(())
+}
+
+/// What [`probe_partition`] found.
+struct PartitionProbe {
+    /// The most bytes `partition` formats to.
+    longest: usize,
+    /// Whether `prefix` and a formatted `partition` make a `.` or `..` path segment.
+    dot_segment: bool,
+}
+
+/// Formats `partition` in UTC at one instant per month and weekday in year 9999, the longest
+/// year jiff formats, at the last millisecond of a day, so month and weekday names and every
+/// numeric field are at their widest. It formats each day again at millisecond 0, where `%.f`
+/// writes nothing and can leave a bare `.`. Each result follows `prefix` to find a dot segment:
+/// every `/`-ended segment, since the key's own tail follows the last one.
+fn probe_partition(prefix: &str, partition: &str) -> Result<PartitionProbe, jiff::Error> {
+    let mut probe = PartitionProbe { longest: 0, dot_segment: false };
+    for month in 1..=12 {
+        for day in 20..=26 {
+            for nanos in [999_000_000, 0] {
+                let instant = jiff::civil::date(9999, month, day)
+                    .at(23, 59, 59, nanos)
+                    .to_zoned(jiff::tz::TimeZone::UTC)?;
+                let formatted = jiff::fmt::strtime::format(partition, &instant)?;
+                probe.longest = probe.longest.max(formatted.len());
+                let path = format!("{prefix}{formatted}");
+                let mut segments: Vec<&str> = path.split('/').collect();
+                segments.pop();
+                probe.dot_segment |= segments.iter().any(|segment| matches!(*segment, "." | ".."));
+            }
+        }
+    }
+    Ok(probe)
+}
+
+/// Whether a sink of `kind` keeps a window open across arrivals through `Output::collecting`
+/// (`docs/adr/collecting-sink-window.md`). Rule 35 reads it: beside `buffer.disk:`, such a sink's
+/// `buffer.max_bytes` bounds its window's decoded batches.
+fn collects_windows(kind: &ComponentKind) -> bool {
+    matches!(kind, ComponentKind::S3Out { .. })
+}
+
 /// Rules 17/18/57's datagram predicate: the kinds the datagram listener driver backs
 /// (`logit-inputs::udp::UdpListener`, `docs/adr/decoupled-listener-io.md`), a Unix datagram
 /// `statsd_in` or `lines_in` included. An explicit list, not
@@ -4935,7 +5178,10 @@ fn is_stream_listener(kind: &ComponentKind) -> bool {
 /// is its own durable buffer, so there is no receive queue. An explicit list, like
 /// [`is_datagram_listener`].
 fn is_tail_listener(kind: &ComponentKind) -> bool {
-    matches!(kind, ComponentKind::TailIn { .. } | ComponentKind::DockerIn { .. })
+    matches!(
+        kind,
+        ComponentKind::TailIn { .. } | ComponentKind::DockerIn { .. } | ComponentKind::CriIn { .. }
+    )
 }
 
 /// Whether `name` is a placeholder `generate_in` substitutes: `seq` (the 0-based event counter) or
@@ -8682,6 +8928,106 @@ mod tests {
         }
     }
 
+    /// An `s3_out` from its required fields and `extra`, JSON object members that add to them or
+    /// replace them.
+    fn s3_out(extra: &str) -> ComponentKind {
+        let mut json = serde_json::json!({"type": "s3_out", "bucket": "b", "region": "us-east-1"});
+        let extra: serde_json::Value =
+            serde_json::from_str(&format!("{{{extra}}}")).expect("JSON object members");
+        for (key, value) in extra.as_object().expect("an object") {
+            json[key] = value.clone();
+        }
+        serde_json::from_value::<Component>(json).expect("an s3_out").kind
+    }
+
+    /// Rule 100 accepts every default, and each bound at its edge.
+    #[test]
+    fn an_s3_out_at_its_defaults_and_bounds_validates() {
+        for extra in [
+            "",
+            r#""endpoint": "http://minio:9000""#,
+            r#""endpoint": "https://minio.internal:9000/", "tls": {"ca_file": "ca.pem"}"#,
+            r#""part_size": "5MiB", "max_bytes": "1""#,
+            r#""part_size": "5GiB""#,
+            r#""part_size": "5MiB", "max_bytes": "45000MiB""#,
+            r#""sse": {"algorithm": "aws_kms", "kms_key_id": "k", "bucket_key": true}"#,
+            r#""sse": {"algorithm": "aes256"}, "storage_class": "STANDARD_IA""#,
+            r#""credentials": {"access_key_id": "a", "secret_access_key": "s"}"#,
+            r#""partition": "%A/%B/%s/""#,
+            r#""prefix": "logs/.hidden/a..b/", "partition": "x/.""#,
+        ] {
+            resolve(cfg(vec![("in", vec![], listener()), ("out", vec!["in"], s3_out(extra))]))
+                .unwrap_or_else(|err| panic!("{extra}: {err}"));
+        }
+        let fits = "p"
+            .repeat(logit_config::S3_MAX_KEY_BYTES - logit_config::S3_KEY_TAIL_BYTES - "dt=".len());
+        resolve(cfg(vec![
+            ("in", vec![], listener()),
+            ("out", vec!["in"], s3_out(&format!(r#""prefix": "{fits}", "partition": "dt=""#))),
+        ]))
+        .expect("a key of 1,024 bytes fits");
+    }
+
+    /// Rule 100 rejects each bound of `docs/adr/s3-object-archive.md`'s decision 7.
+    #[test]
+    fn an_s3_out_past_each_bound_is_rejected() {
+        let over = "p".repeat(
+            logit_config::S3_MAX_KEY_BYTES - logit_config::S3_KEY_TAIL_BYTES - "dt=".len() + 1,
+        );
+        let long_prefix = format!(r#""prefix": "{over}", "partition": "dt=""#);
+        let cases: Vec<(String, &str)> = vec![
+            (r#""bucket": """#.into(), "'bucket' is empty"),
+            (r#""region": """#.into(), "'region' is empty"),
+            (r#""storage_class": """#.into(), "'storage_class' is empty"),
+            (r#""endpoint": "minio:9000""#.into(), "isn't an http:// or https:// URL"),
+            (r#""endpoint": "https://""#.into(), "names no host"),
+            (r#""endpoint": "https://u:p@minio""#.into(), "carries user info"),
+            (r#""endpoint": "https://minio/base""#.into(), "has a path, query, or fragment"),
+            (r#""endpoint": "https://minio?x=1""#.into(), "has a path, query, or fragment"),
+            (r#""partition": "dt=%""#.into(), "isn't a pattern jiff can format"),
+            (long_prefix, "can make a 1025-byte key"),
+            (r#""prefix": "./logs/""#.into(), "'.' or '..' segment"),
+            (r#""prefix": "logs/../""#.into(), "'.' or '..' segment"),
+            (r#""prefix": "logs/.", "partition": "./""#.into(), "'.' or '..' segment"),
+            (r#""partition": "%Y/../""#.into(), "'.' or '..' segment"),
+            (r#""partition": ".%.f/""#.into(), "'.' or '..' segment"),
+            (r#""partition": "%Y/.%.f/""#.into(), "'.' or '..' segment"),
+            (r#""part_size": "5242879""#.into(), "S3 takes parts from"),
+            (r#""part_size": "5121MiB""#.into(), "S3 takes parts from"),
+            (r#""max_bytes": "0""#.into(), "'max_bytes' is 0"),
+            (r#""part_size": "5MiB", "max_bytes": "47185920001""#.into(), "at most 9000 times"),
+            (r#""max_age": "0s""#.into(), "'max_age' is 0s"),
+            (r#""timeout": "0s""#.into(), "'timeout' is 0s"),
+            (r#""connect_timeout": "0s""#.into(), "'connect_timeout' is 0s"),
+            (r#""sse": {"algorithm": "aes256", "kms_key_id": "k"}"#.into(), "apply only to"),
+            (r#""sse": {"algorithm": "aes256", "bucket_key": true}"#.into(), "apply only to"),
+            (r#""sse": {"algorithm": "aws_kms", "kms_key_id": ""}"#.into(), "'sse.kms_key_id' is empty"),
+            (
+                r#""credentials": {"access_key_id": "", "secret_access_key": "s"}"#.into(),
+                "has an empty value",
+            ),
+            (
+                r#""credentials": {"access_key_id": "a", "secret_access_key": "s", "session_token": ""}"#
+                    .into(),
+                "has an empty value",
+            ),
+            (r#""tls": {"cert_file": "c.pem"}"#.into(), "must both be set"),
+            (
+                r#""tls": {"insecure_skip_verify": true, "ca_file": "ca.pem"}"#.into(),
+                "can't both be set",
+            ),
+            (
+                r#""endpoint": "http://minio:9000", "tls": {"ca_file": "ca.pem"}"#.into(),
+                "isn't 'https://'",
+            ),
+        ];
+        for (extra, want) in cases {
+            let config = cfg(vec![("in", vec![], listener()), ("out", vec!["in"], s3_out(&extra))]);
+            let Err(err) = resolve(config) else { panic!("{extra}: validated") };
+            assert!(err.to_string().contains(want), "{extra}: got {err}");
+        }
+    }
+
     /// Rule 98: rule 24's `tls` checks on an `influxdb_out`, including a block under `http://`.
     #[test]
     fn an_influxdb_out_tls_block_that_cant_take_effect_is_rejected() {
@@ -12312,6 +12658,25 @@ mod tests {
         assert!(err.contains("are ignored once 'buffer.disk' is set"), "got: {err}");
     }
 
+    /// Rule 35: beside `disk:`, a collecting sink's `buffer.max_bytes` bounds its window, so it
+    /// may be set; its `max_batches` is still ignored.
+    #[test]
+    fn a_disk_buffer_beside_max_bytes_validates_on_s3_out_alone() {
+        let mut buffer = disk_buffer("spool");
+        buffer.max_bytes = 256 * 1024 * 1024;
+        resolve(cfg_with_buffer(vec![
+            ("in", vec![], listener(), BufferConfig::default()),
+            ("out", vec!["in"], s3_out(""), buffer.clone()),
+        ]))
+        .expect("max_bytes bounds a collecting sink's window");
+        buffer.max_batches = 4096;
+        let err = expect_err(cfg_with_buffer(vec![
+            ("in", vec![], listener(), BufferConfig::default()),
+            ("out", vec!["in"], s3_out(""), buffer),
+        ]));
+        assert!(err.contains("'buffer.max_batches' is ignored"), "got: {err}");
+    }
+
     #[test]
     fn a_disk_buffer_with_zero_segment_bytes_is_rejected() {
         let mut buffer = disk_buffer("spool");
@@ -12381,6 +12746,57 @@ mod tests {
                 ..logit_config::TailOptions::default()
             },
         }
+    }
+
+    fn cri_in(tail: logit_config::TailOptions) -> ComponentKind {
+        ComponentKind::CriIn {
+            root: "/var/log/pods".to_string(),
+            containers_dir: "/var/log/containers".to_string(),
+            partial_timeout: std::time::Duration::from_secs(5),
+            tail,
+        }
+    }
+
+    #[test]
+    fn cri_in_is_a_tail_listener_with_its_root_and_knobs_checked() {
+        assert_eq!(kind_name(&cri_in(Default::default())), "cri_in");
+        assert_eq!(role(&cri_in(Default::default())), Role::Listener);
+        assert!(is_tail_listener(&cri_in(Default::default())));
+        resolve(cfg(vec![("in", vec![], cri_in(Default::default())), ("out", vec!["in"], sink())]))
+            .expect("a default cri_in validates");
+
+        let mut kind = cri_in(Default::default());
+        if let ComponentKind::CriIn { root, .. } = &mut kind {
+            root.clear();
+        }
+        let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+        assert!(err.contains("'root' must not be empty"), "got: {err}");
+
+        let mut kind = cri_in(Default::default());
+        if let ComponentKind::CriIn { containers_dir, .. } = &mut kind {
+            containers_dir.clear();
+        }
+        let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+        assert!(err.contains("'containers_dir' must not be empty"), "got: {err}");
+
+        let zero = logit_config::TailOptions {
+            poll_interval: std::time::Duration::ZERO,
+            ..Default::default()
+        };
+        let err = expect_err(cfg(vec![("in", vec![], cri_in(zero)), ("out", vec!["in"], sink())]));
+        assert!(err.contains("'poll_interval' must be greater than 0s"), "got: {err}");
+
+        // Rule 62 names `cri_in` beside the other two tail kinds.
+        let shared = logit_config::TailOptions {
+            checkpoint_path: Some("state/tail.json".to_string()),
+            ..Default::default()
+        };
+        let err = expect_err(cfg(vec![
+            ("logs", vec![], tail_in_checkpointing_to("state/tail.json")),
+            ("pods", vec![], cri_in(shared)),
+            ("out", vec!["logs", "pods"], sink()),
+        ]));
+        assert!(err.contains("both set 'checkpoint_path' to 'state/tail.json'"), "got: {err}");
     }
 
     fn docker_in_checkpointing_to(checkpoint_path: &str) -> ComponentKind {

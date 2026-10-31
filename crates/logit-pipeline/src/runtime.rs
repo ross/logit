@@ -14,7 +14,7 @@ use crate::graph::{Graph, Role};
 use crate::output::{classify, is_head_only, is_retryable, DeliveryPosture, Fault, HeadOnly};
 #[cfg(test)]
 use crate::queue::{SinkQueue, SinkQueueConfig};
-use crate::queue::{SinkStore, SinkStoreConfig, StoreItem};
+use crate::queue::{SinkStore, SinkStoreConfig, StoreItem, StoreWait};
 use crate::readiness::{NodeState, Phase};
 use crate::route_signals::{route_signals_batch, SignalRoutes};
 use crate::router::{Destinations, Router, RouterScratch};
@@ -917,6 +917,10 @@ pub struct WriteLoopConfig {
     /// The least time between two `retrying` lines while one head keeps failing. Not
     /// config-exposed; a test sets it small.
     pub retrying_log_interval: Duration,
+    /// `buffer.max_bytes`: a collecting sink's window closes once its staged batches'
+    /// `EventBatch::estimated_heap_bytes` reach it, under either store
+    /// (`docs/adr/collecting-sink-window.md`, decision 2). No other sink reads it.
+    pub window_max_bytes: u64,
 }
 
 impl Default for WriteLoopConfig {
@@ -926,6 +930,7 @@ impl Default for WriteLoopConfig {
             shutdown_grace: Duration::from_secs(5),
             delivery_override: None,
             retrying_log_interval: RETRYING_LOG_INTERVAL,
+            window_max_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -1140,6 +1145,14 @@ struct InFlight {
     /// How long the head's last submission took to be answered, set by [`window_round`] when its
     /// `await_ack` returns for the head alone, and taken by [`deliver_window`].
     head_answered: Option<Duration>,
+    /// `true` while the fill of a collecting sink's window is open: an `Output::collecting` read
+    /// after the head's submit returned `Some` (`docs/adr/collecting-sink-window.md`).
+    collecting: bool,
+    /// The staged batches' `estimated_heap_bytes` while `collecting`.
+    staged_bytes: u64,
+    /// A collecting window closed and some of its batches are still outstanding: from the close
+    /// until the last of them is answered or a fault cuts them.
+    closed_window: bool,
 }
 
 impl InFlight {
@@ -1147,12 +1160,25 @@ impl InFlight {
     fn settle_head(&mut self) {
         self.outstanding = self.outstanding.saturating_sub(1);
         self.submitted.pop_front();
+        if self.outstanding == 0 {
+            self.closed_window = false;
+        }
     }
 
     /// The sink dropped its connection: nothing is outstanding.
     fn cut(&mut self) {
         self.outstanding = 0;
         self.submitted.clear();
+        self.collecting = false;
+        self.closed_window = false;
+    }
+
+    /// Whether a round starting now only reads answers a closed collecting window owes: the
+    /// sink's `window()`, sampled before the round, reads its owed count, not `usize::MAX`. The
+    /// grace cuts no such round (`docs/adr/collecting-sink-window.md`, decision 5). The head's
+    /// own round, which runs the upload, starts before the close, so the grace still cuts it.
+    fn owed_round(&self, output: &(dyn Output + Send)) -> bool {
+        self.closed_window && output.window() != usize::MAX
     }
 
     /// How many of the store's first items have left the process, wholly or in part, and are
@@ -1172,7 +1198,8 @@ impl InFlight {
 ///
 /// - **Fill.** While `state.outstanding` is below `min(output.window(), store.max_in_flight())`,
 ///   it submits the next item, observing it first if it hasn't been. `peek_at` returning `None`
-///   ends the fill.
+///   ends the fill, except in a collecting sink's window, which waits on the store and closes on
+///   its own bounds ([`window_round`]).
 /// - **No submit or acknowledgment wait has a runtime timeout**: the sink bounds every write and
 ///   every acknowledgment wait itself (the `Output::window` contract).
 /// - **A submit failure at the head** is the round's fault. **A failure past the head classifies
@@ -1197,7 +1224,10 @@ impl InFlight {
 /// whose `Output::send_duration_per_batch` says so gets its `send.duration` sample per head
 /// answer instead, the head's request time `Output::answered_send_duration` reports, and none
 /// per round. As there, a grace deadline
-/// already reached before a round returns [`Delivery::GraceExpired`] with nothing new submitted.
+/// already reached before a round returns [`Delivery::GraceExpired`] with nothing new submitted,
+/// unless the round only reads the answers a closed collecting window owes
+/// ([`InFlight::owed_round`]). `signal` is the shutdown signal, which closes a collecting window
+/// ([`window_round`]).
 #[allow(clippy::too_many_arguments)]
 async fn deliver_window(
     output: &mut (dyn Output + Send),
@@ -1209,18 +1239,23 @@ async fn deliver_window(
     retrying: &mut Retrying,
     grace_deadline: &std::sync::OnceLock<tokio::time::Instant>,
     state: &mut InFlight,
+    signal: &mut watch::Receiver<bool>,
+    window_max_bytes: u64,
 ) -> Delivery {
     debug_assert!(!retry.max_delay.is_zero(), "a zero retry max delay");
     let mut attempt: u32 = 0;
     let mut resubmit_head = false;
     let per_batch = output.send_duration_per_batch();
+    let mut env = RoundEnv { telemetry, signal, window_max_bytes };
     loop {
-        if grace_deadline.get().is_some_and(|&due| tokio::time::Instant::now() >= due) {
+        if !state.owed_round(output)
+            && grace_deadline.get().is_some_and(|&due| tokio::time::Instant::now() >= due)
+        {
             return Delivery::GraceExpired;
         }
         attempt = attempt.saturating_add(1);
         let timer = (!per_batch).then(|| telemetry.timer("logit.component.send.duration"));
-        let result = window_round(output, store, head, state, resubmit_head).await;
+        let result = window_round(output, store, head, state, resubmit_head, &mut env).await;
         drop(timer);
         if let Some(took) = state.head_answered.take() {
             store.send_limit().answered(took);
@@ -1247,15 +1282,62 @@ async fn deliver_window(
     }
 }
 
+/// What closed a collecting sink's window: the `cause` tag of `logit.component.window.closed`
+/// (`docs/adr/collecting-sink-window.md`, decision 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowClose {
+    /// `Output::collecting` returned `None`, or the window reached `max_in_flight`.
+    Full,
+    Deadline,
+    Pressure,
+    /// The staged batches reached `buffer.max_bytes`.
+    Memory,
+    /// The store closed.
+    Closed,
+    Shutdown,
+}
+
+impl WindowClose {
+    fn tag(self) -> &'static str {
+        match self {
+            WindowClose::Full => "full",
+            WindowClose::Deadline => "deadline",
+            WindowClose::Pressure => "pressure",
+            WindowClose::Memory => "memory",
+            WindowClose::Closed => "closed",
+            WindowClose::Shutdown => "shutdown",
+        }
+    }
+}
+
+/// What [`window_round`] needs beyond the sink, the store, and the window's state: the
+/// telemetry a collecting window's close counts into, the shutdown signal that closes one, and
+/// `buffer.max_bytes`, which bounds one.
+struct RoundEnv<'a> {
+    telemetry: &'a Telemetry,
+    signal: &'a mut watch::Receiver<bool>,
+    window_max_bytes: u64,
+}
+
 /// One [`deliver_window`] round: the head's resubmit when `resubmit_head` is set, the fill, then
 /// the head's `await_ack`. `Ok` means the head was acknowledged. Every `Err` has set
 /// `state.at_fault`.
+///
+/// A collecting sink's window (`Output::collecting`, `docs/adr/collecting-sink-window.md`)
+/// opens when a `collecting()` read after the head's submit returns `Some`. Before each later
+/// submit, the fill closes it once `collecting()` reads `None`, its deadline has passed, or the
+/// staged batches reach `env.window_max_bytes`. It takes every batch the store already holds;
+/// an empty `peek_at` waits on the store until an item, the deadline, store pressure, the store
+/// closing, or the shutdown signal, and after the signal it doesn't wait. Each close is counted under its
+/// [`WindowClose`] cause. A submit failure past the head ends the fill uncounted: the sink fails
+/// the head's answer, and the window reopens from the head.
 async fn window_round(
     output: &mut (dyn Output + Send),
     store: &SinkStore,
     head: &StoreItem,
     state: &mut InFlight,
     resubmit_head: bool,
+    env: &mut RoundEnv<'_>,
 ) -> anyhow::Result<()> {
     // The head's earlier fault was its own, and the batches behind it are still in flight. It
     // stays counted in `state.outstanding` and was observed with its first submit. The sink says
@@ -1276,16 +1358,28 @@ async fn window_round(
             *front = started;
         }
     }
+    let mut close = None;
     loop {
         let window = output.window().min(store.max_in_flight()).max(1);
         if state.outstanding >= window {
+            close = Some(WindowClose::Full);
             break;
         }
         let position = state.outstanding;
         // The head is held already, and `peek_at(0)` would return the same item.
-        let item = match position {
-            0 => Some(head.clone()),
-            _ => store.peek_at(position).await,
+        let item = if position == 0 {
+            Some(head.clone())
+        } else if state.collecting {
+            let next = match collecting_next(output, store, state, position, env).await {
+                Ok(item) => item,
+                Err(cause) => {
+                    close = Some(cause);
+                    break;
+                }
+            };
+            Some(next)
+        } else {
+            store.peek_at(position).await
         };
         let Some((batch, ctx, seq)) = item else {
             break;
@@ -1302,18 +1396,45 @@ async fn window_round(
             Ok(()) => {
                 state.outstanding += 1;
                 state.submitted.push_back(started);
+                if position == 0 && output.collecting().is_some() {
+                    // A window that collects waits on intake, not on a send, so the
+                    // `buffer_full` line names no limit until it closes.
+                    state.collecting = true;
+                    state.staged_bytes = 0;
+                    store.send_limit().set(1, 0);
+                }
+                if state.collecting {
+                    state.staged_bytes =
+                        state.staged_bytes.saturating_add(batch.estimated_heap_bytes());
+                }
             }
             Err(err) if position == 0 => {
+                state.collecting = false;
                 state.at_fault = 1;
                 return Err(err);
             }
             // Past the head: the sink keeps its connection for the acknowledgments already owed.
-            Err(_) => break,
+            Err(_) => {
+                close = None;
+                break;
+            }
         }
     }
     debug_assert!(state.outstanding > 0, "the fill submits the head or returns its fault");
-    let window = output.window().min(store.max_in_flight()).max(1);
-    store.send_limit().set(window, state.outstanding);
+    if state.collecting {
+        state.collecting = false;
+        state.closed_window = true;
+        if let Some(cause) = close {
+            env.telemetry.count("logit.component.window.closed", 1.0, &[("cause", cause.tag())]);
+        }
+    }
+    if state.closed_window {
+        // One upload at a time, and its owed answers read with no wait: the true bound.
+        store.send_limit().set(1, 1);
+    } else {
+        let window = output.window().min(store.max_in_flight()).max(1);
+        store.send_limit().set(window, state.outstanding);
+    }
     let result = output.await_ack().await;
     // A batch behind a held head may have been answered while the loop retried the head, so its
     // submit time would count that wait; a sink timing its own requests reports the request's.
@@ -1339,6 +1460,48 @@ async fn window_round(
     state.at_fault = state.outstanding;
     state.cut();
     Err(err)
+}
+
+/// The next batch for an open collecting window at `position`, or what closes the window first
+/// ([`window_round`]'s doc lists the checks, in this order). `output` is `&mut` only because a
+/// shared `&(dyn Output + Send)` isn't `Send`, which `run_output`'s spawned future needs.
+async fn collecting_next(
+    output: &mut (dyn Output + Send),
+    store: &SinkStore,
+    state: &InFlight,
+    position: usize,
+    env: &mut RoundEnv<'_>,
+) -> Result<StoreItem, WindowClose> {
+    let Some(deadline) = output.collecting() else {
+        return Err(WindowClose::Full);
+    };
+    if tokio::time::Instant::now() >= deadline {
+        return Err(WindowClose::Deadline);
+    }
+    if state.staged_bytes >= env.window_max_bytes {
+        return Err(WindowClose::Memory);
+    }
+    // Pressure stops only the wait for new arrivals, inside `wait_at`. A batch the store holds
+    // grows neither store when the window takes it: a memory store already counts it, and the
+    // memory bound above bounds a disk store's read-ahead. Closing frees one slot, so a check
+    // here would make every window one batch under sustained overload.
+    if let Some(item) = store.peek_at(position).await {
+        return Ok(item);
+    }
+    if *env.signal.borrow() {
+        return Err(WindowClose::Shutdown);
+    }
+    // The wait reserves nothing unless it returns an item, so the signal's arm may drop it.
+    tokio::select! {
+        waited = store.wait_at(position, deadline) => match waited {
+            StoreWait::Item(item) => Ok(item),
+            StoreWait::Closed => Err(WindowClose::Closed),
+            StoreWait::Deadline => Err(WindowClose::Deadline),
+            StoreWait::Pressure => Err(WindowClose::Pressure),
+        },
+        // An error means the sender is gone, which `shutdown_grace_expired` reads as shutdown.
+        _ = env.signal.wait_for(|&due| due) => Err(WindowClose::Shutdown),
+    }
 }
 
 /// At shutdown, the store's first `n` items left the process and their outcome is unknown: the
@@ -1537,6 +1700,8 @@ pub(crate) async fn write_loop(
     // on the next success after a drop or a retried failure.
     let mut degraded = false;
     let mut in_flight = InFlight::default();
+    // The signal itself, for a collecting window's fill; `shutdown` stays the grace arms'.
+    let mut signal = shutdown.clone();
 
     loop {
         // Each `select!` reduces to a plain enum so no handler arm touches `output`: the
@@ -1547,6 +1712,8 @@ pub(crate) async fn write_loop(
             Closed,
             ShutdownExpired,
         }
+        // Answers a closed collecting window owes are read before the grace is honored.
+        let owed = in_flight.owed_round(output);
         // Unbiased; `unconstrained` grace arm: see `docs/design/pipeline-graph.md`'s
         // "Cancellation points".
         let next = tokio::select! {
@@ -1558,7 +1725,7 @@ pub(crate) async fn write_loop(
                 &mut shutdown,
                 &shutdown_deadline,
                 write_config.shutdown_grace,
-            )) => NextBatch::ShutdownExpired,
+            )), if !owed => NextBatch::ShutdownExpired,
         };
         let (batch, ctx, seq) = match next {
             NextBatch::Batch(batch, ctx, seq) => (batch, ctx, seq),
@@ -1570,7 +1737,7 @@ pub(crate) async fn write_loop(
                 // No submit is in progress between rounds.
                 drop_cut_off_at_shutdown(
                     &store,
-                    in_flight.outstanding,
+                    output.reached_destination(in_flight.outstanding),
                     posture,
                     &telemetry,
                     shutdown_dropped,
@@ -1646,12 +1813,14 @@ pub(crate) async fn write_loop(
                     &mut retrying,
                     &shutdown_deadline,
                     &mut in_flight,
+                    &mut signal,
+                    write_config.window_max_bytes,
                 ) => DeliverStep::Outcome(outcome),
                 () = tokio::task::unconstrained(shutdown_grace_expired(
                     &mut shutdown,
                     &shutdown_deadline,
                     write_config.shutdown_grace,
-                )) => DeliverStep::ShutdownExpired,
+                )), if !owed => DeliverStep::ShutdownExpired,
             }
         };
         let outcome = match step {
@@ -1659,8 +1828,8 @@ pub(crate) async fn write_loop(
             DeliverStep::ShutdownExpired => {
                 // What left the process unacknowledged: on the fast path the one send in flight,
                 // under a window every batch submitted and one whose submit was cut off.
-                let cut_off =
-                    if fast { usize::from(sending) } else { in_flight.left_the_process() };
+                let left = if fast { usize::from(sending) } else { in_flight.left_the_process() };
+                let cut_off = output.reached_destination(left);
                 if cut_off > 0 {
                     span.error();
                     span.tag("fault", fault_tag(Fault::Ambiguous));
@@ -1685,7 +1854,7 @@ pub(crate) async fn write_loop(
             // between batches. Batches already submitted under a window left the process, and
             // are treated as a grace cut treats them.
             Delivery::GraceExpired => {
-                let cut_off = in_flight.outstanding;
+                let cut_off = output.reached_destination(in_flight.outstanding);
                 if cut_off > 0 {
                     span.error();
                     span.tag("fault", fault_tag(Fault::Ambiguous));
@@ -8647,6 +8816,828 @@ mod tests {
             "a rejected batch is committed, so a restart doesn't replay it"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // A collecting window (`docs/adr/collecting-sink-window.md`)
+    // -----------------------------------------------------------------------------------------
+
+    /// One call [`CollectingOutput`] saw, by the batch's counter value.
+    #[derive(Debug, Clone, PartialEq)]
+    enum Col {
+        /// `observe_batch`, by the sequence number the store gave the batch.
+        Observe(u64),
+        Submit(u64),
+        /// The head's `await_ack` closed a window holding this many staged batches.
+        Close(usize),
+        /// An `await_ack` that delivered this batch.
+        Ack(u64),
+    }
+
+    /// What the head's `await_ack` does after it closes the window, before it answers.
+    #[derive(Debug, Clone, Copy)]
+    enum Upload {
+        /// Sends the request that makes the window visible, then takes this long.
+        Takes(Duration),
+        /// Never sends that request, and never returns.
+        HangsBeforeVisible,
+        /// Sends it, then never returns.
+        HangsAfterVisible,
+    }
+
+    /// A collecting sink with the contract `s3_out` has: it stages each submitted batch into one
+    /// window that collects until `max_age` after its first batch or until it holds `max_staged`,
+    /// and the head's `await_ack` uploads the window and answers the head. From the close it
+    /// owes one `Ok` per batch behind the head, and `window()` reads that count. A failed
+    /// `submit` past the head poisons the window, failing the head's answer with no
+    /// `HeadOnly`. A cancelled upload leaves nothing staged.
+    struct CollectingOutput {
+        max_age: Duration,
+        max_staged: usize,
+        deadline: Option<tokio::time::Instant>,
+        staged: Vec<u64>,
+        owed: std::collections::VecDeque<u64>,
+        poison: Option<Fault>,
+        /// Each listed submit fails once with its fault.
+        submit_fails: Vec<(u64, Fault)>,
+        /// One result per upload, `None` succeeding; success once the list runs out.
+        upload_faults: std::collections::VecDeque<Option<Fault>>,
+        upload: Upload,
+        /// The request that makes the current window visible was sent.
+        visible: bool,
+        answered: Option<Duration>,
+        log: Arc<std::sync::Mutex<Vec<Col>>>,
+        /// When each window closed.
+        closes: Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
+    }
+
+    struct CollectLog {
+        log: Arc<std::sync::Mutex<Vec<Col>>>,
+        closes: Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
+    }
+
+    impl CollectLog {
+        fn calls(&self) -> Vec<Col> {
+            self.log.lock().unwrap().clone()
+        }
+        fn has(&self, call: &Col) -> bool {
+            self.calls().contains(call)
+        }
+        fn count(&self, call: &Col) -> usize {
+            self.calls().iter().filter(|c| *c == call).count()
+        }
+        fn closes(&self) -> Vec<tokio::time::Instant> {
+            self.closes.lock().unwrap().clone()
+        }
+    }
+
+    fn collecting_output(max_age: Duration, max_staged: usize) -> (CollectingOutput, CollectLog) {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let closes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        (
+            CollectingOutput {
+                max_age,
+                max_staged,
+                deadline: None,
+                staged: Vec::new(),
+                owed: std::collections::VecDeque::new(),
+                poison: None,
+                submit_fails: Vec::new(),
+                upload_faults: std::collections::VecDeque::new(),
+                upload: Upload::Takes(Duration::ZERO),
+                visible: false,
+                answered: None,
+                log: Arc::clone(&log),
+                closes: Arc::clone(&closes),
+            },
+            CollectLog { log, closes },
+        )
+    }
+
+    impl CollectingOutput {
+        fn record(&self, call: Col) {
+            self.log.lock().unwrap().push(call);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Output for CollectingOutput {
+        async fn send(&mut self, _batch: &EventBatch) -> anyhow::Result<()> {
+            unreachable!("a window of usize::MAX never takes the send path")
+        }
+
+        fn observe_batch(&mut self, _ctx: BatchContext, seq: SeqId) {
+            self.record(Col::Observe(seq.seq));
+        }
+
+        fn window(&self) -> usize {
+            if self.owed.is_empty() {
+                usize::MAX
+            } else {
+                self.owed.len()
+            }
+        }
+
+        fn collecting(&self) -> Option<tokio::time::Instant> {
+            if !self.owed.is_empty() || self.staged.len() >= self.max_staged {
+                return None;
+            }
+            self.deadline.filter(|_| !self.staged.is_empty())
+        }
+
+        fn reached_destination(&self, left_the_process: usize) -> usize {
+            if self.visible {
+                left_the_process
+            } else {
+                0
+            }
+        }
+
+        fn send_duration_per_batch(&self) -> bool {
+            true
+        }
+
+        fn answered_send_duration(&self) -> Option<Duration> {
+            self.answered
+        }
+
+        async fn submit(
+            &mut self,
+            batch: &EventBatch,
+            _ctx: BatchContext,
+            _seq: SeqId,
+        ) -> anyhow::Result<()> {
+            let value = value_of(batch);
+            self.record(Col::Submit(value));
+            if let Some(at) = self.submit_fails.iter().position(|(v, _)| *v == value) {
+                let (_, fault) = self.submit_fails.remove(at);
+                if !self.staged.is_empty() {
+                    self.poison = Some(fault);
+                }
+                return Err(anyhow::anyhow!("simulated {fault:?} submit")).context(fault);
+            }
+            if self.staged.is_empty() {
+                self.deadline = Some(tokio::time::Instant::now() + self.max_age);
+                self.visible = false;
+            }
+            self.staged.push(value);
+            Ok(())
+        }
+
+        async fn await_ack(&mut self) -> anyhow::Result<()> {
+            if let Some(value) = self.owed.pop_front() {
+                self.answered = None;
+                self.record(Col::Ack(value));
+                return Ok(());
+            }
+            // Taken first, so a cancelled upload leaves nothing staged.
+            let window = std::mem::take(&mut self.staged);
+            let closed_at = tokio::time::Instant::now();
+            self.closes.lock().unwrap().push(closed_at);
+            self.record(Col::Close(window.len()));
+            if let Some(fault) = self.poison.take() {
+                return Err(anyhow::anyhow!("simulated poisoned window")).context(fault);
+            }
+            match self.upload {
+                Upload::Takes(took) => {
+                    self.visible = true;
+                    tokio::time::sleep(took).await;
+                }
+                Upload::HangsBeforeVisible => std::future::pending().await,
+                Upload::HangsAfterVisible => {
+                    self.visible = true;
+                    std::future::pending().await
+                }
+            }
+            if let Some(fault) = self.upload_faults.pop_front().flatten() {
+                return Err(anyhow::anyhow!("simulated {fault:?} upload")).context(fault);
+            }
+            self.answered = Some(closed_at.elapsed());
+            self.record(Col::Ack(window[0]));
+            self.owed = window[1..].iter().copied().collect();
+            Ok(())
+        }
+    }
+
+    fn collecting_memory_store(
+        max_batches: usize,
+        max_bytes: u64,
+        overflow: OverflowPolicy,
+        telemetry: &Telemetry,
+    ) -> Arc<SinkStore> {
+        Arc::new(SinkStore::Memory(SinkQueue::new(
+            SinkQueueConfig {
+                max_batches,
+                max_bytes,
+                overflow,
+                recover_below: crate::queue::DEFAULT_RECOVER_BELOW,
+            },
+            telemetry.clone(),
+        )))
+    }
+
+    fn collecting_config(posture: DeliveryPosture) -> WriteLoopConfig {
+        WriteLoopConfig {
+            retry: fast_retry_config(),
+            delivery_override: Some(posture),
+            ..WriteLoopConfig::default()
+        }
+    }
+
+    /// Runs `write_loop` over `store` beside `producer`, which pushes and closes the store,
+    /// until both finish.
+    async fn run_collecting(
+        output: &mut CollectingOutput,
+        store: &Arc<SinkStore>,
+        telemetry: Telemetry,
+        config: WriteLoopConfig,
+        shutdown_rx: watch::Receiver<bool>,
+        producer: impl Future<Output = ()>,
+    ) -> u64 {
+        let shutdown_dropped = AtomicU64::new(0);
+        let write = write_loop(
+            "out".to_string(),
+            output,
+            Arc::clone(store),
+            telemetry,
+            config,
+            shutdown_rx,
+            &shutdown_dropped,
+        );
+        tokio::time::timeout(Duration::from_secs(600), async { tokio::join!(producer, write) })
+            .await
+            .expect("write_loop drains a closed store");
+        shutdown_dropped.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    async fn push_value(store: &SinkStore, value: u64) {
+        store.push((one_event_batch(value as f64), BatchContext::default())).await;
+    }
+
+    fn closed_by(totals: &Totals, cause: &str) -> f64 {
+        totals.sum("logit.component.window.closed", &[("cause", cause)])
+    }
+
+    /// Batch 2 arrives while the window holding batch 1 collects: it's submitted into the same
+    /// window, which closes at its deadline, and the head is answered once.
+    #[tokio::test(start_paused = true)]
+    async fn a_batch_pushed_while_a_window_collects_joins_it_and_the_window_closes_at_its_deadline()
+    {
+        let (mut output, log) = collecting_output(Duration::from_secs(1), 100);
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("out", "s3_out", "sink");
+        let store = collecting_memory_store(1024, u64::MAX, OverflowPolicy::Block, &telemetry);
+        let started = tokio::time::Instant::now();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let producer = async {
+            push_value(&store, 1).await;
+            wait_until("batch 1 staged", || log.has(&Col::Submit(1))).await;
+            push_value(&store, 2).await;
+            wait_until("batch 2 answered", || log.has(&Col::Ack(2))).await;
+            store.close();
+        };
+        let config = collecting_config(DeliveryPosture::AtLeastOnce);
+        run_collecting(&mut output, &store, telemetry, config, shutdown_rx, producer).await;
+        assert_eq!(
+            log.calls(),
+            vec![
+                Col::Observe(1),
+                Col::Submit(1),
+                Col::Observe(2),
+                Col::Submit(2),
+                Col::Close(2),
+                Col::Ack(1),
+                Col::Ack(2),
+            ]
+        );
+        assert_eq!(log.closes(), vec![started + Duration::from_secs(1)], "at the deadline");
+        let totals = Totals::of(registry.drain(0));
+        assert_eq!(closed_by(&totals, "deadline"), 1.0);
+        assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 2.0);
+    }
+
+    /// Batches 1 to 3 are queued and the store closed: the first window closes `full` once the
+    /// sink says it takes no more, and the second waits on an empty, closed store.
+    #[tokio::test(start_paused = true)]
+    async fn a_window_closes_when_the_sink_takes_no_more_and_when_the_store_closes() {
+        let (mut output, log) = collecting_output(Duration::from_secs(10), 2);
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("out", "s3_out", "sink");
+        let store = collecting_memory_store(1024, u64::MAX, OverflowPolicy::Block, &telemetry);
+        for value in 1..=3 {
+            push_value(&store, value).await;
+        }
+        store.close();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let config = collecting_config(DeliveryPosture::AtLeastOnce);
+        let started = tokio::time::Instant::now();
+        run_collecting(&mut output, &store, telemetry, config, shutdown_rx, async {}).await;
+        assert!(log.calls().contains(&Col::Close(2)) && log.calls().contains(&Col::Close(1)));
+        assert_eq!(log.closes(), vec![started, started], "neither waited for its deadline");
+        let totals = Totals::of(registry.drain(0));
+        assert_eq!(closed_by(&totals, "full"), 1.0);
+        assert_eq!(closed_by(&totals, "closed"), 1.0);
+        assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 3.0);
+    }
+
+    /// A memory store of two batches caps the window at two, `full`, with nothing pushed into a
+    /// full store.
+    #[tokio::test(start_paused = true)]
+    async fn a_window_closes_at_a_memory_stores_max_in_flight() {
+        let (mut output, log) = collecting_output(Duration::from_secs(10), 100);
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("out", "s3_out", "sink");
+        let store = collecting_memory_store(2, u64::MAX, OverflowPolicy::Block, &telemetry);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let producer = async {
+            push_value(&store, 1).await;
+            push_value(&store, 2).await;
+            wait_until("batch 2 answered", || log.has(&Col::Ack(2))).await;
+            store.close();
+        };
+        let config = collecting_config(DeliveryPosture::AtLeastOnce);
+        let started = tokio::time::Instant::now();
+        run_collecting(&mut output, &store, telemetry, config, shutdown_rx, producer).await;
+        assert_eq!(log.closes(), vec![started]);
+        assert!(log.has(&Col::Close(2)));
+        let totals = Totals::of(registry.drain(0));
+        assert_eq!(closed_by(&totals, "full"), 1.0);
+        assert_eq!(closed_by(&totals, "pressure"), 0.0);
+    }
+
+    /// `buffer.max_bytes` bounds the staged batches on either store: with room for one batch
+    /// and a byte, the window closes holding two, `memory`.
+    #[tokio::test(start_paused = true)]
+    async fn a_window_closes_once_its_staged_batches_reach_buffer_max_bytes_on_either_store() {
+        let one = one_event_batch(1.0).estimated_heap_bytes();
+        for disk in [false, true] {
+            let (mut output, log) = collecting_output(Duration::from_secs(10), 100);
+            let registry = Registry::new();
+            let telemetry = registry.telemetry_for("out", "s3_out", "sink");
+            let dir = crate::disk_queue::test_support::scratch_dir("collecting-memory-bound");
+            let store = if disk {
+                Arc::new(SinkStore::Disk(Box::new(
+                    crate::disk_queue::DiskQueue::open(
+                        disk_store_config(&dir, u64::MAX),
+                        telemetry.clone(),
+                        Diagnostics::new("out"),
+                    )
+                    .unwrap(),
+                )))
+            } else {
+                collecting_memory_store(1024, u64::MAX, OverflowPolicy::Block, &telemetry)
+            };
+            for value in 1..=3 {
+                push_value(&store, value).await;
+            }
+            store.close();
+            let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+            let config = WriteLoopConfig {
+                window_max_bytes: one + 1,
+                ..collecting_config(DeliveryPosture::AtLeastOnce)
+            };
+            run_collecting(&mut output, &store, telemetry, config, shutdown_rx, async {}).await;
+            assert_eq!(
+                log.calls().iter().filter(|c| matches!(c, Col::Close(_))).collect::<Vec<_>>(),
+                vec![&Col::Close(2), &Col::Close(1)],
+                "disk: {disk}"
+            );
+            let totals = Totals::of(registry.drain(0));
+            assert_eq!(closed_by(&totals, "memory"), 1.0, "disk: {disk}");
+            assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 3.0, "disk: {disk}");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// The shutdown signal ends the fill's wait at once, so the upload starts with the whole
+    /// grace ahead of it.
+    #[tokio::test(start_paused = true)]
+    async fn the_shutdown_signal_closes_a_collecting_window_before_the_grace_expires() {
+        let (mut output, log) = collecting_output(Duration::from_secs(3600), 100);
+        output.upload = Upload::Takes(Duration::from_secs(1));
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("out", "s3_out", "sink");
+        let store = collecting_memory_store(1024, u64::MAX, OverflowPolicy::Block, &telemetry);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let signalled = std::sync::Mutex::new(None);
+        let producer = async {
+            push_value(&store, 1).await;
+            wait_until("batch 1 staged", || log.has(&Col::Submit(1))).await;
+            *signalled.lock().unwrap() = Some(tokio::time::Instant::now());
+            shutdown_tx.send(true).unwrap();
+        };
+        let config = WriteLoopConfig {
+            shutdown_grace: Duration::from_secs(5),
+            ..collecting_config(DeliveryPosture::AtMostOnce)
+        };
+        let dropped =
+            run_collecting(&mut output, &store, telemetry, config, shutdown_rx, producer).await;
+        let signalled = signalled.lock().unwrap().expect("set by the producer");
+        assert_eq!(log.closes(), vec![signalled], "closed at the signal");
+        let totals = Totals::of(registry.drain(0));
+        assert_eq!(closed_by(&totals, "shutdown"), 1.0);
+        assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 1.0);
+        assert_eq!(dropped, 0);
+    }
+
+    /// A window that closed and uploaded owes the answers behind its head. A batch pushed during
+    /// the upload waits in the store until all three are read, and the two behind the head are
+    /// read with no fill or wait between them.
+    #[tokio::test(start_paused = true)]
+    async fn a_batch_arriving_during_an_upload_waits_until_every_owed_answer_is_read() {
+        let (mut output, log) = collecting_output(Duration::from_secs(10), 3);
+        output.upload = Upload::Takes(Duration::from_secs(1));
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("out", "s3_out", "sink");
+        let store = collecting_memory_store(1024, u64::MAX, OverflowPolicy::Block, &telemetry);
+        for value in 1..=3 {
+            push_value(&store, value).await;
+        }
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let producer = async {
+            wait_until("the window closed", || log.has(&Col::Close(3))).await;
+            push_value(&store, 4).await;
+            wait_until("batch 4 staged", || log.has(&Col::Submit(4))).await;
+            store.close();
+        };
+        let config = collecting_config(DeliveryPosture::AtLeastOnce);
+        run_collecting(&mut output, &store, telemetry, config, shutdown_rx, producer).await;
+        assert_eq!(
+            log.calls(),
+            vec![
+                Col::Observe(1),
+                Col::Submit(1),
+                Col::Observe(2),
+                Col::Submit(2),
+                Col::Observe(3),
+                Col::Submit(3),
+                Col::Close(3),
+                Col::Ack(1),
+                Col::Ack(2),
+                Col::Ack(3),
+                Col::Observe(4),
+                Col::Submit(4),
+                Col::Close(1),
+                Col::Ack(4),
+            ]
+        );
+        let totals = Totals::of(registry.drain(0));
+        assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 4.0);
+    }
+
+    /// A window of three under a 1 s grace, signalled before the loop starts, with the head's
+    /// answer landing on the grace deadline: the `biased` deliver arm takes it. The rounds after
+    /// it start with an owed count, so neither the loop-top `select!`'s grace arm, nor the deliver
+    /// one, nor `deliver_window`'s early return cuts them: each batch counts delivered, nothing
+    /// is dropped, and nothing is left to replay. Repeated so the unbiased loop-top `select!`
+    /// gets both orders.
+    #[tokio::test(start_paused = true)]
+    async fn a_grace_passing_between_the_heads_answer_and_the_owed_ones_cuts_nothing() {
+        let grace = Duration::from_secs(1);
+        for posture in [DeliveryPosture::AtMostOnce, DeliveryPosture::AtLeastOnce] {
+            for round in 0..16 {
+                let at = format!("{posture:?}, round {round}");
+                let (mut output, log) = collecting_output(Duration::from_secs(10), 3);
+                output.upload = Upload::Takes(grace);
+                let registry = Registry::new();
+                let telemetry = registry.telemetry_for("out", "s3_out", "sink");
+                let store =
+                    collecting_memory_store(1024, u64::MAX, OverflowPolicy::Block, &telemetry);
+                for value in 1..=3 {
+                    push_value(&store, value).await;
+                }
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                shutdown_tx.send(true).unwrap();
+                let config =
+                    WriteLoopConfig { shutdown_grace: grace, ..collecting_config(posture) };
+                let dropped =
+                    run_collecting(&mut output, &store, telemetry, config, shutdown_rx, async {})
+                        .await;
+                assert_eq!(
+                    log.calls()[6..],
+                    [Col::Close(3), Col::Ack(1), Col::Ack(2), Col::Ack(3)],
+                    "{at}"
+                );
+                let totals = Totals::of(registry.drain(0));
+                assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 3.0, "{at}");
+                assert_eq!(dropped, 0, "{at}");
+                assert_eq!(store.finish().await, (0, 0), "{at}: nothing left reserved");
+            }
+        }
+    }
+
+    /// The grace still cuts the head's own round, which runs the upload. A sink that sent the
+    /// request that makes its window visible has every staged batch counted under
+    /// at-most-once; one that didn't has none counted, and every batch stays in the store. Under
+    /// at-least-once, nothing is counted either way.
+    #[tokio::test(start_paused = true)]
+    async fn a_grace_passing_during_the_heads_upload_cuts_it_and_counts_what_reached_the_destination(
+    ) {
+        for upload in [Upload::HangsAfterVisible, Upload::HangsBeforeVisible] {
+            for posture in [DeliveryPosture::AtMostOnce, DeliveryPosture::AtLeastOnce] {
+                let at = format!("{upload:?}, {posture:?}");
+                let (mut output, log) = collecting_output(Duration::from_secs(10), 3);
+                output.upload = upload;
+                let mut probe = TelemetryProbe::new();
+                let telemetry = probe.telemetry("out", "s3_out", "sink");
+                let store =
+                    collecting_memory_store(1024, u64::MAX, OverflowPolicy::Block, &telemetry);
+                for value in 1..=3 {
+                    push_value(&store, value).await;
+                }
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                shutdown_tx.send(true).unwrap();
+                let config = WriteLoopConfig {
+                    shutdown_grace: Duration::from_secs(1),
+                    ..collecting_config(posture)
+                };
+                let dropped =
+                    run_collecting(&mut output, &store, telemetry, config, shutdown_rx, async {})
+                        .await;
+                assert!(log.has(&Col::Close(3)), "{at}");
+                assert_eq!(log.count(&Col::Ack(1)), 0, "{at}: cut before any answer");
+                let shutdown =
+                    probe.sum("logit.component.batches.dropped", &[("reason", "shutdown")]);
+                let left = store.finish().await;
+                let counted = matches!(
+                    (upload, posture),
+                    (Upload::HangsAfterVisible, DeliveryPosture::AtMostOnce)
+                );
+                if counted {
+                    assert_eq!((shutdown, dropped), (3.0, 3), "{at}");
+                    assert_eq!(left, (0, 0), "{at}: committed");
+                } else {
+                    assert_eq!((shutdown, dropped), (0.0, 0), "{at}");
+                    assert_eq!(left, (3, 3), "{at}: left reserved, for `finish` to count");
+                }
+            }
+        }
+    }
+
+    /// Batch 2's submit fails past the head: the fill stops uncounted, the head's answer fails
+    /// with no `HeadOnly`, and the loop resubmits from the head, batch 2 included, observing
+    /// nothing again.
+    #[tokio::test(start_paused = true)]
+    async fn a_submit_failure_past_the_head_poisons_the_window_and_it_reopens_from_the_head() {
+        let (mut output, log) = collecting_output(Duration::from_secs(10), 3);
+        output.submit_fails = vec![(2, Fault::Clean)];
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("out", "s3_out", "sink");
+        let store = collecting_memory_store(1024, u64::MAX, OverflowPolicy::Block, &telemetry);
+        for value in 1..=3 {
+            push_value(&store, value).await;
+        }
+        store.close();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let config = collecting_config(DeliveryPosture::AtLeastOnce);
+        run_collecting(&mut output, &store, telemetry, config, shutdown_rx, async {}).await;
+        assert_eq!(
+            log.calls(),
+            vec![
+                Col::Observe(1),
+                Col::Submit(1),
+                Col::Observe(2),
+                Col::Submit(2),
+                Col::Close(1),
+                Col::Submit(1),
+                Col::Submit(2),
+                Col::Observe(3),
+                Col::Submit(3),
+                Col::Close(3),
+                Col::Ack(1),
+                Col::Ack(2),
+                Col::Ack(3),
+            ]
+        );
+        let totals = Totals::of(registry.drain(0));
+        assert_eq!(totals.sum("logit.component.window.closed", &[]), 1.0, "the poisoned one isn't");
+        assert_eq!(totals.sum("logit.component.retries", &[]), 1.0);
+        assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 3.0);
+    }
+
+    /// The upload fails `Ambiguous` with no `HeadOnly`. Under at-least-once the loop reopens the
+    /// window from the head without observing any batch again; under at-most-once the whole
+    /// window is dropped, each batch as ambiguous as the head.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_upload_reopens_the_window_from_the_head_or_drops_it_whole_under_at_most_once()
+    {
+        for posture in [DeliveryPosture::AtLeastOnce, DeliveryPosture::AtMostOnce] {
+            let (mut output, log) = collecting_output(Duration::from_secs(10), 3);
+            output.upload_faults = [Some(Fault::Ambiguous)].into();
+            let registry = Registry::new();
+            let telemetry = registry.telemetry_for("out", "s3_out", "sink");
+            let store = collecting_memory_store(1024, u64::MAX, OverflowPolicy::Block, &telemetry);
+            for value in 1..=3 {
+                push_value(&store, value).await;
+            }
+            store.close();
+            let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+            let config = collecting_config(posture);
+            run_collecting(&mut output, &store, telemetry, config, shutdown_rx, async {}).await;
+            let totals = Totals::of(registry.drain(0));
+            for value in 1..=3 {
+                assert_eq!(log.count(&Col::Observe(value)), 1, "{posture:?}: observed once");
+            }
+            match posture {
+                DeliveryPosture::AtLeastOnce => {
+                    assert_eq!(log.count(&Col::Close(3)), 2, "reopened whole");
+                    assert_eq!(log.count(&Col::Submit(1)), 2);
+                    assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 3.0);
+                }
+                DeliveryPosture::AtMostOnce => {
+                    assert_eq!(log.count(&Col::Close(3)), 1);
+                    assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 0.0);
+                    assert_eq!(
+                        totals.sum(
+                            "logit.component.batches.dropped",
+                            &[("reason", "ambiguous_at_most_once")]
+                        ),
+                        3.0
+                    );
+                }
+            }
+        }
+    }
+
+    /// Store pressure closes a window that waits for its next batch: a `block` push waiting for
+    /// room in a memory store and in a disk store. Batches 1 and 2 are staged before batch 3 is
+    /// pushed into a store without room for it, and the waiting push completes once the window's
+    /// batches commit. `window_max_bytes` is the memory store's `max_bytes`, as `buffer.max_bytes`
+    /// sets both.
+    ///
+    /// Under `drop_oldest` the memory store accepts batch 3 over its bound, since every batch is
+    /// reserved, and the window takes it like any batch the store holds. The window then closes at
+    /// the memory bound, with the store one batch over its bound and nothing shed.
+    #[tokio::test(start_paused = true)]
+    async fn store_pressure_closes_a_collecting_window_in_each_store() {
+        let one = one_event_batch(1.0).estimated_heap_bytes();
+        let max_bytes = 2 * one + one / 2;
+        for case in ["memory block", "memory drop_oldest", "disk block"] {
+            let (mut output, log) = collecting_output(Duration::from_secs(3600), 100);
+            let registry = Registry::new();
+            let telemetry = registry.telemetry_for("out", "s3_out", "sink");
+            let dir = crate::disk_queue::test_support::scratch_dir("collecting-pressure");
+            let store = match case {
+                "disk block" => Arc::new(SinkStore::Disk(Box::new(
+                    crate::disk_queue::DiskQueue::open(
+                        disk_store_config(&dir, 2 * one_counter_record_len()),
+                        telemetry.clone(),
+                        Diagnostics::new("out"),
+                    )
+                    .unwrap(),
+                ))),
+                "memory block" => {
+                    collecting_memory_store(1024, max_bytes, OverflowPolicy::Block, &telemetry)
+                }
+                _ => {
+                    collecting_memory_store(1024, max_bytes, OverflowPolicy::DropOldest, &telemetry)
+                }
+            };
+            let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+            let producer = async {
+                push_value(&store, 1).await;
+                wait_until("batch 1 staged", || log.has(&Col::Submit(1))).await;
+                push_value(&store, 2).await;
+                wait_until("batch 2 staged", || log.has(&Col::Submit(2))).await;
+                push_value(&store, 3).await;
+                wait_until("batch 3 staged", || log.has(&Col::Submit(3))).await;
+                store.close();
+            };
+            let config = WriteLoopConfig {
+                window_max_bytes: max_bytes,
+                ..collecting_config(DeliveryPosture::AtLeastOnce)
+            };
+            run_collecting(&mut output, &store, telemetry, config, shutdown_rx, producer).await;
+            let closes: Vec<_> =
+                log.calls().into_iter().filter(|c| matches!(c, Col::Close(_))).collect();
+            let totals = Totals::of(registry.drain(0));
+            if case == "memory drop_oldest" {
+                assert_eq!(closes, vec![Col::Close(3)], "{case}");
+                assert_eq!(closed_by(&totals, "memory"), 1.0, "{case}");
+            } else {
+                assert_eq!(closes, vec![Col::Close(2), Col::Close(1)], "{case}");
+                assert_eq!(closed_by(&totals, "pressure"), 1.0, "{case}");
+                assert_eq!(closed_by(&totals, "closed"), 1.0, "{case}");
+            }
+            assert_eq!(totals.sum("logit.component.batches.delivered", &[]), 3.0, "{case}");
+            assert_eq!(totals.sum("logit.component.batches.dropped", &[]), 0.0, "{case}");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// A producer pushes 40 batches back to back into a store with room for four, so a push
+    /// waits or sheds, and the store is at its bound, across every upload. Each window still
+    /// takes every batch the store holds: pressure stops only the wait for new arrivals, since
+    /// closing a window frees one slot and a check before intake would make each window one
+    /// batch.
+    #[tokio::test(start_paused = true)]
+    async fn a_store_held_at_its_bound_still_fills_each_window_with_every_ready_batch() {
+        for case in ["memory block", "memory drop_oldest", "disk block"] {
+            let (mut output, log) = collecting_output(Duration::from_secs(3600), 100);
+            output.upload = Upload::Takes(Duration::from_secs(1));
+            let registry = Registry::new();
+            let telemetry = registry.telemetry_for("out", "s3_out", "sink");
+            let dir = crate::disk_queue::test_support::scratch_dir("collecting-held-at-bound");
+            let store = match case {
+                "disk block" => Arc::new(SinkStore::Disk(Box::new(
+                    crate::disk_queue::DiskQueue::open(
+                        disk_store_config(&dir, 4 * one_counter_record_len()),
+                        telemetry.clone(),
+                        Diagnostics::new("out"),
+                    )
+                    .unwrap(),
+                ))),
+                "memory block" => {
+                    collecting_memory_store(4, u64::MAX, OverflowPolicy::Block, &telemetry)
+                }
+                _ => collecting_memory_store(4, u64::MAX, OverflowPolicy::DropOldest, &telemetry),
+            };
+            let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+            let producer = async {
+                for value in 1..=40 {
+                    push_value(&store, value).await;
+                    tokio::task::yield_now().await;
+                }
+                store.close();
+            };
+            let config = collecting_config(DeliveryPosture::AtLeastOnce);
+            run_collecting(&mut output, &store, telemetry, config, shutdown_rx, producer).await;
+            let closes: Vec<usize> = log
+                .calls()
+                .into_iter()
+                .filter_map(|c| match c {
+                    Col::Close(n) => Some(n),
+                    _ => None,
+                })
+                .collect();
+            let expected = match case {
+                // Everything but the first window and the last batch was evicted during the
+                // upload, never staged.
+                "memory drop_oldest" => vec![4, 1],
+                _ => vec![4; 10],
+            };
+            assert_eq!(closes, expected, "{case}");
+            let totals = Totals::of(registry.drain(0));
+            let delivered = totals.sum("logit.component.batches.delivered", &[]);
+            assert_eq!(delivered, expected.iter().sum::<usize>() as f64, "{case}");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// `send.duration` records one sample per window, the head's close-to-answer time, and the
+    /// `buffer_full` cause names no limit while a window collects and a concurrency of 1 while
+    /// its upload runs. The second window collects after the first's owed answers were read at a
+    /// concurrency of 1, so its `None` shows the open window resets the limit.
+    #[tokio::test(start_paused = true)]
+    async fn send_duration_is_one_sample_per_window_and_the_buffer_full_cause_follows_the_upload() {
+        let (mut output, log) = collecting_output(Duration::from_secs(10), 2);
+        output.upload = Upload::Takes(Duration::from_secs(2));
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("out", "s3_out", "sink");
+        let store = collecting_memory_store(1024, u64::MAX, OverflowPolicy::Block, &telemetry);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let causes = std::sync::Mutex::new(Vec::new());
+        let producer = async {
+            push_value(&store, 1).await;
+            wait_until("batch 1 staged", || log.has(&Col::Submit(1))).await;
+            causes.lock().unwrap().push(store.send_limit().cause());
+            push_value(&store, 2).await;
+            wait_until("the first window closed", || log.has(&Col::Close(2))).await;
+            causes.lock().unwrap().push(store.send_limit().cause());
+            wait_until("batch 2 answered", || log.has(&Col::Ack(2))).await;
+            push_value(&store, 3).await;
+            wait_until("batch 3 staged", || log.has(&Col::Submit(3))).await;
+            causes.lock().unwrap().push(store.send_limit().cause());
+            push_value(&store, 4).await;
+            wait_until("the second window closed", || log.count(&Col::Close(2)) == 2).await;
+            causes.lock().unwrap().push(store.send_limit().cause());
+            wait_until("batch 4 answered", || log.has(&Col::Ack(4))).await;
+            store.close();
+        };
+        let config = collecting_config(DeliveryPosture::AtLeastOnce);
+        run_collecting(&mut output, &store, telemetry, config, shutdown_rx, producer).await;
+        assert_eq!(
+            causes.into_inner().unwrap(),
+            vec![
+                None,
+                Some("; sending at its concurrency of 1, no send answered yet".to_string()),
+                None,
+                Some("; sending at its concurrency of 1, the last send took 2s".to_string()),
+            ]
+        );
+        let totals = Totals::of(registry.drain(0));
+        let samples: Vec<u64> = totals
+            .events
+            .iter()
+            .flat_map(|e| e.metrics.iter())
+            .filter(|m| logit_core::interner::resolve(m.name) == "logit.component.send.duration")
+            .map(|m| match &m.kind {
+                MetricKind::Distribution(sketch) => sketch.count() as u64,
+                other => panic!("send.duration is a distribution, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(samples.iter().sum::<u64>(), 2, "one per window: {samples:?}");
+        assert_eq!(closed_by(&totals, "full"), 2.0);
     }
 
     // -----------------------------------------------------------------------------------------
