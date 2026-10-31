@@ -19,8 +19,14 @@ and a short `P` as CRI-O's conmon writes one:
   dangle, logged to `<root>/criwriter-dangles.jsonl` (`DANGLE_LOG`) outside the pod log tree:
   a `dangle_open` record when its `P` is written and a `dangle_close` when its `F` is, each
   with the wall-clock time `at` in epoch seconds, `lines`, the finished lines so far, and
-  `stream`. The soak ledger places each SUT stop and kill against these windows. A rotation's
-  split line isn't logged: its `P` ends the renamed file, so no record follows it there.
+  `stream`. The soak ledger places each SUT stop and kill against these windows.
+- Each rotation adds a `rotate` record to the same log: `at`, when it began removing and
+  compressing; `file`, the name it renamed the live file to; and the `P` it left held at that
+  file's end, which `cri_in` pins the file's checkpoint at: `held_at`, when that `P` was
+  written, and `held_bytes`, the bytes from it to the file's end. That `P` is the split line's
+  head, or a dangle's head when a dangle is open across the rotation; with neither, `held_at`
+  is null and `held_bytes` 0. The next rotation compresses the file, and a SUT down across it
+  with the pin still in its checkpoint counts those bytes `gone` at its restart.
 - Every `rotate_every_s`, the kubelet's rotation, in its order: remove the oldest rotated files
   past `max_files - 2`, gzip every uncompressed rotated file (to `.gz.tmp`, renamed to `.gz`,
   the original removed), rename the live file to `<n>.log.<YYYYMMDD-HHMMSS>`, then reopen. The
@@ -55,10 +61,11 @@ import time
 PIECE_BYTES = 16 * 1024
 # The kubelet's rotated name suffix, `time.Format("20060102-150405")`.
 ROTATED_FORMAT = "%Y%m%d-%H%M%S"
-# The dangle log's name under `root`: a top-level file, which `cri_in`'s discovery of
+# The dangle log's name under `root`: every `P` the writer leaves held, a stall's and a
+# rotation's, in one file. A top-level file, which `cri_in`'s discovery of
 # `<namespace>_<pod>_<uid>/<container>/` directories never reads.
 DANGLE_LOG = "criwriter-dangles.jsonl"
-DANGLE_OPEN, DANGLE_CLOSE = "dangle_open", "dangle_close"
+DANGLE_OPEN, DANGLE_CLOSE, ROTATE = "dangle_open", "dangle_close", "rotate"
 
 KEYS = {
     "root": str, "namespace": str, "pod": str, "uid": str, "container": str,
@@ -131,6 +138,8 @@ class Writer:
         self.seq = 0
         # The stream whose line is held open as a `P`, and when its `F` is due.
         self.dangling = None
+        # The open dangle's `P`: `(file, offset, written at)`, the file by its name when written.
+        self.dangle_pin = None
         self.started = time.monotonic()
         self.counts = {"delivered": 0, "sent": 0, "batches": 0, "rotations": 0,
                        "removed": 0, "split": 0}
@@ -177,6 +186,8 @@ class Writer:
         name = f"{self.live()}.{time.strftime(ROTATED_FORMAT)}"
         if os.path.exists(name) or os.path.exists(name + ".gz"):
             return  # a second rotation inside one second: the kubelet's next check retries
+        rotate_at = time.time()
+        live = self.live()
         self.flush()
         files = self.rotated()
         keep = self.cfg["max_files"] - 2
@@ -195,11 +206,19 @@ class Writer:
         self.lines_in[name] = self.lines_in.pop(self.live(), 0)
         self.current = name
         split = self.dangling is None
+        held_at, held_bytes = None, 0
         if split:
             # The runtime writes on through the old descriptor until the reopen.
             head = self.next_content()
+            held_at = time.time()
             self.record("stdout", "P", head + b" head")
+            held_bytes = len(self.pending[-1])
             self.flush()
+        elif self.dangle_pin is not None and self.dangle_pin[0] == live:
+            held_at = self.dangle_pin[2]
+            held_bytes = os.fstat(self.fd).st_size - self.dangle_pin[1]
+        self.log_event({"event": ROTATE, "at": rotate_at, "file": os.path.basename(name),
+                        "held_at": held_at, "held_bytes": held_bytes})
         os.close(self.fd)
         self.open_live()
         if split:
@@ -245,13 +264,16 @@ class Writer:
         open's `at` is taken before its `P` is written and a close's after its `F` is, so the
         window holds every instant a reader could see the `P` without its `F`."""
         self.flush()
-        self.dangle_log.write(json.dumps({
-            "event": event, "at": time.time() if at is None else at,
-            "lines": self.counts["delivered"], "stream": "stdout"},
-            separators=(",", ":")) + "\n")
+        self.log_event({"event": event, "at": time.time() if at is None else at,
+                        "lines": self.counts["delivered"], "stream": "stdout"})
+
+    def log_event(self, record):
+        self.dangle_log.write(json.dumps(record, separators=(",", ":")) + "\n")
 
     def start_dangle(self, now):
+        self.flush()
         at = time.time()
+        self.dangle_pin = (self.current, os.fstat(self.fd).st_size, at)
         self.record("stdout", "P", self.next_content() + b" dangling head")
         self.log_dangle(DANGLE_OPEN, at)
         self.dangling = now + self.cfg["dangle_s"]
@@ -262,6 +284,7 @@ class Writer:
             self.log_dangle(DANGLE_CLOSE, None)
             self.counts["split"] += 1
             self.dangling = None
+            self.dangle_pin = None
 
     # ---- telemetry -----------------------------------------------------------------------------
 

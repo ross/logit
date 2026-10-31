@@ -954,7 +954,9 @@ the operator-facing account of all of this.
   restart into `1.log`) and reports in `internal`'s grammar; its source's `wire = "cri"` judges
   `cri_in`'s events sent less its `partial_timeout` flushes against the writer's finished
   lines, the end count reading each `F` record in the tree, and allows a held run's replay only
-  for a stop or kill inside a stall the writer logged, which `cri.dangles` checks happened.
+  for a stop or kill while a logged stall's pin was held (or, for a kill, still persisted),
+  which `cri.dangles` checks happened; `drops` excuses the split head a rotation leaves, counted
+  `gone` when a stop or kill pinned it and the next rotation compressed it.
   `sighup` sends SIGHUPs (a `signal`
   step) to a SUT whose `stdio_out` file target a `rename` step moves aside, and `file.reopen` checks each line landed on its side of the reopen.
   `tls-reload` rotates the SUT's server certificate and the generator's client certificate from

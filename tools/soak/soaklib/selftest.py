@@ -189,8 +189,10 @@ short run of it (the kubelet's names, compression, removal, a restart into `1.lo
 counts against the tree), the loader's rules for the wire and the writer's config, and over
 synthetic runs `ledger.wire` judging W − S + F − G, the end count plus the removed lines held to
 G, the end-to-end bound widened by S, the rotation guard for a stop, the held-pin term from the
-writer's dangle log (a stop or kill inside a dangle allowed its lines up to the cap, one outside
-allowed none, a run with no log given the cap), and `cri.dangles` both ways.
+writer's dangle log (a stop at a held pin, or a kill within checkpoint_interval of its release,
+allowed the dangle's lines up to the cap, any other end none, a run with no log the cap),
+`cri.dangles` both ways, and `drops` excusing a rotation's held head counted gone after a stop or
+kill, and only that.
 
 For `[tls]`, `rotate`, and `probe`, it covers every validation rule (the table's keys, names,
 DNS names, and usages; the keys each step takes; a rotate's certificate read by its service's
@@ -14380,6 +14382,14 @@ def _cri_writer():
                                    and all(n.endswith(".gz") for n in rotated[:-1])),
                    f"{live}'s newest rotated file stays uncompressed and every older one is "
                    f"compressed, as the kubelet leaves them, got {rotated}")
+        rotations = [json.loads(line) for line in
+                     (Path(tmp) / criwriter.DANGLE_LOG).read_text().splitlines()
+                     if json.loads(line)["event"] == criwriter.ROTATE]
+        expect(len(rotations) == total(checks.CRI_ROTATIONS)
+               and all(r["file"].startswith(("0.log.", "1.log.")) for r in rotations)
+               and all((r["held_at"] is None) == (r["held_bytes"] == 0) for r in rotations)
+               and any(r["held_bytes"] > 0 for r in rotations),
+               f"the writer logs each rotation with the P it left held, got {rotations}")
         expect(any(n.endswith(".gz") for n in names)
                and any(p.endswith(".gz") for p in removed_paths),
                f"the run compresses files and a rotation removes a compressed one, got {names}, "
@@ -14634,11 +14644,13 @@ def _dangle_log(run_dir, dangles):
 
 
 def _cri_dangles():
-    """The `cri` wire's pin term from the writer's dangle log: a SUT stop or kill inside a
-    dangle allows that dangle's lines, capped at partial_timeout + poll_interval of lines, one
-    outside every dangle allows none, and `cri.dangles` PASSes when a stop or kill landed
-    inside one and WARNs when none did or the run has no log. Life 0 of the stop fixture ends at
-    +101 at 200 lines/s, so the cap is 1,200 and the stop's split line adds 1."""
+    """The `cri` wire's pin term from the writer's dangle log: a SUT stop while a dangle's pin
+    is held, up to partial_timeout + 2 x poll_interval past its open or one poll past its close,
+    or a kill up to checkpoint_interval later, allows that dangle's lines, capped at
+    partial_timeout + poll_interval of lines; any other end allows none; and `cri.dangles`
+    PASSes when an end landed while a pin was held and WARNs when none did or the run has no
+    log. Life 0 of the stop fixture ends at +101 at 200 lines/s, so the cap is 1,200 and the
+    stop's split line adds 1; at the defaults a pin is held 7 s past its open."""
     with tempfile.TemporaryDirectory() as tmp:
         def run(name, dangles, w_minus_g=0):
             run_dir = _ledger_run(tmp, name, shutdown_drops=0, life0_extra=0, v0_extra=0)
@@ -14665,13 +14677,24 @@ def _cri_dangles():
                f"a dangle's lines are capped at the pin's, got {capped}")
         # The tailer reads a close up to one poll_interval late, so a dangle that closed 0.5 s
         # before the stop's apply still pins; one that closed 1.5 s before doesn't.
-        late = run("dangle-late-close", [(88, 100.5, 300)], w_minus_g=301)["ledger.wire"]
+        late = run("dangle-late-close", [(95, 100.5, 300)], w_minus_g=301)["ledger.wire"]
         expect(late.status == checks.PASS and "[0, 301]" in late.detail,
                f"a dangle closed within a poll of the stop pins, got {late}")
-        early = run("dangle-early-close", [(88, 99.5, 300)], w_minus_g=2)["ledger.wire"]
+        early = run("dangle-early-close", [(95, 99.5, 300)], w_minus_g=2)["ledger.wire"]
         expect(early.status == checks.FAIL and early.detail.startswith(
                    "W − S + F − G 2 is surplus, outside the replay band [0, 1]"),
                f"a dangle closed more than a poll before the stop pins nothing, got {early}")
+        # The idle flush releases a pin 7 s past its open: a dangle open from +92 to +104 no
+        # longer pins at the stop at +101, though its F isn't written yet.
+        flushed = run("dangle-idle-flushed", [(92, 104, 400)], w_minus_g=2)
+        expect(flushed["ledger.wire"].status == checks.FAIL
+               and flushed["ledger.wire"].detail.startswith(
+                   "W − S + F − G 2 is surplus, outside the replay band [0, 1]")
+               and flushed["cri.dangles"].status == checks.WARN
+               and flushed["cri.dangles"].lines == [
+                   "life 0: its stop at +101s landed while no dangle's pin was held"],
+               f"a stop after the idle flush released the pin allows nothing and the row WARNs, "
+               f"got {flushed['ledger.wire']} {flushed['cri.dangles']}")
         unclosed = run("dangle-unclosed", [(95, None, 0)], w_minus_g=1_201)["ledger.wire"]
         expect(unclosed.status == checks.PASS and "[0, 1,201]" in unclosed.detail,
                f"a dangle the log never closes takes the cap, got {unclosed}")
@@ -14689,16 +14712,19 @@ def _cri_dangles():
         row = inside["cri.dangles"]
         expect(row.status == checks.PASS
                and row.detail.startswith("1 of 1 SUT stop(s), kill(s), and restart(s) landed "
-                                         "inside one of the writer's 2 dangle(s)")
-               and row.lines == ["life 0: its stop at +101s landed inside the dangle +95s to "
-                                 "+107s of 400 lines"],
-               f"cri.dangles PASSes a stop inside a dangle, got {row} {row.lines}")
+                                         "while a run's pin was held (or still persisted, for "
+                                         "a kill), of the writer's 2 dangle(s)")
+               and row.lines == ["life 0: its stop at +101s landed while the pin of the dangle "
+                                 "+95s to +107s of 400 lines was held"],
+               f"cri.dangles PASSes a stop while a pin was held, got {row} {row.lines}")
         row = outside["cri.dangles"]
         expect(row.status == checks.WARN
                and row.detail.startswith("0 of 1 SUT stop(s)")
                and "the replay band's pin term went unexercised" in row.detail
-               and row.lines == ["life 0: its stop at +101s landed outside every dangle"],
-               f"cri.dangles WARNs when no stop landed inside a dangle, got {row} {row.lines}")
+               and row.lines == ["life 0: its stop at +101s landed while no dangle's pin was "
+                                 "held"],
+               f"cri.dangles WARNs when no stop landed while a pin was held, got {row} "
+               f"{row.lines}")
         none = run("dangle-no-log", None)
         expect(none["cri.dangles"].status == checks.WARN
                and none["cri.dangles"].detail.startswith("no dangle log (shared/"
@@ -14715,11 +14741,23 @@ def _cri_dangles():
 
         # The kill fixture: life 0 stopped at +101, life 1 killed at +203 with its checkpoint
         # interval's 1,000 lines and two 690-line reads, 2,380, above.
-        def killed(name, w_minus_g):
+        def killed(name, w_minus_g, dangles=((198, 210, 300),)):
             run_dir = _kill_run(tmp, name, every_window=False)
             _as_cri_wire(run_dir, w_minus_g=w_minus_g)
-            _dangle_log(run_dir, [(198, 210, 300)])
+            _dangle_log(run_dir, list(dangles))
             return {r.id: r for r in checks.run_all(run_dir)}
+
+        # A kill writes no final checkpoint, and a released pin stays in the persisted one until
+        # the next interval write: a kill 1.5 s after a dangle's close, past its F's poll and
+        # within checkpoint_interval of the release, still replays the dangle's lines.
+        persisted = killed("dangle-kill-persisted", 2_681, dangles=((195, 201.5, 300),))
+        expect(persisted["ledger.wire"].status == checks.PASS
+               and "against the replay band [-1,000, 2,681]" in persisted["ledger.wire"].detail
+               and persisted["cri.dangles"].status == checks.PASS
+               and "life 1: its kill at +203s landed while the pin of the dangle +195s to "
+               "+202s of 300 lines persisted" in persisted["cri.dangles"].lines,
+               f"a kill within checkpoint_interval of a pin's release gets the dangle's lines, "
+               f"got {persisted['ledger.wire']} {persisted['cri.dangles'].lines}")
 
         kill = killed("dangle-kill", 2_681)
         expect(kill["ledger.wire"].status == checks.PASS
@@ -14732,10 +14770,73 @@ def _cri_dangles():
                "a line past the killed life's dangle and checkpoint FAILs")
         row = kill["cri.dangles"]
         expect(row.status == checks.PASS and row.detail.startswith("1 of 2 SUT stop(s)")
-               and row.lines == ["life 0: its stop at +101s landed outside every dangle",
-                                 "life 1: its kill at +203s landed inside the dangle +198s to "
-                                 "+210s of 300 lines"],
+               and row.lines == ["life 0: its stop at +101s landed while no dangle's pin "
+                                 "was held",
+                                 "life 1: its kill at +203s landed while the pin of the dangle "
+                                 "+198s to +210s of 300 lines persisted"],
                f"cri.dangles reports each life's end, got {row} {row.lines}")
+
+
+def _cri_gone():
+    """`drops` on a `cri` source excuses `bytes.dropped{reason="gone"}` up to the held `P`
+    bytes of each rotation the writer logged that a SUT kill or stop came within
+    partial_timeout + 2 x poll_interval of (plus checkpoint_interval for a kill), when the next
+    rotation fell inside the fault's window; past that, and in a run with no rotation records,
+    it WARNs as before. The kill fixture kills at +203 until +213, and a pin reaches its
+    checkpoint 12 s past its P; the stop runs +101 to +131, and a pin is held 7 s."""
+    with tempfile.TemporaryDirectory() as tmp:
+        def run(name, rotations, gone=62, dangles=()):
+            gone_line = _line(_stamp(T0 + 215), "logit.input.bytes.dropped", "sum", gone,
+                              component="in", attrs={"reason": "gone"})
+            run_dir = _kill_run(tmp, name, every_window=False, sut_extra=[gone_line])
+            _as_cri_wire(run_dir)
+            if rotations is not None:
+                _dangle_log(run_dir, dangles)
+                path = run_dir / scenario.SHARED_DIR / criwriter.DANGLE_LOG
+                with open(path, "a") as log:
+                    for at, held in rotations:
+                        log.write(json.dumps({
+                            "event": criwriter.ROTATE, "at": T0 + at,
+                            "file": f"0.log.r{at}", "held_at": T0 + at,
+                            "held_bytes": held}) + "\n")
+            return {r.id: r for r in checks.run_all(run_dir)}["drops"]
+
+        excused = run("gone-excused", [(195, 62), (210, 62), (255, 62)])
+        expect(excused.status == checks.PASS
+               and "excused: 62 gone byte(s) within the 62 the writer's rotation-held P's "
+               "explain" in excused.detail
+               and "c0s2 kill at +203s: 0.log.r195's held P of 62 bytes, written at +195s, "
+               "its pin in the checkpoint until +207s, and the next rotation at +210s inside "
+               "the window" in excused.lines,
+               f"a kill within the bound of a rotation, with the next inside its window, "
+               f"excuses the held P's bytes, got {excused} {excused.lines}")
+        early = run("gone-early", [(190, 62), (210, 62)])
+        expect(early.status == checks.WARN
+               and 'in: logit.input.bytes.dropped{reason="gone"} 62' in early.detail,
+               f"a rotation past the bound before the kill excuses nothing, got {early}")
+        outside = run("gone-no-rotation-in-window", [(195, 62), (240, 62)])
+        expect(outside.status == checks.WARN,
+               f"no rotation inside the kill's window excuses nothing, got {outside}")
+        excess = run("gone-excess", [(195, 62), (210, 62)], gone=100)
+        expect(excess.status == checks.WARN
+               and "100 gone byte(s) exceed the 62 the writer's rotation-held P's explain"
+               in excess.lines,
+               f"gone bytes past the excuse WARN, got {excess} {excess.lines}")
+        old = run("gone-no-records", [], dangles=[(30, 42, 900)])
+        expect(old.status == checks.WARN and "excused" not in old.detail,
+               f"a log with no rotation records excuses nothing, got {old}")
+        none = run("gone-no-log", None)
+        expect(none.status == checks.WARN, f"a run with no log excuses nothing, got {none}")
+        # The stop's bound is 7 s: a held P at +97 excuses, one at +93 doesn't, though a
+        # kill's 12 s would.
+        stopped = run("gone-stop", [(97, 62), (120, 62)])
+        expect(stopped.status == checks.PASS
+               and "c0s1 stop at +101s: 0.log.r97's held P of 62 bytes, written at +97s, "
+               "its pin in the checkpoint until +104s, and the next rotation at +120s inside "
+               "the window" in stopped.lines,
+               f"a stop within the bound excuses the held P, got {stopped} {stopped.lines}")
+        expect(run("gone-stop-early", [(93, 62), (120, 62)]).status == checks.WARN,
+               "a stop past its bound excuses nothing")
 
 
 def run(root, quiet=False):
@@ -14760,6 +14861,7 @@ def run(root, quiet=False):
                      _http_ledger, _http_rules, _file_ledger, _file_rules,
                      _kafka_wire_ledger, _kafka_wire_rules,
                      _cri_count, _cri_writer, _cri_rules, _cri_ledger, _cri_dangles,
+                     _cri_gone,
                      _file_ops, _file_action_rules, _copytruncate_ledger, _two_sut_rules,
                      _two_sut_driver, _two_sut_checks, _relay_rules, _relay_driver,
                      _relay_checks, _per_service, _slope_edges,

@@ -1595,14 +1595,118 @@ def _dangle_text(data, one):
             f"{_n(one.lines)} lines")
 
 
-def dangles_at(dangles, end, poll):
-    """The dangles a run of the tailer could be held on at `end`, a `LifeEnd`: each opened by
-    the end's finish and closed no earlier than `poll` (the tailer's `poll_interval`) before
-    its start, since the tailer reads the closing `F` up to one poll after the writer wrote it.
-    The writer and the fault driver both read the host's wall clock (a container shares the
-    host kernel's), so the two sides compare with no offset."""
+@dataclass(frozen=True)
+class Rotation:
+    """One `rotate` record of criwriter.py's dangle log: `at`, when the rotation began
+    removing and compressing, and the `P` it left held at the renamed file's end, written at
+    `held_at` (None when it left none) and `held_bytes` long to the file's end."""
+
+    at: float
+    file: str
+    held_at: object
+    held_bytes: int
+
+
+def cri_rotations(data):
+    """The writer's rotations from the run's dangle log, oldest first; empty when the run has no
+    log or the log has no `rotate` record. A record that doesn't parse is skipped."""
+    try:
+        text = (data.run_dir / SHARED_DIR / criwriter.DANGLE_LOG).read_text()
+    except OSError:
+        return []
+    rotations = []
+    for line in text.splitlines():
+        try:
+            record = json.loads(line)
+            if record.get("event") != criwriter.ROTATE:
+                continue
+            held_at = record.get("held_at")
+            rotations.append(Rotation(float(record["at"]), str(record.get("file")),
+                                      None if held_at is None else float(held_at),
+                                      int(record.get("held_bytes") or 0)))
+        except (ValueError, TypeError, KeyError, AttributeError):
+            continue
+    return sorted(rotations, key=lambda one: one.at)
+
+
+# The SUT actions that can leave a rotated file's held `P` pinned in the checkpoint: a SIGKILL
+# keeps the last interval checkpoint, and a clean stop under a checkpoint writes the held run's
+# start as its final one (ADR `cri-container-logs`, "Clean stop").
+GONE_PIN_ACTIONS = ("kill", "stop", "restart")
+
+
+def cri_gone_excuse(led, listeners):
+    """`(bytes, lines)`: the `logit.input.bytes.dropped{reason="gone"}` the `cri` listeners
+    `listeners` may count from the writer's rotations, with one line per SUT stop, restart, or
+    kill that earns any. A rotation leaves a `P` held at the renamed file's end, which no
+    `F` follows, so `cri_in` pins that file's checkpoint at it until the idle flush
+    (`held_until`); the next rotation compresses the file. So a fault whose start falls before
+    the pin's release, or for a kill before its last persisted copy, and whose window holds the
+    next rotation, finds the pinned file gone at the restart and counts the held bytes. The
+    writer and the fault driver read the same host clock. A run whose log has no `rotate`
+    record earns nothing."""
+    rotations = cri_rotations(led.data)
+    if not rotations or not listeners:
+        return 0, []
+    hold = led.cri_hold(listeners)
+    total, lines = 0, []
+    for fault in led.data.faults:
+        if fault.on != led.inn.service or fault.action not in GONE_PIN_ACTIONS:
+            continue
+        for index, one in enumerate(rotations):
+            following = rotations[index + 1] if index + 1 < len(rotations) else None
+            if (one.at > fault.start or one.held_at is None or not one.held_bytes
+                    or held_until(one.held_at, None, hold, fault.action) < fault.start
+                    or following is None or not fault.start < following.at <= fault.end):
+                continue
+            total += one.held_bytes
+            lines.append(f"{fault.step} {fault.action} at {led.data.offset(fault.start)}: "
+                         f"{one.file}'s held P of {_n(one.held_bytes)} bytes, written at "
+                         f"{led.data.offset(one.held_at)}, its pin in the checkpoint until "
+                         f"{led.data.offset(held_until(one.held_at, None, hold, fault.action))}"
+                         f", and the next rotation at {led.data.offset(following.at)} inside "
+                         "the window")
+    return total, lines
+
+
+@dataclass(frozen=True)
+class CriHold:
+    """The `cri_in` timings that bound a held run's pin, in seconds, each the longest over the
+    listeners and at its default where the config names none: `cap`, `partial_timeout` +
+    `poll_interval`, the time a pin's other-stream lines accrue over; `poll`, `poll_interval`;
+    `release`, `partial_timeout` + 2 × `poll_interval`, the latest a pin lasts past its `P`'s
+    write; and `checkpoint`, `checkpoint_interval`."""
+
+    cap: float
+    poll: float
+    release: float
+    checkpoint: float
+
+
+def held_until(opened, closed, hold, action):
+    """When a pin from a `P` written at `opened` stops reaching the checkpoint a restart after
+    an `action` resumes from, on the host clock.
+
+    The tailer reads the `P` up to one poll after it was written, and its idle flush releases
+    the pin `partial_timeout` after that, checked once a poll: `release` past `opened`. A
+    closing `F` written at `closed` releases it sooner, read up to one poll later. A stop or a
+    restart writes a final checkpoint, so its restart sees the pin only while it's held. A
+    SIGKILL writes none: a release only marks the checkpoint dirty, and the next interval
+    write, up to `checkpoint_interval` later, is the first without the pin, so a kill sees it
+    that much longer."""
+    until = opened + hold.release
+    if closed is not None:
+        until = min(until, closed + hold.poll)
+    return until + (hold.checkpoint if action == "kill" else 0.0)
+
+
+def dangles_at(dangles, end, hold):
+    """The dangles whose pin a restart after `end`, a `LifeEnd`, can resume from: each opened by
+    the end's finish and held, or for a kill persisted, at its start (`held_until`). The
+    writer and the fault driver both read the host's wall clock (a container shares the host
+    kernel's), so the two sides compare with no offset."""
     return [one for one in dangles if one.opened <= end.finish
-            and (one.closed is None or one.closed + poll >= end.start)]
+            and held_until(one.opened, one.closed, hold, end.action) >= end.start]
 # A file wire's tailer reads at most this much of one file per read, so a kill can replay up to
 # one read's lines per file past its last checkpoint (docs/known-gaps/tailing.md, "The tail
 # driver notices shutdown only between two files' reads").
@@ -2680,8 +2784,9 @@ class Ledger:
         A `cri_in` listener keeps one checkpoint position per file, pinned at a held `P` run's
         first record while it waits for its `F` or for `partial_timeout`, and the other
         stream's lines after the pin have already been sent. A stop or a kill while a run is
-        held replays them, so on a `cri` wire a stopped or killed life whose end landed inside
-        one of the writer's dangles (`dangles_at`) adds that dangle's lines above, capped at
+        held replays them, so on a `cri` wire a stopped or killed life whose end landed while
+        one of the writer's dangles held its pin, or for a kill while the persisted checkpoint
+        still carried it (`dangles_at`), adds that dangle's lines above, capped at
         `partial_timeout` + `poll_interval` of lines at its rate over its last drain interval,
         or its one drain's W when it has no interval (`CRI_PIN_DEFAULTS_S`). An end inside two
         dangles adds both, each capped: the writer holds one line open at a time, so two can
@@ -2691,7 +2796,8 @@ class Ledger:
         inn = self.inn
         text = self._sut_config_text(inn.service)
         cri = [listener for listener in listeners if self.wires[listener] is WIRES[CRI_WIRE]]
-        pin, poll = self.cri_pin(cri)
+        hold = self.cri_hold(cri)
+        pin = hold.cap
         dangles = cri_dangles(self.data) if cri else None
         counted = self.data.phases.get("shared_counted") or {}
         line_bytes = (counted.get("bytes", 0) / counted["lines"]
@@ -2723,7 +2829,7 @@ class Ledger:
                         lines.append(f"life {life}: no stop, kill, or restart ended it, so "
                                      "its end isn't placed against the writer's dangles")
                 else:
-                    hits = dangles_at(dangles, end, poll)
+                    hits = dangles_at(dangles, end, hold)
                     held = sum(cap if one.lines is None else min(cap, one.lines)
                                for one in hits)
                     at = f"its {end.action} at {self.data.offset(end.start)}"
@@ -2777,18 +2883,22 @@ class Ledger:
         one_low, one_high, one_lines = self.copytruncate_band(listeners, counted)
         return low + one_low, high + one_high, lines + one_lines
 
-    def cri_pin(self, listeners):
-        """`(pin, poll)` over the `cri_in` `listeners`: the longest `partial_timeout` +
-        `poll_interval`, and the longest `poll_interval`, in seconds, each at its default
-        (`CRI_PIN_DEFAULTS_S`) where the config names none; `(0, 0)` with no listener."""
+    def cri_hold(self, listeners):
+        """The `CriHold` over the `cri_in` `listeners`, each timing at its default
+        (`CRI_PIN_DEFAULTS_S`, `DEFAULT_TAIL_CHECKPOINT_INTERVAL_S`) where the config names
+        none; all 0 with no listener."""
         if not listeners:
-            return 0.0, 0.0
+            return CriHold(0.0, 0.0, 0.0, 0.0)
         text = self._sut_config_text(self.inn.service)
-        polls = [component_duration(text, listener, "poll_interval") or CRI_PIN_DEFAULTS_S[1]
-                 for listener in listeners]
-        pin = max((component_duration(text, listener, "partial_timeout")
-                   or CRI_PIN_DEFAULTS_S[0]) + one for listener, one in zip(listeners, polls))
-        return pin, max(polls)
+
+        def longest(key, default):
+            return max(component_duration(text, listener, key) or default
+                       for listener in listeners)
+
+        timeout = longest("partial_timeout", CRI_PIN_DEFAULTS_S[0])
+        poll = longest("poll_interval", CRI_PIN_DEFAULTS_S[1])
+        return CriHold(timeout + poll, poll, timeout + 2 * poll,
+                       longest("checkpoint_interval", DEFAULT_TAIL_CHECKPOINT_INTERVAL_S))
 
     def deferred(self, life, listeners=None):
         """The most records the batches the Kafka wire's listeners (or `listeners`) deferred in
@@ -7162,11 +7272,12 @@ def _reopen_count(data, service, path, names, files):
 
 
 def check_cri_dangles(data):
-    """`cri.dangles`: whether a stop, kill, or restart of the ingress SUT landed inside one of
-    the `cri` writer's dangles (`dangles_at`), the case the replay band's pin term covers, with
-    one line per SUT life saying where its end landed. PASS when at least one did. Like
-    `recovery` with no fault to judge, the row WARNs when none did, since the run then never
-    exercised a held pin, and when the run has no dangle log. SKIPs with no `cri` source."""
+    """`cri.dangles`: whether a stop, kill, or restart of the ingress SUT landed while one of
+    the `cri` writer's dangles held its pin, or for a kill while the persisted checkpoint still
+    carried it (`dangles_at`), the case the replay band's pin term covers, with one line per SUT
+    life saying where its end landed. PASS when at least one did. Like `recovery` with no fault
+    to judge, the row WARNs when none did, since the run then never exercised a held pin, and
+    when the run has no dangle log. SKIPs with no `cri` source."""
     led = _ledger(data)
     cri = [source.get("sut_listener") for source in led.sources
            if source_wire(source) == CRI_WIRE]
@@ -7180,24 +7291,26 @@ def check_cri_dangles(data):
         return Result("cri.dangles", WARN, f"no dangle log ({SHARED_DIR}/"
                       f"{criwriter.DANGLE_LOG}): no SUT stop or kill was placed against a "
                       "held run, and the replay band gave every one the pin's cap")
-    _, poll = led.cri_pin(cri)
+    hold = led.cri_hold(cri)
     inn = led.inn
     ends = [(life, inn.ended[life]) for life in inn.lives
             if life != inn.final and life in inn.ended]
     lines, landed = [], 0
     for life, end in ends:
-        hits = dangles_at(dangles, end, poll)
+        hits = dangles_at(dangles, end, hold)
         landed += bool(hits)
-        where = ("inside " + ", ".join(_dangle_text(data, one) for one in hits) if hits
-                 else "outside every dangle")
+        where = ("while the pin of " + ", ".join(_dangle_text(data, one) for one in hits)
+                 + (" persisted" if end.action == "kill" else " was held") if hits
+                 else "while no dangle's pin was held")
         lines.append(f"life {life}: its {end.action} at {data.offset(end.start)} landed "
                      f"{where}")
-    detail = (f"{landed} of {len(ends)} SUT stop(s), kill(s), and restart(s) landed inside one "
-              f"of the writer's {len(dangles)} dangle(s), a closing F read up to "
-              f"{poll:g}s of poll_interval late")
+    detail = (f"{landed} of {len(ends)} SUT stop(s), kill(s), and restart(s) landed while a "
+              f"run's pin was held (or still persisted, for a kill), of the writer's "
+              f"{len(dangles)} dangle(s): a pin held up to {hold.release:g}s past its P, or "
+              f"one poll past its F, and persisted {hold.checkpoint:g}s more after a kill")
     if not landed:
-        return Result("cri.dangles", WARN, detail + ": no run held a pin at a SUT end, so the "
-                      "replay band's pin term went unexercised", lines)
+        return Result("cri.dangles", WARN, detail + ": no SUT end landed while a run's pin "
+                      "was held, so the replay band's pin term went unexercised", lines)
     return Result("cri.dangles", PASS, detail, lines)
 
 
@@ -7613,8 +7726,9 @@ def _balanced_drop(led, service, name, component, reason, batch_drops):
 def check_drops(data):
     """Every `logit.*.dropped` counter a SUT service emitted that no other row judges: loss by
     the name alone (ADR `telemetry-loss-vocabulary`). A `FAULT_DROP_REASONS` reason FAILs, any
-    other WARNs. Terms the ledger and the sink rows balance stay with them. With several SUT
-    services each line names its service."""
+    other WARNs. Terms the ledger and the sink rows balance stay with them. On a `cri` source,
+    `bytes.dropped{reason="gone"}` within what the writer's rotations explain is excused and
+    listed (`_excuse_cri_gone`). With several SUT services each line names its service."""
     if _overlapped(data):
         return _per_instance(data, check_drops)
     led = _ledger(data)
@@ -7639,8 +7753,10 @@ def check_drops(data):
                     continue
                 key = (name, service, component, reason)
                 totals[key] = totals.get(key, 0) + point.value
+    excused = _excuse_cri_gone(led, totals)
     if not totals:
-        return Result("drops", PASS, "no *.dropped count outside the ledger and the sink rows")
+        return Result("drops", PASS, "no *.dropped count outside the ledger and the sink rows"
+                      + (f"; {excused[0]}" if excused else ""), excused)
     status = PASS
     lines = []
     for (name, service, component, reason), value in sorted(totals.items()):
@@ -7649,7 +7765,33 @@ def check_drops(data):
         label = f"{service} " if len(led.views) > 1 else ""
         lines.append(f"{label}{component}: {name}{{reason=\"{reason}\"}} {_n(value)}")
     return Result("drops", status, f"{len(lines)} *.dropped count(s) outside the ledger: "
-                  + "; ".join(lines), lines)
+                  + "; ".join(lines + excused[:1]), lines + excused)
+
+
+def _excuse_cri_gone(led, totals):
+    """Removes the `cri` listeners' `logit.input.bytes.dropped{reason="gone"}` from `totals`
+    when their sum is within what the writer's rotations explain (`cri_gone_excuse`), and
+    returns the lines saying so; a sum past it stays in `totals` and the lines say what was
+    excused. Empty when the run has nothing to excuse."""
+    cri = [source.get("sut_listener") for source in led.sources
+           if source_wire(source) == CRI_WIRE]
+    keys = [key for key in totals if key[0] == "logit.input.bytes.dropped"
+            and key[1] == led.inn.service and key[2] in cri and key[3] == "gone"]
+    if not keys:
+        return []
+    allowed, why = cri_gone_excuse(led, cri)
+    if not allowed:
+        return []
+    counted = sum(totals[key] for key in keys)
+    if counted <= allowed:
+        for key in keys:
+            del totals[key]
+        head = (f"excused: {_n(counted)} gone byte(s) within the {_n(allowed)} the writer's "
+                "rotation-held P's explain")
+    else:
+        head = (f"{_n(counted)} gone byte(s) exceed the {_n(allowed)} the writer's "
+                "rotation-held P's explain")
+    return [head] + why
 
 
 def check_ledger_absent(data):

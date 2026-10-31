@@ -861,11 +861,14 @@ arrives, which the writer guarantees by finishing every line before it exits; a 
 mid-line, whose head never gets its rest, is left out of the writer for that reason. `cri_in` pins a
 file's checkpoint at a held run's first record, after which it has sent the other stream's lines, so
 a stop or a kill while a run is held replays them. The writer logs each window it holds a line
-open, and on a `cri` wire a stopped or killed life whose end landed inside one widens the band above
-by the lines it finished in that window, capped at its rate times `partial_timeout` plus
-`poll_interval`; an end in no window widens it by nothing. A `cri.dangles` row reports whether any
-end landed inside a window, and WARNs when none did, since the run then never held a pin at a
-fault. The end count reads
+open, and on a `cri` wire a stopped or killed life whose end landed while that line's pin was held,
+until the idle flush or the `F`, or for a kill while the last interval checkpoint still carried it,
+widens the band above by the lines it finished in that window, capped at its rate times
+`partial_timeout` plus `poll_interval`; any other end widens it by nothing. A `cri.dangles` row
+reports whether any end landed at a held pin, and WARNs when none did, since the run then never
+exercised one. The writer also logs each rotation's held `P`, and `drops` excuses the
+`bytes.dropped{reason="gone"}` a stop or kill shortly after a rotation counts when the next rotation
+compresses the pinned file while the SUT is down. The end count reads
 the tree's `F` records, gzip files decompressed, and that count plus the lines the writer's
 rotations removed, which it reports, must equal G. `cri_in` never reads a `.gz`, so a SUT down
 across two rotations, or paused across three, loses a file's unread tail, and the row FAILs such a
