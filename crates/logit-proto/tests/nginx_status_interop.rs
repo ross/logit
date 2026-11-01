@@ -41,7 +41,7 @@ fn every_recorded_page_maps_onto_the_adrs_table() {
         let body = std::fs::read(&path).unwrap();
         let headers = std::fs::read_to_string(path.with_extension("headers")).unwrap();
         assert!(
-            headers.lines().any(|l| l.eq_ignore_ascii_case("content-type: text/plain\r")),
+            headers.lines().any(|l| l.eq_ignore_ascii_case("content-type: text/plain")),
             "{name}: {headers}"
         );
 
