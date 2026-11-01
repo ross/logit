@@ -2,9 +2,10 @@
 //!
 //! [`build_server_config`] builds the `rustls::ServerConfig` every TLS-terminating listener uses,
 //! and [`build_client_config`] the `rustls::ClientConfig` every TLS client uses: each sink, and
-//! the scrape driver's client (`prometheus_in`, `nginx_stub_status_in`). Each registers the files
-//! it read with a [`TlsReloader`]. A config is built once around swappable pieces,
-//! [`ReloadingCert`], [`ReloadingClientVerifier`], and [`ReloadingServerVerifier`], so a reload
+//! the scrape driver's client (`prometheus_in`, `nginx_stub_status_in`, `apache_status_in`). Each
+//! registers the files it read with a [`TlsReloader`]. A config is built once around swappable
+//! pieces, [`ReloadingCert`], [`ReloadingClientVerifier`], and [`ReloadingServerVerifier`], so a
+//! reload
 //! reaches the next full handshake with no rebuilt config or client, and an open connection keeps the certificate it handshook with.
 //! [`AsyncStream`], [`PendingClose`], and [`poll_pending_close`] are the stream pieces every raw
 //! TCP client shares, TLS or not: the sinks and `logit-kafka`'s broker connection.

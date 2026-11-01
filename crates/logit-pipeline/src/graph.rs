@@ -478,6 +478,7 @@ pub fn role(kind: &ComponentKind) -> Role {
         | Internal { .. }
         | PrometheusIn { .. }
         | NginxStubStatusIn { .. }
+        | ApacheStatusIn { .. }
         | GenerateIn { .. }
         | ReplayIn { .. }
         | KafkaIn { .. } => Role::Listener,
@@ -560,6 +561,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         Internal { .. } => "internal",
         PrometheusIn { .. } => "prometheus_in",
         NginxStubStatusIn { .. } => "nginx_stub_status_in",
+        ApacheStatusIn { .. } => "apache_status_in",
         GenerateIn { .. } => "generate_in",
         ReplayIn { .. } => "replay_in",
         KafkaIn { .. } => "kafka_in",
@@ -696,6 +698,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::Internal { .. }
             | ComponentKind::PrometheusIn { .. }
             | ComponentKind::NginxStubStatusIn { .. }
+            | ComponentKind::ApacheStatusIn { .. }
             | ComponentKind::Lua { .. }
             | ComponentKind::LuaFile { .. }
             | ComponentKind::Aggregate { .. }
@@ -765,7 +768,8 @@ fn interval(kind: &ComponentKind) -> Option<Duration> {
         | ComponentKind::Internal { interval, .. }
         | ComponentKind::Shape { interval, .. }
         | ComponentKind::PrometheusIn { interval, .. }
-        | ComponentKind::NginxStubStatusIn { interval, .. } => Some(*interval),
+        | ComponentKind::NginxStubStatusIn { interval, .. }
+        | ComponentKind::ApacheStatusIn { interval, .. } => Some(*interval),
         _ => None,
     }
 }
@@ -2267,6 +2271,9 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 headers,
                 scrape_tls,
                 ..
+            }
+            | ComponentKind::ApacheStatusIn {
+                scrape_targets, timeout, headers, scrape_tls, ..
             } => {
                 if scrape_targets.is_empty() {
                     continue;
@@ -5970,6 +5977,17 @@ mod tests {
     /// An `nginx_stub_status_in` with every field but its targets at its default.
     fn nginx_stub_status_in(targets: Vec<&str>) -> ComponentKind {
         ComponentKind::NginxStubStatusIn {
+            scrape_targets: targets.into_iter().map(String::from).collect(),
+            interval: default_prometheus_scrape_interval(),
+            timeout: default_prometheus_scrape_timeout(),
+            headers: Map::new(),
+            scrape_tls: logit_config::TlsClientConfig::default(),
+        }
+    }
+
+    /// An `apache_status_in` with every field but its targets at its default.
+    fn apache_status_in(targets: Vec<&str>) -> ComponentKind {
+        ComponentKind::ApacheStatusIn {
             scrape_targets: targets.into_iter().map(String::from).collect(),
             interval: default_prometheus_scrape_interval(),
             timeout: default_prometheus_scrape_timeout(),
@@ -14055,6 +14073,67 @@ mod tests {
     fn an_nginx_stub_status_in_with_zero_interval_is_rejected_by_rule_9() {
         let mut kind = nginx_stub_status_in(vec!["http://h/nginx_status"]);
         if let ComponentKind::NginxStubStatusIn { interval, .. } = &mut kind {
+            *interval = Duration::ZERO;
+        }
+        let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+        assert!(err.contains("interval"), "got: {err}");
+    }
+
+    /// Rule 40's shared checks reach `apache_status_in`, one case per check.
+    #[test]
+    fn apache_status_in_runs_the_shared_scrape_checks() {
+        let resolves = |kind| resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+        resolves(apache_status_in(vec!["http://127.0.0.1:8080/server-status?auto"]))
+            .expect("a plain target resolves");
+
+        let rejected = |kind, needle: &str| {
+            let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+            assert!(err.contains(needle), "expected {needle:?}, got: {err}");
+        };
+        rejected(apache_status_in(vec!["127.0.0.1:8080/server-status?auto"]), "isn't an absolute");
+
+        let mut kind = apache_status_in(vec!["http://h/server-status?auto"]);
+        if let ComponentKind::ApacheStatusIn { timeout, .. } = &mut kind {
+            *timeout = Duration::ZERO;
+        }
+        rejected(kind, "'timeout: 0s'");
+
+        let mut kind = apache_status_in(vec!["http://h/server-status?auto"]);
+        if let ComponentKind::ApacheStatusIn { scrape_tls, .. } = &mut kind {
+            scrape_tls.insecure_skip_verify = true;
+        }
+        rejected(kind, "no 'scrape_targets' entry is 'https://'");
+
+        for name in ["Accept", "accept-encoding", "User-Agent", ":path"] {
+            let mut kind = apache_status_in(vec!["http://h/server-status?auto"]);
+            if let ComponentKind::ApacheStatusIn { headers, .. } = &mut kind {
+                headers.insert(name.to_string(), "x".to_string());
+            }
+            rejected(kind, name);
+        }
+    }
+
+    /// `status_handler` finds `auto` anywhere in the query string, and a proxy may add it, so no
+    /// rule checks a target for it.
+    #[test]
+    fn an_apache_status_in_target_without_auto_validates() {
+        resolve(cfg(vec![
+            ("in", vec![], apache_status_in(vec!["http://h/server-status"])),
+            ("out", vec!["in"], sink()),
+        ]))
+        .expect("a target without ?auto is a runtime parse_error, not a config error");
+    }
+
+    #[test]
+    fn an_apache_status_in_with_no_scrape_targets_validates() {
+        resolve(cfg(vec![("in", vec![], apache_status_in(vec![])), ("out", vec!["in"], sink())]))
+            .expect("no targets is pointless, not broken");
+    }
+
+    #[test]
+    fn an_apache_status_in_with_zero_interval_is_rejected_by_rule_9() {
+        let mut kind = apache_status_in(vec!["http://h/server-status?auto"]);
+        if let ComponentKind::ApacheStatusIn { interval, .. } = &mut kind {
             *interval = Duration::ZERO;
         }
         let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));

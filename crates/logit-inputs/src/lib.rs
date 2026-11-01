@@ -13,6 +13,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
+pub mod apache_status;
 pub mod collectd;
 pub mod cri;
 pub mod datadog;

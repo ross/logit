@@ -4923,6 +4923,46 @@ pub enum ComponentKind {
         #[serde(default)]
         scrape_tls: TlsClientConfig,
     },
+    /// Apache httpd's `mod_status` page in its `?auto` form, scraped on `interval` from each
+    /// target, as the OpenTelemetry Collector's `apachereceiver` metrics under their new-format
+    /// names: `apache.uptime`, `apache.request.count`, `apache.traffic`, and
+    /// `apache.request.time` as cumulative counters, and the load, CPU, worker, connection, and
+    /// scoreboard counts as gauges. Which of them a page carries depends on the MPM and on
+    /// `ExtendedStatus`. Each target's events carry `server.address`, `server.port`, and
+    /// `url.path` on their resource, and each scrape adds `up`, `scrape_duration_seconds`, and
+    /// `scrape_samples_scraped`, as `prometheus_in`'s scrape mode does. A body with none of the
+    /// page's keys is a failed scrape: no decoded events, and the three synthetics with `up` at
+    /// `0`.
+    ///
+    /// The page discloses the server's version and connection counts, and Apache counts this
+    /// input's own requests. Serve it on an internal address only.
+    ApacheStatusIn {
+        /// Absolute `http://` or `https://` URLs of `mod_status` pages, each with `auto` in its
+        /// query string, such as `http://127.0.0.1:8080/server-status?auto`; without it Apache
+        /// serves its HTML page and every scrape fails. Defaults to none, and with none the input
+        /// scrapes nothing.
+        #[serde(default)]
+        scrape_targets: Vec<String>,
+        /// Scrape cadence. Defaults to `15s`; `0s` is rejected.
+        #[serde(default = "default_prometheus_scrape_interval", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        interval: Duration,
+        /// Per-request timeout. Defaults to `10s`; `0s` is rejected.
+        #[serde(default = "default_prometheus_scrape_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        timeout: Duration,
+        /// Extra headers sent on every scrape request. A name this input reserves (`accept`,
+        /// `accept-encoding`, `user-agent`, `content-type`, `content-length`, `content-encoding`,
+        /// `host`, `te`, `transfer-encoding`, `connection`, or an HTTP/2 pseudo-header starting
+        /// with `:`) is rejected, as are two keys naming the same header once case is ignored.
+        #[serde(default)]
+        headers: HashMap<String, String>,
+        /// Client-side TLS tuning for `https://` targets. A non-default block with no
+        /// `https://` target is rejected. Named `scrape_tls`, as on `prometheus_in`, so a block
+        /// copied between the two works.
+        #[serde(default)]
+        scrape_tls: TlsClientConfig,
+    },
     /// A synthetic event source for load testing. No socket and no decoder: it renders a
     /// declarative `event:` template as fast as `count`/`rate` allow, so a scenario measures the
     /// runtime and the components under test rather than a generator process and a kernel
@@ -11465,6 +11505,49 @@ mod tests {
 
         let err = serde_json::from_str::<Component>(
             r#"{"type": "nginx_stub_status_in", "scrape_targets": ["http://h/s"],
+                "bind": "127.0.0.1:0"}"#,
+        )
+        .expect_err("bind is prometheus_in's");
+        assert!(err.to_string().contains("bind"), "got: {err}");
+    }
+
+    #[test]
+    fn apache_status_in_takes_prometheus_ins_scrape_defaults() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "apache_status_in",
+                "scrape_targets": ["http://127.0.0.1:8080/server-status?auto"]}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::ApacheStatusIn {
+                scrape_targets,
+                interval,
+                timeout,
+                headers,
+                scrape_tls,
+            } => {
+                assert_eq!(scrape_targets, ["http://127.0.0.1:8080/server-status?auto"]);
+                assert_eq!(interval, default_prometheus_scrape_interval());
+                assert_eq!(timeout, default_prometheus_scrape_timeout());
+                assert!(headers.is_empty());
+                assert!(scrape_tls.is_empty());
+            }
+            other => panic!("expected ApacheStatusIn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apache_status_in_defaults_scrape_targets_and_rejects_a_prometheus_in_only_key() {
+        let component: Component = serde_json::from_str(r#"{"type": "apache_status_in"}"#).unwrap();
+        match component.kind {
+            ComponentKind::ApacheStatusIn { scrape_targets, .. } => {
+                assert!(scrape_targets.is_empty())
+            }
+            other => panic!("wrong kind: {other:?}"),
+        }
+
+        let err = serde_json::from_str::<Component>(
+            r#"{"type": "apache_status_in", "scrape_targets": ["http://h/s?auto"],
                 "bind": "127.0.0.1:0"}"#,
         )
         .expect_err("bind is prometheus_in's");

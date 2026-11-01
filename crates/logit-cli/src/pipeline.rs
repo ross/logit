@@ -18,6 +18,7 @@ use crate::signals::Signals;
 use anyhow::Context;
 use logit_config::{BufferConfig, Config, StdioTarget};
 use logit_core::{Diagnostics, Registry, Telemetry};
+use logit_inputs::apache_status;
 use logit_inputs::collectd::CollectdInput;
 use logit_inputs::cri::CriInput;
 use logit_inputs::datadog::DatadogInput;
@@ -890,6 +891,15 @@ pub(crate) fn build_spec(
         }
         NginxStubStatusIn { scrape_targets, interval, timeout, headers, scrape_tls } => {
             let input = nginx_status::input(scrape_targets.clone(), *interval)
+                .with_timeout(*timeout)
+                .with_headers(headers)?
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone())
+                .with_tls(&to_tls_client_settings(scrape_tls), base_dir, tls_reloader)?;
+            NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
+        }
+        ApacheStatusIn { scrape_targets, interval, timeout, headers, scrape_tls } => {
+            let input = apache_status::input(scrape_targets.clone(), *interval)
                 .with_timeout(*timeout)
                 .with_headers(headers)?
                 .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
@@ -4077,6 +4087,28 @@ mod tests {
             consumers: vec!["out".to_string()],
             kind: ComponentKind::NginxStubStatusIn {
                 scrape_targets: vec!["http://127.0.0.1:0/nginx_status".to_string()],
+                interval: Duration::from_secs(15),
+                timeout: Duration::from_secs(10),
+                headers: HashMap::new(),
+                scrape_tls: logit_config::TlsClientConfig::default(),
+            },
+        };
+        assert!(matches!(
+            build_spec("in", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Input(..)
+        ));
+    }
+
+    #[test]
+    fn build_spec_builds_an_apache_status_input() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec![],
+            targets: Vec::new(),
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::ApacheStatusIn {
+                scrape_targets: vec!["http://127.0.0.1:0/server-status?auto".to_string()],
                 interval: Duration::from_secs(15),
                 timeout: Duration::from_secs(10),
                 headers: HashMap::new(),
