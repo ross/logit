@@ -127,7 +127,8 @@
 //!     (`docs/adr/aggregation-window-semantics.md`).
 //! 40. A scrape-mode `prometheus_in` with a target that isn't an absolute `http(s)://` URL
 //!     (`is_absolute_http_url`), `timeout: 0s`, a `scrape_tls:` failing 24's checks or with no
-//!     `https://` target, or 22's header faults against `RESERVED_PROMETHEUS_HEADERS`.
+//!     `https://` target, or 22's header faults against `RESERVED_SCRAPE_HEADERS`
+//!     (`check_scrape_settings`, which every scrape kind shares).
 //! 41. A registry-mode `prometheus_out` `path` not starting with `/` (every scrape would 404) or
 //!     `max_series: 0` (every series evicted on arrival)
 //!     (`docs/adr/prometheus-scrape-and-exposition.md`).
@@ -874,12 +875,14 @@ const RESERVED_OTLP_HEADERS: &[&str] = &[
     "connection",
 ];
 
-/// Header names `prometheus_in`'s scrape client sets itself (rule 40): `Accept` (dialect
-/// negotiation) and `User-Agent` (`crates/logit-inputs/src/prometheus.rs`'s `scrape_target`), plus
-/// [`RESERVED_OTLP_HEADERS`]'s connection-management names. A scrape sends no body, so
+/// Header names the scrape driver sets itself or decides on its own (rule 40): `Accept` (the
+/// decoder's) and `User-Agent` (`crates/logit-inputs/src/scrape.rs`'s `scrape_target`), and
+/// `Accept-Encoding`, so that only the driver chooses which content encodings a target may answer
+/// in, plus [`RESERVED_OTLP_HEADERS`]'s connection-management names. A scrape sends no body, so
 /// `content-type`/`content-encoding` are listed only to keep the two lists parallel.
-const RESERVED_PROMETHEUS_HEADERS: &[&str] = &[
+const RESERVED_SCRAPE_HEADERS: &[&str] = &[
     "accept",
+    "accept-encoding",
     "user-agent",
     "content-type",
     "content-length",
@@ -889,6 +892,82 @@ const RESERVED_PROMETHEUS_HEADERS: &[&str] = &[
     "transfer-encoding",
     "connection",
 ];
+
+/// Rule 40's checks on the settings every scrape kind shares (`crates/logit-inputs/src/scrape.rs`):
+/// each target an absolute `http(s)://` URL, a positive `timeout`, rule 24's `scrape_tls:`
+/// checks plus a set block with no `https://` target, and rule 22's header checks against
+/// [`RESERVED_SCRAPE_HEADERS`]. `interval` is rule 9's.
+fn check_scrape_settings(
+    id: &str,
+    scrape_targets: &[String],
+    timeout: Duration,
+    headers: &HashMap<String, String>,
+    tls: &logit_config::TlsClientConfig,
+) -> anyhow::Result<()> {
+    for target in scrape_targets {
+        if !is_absolute_http_url(target) {
+            anyhow::bail!(
+                "component '{id}': 'scrape_targets' entry {target:?} isn't an absolute \
+                 'http://' or 'https://' URL",
+                target = redact::url(target)
+            );
+        }
+    }
+    if timeout.is_zero() {
+        anyhow::bail!(
+            "component '{id}': 'timeout: 0s' would fail every scrape immediately -- use a \
+             positive duration"
+        );
+    }
+    if tls.cert_file.is_some() != tls.key_file.is_some() {
+        anyhow::bail!(
+            "component '{id}': 'scrape_tls.cert_file' and 'scrape_tls.key_file' must both be \
+             set for mutual TLS, or both omitted -- one alone can't be used"
+        );
+    }
+    if tls.insecure_skip_verify && tls.ca_file.is_some() {
+        anyhow::bail!(
+            "component '{id}': 'scrape_tls.insecure_skip_verify' and 'scrape_tls.ca_file' \
+             can't both be set -- 'insecure_skip_verify' trusts any certificate, which makes a \
+             specific trusted CA meaningless"
+        );
+    }
+    let any_https = scrape_targets.iter().any(|t| t.to_ascii_lowercase().starts_with("https://"));
+    if !tls.is_empty() && !any_https {
+        anyhow::bail!(
+            "component '{id}': 'scrape_tls' is set, but no 'scrape_targets' entry is \
+             'https://' -- TLS is selected per-target by its own scheme, so a 'scrape_tls:' \
+             block here would have no effect"
+        );
+    }
+    let mut seen_lowercase = BTreeSet::new();
+    for name in headers.keys() {
+        if name.is_empty() {
+            anyhow::bail!("component '{id}': 'headers' has an empty header name");
+        }
+        if name.starts_with(':') {
+            anyhow::bail!(
+                "component '{id}': 'headers' names {name:?} -- an HTTP/2 pseudo-header \
+                 (starting with ':') can't be set as a custom header"
+            );
+        }
+        let lowercase = name.to_ascii_lowercase();
+        if RESERVED_SCRAPE_HEADERS.contains(&lowercase.as_str()) {
+            anyhow::bail!(
+                "component '{id}': 'headers' names {name:?}, which this input sets itself -- it \
+                 can't be overridden"
+            );
+        }
+        if !seen_lowercase.insert(lowercase) {
+            anyhow::bail!(
+                "component '{id}': 'headers' names {name:?}, which differs only in case from \
+                 another entry -- HTTP header names are case-insensitive, so which value would \
+                 actually be sent is undefined"
+            );
+        }
+    }
+    Ok(())
+}
 
 /// Header names `prometheus_out`'s remote-write sender sets itself (rule 56): the four protocol
 /// headers `RemoteWriteOutput::send` inserts over the operator's map
@@ -2168,79 +2247,13 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     // the mode itself, including neither mode set.
     for (id, component) in &components {
         if let ComponentKind::PrometheusIn {
-            scrape_targets,
-            timeout,
-            headers,
-            scrape_tls: tls,
-            ..
+            scrape_targets, timeout, headers, scrape_tls, ..
         } = &component.kind
         {
             if scrape_targets.is_empty() {
                 continue; // bind mode, or no mode at all -- rule 55's, either way
             }
-            for target in scrape_targets {
-                if !is_absolute_http_url(target) {
-                    anyhow::bail!(
-                        "component '{id}': 'scrape_targets' entry {target:?} isn't an absolute \
-                         'http://' or 'https://' URL",
-                        target = redact::url(target)
-                    );
-                }
-            }
-            if timeout.is_zero() {
-                anyhow::bail!(
-                    "component '{id}': 'timeout: 0s' would fail every scrape immediately -- use \
-                     a positive duration"
-                );
-            }
-            if tls.cert_file.is_some() != tls.key_file.is_some() {
-                anyhow::bail!(
-                    "component '{id}': 'scrape_tls.cert_file' and 'scrape_tls.key_file' must \
-                     both be set for mutual TLS, or both omitted -- one alone can't be used"
-                );
-            }
-            if tls.insecure_skip_verify && tls.ca_file.is_some() {
-                anyhow::bail!(
-                    "component '{id}': 'scrape_tls.insecure_skip_verify' and \
-                     'scrape_tls.ca_file' can't both be set -- 'insecure_skip_verify' trusts any \
-                     certificate, which makes a specific trusted CA meaningless"
-                );
-            }
-            let any_https =
-                scrape_targets.iter().any(|t| t.to_ascii_lowercase().starts_with("https://"));
-            if !tls.is_empty() && !any_https {
-                anyhow::bail!(
-                    "component '{id}': 'scrape_tls' is set, but no 'scrape_targets' entry is \
-                     'https://' -- TLS is selected per-target by its own scheme, so a \
-                     'scrape_tls:' block here would have no effect"
-                );
-            }
-            let mut seen_lowercase = BTreeSet::new();
-            for name in headers.keys() {
-                if name.is_empty() {
-                    anyhow::bail!("component '{id}': 'headers' has an empty header name");
-                }
-                if name.starts_with(':') {
-                    anyhow::bail!(
-                        "component '{id}': 'headers' names {name:?} -- an HTTP/2 pseudo-header \
-                         (starting with ':') can't be set as a custom header"
-                    );
-                }
-                let lowercase = name.to_ascii_lowercase();
-                if RESERVED_PROMETHEUS_HEADERS.contains(&lowercase.as_str()) {
-                    anyhow::bail!(
-                        "component '{id}': 'headers' names {name:?}, which this input sets \
-                         itself -- it can't be overridden"
-                    );
-                }
-                if !seen_lowercase.insert(lowercase) {
-                    anyhow::bail!(
-                        "component '{id}': 'headers' names {name:?}, which differs only in \
-                         case from another entry -- HTTP header names are case-insensitive, so \
-                         which value would actually be sent is undefined"
-                    );
-                }
-            }
+            check_scrape_settings(id, scrape_targets, *timeout, headers, scrape_tls)?;
         }
     }
 
@@ -2936,7 +2949,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                          'compression: snappy' with 'version: 2'"
                     );
                 }
-                // Rule 40's header checks, against this sink's own reserved list.
+                // Rule 22's header checks, against this sink's own reserved list.
                 let mut seen_lowercase = BTreeSet::new();
                 for name in headers.keys() {
                     if name.is_empty() {
@@ -14081,6 +14094,25 @@ mod tests {
             ("out", vec!["in"], sink()),
         ]));
         assert!(err.contains("sets itself"), "got: {err}");
+    }
+
+    /// The driver alone decides which content encodings a target may answer in.
+    #[test]
+    fn a_prometheus_in_accept_encoding_header_is_rejected_whatever_its_case() {
+        for name in ["accept-encoding", "Accept-Encoding"] {
+            let err = expect_err(cfg(vec![
+                (
+                    "in",
+                    vec![],
+                    prometheus_in_with_headers(
+                        vec!["http://node-exporter:9100/metrics"],
+                        vec![(name, "gzip")],
+                    ),
+                ),
+                ("out", vec!["in"], sink()),
+            ]));
+            assert!(err.contains(name) && err.contains("sets itself"), "got: {err}");
+        }
     }
 
     #[test]

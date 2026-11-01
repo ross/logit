@@ -4777,10 +4777,10 @@ pub enum ComponentKind {
         #[schemars(with = "String")]
         timeout: Duration,
         /// Extra headers sent on every scrape request. A name this input reserves (`accept`,
-        /// `user-agent`, `content-type`, `content-length`, `content-encoding`, `host`, `te`,
-        /// `transfer-encoding`, `connection`, or an HTTP/2 pseudo-header starting with `:`) is
-        /// rejected, as are two keys naming the same header once case is ignored. Scrape mode
-        /// only.
+        /// `accept-encoding`, `user-agent`, `content-type`, `content-length`, `content-encoding`,
+        /// `host`, `te`, `transfer-encoding`, `connection`, or an HTTP/2 pseudo-header starting
+        /// with `:`) is rejected, as are two keys naming the same header once case is ignored.
+        /// Scrape mode only.
         #[serde(default)]
         headers: HashMap<String, String>,
         /// Client-side TLS tuning for `https://` scrape targets. A non-default block with no

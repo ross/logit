@@ -4316,7 +4316,7 @@
               ]
             },
             "headers": {
-              "description": "Extra headers sent on every scrape request. A name this input reserves (`accept`, `user-agent`, `content-type`, `content-length`, `content-encoding`, `host`, `te`, `transfer-encoding`, `connection`, or an HTTP/2 pseudo-header starting with `:`) is rejected, as are two keys naming the same header once case is ignored. Scrape mode only.",
+              "description": "Extra headers sent on every scrape request. A name this input reserves (`accept`, `accept-encoding`, `user-agent`, `content-type`, `content-length`, `content-encoding`, `host`, `te`, `transfer-encoding`, `connection`, or an HTTP/2 pseudo-header starting with `:`) is rejected, as are two keys naming the same header once case is ignored. Scrape mode only.",
               "default": {},
               "type": "object",
               "additionalProperties": {
