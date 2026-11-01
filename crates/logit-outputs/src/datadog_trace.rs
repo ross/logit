@@ -2146,9 +2146,7 @@ mod tests {
 
     #[tokio::test]
     async fn connect_refused_is_clean() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
+        let (addr, _held) = logit_pipeline::test_util::refused_addr();
         let (registry, mut out) = metered(sink(addr));
         let err = out.send(&two_traces()).await.unwrap_err();
         assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
@@ -2285,8 +2283,8 @@ mod tests {
     use crate::test_support::{
         assert_counted_once_per_batch, assert_direct_sends_count_after_an_empty_batch,
         at_least_once, at_most_once, bodies, fast_retry, http_recorder, per_path_recorder,
-        recorded_paths, refused_addr, sum_of, sums_through_write_loop, Recorded, Reply as Answer,
-        SumSeries, Sums,
+        recorded_paths, sum_of, sums_through_write_loop, Recorded, Reply as Answer, SumSeries,
+        Sums,
     };
     use logit_pipeline::test_util::TelemetryProbe;
     use logit_pipeline::WriteLoopConfig;
@@ -2788,7 +2786,8 @@ mod tests {
     #[tokio::test]
     async fn a_refused_connection_or_a_missing_socket_counts_no_request_bytes() {
         let dir = TempDir::new("bytes");
-        for out in [sink(refused_addr().await), DatadogTraceOutput::unix(dir.0.join("missing"))] {
+        let (addr, _held) = logit_pipeline::test_util::refused_addr();
+        for out in [sink(addr), DatadogTraceOutput::unix(dir.0.join("missing"))] {
             let (registry, mut out) = metered(out);
             let err = out.send(&two_traces()).await.unwrap_err();
             assert_eq!(logit_pipeline::classify(&err), Fault::Clean, "{err:#}");

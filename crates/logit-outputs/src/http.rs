@@ -832,9 +832,7 @@ mod tests {
     /// `network_error` a request the destination may have taken counts.
     #[tokio::test]
     async fn a_refused_dial_counts_connect_error() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
+        let (addr, _held) = logit_pipeline::test_util::refused_addr();
         let client = build_client(
             Duration::from_secs(5),
             crate::http::DEFAULT_CONNECT_TIMEOUT,

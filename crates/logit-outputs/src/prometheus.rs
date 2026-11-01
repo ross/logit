@@ -3521,10 +3521,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_refused_connection_is_clean() {
-        // Bound and dropped, so (almost certainly) nothing listens there.
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
+        let (addr, _held) = logit_pipeline::test_util::refused_addr();
         let registry = logit_core::Registry::new();
         let mut sink = sender(&format!("http://{addr}/api/v1/write"))
             .with_telemetry(registry.telemetry_for("out", "prometheus_out", "sink"));

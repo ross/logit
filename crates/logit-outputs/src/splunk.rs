@@ -1956,9 +1956,7 @@ mod tests {
 
     #[tokio::test]
     async fn connect_refused_is_clean() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
+        let (addr, _held) = logit_pipeline::test_util::refused_addr();
         let err = sink(addr).send(&logs(1)).await.unwrap_err();
         assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
     }
@@ -1993,7 +1991,7 @@ mod tests {
     /// A refused connection sent nothing, so it counts no `request.bytes`, only its request.
     #[tokio::test]
     async fn a_refused_connection_counts_no_request_bytes() {
-        let addr = crate::test_support::refused_addr().await;
+        let (addr, _held) = logit_pipeline::test_util::refused_addr();
         let (registry, mut out) = metered(addr);
         let err = out.send(&logs(1)).await.unwrap_err();
         assert_eq!(logit_pipeline::classify(&err), Fault::Clean);

@@ -557,9 +557,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_refused_dial_is_clean_leaves_the_pool_empty_and_counts_no_reconnect() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = listener.local_addr().unwrap().to_string();
-        drop(listener); // nothing listens there now
+        let (endpoint, _held) = logit_pipeline::test_util::refused_addr();
+        let endpoint = endpoint.to_string();
         let (mut probe, telemetry) = sink_telemetry();
         let dial = Dial {
             target: Target::Tcp { endpoint: &endpoint, tls: None },

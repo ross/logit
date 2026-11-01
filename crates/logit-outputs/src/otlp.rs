@@ -1356,9 +1356,7 @@ mod tests {
     /// A refused dial is `Clean`, and its request counts `connect_error`, not `network_error`.
     #[tokio::test]
     async fn connect_refused_is_classified_clean() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
+        let (addr, _held) = logit_pipeline::test_util::refused_addr();
         let registry = Registry::new();
         let telemetry = registry.telemetry_for("out", "otlp_out", "sink");
         let mut output = http_output(addr).with_telemetry(telemetry);
@@ -1742,7 +1740,7 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_connect_refused_is_clean() {
-        let addr = crate::test_support::refused_addr().await;
+        let (addr, _held) = logit_pipeline::test_util::refused_addr();
         let registry = Registry::new();
         let telemetry = registry.telemetry_for("out", "otlp_out", "sink");
         let err =

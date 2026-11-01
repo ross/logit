@@ -1237,9 +1237,9 @@ async fn token_endpoint_faults_are_clean_when_transient_and_refused_otherwise() 
         assert_eq!(values_in(&cluster, 0).len(), 1, "{status}");
     }
 
-    // Nothing listening: a port bound and released.
-    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-    let url = format!("http://127.0.0.1:{port}/oauth2/token");
+    // Nothing listening: a bound port that never listens, held for the rest of the test.
+    let (addr, _held) = logit_pipeline::test_util::refused_addr();
+    let url = format!("http://{addr}/oauth2/token");
     let cluster = oauth_cluster(1, &[0], None).await;
     let settings = KafkaSasl::OAuthBearer {
         token: OAuthToken::ClientCredentials {
@@ -1413,10 +1413,12 @@ fn aws_env(vars: &[(&str, &str)]) -> Env {
     std::sync::Arc::new(move |name| vars.get(name).cloned())
 }
 
-/// Endpoints for the chain's HTTP sources that answer nothing: a closed port.
+/// Endpoints for the chain's HTTP sources that answer nothing: a refused port, held bound for
+/// the rest of the process so no other test is handed it.
 fn no_endpoints() -> Endpoints {
-    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-    let base = format!("http://127.0.0.1:{port}");
+    let (addr, held) = logit_pipeline::test_util::refused_addr();
+    std::mem::forget(held);
+    let base = format!("http://{addr}");
     Endpoints { imds: base.clone(), container: base.clone(), sts: Some(base) }
 }
 

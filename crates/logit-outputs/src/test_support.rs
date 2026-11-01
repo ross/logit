@@ -962,14 +962,6 @@ where
         .await;
 }
 
-/// A `127.0.0.1` address nothing listens on: a connect to it is refused.
-pub(crate) async fn refused_addr() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    addr
-}
-
 /// An [`http_recorder`] that answers the `k`th request (from 0) on each path with
 /// `script(path, k)`, for a sink that sends to several routes and fails one of them.
 pub(crate) async fn per_path_recorder(

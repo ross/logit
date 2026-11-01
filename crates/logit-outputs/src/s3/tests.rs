@@ -719,7 +719,7 @@ async fn any_other_4xx_is_rejected() {
 
 #[tokio::test]
 async fn a_refused_or_stalled_dial_is_clean() {
-    let addr = crate::test_support::refused_addr().await;
+    let (addr, _held) = logit_pipeline::test_util::refused_addr();
     let mut probe = TelemetryProbe::new();
     let mut out = sink_with(settings(addr), &probe);
     let err = put(&mut out, 1, &[batch("a")]).await.unwrap_err();
