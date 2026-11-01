@@ -1,0 +1,21 @@
+{
+  "root": "/shared",
+  "namespace": "soak",
+  "pod": "writer",
+  "uid": "5f0c2d7e-8a41-4c39-9b6e-2f1d3a7c9e10",
+  "container": "app",
+  "input": "load",
+  "sink": "pods",
+  "rate": 500,
+  "batch": 50,
+  "interval_s": 1,
+  "stderr_share": 0.3,
+  "long_every": 100,
+  "long_bytes": [20000, 50000],
+  "dangle_every_s": 21,
+  "dangle_s": 8,
+  "rotate_every_s": 45,
+  "max_files": 5,
+  "restart_after_s": 330,
+  "seed": 1
+}

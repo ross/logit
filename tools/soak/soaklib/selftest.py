@@ -3573,7 +3573,7 @@ def _rss_settle_rules(root):
                  f"rss_settle = {value!r}")
     # Only these schedules opt in; every other shipped scenario keeps recovery_bound alone.
     opted_in = {"fanin": 60.0, "tcp-ingress": 60.0, "partition-rss": 120.0,
-                "syslog-tcp-ingress": 60.0, "syslog-tls-ingress": 60.0}
+                "cri-rotate-rss": 120.0, "syslog-tcp-ingress": 60.0, "syslog-tls-ingress": 60.0}
     for path_one in sorted((root / "scenarios").glob("*/scenario.toml")):
         name = path_one.parent.name
         want = opted_in.get(name, 0.0)
