@@ -3,8 +3,11 @@
 # scrape wire is a pull: G is the increments each generator life generated, V the stored
 # counters' reset-aware total in that life, and a scrape that fails loses only the values
 # between two that succeed. Each generator life's end loses the increments after its last
-# scrape, judged against a band. The schema is docs/plans/soak-harness.md's "The scenario
-# schema".
+# scrape, judged against a band. The pause leaves the generator's RSS about 11 MiB higher for
+# the rest of its life as it catches up (24.8 to 35.7 MiB in 20261029T201553Z), a level shift
+# past the 3 MiB step `rss_slope`'s limit allows for, so its first life's fit sits near that
+# limit (+103.7 against 106 MiB/h) and a slightly higher plateau WARNs. The schema is
+# docs/plans/soak-harness.md's "The scenario schema".
 
 name = "prometheus-scrape"
 description = "generator generate_in -> aggregate 1s cumulative -> prometheus_out bind <- prometheus_in scrape 5s -> prometheus_out RW1 zstd -> VictoriaMetrics"
