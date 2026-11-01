@@ -6,7 +6,8 @@
 #              datadog-dogstatsd-unix), splunk (= splunk-otel, splunk-docker, splunk-sc4s,
 #              splunk-java, then check_splunk_capture.py), influxdb, kafka, cri
 #              (= cri-containerd, a kind node, then cri-crio, a minikube node: each's pod log tree),
-#              nginx-status (nginx stable and mainline, Angie, freenginx: each's stub_status page)
+#              nginx-status (nginx stable and mainline, Angie, freenginx: each's stub_status page),
+#              apache-status (httpd under event, worker, prefork, ExtendedStatus Off, mod_ssl)
 #   With no arguments, records every producer in `all` below.
 #
 # Captures wire traffic from real third-party producers into testdata/interop/, so decoders are
@@ -1456,10 +1457,76 @@ record_nginx_status() {
     done
 }
 
+# `mod_status` `?auto` pages from httpd, for `logit_proto::apache_status`'s corpus
+# (testdata/interop/apache-status/), from the official image under each variant
+# tools/record-fixtures/apache-status/status.conf selects with an `httpd -D` name: the `event`,
+# `worker`, and `prefork` MPMs, `ExtendedStatus Off` (under `event`), and `mod_ssl` with an
+# `shmcb` session cache (under `event`), which generates its own certificate at start.
+#
+# Two captures per variant, each `<variant>-<n>.body` byte for byte as served beside a `.headers`
+# sidecar holding the response's status line and headers verbatim:
+#   <variant>-0  the first request after start
+#   <variant>-1  with tools/record-fixtures/apache-status/connections.py holding keepalive
+#                connections, a half-sent request, and a silent connection open (and, under
+#                `ssl`, after three TLS requests); under the `event` MPM the keepalive
+#                connections come in two waves, so the page's `Conns*` counts are refreshed
+# plus `html`, the `event` server's page without `?auto`, which the decoder reads as a
+# `parse_error`.
+APACHE_STATUS_IMAGE="httpd:2.4.69@sha256:c6b7745aa371570cc8460a9f08c39989583d4aa7bc8e3ed8bd77a492803ea704"
+
+record_apache_status() {
+    echo "== recording: httpd mod_status pages (event, worker, prefork, ExtendedStatus Off, mod_ssl) =="
+    local out="${OUT_ROOT}/apache-status" dir="${TOOLS_DIR}/apache-status"
+    mkdir -p "${out}"
+    rm -f "${out}"/*.body "${out}"/*.headers
+    local url=http://status-server:8080/server-status?auto
+    local cert='openssl req -x509 -newkey rsa:2048 -nodes -subj /CN=status-server -days 1 \
+-keyout /tmp/server.key -out /tmp/server.crt 2>/dev/null'
+
+    local variant defines setup holder
+    for variant in event worker prefork ext-off ssl; do
+        setup=true
+        holder=(--waves)
+        case "${variant}" in
+        event) defines="" ;;
+        worker) defines="-D WORKER" holder=() ;;
+        prefork) defines="-D PREFORK" holder=() ;;
+        ext-off) defines="-D EXT_OFF" ;;
+        ssl)
+            defines="-D SSL"
+            setup="${cert}"
+            holder=(8443 --waves)
+            ;;
+        esac
+        ${DOCKER} run -d --name status-server --network "${NET}" \
+            -v "${dir}/status.conf:/status.conf:ro,z" "${APACHE_STATUS_IMAGE}" \
+            sh -c "${setup} && exec httpd -f /status.conf -D FOREGROUND ${defines}" >/dev/null
+        status_page "${out}" "${variant}-0" "${url}"
+        if [ "${variant}" = event ]; then
+            status_page "${out}" html http://status-server:8080/server-status
+        fi
+
+        ${DOCKER} run -d --name status-connections --network "${NET}" \
+            -v "${dir}/connections.py:/connections.py:ro,z" "${PROM_SCRAPE_PYTHON_IMAGE}" \
+            python3 /connections.py status-server 8080 "${holder[@]}" >/dev/null
+        local i
+        for i in $(seq 1 60); do
+            ${DOCKER} logs status-connections 2>&1 | grep -q '^ready' && break
+            sleep 1
+        done
+        ${DOCKER} logs status-connections 2>&1 | grep -q '^ready' ||
+            { echo "record-fixtures: connections.py never became ready" >&2; return 1; }
+        status_page "${out}" "${variant}-1" "${url}"
+
+        ${DOCKER} logs status-server 2>&1 | sed 's/^/  [server] /' || true
+        ${DOCKER} rm -f status-server status-connections >/dev/null 2>&1 || true
+    done
+}
+
 # ---- entry point ----------------------------------------------------------------------------------
 
 all=(logger python-syslog-handler rsyslog rsyslog-tcp collectd otlp graphite prometheus
-    prometheus-scrape vmagent statsd datadog splunk influxdb kafka cri nginx-status)
+    prometheus-scrape vmagent statsd datadog splunk influxdb kafka cri nginx-status apache-status)
 
 producers=("$@")
 if [ "${#producers[@]}" -eq 0 ]; then
@@ -1497,6 +1564,7 @@ for p in "${producers[@]}"; do
     kafka) record_kafka ;;
     cri) record_cri ;;
     nginx-status) record_nginx_status ;;
+    apache-status) record_apache_status ;;
     cri-containerd) record_cri_containerd ;;
     cri-crio) record_cri_crio ;;
     datadog)
