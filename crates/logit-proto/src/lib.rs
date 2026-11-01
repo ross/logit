@@ -26,6 +26,7 @@ pub mod msgpack;
 pub mod msgpack_event;
 pub mod multi_value;
 pub mod native;
+pub mod nginx_status;
 pub mod otlp;
 pub mod prometheus;
 pub mod proxy;

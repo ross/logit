@@ -5,7 +5,8 @@
 #              prometheus-scrape, vmagent, statsd, datadog (= datadog-agent, datadog-tracer,
 #              datadog-dogstatsd-unix), splunk (= splunk-otel, splunk-docker, splunk-sc4s,
 #              splunk-java, then check_splunk_capture.py), influxdb, kafka, cri
-#              (= cri-containerd, a kind node, then cri-crio, a minikube node: each's pod log tree)
+#              (= cri-containerd, a kind node, then cri-crio, a minikube node: each's pod log tree),
+#              nginx-status (nginx stable and mainline, Angie, freenginx: each's stub_status page)
 #   With no arguments, records every producer in `all` below.
 #
 # Captures wire traffic from real third-party producers into testdata/interop/, so decoders are
@@ -72,7 +73,7 @@ finish_capture() {
 
 cleanup() {
     ${DOCKER} rm -f -v capture otelcol prometheus vmagent metatarget dd-agent dd-clients \
-        telegraf scrape-node scrape-python splunk-dind splunk-sc4s splunk-java kafka-record-broker kafka-record-javac >/dev/null 2>&1 || true
+        telegraf scrape-node scrape-python status-server status-connections splunk-dind splunk-sc4s splunk-java kafka-record-broker kafka-record-javac >/dev/null 2>&1 || true
     ${DOCKER} volume rm "${DD_VOLUME}" >/dev/null 2>&1 || true
     ${DOCKER} network rm "${NET}" "${KAFKA_NET}" >/dev/null 2>&1 || true
     # record_prometheus and record_datadog_agent render config into a temp dir; remove it here too
@@ -1367,10 +1368,98 @@ record_cri() {
     record_cri_crio
 }
 
+# `stub_status` pages from four nginx-family servers, for `logit_proto::nginx_status`'s corpus
+# (testdata/interop/nginx-status/): nginx stable and mainline from the official image, Angie from
+# its own registry, and freenginx built from its release tarball by
+# tools/record-fixtures/nginx-status/build-freenginx.sh, since freenginx publishes no image. Each
+# runs tools/record-fixtures/nginx-status/status.conf, which serves nothing but the page.
+#
+# Two captures per server, each `<server>-<n>.body` byte for byte as served beside a `.headers`
+# sidecar holding the response's status line and headers verbatim:
+#   <server>-0  the first request after start: one active connection, the scrape itself
+#   <server>-1  with tools/record-fixtures/nginx-status/connections.py holding three idle
+#               connections (Waiting) and a half-sent request (Reading) open
+#
+# Tengine has no official image; its four-column form is tested from a literal in
+# crates/logit-proto/src/nginx_status.rs's tests instead.
+NGINX_STATUS_STABLE_IMAGE="nginx:1.30.6@sha256:66b50d24288dba67f3d000b31223daefc4868c58d29aaacb6a4ff9771597b5eb"
+NGINX_STATUS_MAINLINE_IMAGE="nginx:1.31.8@sha256:5ab5b0b01097420873a3f3330f44248e34a3c2a3e8d5ee30658aeae8cb7435da"
+NGINX_STATUS_ANGIE_IMAGE="docker.angie.software/angie:1.12.4@sha256:5e0cffc7863bdf9562db301c114f0a8cba21c3727854aa22c822d0fc7bf6dea4"
+NGINX_STATUS_DEBIAN_IMAGE="debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3"
+NGINX_STATUS_FREENGINX_VERSION="1.30.2"
+NGINX_STATUS_FREENGINX_SHA256="3166632fe3c74892e3fb216ed36d36e1bcaafa46a54d28c00d575998bc7ea927"
+
+# status_page <out_dir> <stem> <url>: one GET, the body to <stem>.body and the response's head to
+# <stem>.headers, both written on the host. curl's stderr also holds a line per retry while the
+# server starts, so only the head from the last status line on is kept.
+status_page() {
+    local out="$1" stem="$2" url="$3" stderr
+    stderr="$(mktemp)"
+    ${DOCKER} run --rm --network "${NET}" "${PROM_SCRAPE_CURL_IMAGE}" \
+        -sS --fail --retry 300 --retry-all-errors --retry-delay 1 \
+        -D /dev/stderr -o - "${url}" \
+        >"${out}/${stem}.body" 2>"${stderr}" || { cat "${stderr}" >&2; rm -f "${stderr}"; return 1; }
+    awk '/^HTTP\//{head=""} {head=head $0 "\n"} END{printf "%s", head}' "${stderr}" \
+        >"${out}/${stem}.headers"
+    rm -f "${stderr}"
+    echo "-- ${stem} ($(wc -c <"${out}/${stem}.body") bytes)"
+    sed 's/^/  [body] /' "${out}/${stem}.body"
+}
+
+record_nginx_status() {
+    echo "== recording: nginx-family stub_status pages (nginx, Angie, freenginx) =="
+    local out="${OUT_ROOT}/nginx-status" dir="${TOOLS_DIR}/nginx-status"
+    mkdir -p "${out}"
+    rm -f "${out}"/*.body "${out}"/*.headers
+    local conf=(-v "${dir}/status.conf:/status.conf:ro,z")
+
+    local spec name
+    for spec in stable mainline angie freenginx; do
+        name="nginx-${spec}"
+        [ "${spec}" = angie ] && name=angie
+        [ "${spec}" = freenginx ] && name=freenginx
+        case "${spec}" in
+        stable | mainline)
+            local image="${NGINX_STATUS_STABLE_IMAGE}"
+            [ "${spec}" = mainline ] && image="${NGINX_STATUS_MAINLINE_IMAGE}"
+            ${DOCKER} run -d --name status-server --network "${NET}" "${conf[@]}" "${image}" \
+                nginx -c /status.conf -g 'daemon off;' >/dev/null
+            ;;
+        angie)
+            ${DOCKER} run -d --name status-server --network "${NET}" "${conf[@]}" \
+                "${NGINX_STATUS_ANGIE_IMAGE}" angie -c /status.conf -g 'daemon off;' >/dev/null
+            ;;
+        freenginx)
+            ${DOCKER} run -d --name status-server --network "${NET}" "${conf[@]}" \
+                -v "${dir}/build-freenginx.sh:/build-freenginx.sh:ro,z" \
+                "${NGINX_STATUS_DEBIAN_IMAGE}" \
+                sh /build-freenginx.sh "${NGINX_STATUS_FREENGINX_VERSION}" \
+                "${NGINX_STATUS_FREENGINX_SHA256}" >/dev/null
+            ;;
+        esac
+        status_page "${out}" "${name}-0" http://status-server:8080/nginx_status
+
+        ${DOCKER} run -d --name status-connections --network "${NET}" \
+            -v "${dir}/connections.py:/connections.py:ro,z" "${PROM_SCRAPE_PYTHON_IMAGE}" \
+            python3 /connections.py status-server 8080 >/dev/null
+        local i
+        for i in $(seq 1 60); do
+            ${DOCKER} logs status-connections 2>&1 | grep -q '^ready' && break
+            sleep 1
+        done
+        ${DOCKER} logs status-connections 2>&1 | grep -q '^ready' ||
+            { echo "record-fixtures: connections.py never became ready" >&2; return 1; }
+        status_page "${out}" "${name}-1" http://status-server:8080/nginx_status
+
+        ${DOCKER} logs status-server 2>&1 | grep -E 'version|warn|emerg' | sed 's/^/  [server] /' || true
+        ${DOCKER} rm -f status-server status-connections >/dev/null 2>&1 || true
+    done
+}
+
 # ---- entry point ----------------------------------------------------------------------------------
 
 all=(logger python-syslog-handler rsyslog rsyslog-tcp collectd otlp graphite prometheus
-    prometheus-scrape vmagent statsd datadog splunk influxdb kafka cri)
+    prometheus-scrape vmagent statsd datadog splunk influxdb kafka cri nginx-status)
 
 producers=("$@")
 if [ "${#producers[@]}" -eq 0 ]; then
@@ -1407,6 +1496,7 @@ for p in "${producers[@]}"; do
     influxdb) record_influxdb ;;
     kafka) record_kafka ;;
     cri) record_cri ;;
+    nginx-status) record_nginx_status ;;
     cri-containerd) record_cri_containerd ;;
     cri-crio) record_cri_crio ;;
     datadog)
