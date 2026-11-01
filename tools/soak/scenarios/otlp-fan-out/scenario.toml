@@ -3,8 +3,8 @@
 # VictoriaMetrics, under statsd-vm's schedule. `fan_out = { points = 4 }` has `ledger.edge`
 # judge the node's children against 4 x the records it received, less the lines it dropped, and
 # every row after it count the listener's records carried through the node. The backend stop
-# blocks the sink, and each batch held behind it past `line_protocol` holds 4 times the events.
-# The schema is docs/plans/soak-harness.md's "The scenario schema".
+# blocks the sink, and each batch held behind it past `line_protocol` holds 4 times the events,
+# which `rss_slope` watches. The schema is docs/plans/soak-harness.md's "The scenario schema".
 
 name = "otlp-fan-out"
 description = "generator otlp_out -> otlp_in (HTTP) -> line_protocol (4 points per record) -> kv_metrics -> aggregate 500ms cumulative -> prometheus_out RW1 zstd -> VictoriaMetrics"

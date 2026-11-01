@@ -161,15 +161,18 @@ MIB = 1024 * 1024
 # An `[[expect]]` `slope` is fitted only over at least this many samples spanning this long.
 SLOPE_MIN_SAMPLES = 6
 SLOPE_MIN_SPAN_S = 60
-# `rss_slope` skips each life's first `RSS_LIFE_WARMUP_S` and fits a life only over a span of
-# `RSS_MIN_SPAN_S`. A started or restarted `logit` gains 6 to 10 MiB of RSS in its first 30 s
-# and moves up to 3 MiB more until about 70 s (cri-rotate, 20261101T000854Z). Past that, RSS
-# still moves in steps of up to 2.8 MiB within 60 s at a 5 s drain. A step of A MiB in the
-# middle of a span of T s biases a least-squares slope by 1.5 x A / T, so against the 64 MiB/h
-# limit a 3 MiB step needs T >= 1.5 x 3 MiB x 3600 / 64 MiB/h = 253 s. At 300 s that step
-# fits as 54 MiB/h; at 60 s it fits as 270 MiB/h.
+# `rss_slope` skips each life's first `RSS_LIFE_WARMUP_S` and fits a life over at least
+# `RSS_MIN_SAMPLES` samples spanning `RSS_MIN_SPAN_S`, against `rss_fit_limit`. A started or
+# restarted `logit` gains 6 to 10 MiB of RSS in its first 30 s and moves up to 3 MiB more until
+# about 70 s (cri-rotate, 20261101T000854Z). Past that, RSS still moves in steps of up to 2.8 MiB
+# within 60 s at a 5 s drain, `RSS_STEP_MIB` rounded up. A step of A MiB in the middle of a span
+# of T s biases a least-squares slope by 1.5 x A / T: 270 MiB/h over 60 s, 54 over 300 s, and
+# 4.5 over an hour for a 3 MiB step. 60 s keeps that term a 4.5 MiB rise, below a gross leak's
+# (600 MiB/h is 10 MiB a minute); it doubles at 30 s.
 RSS_LIFE_WARMUP_S = 120
-RSS_MIN_SPAN_S = 300
+RSS_MIN_SPAN_S = 60
+RSS_MIN_SAMPLES = 12
+RSS_STEP_MIB = 3.0
 # `progress` and `rss_slope` WARN when what they judged spans less than this share of the run
 # after warmup, so a PASS resting on a few minutes of a fault-dense, hours-long run says so.
 COVERAGE_MIN_SHARE = 0.05
@@ -1124,6 +1127,14 @@ def classify_stall(tel, sink, start, end):
     return FAIL, "nothing delivered and nothing queued"
 
 
+def rss_fit_limit(limit, span_s):
+    """The MiB/h a fit over `span_s` seconds may read before it's growth: `limit` plus the bias
+    one `RSS_STEP_MIB` step adds to a least-squares slope over that span. The term adds to the
+    limit rather than replacing it, because a leak at the limit with one step in its fit reads as
+    their sum; over a long span the term falls toward 0, leaving the limit itself."""
+    return limit + 1.5 * RSS_STEP_MIB * SECONDS_PER_HOUR / span_s
+
+
 def _rss_points(data, service, windows):
     """`(by_life, source, sampled)`: `{life: [(ts, bytes)]}` outside `windows` after warmup
     and past each life's `RSS_LIFE_WARMUP_S`, where they came from, and whether the service had
@@ -1156,13 +1167,22 @@ def _rss_points(data, service, windows):
     return by_life, "docker stats", sampled
 
 
-def _longest_quiet_s(data, windows):
-    """The longest stretch after warmup and before the end sequence outside every one of
-    `windows`, in seconds, or 0 with no timeline start."""
+def _longest_fittable_s(data, service, windows):
+    """The longest stretch a life of `service` spent past its `RSS_LIFE_WARMUP_S`, after warmup,
+    before the end sequence, and outside every one of `windows`, in seconds, or 0 with no
+    timeline start: what the schedule left a fit, whatever telemetry the service wrote. With no
+    process lives in its telemetry the service's one life starts at the timeline's zero."""
     if data.t0 is None:
         return 0.0
-    spans = data.quiet_intervals(data.t0 + data.warmup, windows)
-    return max((end - start for start, end in spans), default=0.0)
+    tel = data.telemetry.get(service)
+    starts = (tel.life_starts if tel is not None else []) or [data.t0]
+    longest = 0.0
+    for life, start in enumerate(starts):
+        end = starts[life + 1] if life + 1 < len(starts) else data.end
+        begin = max(start + RSS_LIFE_WARMUP_S, data.t0 + data.warmup)
+        for a, b in data.quiet_intervals(begin, windows):
+            longest = max(longest, min(b, end) - a)
+    return longest
 
 
 def judge_services(data, check_id, judged):
@@ -1194,17 +1214,16 @@ def judge_services(data, check_id, judged):
 
 def check_rss_slope(data):
     """Per `logit` service: the least-squares RSS slope of each life over steady samples after
-    warmup and past the life's first `RSS_LIFE_WARMUP_S`, over at least `RSS_MIN_SPAN_S`,
-    against `rss_growth_mib_per_hour`, a growth WARNing under an hour's run and FAILing from
-    one; WARN when the judged slopes cover under `COVERAGE_MIN_SHARE` of the run. Steady here
-    excludes `rss_windows()`, each fault's window plus `rss_settle`. A service with no life to
-    fit SKIPs when the schedule leaves no steady stretch of `RSS_MIN_SPAN_S`, and WARNs when it
-    does. Each service is judged apart and `[expected]` can set its verdict
-    (`judge_services`)."""
+    warmup and past the life's first `RSS_LIFE_WARMUP_S`, `RSS_MIN_SAMPLES` of them over
+    `RSS_MIN_SPAN_S` at least, against `rss_fit_limit` of `rss_growth_mib_per_hour` and the
+    fit's span, a growth WARNing under an hour's run and FAILing from one; WARN when the judged
+    slopes cover under `COVERAGE_MIN_SHARE` of the run. Steady here excludes `rss_windows()`,
+    each fault's window plus `rss_settle`. A service with no life to fit SKIPs when the schedule
+    left none of its lives `RSS_MIN_SPAN_S` past the warm-up, and WARNs when it did. Each
+    service is judged apart and `[expected]` can set its verdict (`judge_services`)."""
     limit = float(data.thresholds.get("rss_growth_mib_per_hour", 64))
     windows = data.rss_windows()
     over = WARN if data.duration < SECONDS_PER_HOUR else FAIL
-    quiet = _longest_quiet_s(data, windows)
     judged = {}
     extra = []
     for service in data.logit_services:
@@ -1217,23 +1236,24 @@ def check_rss_slope(data):
         judged_s = 0.0
         for life, points in sorted(by_life.items()):
             span = points[-1][0] - points[0][0] if points else 0
-            if len(points) < SLOPE_MIN_SAMPLES or span < RSS_MIN_SPAN_S:
+            if len(points) < RSS_MIN_SAMPLES or span < RSS_MIN_SPAN_S:
                 extra.append(f"{service} life {life}: {len(points)} sample(s) over {span:.0f}s "
                              f"past its {RSS_LIFE_WARMUP_S}s warm-up, under the "
-                             f"{RSS_MIN_SPAN_S}s a fit needs")
+                             f"{RSS_MIN_SAMPLES} over {RSS_MIN_SPAN_S}s a fit needs")
                 continue
             judged_s += data.steady_span(points, windows)
             per_hour = slope(points) * SECONDS_PER_HOUR / MIB
-            slopes.append(f"life {life} {per_hour:+.1f}")
+            fit_limit = rss_fit_limit(limit, span)
+            slopes.append(f"life {life} {per_hour:+.1f} (limit {fit_limit:.0f})")
             extra.append(f"{service} life {life}: {per_hour:+.1f} MiB/h over {len(points)} "
-                         f"samples, {span:.0f}s ({source})")
-            if per_hour > limit:
+                         f"samples, {span:.0f}s ({source}), limit {fit_limit:.1f}")
+            if per_hour > fit_limit:
                 status = worst([status, over])
-        if not slopes and quiet < RSS_MIN_SPAN_S:
-            judged[service] = (SKIP, f"no life's steady samples span {RSS_MIN_SPAN_S}s past "
-                                     f"its {RSS_LIFE_WARMUP_S}s warm-up, and the schedule "
-                                     f"leaves none that could (longest steady stretch "
-                                     f"{quiet:.0f}s outside fault windows and rss_settle)")
+        fittable = _longest_fittable_s(data, service, windows)
+        if not slopes and fittable < RSS_MIN_SPAN_S:
+            judged[service] = (SKIP, f"the schedule leaves no life {RSS_MIN_SPAN_S}s to fit "
+                                     f"past its {RSS_LIFE_WARMUP_S}s warm-up (longest "
+                                     f"{fittable:.0f}s outside fault windows and rss_settle)")
             continue
         # A service with samples but no life long enough to fit, in a schedule that had room
         # for one, judges 0 seconds, which the coverage rule WARNs, so it can't read as a pass
@@ -1242,10 +1262,12 @@ def check_rss_slope(data):
         if share is not None and share < COVERAGE_MIN_SHARE:
             status = worst([status, WARN])
             extra.append(f"{service}: slopes cover little of the run: {text}")
-        fits = (f"MiB/h {', '.join(slopes)}" if slopes
-                else "no life with enough samples" if by_life
-                else "every sample after warmup in a fault window or a life's warm-up")
-        judged[service] = (status, f"{fits} (limit {limit:g}); {text}")
+        fits = (f"MiB/h {', '.join(slopes)}; each limit is {limit:g} plus a "
+                f"{RSS_STEP_MIB:g} MiB step's bias over the fit's span" if slopes
+                else f"no life with enough samples (limit {limit:g})" if by_life
+                else "every sample after warmup in a fault window or a life's warm-up "
+                     f"(limit {limit:g})")
+        judged[service] = (status, f"{fits}; {text}")
     status, lines = judge_services(data, "rss_slope", judged)
     if status == SKIP:
         return Result("rss_slope", SKIP, " | ".join(lines) or "no logit service to judge",

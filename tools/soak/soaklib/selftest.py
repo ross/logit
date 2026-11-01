@@ -1381,15 +1381,10 @@ def _checks():
         thin = _run_dir(tmp, "thin", [start, _action("apply", "c0s1", "netem", "logit", 100),
                                       _action("revert", "c0s1", "netem", "logit", 3450)]
                         + long_end, _sut_stdout(3600), duration=3600.0)
-        result = _status(thin, checks.check_progress)
-        expect(result.status == checks.WARN and "cover little" in " ".join(result.lines),
-               f"check_progress WARNs on thin coverage, got {result}")
-        # Its longest steady stretch, 105 s, can't hold an RSS fit.
-        result = _status(thin, checks.check_rss_slope)
-        expect(result.status == checks.SKIP
-               and "logit SKIP: no life's steady samples span 300s" in result.detail
-               and "longest steady stretch 104s" in result.detail,
-               f"check_rss_slope SKIPs a schedule with no stretch to fit, got {result}")
+        for check in (checks.check_progress, checks.check_rss_slope):
+            result = _status(thin, check)
+            expect(result.status == checks.WARN and "cover little" in " ".join(result.lines),
+                   f"{check.__name__} WARNs on thin coverage, got {result}")
         wide = _run_dir(tmp, "wide", [start] + long_end, _sut_stdout(3600), duration=3600.0)
         for check in (checks.check_progress, checks.check_rss_slope):
             result = _status(wide, check)
@@ -3519,11 +3514,11 @@ def _slope_edges():
             expect(result.status == checks.SKIP,
                    f"{check.__name__} SKIPs with no service to judge, got {result}")
 
-        # The generator's telemetry stops at +200: 80 s past its life's warm-up, too short to
+        # The generator's telemetry stops at +170: 50 s past its life's warm-up, too short to
         # fit, in a fault-free hour that had room for a fit.
         short = _slope_run(tmp, "unfittable")
         (short / "logs" / "generator.stdout").write_text("\n".join(
-            _service_stdout(200, lambda o: 50 * 2 ** 20, lambda o: 10, lambda o: 100)) + "\n")
+            _service_stdout(170, lambda o: 50 * 2 ** 20, lambda o: 10, lambda o: 100)) + "\n")
         result = _status(short, checks.check_rss_slope)
         expect(result.status == checks.WARN
                and "generator WARN: no life with enough samples" in result.detail
@@ -3632,18 +3627,22 @@ def _rss_settle_checks():
                 return 32 * mib
             return 18 * mib
         partition = [("c0s1", "partition", "generator", 330, 375)]
+        # Over these 475 s fits a 3 MiB step's bias adds 34 MiB/h to the limit, so a 24 MiB/h
+        # limit puts the plateaus' +72 MiB/h fit over it.
+        low = {**RESOLVED["thresholds"], "rss_growth_mib_per_hour": 24}
         settled = _settle_run(tmp, "settle-bump", partition, 600, flat, stepped,
-                              rss_settle=60.0)
+                              rss_settle=60.0, thresholds=low)
         result = _status(settled, checks.check_rss_slope)
         expect(result.status == checks.PASS and "generator PASS" in result.detail,
                f"a fault's RSS returned within rss_settle PASSes, got {result}")
         unsettled = _settle_run(tmp, "settle-bump-off", partition, 600, flat, stepped,
-                                rss_settle=0.0)
+                                rss_settle=0.0, thresholds=low)
         result = _status(unsettled, checks.check_rss_slope)
         expect(result.status == checks.WARN and "generator WARN" in result.detail,
                f"the same RSS with rss_settle 0s WARNs on its slope, got {result}")
         # A run directory recorded before the key scores as it did then, with no settle.
-        unkeyed = _settle_run(tmp, "settle-bump-unkeyed", partition, 600, flat, stepped)
+        unkeyed = _settle_run(tmp, "settle-bump-unkeyed", partition, 600, flat, stepped,
+                              thresholds=low)
         data = checks.RunData(unkeyed)
         result = checks.check_rss_slope(data)
         expect(data.rss_settle == 0.0 and result.status == checks.WARN,
@@ -3687,7 +3686,7 @@ def _rss_settle_checks():
         excused = _settle_run(tmp, "settle-whole", whole, 1000, flat, flat, rss_settle=60.0)
         result = _status(excused, checks.check_rss_slope)
         expect(result.status == checks.SKIP
-               and "longest steady stretch 0s" in result.detail,
+               and "(longest 0s outside fault windows" in result.detail,
                f"a schedule that excuses every sample SKIPs, saying why, got {result}")
 
 
@@ -3713,9 +3712,10 @@ def _lives_stdout(end_s, down, rss):
 
 
 def _rss_life_warmup():
-    """`rss_slope` fits a life only past its first `RSS_LIFE_WARMUP_S` and over
-    `RSS_MIN_SPAN_S`: cri-rotate's short, noisy lives SKIP rather than FAIL, growth over a long
-    life still FAILs, and a span one drain short of the minimum isn't fitted."""
+    """`rss_slope` fits a life past its first `RSS_LIFE_WARMUP_S`, over `RSS_MIN_SPAN_S` at
+    least, against a limit that grows as the fit's span shrinks: short lives with an allocator
+    step PASS, a gross leak over the same lives and growth over a long life FAIL, and a span
+    one drain short of the floor isn't fitted."""
     mib = 2 ** 20
     with tempfile.TemporaryDirectory() as tmp:
         def run(name, end_s, kills, rss, **resolved):
@@ -3730,41 +3730,62 @@ def _rss_life_warmup():
                 end_s + 50, [], lambda u: 50 * mib)) + "\n")
             return run_dir
 
-        # cri-rotate's SUT (20261101T000854Z): a kill every 150 s for 35 s, each life 21 MiB
-        # at its start, 28 MiB from 30 s, and a 2.8 MiB step at 80 s, near the middle of the 45
-        # to 110 s steady stretch, which fits as 233 MiB/h over 65 s. The lives never grow, and
-        # none holds 300 s past its warm-up.
-        def noisy(uptime):
-            return (21 + (7 if uptime >= 30 else 0) + (2.8 if uptime >= 80 else 0)) * mib
-        kills = [(start, start + 35) for start in range(100, 3400, 150)]
-        result = _status(run("noisy-lives", 3600, kills, noisy), checks.check_rss_slope)
-        expect(result.status == checks.PASS
-               and "logit SKIP: no life's steady samples span 300s past its 120s warm-up"
-               in result.detail and "generator PASS" in result.detail,
-               f"short noisy lives SKIP rather than FAIL, got {result}")
+        # A kill every 240 s for 35 s leaves each life 85 s of steady samples past its warm-up,
+        # from 120 to 200 s, fitted against 64 + 1.5 x 3 x 3600 / 80 = 266 MiB/h. Each life is
+        # cri-rotate's SUT (20261101T000854Z): 21 MiB at its start, 28 MiB from 30 s, and a
+        # 2.8 MiB step at 160 s, mid-fit, which reads as +189 MiB/h with no growth.
+        kills = [(start, start + 35) for start in range(100, 3400, 240)]
 
-        # One kill at +300, then a life of almost an hour growing 128 MiB/h past a 7 MiB
-        # start-up rise.
+        def noisy(uptime):
+            return (21 + (7 if uptime >= 30 else 0) + (2.8 if uptime >= 160 else 0)) * mib
+        result = _status(run("noisy-lives", 3600, kills, noisy), checks.check_rss_slope)
+        expect(result.status == checks.PASS and "logit PASS: MiB/h life 1 +" in result.detail
+               and "(limit 266)" in result.detail,
+               f"short lives with an allocator step PASS under the span's limit, got {result}")
+
+        # The same lives leaking 600 MiB/h, 10 MiB a minute.
+        def gross(uptime):
+            return (21 + (7 if uptime >= 30 else 0)) * mib + 600 * mib * uptime / 3600
+        result = _status(run("gross-leak", 3600, kills, gross), checks.check_rss_slope)
+        expect(result.status == checks.FAIL and "logit FAIL: MiB/h life 1 +600.0 (limit 266)"
+               in result.detail,
+               f"a gross leak over short lives FAILs, got {result}")
+
+        # A kill every 150 s for 35 s: each 70 s stretch between fault windows falls inside a
+        # life's warm-up, so the schedule leaves nothing to fit, and the SUT SKIPs, not WARNs.
+        brief = [(start, start + 35) for start in range(100, 3551, 150)]
+        result = _status(run("brief-lives", 3600, brief, gross), checks.check_rss_slope)
+        expect(result.status == checks.PASS
+               and "logit SKIP: the schedule leaves no life 60s to fit past its 120s warm-up"
+               in result.detail,
+               f"lives the warm-up covers SKIP, got {result}")
+
+        # One kill at +300, then a life of almost an hour, both growing 128 MiB/h past a 7 MiB
+        # start-up rise: the first life's 175 s fit sits under its limit, 64 plus 93, and the
+        # second's 3,440 s fit over its own, 64 plus 4.7.
         def growing(uptime):
             return (21 + (7 if uptime >= 30 else 0)) * mib + _FAST_RSS * uptime
         result = _status(run("long-growth", 3900, [(300, 335)], growing),
                          checks.check_rss_slope)
-        expect(result.status == checks.FAIL and "logit FAIL: MiB/h" in result.detail
-               and "life 1 +128.0" in result.detail,
+        expect(result.status == checks.FAIL
+               and "logit FAIL: MiB/h life 0 +128.0 (limit 157), life 1 +128.0 (limit 69)"
+               in result.detail,
                f"growth over a long life still FAILs, got {result}")
 
         # A fault-free run whose one life's first sample past its warm-up is at +120 (it
-        # started at -1) and its last before the end sequence at end_s - 5: 300 s fits at
-        # end_s 425, and 295 s at 420 doesn't, in a run with room for a fit, which WARNs.
+        # started at -1) and its last before the end sequence at end_s - 5: 13 samples over
+        # 60 s fit at end_s 185, and 12 over 55 s at 180 don't, in a run with room for a fit,
+        # which WARNs.
         def flat(uptime):
             return 50 * mib
-        result = _status(run("span-300", 425, [], flat, cooldown=0.0), checks.check_rss_slope)
-        expect(result.status == checks.PASS and "logit PASS: MiB/h life 0 +0.0" in result.detail,
-               f"a 300 s span is fitted, got {result}")
-        result = _status(run("span-295", 420, [], flat, cooldown=0.0), checks.check_rss_slope)
+        result = _status(run("span-60", 185, [], flat, cooldown=0.0), checks.check_rss_slope)
+        expect(result.status == checks.PASS
+               and "logit PASS: MiB/h life 0 +0.0 (limit 334)" in result.detail,
+               f"a 60 s span is fitted, got {result}")
+        result = _status(run("span-55", 180, [], flat, cooldown=0.0), checks.check_rss_slope)
         expect(result.status == checks.WARN
                and "logit WARN: no life with enough samples" in result.detail,
-               f"a 295 s span isn't fitted, got {result}")
+               f"a 55 s span isn't fitted, got {result}")
 
 
 def _expected_rules(root):

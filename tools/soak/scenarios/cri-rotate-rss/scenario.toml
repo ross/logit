@@ -1,8 +1,9 @@
 # cri-rotate's stack and its one cycle of faults on the SUT (a pause, a stop, a restart, and two
 # kills), then over an hour with no fault, to see whether the SUT's resident memory holds flat
 # while `cri_in` keeps following the writer's kubelet rotations, gzips, stalls, and container
-# restart. cri-rotate restarts the SUT four times a cycle, so no life of it lasts long enough for
-# `rss_slope` to fit; here its last life runs from the second kill to the end. cri-rotate's
+# restart. cri-rotate restarts the SUT four times a cycle, so `rss_slope` fits its lives over a
+# minute or two, against a limit that catches only a gross leak; here its last life runs from
+# the second kill to the end, fitted against about the scenario's own limit. cri-rotate's
 # header has the writer, the ledger, and why each fault window holds at most one rotation. The
 # schema is docs/plans/soak-harness.md's "The scenario schema".
 
