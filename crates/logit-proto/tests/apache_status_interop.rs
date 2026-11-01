@@ -22,7 +22,10 @@ fn value<'a>(body: &'a str, key: &str) -> Option<&'a str> {
     body.lines().find_map(|line| line.strip_prefix(key)?.strip_prefix(": "))
 }
 
-fn point(e: &Event) -> (&'static str, &'static str, f64, Vec<(String, String)>) {
+/// A point as `(name, unit, value, attributes)`.
+type Point<'a> = (&'a str, &'a str, f64, Vec<(String, String)>);
+
+fn point(e: &Event) -> Point<'static> {
     assert_eq!(e.metrics.len(), 1);
     let m = &e.metrics[0];
     let v = match m.kind {
@@ -76,7 +79,7 @@ fn every_recorded_page_maps_onto_the_table_and_omits_what_its_variant_omits() {
         assert!(status.malformed.is_empty(), "{name}: {:?}", status.malformed);
         assert_eq!((status.duplicates, status.truncated), (0, false), "{name}");
 
-        let mut want: Vec<(&str, &str, f64, Vec<(String, String)>)> = Vec::new();
+        let mut want: Vec<Point> = Vec::new();
         let num = |key: &str| -> f64 {
             value(body, key).unwrap_or_else(|| panic!("{name}: no {key}")).parse().unwrap()
         };
