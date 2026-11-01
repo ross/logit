@@ -3344,13 +3344,25 @@ fn stdio_json_encode_100_events() {
     expect_allocs("stdio_out: encode 100 events as json", stats, 2);
 }
 
+/// [`fixtures::nginx_batch`] with every event stamped 2026-08-31T06:52:01Z, the fixture line's own
+/// syslog time. The decoder stamps the wall clock, which the rendered lines carry, and a
+/// compressor's allocations follow its input's content: `ruzstd`'s count for one 1 MiB chunk of
+/// these lines ranges over 578 to 584 as the clock's digits change.
+fn s3_batch() -> EventBatch {
+    let mut batch = fixtures::nginx_batch(100);
+    for event in &mut batch.events {
+        event.timestamp = 1_788_159_121_000_000_000;
+    }
+    batch
+}
+
 /// `s3_out` staging one 100-event nginx batch into an open object, warm: the batch encoded,
 /// compressed into the body, and hashed (`logit_outputs::s3::StagedObject::stage`). The object
 /// was opened and one batch staged before the measurement, so the reused encode buffer and the
 /// body have their capacity; what's left is each compressor's own per-batch cost.
 fn s3_stage(format: ObjectFormat, compression: ObjectCompression) -> Stats {
     let mut object = StagedObject::new(format, compression, 8 * 1024 * 1024);
-    let batch = fixtures::nginx_batch(100);
+    let batch = s3_batch();
     object.stage(&batch).expect("should stage");
     let ((), stats) = measure(|| object.stage(&batch).expect("should stage"));
     assert_eq!(object.batches(), 2);
@@ -3379,7 +3391,7 @@ fn s3_stage_json_zstd() {
     );
 }
 
-/// `format: json`, `compression: zstd`, the stage that fills the chunk: 582.
+/// `format: json`, `compression: zstd`, the stage that fills the chunk: 581.
 /// `ruzstd` has no reusable compressor, so each frame builds its own match tables and block
 /// buffers, once per `ZSTD_CHUNK_BYTES` of input rather than per batch. Nine 100-event batches
 /// (108,300 bytes of lines each) stay under the 1 MiB chunk, and the tenth fills it.
@@ -3387,7 +3399,7 @@ fn s3_stage_json_zstd() {
 fn s3_stage_json_zstd_filling_a_chunk() {
     let mut object =
         StagedObject::new(ObjectFormat::Json, ObjectCompression::Zstd, 8 * 1024 * 1024);
-    let batch = fixtures::nginx_batch(100);
+    let batch = s3_batch();
     for _ in 0..9 {
         object.stage(&batch).expect("should stage");
     }
@@ -3395,7 +3407,7 @@ fn s3_stage_json_zstd_filling_a_chunk() {
     let ((), stats) = measure(|| object.stage(&batch).expect("should stage"));
     assert_eq!(before, 0, "nine batches stay in the chunk");
     assert!(object.compressed_bytes() > 0, "the tenth compresses a frame");
-    expect_allocs("s3_out: stage json+zstd, filling a chunk", stats, 582);
+    expect_allocs("s3_out: stage json+zstd, filling a chunk", stats, 581);
 }
 
 /// `format: json`, `compression: none`: 0, the rendered lines appended to the body.
@@ -3415,7 +3427,7 @@ fn s3_stage_json_none() {
 #[test]
 fn s3_stage_json_none_filling_a_part() {
     let mut object = StagedObject::new(ObjectFormat::Json, ObjectCompression::None, 150_000);
-    let batch = fixtures::nginx_batch(100);
+    let batch = s3_batch();
     object.stage(&batch).expect("should stage");
     let ((), stats) = measure(|| object.stage(&batch).expect("should stage"));
     assert_eq!(object.cut_parts(), 1, "the second batch fills the first part");
