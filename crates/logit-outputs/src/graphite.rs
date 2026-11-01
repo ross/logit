@@ -549,9 +549,7 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_connect_refused_is_classified_as_a_clean_fault() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
+        let (addr, _held) = logit_pipeline::test_util::refused_addr();
         let mut output = GraphiteOutput::tcp(addr.to_string(), Duration::from_millis(500));
         let batch = batch_with(vec![gauge_event("hits", 1.0)]);
         let err = output.send(&batch).await.expect_err("connect should fail");

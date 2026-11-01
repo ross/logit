@@ -1097,9 +1097,7 @@ mod tests {
     /// A refused connection is `Clean`: pins `is_connect()`, which `at_most_once` relies on.
     #[tokio::test]
     async fn connect_refused_is_reliably_classified_as_a_clean_fault() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener); // nothing is listening on `addr` any more: a real "connection refused".
+        let (addr, _held) = logit_pipeline::test_util::refused_addr();
 
         let mut output = output_against(addr).await;
         let err = output

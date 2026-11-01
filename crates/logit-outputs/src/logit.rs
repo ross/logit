@@ -1660,9 +1660,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_refused_connect_counts_one_clean_request() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        drop(listener);
+        let (addr, _held) = logit_pipeline::test_util::refused_addr();
+        let addr = addr.to_string();
         let mut probe = TelemetryProbe::new();
         let mut output =
             LogitOutput::new(addr).with_telemetry(probe.telemetry("out", "logit_out", "sink"));
@@ -1723,9 +1722,8 @@ mod tests {
     /// Over a run of every kind of outcome, the `requests` total is the number of `send` calls.
     #[tokio::test]
     async fn every_returned_send_counts_one_request() {
-        let refused = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let refused_addr = refused.local_addr().unwrap().to_string();
-        drop(refused);
+        let (refused_addr, _held) = logit_pipeline::test_util::refused_addr();
+        let refused_addr = refused_addr.to_string();
         let (addr, mut rx) = spawn_real_listener().await;
         let rejecting = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let rejecting_addr = rejecting.local_addr().unwrap().to_string();
@@ -1878,9 +1876,8 @@ mod tests {
 
     #[tokio::test]
     async fn connect_refused_is_classified_clean() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        drop(listener); // nothing listens here now
+        let (addr, _held) = logit_pipeline::test_util::refused_addr();
+        let addr = addr.to_string();
 
         let mut output = LogitOutput::new(addr).with_timeout(Duration::from_millis(300));
         let err = send_next(&mut output, &sample_batch()).await.unwrap_err();

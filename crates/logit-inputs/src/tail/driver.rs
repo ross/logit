@@ -7606,31 +7606,42 @@ mod tests {
 
     /// A pass reads claimable files before the others, so a tracked file whose head the drain
     /// grows past 64 bytes isn't in the snapshot a copy of it is decided against, wherever the
-    /// map puts it: the copy is read at once. Files are added until the copy isn't first in the
-    /// map's order, so a pass in that order would read a tracked file, and offer its candidate,
-    /// before the copy.
+    /// map puts it: the copy is read at once. The map's order comes from its random hash seed,
+    /// so empty copies are added until one sits after a tracked file in that order, where a pass
+    /// in map order would read that file, and offer its candidate, before the copy. The other
+    /// copies stay empty and read nothing.
     #[tokio::test]
     async fn a_pass_reads_claimable_files_before_the_others() {
         let dir = scratch_dir("claim-pass-order");
-        let copy = dir.join("copy.log");
         let long = long_line("long");
-        std::fs::write(dir.join("f0.log"), "short\n").unwrap();
+        let originals: Vec<PathBuf> = (0..8).map(|i| dir.join(format!("f{i}.log"))).collect();
+        for original in &originals {
+            std::fs::write(original, "short\n").unwrap();
+        }
         let mut tailer = Tailer::new(
             vec![PathPattern::new(dir.join("*.log"))],
             LineFactory,
             fast_config(ReadFrom::Beginning),
         );
-        assert_eq!(tick(&mut tailer, true).await.len(), 1);
-        std::fs::File::create_new(&copy).unwrap();
-        assert!(tick(&mut tailer, false).await.is_empty());
-        let mut originals = vec![dir.join("f0.log")];
-        while tailer.files.keys().next() == Some(&id_of(&copy)) {
-            assert!(originals.len() < 32, "the map keeps the copy first");
-            let next = dir.join(format!("f{}.log", originals.len()));
-            std::fs::write(&next, "short\n").unwrap();
-            assert_eq!(tick(&mut tailer, false).await.len(), 1);
-            originals.push(next);
+        assert_eq!(tick(&mut tailer, true).await.len(), originals.len());
+        let original_ids: Vec<FileId> = originals.iter().map(|path| id_of(path)).collect();
+        // Each copy is a new key, so where it lands among the eight originals is a fresh draw
+        // that puts it after one of them about 8 times in 9; 32 draws all landing first is
+        // around 1 in 10^30.
+        let mut copy = None;
+        for attempt in 0..32 {
+            let path = dir.join(format!("copy{attempt}.log"));
+            std::fs::File::create_new(&path).unwrap();
+            assert!(tick(&mut tailer, false).await.is_empty());
+            let id = id_of(&path);
+            let keys: Vec<FileId> = tailer.files.keys().copied().collect();
+            let first_original = keys.iter().position(|k| original_ids.contains(k)).unwrap();
+            if keys.iter().position(|k| *k == id).unwrap() > first_original {
+                copy = Some(path);
+                break;
+            }
         }
+        let copy = copy.expect("a copy after a tracked file in the map's order");
         assert!(tailer.files[&id_of(&copy)].claimable);
 
         for original in &originals {

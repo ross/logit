@@ -1838,9 +1838,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_refused_connection_reports_up_zero() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
+        let (addr, _held) = logit_pipeline::test_util::refused_addr();
         let mut input = input_for(&format!("http://{addr}/metrics"));
         let (tx, mut rx) = mpsc::channel(4);
         let fanout = Fanout::new(vec![tx]);

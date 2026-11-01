@@ -2813,7 +2813,7 @@ mod tests {
     use logit_proto::Decoder;
     use std::sync::{Arc, Mutex};
     use tokio::io::AsyncWriteExt;
-    use tokio::net::{TcpListener, UnixDatagram};
+    use tokio::net::UnixDatagram;
 
     fn batch_with(events: Vec<Event>) -> EventBatch {
         EventBatch { resource: Arc::new(Resource::default()), scope: None, events }
@@ -5862,9 +5862,7 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_connect_refused_is_classified_as_a_clean_fault() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
+        let (addr, _held) = logit_pipeline::test_util::refused_addr();
         let mut output = StatsdOutput::tcp(addr.to_string(), Duration::from_millis(500));
         let batch = batch_with(vec![metric_event("a", MetricKind::counter(1.0), &[])]);
         let err = output.send(&batch).await.expect_err("connect should fail");
@@ -6248,9 +6246,8 @@ mod tests {
     /// once, and a failed retry is `Fault::Clean`.
     #[tokio::test]
     async fn a_plaintext_zero_byte_write_still_reconnects_once() {
-        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let dead_addr = dead.local_addr().unwrap().to_string();
-        drop(dead); // now nothing is listening there
+        let (dead_addr, _held) = logit_pipeline::test_util::refused_addr();
+        let dead_addr = dead_addr.to_string();
 
         let fake = FakeStream::new().on_write(1, WriteStep::Fail(std::io::ErrorKind::BrokenPipe));
         let mut output = with_pooled_fake(&dead_addr, &fake, false);

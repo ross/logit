@@ -798,10 +798,12 @@ mod tests {
         Arc::new(move |name| vars.get(name).cloned())
     }
 
-    /// Endpoints that answer nothing: IMDS and the container base are a closed port.
+    /// Endpoints that answer nothing: IMDS and the container base are a refused port, held bound
+    /// for the rest of the process so no other test is handed it.
     fn closed() -> Endpoints {
-        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-        let base = format!("http://127.0.0.1:{port}");
+        let (addr, held) = logit_pipeline::test_util::refused_addr();
+        std::mem::forget(held);
+        let base = format!("http://{addr}");
         Endpoints { imds: base.clone(), container: base.clone(), sts: Some(base) }
     }
 

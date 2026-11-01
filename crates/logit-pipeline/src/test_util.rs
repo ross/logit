@@ -402,6 +402,16 @@ pub async fn drive_write_loop_over<O: crate::Output + Send>(
         .unwrap_or_else(|_| panic!("write_loop still running after {RECV_TIMEOUT:?}"));
 }
 
+/// A `127.0.0.1` address that refuses every connect, and the guard that keeps it so. The guard is
+/// a bound socket that never listens: Linux answers a connect to such a port with a reset, and
+/// the held bind keeps another test from being handed the port, which a bound-then-dropped
+/// listener doesn't. Keep the guard alive for the whole test body.
+pub fn refused_addr() -> (std::net::SocketAddr, tokio::net::TcpSocket) {
+    let socket = tokio::net::TcpSocket::new_v4().expect("create a TCP socket");
+    socket.bind("127.0.0.1:0".parse().unwrap()).expect("bind a loopback port");
+    (socket.local_addr().expect("bound socket address"), socket)
+}
+
 static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// A new, empty directory at `{tmp}/logit-test-{label}-{pid}-{seq}`. A leftover directory at that
@@ -507,5 +517,19 @@ mod tests {
         assert_eq!(std::fs::read_dir(&a).unwrap().count(), 0);
         std::fs::remove_dir_all(a).unwrap();
         std::fs::remove_dir_all(b).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_connect_to_the_held_address_is_refused_while_the_guard_lives() {
+        let (addr, _held) = refused_addr();
+        let err = tokio::net::TcpStream::connect(addr).await.expect_err("nothing listens");
+        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
+    }
+
+    #[tokio::test]
+    async fn the_held_port_cannot_be_bound_by_another_socket() {
+        let (addr, _held) = refused_addr();
+        let err = std::net::TcpListener::bind(addr).expect_err("the guard holds the port");
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
     }
 }

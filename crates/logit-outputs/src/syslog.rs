@@ -2614,9 +2614,7 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_connect_refused_is_classified_as_a_clean_fault() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener); // now nothing is listening on `addr`
+        let (addr, _held) = logit_pipeline::test_util::refused_addr();
         let mut output = SyslogOutput::tcp(addr.to_string(), Duration::from_millis(500));
         let batch = batch_with(vec![log_event(0, "x", None)]);
         let err = output.send(&batch).await.expect_err("connect should fail");
@@ -3140,9 +3138,8 @@ mod tests {
     /// `Fault::Clean` when that fails too.
     #[tokio::test]
     async fn a_plaintext_write_failure_still_reconnects_once_and_stays_clean() {
-        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let dead_addr = dead.local_addr().unwrap().to_string();
-        drop(dead); // now nothing is listening there
+        let (dead_addr, _held) = logit_pipeline::test_util::refused_addr();
+        let dead_addr = dead_addr.to_string();
 
         let fake = FakeStream::new().on_write(1, WriteStep::Fail(std::io::ErrorKind::BrokenPipe));
         let mut probe = TelemetryProbe::new();

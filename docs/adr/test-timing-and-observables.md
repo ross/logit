@@ -44,7 +44,10 @@ Tests follow these rules. A reviewer can check each one on a diff.
    through `build_spec` reads the address from `Input::bound_addr` or `Output::bound_addr` on the
    boxed trait object; see "Amendment: a boxed `dyn Input` reports its address". A child
    process binds port `0` and reports the port it got; see "Amendment: a child process picks its
-   own port".
+   own port". A test that needs an address that refuses connects holds a bound, non-listening
+   socket for its whole body (`logit_pipeline::test_util::refused_addr`, 2026-11-01); a
+   listener bound and then dropped leaves the port free for a parallel test to take, and the
+   connect then succeeds.
 3. **A timing constant states its interval, its margin, and what each side of the margin
    protects.** Commit 47142b7b's comment is the model. A wall-clock bound over work that scales
    with CPU is at least 10x a gap measured under load, or it bounds progress instead of time.
