@@ -1,6 +1,6 @@
 ---
 created: 2026-10-31
-updated: 2026-10-31
+updated: 2026-11-01
 ---
 
 # Server status inputs: `nginx_stub_status_in` and `apache_status_in` on a scrape driver shared with `prometheus_in`
@@ -341,6 +341,22 @@ HTML page, will be a `parse_error`.
 A listed key that's absent will emit nothing and count nothing: `ExtendedStatus Off` drops every
 `Total*` and `CPU*` key, a non-async MPM drops the `Conns*` keys, and `mod_status` omits `CPULoad`
 when CPU time is zero. `scrape_samples_scraped` will show how many points a page gave.
+
+The value types are narrow. A count is ASCII digits that fit an `I64`, so a sign, a fraction, or a
+value past `i64::MAX` is a malformed value, and so is a `Total kBytes` whose value × 1024 doesn't
+fit; `apache_status_in` has no `out_of_range` reason of its own. A float is a finite number written
+with digits, `.`, an exponent, and signs, so Rust's own `inf` and `nan` spellings are malformed. A
+negative float is kept: `Load1` reads `-1.00` when the host's load average is unavailable. Only a
+trailing `\r` is removed from a value, never a space, since `mod_status` writes none. Last-wins
+applies to the raw value, so a key whose last value is malformed is skipped even when an earlier
+one parsed. An unterminated last line is counted only on a page that parses: on a `parse_error`
+nothing is read, so nothing is counted beyond the scrape's class. A `Scoreboard` with an empty
+value gives the eleven states at `0` and `apache.worker.limit` at `0`. The `malformed_value`
+diagnostic names the key and the type it should have been, never the value.
+
+The `event` MPM refreshes the `Conns*` counts only when one of its timeout queues expires an entry
+(`listener_thread` in `server/mpm/event/event.c`), so on a quiet server they trail the connections
+it holds (tested: a page read 0 with keepalive connections open until a keepalive timeout passed).
 
 **Mapping** (the Collector's new-format names only, never the old duplicates; every name, unit, and
 attribute checked against `apachereceiver`'s `metadata.yaml`, and the `apache.cpu.time` attribute

@@ -1732,7 +1732,7 @@ recipe and what the split does to the data. `logit validate` rejects `reuse_port
 `transport: unix` or `unix_stream` and on a `datadog_trace_in` without `bind:`, none of which has
 a port to share; on a multicast `bind:`, whose group already delivers every datagram to every
 member (rule 80); and in `prometheus_in`'s scrape mode or `prometheus_out`'s remote-write mode,
-which bind nothing (rules 55 and 56). `nginx_stub_status_in` has no `reuse_port:` field, since it binds nothing either.
+which bind nothing (rules 55 and 56). `nginx_stub_status_in` and `apache_status_in` have no `reuse_port:` field, since they bind nothing either.
 
 ### Recording the sender: `peer`, `proxy_protocol`, and `forwarded`
 
@@ -4752,14 +4752,16 @@ Native histograms are skipped and counted on both wires regardless of version
 
 ## Server status pages
 
-`nginx_stub_status_in` scrapes nginx's `stub_status` page on an interval and turns it into the
-OpenTelemetry Collector's `nginxreceiver` metrics. It reads freenginx's, Angie's, and Tengine's
-pages too. It takes `prometheus_in`'s scrape-mode keys under the same names and defaults
+Two inputs scrape a web server's own status page on an interval and turn it into the
+OpenTelemetry Collector's metric names: `nginx_stub_status_in` reads nginx's `stub_status` page
+(and freenginx's, Angie's, and Tengine's), and `apache_status_in` reads Apache httpd's
+`mod_status` page. Both take `prometheus_in`'s scrape-mode keys under the same names and defaults
 (`scrape_targets:`, `interval:`, `timeout:`, `headers:`, and `scrape_tls:`), so a block copied
-between the two works, and it adds the same `up`, `scrape_duration_seconds`, and
-`scrape_samples_scraped` series per target per scrape, so one `up == 0` alert covers both. The
-decoder's module doc, `crates/logit-proto/src/nginx_status.rs`, has the grammar and the mapping
-table ([ADR `server-status-scrape-inputs`](adr/server-status-scrape-inputs.md)).
+between them works, and both add the same `up`, `scrape_duration_seconds`, and
+`scrape_samples_scraped` series per target per scrape, so one `up == 0` alert covers every scrape
+kind. Each decoder's module doc, `crates/logit-proto/src/nginx_status.rs` and
+`crates/logit-proto/src/apache_status.rs`, has its grammar and mapping table
+([ADR `server-status-scrape-inputs`](adr/server-status-scrape-inputs.md)).
 
 ```yaml
 components:
@@ -4767,15 +4769,35 @@ components:
     type: nginx_stub_status_in
     scrape_targets: ["http://127.0.0.1:8081/nginx_status"]
 
+  apache_status:
+    type: apache_status_in
+    scrape_targets: ["http://127.0.0.1:8082/server-status?auto"]
+
   out:
     type: otlp_out
-    sources: [nginx_status]
+    sources: [nginx_status, apache_status]
     endpoint: http://collector:4318
 ```
 
-Serve the page on an internal interface or network only. It discloses connection counts. Put
-the `stub_status` location in its own `server` block with a `listen` on a loopback or internal
-address, or restrict it with `allow` and `deny`:
+**Serve each page on an internal interface or network only.** Both pages disclose connection
+counts, and Apache's also discloses the server's version and MPM.
+
+What to expect from both:
+
+- **Each target is its own resource.** Its events carry `server.address` (the URL's host, an
+  IPv6 address without brackets), `server.port`, and `url.path`, so two pages behind one proxy at
+  one host and port stay apart. The query string is left out, since it may hold a credential.
+- **The scrape counts itself.** Both servers count `logit`'s request in their request totals.
+- **A page the decoder can't read fails the scrape.** `up` reads `0`, no decoded events are
+  emitted, the scrape counts as `logit.input.scrapes{class="parse_error"}`, and the
+  `scrape_failed` diagnostic says why.
+- **No point carries a start time.** A server restart reads as the counters decreasing, which a
+  downstream reset check handles.
+
+### nginx `stub_status`
+
+Put the `stub_status` location in its own `server` block with a `listen` on a loopback or
+internal address, or restrict it with `allow` and `deny`:
 
 ```nginx
 server {
@@ -4787,28 +4809,66 @@ server {
 }
 ```
 
-What to expect from the data:
-
-- **Each target is its own resource.** Its events carry `server.address` (the URL's host, an
-  IPv6 address without brackets), `server.port`, and `url.path`, so two pages behind one proxy at
-  one host and port stay apart. The query string is left out, since it may hold a credential.
-- **The scrape counts itself.** nginx counts `logit`'s request in `nginx.requests` and in the
-  `writing` state, so an idle server reads `requests` rising by one per scrape and `writing` at
-  `1`.
+- **The scrape is in `requests` and `writing`.** An idle server reads `nginx.requests` rising by
+  one per scrape and the `writing` state at `1`.
 - **`active` overlaps the other states.** It counts every client connection, so summing
   `nginx.connections_current` across `state` double-counts.
-- **A page that isn't a `stub_status` page fails the scrape.** `up` reads `0`, no decoded events
-  are emitted, the scrape counts as `logit.input.scrapes{class="parse_error"}`, and the
-  `scrape_failed` diagnostic says which line didn't match. A body cut short counts the same way.
+- **The page is fixed-format.** Any other body fails the scrape, and the diagnostic says which
+  line didn't match. A body cut short counts the same way.
 - **A field past `i64::MAX` is dropped, counted.** nginx prints its counters unsigned, so a
   connection gauge that dips below zero prints as a number near 2^64. That field is left out and
   counted `logit.input.metrics.dropped{reason="out_of_range"}`, and the rest of the page still
   arrives with `up` at `1`.
-- **No point carries a start time.** A server restart reads as the counters decreasing, which a
-  downstream reset check handles. A `reload` keeps them.
+- **A `reload` keeps the counters.** They live in shared memory and reset only when the master
+  process restarts.
 
-The three counters are cumulative monotonic sums and the connection states are gauges, so each
-sink handles them differently:
+### Apache httpd `mod_status`
+
+The target URL needs `auto` in its query string, as in `http://127.0.0.1:8082/server-status?auto`.
+Without it, Apache serves its HTML page, every scrape fails as `parse_error`, and the diagnostic
+says to add `?auto`. `logit validate` doesn't check for it, because a proxy in front of the server
+may add it. Serve the handler from its own `<VirtualHost>` on a loopback or internal address, and
+restrict it with `Require local` or `Require ip`:
+
+```apache
+Listen 127.0.0.1:8082
+<VirtualHost 127.0.0.1:8082>
+    <Location "/server-status">
+        SetHandler server-status
+        Require local
+    </Location>
+</VirtualHost>
+```
+
+- **Which metrics a page carries depends on the server.** `ExtendedStatus Off` drops
+  `apache.request.count`, `apache.traffic`, `apache.request.time`, `apache.cpu.time`, and
+  `apache.cpu.load`. The `prefork` and `worker` MPMs drop `apache.connection.active` and
+  `apache.connection.status`, which only the `event` MPM reports. An absent key emits nothing and
+  counts nothing; `scrape_samples_scraped` shows how many points each page gave.
+- **The scoreboard is per state.** `apache.worker.status` has one point per
+  `apache.worker.state` on every scrape, `0` included, plus `unknown` when the scoreboard holds a
+  character `mod_status` doesn't document. `apache.worker.limit` is the scoreboard's length: the
+  configured worker limit, plus any slot past it whose process is still running.
+- **`apache.cpu.time` is a gauge.** A child process's CPU time leaves the total when the process
+  exits, so the value can fall while the server runs. A graceful restart keeps the request,
+  traffic, and duration counters; a full restart zeroes them and `apache.uptime`, but not the CPU
+  time.
+- **The `event` MPM's connection counts lag.** It refreshes `ConnsTotal` and the `ConnsAsync*`
+  counts only when one of its timeout queues expires an entry, so on a quiet server they can trail
+  the connections it holds.
+- **`apache.load.*` is the host's load average**, not Apache's.
+- **What the page can't say is counted.** A value that doesn't parse is skipped and counted
+  `logit.input.metrics.dropped{reason="malformed_value"}`, with a `malformed_value` diagnostic
+  naming the key. A key that repeats keeps its last value, counted
+  `logit.input.metrics.normalized{reason="duplicate_key"}`. A last line with no newline was cut
+  short: it's discarded and counted `logit.input.lines.dropped{reason="truncated"}`, and the
+  lines before it are still read. In each case `up` stays at `1`.
+
+### Counters and units at each sink
+
+The counters (`nginx.connections_accepted`, `nginx.connections_handled`, `nginx.requests`,
+`apache.uptime`, `apache.request.count`, `apache.traffic`, and `apache.request.time`) are
+cumulative monotonic sums, and everything else is a gauge, so each sink handles them differently:
 
 | Sink | The counters arrive as |
 |---|---|
@@ -4818,15 +4878,14 @@ sink handles them differently:
 | `statsd_out` | `\|g` gauges of the running total; a `cumulative_to_delta` upstream makes them `\|c` deltas |
 | `influxdb_out`, `graphite_out` | the running total, so take a rate in the query |
 
-`prometheus_out`'s OpenMetrics exposition can't write these units: `{connections}` and
-`{requests}` aren't a family-name suffix. It leaves them off and counts
-`logit.output.metrics.degraded{reason="unit_not_suffix"}` once per family on every write, so
-that count is expected for these series. The text 0.0.4 exposition writes no unit and counts
-nothing.
+`prometheus_out`'s OpenMetrics exposition can write a unit only when it ends the family name, so
+it leaves off every unit these inputs set except `apache.load.1`'s `1`, and counts
+`logit.output.metrics.degraded{reason="unit_not_suffix"}` once per family on every write. That
+count is expected for these series. The text 0.0.4 exposition writes no unit and counts nothing.
 
-`nginx_stub_status_in` doesn't set `host.name`, so `datadog_out`, `splunk_hec_out`, and
-`syslog_out` send `logit`'s own hostname as each event's host (see [Hostname](#hostname)). To
-send the server's, add a `set` after the component:
+Neither input sets `host.name`, so `datadog_out`, `splunk_hec_out`, and `syslog_out` send
+`logit`'s own hostname as each event's host (see [Hostname](#hostname)). To send the server's,
+add a `set` after each component:
 
 ```yaml
   nginx_host:
@@ -4834,6 +4893,19 @@ send the server's, add a `set` after the component:
     sources: [nginx_status]
     resource:
       host.name: web-1
+```
+
+### HAProxy
+
+HAProxy has no status input of its own, because it ships a Prometheus exporter: turn it on with
+`http-request use-service prometheus-exporter` on a frontend, and scrape that with
+`prometheus_in`. `haproxy -vv` lists `prometheus-exporter` under its services when the build
+includes it.
+
+```haproxy
+frontend stats
+    bind 127.0.0.1:8405
+    http-request use-service prometheus-exporter if { path /metrics }
 ```
 
 ## VictoriaMetrics, VictoriaLogs, and VictoriaTraces
@@ -5079,7 +5151,7 @@ for the gap that leaves, which `otlp_in.idle_timeout` (off by default) closes: s
 a request that starts right at the idle deadline.
 
 **`tls.insecure_skip_verify`** disables server-certificate verification. Every client `tls:` block
-honors it, as do `prometheus_in`'s and `nginx_stub_status_in`'s `scrape_tls:`. The connection is still encrypted, but any
+honors it, as do the `scrape_tls:` blocks of `prometheus_in`, `nginx_stub_status_in`, and `apache_status_in`. The connection is still encrypted, but any
 certificate is accepted. `logit` logs a startup warning whenever it's set. Use it only for a
 throwaway or pre-production endpoint, not a real deployment. Validation rejects it together with
 `ca_file`, because a specific trusted CA and "trust nothing" contradict each other.
@@ -5112,7 +5184,7 @@ routes on SNI can't be reached by IP.
 
 ### Certificate rotation
 
-Every TLS listener, every TLS sink, and the scrape client of `prometheus_in` and `nginx_stub_status_in` reload their certificate,
+Every TLS listener, every TLS sink, and the scrape client of `prometheus_in`, `nginx_stub_status_in`, and `apache_status_in` reload their certificate,
 key, and CA files with no restart. A renewed certificate takes effect without dropping a queue,
 an `aggregate` window, or a UDP port.
 
@@ -5367,6 +5439,7 @@ Which component takes which block:
 | `kafka_out` | `TlsClientConfig` | the block's presence | brokers are `host:port`, so even `tls: {}` turns TLS on |
 | `prometheus_in` (`scrape_tls:`) | `TlsClientConfig` | an `https://` scrape target | scrape mode is a client, not a listener; a set block with no `https://` target is rule 40 |
 | `nginx_stub_status_in` (`scrape_tls:`) | `TlsClientConfig` | an `https://` scrape target | a client, not a listener; a set block with no `https://` target, or with no targets at all, is rule 40 |
+| `apache_status_in` (`scrape_tls:`) | `TlsClientConfig` | an `https://` scrape target | a client, not a listener; a set block with no `https://` target, or with no targets at all, is rule 40 |
 | `prometheus_in` (`bind_tls:`) | `TlsServerConfig` | the block's presence | the remote-write receiver's own listener; bind mode only (rule 55) |
 | `prometheus_out` (`bind_tls:`) | `TlsServerConfig` | the block's presence | the exposition's listener, HTTP/1.1; registry mode only (rule 56) |
 | `otlp_in` | `TlsServerConfig` | the block's presence | both transports |

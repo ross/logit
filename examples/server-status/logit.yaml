@@ -1,0 +1,52 @@
+# Scrapes an nginx's and an Apache httpd's status pages every 15 seconds and sends their
+# connection, request, and worker metrics to VictoriaMetrics over Prometheus remote write:
+#
+#   nginx  /nginx_status         -> nginx_status (nginx_stub_status_in) -> nginx_host ---\
+#   Apache /server-status?auto   -> apache_status (apache_status_in) -> apache_host -> victoria
+#
+# Every scrape also writes `up`, 1 or 0, per page, so one alert on `up == 0` covers both servers.
+# Request and traffic totals arrive as counters (`nginx_requests_total`,
+# `apache_request_count_total`): take a rate in the query. The names follow the OpenTelemetry
+# Collector's nginx and Apache receivers.
+#
+# Before running it:
+#   - serve each page on an internal address only. Both pages disclose connection counts, and
+#     Apache's also shows its version. For nginx, a `server` with `listen 127.0.0.1:8081;` and
+#     `location = /nginx_status { stub_status; }`. For Apache, a `<VirtualHost 127.0.0.1:8082>`
+#     holding `<Location "/server-status">` with `SetHandler server-status` and `Require local`;
+#   - keep `?auto` on Apache's URL. Without it Apache serves its HTML page and every scrape fails;
+#   - expect each server's request count to rise by one per scrape: the scrape is a request.
+
+admin:
+  bind: 0.0.0.0:9600
+
+components:
+  nginx_status:
+    type: nginx_stub_status_in
+    scrape_targets: ["http://127.0.0.1:8081/nginx_status"]
+    interval: 15s
+
+  apache_status:
+    type: apache_status_in
+    scrape_targets: ["http://127.0.0.1:8082/server-status?auto"]
+    interval: 15s
+
+  # Neither input knows the machine's name: each event's resource carries the page's address
+  # (server.address, server.port, url.path). Name each server so its series read as that host.
+  nginx_host:
+    type: set
+    sources: [nginx_status]
+    resource:
+      host.name: web-1
+
+  apache_host:
+    type: set
+    sources: [apache_status]
+    resource:
+      host.name: web-1
+
+  victoria:
+    type: prometheus_out
+    sources: [nginx_host, apache_host]
+    endpoint: http://victoriametrics:8428/api/v1/write
+    version: 1

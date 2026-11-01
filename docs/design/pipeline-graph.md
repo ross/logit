@@ -202,7 +202,7 @@ native transform — take no suffix, because a transform has only one direction.
 
 **`interval` is a per-kind field.** `lua`/`lua_file` carry an optional flush interval
 (`docs/adr/aggregation-window-semantics.md`); `aggregate`, `internal`, `shape`,
-`prometheus_in`, and `nginx_stub_status_in` require one. Rule 9 rejects a zero `interval` on any kind that has one, via
+`prometheus_in`, `nginx_stub_status_in`, and `apache_status_in` require one. Rule 9 rejects a zero `interval` on any kind that has one, via
 `graph.rs`'s `interval()` table.
 
 **`Component` flattens `ComponentKind` with `#[serde(flatten)]`.** `schemars` 0.8 (pinned in
@@ -242,7 +242,7 @@ literal argument string.
 
 | Kind class | `sources` | May be another component's source |
 |---|---|---|
-| Listener (`statsd_in`, `lines_in`, `collectd_in`, `graphite_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `cri_in`, `logit_in`, `internal`, `prometheus_in`, `nginx_stub_status_in`, `generate_in`, `replay_in`) | must be empty | required (≥1 consumer) |
+| Listener (`statsd_in`, `lines_in`, `collectd_in`, `graphite_in`, `syslog_in`, `otlp_in`, `tail_in`, `docker_in`, `cri_in`, `logit_in`, `internal`, `prometheus_in`, `nginx_stub_status_in`, `apache_status_in`, `generate_in`, `replay_in`) | must be empty | required (≥1 consumer) |
 | Transform (`lua`, `lua_file`, `aggregate`, `json`, `csv`, `kv_metrics`, `keep`, `remove`, `set`, `trace_context`, `scale`, `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `has_stale`, `drop_stale`, `cumulative_to_delta`, `dedup_timestamps`, `keep_values`, `bucket`, `logfmt`, `kv`, `regex`, `shape`, `flatten`, `line_protocol`, `http_access`, `sample`, `timestamp`, `route`, `route_signals`) | ≥1 required | required (≥1 consumer), except `route_signals`, which must have none (rule 92) |
 | Sink (`influxdb_out`, `stdio_out`, `file_out`, `otlp_out`, `datadog_out`, `datadog_trace_out`, `splunk_hec_out`, `kafka_out`, `syslog_out`, `logit_out`, `statsd_out`, `collectd_out`, `graphite_out`, `prometheus_out`, `null_out`) | ≥1 required | must not be |
 | Target (`target`) | must be empty | required (≥1 consumer), and ≥1 directing router (rule 49) |
@@ -399,11 +399,12 @@ a black hole counts what it discards as `events.discarded`.
     `series_retention` or `max_retained_series` of `0`; in either mode, `series_retention` above `0`
     with `max_retained_series: 0`, a `max_series` or `max_series_per_metric` of `0`, and a
     `max_samples_per_series` or `max_set_members_per_series` of `0`.
-40. A scrape-mode `prometheus_in` or an `nginx_stub_status_in` with a bad target URL,
-    `timeout: 0s`, a bad `scrape_tls:`, or a reserved or colliding header (`accept-encoding` among
-    them). Every scrape kind shares the checks. An `nginx_stub_status_in` with no target is legal and
-    scrapes nothing, but the other checks still run on it, so a set `scrape_tls:` is rejected.
-    A `prometheus_in` with no target is rule 55's.
+40. A scrape-mode `prometheus_in`, an `nginx_stub_status_in`, or an `apache_status_in` with a bad
+    target URL, `timeout: 0s`, a bad `scrape_tls:`, or a reserved or colliding header
+    (`accept-encoding` among them). Every scrape kind shares the checks. An `nginx_stub_status_in`
+    or `apache_status_in` with no target is legal and scrapes nothing, but the other checks still
+    run on it, so a set `scrape_tls:` is rejected. A `prometheus_in` with no target is rule 55's.
+    An `apache_status_in` target without `?auto` is legal: a proxy may add it.
 41. A registry-mode `prometheus_out` `path` not starting with `/`, or `max_series: 0`.
 42. A `generate_in` `batch` or `rate` of `0`, an empty key or metric name, a non-finite metric
     value, or an unknown or unbounded template placeholder.

@@ -1253,6 +1253,28 @@ The decoder adds one counter:
 |---|---|---|
 | `logit.input.metrics.dropped{reason="out_of_range"}` | count | one per page field whose digits don't fit an `i64`, left out of the page's events while the rest are emitted and `up` stays `1`. nginx prints the counters unsigned, so a connection gauge transiently below zero prints near 2^64 |
 
+##### `apache_status_in`
+
+`crates/logit-inputs/src/apache_status.rs`, on the same scrape driver, codec in
+`crates/logit-proto/src/apache_status.rs`,
+[ADR `server-status-scrape-inputs`](../adr/server-status-scrape-inputs.md).
+
+The driver's counters and diagnostic, as for `nginx_stub_status_in`: `logit.input.scrapes{class}`
+(`parse_error` is a `2xx` body with none of the `?auto` page's keys, such as the HTML page a URL
+without `?auto` gets, and its `scrape_failed` message says to add `?auto`),
+`logit.input.scrape.duration`, `logit.input.samples` (the events a page decoded, at most 31), and
+`scrape_failed`. It has no connection metrics: it's a client.
+
+The decoder adds three counters and one diagnostic, none of which changes `up` from `1`:
+
+| Name | Kind | Meaning |
+|---|---|---|
+| `logit.input.metrics.dropped{reason="malformed_value"}` | count | one per mapped key whose value doesn't parse as its type (a count that isn't digits or doesn't fit an `i64`, a float that isn't a finite `%g` form), left out while the rest of the page is emitted |
+| `logit.input.metrics.normalized{reason="duplicate_key"}` | count | one per line repeating a mapped key; the last value wins, as in the Collector's receiver |
+| `logit.input.lines.dropped{reason="truncated"}` | count | one per page whose last line has no newline: that line was cut short and is discarded, and the lines before it are read |
+
+`malformed_value` (throttled) names the key and the type it should have been, never the value.
+
 ##### `datadog_in`
 
 `crates/logit-inputs/src/datadog.rs`, codec in `crates/logit-proto/src/datadog/`,

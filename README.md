@@ -98,7 +98,7 @@ DOT format. [examples/](examples) has complete starting configs, each with a ren
 
 | Role | Types |
 |---|---|
-| Inputs | `statsd_in` (statsd and DogStatsD), `syslog_in`, `otlp_in`, `prometheus_in` (scrape or remote-write), `nginx_stub_status_in` (nginx's `stub_status` page), `datadog_in` (Datadog's intake API), `datadog_trace_in` (a Datadog Agent's APM API), `splunk_hec_in` (Splunk's HTTP Event Collector), `collectd_in`, `graphite_in`, `lines_in` (plain newline-delimited lines), `tail_in`, `docker_in`, `cri_in` (Kubernetes container logs), `logit_in`, `internal` (`logit`'s own telemetry), `generate_in`, `replay_in` (a `format: json` or `format: native` archive, read once) |
+| Inputs | `statsd_in` (statsd and DogStatsD), `syslog_in`, `otlp_in`, `prometheus_in` (scrape or remote-write), `nginx_stub_status_in` (nginx's `stub_status` page), `apache_status_in` (Apache httpd's `mod_status` page), `datadog_in` (Datadog's intake API), `datadog_trace_in` (a Datadog Agent's APM API), `splunk_hec_in` (Splunk's HTTP Event Collector), `collectd_in`, `graphite_in`, `lines_in` (plain newline-delimited lines), `tail_in`, `docker_in`, `cri_in` (Kubernetes container logs), `logit_in`, `internal` (`logit`'s own telemetry), `generate_in`, `replay_in` (a `format: json` or `format: native` archive, read once) |
 | Parsers | `json`, `csv`, `logfmt`, `kv`, `regex`, `http_access`, `line_protocol` (one event per InfluxDB line-protocol point in a log message) |
 | Reshaping | `set`, `remove`, `keep`, `keep_values`, `flatten`, `scale`, `bucket`, `kv_metrics`, `trace_context`, `timestamp` |
 | Filtering and sampling | `has_signal`, `keep_signals`, `drop_signals`, `has_attributes`, `drop_attributes`, `has_provenance`, `drop_provenance`, `has_stale`, `drop_stale`, `sample` |
