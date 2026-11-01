@@ -1,0 +1,150 @@
+# cri-rotate's stack and its one cycle of faults on the SUT (a pause, a stop, a restart, and two
+# kills), then over an hour with no fault, to see whether the SUT's resident memory holds flat
+# while `cri_in` keeps following the writer's kubelet rotations, gzips, stalls, and container
+# restart. cri-rotate restarts the SUT four times a cycle, each time before the life holds 60 s
+# past its warm-up, so `rss_slope` fits at most the life that runs into the cooldown; here the
+# SUT's last life runs from the second kill to the end, fitted against about the scenario's own
+# limit. cri-rotate's
+# header has the writer, the ledger, and why each fault window holds at most one rotation. The
+# schema is docs/plans/soak-harness.md's "The scenario schema".
+
+name = "cri-rotate-rss"
+description = "cri-rotate's stack and one cycle of its SUT faults, then over an hour quiet: does the SUT's RSS hold flat while cri_in follows kubelet rotations"
+duration = "70m"          # rss_slope fits the last life from +9m05s to +70m, about 61 minutes
+# One cycle, the longest the duration fits: the next would start at the cooldown. A longer
+# --duration repeats the faults, which the writer's retention allows, as in cri-rotate.
+cycle = "67m"
+warmup = "60s"
+cooldown = "120s"         # >= recovery_bound
+recovery_bound = "45s"    # retry_max_delay 10s + two aggregate windows + a drain
+# As partition-rss: rss_slope's fit starts past a backlog's release, here the kill's replay.
+rss_settle = "120s"
+compose = "compose.override.yaml"   # the shared directory, and the writer in place of `logit`
+
+# The SUT's last life is the scenario's point: an rss_slope that can't fit it FAILs too.
+[expected]
+rss_slope = { logit = "PASS" }
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "cri-writer.json"   # criwriter.py's config, mounted at /config.yaml
+
+[ledger]
+sut_aggregate = "window"
+wire_loss_outside_faults = 0.0
+vm_every_window = true    # one series, written in every window the tailer reads in
+
+[[ledger.source]]
+service = "generator"
+generator_input = "load"
+generator_sink = "pods"   # the writer's own ids: G is its finished lines, events.delivered
+sut_listener = "pods"
+wire = "cri"              # W − S is cri_in's events less its partial_timeout flushes
+sut_transforms = ["identity", "labels", "count", "metrics_only"]   # cri_in to aggregate
+
+[[ledger.sink]]
+id = "victoria_metrics"
+backend = "victoria-metrics"
+vm_selector = '{__name__="soak_lines_total"}'
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64   # WARN under 1h, FAIL above
+# The tailer holds the live file of each attempt and the newest rotated file of the live one;
+# the kubelet's compression closes the rest.
+fd_growth = 10
+
+# Each down window is 35 s, under the writer's 45 s rotation less a drain on each side, so it
+# holds at most one rotation: a second would compress the file the SUT stopped reading in,
+# which `cri_in` never reads, and `ledger.wire` FAILs that as the scenario's fault. One rotation
+# can still compress the file the previous rotation renamed, when a stop or kill shortly after
+# that rotation left the checkpoint pinned at the split head at its end: `cri_in` counts the
+# head's bytes gone, and `drops` excuses them from the writer's rotation records.
+
+# The tailer stops reading; the writer doesn't, so it catches up after.
+[[step]]
+at = "0s"
+action = "pause"
+on = "logit"
+for = "35s"
+
+# A clean stop writes a final checkpoint and keeps each held run unsent, pinned at its first
+# record: the restart reads it whole, so it doesn't split, but the other stream's lines after the
+# pin replay, which the cri wire's replay band allows when the stop lands inside a stall.
+[[step]]
+at = "1m15s"
+action = "stop"
+on = "logit"
+for = "35s"
+
+[[step]]
+at = "2m30s"
+action = "restart"
+on = "logit"
+for = "30s"
+
+# A SIGKILL writes no final checkpoint: what was read after the last one replays, and a
+# rotation inside the kill leaves the live file under its rotated name, found by its inode at
+# the restart.
+[[step]]
+at = "3m30s"
+action = "kill"
+on = "logit"
+for = "35s"
+
+[[step]]
+at = "4m45s"
+action = "kill"
+on = "logit"
+for = "35s"
+
+# Each stall and each rotation's split line leaves a run that only `partial_timeout` sends:
+# about 29 stalls and 13 rotations in a default run, a rotation inside a stall splitting
+# nothing. A run held across a SUT stop can complete before the restart reads it, so the floor
+# is well below their sum.
+[[expect]]
+name = "partial-timeout-flushes"
+service = "logit"
+metric = "logit.input.frames.truncated"
+component = "pods"
+attrs = { reason = "partial_timeout" }
+window = "run"
+reduce = "delta"
+min = 10
+
+# No line is oversize, malformed, or truncated in place, so `cri_in` drops none.
+[[expect]]
+name = "no-frames-dropped"
+service = "logit"
+metric = "logit.input.frames.dropped"
+component = "pods"
+window = "run"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "files-rotated"
+service = "logit"
+metric = "logit.input.files.rotated"
+component = "pods"
+window = "run"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "no-resume-rejected"
+service = "logit"
+metric = "logit.input.files.resume_rejected"
+component = "pods"
+window = "run"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "no-checkpoint-errors"
+service = "logit"
+metric = "logit.input.checkpoint.errors"
+component = "pods"
+window = "run"
+reduce = "delta"
+max = 0
