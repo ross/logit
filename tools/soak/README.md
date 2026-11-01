@@ -475,6 +475,14 @@ at least 10 `partial_timeout` flushes, no frame dropped, rotations seen, and no 
 or checkpoint failed. It has no `max_duration`: the writer's retention bounds its files and
 the tailer's descriptors.
 
+`cri-rotate-rss` (70 minutes) is `cri-rotate`'s stack and one cycle of its SUT faults, then
+about an hour with no fault, to judge the SUT's memory while `cri_in` keeps following the
+writer's rotations, gzips, and stalls. `cri-rotate` restarts the SUT four times a cycle, so no
+life of it holds the 300 s `rss_slope` fits; here the life after the second kill runs to the
+end, and `rss_slope` fits it from +9m05s, past `rss_settle` of `120s` as in `partition-rss`.
+`[expected]` sets `rss_slope` to PASS on `logit`, so a run that couldn't fit that life FAILs
+rather than SKIPs. Every other row and expectation is `cri-rotate`'s.
+
 `otlp-fan-out` (16 minutes) sends 500 OTLP log records a second with `otlp_out` over HTTP, 50
 to a request, into `otlp_in`, its source declared `wire = "http"`. Each record's body is four
 lines of InfluxDB line protocol, each point with its own tag value so none merge, and the SUT's
@@ -1595,8 +1603,9 @@ for = { min = "60s", max = "3m" }
 
 A scenario that sets `max_duration` refuses a longer `--duration`, because its thresholds or
 configs hold only that long; `tail-rotate`'s is 25 minutes, and `tail-copytruncate`'s is its
-own 15, since its steps run once per run. `tail-rotate-delete` and `cri-rotate` have none:
-each writer's retention bounds both the shared directory and the tailer's descriptors.
+own 15, since its steps run once per run. `tail-rotate-delete`, `cri-rotate`, and
+`cri-rotate-rss` have none: each writer's retention bounds both the shared directory and the
+tailer's descriptors.
 
 To run for hours, keep the driver alive when the terminal closes: a closed terminal sends
 SIGHUP, which ends the schedule, collects, and tears down, so an unprotected 8-hour run stops at

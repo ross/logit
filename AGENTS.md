@@ -957,6 +957,9 @@ the operator-facing account of all of this.
   for a stop or kill while a logged stall's pin was held (or, for a kill, still persisted),
   which `cri.dangles` checks happened; `drops` excuses the split head a rotation leaves, counted
   `gone` when a stop or kill pinned it and the next rotation compressed it.
+  `cri-rotate-rss` runs one cycle of `cri-rotate`'s faults, then an hour quiet, so
+  `rss_slope`, which fits only a life holding 300 s past its first 120 s, judges the SUT's
+  last life, `[expected]` to PASS.
   `sighup` sends SIGHUPs (a `signal`
   step) to a SUT whose `stdio_out` file target a `rename` step moves aside, and `file.reopen` checks each line landed on its side of the reopen.
   `tls-reload` rotates the SUT's server certificate and the generator's client certificate from
