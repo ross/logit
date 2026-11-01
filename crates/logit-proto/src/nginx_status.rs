@@ -303,9 +303,10 @@ mod tests {
     use super::*;
     use logit_core::interner::resolve;
 
-    /// nginx 1.31.8's page, verbatim: lines 1, 3, and 4 end in a space.
-    const PAGE: &[u8] = b"Active connections: 5 \nserver accepts handled requests\n 6 6 3 \n\
-Reading: 1 Writing: 1 Waiting: 3 \n";
+    /// nginx's page layout: lines 1, 3, and 4 end in a space. Its seven values are all distinct, so a
+    /// swapped label fails.
+    const PAGE: &[u8] = b"Active connections: 10 \nserver accepts handled requests\n 9 8 21 \n\
+Reading: 2 Writing: 3 Waiting: 5 \n";
 
     /// Tengine's page, built from its handler's format strings (`alibaba/tengine`,
     /// `src/http/modules/ngx_http_stub_status_module.c` at commit `e8a99391`, the 3.1.0 release
@@ -335,13 +336,13 @@ server accepts handled requests request_time\n 10 10 12 345\nReading: 0 Writing:
 
     #[test]
     fn the_four_line_page_parses_with_and_without_trailing_spaces_and_with_crlf() {
-        let want = expected(5, 6, 6, 3, [1, 1, 3]);
+        let want = expected(10, 9, 8, 21, [2, 3, 5]);
         assert_eq!(parse(PAGE), Ok(want.clone()));
-        let bare = b"Active connections: 5\nserver accepts handled requests\n 6 6 3\n\
-Reading: 1 Writing: 1 Waiting: 3\n";
+        let bare = b"Active connections: 10\nserver accepts handled requests\n 9 8 21\n\
+Reading: 2 Writing: 3 Waiting: 5\n";
         assert_eq!(parse(bare), Ok(want.clone()));
-        let crlf = b"Active connections: 5 \r\nserver accepts handled requests\r\n 6 6 3 \r\n\
-Reading: 1 Writing: 1 Waiting: 3 \r\n";
+        let crlf = b"Active connections: 10 \r\nserver accepts handled requests\r\n 9 8 21 \r\n\
+Reading: 2 Writing: 3 Waiting: 5 \r\n";
         assert_eq!(parse(crlf), Ok(want.clone()));
         let trailing_blank = [PAGE, b"\n\r\n  \n"].concat();
         assert_eq!(parse(&trailing_blank), Ok(want));
@@ -480,13 +481,13 @@ Writing: 1 Reading: 1 Waiting: 3 \n",
         assert_eq!(
             rows,
             vec![
-                (CONNECTIONS_ACCEPTED.to_string(), s("{connections}"), sum(6), None),
-                (CONNECTIONS_HANDLED.to_string(), s("{connections}"), sum(6), None),
-                (REQUESTS.to_string(), s("{requests}"), sum(3), None),
-                (CONNECTIONS_CURRENT.to_string(), s("{connections}"), gauge(5), state("active")),
-                (CONNECTIONS_CURRENT.to_string(), s("{connections}"), gauge(1), state("reading")),
-                (CONNECTIONS_CURRENT.to_string(), s("{connections}"), gauge(1), state("writing")),
-                (CONNECTIONS_CURRENT.to_string(), s("{connections}"), gauge(3), state("waiting")),
+                (CONNECTIONS_ACCEPTED.to_string(), s("{connections}"), sum(9), None),
+                (CONNECTIONS_HANDLED.to_string(), s("{connections}"), sum(8), None),
+                (REQUESTS.to_string(), s("{requests}"), sum(21), None),
+                (CONNECTIONS_CURRENT.to_string(), s("{connections}"), gauge(10), state("active")),
+                (CONNECTIONS_CURRENT.to_string(), s("{connections}"), gauge(2), state("reading")),
+                (CONNECTIONS_CURRENT.to_string(), s("{connections}"), gauge(3), state("writing")),
+                (CONNECTIONS_CURRENT.to_string(), s("{connections}"), gauge(5), state("waiting")),
             ]
         );
     }

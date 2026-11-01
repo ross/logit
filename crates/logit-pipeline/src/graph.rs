@@ -129,7 +129,9 @@
 //!     absolute `http(s)://` URL (`is_absolute_http_url`), `timeout: 0s`, a `scrape_tls:` failing
 //!     24's checks or with no `https://` target, or 22's header faults against
 //!     `RESERVED_SCRAPE_HEADERS` (`check_scrape_settings`, which every scrape kind shares). An
-//!     `nginx_stub_status_in` with no target is legal: it scrapes nothing.
+//!     `nginx_stub_status_in` with no target is legal and scrapes nothing, but every check still
+//!     runs on it, so a set `scrape_tls:` with no target is rejected like one with only `http://`
+//!     targets. A `prometheus_in` with no target is rule 55's.
 //! 41. A registry-mode `prometheus_out` `path` not starting with `/` (every scrape would 404) or
 //!     `max_series: 0` (every series evicted on arrival)
 //!     (`docs/adr/prometheus-scrape-and-exposition.md`).
@@ -2252,9 +2254,11 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 40: every scrape kind's scrape settings. On `prometheus_in`, gated on scrape mode; rule
-    // 55 owns the mode itself, including neither mode set. An empty target list is legal on both
-    // kinds and checks nothing.
+    // Rule 40: every scrape kind's scrape settings. `prometheus_in` is gated on scrape mode, and
+    // rule 55 owns the mode itself, including neither mode set. A single-mode kind has no mode to
+    // pick, so it runs every check whatever its target list holds: an empty list is legal, but a
+    // zero `timeout` or a colliding header would still fail `logit run`. A new single-mode scrape
+    // kind adds an arm like `NginxStubStatusIn`'s, with no emptiness gate.
     for (id, component) in &components {
         match &component.kind {
             ComponentKind::PrometheusIn {
@@ -2275,9 +2279,6 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
             | ComponentKind::ApacheStatusIn {
                 scrape_targets, timeout, headers, scrape_tls, ..
             } => {
-                if scrape_targets.is_empty() {
-                    continue;
-                }
                 check_scrape_settings(id, scrape_targets, *timeout, headers, scrape_tls)?;
             }
             _ => {}
@@ -14058,6 +14059,34 @@ mod tests {
             }
             rejected(kind, name);
         }
+    }
+
+    /// An empty target list stays legal but doesn't exempt the other checks; `logit run` would
+    /// fail on each of these.
+    #[test]
+    fn an_nginx_stub_status_in_with_no_targets_still_runs_the_other_checks() {
+        let rejected = |kind, needle: &str| {
+            let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+            assert!(err.contains(needle), "expected {needle:?}, got: {err}");
+        };
+        let mut kind = nginx_stub_status_in(vec![]);
+        if let ComponentKind::NginxStubStatusIn { headers, .. } = &mut kind {
+            headers.insert("X-Tenant".to_string(), "a".to_string());
+            headers.insert("x-tenant".to_string(), "b".to_string());
+        }
+        rejected(kind, "differs only in case");
+
+        let mut kind = nginx_stub_status_in(vec![]);
+        if let ComponentKind::NginxStubStatusIn { timeout, .. } = &mut kind {
+            *timeout = Duration::ZERO;
+        }
+        rejected(kind, "'timeout: 0s'");
+
+        let mut kind = nginx_stub_status_in(vec![]);
+        if let ComponentKind::NginxStubStatusIn { scrape_tls, .. } = &mut kind {
+            scrape_tls.insecure_skip_verify = true;
+        }
+        rejected(kind, "no 'scrape_targets' entry is 'https://'");
     }
 
     #[test]

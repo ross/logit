@@ -146,11 +146,11 @@ checks, so one validation rule covers all three kinds and a block copied between
 
 | Key | Default | Meaning |
 |---|---|---|
-| `scrape_targets` | none | absolute `http://` or `https://` URLs (`targets` is `Component.targets`); an empty list is legal and scrapes nothing |
+| `scrape_targets` | none | absolute `http://` or `https://` URLs (`targets` is `Component.targets`); on the single-mode kinds an empty list is legal and scrapes nothing, and every other check still runs. On `prometheus_in`, rule 55 picks the mode from the list and `bind:`, so an empty list there selects bind mode or fails rule 55 |
 | `interval` | `15s` | scrape cadence; `0s` is rejected (graph rule 9's table will gain both kinds) |
 | `timeout` | `10s` | per-request timeout; `0s` is rejected |
 | `headers` | `{}` | extra request headers; a name the driver reserves is rejected |
-| `scrape_tls` | `{}` | client TLS for `https://` targets; rejected when no target is `https://` |
+| `scrape_tls` | `{}` | client TLS for `https://` targets; rejected when no target is `https://`, an empty list included |
 
 `scrape_tls` will keep its prefix although these kinds have one mode, so that no scrape kind has a
 bare `tls:` key. Each kind's config struct will carry `deny_unknown_fields`.
@@ -159,8 +159,8 @@ Graph rule 40's scrape-target checks will become shared across the three kinds, 
 reserved-header list will become the driver's: `accept`, `user-agent`, and the connection-management
 names rule 40 lists today, plus `accept-encoding`, so the driver alone decides which content
 encodings a target may answer in. The shared checks keep rejecting a non-empty `scrape_tls:` with no
-`https://` target, as the other sinks and inputs whose scheme selects TLS do. That one is the only
-change to `prometheus_in`'s validation. Rule 55 will stay
+`https://` target, an empty target list included, as the other sinks and inputs whose scheme
+selects TLS do. That one is the only change to `prometheus_in`'s validation. Rule 55 will stay
 `prometheus_in`'s, since only it has two modes.
 
 ### 4. Resource identity

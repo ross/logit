@@ -401,7 +401,9 @@ a black hole counts what it discards as `events.discarded`.
     `max_samples_per_series` or `max_set_members_per_series` of `0`.
 40. A scrape-mode `prometheus_in` or an `nginx_stub_status_in` with a bad target URL,
     `timeout: 0s`, a bad `scrape_tls:`, or a reserved or colliding header (`accept-encoding` among
-    them). An `nginx_stub_status_in` with no target is legal. Every scrape kind shares the checks.
+    them). Every scrape kind shares the checks. An `nginx_stub_status_in` with no target is legal and
+    scrapes nothing, but the other checks still run on it, so a set `scrape_tls:` is rejected.
+    A `prometheus_in` with no target is rule 55's.
 41. A registry-mode `prometheus_out` `path` not starting with `/`, or `max_series: 0`.
 42. A `generate_in` `batch` or `rate` of `0`, an empty key or metric name, a non-finite metric
     value, or an unknown or unbounded template placeholder.
