@@ -125,13 +125,15 @@
 //!     series folded into its name's overflow series), and a `max_samples_per_series` or
 //!     `max_set_members_per_series` of `0` (every record falls back)
 //!     (`docs/adr/aggregation-window-semantics.md`).
-//! 40. A scrape-mode `prometheus_in` or an `nginx_stub_status_in` with a target that isn't an
-//!     absolute `http(s)://` URL (`is_absolute_http_url`), `timeout: 0s`, a `scrape_tls:` failing
-//!     24's checks or with no `https://` target, or 22's header faults against
-//!     `RESERVED_SCRAPE_HEADERS` (`check_scrape_settings`, which every scrape kind shares). An
-//!     `nginx_stub_status_in` with no target is legal and scrapes nothing, but every check still
-//!     runs on it, so a set `scrape_tls:` with no target is rejected like one with only `http://`
-//!     targets. A `prometheus_in` with no target is rule 55's.
+//! 40. A scrape-mode `prometheus_in`, an `nginx_stub_status_in`, or an `apache_status_in` with a
+//!     target that isn't an absolute `http(s)://` URL (`is_absolute_http_url`), `timeout: 0s`, a
+//!     `scrape_tls:` failing 24's checks or with no `https://` target, or 22's header faults
+//!     against `RESERVED_SCRAPE_HEADERS` (`check_scrape_settings`, which every scrape kind
+//!     shares). An `nginx_stub_status_in` or `apache_status_in` with no target is legal and
+//!     scrapes nothing, but every check still runs on it, so a set `scrape_tls:` with no target is
+//!     rejected like one with only `http://` targets. A `prometheus_in` with no target is rule
+//!     55's. No rule checks an `apache_status_in` target for `?auto`: `mod_status` finds `auto`
+//!     anywhere in the query string, and a proxy in front of the server may add it.
 //! 41. A registry-mode `prometheus_out` `path` not starting with `/` (every scrape would 404) or
 //!     `max_series: 0` (every series evicted on arrival)
 //!     (`docs/adr/prometheus-scrape-and-exposition.md`).
@@ -14151,6 +14153,34 @@ mod tests {
             ("out", vec!["in"], sink()),
         ]))
         .expect("a target without ?auto is a runtime parse_error, not a config error");
+    }
+
+    /// An empty target list stays legal but doesn't exempt the other checks; `logit run` would
+    /// fail on each of these.
+    #[test]
+    fn an_apache_status_in_with_no_targets_still_runs_the_other_checks() {
+        let rejected = |kind, needle: &str| {
+            let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+            assert!(err.contains(needle), "expected {needle:?}, got: {err}");
+        };
+        let mut kind = apache_status_in(vec![]);
+        if let ComponentKind::ApacheStatusIn { headers, .. } = &mut kind {
+            headers.insert("X-Tenant".to_string(), "a".to_string());
+            headers.insert("x-tenant".to_string(), "b".to_string());
+        }
+        rejected(kind, "differs only in case");
+
+        let mut kind = apache_status_in(vec![]);
+        if let ComponentKind::ApacheStatusIn { timeout, .. } = &mut kind {
+            *timeout = Duration::ZERO;
+        }
+        rejected(kind, "'timeout: 0s'");
+
+        let mut kind = apache_status_in(vec![]);
+        if let ComponentKind::ApacheStatusIn { scrape_tls, .. } = &mut kind {
+            scrape_tls.insecure_skip_verify = true;
+        }
+        rejected(kind, "no 'scrape_targets' entry is 'https://'");
     }
 
     #[test]

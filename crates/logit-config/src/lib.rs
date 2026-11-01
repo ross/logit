@@ -4940,7 +4940,7 @@ pub enum ComponentKind {
         /// Absolute `http://` or `https://` URLs of `mod_status` pages, each with `auto` in its
         /// query string, such as `http://127.0.0.1:8080/server-status?auto`; without it Apache
         /// serves its HTML page and every scrape fails. Defaults to none, and with none the input
-        /// scrapes nothing.
+        /// scrapes nothing; the other settings below are still checked.
         #[serde(default)]
         scrape_targets: Vec<String>,
         /// Scrape cadence. Defaults to `15s`; `0s` is rejected.
@@ -4958,8 +4958,8 @@ pub enum ComponentKind {
         #[serde(default)]
         headers: HashMap<String, String>,
         /// Client-side TLS tuning for `https://` targets. A non-default block with no
-        /// `https://` target is rejected. Named `scrape_tls`, as on `prometheus_in`, so a block
-        /// copied between the two works.
+        /// `https://` target is rejected, and so is one with no targets at all. Named
+        /// `scrape_tls`, as on `prometheus_in`, so a block copied between the two works.
         #[serde(default)]
         scrape_tls: TlsClientConfig,
     },
