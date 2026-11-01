@@ -477,11 +477,11 @@ the tailer's descriptors.
 
 `cri-rotate-rss` (70 minutes) is `cri-rotate`'s stack and one cycle of its SUT faults, then
 about an hour with no fault, to judge the SUT's memory while `cri_in` keeps following the
-writer's rotations, gzips, and stalls. `cri-rotate` restarts the SUT four times a cycle, so
-`rss_slope` fits its lives over a minute or two, against a limit that allows a single allocator
-step and catches only a gross leak; here the life after the second kill runs to the end, and
-`rss_slope` fits it from +9m05s, past `rss_settle` of `120s` as in `partition-rss`, against
-about the scenario's own limit.
+writer's rotations, gzips, and stalls. `cri-rotate` restarts the SUT four times a cycle, each
+time before the life holds 60 s past its warm-up, so `rss_slope` fits at most the last life,
+the one that runs into the cooldown, and SKIPs the SUT at 20 minutes; here the life after the
+second kill runs to the end, and `rss_slope` fits it from +9m05s, past `rss_settle` of `120s`
+as in `partition-rss`, against about the scenario's own limit.
 `[expected]` sets `rss_slope` to PASS on `logit`, so a run that couldn't fit that life FAILs
 rather than SKIPs. Every other row and expectation is `cri-rotate`'s.
 
