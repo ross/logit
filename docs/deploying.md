@@ -1732,7 +1732,7 @@ recipe and what the split does to the data. `logit validate` rejects `reuse_port
 `transport: unix` or `unix_stream` and on a `datadog_trace_in` without `bind:`, none of which has
 a port to share; on a multicast `bind:`, whose group already delivers every datagram to every
 member (rule 80); and in `prometheus_in`'s scrape mode or `prometheus_out`'s remote-write mode,
-which bind nothing (rules 55 and 56).
+which bind nothing (rules 55 and 56). `nginx_stub_status_in` has no `reuse_port:` field, since it binds nothing either.
 
 ### Recording the sender: `peer`, `proxy_protocol`, and `forwarded`
 
@@ -4750,6 +4750,92 @@ Native histograms are skipped and counted on both wires regardless of version
   `normalized` for a state equal to the one sent; see
   [Duplicate timestamps](#duplicate-timestamps).
 
+## Server status pages
+
+`nginx_stub_status_in` scrapes nginx's `stub_status` page on an interval and turns it into the
+OpenTelemetry Collector's `nginxreceiver` metrics. It reads freenginx's, Angie's, and Tengine's
+pages too. It takes `prometheus_in`'s scrape-mode keys under the same names and defaults
+(`scrape_targets:`, `interval:`, `timeout:`, `headers:`, and `scrape_tls:`), so a block copied
+between the two works, and it adds the same `up`, `scrape_duration_seconds`, and
+`scrape_samples_scraped` series per target per scrape, so one `up == 0` alert covers both. The
+decoder's module doc, `crates/logit-proto/src/nginx_status.rs`, has the grammar and the mapping
+table ([ADR `server-status-scrape-inputs`](adr/server-status-scrape-inputs.md)).
+
+```yaml
+components:
+  nginx_status:
+    type: nginx_stub_status_in
+    scrape_targets: ["http://127.0.0.1:8081/nginx_status"]
+
+  out:
+    type: otlp_out
+    sources: [nginx_status]
+    endpoint: http://collector:4318
+```
+
+Serve the page on an internal interface or network only. It discloses connection counts. Put
+the `stub_status` location in its own `server` block with a `listen` on a loopback or internal
+address, or restrict it with `allow` and `deny`:
+
+```nginx
+server {
+    listen 127.0.0.1:8081;
+
+    location = /nginx_status {
+        stub_status;
+    }
+}
+```
+
+What to expect from the data:
+
+- **Each target is its own resource.** Its events carry `server.address` (the URL's host, an
+  IPv6 address without brackets), `server.port`, and `url.path`, so two pages behind one proxy at
+  one host and port stay apart. The query string is left out, since it may hold a credential.
+- **The scrape counts itself.** nginx counts `logit`'s request in `nginx.requests` and in the
+  `writing` state, so an idle server reads `requests` rising by one per scrape and `writing` at
+  `1`.
+- **`active` overlaps the other states.** It counts every client connection, so summing
+  `nginx.connections_current` across `state` double-counts.
+- **A page that isn't a `stub_status` page fails the scrape.** `up` reads `0`, nothing else is
+  emitted, the scrape counts as `logit.input.scrapes{class="parse_error"}`, and the
+  `scrape_failed` diagnostic says which line didn't match. A body cut short counts the same way.
+- **A field past `i64::MAX` is dropped, counted.** nginx prints its counters unsigned, so a
+  connection gauge that dips below zero prints as a number near 2^64. That field is left out and
+  counted `logit.input.metrics.dropped{reason="out_of_range"}`, and the rest of the page still
+  arrives with `up` at `1`.
+- **No point carries a start time.** A server restart reads as the counters decreasing, which a
+  downstream reset check handles. A `reload` keeps them.
+
+The three counters are cumulative monotonic sums and the connection states are gauges, so each
+sink handles them differently:
+
+| Sink | The counters arrive as |
+|---|---|
+| `otlp_out`, `kafka_out`'s OTLP formats | cumulative monotonic sums, exact |
+| `prometheus_out` | `counter` families with `_total` added (`nginx_requests_total`) |
+| `datadog_out` | dropped, counted `logit.output.metrics.dropped{reason="unresolved_cumulative"}`, unless a `cumulative_to_delta` sits upstream |
+| `statsd_out` | `\|g` gauges of the running total; a `cumulative_to_delta` upstream makes them `\|c` deltas |
+| `influxdb_out`, `graphite_out` | the running total, so take a rate in the query |
+
+`prometheus_out`'s OpenMetrics exposition can't write these units: `{connections}` and
+`{requests}` aren't a family-name suffix. It leaves them off and counts
+`logit.output.metrics.degraded{reason="unit_not_suffix"}` once per family on every write, so
+that count is expected for these series. The text 0.0.4 exposition writes no unit and counts
+nothing.
+
+`nginx_stub_status_in` doesn't set `host.name`, so `datadog_out`, `splunk_hec_out`, and
+`syslog_out` send `logit`'s own hostname as each event's host (see [Hostname](#hostname)). To
+send the server's, add a `set` after the component:
+
+```yaml
+  nginx_host:
+    type: set
+    sources: [nginx_status]
+    resource:
+      host.name: web-1
+```
+
 ## VictoriaMetrics, VictoriaLogs, and VictoriaTraces
 
 There's no VictoriaMetrics-specific component. All three products ingest standard wires that
@@ -4993,7 +5079,7 @@ for the gap that leaves, which `otlp_in.idle_timeout` (off by default) closes: s
 a request that starts right at the idle deadline.
 
 **`tls.insecure_skip_verify`** disables server-certificate verification. Every client `tls:` block
-honors it, as does `prometheus_in`'s `scrape_tls:`. The connection is still encrypted, but any
+honors it, as do `prometheus_in`'s and `nginx_stub_status_in`'s `scrape_tls:`. The connection is still encrypted, but any
 certificate is accepted. `logit` logs a startup warning whenever it's set. Use it only for a
 throwaway or pre-production endpoint, not a real deployment. Validation rejects it together with
 `ca_file`, because a specific trusted CA and "trust nothing" contradict each other.
@@ -5026,7 +5112,7 @@ routes on SNI can't be reached by IP.
 
 ### Certificate rotation
 
-Every TLS listener, every TLS sink, and `prometheus_in`'s scrape client reload their certificate,
+Every TLS listener, every TLS sink, and the scrape client of `prometheus_in` and `nginx_stub_status_in` reload their certificate,
 key, and CA files with no restart. A renewed certificate takes effect without dropping a queue,
 an `aggregate` window, or a UDP port.
 
@@ -5280,6 +5366,7 @@ Which component takes which block:
 | `logit_out`, `syslog_out`, `statsd_out` | `TlsClientConfig` | the block's presence | bare `host:port`; stream transport only (rules 34/44/52) |
 | `kafka_out` | `TlsClientConfig` | the block's presence | brokers are `host:port`, so even `tls: {}` turns TLS on |
 | `prometheus_in` (`scrape_tls:`) | `TlsClientConfig` | an `https://` scrape target | scrape mode is a client, not a listener; a set block with no `https://` target is rule 40 |
+| `nginx_stub_status_in` (`scrape_tls:`) | `TlsClientConfig` | an `https://` scrape target | a client, not a listener; a set block with no `https://` target is rule 40 |
 | `prometheus_in` (`bind_tls:`) | `TlsServerConfig` | the block's presence | the remote-write receiver's own listener; bind mode only (rule 55) |
 | `prometheus_out` (`bind_tls:`) | `TlsServerConfig` | the block's presence | the exposition's listener, HTTP/1.1; registry mode only (rule 56) |
 | `otlp_in` | `TlsServerConfig` | the block's presence | both transports |

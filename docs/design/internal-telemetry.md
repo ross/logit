@@ -1235,6 +1235,24 @@ before sending a request byte, after a complete PROXY header under `proxy_protoc
 TLS listener that close fails the TLS accept and is counted), `proxy_header` (bind mode, any
 `connections.rejected{reason="proxy_header"}` refusal), and `forwarded` (bind mode, under `forwarded:`, a request whose named header names no usable client; the header name and the reason appear in the message text, never the value; a request without the header isn't counted).
 
+##### `nginx_stub_status_in`
+
+`crates/logit-inputs/src/nginx_status.rs`, on the scrape driver `prometheus_in`'s scrape mode runs
+on (`crates/logit-inputs/src/scrape.rs`), codec in `crates/logit-proto/src/nginx_status.rs`,
+[ADR `server-status-scrape-inputs`](../adr/server-status-scrape-inputs.md).
+
+The driver's counters and diagnostic, under `prometheus_in`'s scrape-mode names:
+`logit.input.scrapes{class}` with the same eight classes (`parse_error` is a `2xx` body that isn't
+a `stub_status` page), `logit.input.scrape.duration`, `logit.input.samples` (the events a page
+decoded, at most seven), and `scrape_failed`, whose message names the kind and the target's
+redacted URL, never a tag. It has no connection metrics: it's a client.
+
+The decoder adds one counter:
+
+| Name | Kind | Meaning |
+|---|---|---|
+| `logit.input.metrics.dropped{reason="out_of_range"}` | count | one per page field whose digits don't fit an `i64`, left out of the page's events while the rest are emitted and `up` stays `1`. nginx prints the counters unsigned, so a connection gauge transiently below zero prints near 2^64 |
+
 ##### `datadog_in`
 
 `crates/logit-inputs/src/datadog.rs`, codec in `crates/logit-proto/src/datadog/`,

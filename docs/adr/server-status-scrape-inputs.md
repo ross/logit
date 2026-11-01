@@ -411,7 +411,9 @@ and a README with the provenance table:
 
 Tengine has no official image; its four-column form will be tested from a literal built from its
 source format string, with that provenance, unless the workstream finds an official image to record.
-The decoder tests will read the corpus, and `fuzz/seedgen` will turn it into seeds.
+freenginx publishes no image either, so its producer builds the release tarball, pinned by
+SHA-256, in a Debian image pinned by digest. The decoder tests will read the corpus, and
+`fuzz/seedgen` will turn it into seeds.
 
 ### 13. Telemetry and diagnostics
 
