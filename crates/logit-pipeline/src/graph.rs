@@ -128,8 +128,8 @@
 //! 40. A scrape-mode `prometheus_in` or an `nginx_stub_status_in` with a target that isn't an
 //!     absolute `http(s)://` URL (`is_absolute_http_url`), `timeout: 0s`, a `scrape_tls:` failing
 //!     24's checks or with no `https://` target, or 22's header faults against
-//!     `RESERVED_SCRAPE_HEADERS` (`check_scrape_settings`, which every scrape kind shares); and an
-//!     `nginx_stub_status_in` with no target, since it has no other mode.
+//!     `RESERVED_SCRAPE_HEADERS` (`check_scrape_settings`, which every scrape kind shares). An
+//!     `nginx_stub_status_in` with no target is legal: it scrapes nothing.
 //! 41. A registry-mode `prometheus_out` `path` not starting with `/` (every scrape would 404) or
 //!     `max_series: 0` (every series evicted on arrival)
 //!     (`docs/adr/prometheus-scrape-and-exposition.md`).
@@ -2249,8 +2249,8 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
     }
 
     // Rule 40: every scrape kind's scrape settings. On `prometheus_in`, gated on scrape mode; rule
-    // 55 owns the mode itself, including neither mode set. A single-mode scrape kind has no other
-    // mode, so an empty target list is rejected here.
+    // 55 owns the mode itself, including neither mode set. An empty target list is legal on both
+    // kinds and checks nothing.
     for (id, component) in &components {
         match &component.kind {
             ComponentKind::PrometheusIn {
@@ -2269,10 +2269,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                 ..
             } => {
                 if scrape_targets.is_empty() {
-                    anyhow::bail!(
-                        "component '{id}': 'scrape_targets' is empty -- name at least one page \
-                         to scrape"
-                    );
+                    continue;
                 }
                 check_scrape_settings(id, scrape_targets, *timeout, headers, scrape_tls)?;
             }
@@ -14022,7 +14019,6 @@ mod tests {
             let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
             assert!(err.contains(needle), "expected {needle:?}, got: {err}");
         };
-        rejected(nginx_stub_status_in(vec![]), "'scrape_targets' is empty");
         rejected(nginx_stub_status_in(vec!["127.0.0.1:8080/nginx_status"]), "isn't an absolute");
 
         let mut kind = nginx_stub_status_in(vec!["http://h/nginx_status"]);
@@ -14044,6 +14040,15 @@ mod tests {
             }
             rejected(kind, name);
         }
+    }
+
+    #[test]
+    fn an_nginx_stub_status_in_with_no_scrape_targets_validates() {
+        resolve(cfg(vec![
+            ("in", vec![], nginx_stub_status_in(vec![])),
+            ("out", vec!["in"], sink()),
+        ]))
+        .expect("no targets is pointless, not broken");
     }
 
     #[test]

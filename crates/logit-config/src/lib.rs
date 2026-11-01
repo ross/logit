@@ -4899,7 +4899,9 @@ pub enum ComponentKind {
     /// Serve it on an internal address only.
     NginxStubStatusIn {
         /// Absolute `http://` or `https://` URLs of `stub_status` locations, such as
-        /// `http://127.0.0.1:8080/nginx_status`. At least one is required.
+        /// `http://127.0.0.1:8080/nginx_status`. Defaults to none, and with none the input scrapes
+        /// nothing.
+        #[serde(default)]
         scrape_targets: Vec<String>,
         /// Scrape cadence. Defaults to `15s`; `0s` is rejected.
         #[serde(default = "default_prometheus_scrape_interval", with = "humantime_serde_duration")]
@@ -11451,10 +11453,15 @@ mod tests {
     }
 
     #[test]
-    fn nginx_stub_status_in_requires_scrape_targets_and_rejects_a_prometheus_in_only_key() {
-        let err = serde_json::from_str::<Component>(r#"{"type": "nginx_stub_status_in"}"#)
-            .expect_err("scrape_targets is required");
-        assert!(err.to_string().contains("scrape_targets"), "got: {err}");
+    fn nginx_stub_status_in_defaults_scrape_targets_and_rejects_a_prometheus_in_only_key() {
+        let component: Component =
+            serde_json::from_str(r#"{"type": "nginx_stub_status_in"}"#).unwrap();
+        match component.kind {
+            ComponentKind::NginxStubStatusIn { scrape_targets, .. } => {
+                assert!(scrape_targets.is_empty())
+            }
+            other => panic!("wrong kind: {other:?}"),
+        }
 
         let err = serde_json::from_str::<Component>(
             r#"{"type": "nginx_stub_status_in", "scrape_targets": ["http://h/s"],

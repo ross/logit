@@ -146,7 +146,7 @@ checks, so one validation rule covers all three kinds and a block copied between
 
 | Key | Default | Meaning |
 |---|---|---|
-| `scrape_targets` | required, non-empty | absolute `http://` or `https://` URLs (`targets` is `Component.targets`) |
+| `scrape_targets` | none | absolute `http://` or `https://` URLs (`targets` is `Component.targets`); an empty list is legal and scrapes nothing |
 | `interval` | `15s` | scrape cadence; `0s` is rejected (graph rule 9's table will gain both kinds) |
 | `timeout` | `10s` | per-request timeout; `0s` is rejected |
 | `headers` | `{}` | extra request headers; a name the driver reserves is rejected |
