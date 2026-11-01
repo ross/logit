@@ -5221,9 +5221,10 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
      a sample of their references was independently re-verified. -->
 
 ### WIRE-14 — `prometheus_in` scrape loop: per-tick fan-out, per-target body cap, outcome bookkeeping
-- **Location:** `crates/logit-inputs/src/prometheus.rs` (`MAX_SCRAPE_BYTES` = 32 MiB,
-  `instance_of`, `redact_url`, `build_resource`, `status_class`, `ScrapeStatus`, `scrape_target`,
-  `PrometheusInput::tick`, `PrometheusInput`'s `Input::run`)
+- **Location:** `crates/logit-inputs/src/scrape.rs`, the scrape driver (`redact_url`,
+  `status_class`, `ScrapeStatus`, `scrape_target`, `ScrapeInput::tick`, `ScrapeInput`'s
+  `Input::run`), and `crates/logit-inputs/src/prometheus.rs`'s decoder half (`MAX_SCRAPE_BYTES` =
+  32 MiB, `instance_of`, `build_resource`, `PrometheusScrapeDecoder`)
 - **What it does:** `run` drives a `tokio::time::interval` with `MissedTickBehavior::Delay`,
   swallows the first tick, and calls `tick`. `tick` spawns one `JoinSet` task per target (all
   targets concurrently, **no cap**), collects `(idx, ScrapeStatus, elapsed)` into a pre-sized
@@ -5261,7 +5262,7 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
     slowest target has finished or timed out, so one slow target delays all targets' batches by up
     to `timeout`, and a full downstream then blocks the whole round at `tick`'s `sink.send`. **High confidence;
     by design, but worth stating.**
-  - The scrape client follows redirects — `reqwest::Client::new()` in `PrometheusInput::new` keeps `reqwest`'s
+  - The scrape client follows redirects — `reqwest::Client::new()` in `ScrapeInput::with_decoder` keeps `reqwest`'s
     `limited(10)` default, unlike `crate::http::build_client` on the sink side. **Documented in
     `docs/known-gaps/` and ADR `prometheus-remote-write`'s Consequences; context, not new.**
   - `logit.input.samples` counts *series* here and *wire samples* in bind mode — documented, by
@@ -5271,7 +5272,8 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   `two_unparseable_targets_get_distinct_resources`: dialect
   selection, 4xx/5xx classes, timeout, oversize, refused connection, resource identity, URL
   redaction, `Accept` header, two targets in one tick, telemetry classes, TLS trusted/untrusted
-  CA). Integration: `crates/logit-cli/tests/prometheus_round_trip.rs`.
+  CA), and `crates/logit-inputs/src/scrape.rs`'s driver tests over a stub decoder.
+  Integration: `crates/logit-cli/tests/prometheus_round_trip.rs`.
   [ADR `prometheus-scrape-and-exposition`](../adr/prometheus-scrape-and-exposition.md).
 - **Suggested verification approach:** N canned servers each serving just under 32 MiB, asserting
   peak RSS (or simply adding and testing a `JoinSet` concurrency bound); a one-hangs-one-answers
