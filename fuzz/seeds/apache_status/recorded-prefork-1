@@ -1,0 +1,30 @@
+status-server
+ServerVersion: Apache/2.4.69 (Unix)
+ServerMPM: prefork
+Server Built: Oct 28 2026 01:15:47
+CurrentTime: Sunday, 01-Nov-2026 15:27:05 UTC
+RestartTime: Sunday, 01-Nov-2026 15:27:03 UTC
+ParentServerConfigGeneration: 1
+ParentServerMPMGeneration: 0
+ServerUptimeSeconds: 1
+ServerUptime: 1 second
+Load1: 9.14
+Load5: 5.86
+Load15: 3.28
+Total Accesses: 4
+Total kBytes: 3
+Total Duration: 1
+CPUUser: .01
+CPUSystem: .01
+CPUChildrenUser: 0
+CPUChildrenSystem: 0
+CPULoad: 2
+Uptime: 1
+ReqPerSec: 4
+BytesPerSec: 3072
+BytesPerReq: 768
+DurationPerReq: .25
+BusyWorkers: 5
+GracefulWorkers: 0
+IdleWorkers: 1
+Scoreboard: WKKKR_..........................................................................................................................................................................................................................................................

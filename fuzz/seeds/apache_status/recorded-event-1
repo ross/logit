@@ -1,0 +1,37 @@
+status-server
+ServerVersion: Apache/2.4.69 (Unix)
+ServerMPM: event
+Server Built: Oct 28 2026 01:15:47
+CurrentTime: Sunday, 01-Nov-2026 15:27:00 UTC
+RestartTime: Sunday, 01-Nov-2026 15:26:53 UTC
+ParentServerConfigGeneration: 1
+ParentServerMPMGeneration: 0
+ServerUptimeSeconds: 7
+ServerUptime: 7 seconds
+Load1: 9.67
+Load5: 5.91
+Load15: 3.28
+Total Accesses: 26
+Total kBytes: 31
+Total Duration: 3
+CPUUser: .01
+CPUSystem: 0
+CPUChildrenUser: 0
+CPUChildrenSystem: 0
+CPULoad: .142857
+Uptime: 7
+ReqPerSec: 3.71429
+BytesPerSec: 4534.86
+BytesPerReq: 1220.92
+DurationPerReq: .115385
+BusyWorkers: 2
+GracefulWorkers: 0
+IdleWorkers: 98
+Processes: 4
+Stopping: 0
+ConnsTotal: 25
+ConnsAsyncWaitIO: 0
+ConnsAsyncWriting: 0
+ConnsAsyncKeepAlive: 12
+ConnsAsyncClosing: 12
+Scoreboard: ________________________________R______W____________________________________________________________............................................................................................................................................................................................................................................................................................................

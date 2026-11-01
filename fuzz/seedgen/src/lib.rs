@@ -301,6 +301,10 @@ pub fn generate(testdata: &Path) -> std::io::Result<(Seeds, Vec<String>)> {
         add("nginx_status", name, bytes);
     }
 
+    for (name, bytes) in apache_status_seeds(testdata)? {
+        add("apache_status", name, bytes);
+    }
+
     for (name, bytes) in stream_framing_seeds(testdata)? {
         add("stream_framing", name, bytes);
     }
@@ -486,6 +490,33 @@ Reading: 0 Writing: 1 Waiting: 0 \r\n"
         b"Active connections: 18446744073709551615 \nserver accepts handled requests\n 1 1 1 \n\
 Reading: 0 Writing: 1 Waiting: 0 \n"
             .to_vec(),
+    ));
+    Ok(out)
+}
+
+/// Every page under `testdata/interop/apache-status/`, named by its file stem (the HTML page
+/// included, as a body with no listed key), plus pages built from one: CRLF line ends, an
+/// unterminated last line, a repeated key, and a malformed value.
+fn apache_status_seeds(testdata: &Path) -> std::io::Result<Vec<(String, Vec<u8>)>> {
+    let dir = testdata.join("interop/apache-status");
+    let mut paths = std::fs::read_dir(&dir)?
+        .map(|e| e.map(|e| e.path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    paths.sort();
+    let mut out = Vec::new();
+    for path in paths.iter().filter(|p| p.extension().is_some_and(|e| e == "body")) {
+        let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+        out.push((format!("recorded-{stem}"), std::fs::read(path)?));
+    }
+    out.push((
+        "crlf".to_string(),
+        b"localhost\r\nTotal kBytes: 3\r\nCPUUser: .01\r\nScoreboard: _W.\r\n".to_vec(),
+    ));
+    out.push(("truncated".to_string(), b"BusyWorkers: 2\nScoreboard: __W".to_vec()));
+    out.push(("duplicate".to_string(), b"BusyWorkers: 1\nBusyWorkers: 3\n".to_vec()));
+    out.push((
+        "malformed".to_string(),
+        b"Total Accesses: -1\nLoad1: nan\nCPULoad: 1e999\nIdleWorkers: 4\n".to_vec(),
     ));
     Ok(out)
 }
@@ -1823,6 +1854,7 @@ mod tests {
         assert_eq!(
             targets,
             [
+                "apache_status",
                 "collectd",
                 "cri",
                 "forwarded",

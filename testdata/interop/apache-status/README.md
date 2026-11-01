@@ -48,3 +48,18 @@ on 2026-11-01.
   `-1` page reads the second wave as `ConnsAsyncKeepAlive`, with the first wave closing.
   Under `prefork` and `worker`, each keepalive connection holds a slot, read as `K`.
 - Numbers use APR's `%g`, so a fraction has no leading zero (`CPUUser: .01`).
+
+## What isn't covered here (yet)
+
+- **httpd 2.2**, end of life since 2017, whose page has no server-name line. The decoder's unit
+  tests build a page with none instead.
+- **Other session-cache providers** (`dbm`, `memcache`, `redis`), each of which prints its own
+  keys after `TLSSessionCacheStatus`. All of them are unmapped, so `shmcb` stands in for the
+  shape.
+- **A graceful restart in progress** (`G` on the scoreboard, nonzero `GracefulWorkers` and
+  `Stopping`), and **a dead slot past the worker limit** that the scoreboard keeps printing while
+  its process runs.
+- **Distribution builds** (Debian's `apache2`, RHEL's `httpd`), which serve the same
+  `mod_status` code under their own `ServerVersion` strings.
+- **A server under real load**, with a scoreboard tens of thousands of slots long or `L`, `D`, and
+  `C` states.

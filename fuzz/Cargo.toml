@@ -130,6 +130,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "apache_status"
+path = "fuzz_targets/apache_status.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "nginx_status"
 path = "fuzz_targets/nginx_status.rs"
 test = false

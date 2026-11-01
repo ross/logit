@@ -387,7 +387,7 @@ impl ApacheStatus {
     /// The page's points as one event each, in the module doc's table order, each stamped
     /// `timestamp`. An absent or malformed key has no event.
     pub fn to_events(&self, timestamp: i64) -> Vec<Event> {
-        let mut events = Vec::with_capacity(40);
+        let mut events = Vec::with_capacity(31);
         let mut push =
             |name: &str, unit: &str, kind: Option<MetricKind>, attrs: &[(&str, &str)]| {
                 if let Some(kind) = kind {
