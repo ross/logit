@@ -1,0 +1,17 @@
+# Scrapes the dev stack's nginx (fixtures/nginx/) `stub_status` page every 15s and prints the
+# decoded events to stdout. The page is served on port 8082, an internal-only listener the compose
+# file doesn't publish to the host, so `nginx:8082` resolves only on the compose network.
+#
+# Each scrape gives seven metrics (nginx.connections_accepted, nginx.connections_handled,
+# nginx.requests, and nginx.connections_current per `state`) plus `up`,
+# `scrape_duration_seconds`, and `scrape_samples_scraped`, on a resource carrying
+# `server.address`, `server.port`, and `url.path`.
+components:
+  nginx_status:
+    type: nginx_stub_status_in
+    scrape_targets: ["http://nginx:8082/nginx_status"]
+    interval: 15s
+
+  stdout:
+    type: stdio_out
+    sources: [nginx_status]

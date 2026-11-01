@@ -30,6 +30,7 @@ use logit_inputs::internal::InternalInput;
 use logit_inputs::kafka::{KafkaInFormat, KafkaInSettings, KafkaInput};
 use logit_inputs::lines::LinesInput;
 use logit_inputs::logit::LogitInput;
+use logit_inputs::nginx_status;
 use logit_inputs::otlp::{OtlpInput, OtlpTransport as OtlpInTransport};
 use logit_inputs::prometheus::{PrometheusInput, PrometheusReceiver};
 use logit_inputs::replay::{ReplayFormat, ReplayInput};
@@ -886,6 +887,15 @@ pub(crate) fn build_spec(
                 ),
             };
             NodeSpec::Input(input, input_runtime_config(&component.receive))
+        }
+        NginxStubStatusIn { scrape_targets, interval, timeout, headers, scrape_tls } => {
+            let input = nginx_status::input(scrape_targets.clone(), *interval)
+                .with_timeout(*timeout)
+                .with_headers(headers)?
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone())
+                .with_tls(&to_tls_client_settings(scrape_tls), base_dir, tls_reloader)?;
+            NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
         LogitIn {
             bind,
@@ -4049,6 +4059,28 @@ mod tests {
                 reuse_port: false,
                 proxy_protocol: false,
                 forwarded: None,
+            },
+        };
+        assert!(matches!(
+            build_spec("in", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Input(..)
+        ));
+    }
+
+    #[test]
+    fn build_spec_builds_an_nginx_stub_status_input() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec![],
+            targets: Vec::new(),
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::NginxStubStatusIn {
+                scrape_targets: vec!["http://127.0.0.1:0/nginx_status".to_string()],
+                interval: Duration::from_secs(15),
+                timeout: Duration::from_secs(10),
+                headers: HashMap::new(),
+                scrape_tls: logit_config::TlsClientConfig::default(),
             },
         };
         assert!(matches!(

@@ -61,7 +61,9 @@ use crate::Input;
 use http::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE, USER_AGENT};
 use logit_core::interner::intern;
 use logit_core::Telemetry;
-use logit_core::{AttrMap, Diagnostics, Event, EventBatch, MetricKind, MetricRecord, Resource};
+use logit_core::{
+    AttrMap, Diagnostics, Event, EventBatch, MetricKind, MetricRecord, Resource, Value,
+};
 use logit_pipeline::Fanout;
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -154,6 +156,38 @@ pub(crate) fn redact_url(index: usize, url: &str) -> String {
         Err(_) => format!("<unparseable target #{index}>"),
     }
 }
+
+/// The resource a status-page kind gives target `index`: OTel semantic-convention `server.address`
+/// (the URL's host, an IPv6 address without its brackets), `server.port` (an integer, defaulted
+/// from the scheme), and `url.path` (the path without its query string, which may hold a
+/// credential), so two targets behind one proxy at one host and port keep their series apart. A URL
+/// `reqwest` can't parse gets [`redact_url`]'s placeholder as `server.address` and nothing else.
+/// Neither `instance` nor `_logit.prometheus.target`: those are Prometheus's vocabulary
+/// ([ADR `server-status-scrape-inputs`](../../../docs/adr/server-status-scrape-inputs.md)
+/// section 4).
+pub(crate) fn server_resource(index: usize, url: &str) -> Resource {
+    let mut attributes = AttrMap::new();
+    match reqwest::Url::parse(url) {
+        Ok(parsed) => {
+            let host = parsed.host_str().unwrap_or_default();
+            let host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+            attributes.insert(SERVER_ADDRESS, Value::str(host));
+            if let Some(port) = parsed.port_or_known_default() {
+                attributes.insert(SERVER_PORT, Value::I64(i64::from(port)));
+            }
+            attributes.insert(URL_PATH, Value::str(parsed.path()));
+        }
+        Err(_) => attributes.insert(SERVER_ADDRESS, Value::str(redact_url(index, url))),
+    }
+    Resource { attributes, ..Default::default() }
+}
+
+/// `server.address`, the scraped server's host.
+pub const SERVER_ADDRESS: &str = "server.address";
+/// `server.port`, the scraped server's port, an integer.
+pub const SERVER_PORT: &str = "server.port";
+/// `url.path`, the scraped page's path.
+pub const URL_PATH: &str = "url.path";
 
 fn synthetic_event(timestamp: i64, name: &'static str, value: f64) -> Event {
     Event::metric(
@@ -512,7 +546,7 @@ impl<D: ScrapeDecoder> Input for ScrapeInput<D> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use bytes::Bytes;
     use http_body_util::Full;
@@ -520,7 +554,6 @@ mod tests {
     use hyper::service::service_fn;
     use hyper::{Request as HttpRequest, Response};
     use hyper_util::rt::TokioIo;
-    use logit_core::Value;
     use logit_pipeline::Delivered;
     use std::convert::Infallible;
     use std::net::SocketAddr;
@@ -576,7 +609,7 @@ mod tests {
 
     /// A real `hyper` HTTP/1.1 server on an ephemeral port answering every request `200` with
     /// `body`. Returns the bound address and each request's captured headers.
-    async fn canned_server(body: Bytes) -> (SocketAddr, Arc<Mutex<Vec<HeaderMap>>>) {
+    pub(crate) async fn canned_server(body: Bytes) -> (SocketAddr, Arc<Mutex<Vec<HeaderMap>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let captured = Arc::new(Mutex::new(Vec::new()));
@@ -603,7 +636,7 @@ mod tests {
 
     /// The batch a tick already sent: `tick` returns after its send, so an empty channel is a
     /// failure, not a slow scrape.
-    fn sent_batch(rx: &mut mpsc::Receiver<Delivered>) -> EventBatch {
+    pub(crate) fn sent_batch(rx: &mut mpsc::Receiver<Delivered>) -> EventBatch {
         match rx.try_recv().expect("expected a batch to have been sent") {
             Delivered::Owned(batch, _ctx) => batch,
             Delivered::Shared(shared, _ctx) => (*shared).clone(),
@@ -665,6 +698,33 @@ mod tests {
             "http://example.com:9100/metrics"
         );
         assert_eq!(redact_url(0, "https://example.com/metrics"), "https://example.com/metrics");
+    }
+
+    #[test]
+    fn server_resource_takes_host_port_and_path_from_the_url() {
+        let attrs = |url| server_resource(0, url).attributes;
+
+        let a = attrs("http://user:pw@Status.Example:8080/a/nginx_status?token=secret");
+        assert_eq!(a.get(SERVER_ADDRESS), Some(&Value::str("status.example")));
+        assert_eq!(a.get(SERVER_PORT), Some(&Value::I64(8080)));
+        assert_eq!(a.get(URL_PATH), Some(&Value::str("/a/nginx_status")));
+        assert_eq!(a.len(), 3);
+
+        assert_eq!(attrs("http://h/s").get(SERVER_PORT), Some(&Value::I64(80)));
+        assert_eq!(attrs("https://h/s").get(SERVER_PORT), Some(&Value::I64(443)));
+
+        let v6 = attrs("http://[::1]:8080/nginx_status");
+        assert_eq!(v6.get(SERVER_ADDRESS), Some(&Value::str("::1")));
+        assert_eq!(v6.get(SERVER_PORT), Some(&Value::I64(8080)));
+
+        assert_ne!(
+            server_resource(0, "http://proxy/a/nginx_status").attributes,
+            server_resource(1, "http://proxy/b/nginx_status").attributes,
+        );
+
+        let bad = attrs("http://[::1/nginx_status");
+        assert_eq!(bad.get(SERVER_ADDRESS), Some(&Value::str("<unparseable target #0>")));
+        assert_eq!(bad.len(), 1);
     }
 
     #[tokio::test]

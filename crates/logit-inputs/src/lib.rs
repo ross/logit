@@ -29,6 +29,7 @@ pub mod kafka;
 pub mod lines;
 mod listener;
 pub mod logit;
+pub mod nginx_status;
 pub mod otlp;
 pub mod peer;
 mod procstat;

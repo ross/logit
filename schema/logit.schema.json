@@ -4416,6 +4416,67 @@
           "additionalProperties": false
         },
         {
+          "description": "nginx's `stub_status` page, scraped on `interval` from each target, as the OpenTelemetry Collector's `nginxreceiver` metrics: `nginx.connections_accepted`, `nginx.connections_handled`, and `nginx.requests` as cumulative counters, and `nginx.connections_current` as a gauge per `state` (`active`, `reading`, `writing`, `waiting`). Reads freenginx's, Angie's, and Tengine's pages too. Each target's events carry `server.address`, `server.port`, and `url.path` on their resource, and each scrape adds `up`, `scrape_duration_seconds`, and `scrape_samples_scraped`, as `prometheus_in`'s scrape mode does. A body that isn't a `stub_status` page sets `up` to `0` and emits nothing else.\n\nThe page counts connections, and nginx counts this input's own requests in `requests`. Serve it on an internal address only.",
+          "type": "object",
+          "required": [
+            "scrape_targets",
+            "type"
+          ],
+          "properties": {
+            "buffer": true,
+            "headers": {
+              "description": "Extra headers sent on every scrape request. A name this input reserves (`accept`, `accept-encoding`, `user-agent`, `content-type`, `content-length`, `content-encoding`, `host`, `te`, `transfer-encoding`, `connection`, or an HTTP/2 pseudo-header starting with `:`) is rejected, as are two keys naming the same header once case is ignored.",
+              "default": {},
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "interval": {
+              "description": "Scrape cadence. Defaults to `15s`; `0s` is rejected.",
+              "default": "15s",
+              "type": "string"
+            },
+            "receive": true,
+            "scrape_targets": {
+              "description": "Absolute `http://` or `https://` URLs of `stub_status` locations, such as `http://127.0.0.1:8080/nginx_status`. At least one is required.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "scrape_tls": {
+              "description": "Client-side TLS tuning for `https://` targets. A non-default block with no `https://` target is rejected. Named `scrape_tls`, as on `prometheus_in`, so a block copied between the two works.",
+              "default": {
+                "ca_file": null,
+                "cert_file": null,
+                "insecure_skip_verify": false,
+                "key_file": null,
+                "server_name": null
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TlsClientConfig"
+                }
+              ]
+            },
+            "sources": true,
+            "targets": true,
+            "timeout": {
+              "description": "Per-request timeout. Defaults to `10s`; `0s` is rejected.",
+              "default": "10s",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "nginx_stub_status_in"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
           "description": "A synthetic event source for load testing. No socket and no decoder: it renders a declarative `event:` template as fast as `count`/`rate` allow, so a scenario measures the runtime and the components under test rather than a generator process and a kernel socket buffer. There is no shape preset: the template plus an ordinary `json`/`regex`/`kv_metrics` stage downstream composes any shape a scenario needs.",
           "type": "object",
           "required": [

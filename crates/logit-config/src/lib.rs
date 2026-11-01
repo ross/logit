@@ -4886,6 +4886,41 @@ pub enum ComponentKind {
         #[serde(default)]
         reuse_port: bool,
     },
+    /// nginx's `stub_status` page, scraped on `interval` from each target, as the OpenTelemetry
+    /// Collector's `nginxreceiver` metrics: `nginx.connections_accepted`,
+    /// `nginx.connections_handled`, and `nginx.requests` as cumulative counters, and
+    /// `nginx.connections_current` as a gauge per `state` (`active`, `reading`, `writing`,
+    /// `waiting`). Reads freenginx's, Angie's, and Tengine's pages too. Each target's events carry
+    /// `server.address`, `server.port`, and `url.path` on their resource, and each scrape adds
+    /// `up`, `scrape_duration_seconds`, and `scrape_samples_scraped`, as `prometheus_in`'s scrape
+    /// mode does. A body that isn't a `stub_status` page sets `up` to `0` and emits nothing else.
+    ///
+    /// The page counts connections, and nginx counts this input's own requests in `requests`.
+    /// Serve it on an internal address only.
+    NginxStubStatusIn {
+        /// Absolute `http://` or `https://` URLs of `stub_status` locations, such as
+        /// `http://127.0.0.1:8080/nginx_status`. At least one is required.
+        scrape_targets: Vec<String>,
+        /// Scrape cadence. Defaults to `15s`; `0s` is rejected.
+        #[serde(default = "default_prometheus_scrape_interval", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        interval: Duration,
+        /// Per-request timeout. Defaults to `10s`; `0s` is rejected.
+        #[serde(default = "default_prometheus_scrape_timeout", with = "humantime_serde_duration")]
+        #[schemars(with = "String")]
+        timeout: Duration,
+        /// Extra headers sent on every scrape request. A name this input reserves (`accept`,
+        /// `accept-encoding`, `user-agent`, `content-type`, `content-length`, `content-encoding`,
+        /// `host`, `te`, `transfer-encoding`, `connection`, or an HTTP/2 pseudo-header starting
+        /// with `:`) is rejected, as are two keys naming the same header once case is ignored.
+        #[serde(default)]
+        headers: HashMap<String, String>,
+        /// Client-side TLS tuning for `https://` targets. A non-default block with no
+        /// `https://` target is rejected. Named `scrape_tls`, as on `prometheus_in`, so a block
+        /// copied between the two works.
+        #[serde(default)]
+        scrape_tls: TlsClientConfig,
+    },
     /// A synthetic event source for load testing. No socket and no decoder: it renders a
     /// declarative `event:` template as fast as `count`/`rate` allow, so a scenario measures the
     /// runtime and the components under test rather than a generator process and a kernel
@@ -11388,6 +11423,45 @@ mod tests {
             }
             other => panic!("expected PrometheusIn, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn nginx_stub_status_in_takes_prometheus_ins_scrape_defaults() {
+        let component: Component = serde_json::from_str(
+            r#"{"type": "nginx_stub_status_in",
+                "scrape_targets": ["http://127.0.0.1:8080/nginx_status"]}"#,
+        )
+        .unwrap();
+        match component.kind {
+            ComponentKind::NginxStubStatusIn {
+                scrape_targets,
+                interval,
+                timeout,
+                headers,
+                scrape_tls,
+            } => {
+                assert_eq!(scrape_targets, ["http://127.0.0.1:8080/nginx_status"]);
+                assert_eq!(interval, default_prometheus_scrape_interval());
+                assert_eq!(timeout, default_prometheus_scrape_timeout());
+                assert!(headers.is_empty());
+                assert!(scrape_tls.is_empty());
+            }
+            other => panic!("expected NginxStubStatusIn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nginx_stub_status_in_requires_scrape_targets_and_rejects_a_prometheus_in_only_key() {
+        let err = serde_json::from_str::<Component>(r#"{"type": "nginx_stub_status_in"}"#)
+            .expect_err("scrape_targets is required");
+        assert!(err.to_string().contains("scrape_targets"), "got: {err}");
+
+        let err = serde_json::from_str::<Component>(
+            r#"{"type": "nginx_stub_status_in", "scrape_targets": ["http://h/s"],
+                "bind": "127.0.0.1:0"}"#,
+        )
+        .expect_err("bind is prometheus_in's");
+        assert!(err.to_string().contains("bind"), "got: {err}");
     }
 
     #[test]

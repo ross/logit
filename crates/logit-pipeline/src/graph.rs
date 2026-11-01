@@ -125,10 +125,11 @@
 //!     series folded into its name's overflow series), and a `max_samples_per_series` or
 //!     `max_set_members_per_series` of `0` (every record falls back)
 //!     (`docs/adr/aggregation-window-semantics.md`).
-//! 40. A scrape-mode `prometheus_in` with a target that isn't an absolute `http(s)://` URL
-//!     (`is_absolute_http_url`), `timeout: 0s`, a `scrape_tls:` failing 24's checks or with no
-//!     `https://` target, or 22's header faults against `RESERVED_SCRAPE_HEADERS`
-//!     (`check_scrape_settings`, which every scrape kind shares).
+//! 40. A scrape-mode `prometheus_in` or an `nginx_stub_status_in` with a target that isn't an
+//!     absolute `http(s)://` URL (`is_absolute_http_url`), `timeout: 0s`, a `scrape_tls:` failing
+//!     24's checks or with no `https://` target, or 22's header faults against
+//!     `RESERVED_SCRAPE_HEADERS` (`check_scrape_settings`, which every scrape kind shares); and an
+//!     `nginx_stub_status_in` with no target, since it has no other mode.
 //! 41. A registry-mode `prometheus_out` `path` not starting with `/` (every scrape would 404) or
 //!     `max_series: 0` (every series evicted on arrival)
 //!     (`docs/adr/prometheus-scrape-and-exposition.md`).
@@ -476,6 +477,7 @@ pub fn role(kind: &ComponentKind) -> Role {
         | LogitIn { .. }
         | Internal { .. }
         | PrometheusIn { .. }
+        | NginxStubStatusIn { .. }
         | GenerateIn { .. }
         | ReplayIn { .. }
         | KafkaIn { .. } => Role::Listener,
@@ -557,6 +559,7 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         LogitIn { .. } => "logit_in",
         Internal { .. } => "internal",
         PrometheusIn { .. } => "prometheus_in",
+        NginxStubStatusIn { .. } => "nginx_stub_status_in",
         GenerateIn { .. } => "generate_in",
         ReplayIn { .. } => "replay_in",
         KafkaIn { .. } => "kafka_in",
@@ -692,6 +695,7 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::CriIn { .. }
             | ComponentKind::Internal { .. }
             | ComponentKind::PrometheusIn { .. }
+            | ComponentKind::NginxStubStatusIn { .. }
             | ComponentKind::Lua { .. }
             | ComponentKind::LuaFile { .. }
             | ComponentKind::Aggregate { .. }
@@ -760,7 +764,8 @@ fn interval(kind: &ComponentKind) -> Option<Duration> {
         ComponentKind::Aggregate { interval, .. }
         | ComponentKind::Internal { interval, .. }
         | ComponentKind::Shape { interval, .. }
-        | ComponentKind::PrometheusIn { interval, .. } => Some(*interval),
+        | ComponentKind::PrometheusIn { interval, .. }
+        | ComponentKind::NginxStubStatusIn { interval, .. } => Some(*interval),
         _ => None,
     }
 }
@@ -2243,17 +2248,35 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 40: a scrape-mode `prometheus_in`'s scrape settings. Gated on scrape mode; rule 55 owns
-    // the mode itself, including neither mode set.
+    // Rule 40: every scrape kind's scrape settings. On `prometheus_in`, gated on scrape mode; rule
+    // 55 owns the mode itself, including neither mode set. A single-mode scrape kind has no other
+    // mode, so an empty target list is rejected here.
     for (id, component) in &components {
-        if let ComponentKind::PrometheusIn {
-            scrape_targets, timeout, headers, scrape_tls, ..
-        } = &component.kind
-        {
-            if scrape_targets.is_empty() {
-                continue; // bind mode, or no mode at all -- rule 55's, either way
+        match &component.kind {
+            ComponentKind::PrometheusIn {
+                scrape_targets, timeout, headers, scrape_tls, ..
+            } => {
+                if scrape_targets.is_empty() {
+                    continue; // bind mode, or no mode at all -- rule 55's, either way
+                }
+                check_scrape_settings(id, scrape_targets, *timeout, headers, scrape_tls)?;
             }
-            check_scrape_settings(id, scrape_targets, *timeout, headers, scrape_tls)?;
+            ComponentKind::NginxStubStatusIn {
+                scrape_targets,
+                timeout,
+                headers,
+                scrape_tls,
+                ..
+            } => {
+                if scrape_targets.is_empty() {
+                    anyhow::bail!(
+                        "component '{id}': 'scrape_targets' is empty -- name at least one page \
+                         to scrape"
+                    );
+                }
+                check_scrape_settings(id, scrape_targets, *timeout, headers, scrape_tls)?;
+            }
+            _ => {}
         }
     }
 
@@ -5945,6 +5968,17 @@ mod tests {
             *scrape_tls = tls;
         }
         kind
+    }
+
+    /// An `nginx_stub_status_in` with every field but its targets at its default.
+    fn nginx_stub_status_in(targets: Vec<&str>) -> ComponentKind {
+        ComponentKind::NginxStubStatusIn {
+            scrape_targets: targets.into_iter().map(String::from).collect(),
+            interval: default_prometheus_scrape_interval(),
+            timeout: default_prometheus_scrape_timeout(),
+            headers: Map::new(),
+            scrape_tls: logit_config::TlsClientConfig::default(),
+        }
     }
 
     fn file_out(rotate: logit_config::RotateConfig) -> ComponentKind {
@@ -13975,6 +14009,51 @@ mod tests {
             ("out", vec!["in"], sink()),
         ]))
         .expect("an https:// target should resolve fine");
+    }
+
+    /// Rule 40's shared checks reach `nginx_stub_status_in`, one case per check.
+    #[test]
+    fn nginx_stub_status_in_runs_the_shared_scrape_checks() {
+        let resolves = |kind| resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+        resolves(nginx_stub_status_in(vec!["http://127.0.0.1:8080/nginx_status"]))
+            .expect("a plain target resolves");
+
+        let rejected = |kind, needle: &str| {
+            let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+            assert!(err.contains(needle), "expected {needle:?}, got: {err}");
+        };
+        rejected(nginx_stub_status_in(vec![]), "'scrape_targets' is empty");
+        rejected(nginx_stub_status_in(vec!["127.0.0.1:8080/nginx_status"]), "isn't an absolute");
+
+        let mut kind = nginx_stub_status_in(vec!["http://h/nginx_status"]);
+        if let ComponentKind::NginxStubStatusIn { timeout, .. } = &mut kind {
+            *timeout = Duration::ZERO;
+        }
+        rejected(kind, "'timeout: 0s'");
+
+        let mut kind = nginx_stub_status_in(vec!["http://h/nginx_status"]);
+        if let ComponentKind::NginxStubStatusIn { scrape_tls, .. } = &mut kind {
+            scrape_tls.insecure_skip_verify = true;
+        }
+        rejected(kind, "no 'scrape_targets' entry is 'https://'");
+
+        for name in ["Accept", "accept-encoding", "User-Agent", ":path"] {
+            let mut kind = nginx_stub_status_in(vec!["http://h/nginx_status"]);
+            if let ComponentKind::NginxStubStatusIn { headers, .. } = &mut kind {
+                headers.insert(name.to_string(), "x".to_string());
+            }
+            rejected(kind, name);
+        }
+    }
+
+    #[test]
+    fn an_nginx_stub_status_in_with_zero_interval_is_rejected_by_rule_9() {
+        let mut kind = nginx_stub_status_in(vec!["http://h/nginx_status"]);
+        if let ComponentKind::NginxStubStatusIn { interval, .. } = &mut kind {
+            *interval = Duration::ZERO;
+        }
+        let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+        assert!(err.contains("interval"), "got: {err}");
     }
 
     #[test]
