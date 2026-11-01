@@ -85,7 +85,9 @@ TARGET_VOLUME="${UNSAFE_CHECK_TARGET_VOLUME:-logit_unsafe_check_target}"
 # 4,096: a batch of one-byte empty events at `max_len` regrows to about 56 MiB. `proxy_header`'s
 # `max_len` admits the largest PROXY v2 header, 16 plus 65,535 bytes, and one payload byte behind
 # it. `forwarded`'s 4,096 is past any forwarding header a proxy writes, and `http_auth`'s past any
-# `Authorization` header a client sends. `stream_framing`'s `max_len`
+# `Authorization` header a client sends. `nginx_status`'s `max_len` is `nginx_stub_status_in`'s
+# 64 KiB body cap; a page allocates one seven-event `Vec` and interns only fixed names, so 16 MiB
+# is ample and it needs no fork mode. `stream_framing`'s `max_len`
 # is its 4 selector bytes, the longest frame header (`65536 `, six bytes), and a frame of
 # `MAX_FRAME_BYTES`, so an at-bound frame fits under every framing; its only growing allocation is
 # the framer's buffer, never larger than the input, so 16 MiB is ample, and it needs no fork mode
@@ -149,6 +151,7 @@ FUZZ_TARGETS=(
     "proxy_header|65552|16|"
     "forwarded|4096|16|"
     "cri|65536|16|"
+    "nginx_status|65536|16|"
     "http_auth|4096|16|"
     "stream_framing|65546|16|"
     "statsd|65536|56|-fork=1 -ignore_ooms=0"

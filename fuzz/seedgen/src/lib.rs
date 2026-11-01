@@ -297,6 +297,10 @@ pub fn generate(testdata: &Path) -> std::io::Result<(Seeds, Vec<String>)> {
         add("http_auth", name.to_string(), bytes);
     }
 
+    for (name, bytes) in nginx_status_seeds(testdata)? {
+        add("nginx_status", name, bytes);
+    }
+
     for (name, bytes) in stream_framing_seeds(testdata)? {
         add("stream_framing", name, bytes);
     }
@@ -449,6 +453,41 @@ fn cri_lines() -> Vec<(&'static str, Vec<u8>)> {
         ("docker-json", br#"{"log":"x\n","stream":"stdout","time":"2026-09-21T13:33:20Z"}"#),
     ];
     lines.into_iter().map(|(name, line)| (name, line.to_vec())).collect()
+}
+
+/// Every page under `testdata/interop/nginx-status/`, named by its file stem, plus pages built from
+/// one: Tengine's four-column form (from its handler's format strings, as `nginx_status`'s unit
+/// tests build it), CRLF line ends, and a gauge past `i64::MAX`.
+fn nginx_status_seeds(testdata: &Path) -> std::io::Result<Vec<(String, Vec<u8>)>> {
+    let dir = testdata.join("interop/nginx-status");
+    let mut paths = std::fs::read_dir(&dir)?
+        .map(|e| e.map(|e| e.path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    paths.sort();
+    let mut out = Vec::new();
+    for path in paths.iter().filter(|p| p.extension().is_some_and(|e| e == "body")) {
+        let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+        out.push((format!("recorded-{stem}"), std::fs::read(path)?));
+    }
+    out.push((
+        "tengine".to_string(),
+        b"Active connections: 2 \nserver accepts handled requests request_time\n 10 10 12 345\n\
+Reading: 0 Writing: 1 Waiting: 1 \n"
+            .to_vec(),
+    ));
+    out.push((
+        "crlf".to_string(),
+        b"Active connections: 1 \r\nserver accepts handled requests\r\n 1 1 1 \r\n\
+Reading: 0 Writing: 1 Waiting: 0 \r\n"
+            .to_vec(),
+    ));
+    out.push((
+        "out-of-range".to_string(),
+        b"Active connections: 18446744073709551615 \nserver accepts handled requests\n 1 1 1 \n\
+Reading: 0 Writing: 1 Waiting: 0 \n"
+            .to_vec(),
+    ));
+    Ok(out)
 }
 
 /// A few records of each uncompressed file under `testdata/interop/cri/<runtime>/pods/`: the first
@@ -1802,6 +1841,7 @@ mod tests {
                 "native_control",
                 "native_frame",
                 "native_hop_batch",
+                "nginx_status",
                 "otlp_grpc",
                 "otlp_json",
                 "otlp_proto",
