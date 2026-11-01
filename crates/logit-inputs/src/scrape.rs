@@ -776,6 +776,108 @@ pub(crate) mod tests {
         );
     }
 
+    /// A server that accepts connections and never answers, so a request meets its timeout.
+    async fn silent_server() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        addr
+    }
+
+    /// One tick against `url` with a probe on the input's telemetry, returning the probe too.
+    async fn tick_with_probe(
+        url: &str,
+        timeout: Duration,
+    ) -> (EventBatch, logit_pipeline::test_util::TelemetryProbe) {
+        let probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let mut input = ScrapeInput::<StubDecoder>::new(vec![url.to_string()], Duration::MAX)
+            .with_timeout(timeout)
+            .with_telemetry(probe.telemetry("scrape", STUB_KIND, "listener"));
+        let (tx, mut rx) = mpsc::channel(4);
+        input.tick(&Fanout::new(vec![tx])).await;
+        (sent_batch(&mut rx), probe)
+    }
+
+    #[tokio::test]
+    async fn a_rejected_body_is_counted_once_as_parse_error() {
+        let (addr, _) = canned_server(Bytes::from_static(b"!bad")).await;
+
+        let (_batch, mut probe) =
+            tick_with_probe(&format!("http://{addr}/status"), Duration::from_secs(10)).await;
+
+        assert_eq!(probe.sum("logit.input.scrapes", &[("class", "parse_error")]), 1.0);
+        assert_eq!(probe.sum("logit.input.scrapes", &[("class", "2xx")]), 0.0);
+    }
+
+    #[tokio::test]
+    async fn a_body_past_the_cap_is_counted_once_as_oversize() {
+        let (addr, _) = canned_server(Bytes::from(vec![b'a'; STUB_CAP + 1])).await;
+
+        let (_batch, mut probe) =
+            tick_with_probe(&format!("http://{addr}/status"), Duration::from_secs(10)).await;
+
+        assert_eq!(probe.sum("logit.input.scrapes", &[("class", "oversize")]), 1.0);
+        assert_eq!(probe.sum("logit.input.scrapes", &[("class", "2xx")]), 0.0);
+    }
+
+    /// The timeout is the only wait: the server never answers and the request gives up at 50 ms.
+    #[tokio::test]
+    async fn a_timed_out_request_is_counted_once_and_names_the_target() {
+        let addr = silent_server().await;
+        let (captured, _guard) = Captured::start();
+
+        let (batch, mut probe) =
+            tick_with_probe(&format!("http://{addr}/status"), Duration::from_millis(50)).await;
+
+        assert_eq!(probe.sum("logit.input.scrapes", &[("class", "timeout")]), 1.0);
+        assert_eq!(gauge(&batch, "up"), Some(0.0));
+        let logs = captured.text();
+        assert!(
+            logs.contains(&format!("{STUB_KIND}: scraping http://{addr}/status timed out")),
+            "got: {logs}"
+        );
+    }
+
+    /// The gauge is the request's own wall-clock time: positive, and no more than the test
+    /// measured around the whole tick.
+    #[tokio::test]
+    async fn scrape_duration_seconds_is_the_measured_request_time() {
+        let (addr, _) = canned_server(Bytes::from_static(b"ok")).await;
+
+        let started = Instant::now();
+        let batch = tick_once(&format!("http://{addr}/status")).await;
+        let elapsed = started.elapsed().as_secs_f64();
+
+        let duration = gauge(&batch, "scrape_duration_seconds").expect("duration gauge");
+        assert!(duration > 0.0 && duration <= elapsed, "duration {duration}, elapsed {elapsed}");
+    }
+
+    /// The decoder is handed the timestamp taken before the fetches; the synthetics must carry
+    /// the same one, not a fresh reading.
+    #[tokio::test]
+    async fn synthetics_carry_the_timestamp_the_decoder_was_given() {
+        let (addr, _) = canned_server(Bytes::from_static(b"ok")).await;
+
+        let batch = tick_once(&format!("http://{addr}/status")).await;
+
+        let decoded = batch
+            .events
+            .iter()
+            .find(|e| {
+                e.metrics.iter().any(|m| logit_core::interner::resolve(m.name) == "stub.decoded")
+            })
+            .expect("decoded event");
+        assert_eq!(batch.events.len(), 4);
+        for event in &batch.events {
+            assert_eq!(event.timestamp, decoded.timestamp);
+        }
+    }
+
     #[test]
     fn every_headers_construction_error_names_the_decoders_kind() {
         let cases = [
