@@ -1,5 +1,5 @@
 //! `kv_metrics`: turns attributes already on an event (typically from `json`) into metrics on
-//! that same event, such as nginx's `nginx.requests`/`nginx.bytes_sent`/`nginx.request_time`.
+//! that same event, such as an access log's `http.server.requests` and `http.server.request.duration`.
 //! See `docs/adr/kv-metrics-semantics.md` for the skip and numeric-coercion rules, and for why
 //! there's no `tags:` field (tag selection is `keep`'s job).
 //!

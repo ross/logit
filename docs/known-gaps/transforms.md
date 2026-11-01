@@ -229,7 +229,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - `json` fails to parse the body, reports a throttled `parse_failure` diagnostic
     (`crates/logit-transforms/src/json.rs`), and passes the event through with `attributes`
     unchanged (only `syslog.*` metadata survives).
-  - `nginx_metrics` derives nothing field-based (only the fieldless `nginx.requests` counter
+  - `nginx_metrics` derives nothing field-based (only the fieldless `http.server.requests` counter
     increments).
   - Sibling requests are unaffected.
 

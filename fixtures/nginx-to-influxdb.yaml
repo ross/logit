@@ -93,15 +93,20 @@ components:
     type: kv_metrics
     sources: [nginx_trace]
     counters:
-      - name: nginx.requests # +1 per event
-      - name: nginx.bytes_sent
-        field: http.response.body.size
+      # +1 per event. Semconv derives the request count from `http.server.request.duration`'s
+      # histogram count; this counter is a convenience for stores that query a sum.
+      - name: http.server.requests
     distributions:
-      - name: nginx.request_time
+      - name: http.server.response.body.size
+        field: http.response.body.size
+        unit: By
+      - name: http.server.request.duration
         field: http.request.duration_s
         unit: s
-      - name: nginx.upstream_response_time
-        field: upstream.duration_s # empty on a non-proxied request -> silently skipped
+      # nginx is the client of its upstream. The field is empty on a non-proxied request, which
+      # skips the metric.
+      - name: http.client.request.duration
+        field: upstream.duration_s
         unit: s
 
   # A debugging tap beside `influx_out`, so it drops its oldest batches rather than stall the

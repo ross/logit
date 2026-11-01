@@ -1103,6 +1103,9 @@ access_keep:
     - user_agent.class
 ```
 
+The status inputs name their metrics differently and never collide with these; see
+[Names and `server.address` across the two paths](deploying.md#names-and-serveraddress-across-the-two-paths).
+
 `user_agent.class` isn't in semconv's set, but when `http_access` derives it, its values come from
 the table, so adding it costs at most a handful of series per route. A class you send yourself is
 only as bounded as you made it. [`fixtures/nginx-to-influxdb.yaml`](../fixtures/nginx-to-influxdb.yaml)

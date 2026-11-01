@@ -4864,6 +4864,17 @@ Listen 127.0.0.1:8082
   short: it's discarded and counted `logit.input.lines.dropped{reason="truncated"}`, and the
   lines before it are still read. In each case `up` stays at `1`.
 
+### Names and `server.address` across the two paths
+
+The status inputs name their metrics after the OpenTelemetry Collector's receivers (`nginx.*`,
+`apache.*`). The access-log metrics in [the access-log Metrics section](http-access-logs.md#metrics)
+follow semconv's `http.server.*` and `http.client.*`. The two paths never share a metric name in
+one store, so a scraped server total and a per-request delta can't collide.
+
+Both paths carry `server.address`, with different meanings: the scraped server for a status
+input, and the request's virtual host for an access log. Scope a tag-value query, such as a
+dashboard's vhost variable, by measurement, or the variable lists both kinds of value.
+
 ### Counters and units at each sink
 
 The counters (`nginx.connections_accepted`, `nginx.connections_handled`, `nginx.requests`,
@@ -5891,10 +5902,10 @@ listener. The symptoms:
   with none of the JSON body's fields merged in.
 - stderr gets a throttled `parse_failure` diagnostic naming the `json` component that failed to
   parse it.
-- Any *fieldless* counter (`nginx.requests` in the reference config, which counts every event
+- Any *fieldless* counter (`http.server.requests` in the reference config, which counts every event
   regardless of attributes) still increments for that request. Any metric that reads a field from
-  the JSON body (`nginx.bytes_sent`, the two distributions) derives nothing for it, since there's no
-  field to read.
+  the JSON body (the three distributions) derives nothing for it, since there's no field to
+  read.
 - Requests before and after are unaffected; the blast radius is exactly the one truncated line.
 
 ### The ordering rule
