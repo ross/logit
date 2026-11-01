@@ -107,8 +107,7 @@ components:
       # skips the metric. The metric carries the inbound request's attributes (`server.address`
       # is nginx's `$host`, `http.response.status_code` is nginx's own downstream status, plus
       # `http.route`), not semconv's client set: the upstream is in `upstream.address` and its
-      # answer in `upstream.status`. Real client attributes need their own `kv_metrics` and
-      # `keep` branch.
+      # answer in `upstream.status`, which `trimmed` drops.
       - name: http.client.request.duration
         field: upstream.duration_s
         unit: s
