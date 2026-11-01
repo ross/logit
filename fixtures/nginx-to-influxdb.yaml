@@ -104,7 +104,11 @@ components:
         field: http.request.duration_s
         unit: s
       # nginx is the client of its upstream. The field is empty on a non-proxied request, which
-      # skips the metric.
+      # skips the metric. The metric carries the inbound request's attributes (`server.address`
+      # is nginx's `$host`, `http.response.status_code` is nginx's own downstream status, plus
+      # `http.route`), not semconv's client set: the upstream is in `upstream.address` and its
+      # answer in `upstream.status`. Real client attributes need their own `kv_metrics` and
+      # `keep` branch.
       - name: http.client.request.duration
         field: upstream.duration_s
         unit: s

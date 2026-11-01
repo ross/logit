@@ -4867,13 +4867,25 @@ Listen 127.0.0.1:8082
 ### Names and `server.address` across the two paths
 
 The status inputs name their metrics after the OpenTelemetry Collector's receivers (`nginx.*`,
-`apache.*`). The access-log metrics in [the access-log Metrics section](http-access-logs.md#metrics)
-follow semconv's `http.server.*` and `http.client.*`. The two paths never share a metric name in
-one store, so a scraped server total and a per-request delta can't collide.
+`apache.*`). The access-log metrics follow semconv's `http.server.*` distributions, listed in
+[the access-log Metrics section](http-access-logs.md#metrics), plus the names in
+[fixtures/nginx-to-influxdb.yaml](../fixtures/nginx-to-influxdb.yaml). The fixture also defines
+`http.server.requests`, a convenience counter that isn't semconv, and
+`http.client.request.duration`.
+
+The names in `http-access-logs.md` and the fixture never collide with the status inputs'. Don't
+name an access-log metric under the status inputs' `nginx.*` or `apache.*` prefixes, because
+nothing detects a collision.
 
 Both paths carry `server.address`, with different meanings: the scraped server for a status
-input, and the request's virtual host for an access log. Scope a tag-value query, such as a
-dashboard's vhost variable, by measurement, or the variable lists both kinds of value.
+input, and the request's virtual host for an access log (nginx's `$host`). Scope a tag-value
+query, such as a dashboard's vhost variable, by measurement, or the variable lists both kinds of
+value.
+
+The fixture's `http.client.request.duration` carries the inbound request's attributes, not
+semconv's client set: `server.address` is the virtual host, and `http.response.status_code` is
+nginx's own downstream status. The upstream is in `upstream.address` and its answer in
+`upstream.status`. Real client attributes need their own `kv_metrics` and `keep` branch.
 
 ### Counters and units at each sink
 

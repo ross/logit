@@ -22,8 +22,8 @@ components:
     type: json
     sources: [gen]
 
-  # The metric specs from fixtures/nginx-to-influxdb.yaml / fixtures::kv_metrics(), so this
-  # scenario's `kv_metrics` cost matches the reference pipeline's.
+  # The metric specs from `fixtures::kv_metrics()` in crates/logit-bench/src/fixtures.rs, the
+  # pre-`http_access` shape.
   metrics:
     type: kv_metrics
     sources: [parsed]
