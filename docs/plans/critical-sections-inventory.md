@@ -5786,7 +5786,7 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
    exposition accept loop (`serve` in `crates/logit-outputs/src/prometheus.rs`) classifies and
    backs off instead. A cross-cutting lifecycle decision worth making once, deliberately, rather
    than five times by default.
-8. **`prometheus_in`'s scrape client is the one HTTP client in the workspace that still follows
+8. **The scrape driver's client (`prometheus_in`, `nginx_stub_status_in`) is the one HTTP client in the workspace that still follows
    redirects** (`reqwest::Client::new()` in `ScrapeInput::with_decoder` in `crates/logit-inputs/src/scrape.rs`), unlike
    `crate::http::build_client` on the sink side. Already documented, listed here so the
    inconsistency is visible next to the sink-side policy.

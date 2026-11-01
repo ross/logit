@@ -442,7 +442,7 @@ pub fn validate_semantics(config: Config) -> anyhow::Result<Vec<String>> {
 /// `reopen`, when `Some`, is cloned into every `stdio_out`/`file_out` file target. A clone, not
 /// a `subscribe()`, so a SIGHUP that landed during startup still reads as changed.
 ///
-/// Every TLS component (a listener, a sink, or `prometheus_in`'s scrape client) registers its
+/// Every TLS component (a listener, a sink, or a scrape kind's client) registers its
 /// certificate files with `tls_reloader`, under the component's own `Diagnostics` and `Telemetry`.
 ///
 /// `hostname` is the process hostname (`logit_pipeline::host`). `internal` stamps it as
@@ -2726,7 +2726,7 @@ fn kafka_sasl(sasl: logit_config::KafkaSasl) -> anyhow::Result<KafkaSasl> {
 }
 
 /// Config's `TlsClientConfig` into the identically shaped `logit_pipeline::tls::TlsClientSettings`
-/// every sink and `prometheus_in`'s scrape client take.
+/// every sink and every scrape kind's client take.
 fn to_tls_client_settings(
     tls: &logit_config::TlsClientConfig,
 ) -> logit_pipeline::tls::TlsClientSettings {

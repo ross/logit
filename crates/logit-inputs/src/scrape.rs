@@ -1,7 +1,8 @@
 //! The scrape driver: an interval-driven HTTP client that fetches each configured target, hands
 //! the body to a [`ScrapeDecoder`], and sends one batch per target per tick. `prometheus_in`'s
-//! scrape mode runs on it; the decoder owns the page's format, and this module owns everything
-//! else ([ADR `server-status-scrape-inputs`](../../../docs/adr/server-status-scrape-inputs.md)
+//! scrape mode and `nginx_stub_status_in` run on it; the decoder owns the page's format, and this
+//! module owns everything else
+//! ([ADR `server-status-scrape-inputs`](../../../docs/adr/server-status-scrape-inputs.md)
 //! section 2).
 //!
 //! ## The tick
