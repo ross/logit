@@ -4797,8 +4797,8 @@ What to expect from the data:
   `1`.
 - **`active` overlaps the other states.** It counts every client connection, so summing
   `nginx.connections_current` across `state` double-counts.
-- **A page that isn't a `stub_status` page fails the scrape.** `up` reads `0`, nothing else is
-  emitted, the scrape counts as `logit.input.scrapes{class="parse_error"}`, and the
+- **A page that isn't a `stub_status` page fails the scrape.** `up` reads `0`, no decoded events
+  are emitted, the scrape counts as `logit.input.scrapes{class="parse_error"}`, and the
   `scrape_failed` diagnostic says which line didn't match. A body cut short counts the same way.
 - **A field past `i64::MAX` is dropped, counted.** nginx prints its counters unsigned, so a
   connection gauge that dips below zero prints as a number near 2^64. That field is left out and
@@ -5366,7 +5366,7 @@ Which component takes which block:
 | `logit_out`, `syslog_out`, `statsd_out` | `TlsClientConfig` | the block's presence | bare `host:port`; stream transport only (rules 34/44/52) |
 | `kafka_out` | `TlsClientConfig` | the block's presence | brokers are `host:port`, so even `tls: {}` turns TLS on |
 | `prometheus_in` (`scrape_tls:`) | `TlsClientConfig` | an `https://` scrape target | scrape mode is a client, not a listener; a set block with no `https://` target is rule 40 |
-| `nginx_stub_status_in` (`scrape_tls:`) | `TlsClientConfig` | an `https://` scrape target | a client, not a listener; a set block with no `https://` target is rule 40 |
+| `nginx_stub_status_in` (`scrape_tls:`) | `TlsClientConfig` | an `https://` scrape target | a client, not a listener; a set block with no `https://` target, or with no targets at all, is rule 40 |
 | `prometheus_in` (`bind_tls:`) | `TlsServerConfig` | the block's presence | the remote-write receiver's own listener; bind mode only (rule 55) |
 | `prometheus_out` (`bind_tls:`) | `TlsServerConfig` | the block's presence | the exposition's listener, HTTP/1.1; registry mode only (rule 56) |
 | `otlp_in` | `TlsServerConfig` | the block's presence | both transports |

@@ -4893,14 +4893,14 @@ pub enum ComponentKind {
     /// `waiting`). Reads freenginx's, Angie's, and Tengine's pages too. Each target's events carry
     /// `server.address`, `server.port`, and `url.path` on their resource, and each scrape adds
     /// `up`, `scrape_duration_seconds`, and `scrape_samples_scraped`, as `prometheus_in`'s scrape
-    /// mode does. A body that isn't a `stub_status` page sets `up` to `0` and emits nothing else.
+    /// mode does. A body that isn't a `stub_status` page sets `up` to `0` and emits no decoded events.
     ///
     /// The page counts connections, and nginx counts this input's own requests in `requests`.
     /// Serve it on an internal address only.
     NginxStubStatusIn {
         /// Absolute `http://` or `https://` URLs of `stub_status` locations, such as
         /// `http://127.0.0.1:8080/nginx_status`. Defaults to none, and with none the input scrapes
-        /// nothing.
+        /// nothing; the other settings below are still checked.
         #[serde(default)]
         scrape_targets: Vec<String>,
         /// Scrape cadence. Defaults to `15s`; `0s` is rejected.
@@ -4918,7 +4918,7 @@ pub enum ComponentKind {
         #[serde(default)]
         headers: HashMap<String, String>,
         /// Client-side TLS tuning for `https://` targets. A non-default block with no
-        /// `https://` target is rejected. Named `scrape_tls`, as on `prometheus_in`, so a block
+        /// `https://` target is rejected, and so is one with no targets at all. Named `scrape_tls`, as on `prometheus_in`, so a block
         /// copied between the two works.
         #[serde(default)]
         scrape_tls: TlsClientConfig,

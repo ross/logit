@@ -38,5 +38,13 @@ held three idle connections and one half-sent request open. All were captured on
   scrapes.
 - Every server answers `Content-Type: text/plain`.
 
-Tengine has no official image, so its four-column form isn't recorded here. The decoder's unit
-tests build it from Tengine's handler format strings instead.
+## What isn't covered here (yet)
+
+- **Tengine.** It has no official image, so its four-column form isn't recorded here. The
+  decoder's unit tests build it from Tengine's handler format strings instead.
+- **A field past `i64::MAX`.** nginx prints a counter that went below zero as a number near 2^64,
+  and no recording reached one. The decoder's unit tests build it.
+- **A page over HTTPS, or behind `allow`/`deny`.** Every capture is plain HTTP from an
+  unrestricted location, so no `403` or TLS handshake is recorded.
+- **A page after a `reload`.** The counters of a reloaded server, and the old workers' connections
+  that linger as `Writing`, aren't recorded.

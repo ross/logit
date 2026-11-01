@@ -4416,7 +4416,7 @@
           "additionalProperties": false
         },
         {
-          "description": "nginx's `stub_status` page, scraped on `interval` from each target, as the OpenTelemetry Collector's `nginxreceiver` metrics: `nginx.connections_accepted`, `nginx.connections_handled`, and `nginx.requests` as cumulative counters, and `nginx.connections_current` as a gauge per `state` (`active`, `reading`, `writing`, `waiting`). Reads freenginx's, Angie's, and Tengine's pages too. Each target's events carry `server.address`, `server.port`, and `url.path` on their resource, and each scrape adds `up`, `scrape_duration_seconds`, and `scrape_samples_scraped`, as `prometheus_in`'s scrape mode does. A body that isn't a `stub_status` page sets `up` to `0` and emits nothing else.\n\nThe page counts connections, and nginx counts this input's own requests in `requests`. Serve it on an internal address only.",
+          "description": "nginx's `stub_status` page, scraped on `interval` from each target, as the OpenTelemetry Collector's `nginxreceiver` metrics: `nginx.connections_accepted`, `nginx.connections_handled`, and `nginx.requests` as cumulative counters, and `nginx.connections_current` as a gauge per `state` (`active`, `reading`, `writing`, `waiting`). Reads freenginx's, Angie's, and Tengine's pages too. Each target's events carry `server.address`, `server.port`, and `url.path` on their resource, and each scrape adds `up`, `scrape_duration_seconds`, and `scrape_samples_scraped`, as `prometheus_in`'s scrape mode does. A body that isn't a `stub_status` page sets `up` to `0` and emits no decoded events.\n\nThe page counts connections, and nginx counts this input's own requests in `requests`. Serve it on an internal address only.",
           "type": "object",
           "required": [
             "type"
@@ -4438,7 +4438,7 @@
             },
             "receive": true,
             "scrape_targets": {
-              "description": "Absolute `http://` or `https://` URLs of `stub_status` locations, such as `http://127.0.0.1:8080/nginx_status`. Defaults to none, and with none the input scrapes nothing.",
+              "description": "Absolute `http://` or `https://` URLs of `stub_status` locations, such as `http://127.0.0.1:8080/nginx_status`. Defaults to none, and with none the input scrapes nothing; the other settings below are still checked.",
               "default": [],
               "type": "array",
               "items": {
@@ -4446,7 +4446,7 @@
               }
             },
             "scrape_tls": {
-              "description": "Client-side TLS tuning for `https://` targets. A non-default block with no `https://` target is rejected. Named `scrape_tls`, as on `prometheus_in`, so a block copied between the two works.",
+              "description": "Client-side TLS tuning for `https://` targets. A non-default block with no `https://` target is rejected, and so is one with no targets at all. Named `scrape_tls`, as on `prometheus_in`, so a block copied between the two works.",
               "default": {
                 "ca_file": null,
                 "cert_file": null,
