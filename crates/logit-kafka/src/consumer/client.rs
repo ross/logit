@@ -867,21 +867,28 @@ impl Consumer {
         self.cluster = Some(cluster);
     }
 
-    /// Shutdown: stops fetching, commits, and leaves the group so it rebalances at once.
+    /// Shutdown: stops fetching, commits what an installed membership holds, and leaves the
+    /// group so it rebalances at once.
+    ///
+    /// The leave goes out whenever the broker has issued a member id, including one dropped
+    /// mid-join (after JoinGroup, before `install`): the broker counts that member already, and
+    /// without a leave the others wait out its session.
     pub async fn leave(&mut self) {
         self.stop_fetching();
         if self.member.is_some() {
             self.commit_all().await;
-            self.heartbeat = None;
-            let member_id = self.member.as_ref().map(|m| m.member_id.clone()).unwrap_or_default();
-            if let Err(failure) =
-                group::leave(&mut self.coordinator, &self.pool, &self.settings.group, &member_id)
-                    .await
-            {
-                group::count(&self.pool, ApiKey::LeaveGroup, &failure);
-            }
         }
         self.heartbeat = None;
+        if !self.member_id.is_empty() && self.locate().await {
+            let member_id = self.member_id.clone();
+            match group::leave(&mut self.coordinator, &self.pool, &self.settings.group, &member_id)
+                .await
+            {
+                // The broker has already forgotten the member, which is what a leave wants.
+                Err(Failure::Code(code::UNKNOWN_MEMBER_ID)) | Ok(()) => {}
+                Err(failure) => group::count(&self.pool, ApiKey::LeaveGroup, &failure),
+            }
+        }
         self.member = None;
         self.assignment.clear();
         self.shared.lock().unwrap().parts.clear();

@@ -232,7 +232,10 @@ from Redpanda at all.
   `ConsumerCoordinator` rejoins on a changed metadata snapshot.
 - **Every rebalance revokes every partition** (item 8), then rejoins.
 - **Leave.** At shutdown, after the final commit, LeaveGroup, so the group rebalances at once
-  rather than after `session_timeout`.
+  rather than after `session_timeout`. The leave goes out whenever the broker has issued the
+  member an id, including a member dropped between JoinGroup and the install of its membership
+  (nothing is committed then), as Java's does; an `UNKNOWN_MEMBER_ID` answer to it isn't counted,
+  since the broker has already forgotten the member.
 
 ### 5. The fetch path and backpressure
 
