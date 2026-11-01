@@ -873,3 +873,29 @@ the tree's `F` records, gzip files decompressed, and that count plus the lines t
 rotations removed, which it reports, must equal G. `cri_in` never reads a `.gz`, so a SUT down
 across two rotations, or paused across three, loses a file's unread tail, and the row FAILs such a
 window as the scenario's fault.
+
+## Amendment: `rss_slope` skips each life's warm-up and fits only over 300 s (2026-10-31)
+
+`cri-rotate` restarts the SUT four times a cycle, so its only steady samples sat 40 to 100 s into
+a fresh life, and `rss_slope` fit a line over 60 s of them. Over an hour of 33 lives the SUT's RSS
+stayed between 26 and 35 MiB and jemalloc's allocated bytes between 4 and 7 MB, yet those fits read
+from −186 to +135 MiB/h, and the row FAILed. A started `logit` gains 6 to 10 MiB in its first
+30 s and moves up to 3 MiB more until about 70 s. Past that its RSS still steps by up to 2.8 MiB
+within 60 s at a 5 s drain, and a step of A MiB in the middle of a span of T s biases a
+least-squares slope by 1.5 × A / T: 270 MiB/h for a 3 MiB step over 60 s.
+
+- **A life's first 120 s isn't fitted.** The warm-up runs from the life's start, read from its
+  uptime, and applies to every life, the first included, on top of the run's warmup.
+- **A fit needs 300 s of samples past the warm-up.** A 3 MiB step needs 253 s to stay under the
+  64 MiB/h limit, and over 300 s it fits as 54 MiB/h. Six samples is still the floor. An
+  `[[expect]]` `slope` keeps its 60 s, because its bounds are a scenario's own.
+- **A service with no life to fit SKIPs when the schedule couldn't hold one**: when no stretch
+  outside the widened fault windows lasts 300 s, the service SKIPs with that stretch's length,
+  and the row SKIPs when every service does. Where a 300 s stretch existed, a service with no
+  fit still WARNs on coverage, since something other than the schedule took its fit away. This
+  replaces the coverage WARN for a schedule that excuses every sample.
+- **Fault-dense scenarios lose their SUT's verdict.** At default durations, about half the
+  shipped scenarios leave no life of the SUT 300 s, and their `rss_slope` SKIPs for that
+  service; their fits under 60 s to 200 s spans were within the noise of a step anyway. The
+  scenarios built to judge memory, `cardinality`, `cardinality-capped`, `partition-rss`,
+  `tail-rotate-delete`, and `cri-rotate-rss`, keep a fit on every service.

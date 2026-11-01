@@ -1381,10 +1381,15 @@ def _checks():
         thin = _run_dir(tmp, "thin", [start, _action("apply", "c0s1", "netem", "logit", 100),
                                       _action("revert", "c0s1", "netem", "logit", 3450)]
                         + long_end, _sut_stdout(3600), duration=3600.0)
-        for check in (checks.check_progress, checks.check_rss_slope):
-            result = _status(thin, check)
-            expect(result.status == checks.WARN and "cover little" in " ".join(result.lines),
-                   f"{check.__name__} WARNs on thin coverage, got {result}")
+        result = _status(thin, checks.check_progress)
+        expect(result.status == checks.WARN and "cover little" in " ".join(result.lines),
+               f"check_progress WARNs on thin coverage, got {result}")
+        # Its longest steady stretch, 105 s, can't hold an RSS fit.
+        result = _status(thin, checks.check_rss_slope)
+        expect(result.status == checks.SKIP
+               and "logit SKIP: no life's steady samples span 300s" in result.detail
+               and "longest steady stretch 104s" in result.detail,
+               f"check_rss_slope SKIPs a schedule with no stretch to fit, got {result}")
         wide = _run_dir(tmp, "wide", [start] + long_end, _sut_stdout(3600), duration=3600.0)
         for check in (checks.check_progress, checks.check_rss_slope):
             result = _status(wide, check)
@@ -3514,10 +3519,11 @@ def _slope_edges():
             expect(result.status == checks.SKIP,
                    f"{check.__name__} SKIPs with no service to judge, got {result}")
 
-        # The generator's telemetry stops at +80: five samples after warmup, too few to fit.
+        # The generator's telemetry stops at +200: 80 s past its life's warm-up, too short to
+        # fit, in a fault-free hour that had room for a fit.
         short = _slope_run(tmp, "unfittable")
         (short / "logs" / "generator.stdout").write_text("\n".join(
-            _service_stdout(80, lambda o: 50 * 2 ** 20, lambda o: 10, lambda o: 100)) + "\n")
+            _service_stdout(200, lambda o: 50 * 2 ** 20, lambda o: 10, lambda o: 100)) + "\n")
         result = _status(short, checks.check_rss_slope)
         expect(result.status == checks.WARN
                and "generator WARN: no life with enough samples" in result.detail
@@ -3604,8 +3610,8 @@ def _settle_run(tmp, name, steps, end_s, sut, gen, warmup=60.0, **resolved):
 def _rss_settle_checks():
     """`rss_slope` excuses `rss_settle` past `recovery_bound` after each fault: a backlog's RSS
     returned in steps inside it PASSes, the same run with `rss_settle = 0s` doesn't, growth
-    across the whole run still FAILs, and a schedule the window covers whole WARNs on
-    coverage rather than SKIPping."""
+    across the whole run still FAILs, a schedule rss_settle leaves little of WARNs on
+    coverage, and one the window covers whole SKIPs."""
     mib = 2 ** 20
 
     def flat(o):
@@ -3680,9 +3686,85 @@ def _rss_settle_checks():
         whole = [("c0s1", "netem", "generator", 60, 1000)]
         excused = _settle_run(tmp, "settle-whole", whole, 1000, flat, flat, rss_settle=60.0)
         result = _status(excused, checks.check_rss_slope)
+        expect(result.status == checks.SKIP
+               and "longest steady stretch 0s" in result.detail,
+               f"a schedule that excuses every sample SKIPs, saying why, got {result}")
+
+
+def _lives_stdout(end_s, down, rss):
+    """A `logit` service's NDJSON every 5 s from +0 to `end_s`, silent inside each `down`
+    `(start, end)` and starting a new life at each one's end, with `rss(uptime)` as its
+    resident bytes."""
+    lines = []
+    life_start = -1.0
+    for offset in range(0, int(end_s) + 1, 5):
+        if any(start <= offset < end for start, end in down):
+            continue
+        life_start = max([life_start] + [end for _, end in down if end <= offset])
+        uptime = offset - life_start
+        stamp = _stamp(T0 + offset)
+        lines.append(_line(stamp, "logit.process.uptime", "gauge", uptime))
+        lines.append(_line(stamp, "logit.component.batches.delivered", "sum", 1,
+                           component="sink"))
+        lines.append(_line(stamp, "logit.process.memory.resident.bytes", "gauge", rss(uptime)))
+        lines.append(_line(stamp, "logit.process.fds", "gauge", 10))
+        lines.append(_line(stamp, "logit.process.interner.strings", "gauge", 100))
+    return lines
+
+
+def _rss_life_warmup():
+    """`rss_slope` fits a life only past its first `RSS_LIFE_WARMUP_S` and over
+    `RSS_MIN_SPAN_S`: cri-rotate's short, noisy lives SKIP rather than FAIL, growth over a long
+    life still FAILs, and a span one drain short of the minimum isn't fitted."""
+    mib = 2 ** 20
+    with tempfile.TemporaryDirectory() as tmp:
+        def run(name, end_s, kills, rss, **resolved):
+            timeline = [_phase("start", 0, t0=T0)]
+            for i, (start, end) in enumerate(kills):
+                timeline += [_action("apply", f"c{i}s1", "kill", "logit", start, start + 1),
+                             _action("revert", f"c{i}s1", "kill", "logit", end, end)]
+            timeline += [_phase("end_begin", end_s), _phase("end_end", end_s + 50)]
+            run_dir = _run_dir(tmp, name, timeline, _lives_stdout(end_s + 50, kills, rss),
+                               duration=float(end_s), **resolved)
+            (run_dir / "logs" / "generator.stdout").write_text("\n".join(_lives_stdout(
+                end_s + 50, [], lambda u: 50 * mib)) + "\n")
+            return run_dir
+
+        # cri-rotate's SUT (20261101T000854Z): a kill every 150 s for 35 s, each life 21 MiB
+        # at its start, 28 MiB from 30 s, and a 2.8 MiB step at 80 s, near the middle of the 45
+        # to 110 s steady stretch, which fits as 233 MiB/h over 65 s. The lives never grow, and
+        # none holds 300 s past its warm-up.
+        def noisy(uptime):
+            return (21 + (7 if uptime >= 30 else 0) + (2.8 if uptime >= 80 else 0)) * mib
+        kills = [(start, start + 35) for start in range(100, 3400, 150)]
+        result = _status(run("noisy-lives", 3600, kills, noisy), checks.check_rss_slope)
+        expect(result.status == checks.PASS
+               and "logit SKIP: no life's steady samples span 300s past its 120s warm-up"
+               in result.detail and "generator PASS" in result.detail,
+               f"short noisy lives SKIP rather than FAIL, got {result}")
+
+        # One kill at +300, then a life of almost an hour growing 128 MiB/h past a 7 MiB
+        # start-up rise.
+        def growing(uptime):
+            return (21 + (7 if uptime >= 30 else 0)) * mib + _FAST_RSS * uptime
+        result = _status(run("long-growth", 3900, [(300, 335)], growing),
+                         checks.check_rss_slope)
+        expect(result.status == checks.FAIL and "logit FAIL: MiB/h" in result.detail
+               and "life 1 +128.0" in result.detail,
+               f"growth over a long life still FAILs, got {result}")
+
+        # A fault-free run whose one life's first sample past its warm-up is at +120 (it
+        # started at -1) and its last before the end sequence at end_s - 5: 300 s fits at
+        # end_s 425, and 295 s at 420 doesn't, in a run with room for a fit, which WARNs.
+        def flat(uptime):
+            return 50 * mib
+        result = _status(run("span-300", 425, [], flat, cooldown=0.0), checks.check_rss_slope)
+        expect(result.status == checks.PASS and "logit PASS: MiB/h life 0 +0.0" in result.detail,
+               f"a 300 s span is fitted, got {result}")
+        result = _status(run("span-295", 420, [], flat, cooldown=0.0), checks.check_rss_slope)
         expect(result.status == checks.WARN
-               and "every sample after warmup in a fault window" in result.detail,
-               f"a service with every sample excused WARNs rather than SKIPs, got {result}")
+               and "logit WARN: no life with enough samples" in result.detail,
+               f"a 295 s span isn't fitted, got {result}")
 
 
 def _expected_rules(root):
@@ -14865,7 +14947,7 @@ def run(root, quiet=False):
                      _file_ops, _file_action_rules, _copytruncate_ledger, _two_sut_rules,
                      _two_sut_driver, _two_sut_checks, _relay_rules, _relay_driver,
                      _relay_checks, _per_service, _slope_edges,
-                     _rss_settle_rules, _rss_settle_checks,
+                     _rss_settle_rules, _rss_settle_checks, _rss_life_warmup,
                      _expected_rules, _slope_reducer, _standin_codec, _standin_record_parts,
                      _standin_server, _respond_rules, _standin_count, _standin_idle_timeout,
                      _standin_driver,
