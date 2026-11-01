@@ -11921,6 +11921,150 @@ mod tests {
         assert_eq!(snapshot.components.get("out"), Some(&NodeState::Finished));
     }
 
+    /// One `run_lua` thread's progress, measured against its own user-mode CPU time.
+    #[cfg(target_os = "linux")]
+    struct TicklessCpu {
+        /// The most user-mode CPU the thread spent while its heartbeat was busy and unchanged.
+        longest: Duration,
+        /// Every event the node sent downstream.
+        emitted: usize,
+    }
+
+    /// `/proc`'s `utime` is in `USER_HZ` ticks, which the kernel's ABI fixes at 100 per second.
+    #[cfg(target_os = "linux")]
+    const USER_HZ_TICK: Duration = Duration::from_millis(10);
+
+    /// The user-mode CPU `/proc/self/task/<tid>/stat` reports for one thread, or `None` once the
+    /// thread has exited. `utime` is the 14th field; the 2nd is the thread's name in parentheses,
+    /// which may hold spaces, so fields are counted from the last `)`.
+    #[cfg(target_os = "linux")]
+    fn thread_user_cpu(tid: &str) -> Option<Duration> {
+        let stat = std::fs::read_to_string(format!("/proc/self/task/{tid}/stat")).ok()?;
+        let after_name = &stat[stat.rfind(')')? + 1..];
+        let utime: u32 = after_name.split_whitespace().nth(11)?.parse().ok()?;
+        Some(USER_HZ_TICK * utime)
+    }
+
+    /// Runs `script` on a real `run_lua` thread, fed `batch` (if any) and then a closed inbox,
+    /// which runs the close-time `flush()` when `interval` is set. A sampler polls the thread's
+    /// heartbeat and its user-mode CPU time, and reports the most CPU the thread spent inside a
+    /// script call without advancing the heartbeat.
+    ///
+    /// That is the work between two heartbeat ticks, which no scheduler gap or page-fault stall
+    /// stretches: a thread that isn't running user code accrues no user time. The watcher itself
+    /// reads wall time, and its verdicts are covered under paused time by the `watch_lua_thread`
+    /// tests above.
+    #[cfg(target_os = "linux")]
+    async fn tickless_cpu(
+        script: &str,
+        interval: Option<Duration>,
+        batch: Option<EventBatch>,
+    ) -> TicklessCpu {
+        let (inbox_tx, inbox) = mpsc::channel(1);
+        let (fanout, mut out_rx) = crate::test_util::fanout_channel(16);
+        let io: SharedLuaIo = Arc::new(std::sync::Mutex::new(Some(LuaIo {
+            inbox,
+            fanout,
+            target_fanouts: Vec::new(),
+        })));
+        let heartbeat = Arc::new(Heartbeat::new());
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (done_tx, done_rx) = oneshot::channel();
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (script, thread_heartbeat, runtime) =
+            (script.to_string(), heartbeat.clone(), tokio::runtime::Handle::current());
+        std::thread::spawn(move || {
+            // `<pid>/task/<tid>`, read by the thread itself.
+            let link = std::fs::read_link("/proc/thread-self").expect("/proc/thread-self");
+            let tid = link.file_name().expect("a tid").to_string_lossy().into_owned();
+            tid_tx.send(tid).expect("the test waits for the tid");
+            run_lua(
+                "enrich".to_string(),
+                script,
+                Default::default(),
+                false,
+                interval,
+                Vec::new(),
+                ready_tx,
+                done_tx,
+                io,
+                thread_heartbeat,
+                None,
+                LuaRuntimeConfig::default().min_verdict_spacing,
+                Telemetry::default(),
+                Arc::new(AtomicU64::new(0)),
+                runtime,
+            )
+        });
+        let tid = tid_rx.recv().expect("the thread reports its tid");
+        ready_rx.await.unwrap().expect("the script loads");
+
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sampler = {
+            let (done, heartbeat) = (done.clone(), heartbeat.clone());
+            std::thread::spawn(move || {
+                let (mut longest, mut busy_samples) = (Duration::ZERO, 0);
+                let mut last = None;
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    let value = heartbeat.read();
+                    let Some(cpu) = thread_user_cpu(&tid) else { break };
+                    busy_samples += usize::from(Heartbeat::is_busy(value));
+                    match last {
+                        Some((seen, since)) if seen == value && Heartbeat::is_busy(value) => {
+                            longest = longest.max(cpu.saturating_sub(since));
+                        }
+                        Some((seen, _)) if seen == value => {}
+                        _ => last = Some((value, cpu)),
+                    }
+                    // A sampling period, not a wait: well under the bound the callers assert.
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                (longest, busy_samples)
+            })
+        };
+
+        if let Some(batch) = batch {
+            let delivered = Delivered::Owned(batch, TraceContext::new_root().into());
+            inbox_tx.send(delivered).await.expect("the node reads its inbox");
+        }
+        drop(inbox_tx);
+        // The node drops its `Fanout` as it exits, which closes `out_rx`. The script's own work
+        // scales with CPU, so this names a ceiling well past `RECV_TIMEOUT`.
+        let mut emitted = 0;
+        let drained = tokio::time::timeout(Duration::from_secs(60), async {
+            while let Some(delivered) = out_rx.recv().await {
+                emitted += unwrap_batch(delivered).events.len();
+            }
+        });
+        drained.await.expect("the node finishes within 60 s");
+        done_rx.await.unwrap().expect("a clean run");
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (longest, busy_samples) = sampler.join().expect("the sampler");
+        // A sampler that never read the thread inside a call would pass vacuously.
+        assert!(busy_samples > 0, "the sampler never saw the thread inside a script call");
+        TicklessCpu { longest, emitted }
+    }
+
+    /// The most user-mode CPU a script call may spend between heartbeat ticks in these tests.
+    ///
+    /// The longest run measured is under one `USER_HZ` tick (10 ms) on an idle fast machine, and
+    /// 10-20 ms under memory pressure that held the thread in page faults for over a second of
+    /// wall time, where `/proc` folds a share of the thread's kernel time into `utime`. Below the
+    /// bound, 5x room covers that and a slower CPU. Above it is the cost of taking 100,000
+    /// returned events with no ticks: the key walk and the per-element conversion together take
+    /// 90-100 ms of CPU on a fast machine, at the bound, and more on a CI runner's slower CPU.
+    /// User-mode CPU doesn't stretch under load or memory pressure, unlike the watcher's
+    /// wall-clock `stall_after`.
+    #[cfg(target_os = "linux")]
+    const TICKLESS_CPU_BOUND: Duration = Duration::from_millis(100);
+
+    /// A `flush()` returning 100,000 events advances the heartbeat at least once per
+    /// [`TICKLESS_CPU_BOUND`] of its own work, so the watcher reads it as progress whenever the
+    /// thread is running. The per-key and per-element tick counts are pinned by
+    /// `flush_ticks_the_heartbeat_per_construction_key_and_element` in `logit-script`; this pins
+    /// that no pass between them, in the script worker or in the runtime around it, goes long
+    /// without one.
+    #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_progressing_flush_emitting_many_events_is_never_stalled() {
         let script = r#"
@@ -11933,93 +12077,12 @@ mod tests {
                 return out
             end
         "#;
-        let mut components = Map::new();
-        components.insert("in".to_string(), plain_component(vec![], statsd_in()));
-        components.insert(
-            "enrich".to_string(),
-            plain_component(
-                vec!["in".to_string()],
-                ComponentKind::Lua {
-                    script: script.to_string(),
-                    interval: Some(Duration::from_secs(3600)),
-                    max_memory: None,
-                    jit: false,
-                    vars: Default::default(),
-                },
-            ),
-        );
-        components
-            .insert("out".to_string(), plain_component(vec!["enrich".to_string()], influxdb_out()));
-        let g =
-            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
-
-        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
-        // Finishes at once, so the close-time `flush()` is the only work the node does.
-        specs.insert(
-            "in".to_string(),
-            NodeSpec::Input(
-                Box::new(FiniteInput { batch: Some(one_counter_batch("hits")) }),
-                InputRuntimeConfig::default(),
-            ),
-        );
-        // The flush's longest gap between heartbeat ticks is tens of milliseconds, even on a
-        // slow shared runner. 1 s is far above that, so a scheduler pause on a loaded runner
-        // doesn't read as a stall, and below the flush's duration on a slow runner, so a
-        // tickless phase of the return check could still trip the detector. The per-key tick
-        // count is pinned by `flush_ticks_the_heartbeat_per_construction_key_and_element` in
-        // `logit-script`. The flush takes about 1.2 s in a debug build on a fast machine, where
-        // the margin is thin; the bound is not asserted there, so a faster machine can't fail
-        // the test.
-        let runtime = LuaRuntimeConfig {
-            stall_after: Duration::from_secs(1),
-            shutdown_grace: Duration::from_millis(50),
-            ..Default::default()
-        };
-        specs.insert(
-            "enrich".to_string(),
-            lua_spec(script, Some(Duration::from_secs(3600)), runtime),
-        );
-        let (tx, out_rx) = std::sync::mpsc::channel();
-        specs.insert(
-            "out".to_string(),
-            NodeSpec::Output(
-                Box::new(RecordingOutput { tx }),
-                SinkStoreConfig::Memory(SinkQueueConfig::default()),
-                WriteLoopConfig::default(),
-            ),
-        );
-
-        let registry = Registry::new();
-        let telemetry: HashMap<String, Telemetry> =
-            [("enrich".to_string(), registry.telemetry_for("enrich", "x", "x"))].into();
-        let (readiness, mut rx) = Readiness::channel();
-        // Records every state the node passes through, so a stall that clears again is seen.
-        let seen_stalled = tokio::spawn(async move {
-            let mut seen = false;
-            while rx.changed().await.is_ok() {
-                seen |=
-                    rx.borrow_and_update().components.get("enrich") == Some(&NodeState::Stalled);
-            }
-            seen
-        });
-
-        tokio::time::timeout(
-            Duration::from_secs(60),
-            run_with_telemetry(g, specs, telemetry, readiness, std::future::pending()),
-        )
-        .await
-        .expect("the flush finishes")
-        .expect("a progressing flush is a clean run");
-
-        let emitted: usize = out_rx.try_iter().map(|b| b.events.len()).sum();
-        assert_eq!(emitted, 100_000);
-        assert!(!seen_stalled.await.unwrap(), "a flush making progress was reported stalled");
-        assert_eq!(
-            Totals::of(registry.drain(0)).sum(
-                "logit.component.diagnostics",
-                &[("component", "enrich"), ("key", "script_stalled")]
-            ),
-            0.0
+        let run = tickless_cpu(script, Some(Duration::from_secs(3600)), None).await;
+        assert_eq!(run.emitted, 100_000);
+        assert!(
+            run.longest < TICKLESS_CPU_BOUND,
+            "a flush making progress spent {:?} of CPU between heartbeat ticks",
+            run.longest
         );
     }
 
@@ -12127,6 +12190,7 @@ mod tests {
     /// Pins an accepted residual (`docs/adr/lua-runaway-script-bounds.md`): each `Event.new`
     /// advances the heartbeat, so a script constructing and discarding events in a loop reads as
     /// progress however long it runs, the same as a large `flush()`.
+    #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_loop_that_keeps_constructing_events_is_progress_not_a_stall() {
         let script = r#"
@@ -12137,73 +12201,13 @@ mod tests {
                 return event
             end
         "#;
-        let mut components = Map::new();
-        components.insert("in".to_string(), plain_component(vec![], statsd_in()));
-        components.insert(
-            "enrich".to_string(),
-            plain_component(
-                vec!["in".to_string()],
-                ComponentKind::Lua {
-                    script: script.to_string(),
-                    interval: None,
-                    max_memory: None,
-                    jit: false,
-                    vars: Default::default(),
-                },
-            ),
+        let run = tickless_cpu(script, None, Some(one_counter_batch("hits"))).await;
+        assert_eq!(run.emitted, 1);
+        assert!(
+            run.longest < TICKLESS_CPU_BOUND,
+            "a loop constructing events spent {:?} of CPU between heartbeat ticks",
+            run.longest
         );
-        components
-            .insert("out".to_string(), plain_component(vec!["enrich".to_string()], influxdb_out()));
-        let g =
-            graph::resolve(Config { components, ..Default::default() }).expect("should resolve");
-
-        let mut specs: HashMap<String, NodeSpec> = HashMap::new();
-        specs.insert(
-            "in".to_string(),
-            NodeSpec::Input(
-                Box::new(FiniteInput { batch: Some(one_counter_batch("hits")) }),
-                InputRuntimeConfig::default(),
-            ),
-        );
-        // Over 10x the worst heartbeat gap measured under CPU load (18 ms); the loop takes over a
-        // second in a debug build. The bound is not asserted, so a faster machine can't fail the
-        // test.
-        let runtime = LuaRuntimeConfig {
-            stall_after: Duration::from_millis(200),
-            shutdown_grace: Duration::from_millis(20),
-            ..Default::default()
-        };
-        specs.insert("enrich".to_string(), lua_spec(script, None, runtime));
-        let (tx, out_rx) = std::sync::mpsc::channel();
-        specs.insert(
-            "out".to_string(),
-            NodeSpec::Output(
-                Box::new(RecordingOutput { tx }),
-                SinkStoreConfig::Memory(SinkQueueConfig::default()),
-                WriteLoopConfig::default(),
-            ),
-        );
-
-        let (readiness, mut rx) = Readiness::channel();
-        let seen_stalled = tokio::spawn(async move {
-            let mut seen = false;
-            while rx.changed().await.is_ok() {
-                seen |=
-                    rx.borrow_and_update().components.get("enrich") == Some(&NodeState::Stalled);
-            }
-            seen
-        });
-
-        tokio::time::timeout(
-            Duration::from_secs(60),
-            run_with_telemetry(g, specs, HashMap::new(), readiness, std::future::pending()),
-        )
-        .await
-        .expect("the loop finishes")
-        .expect("a constructing loop is a clean run");
-
-        assert_eq!(out_rx.try_iter().map(|b| b.events.len()).sum::<usize>(), 1);
-        assert!(!seen_stalled.await.unwrap(), "a loop constructing events was reported stalled");
     }
 
     // -- `max_memory` (`docs/adr/lua-runaway-script-bounds.md`, decision 3). Real time: each
