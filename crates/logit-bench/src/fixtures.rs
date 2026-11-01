@@ -536,8 +536,8 @@ pub fn csv_event(line: &str) -> Event {
 /// [`NGINX_SYSLOG_LINE`]'s field names come from: two counters (one per-event, one field-backed)
 /// and two distributions. [`NGINX_SYSLOG_LINE`] populates `upstream_response_time`, so all four
 /// fire: the costlier real case (a non-proxied request skips the fourth). The current example's
-/// `nginx_metrics` reads different, semconv field names (`http.response.body.size`,
-/// `http.request.duration_s`, `upstream.duration_s`) instead.
+/// `nginx_metrics` differs in its metric names and kinds as well as its field names
+/// (`http.response.body.size`, `http.request.duration_s`, `upstream.duration_s`).
 pub fn kv_metrics() -> KvMetrics {
     KvMetrics::new(
         vec![

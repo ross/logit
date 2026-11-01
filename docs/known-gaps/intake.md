@@ -226,7 +226,7 @@ Entry format and the other areas: [the known-gaps index](README.md).
   address ([ADR `tls-client-server-name`](../adr/tls-client-server-name.md)). So a front end that
   routes on SNI and is reached by IP can't be reached by name. OTel's `tls.server_name_override`
   sets both. The HTTP clients are why: `reqwest` 0.12.28 (the shared HTTP driver and
-  `prometheus_in`'s scrape client) takes SNI from the connection URI's host, offers only
+  the scrape driver's client) takes SNI from the connection URI's host, offers only
   `tls_sni(bool)`, and gives no connector layer a way to rewrite the URI.
   - **To close, once there's a use case:** on the `reqwest` clients, send the request to a URL whose
     host is the `server_name`, with an explicit `Host` header carrying the real authority and a

@@ -6,6 +6,7 @@
 //! [`MessageBuf`], with per-message drop accounting), or [`SignalEncoder`] (one payload per OTLP
 //! signal). `docs/design/wire-protocol.md` has the native format's framing and payload.
 
+pub mod apache_status;
 pub mod auth;
 pub mod buffer;
 pub mod collectd;
@@ -26,6 +27,7 @@ pub mod msgpack;
 pub mod msgpack_event;
 pub mod multi_value;
 pub mod native;
+pub mod nginx_status;
 pub mod otlp;
 pub mod prometheus;
 pub mod proxy;

@@ -4316,7 +4316,7 @@
               ]
             },
             "headers": {
-              "description": "Extra headers sent on every scrape request. A name this input reserves (`accept`, `user-agent`, `content-type`, `content-length`, `content-encoding`, `host`, `te`, `transfer-encoding`, `connection`, or an HTTP/2 pseudo-header starting with `:`) is rejected, as are two keys naming the same header once case is ignored. Scrape mode only.",
+              "description": "Extra headers sent on every scrape request. A name this input reserves (`accept`, `accept-encoding`, `user-agent`, `content-type`, `content-length`, `content-encoding`, `host`, `te`, `transfer-encoding`, `connection`, or an HTTP/2 pseudo-header starting with `:`) is rejected, as are two keys naming the same header once case is ignored. Scrape mode only.",
               "default": {},
               "type": "object",
               "additionalProperties": {
@@ -4410,6 +4410,128 @@
               "type": "string",
               "enum": [
                 "prometheus_in"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "nginx's `stub_status` page, scraped on `interval` from each target, as the OpenTelemetry Collector's `nginxreceiver` metrics: `nginx.connections_accepted`, `nginx.connections_handled`, and `nginx.requests` as cumulative counters, and `nginx.connections_current` as a gauge per `state` (`active`, `reading`, `writing`, `waiting`). Reads freenginx's, Angie's, and Tengine's pages too. Each target's events carry `server.address`, `server.port`, and `url.path` on their resource, and each scrape adds `up`, `scrape_duration_seconds`, and `scrape_samples_scraped`, as `prometheus_in`'s scrape mode does. A body that isn't a `stub_status` page sets `up` to `0` and emits no decoded events.\n\nThe page counts connections, and nginx counts this input's own requests in `requests`. Serve it on an internal address only.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "buffer": true,
+            "headers": {
+              "description": "Extra headers sent on every scrape request. A name this input reserves (`accept`, `accept-encoding`, `user-agent`, `content-type`, `content-length`, `content-encoding`, `host`, `te`, `transfer-encoding`, `connection`, or an HTTP/2 pseudo-header starting with `:`) is rejected, as are two keys naming the same header once case is ignored.",
+              "default": {},
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "interval": {
+              "description": "Scrape cadence. Defaults to `15s`; `0s` is rejected.",
+              "default": "15s",
+              "type": "string"
+            },
+            "receive": true,
+            "scrape_targets": {
+              "description": "Absolute `http://` or `https://` URLs of `stub_status` locations, such as `http://127.0.0.1:8080/nginx_status`. Defaults to none, and with none the input scrapes nothing; the other settings below are still checked.",
+              "default": [],
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "scrape_tls": {
+              "description": "Client-side TLS tuning for `https://` targets. A non-default block with no `https://` target is rejected, and so is one with no targets at all. Named `scrape_tls`, as on `prometheus_in`, so a block copied between the two works.",
+              "default": {
+                "ca_file": null,
+                "cert_file": null,
+                "insecure_skip_verify": false,
+                "key_file": null,
+                "server_name": null
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TlsClientConfig"
+                }
+              ]
+            },
+            "sources": true,
+            "targets": true,
+            "timeout": {
+              "description": "Per-request timeout. Defaults to `10s`; `0s` is rejected.",
+              "default": "10s",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "nginx_stub_status_in"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Apache httpd's `mod_status` page in its `?auto` form, scraped on `interval` from each target, as the OpenTelemetry Collector's `apachereceiver` metrics under their new-format names: `apache.uptime`, `apache.request.count`, `apache.traffic`, and `apache.request.time` as cumulative counters, and the load, CPU, worker, connection, and scoreboard counts as gauges. Which of them a page carries depends on the MPM and on `ExtendedStatus`. Each target's events carry `server.address`, `server.port`, and `url.path` on their resource, and each scrape adds `up`, `scrape_duration_seconds`, and `scrape_samples_scraped`, as `prometheus_in`'s scrape mode does. A body with none of the page's keys is a failed scrape: no decoded events, and the three synthetics with `up` at `0`.\n\nThe page discloses the server's version and connection counts, and Apache counts this input's own requests. Serve it on an internal address only.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "buffer": true,
+            "headers": {
+              "description": "Extra headers sent on every scrape request. A name this input reserves (`accept`, `accept-encoding`, `user-agent`, `content-type`, `content-length`, `content-encoding`, `host`, `te`, `transfer-encoding`, `connection`, or an HTTP/2 pseudo-header starting with `:`) is rejected, as are two keys naming the same header once case is ignored.",
+              "default": {},
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "interval": {
+              "description": "Scrape cadence. Defaults to `15s`; `0s` is rejected.",
+              "default": "15s",
+              "type": "string"
+            },
+            "receive": true,
+            "scrape_targets": {
+              "description": "Absolute `http://` or `https://` URLs of `mod_status` pages, each with `auto` in its query string, such as `http://127.0.0.1:8080/server-status?auto`; without it Apache serves its HTML page and every scrape fails. Defaults to none, and with none the input scrapes nothing; the other settings below are still checked.",
+              "default": [],
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "scrape_tls": {
+              "description": "Client-side TLS tuning for `https://` targets. A non-default block with no `https://` target is rejected, and so is one with no targets at all. Named `scrape_tls`, as on `prometheus_in`, so a block copied between the two works.",
+              "default": {
+                "ca_file": null,
+                "cert_file": null,
+                "insecure_skip_verify": false,
+                "key_file": null,
+                "server_name": null
+              },
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TlsClientConfig"
+                }
+              ]
+            },
+            "sources": true,
+            "targets": true,
+            "timeout": {
+              "description": "Per-request timeout. Defaults to `10s`; `0s` is rejected.",
+              "default": "10s",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "apache_status_in"
               ]
             }
           },

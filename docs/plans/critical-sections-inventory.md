@@ -300,7 +300,7 @@ Sorted by priority, then area. Update **Status** in the PR that lands a session'
 | [WIRE-09](#wire-09--pooled-connection-close-probe-stream-erasure-and-sni-derivation) | P1 | Pooled-connection close probe, stream erasure, and SNI derivation | `crates/logit-pipeline/src/tls.rs` (`AsyncStream`, `PendingClose`, `poll_pending_close`), `crates/logit-outputs/src/tls.rs` (`host_only`) | findings → #450 |
 | [WIRE-12](#wire-12--otlp_out-grpc-round-trip-over-a-pooled-hyper-utilhyper-rustls-client-and-the-fault-table) | P1 | `otlp_out` gRPC round trip over a pooled hyper-util/hyper-rustls client, and the fault table | `crates/logit-outputs/src/otlp.rs` (`send_http`, `send_grpc`, `grpc_roundtrip`) | unreviewed |
 | [WIRE-13](#wire-13--tls-configuration-construction-private-ca-mtls-and-insecure_skip_verify) | P1 | TLS configuration construction: private CA, mTLS, and `insecure_skip_verify` | `crates/logit-inputs/src/tls.rs` (`build_server_config`, `apply_client_tls`) | unreviewed |
-| [WIRE-14](#wire-14--prometheus_in-scrape-loop-per-tick-fan-out-per-target-body-cap-outcome-bookkeeping) | P1 | `prometheus_in` scrape loop: per-tick fan-out, per-target body cap, outcome bookkeeping | `crates/logit-inputs/src/prometheus.rs` (`PrometheusInput::tick`, `scrape_target`, `MAX_SCRAPE_BYTES`) | unreviewed |
+| [WIRE-14](#wire-14--prometheus_in-scrape-loop-per-tick-fan-out-per-target-body-cap-outcome-bookkeeping) | P1 | `prometheus_in` scrape loop: per-tick fan-out, per-target body cap, outcome bookkeeping | `crates/logit-inputs/src/scrape.rs` (`ScrapeInput::tick`, `scrape_target`), `crates/logit-inputs/src/prometheus.rs` (`MAX_SCRAPE_BYTES`) | unreviewed |
 | [WIRE-16](#wire-16--prometheus_in-metadata-cache-one-blocking-mutex-an-arc-seed-an-expiry-watermark-lru-cap) | P1 | `prometheus_in` metadata cache: one blocking mutex, an `Arc` seed, an expiry watermark, LRU cap | `crates/logit-inputs/src/prometheus.rs` (`MetadataCache`, `CacheState`) | unreviewed |
 | [WIRE-17](#wire-17--prometheus_in--written--logitinputsamples-reconciliation) | P1 | `prometheus_in` `-Written` / `logit.input.samples` reconciliation | `crates/logit-inputs/src/prometheus.rs` (`write_response`'s `-Written` counting, `with_written_headers`) | unreviewed |
 | [WIRE-18](#wire-18--prometheus_out-exposition-registry-upsert-type-conflict-expiry-sweep-one-pass-cap) | P1 | `prometheus_out` exposition registry: upsert, type conflict, expiry sweep, one-pass cap | `crates/logit-outputs/src/prometheus.rs` (`Registry`, `ExposeOutput::send`) | unreviewed |
@@ -5221,9 +5221,10 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
      a sample of their references was independently re-verified. -->
 
 ### WIRE-14 — `prometheus_in` scrape loop: per-tick fan-out, per-target body cap, outcome bookkeeping
-- **Location:** `crates/logit-inputs/src/prometheus.rs` (`MAX_SCRAPE_BYTES` = 32 MiB,
-  `instance_of`, `redact_url`, `build_resource`, `status_class`, `ScrapeStatus`, `scrape_target`,
-  `PrometheusInput::tick`, `PrometheusInput`'s `Input::run`)
+- **Location:** `crates/logit-inputs/src/scrape.rs`, the scrape driver (`redact_url`,
+  `status_class`, `ScrapeStatus`, `scrape_target`, `ScrapeInput::tick`, `ScrapeInput`'s
+  `Input::run`), and `crates/logit-inputs/src/prometheus.rs`'s decoder half (`MAX_SCRAPE_BYTES` =
+  32 MiB, `instance_of`, `build_resource`, `PrometheusScrapeDecoder`)
 - **What it does:** `run` drives a `tokio::time::interval` with `MissedTickBehavior::Delay`,
   swallows the first tick, and calls `tick`. `tick` spawns one `JoinSet` task per target (all
   targets concurrently, **no cap**), collects `(idx, ScrapeStatus, elapsed)` into a pre-sized
@@ -5261,7 +5262,7 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
     slowest target has finished or timed out, so one slow target delays all targets' batches by up
     to `timeout`, and a full downstream then blocks the whole round at `tick`'s `sink.send`. **High confidence;
     by design, but worth stating.**
-  - The scrape client follows redirects — `reqwest::Client::new()` in `PrometheusInput::new` keeps `reqwest`'s
+  - The scrape client follows redirects — `reqwest::Client::new()` in `ScrapeInput::with_decoder` keeps `reqwest`'s
     `limited(10)` default, unlike `crate::http::build_client` on the sink side. **Documented in
     `docs/known-gaps/` and ADR `prometheus-remote-write`'s Consequences; context, not new.**
   - `logit.input.samples` counts *series* here and *wire samples* in bind mode — documented, by
@@ -5271,7 +5272,8 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
   `two_unparseable_targets_get_distinct_resources`: dialect
   selection, 4xx/5xx classes, timeout, oversize, refused connection, resource identity, URL
   redaction, `Accept` header, two targets in one tick, telemetry classes, TLS trusted/untrusted
-  CA). Integration: `crates/logit-cli/tests/prometheus_round_trip.rs`.
+  CA), and `crates/logit-inputs/src/scrape.rs`'s driver tests over a stub decoder.
+  Integration: `crates/logit-cli/tests/prometheus_round_trip.rs`.
   [ADR `prometheus-scrape-and-exposition`](../adr/prometheus-scrape-and-exposition.md).
 - **Suggested verification approach:** N canned servers each serving just under 32 MiB, asserting
   peak RSS (or simply adding and testing a `JoinSet` concurrency bound); a one-hangs-one-answers
@@ -5784,8 +5786,8 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
    exposition accept loop (`serve` in `crates/logit-outputs/src/prometheus.rs`) classifies and
    backs off instead. A cross-cutting lifecycle decision worth making once, deliberately, rather
    than five times by default.
-8. **`prometheus_in`'s scrape client is the one HTTP client in the workspace that still follows
-   redirects** (`reqwest::Client::new()` in `PrometheusInput::new` in `crates/logit-inputs/src/prometheus.rs`), unlike
+8. **The scrape driver's client (`prometheus_in`, `nginx_stub_status_in`, `apache_status_in`) is the one HTTP client in the workspace that still follows
+   redirects** (`reqwest::Client::new()` in `ScrapeInput::with_decoder` in `crates/logit-inputs/src/scrape.rs`), unlike
    `crate::http::build_client` on the sink side. Already documented, listed here so the
    inconsistency is visible next to the sink-side policy.
 

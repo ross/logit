@@ -48,9 +48,10 @@ Entry format and the other areas: [the known-gaps index](README.md).
     merge the same way across batches.
   - **Workaround:** a nonzero `metrics.normalized{reason="name_sanitized"}` says some name was
     rewritten; rename upstream (a `lua` stage) so no two producers' names sanitize onto one.
-- **`prometheus_in`'s scrape client still follows HTTP redirects.** It builds its own
-  `reqwest::Client` with no redirect policy (`crates/logit-inputs/src/prometheus.rs`'s scrape
-  client), so it inherits `reqwest`'s `limited(10)`.
+- **The scrape client still follows HTTP redirects**, for `prometheus_in` in scrape mode,
+  `nginx_stub_status_in`, and `apache_status_in` alike. It builds its own `reqwest::Client` with no redirect policy
+  (`crates/logit-inputs/src/scrape.rs`, the scrape driver), so it inherits `reqwest`'s
+  `limited(10)`.
   - **Consequence:** a `307`/`308` replays the request and the operator's `headers:` at the
     `Location` host, past a config-time `https://` check that has no say at runtime. `reqwest`
     strips only `Authorization`/`Cookie`, and only on a host or port change, so a tenant header

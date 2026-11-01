@@ -125,9 +125,15 @@
 //!     series folded into its name's overflow series), and a `max_samples_per_series` or
 //!     `max_set_members_per_series` of `0` (every record falls back)
 //!     (`docs/adr/aggregation-window-semantics.md`).
-//! 40. A scrape-mode `prometheus_in` with a target that isn't an absolute `http(s)://` URL
-//!     (`is_absolute_http_url`), `timeout: 0s`, a `scrape_tls:` failing 24's checks or with no
-//!     `https://` target, or 22's header faults against `RESERVED_PROMETHEUS_HEADERS`.
+//! 40. A scrape-mode `prometheus_in`, an `nginx_stub_status_in`, or an `apache_status_in` with a
+//!     target that isn't an absolute `http(s)://` URL (`is_absolute_http_url`), `timeout: 0s`, a
+//!     `scrape_tls:` failing 24's checks or with no `https://` target, or 22's header faults
+//!     against `RESERVED_SCRAPE_HEADERS` (`check_scrape_settings`, which every scrape kind
+//!     shares). An `nginx_stub_status_in` or `apache_status_in` with no target is legal and
+//!     scrapes nothing, but every check still runs on it, so a set `scrape_tls:` with no target is
+//!     rejected like one with only `http://` targets. A `prometheus_in` with no target is rule
+//!     55's. No rule checks an `apache_status_in` target for `?auto`: `mod_status` finds `auto`
+//!     anywhere in the query string, and a proxy in front of the server may add it.
 //! 41. A registry-mode `prometheus_out` `path` not starting with `/` (every scrape would 404) or
 //!     `max_series: 0` (every series evicted on arrival)
 //!     (`docs/adr/prometheus-scrape-and-exposition.md`).
@@ -475,6 +481,8 @@ pub fn role(kind: &ComponentKind) -> Role {
         | LogitIn { .. }
         | Internal { .. }
         | PrometheusIn { .. }
+        | NginxStubStatusIn { .. }
+        | ApacheStatusIn { .. }
         | GenerateIn { .. }
         | ReplayIn { .. }
         | KafkaIn { .. } => Role::Listener,
@@ -556,6 +564,8 @@ pub fn kind_name(kind: &ComponentKind) -> &'static str {
         LogitIn { .. } => "logit_in",
         Internal { .. } => "internal",
         PrometheusIn { .. } => "prometheus_in",
+        NginxStubStatusIn { .. } => "nginx_stub_status_in",
+        ApacheStatusIn { .. } => "apache_status_in",
         GenerateIn { .. } => "generate_in",
         ReplayIn { .. } => "replay_in",
         KafkaIn { .. } => "kafka_in",
@@ -691,6 +701,8 @@ fn is_implemented(kind: &ComponentKind) -> bool {
             | ComponentKind::CriIn { .. }
             | ComponentKind::Internal { .. }
             | ComponentKind::PrometheusIn { .. }
+            | ComponentKind::NginxStubStatusIn { .. }
+            | ComponentKind::ApacheStatusIn { .. }
             | ComponentKind::Lua { .. }
             | ComponentKind::LuaFile { .. }
             | ComponentKind::Aggregate { .. }
@@ -759,7 +771,9 @@ fn interval(kind: &ComponentKind) -> Option<Duration> {
         ComponentKind::Aggregate { interval, .. }
         | ComponentKind::Internal { interval, .. }
         | ComponentKind::Shape { interval, .. }
-        | ComponentKind::PrometheusIn { interval, .. } => Some(*interval),
+        | ComponentKind::PrometheusIn { interval, .. }
+        | ComponentKind::NginxStubStatusIn { interval, .. }
+        | ComponentKind::ApacheStatusIn { interval, .. } => Some(*interval),
         _ => None,
     }
 }
@@ -874,12 +888,14 @@ const RESERVED_OTLP_HEADERS: &[&str] = &[
     "connection",
 ];
 
-/// Header names `prometheus_in`'s scrape client sets itself (rule 40): `Accept` (dialect
-/// negotiation) and `User-Agent` (`crates/logit-inputs/src/prometheus.rs`'s `scrape_target`), plus
-/// [`RESERVED_OTLP_HEADERS`]'s connection-management names. A scrape sends no body, so
+/// Header names the scrape driver sets itself or decides on its own (rule 40): `Accept` (the
+/// decoder's) and `User-Agent` (`crates/logit-inputs/src/scrape.rs`'s `scrape_target`), and
+/// `Accept-Encoding`, so that only the driver chooses which content encodings a target may answer
+/// in, plus [`RESERVED_OTLP_HEADERS`]'s connection-management names. A scrape sends no body, so
 /// `content-type`/`content-encoding` are listed only to keep the two lists parallel.
-const RESERVED_PROMETHEUS_HEADERS: &[&str] = &[
+const RESERVED_SCRAPE_HEADERS: &[&str] = &[
     "accept",
+    "accept-encoding",
     "user-agent",
     "content-type",
     "content-length",
@@ -889,6 +905,82 @@ const RESERVED_PROMETHEUS_HEADERS: &[&str] = &[
     "transfer-encoding",
     "connection",
 ];
+
+/// Rule 40's checks on the settings every scrape kind shares (`crates/logit-inputs/src/scrape.rs`):
+/// each target an absolute `http(s)://` URL, a positive `timeout`, rule 24's `scrape_tls:`
+/// checks plus a set block with no `https://` target, and rule 22's header checks against
+/// [`RESERVED_SCRAPE_HEADERS`]. `interval` is rule 9's.
+fn check_scrape_settings(
+    id: &str,
+    scrape_targets: &[String],
+    timeout: Duration,
+    headers: &HashMap<String, String>,
+    tls: &logit_config::TlsClientConfig,
+) -> anyhow::Result<()> {
+    for target in scrape_targets {
+        if !is_absolute_http_url(target) {
+            anyhow::bail!(
+                "component '{id}': 'scrape_targets' entry {target:?} isn't an absolute \
+                 'http://' or 'https://' URL",
+                target = redact::url(target)
+            );
+        }
+    }
+    if timeout.is_zero() {
+        anyhow::bail!(
+            "component '{id}': 'timeout: 0s' would fail every scrape immediately -- use a \
+             positive duration"
+        );
+    }
+    if tls.cert_file.is_some() != tls.key_file.is_some() {
+        anyhow::bail!(
+            "component '{id}': 'scrape_tls.cert_file' and 'scrape_tls.key_file' must both be \
+             set for mutual TLS, or both omitted -- one alone can't be used"
+        );
+    }
+    if tls.insecure_skip_verify && tls.ca_file.is_some() {
+        anyhow::bail!(
+            "component '{id}': 'scrape_tls.insecure_skip_verify' and 'scrape_tls.ca_file' \
+             can't both be set -- 'insecure_skip_verify' trusts any certificate, which makes a \
+             specific trusted CA meaningless"
+        );
+    }
+    let any_https = scrape_targets.iter().any(|t| t.to_ascii_lowercase().starts_with("https://"));
+    if !tls.is_empty() && !any_https {
+        anyhow::bail!(
+            "component '{id}': 'scrape_tls' is set, but no 'scrape_targets' entry is \
+             'https://' -- TLS is selected per-target by its own scheme, so a 'scrape_tls:' \
+             block here would have no effect"
+        );
+    }
+    let mut seen_lowercase = BTreeSet::new();
+    for name in headers.keys() {
+        if name.is_empty() {
+            anyhow::bail!("component '{id}': 'headers' has an empty header name");
+        }
+        if name.starts_with(':') {
+            anyhow::bail!(
+                "component '{id}': 'headers' names {name:?} -- an HTTP/2 pseudo-header \
+                 (starting with ':') can't be set as a custom header"
+            );
+        }
+        let lowercase = name.to_ascii_lowercase();
+        if RESERVED_SCRAPE_HEADERS.contains(&lowercase.as_str()) {
+            anyhow::bail!(
+                "component '{id}': 'headers' names {name:?}, which this input sets itself -- it \
+                 can't be overridden"
+            );
+        }
+        if !seen_lowercase.insert(lowercase) {
+            anyhow::bail!(
+                "component '{id}': 'headers' names {name:?}, which differs only in case from \
+                 another entry -- HTTP header names are case-insensitive, so which value would \
+                 actually be sent is undefined"
+            );
+        }
+    }
+    Ok(())
+}
 
 /// Header names `prometheus_out`'s remote-write sender sets itself (rule 56): the four protocol
 /// headers `RemoteWriteOutput::send` inserts over the operator's map
@@ -2164,83 +2256,34 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
         }
     }
 
-    // Rule 40: a scrape-mode `prometheus_in`'s scrape settings. Gated on scrape mode; rule 55 owns
-    // the mode itself, including neither mode set.
+    // Rule 40: every scrape kind's scrape settings. `prometheus_in` is gated on scrape mode, and
+    // rule 55 owns the mode itself, including neither mode set. A single-mode kind has no mode to
+    // pick, so it runs every check whatever its target list holds: an empty list is legal, but a
+    // zero `timeout` or a colliding header would still fail `logit run`. A new single-mode scrape
+    // kind adds an arm like `NginxStubStatusIn`'s, with no emptiness gate.
     for (id, component) in &components {
-        if let ComponentKind::PrometheusIn {
-            scrape_targets,
-            timeout,
-            headers,
-            scrape_tls: tls,
-            ..
-        } = &component.kind
-        {
-            if scrape_targets.is_empty() {
-                continue; // bind mode, or no mode at all -- rule 55's, either way
-            }
-            for target in scrape_targets {
-                if !is_absolute_http_url(target) {
-                    anyhow::bail!(
-                        "component '{id}': 'scrape_targets' entry {target:?} isn't an absolute \
-                         'http://' or 'https://' URL",
-                        target = redact::url(target)
-                    );
+        match &component.kind {
+            ComponentKind::PrometheusIn {
+                scrape_targets, timeout, headers, scrape_tls, ..
+            } => {
+                if scrape_targets.is_empty() {
+                    continue; // bind mode, or no mode at all -- rule 55's, either way
                 }
+                check_scrape_settings(id, scrape_targets, *timeout, headers, scrape_tls)?;
             }
-            if timeout.is_zero() {
-                anyhow::bail!(
-                    "component '{id}': 'timeout: 0s' would fail every scrape immediately -- use \
-                     a positive duration"
-                );
+            ComponentKind::NginxStubStatusIn {
+                scrape_targets,
+                timeout,
+                headers,
+                scrape_tls,
+                ..
             }
-            if tls.cert_file.is_some() != tls.key_file.is_some() {
-                anyhow::bail!(
-                    "component '{id}': 'scrape_tls.cert_file' and 'scrape_tls.key_file' must \
-                     both be set for mutual TLS, or both omitted -- one alone can't be used"
-                );
+            | ComponentKind::ApacheStatusIn {
+                scrape_targets, timeout, headers, scrape_tls, ..
+            } => {
+                check_scrape_settings(id, scrape_targets, *timeout, headers, scrape_tls)?;
             }
-            if tls.insecure_skip_verify && tls.ca_file.is_some() {
-                anyhow::bail!(
-                    "component '{id}': 'scrape_tls.insecure_skip_verify' and \
-                     'scrape_tls.ca_file' can't both be set -- 'insecure_skip_verify' trusts any \
-                     certificate, which makes a specific trusted CA meaningless"
-                );
-            }
-            let any_https =
-                scrape_targets.iter().any(|t| t.to_ascii_lowercase().starts_with("https://"));
-            if !tls.is_empty() && !any_https {
-                anyhow::bail!(
-                    "component '{id}': 'scrape_tls' is set, but no 'scrape_targets' entry is \
-                     'https://' -- TLS is selected per-target by its own scheme, so a \
-                     'scrape_tls:' block here would have no effect"
-                );
-            }
-            let mut seen_lowercase = BTreeSet::new();
-            for name in headers.keys() {
-                if name.is_empty() {
-                    anyhow::bail!("component '{id}': 'headers' has an empty header name");
-                }
-                if name.starts_with(':') {
-                    anyhow::bail!(
-                        "component '{id}': 'headers' names {name:?} -- an HTTP/2 pseudo-header \
-                         (starting with ':') can't be set as a custom header"
-                    );
-                }
-                let lowercase = name.to_ascii_lowercase();
-                if RESERVED_PROMETHEUS_HEADERS.contains(&lowercase.as_str()) {
-                    anyhow::bail!(
-                        "component '{id}': 'headers' names {name:?}, which this input sets \
-                         itself -- it can't be overridden"
-                    );
-                }
-                if !seen_lowercase.insert(lowercase) {
-                    anyhow::bail!(
-                        "component '{id}': 'headers' names {name:?}, which differs only in \
-                         case from another entry -- HTTP header names are case-insensitive, so \
-                         which value would actually be sent is undefined"
-                    );
-                }
-            }
+            _ => {}
         }
     }
 
@@ -2936,7 +2979,7 @@ pub fn resolve(config: Config) -> anyhow::Result<Graph> {
                          'compression: snappy' with 'version: 2'"
                     );
                 }
-                // Rule 40's header checks, against this sink's own reserved list.
+                // Rule 22's header checks, against this sink's own reserved list.
                 let mut seen_lowercase = BTreeSet::new();
                 for name in headers.keys() {
                     if name.is_empty() {
@@ -5932,6 +5975,28 @@ mod tests {
             *scrape_tls = tls;
         }
         kind
+    }
+
+    /// An `nginx_stub_status_in` with every field but its targets at its default.
+    fn nginx_stub_status_in(targets: Vec<&str>) -> ComponentKind {
+        ComponentKind::NginxStubStatusIn {
+            scrape_targets: targets.into_iter().map(String::from).collect(),
+            interval: default_prometheus_scrape_interval(),
+            timeout: default_prometheus_scrape_timeout(),
+            headers: Map::new(),
+            scrape_tls: logit_config::TlsClientConfig::default(),
+        }
+    }
+
+    /// An `apache_status_in` with every field but its targets at its default.
+    fn apache_status_in(targets: Vec<&str>) -> ComponentKind {
+        ComponentKind::ApacheStatusIn {
+            scrape_targets: targets.into_iter().map(String::from).collect(),
+            interval: default_prometheus_scrape_interval(),
+            timeout: default_prometheus_scrape_timeout(),
+            headers: Map::new(),
+            scrape_tls: logit_config::TlsClientConfig::default(),
+        }
     }
 
     fn file_out(rotate: logit_config::RotateConfig) -> ComponentKind {
@@ -13964,6 +14029,176 @@ mod tests {
         .expect("an https:// target should resolve fine");
     }
 
+    /// Rule 40's shared checks reach `nginx_stub_status_in`, one case per check.
+    #[test]
+    fn nginx_stub_status_in_runs_the_shared_scrape_checks() {
+        let resolves = |kind| resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+        resolves(nginx_stub_status_in(vec!["http://127.0.0.1:8080/nginx_status"]))
+            .expect("a plain target resolves");
+
+        let rejected = |kind, needle: &str| {
+            let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+            assert!(err.contains(needle), "expected {needle:?}, got: {err}");
+        };
+        rejected(nginx_stub_status_in(vec!["127.0.0.1:8080/nginx_status"]), "isn't an absolute");
+
+        let mut kind = nginx_stub_status_in(vec!["http://h/nginx_status"]);
+        if let ComponentKind::NginxStubStatusIn { timeout, .. } = &mut kind {
+            *timeout = Duration::ZERO;
+        }
+        rejected(kind, "'timeout: 0s'");
+
+        let mut kind = nginx_stub_status_in(vec!["http://h/nginx_status"]);
+        if let ComponentKind::NginxStubStatusIn { scrape_tls, .. } = &mut kind {
+            scrape_tls.insecure_skip_verify = true;
+        }
+        rejected(kind, "no 'scrape_targets' entry is 'https://'");
+
+        for name in ["Accept", "accept-encoding", "User-Agent", ":path"] {
+            let mut kind = nginx_stub_status_in(vec!["http://h/nginx_status"]);
+            if let ComponentKind::NginxStubStatusIn { headers, .. } = &mut kind {
+                headers.insert(name.to_string(), "x".to_string());
+            }
+            rejected(kind, name);
+        }
+    }
+
+    /// An empty target list stays legal but doesn't exempt the other checks; `logit run` would
+    /// fail on each of these.
+    #[test]
+    fn an_nginx_stub_status_in_with_no_targets_still_runs_the_other_checks() {
+        let rejected = |kind, needle: &str| {
+            let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+            assert!(err.contains(needle), "expected {needle:?}, got: {err}");
+        };
+        let mut kind = nginx_stub_status_in(vec![]);
+        if let ComponentKind::NginxStubStatusIn { headers, .. } = &mut kind {
+            headers.insert("X-Tenant".to_string(), "a".to_string());
+            headers.insert("x-tenant".to_string(), "b".to_string());
+        }
+        rejected(kind, "differs only in case");
+
+        let mut kind = nginx_stub_status_in(vec![]);
+        if let ComponentKind::NginxStubStatusIn { timeout, .. } = &mut kind {
+            *timeout = Duration::ZERO;
+        }
+        rejected(kind, "'timeout: 0s'");
+
+        let mut kind = nginx_stub_status_in(vec![]);
+        if let ComponentKind::NginxStubStatusIn { scrape_tls, .. } = &mut kind {
+            scrape_tls.insecure_skip_verify = true;
+        }
+        rejected(kind, "no 'scrape_targets' entry is 'https://'");
+    }
+
+    #[test]
+    fn an_nginx_stub_status_in_with_no_scrape_targets_validates() {
+        resolve(cfg(vec![
+            ("in", vec![], nginx_stub_status_in(vec![])),
+            ("out", vec!["in"], sink()),
+        ]))
+        .expect("no targets is pointless, not broken");
+    }
+
+    #[test]
+    fn an_nginx_stub_status_in_with_zero_interval_is_rejected_by_rule_9() {
+        let mut kind = nginx_stub_status_in(vec!["http://h/nginx_status"]);
+        if let ComponentKind::NginxStubStatusIn { interval, .. } = &mut kind {
+            *interval = Duration::ZERO;
+        }
+        let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+        assert!(err.contains("interval"), "got: {err}");
+    }
+
+    /// Rule 40's shared checks reach `apache_status_in`, one case per check.
+    #[test]
+    fn apache_status_in_runs_the_shared_scrape_checks() {
+        let resolves = |kind| resolve(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+        resolves(apache_status_in(vec!["http://127.0.0.1:8080/server-status?auto"]))
+            .expect("a plain target resolves");
+
+        let rejected = |kind, needle: &str| {
+            let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+            assert!(err.contains(needle), "expected {needle:?}, got: {err}");
+        };
+        rejected(apache_status_in(vec!["127.0.0.1:8080/server-status?auto"]), "isn't an absolute");
+
+        let mut kind = apache_status_in(vec!["http://h/server-status?auto"]);
+        if let ComponentKind::ApacheStatusIn { timeout, .. } = &mut kind {
+            *timeout = Duration::ZERO;
+        }
+        rejected(kind, "'timeout: 0s'");
+
+        let mut kind = apache_status_in(vec!["http://h/server-status?auto"]);
+        if let ComponentKind::ApacheStatusIn { scrape_tls, .. } = &mut kind {
+            scrape_tls.insecure_skip_verify = true;
+        }
+        rejected(kind, "no 'scrape_targets' entry is 'https://'");
+
+        for name in ["Accept", "accept-encoding", "User-Agent", ":path"] {
+            let mut kind = apache_status_in(vec!["http://h/server-status?auto"]);
+            if let ComponentKind::ApacheStatusIn { headers, .. } = &mut kind {
+                headers.insert(name.to_string(), "x".to_string());
+            }
+            rejected(kind, name);
+        }
+    }
+
+    /// `status_handler` finds `auto` anywhere in the query string, and a proxy may add it, so no
+    /// rule checks a target for it.
+    #[test]
+    fn an_apache_status_in_target_without_auto_validates() {
+        resolve(cfg(vec![
+            ("in", vec![], apache_status_in(vec!["http://h/server-status"])),
+            ("out", vec!["in"], sink()),
+        ]))
+        .expect("a target without ?auto is a runtime parse_error, not a config error");
+    }
+
+    /// An empty target list stays legal but doesn't exempt the other checks; `logit run` would
+    /// fail on each of these.
+    #[test]
+    fn an_apache_status_in_with_no_targets_still_runs_the_other_checks() {
+        let rejected = |kind, needle: &str| {
+            let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+            assert!(err.contains(needle), "expected {needle:?}, got: {err}");
+        };
+        let mut kind = apache_status_in(vec![]);
+        if let ComponentKind::ApacheStatusIn { headers, .. } = &mut kind {
+            headers.insert("X-Tenant".to_string(), "a".to_string());
+            headers.insert("x-tenant".to_string(), "b".to_string());
+        }
+        rejected(kind, "differs only in case");
+
+        let mut kind = apache_status_in(vec![]);
+        if let ComponentKind::ApacheStatusIn { timeout, .. } = &mut kind {
+            *timeout = Duration::ZERO;
+        }
+        rejected(kind, "'timeout: 0s'");
+
+        let mut kind = apache_status_in(vec![]);
+        if let ComponentKind::ApacheStatusIn { scrape_tls, .. } = &mut kind {
+            scrape_tls.insecure_skip_verify = true;
+        }
+        rejected(kind, "no 'scrape_targets' entry is 'https://'");
+    }
+
+    #[test]
+    fn an_apache_status_in_with_no_scrape_targets_validates() {
+        resolve(cfg(vec![("in", vec![], apache_status_in(vec![])), ("out", vec!["in"], sink())]))
+            .expect("no targets is pointless, not broken");
+    }
+
+    #[test]
+    fn an_apache_status_in_with_zero_interval_is_rejected_by_rule_9() {
+        let mut kind = apache_status_in(vec!["http://h/server-status?auto"]);
+        if let ComponentKind::ApacheStatusIn { interval, .. } = &mut kind {
+            *interval = Duration::ZERO;
+        }
+        let err = expect_err(cfg(vec![("in", vec![], kind), ("out", vec!["in"], sink())]));
+        assert!(err.contains("interval"), "got: {err}");
+    }
+
     #[test]
     fn a_prometheus_in_with_zero_interval_is_rejected() {
         let mut kind = prometheus_in(vec!["http://node-exporter:9100/metrics"]);
@@ -14081,6 +14316,25 @@ mod tests {
             ("out", vec!["in"], sink()),
         ]));
         assert!(err.contains("sets itself"), "got: {err}");
+    }
+
+    /// The driver alone decides which content encodings a target may answer in.
+    #[test]
+    fn a_prometheus_in_accept_encoding_header_is_rejected_whatever_its_case() {
+        for name in ["accept-encoding", "Accept-Encoding"] {
+            let err = expect_err(cfg(vec![
+                (
+                    "in",
+                    vec![],
+                    prometheus_in_with_headers(
+                        vec!["http://node-exporter:9100/metrics"],
+                        vec![(name, "gzip")],
+                    ),
+                ),
+                ("out", vec!["in"], sink()),
+            ]));
+            assert!(err.contains(name) && err.contains("sets itself"), "got: {err}");
+        }
     }
 
     #[test]

@@ -2,9 +2,9 @@
 
 This directory holds real wire traffic, captured once from real third-party producers and
 committed. The producers are syslog senders, collectd, OTel SDKs, carbon senders, Prometheus,
-node_exporter, a `prometheus_client` app, vmagent, statsd/DogStatsD clients, a Datadog Agent, a dd-trace tracer, four Splunk HEC
-clients, Telegraf's InfluxDB v2 output, and the pod log files a kubelet leaves with containerd and
-CRI-O. The fixtures check `logit`'s decoders against what those producers put on the wire:
+node_exporter, a `prometheus_client` app, vmagent, statsd/DogStatsD clients, nginx, Angie,
+freenginx, Apache httpd, a Datadog Agent, a dd-trace tracer, four Splunk HEC clients, Telegraf's
+InfluxDB v2 output, and the pod log files a kubelet leaves with containerd and CRI-O. The fixtures check `logit`'s decoders against what those producers put on the wire:
 
 - `crates/logit-proto/src/syslog/`
 - `crates/logit-proto/src/statsd/`
@@ -19,6 +19,8 @@ CRI-O. The fixtures check `logit`'s decoders against what those producers put on
 - `crates/logit-proto/src/splunk/` and `crates/logit-inputs/src/splunk.rs`
 - `crates/logit-proto/src/influxdb/`
 - `crates/logit-inputs/src/cri.rs` and `crates/logit-proto/src/cri.rs`
+- `crates/logit-proto/src/nginx_status.rs`
+- `crates/logit-proto/src/apache_status.rs`
 
 Without them, a decoder is checked only against this team's reading of RFC 3164/5424, collectd's
 `network.c`, the OTLP spec, or the remote-write spec, and against `logit`'s own encoder. An encoder
@@ -63,6 +65,14 @@ testdata/interop/
                                  served, byte for byte, one file per response
   prometheus-scrape/*.headers -- one sidecar per body, holding the response's Content-Type, which
                                  picks the dialect
+  nginx-status/README.md  -- provenance table for nginx-status/*.body
+  nginx-status/*.body     -- stub_status pages nginx, Angie, and freenginx served, byte for byte,
+                             one file per response
+  nginx-status/*.headers  -- one sidecar per body, holding the response's status line and headers
+  apache-status/README.md -- provenance table for apache-status/*.body
+  apache-status/*.body    -- mod_status pages httpd served under three MPMs, ExtendedStatus Off,
+                             and mod_ssl, plus the HTML page, byte for byte, one file per response
+  apache-status/*.headers -- one sidecar per body, holding the response's status line and headers
   statsd/README.md     -- provenance table for statsd/*.raw
   statsd/*.raw         -- raw captured UDP datagrams from two real statsd clients (Datadog's
                           `datadog` package and the plain-statsd `statsd` package), each in a

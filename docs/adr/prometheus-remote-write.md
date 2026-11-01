@@ -358,7 +358,7 @@ protocol headers — `Content-Type`, `Content-Encoding`, `X-Prometheus-Remote-Wr
 `User-Agent` — are `insert`ed *over* a clone of the operator's `headers:` map, the same merge order
 `otlp_out` uses, so a protocol-owned name always wins. `RESERVED_REMOTE_WRITE_HEADERS` is those
 four plus `content-length`, which the client sets itself — five names, the same shape
-`RESERVED_PROMETHEUS_HEADERS` already takes — and rule 56 rejects any of them at config time rather
+`RESERVED_SCRAPE_HEADERS` already takes — and rule 56 rejects any of them at config time rather
 than letting the sink silently override an operator's value at runtime.
 
 **The sink does not retry.** One `send` is one attempt; retry is `write_loop`'s job, and the sink's

@@ -79,8 +79,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
   a prefix of them, and no counter records the difference. A listener's future is dropped in two
   places:
   - `Input::run_until_shutdown`'s default races `run` against the signal with no grace, so the
-    drop comes the instant shutdown fires. That covers `prometheus_in` in scrape mode (the scrape
-    in flight, and each target's batch still to send) and `generate_in`.
+    drop comes the instant shutdown fires. That covers the scrape driver's kinds,
+    `prometheus_in` in scrape mode, `nginx_stub_status_in`, and `apache_status_in` (the scrape in
+    flight, and each target's batch still to send), and `generate_in`.
   - `run_input`'s grace backstop drops a listener still draining after its grace: the UDP
     listeners (under [UDP intake](intake.md#udp-intake)), `internal` (under
     [Internal telemetry and self-logging](telemetry.md#internal-telemetry-and-self-logging)), and

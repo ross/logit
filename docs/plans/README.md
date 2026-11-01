@@ -10,6 +10,7 @@ branches and PRs are its record. See [Branches and PR titles](../../AGENTS.md#br
 
 | Plan | Created | Updated |
 |---|---|---|
+| [Enabling plan: server status inputs — `nginx_stub_status_in` and `apache_status_in` on a shared scrape driver](server-status-inputs.md) | 2026-10-31 | 2026-10-31 |
 | [Enabling plan: an S3 object-archive sink — one object per window, delivered at completion](s3-object-archive.md) | 2026-10-30 | 2026-10-30 |
 | [Enabling plan: `cri_in` — Kubernetes container logs from `/var/log/pods`](cri-container-logs.md) | 2026-10-29 | 2026-10-30 |
 | [Enabling plan: `kafka_in` — a consumer-group client and the eleventh lossless pair](kafka-input.md) | 2026-10-29 | 2026-10-29 |

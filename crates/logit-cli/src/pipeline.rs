@@ -18,6 +18,7 @@ use crate::signals::Signals;
 use anyhow::Context;
 use logit_config::{BufferConfig, Config, StdioTarget};
 use logit_core::{Diagnostics, Registry, Telemetry};
+use logit_inputs::apache_status;
 use logit_inputs::collectd::CollectdInput;
 use logit_inputs::cri::CriInput;
 use logit_inputs::datadog::DatadogInput;
@@ -30,6 +31,7 @@ use logit_inputs::internal::InternalInput;
 use logit_inputs::kafka::{KafkaInFormat, KafkaInSettings, KafkaInput};
 use logit_inputs::lines::LinesInput;
 use logit_inputs::logit::LogitInput;
+use logit_inputs::nginx_status;
 use logit_inputs::otlp::{OtlpInput, OtlpTransport as OtlpInTransport};
 use logit_inputs::prometheus::{PrometheusInput, PrometheusReceiver};
 use logit_inputs::replay::{ReplayFormat, ReplayInput};
@@ -441,7 +443,7 @@ pub fn validate_semantics(config: Config) -> anyhow::Result<Vec<String>> {
 /// `reopen`, when `Some`, is cloned into every `stdio_out`/`file_out` file target. A clone, not
 /// a `subscribe()`, so a SIGHUP that landed during startup still reads as changed.
 ///
-/// Every TLS component (a listener, a sink, or `prometheus_in`'s scrape client) registers its
+/// Every TLS component (a listener, a sink, or a scrape kind's client) registers its
 /// certificate files with `tls_reloader`, under the component's own `Diagnostics` and `Telemetry`.
 ///
 /// `hostname` is the process hostname (`logit_pipeline::host`). `internal` stamps it as
@@ -886,6 +888,24 @@ pub(crate) fn build_spec(
                 ),
             };
             NodeSpec::Input(input, input_runtime_config(&component.receive))
+        }
+        NginxStubStatusIn { scrape_targets, interval, timeout, headers, scrape_tls } => {
+            let input = nginx_status::input(scrape_targets.clone(), *interval)
+                .with_timeout(*timeout)
+                .with_headers(headers)?
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone())
+                .with_tls(&to_tls_client_settings(scrape_tls), base_dir, tls_reloader)?;
+            NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
+        }
+        ApacheStatusIn { scrape_targets, interval, timeout, headers, scrape_tls } => {
+            let input = apache_status::input(scrape_targets.clone(), *interval)
+                .with_timeout(*timeout)
+                .with_headers(headers)?
+                .with_diagnostics(Diagnostics::new(id).with_telemetry(telemetry.clone()))
+                .with_telemetry(telemetry.clone())
+                .with_tls(&to_tls_client_settings(scrape_tls), base_dir, tls_reloader)?;
+            NodeSpec::Input(Box::new(input), input_runtime_config(&component.receive))
         }
         LogitIn {
             bind,
@@ -2716,7 +2736,7 @@ fn kafka_sasl(sasl: logit_config::KafkaSasl) -> anyhow::Result<KafkaSasl> {
 }
 
 /// Config's `TlsClientConfig` into the identically shaped `logit_pipeline::tls::TlsClientSettings`
-/// every sink and `prometheus_in`'s scrape client take.
+/// every sink and every scrape kind's client take.
 fn to_tls_client_settings(
     tls: &logit_config::TlsClientConfig,
 ) -> logit_pipeline::tls::TlsClientSettings {
@@ -4049,6 +4069,50 @@ mod tests {
                 reuse_port: false,
                 proxy_protocol: false,
                 forwarded: None,
+            },
+        };
+        assert!(matches!(
+            build_spec("in", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Input(..)
+        ));
+    }
+
+    #[test]
+    fn build_spec_builds_an_nginx_stub_status_input() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec![],
+            targets: Vec::new(),
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::NginxStubStatusIn {
+                scrape_targets: vec!["http://127.0.0.1:0/nginx_status".to_string()],
+                interval: Duration::from_secs(15),
+                timeout: Duration::from_secs(10),
+                headers: HashMap::new(),
+                scrape_tls: logit_config::TlsClientConfig::default(),
+            },
+        };
+        assert!(matches!(
+            build_spec("in", &component, Path::new(""), None).unwrap().0,
+            NodeSpec::Input(..)
+        ));
+    }
+
+    #[test]
+    fn build_spec_builds_an_apache_status_input() {
+        let component = ResolvedComponent {
+            buffer: logit_config::BufferConfig::default(),
+            receive: logit_config::ReceiveConfig::default(),
+            sources: vec![],
+            targets: Vec::new(),
+            consumers: vec!["out".to_string()],
+            kind: ComponentKind::ApacheStatusIn {
+                scrape_targets: vec!["http://127.0.0.1:0/server-status?auto".to_string()],
+                interval: Duration::from_secs(15),
+                timeout: Duration::from_secs(10),
+                headers: HashMap::new(),
+                scrape_tls: logit_config::TlsClientConfig::default(),
             },
         };
         assert!(matches!(

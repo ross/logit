@@ -34,38 +34,32 @@
 //! `scrape_targets`, not `targets`: `Component.targets` (`docs/adr/target-components.md`) claims
 //! the bare name at the flattened top level. The TLS keys are `scrape_tls`/`bind_tls`, never a
 //! bare `tls`: each mode has its own TLS role (client TLS dialling out, server TLS terminating
-//! in), and each key names the socket it governs. The scrape client negotiates HTTP/2 through ALPN
-//! on an `https://` target, with or without `scrape_tls:`, and falls back to HTTP/1.1.
+//! in), and each key names the socket it governs.
 //!
 //! # Scrape mode
 //!
-//! ## Modeled on `internal.rs`
-//!
-//! Interval-driven, like [`crate::internal::InternalInput`]: [`Input::run`] owns a
-//! `tokio::time::interval` ticker, swallows its immediate first tick (so the first scrape happens
-//! one full `interval` after start, not at t=0), and calls [`PrometheusInput::tick`], a plain
-//! method testable without a runtime harness. There is no `bind` override: a scrape client has no
-//! socket to open ahead of time.
-//!
-//! The ticker's missed-tick behavior is `Delay`, not the default `Burst`. `internal`'s tick does
-//! no network I/O, so `Burst` (fire every missed tick back-to-back once a stall clears) is
-//! harmless there. This tick awaits `sink.send` (bounded-channel backpressure) plus a per-target
-//! request timeout, so a downstream stall lasting several intervals is ordinary, and `Burst` would
-//! turn it into N full scrape rounds in a row. `Delay` resumes on a fixed cadence, matching
-//! Prometheus's own scrape scheduler, which skips a missed scrape rather than bursting to catch up.
+//! [`PrometheusInput`] is the scrape driver ([`crate::scrape`]) over [`PrometheusScrapeDecoder`].
+//! The driver's module doc holds what every scrape kind shares: the ticker and its missed-tick
+//! behavior, the request and its headers, the body cap's enforcement, the synthetic `up`,
+//! `scrape_duration_seconds`, and `scrape_samples_scraped` series, the
+//! `logit.input.scrapes{class}`, `logit.input.scrape.duration`, and `logit.input.samples`
+//! counters, and the `scrape_failed` diagnostic. The ADR's "Synthetic scrape metrics" section
+//! says why those three series, and why they're always on. **Bind mode synthesizes none of
+//! them**: a receiver performed no scrape, so there is no `up` to report and no duration to
+//! measure. This module supplies the rest.
 //!
 //! ## Dialect negotiation
 //!
 //! Every request carries `Accept: application/openmetrics-text;version=1.0.0,text/plain;
-//! version=0.0.4;q=0.5,*/*;q=0.1` and `User-Agent: logit/<CARGO_PKG_VERSION>`, but this input
-//! never *forces* a dialect: the one a target sent is read off the response's own `Content-Type`
-//! via [`Dialect::from_content_type`] (`application/openmetrics-text` selects OpenMetrics;
-//! anything else, including a missing header, is text 0.0.4). A target that ignores `Accept` and
-//! always answers in text 0.0.4 still decodes.
+//! version=0.0.4;q=0.5,*/*;q=0.1`, but this input never *forces* a dialect: the one a target sent
+//! is read off the response's own `Content-Type` via [`Dialect::from_content_type`]
+//! (`application/openmetrics-text` selects OpenMetrics; anything else, including a missing
+//! header, is text 0.0.4). A target that ignores `Accept` and always answers in text 0.0.4 still
+//! decodes. A body is capped at [`MAX_SCRAPE_BYTES`].
 //!
 //! ## Resource identity
 //!
-//! Built once per target in [`PrometheusInput::new`], never per scrape:
+//! Built once per target when the input is constructed, never per scrape:
 //!
 //! - an unprefixed `instance` ([`logit_proto::prometheus::LABEL_INSTANCE`]): `host:port`, the port
 //!   defaulted to 80/443 when the target URL omits one, matching Prometheus's own scrape;
@@ -76,28 +70,6 @@
 //!
 //! Both ride on every batch the target produces, synthetic metrics included, which keeps two
 //! targets exposing the same exporter from colliding once relayed onward.
-//!
-//! ## Synthetic scrape metrics
-//!
-//! Every tick, every target, scrape failures included, gets exactly three synthetic series
-//! appended to its batch, on that target's resource, with no `timestamped` flag: `up`
-//! (`Gauge(0|1)`), `scrape_duration_seconds` (`Gauge`, wall-clock seconds for that target's
-//! request), and `scrape_samples_scraped` (`Gauge`, the number of series decoded, `0` on any
-//! failure). The ADR's "Synthetic scrape metrics" section says why these three, and why they're
-//! always on. **Bind mode synthesizes none of them**: a receiver performed no scrape, so there is
-//! no `up` to report and no duration to measure.
-//!
-//! ## Counters
-//!
-//! `logit.input.scrapes{class}` -- one count per target per tick, `class` one of `2xx`/`4xx`/`5xx`/
-//! `other` (HTTP response classes), `network_error`, `timeout`, `parse_error` (a 2xx response body
-//! that failed to parse), or `oversize` (a response body that exceeded [`MAX_SCRAPE_BYTES`]).
-//! `logit.input.scrape.duration` -- a timing sample per target per tick, recorded regardless of
-//! outcome. `logit.input.samples` -- the number of series decoded, summed across every target.
-//! A scrape failure also reports `Diagnostics::warn_throttled("scrape_failed", ..)` with the
-//! target's [`redact_url`]ed form in the message text only: never a tag (a target URL isn't
-//! `&'static` and isn't safe to intern per target, `logit_core::telemetry::Tag`'s convention),
-//! and never the raw URL, which may carry a credential.
 //!
 //! # Bind mode: the remote-write receiver
 //!
@@ -350,18 +322,16 @@ use crate::http::{
 };
 use crate::listener::Prelude;
 use crate::peer::ConnectionPeer;
+use crate::scrape::{now_nanos, redact_url, ScrapeDecoder, ScrapeInput};
 use crate::Input;
 use bytes::Bytes;
-use http::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE, USER_AGENT};
+use http::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use http::{Method, StatusCode};
 use http_body_util::{Full, Limited};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
-use logit_core::interner::intern;
-use logit_core::{
-    AttrMap, Diagnostics, Event, EventBatch, MetricKind, MetricRecord, Resource, Telemetry, Value,
-};
+use logit_core::{AttrMap, Diagnostics, Event, EventBatch, Resource, Telemetry, Value};
 use logit_pipeline::listen::BindOptions;
 use logit_pipeline::Fanout;
 use logit_proto::auth::Credentials;
@@ -377,16 +347,15 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
-use tokio::task::JoinSet;
 
 // -------------------------------------------------------------------------------------------------
-// Scrape mode: the interval-driven scrape client
+// Scrape mode: the Prometheus decoder on the scrape driver
 // -------------------------------------------------------------------------------------------------
 
-/// Hard cap on one scrape response's body, read incrementally via [`reqwest::Response::chunk`], so
-/// a hostile or misconfigured exporter can't grow this input's memory unboundedly. 32 MiB is
-/// generous for a very large `/metrics` page; an exporter that needs more is a problem to fix at
-/// the source, not a reason to raise this.
+/// Hard cap on one scrape response's body, which the driver reads incrementally, so a hostile or
+/// misconfigured exporter can't grow this input's memory unboundedly. 32 MiB is generous for a
+/// very large `/metrics` page; an exporter that needs more is a problem to fix at the source, not
+/// a reason to raise this.
 const MAX_SCRAPE_BYTES: usize = 32 * 1024 * 1024;
 
 /// A preference, never a forced dialect (the ADR's "Dialects and negotiation" section): the
@@ -394,21 +363,8 @@ const MAX_SCRAPE_BYTES: usize = 32 * 1024 * 1024;
 const ACCEPT_HEADER_VALUE: &str =
     "application/openmetrics-text;version=1.0.0,text/plain;version=0.0.4;q=0.5,*/*;q=0.1";
 
-/// `logit/<CARGO_PKG_VERSION>`, a compile-time constant, so sending it allocates nothing.
-const USER_AGENT_VALUE: &str = concat!("logit/", env!("CARGO_PKG_VERSION"));
-
 /// `logit_pipeline::tls::TlsClientSettings`, re-exported beside this module's other settings types.
 pub use logit_pipeline::tls::TlsClientSettings;
-
-/// One configured scrape target: the URL to `GET`, its [`redact_url`]ed form (for everything that
-/// isn't the request itself: diagnostics text, `_logit.prometheus.target`), and the `Resource`
-/// every batch built from it carries. Built once in [`PrometheusInput::new`].
-#[derive(Clone)]
-struct Target {
-    url: String,
-    redacted_url: String,
-    resource: Arc<Resource>,
-}
 
 /// `host:port` of `url`'s authority, the port defaulted to the scheme's (80/443) when absent: what
 /// Prometheus's own `instance` label holds ([`logit_proto::prometheus::LABEL_INSTANCE`]).
@@ -431,38 +387,6 @@ fn instance_of(index: usize, url: &str) -> String {
     }
 }
 
-/// `url` with its userinfo (`user:pass@`) and query string stripped: what everything but the
-/// scrape request itself (`_logit.prometheus.target`, every `scrape_failed` diagnostic) uses.
-/// `reqwest` turns `http://user:pass@host/metrics` into an `Authorization` header, but the
-/// configured `String` still holds the password, and `_logit.prometheus.target` rides the batch to
-/// every sink the pipeline routes to. A protocol sink leaves a private attribute off its tags,
-/// labels, and fields, but a `stdio_out` or `file_out` render, a `kafka_out` record in its `json`,
-/// `msgpack`, or `native` format, and the native hop carry it. The query string goes too, since
-/// `?token=...` is as real a credential shape. The fragment is kept. Parsing also normalizes the
-/// result (host lowercased, a default port dropped), which is harmless for a valid absolute URL.
-///
-/// Falls back to `<unparseable target #{index}>`, never the raw `url` and never a placeholder
-/// shared across targets. Rule 40 (`logit-pipeline::graph`) only approximates a URL grammar
-/// (scheme plus non-empty authority), so `http://999.999.999.999/metrics`,
-/// `http://[::1/metrics`, `http://host:99999/metrics`, or a host with a space or an invalid
-/// percent-escape reaches this function; `index` (the target's position in `scrape_targets`)
-/// keeps two such targets from colliding onto one `instance`/`_logit.prometheus.target` and merging
-/// their series.
-fn redact_url(index: usize, url: &str) -> String {
-    match reqwest::Url::parse(url) {
-        Ok(mut parsed) => {
-            // `Url::set_username`/`set_password` fail only for a URL that can't have userinfo
-            // (`cannot-be-a-base`, e.g. `data:`), never an absolute `http`/`https` URL, which is
-            // all rule 40 lets through.
-            let _ = parsed.set_username("");
-            let _ = parsed.set_password(None);
-            parsed.set_query(None);
-            parsed.to_string()
-        }
-        Err(_) => format!("<unparseable target #{index}>"),
-    }
-}
-
 fn build_resource(index: usize, url: &str) -> Resource {
     let mut attributes = AttrMap::new();
     attributes.insert(LABEL_INSTANCE, Value::str(instance_of(index, url)));
@@ -470,347 +394,56 @@ fn build_resource(index: usize, url: &str) -> Resource {
     Resource { attributes, ..Default::default() }
 }
 
-fn synthetic_event(timestamp: i64, name: &'static str, value: f64) -> Event {
-    Event::metric(
-        timestamp,
-        AttrMap::new(),
-        MetricRecord::new(intern(name), MetricKind::gauge(value)),
-    )
-}
-
-fn now_nanos() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as i64
-}
-
-/// A coarse HTTP response-status bucket, modelled on `logit_outputs::http::status_class` rather
-/// than shared across crates, except that `1xx`/`3xx` fold into `other`: a scrape response is
-/// never legitimately either.
-fn status_class(status: reqwest::StatusCode) -> &'static str {
-    match status.as_u16() / 100 {
-        2 => "2xx",
-        4 => "4xx",
-        5 => "5xx",
-        _ => "other",
-    }
-}
-
-/// One target's scrape outcome, which [`PrometheusInput::tick`] classifies into a
-/// `logit.input.scrapes{class}` count and a decoded or failed batch.
-enum ScrapeStatus {
-    Ok { dialect: Dialect, body: Vec<u8> },
-    Http(reqwest::StatusCode),
-    NetworkError,
-    Timeout,
-    Oversize,
-}
-
-/// Scrapes one target, reading the body incrementally via [`reqwest::Response::chunk`] capped at
-/// [`MAX_SCRAPE_BYTES`]. The fixed `Accept`/`User-Agent` pair is inserted after the extra
-/// `headers`, so it wins even over a `headers` entry naming one of them, the same defense
-/// `logit_outputs::otlp::OtlpOutput::send_http` uses for `Content-Type`.
-async fn scrape_target(
-    client: reqwest::Client,
-    url: String,
-    headers: HeaderMap,
-    timeout: Duration,
-) -> ScrapeStatus {
-    let mut request_headers = headers;
-    request_headers.insert(ACCEPT, HeaderValue::from_static(ACCEPT_HEADER_VALUE));
-    request_headers.insert(USER_AGENT, HeaderValue::from_static(USER_AGENT_VALUE));
-
-    let response = match client.get(&url).timeout(timeout).headers(request_headers).send().await {
-        Ok(response) => response,
-        Err(err) if err.is_timeout() => return ScrapeStatus::Timeout,
-        Err(_) => return ScrapeStatus::NetworkError,
-    };
-
-    let status = response.status();
-    if !status.is_success() {
-        return ScrapeStatus::Http(status);
-    }
-    let dialect = response
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(Dialect::from_content_type)
-        .unwrap_or(Dialect::Text0_0_4);
-
-    let mut response = response;
-    let mut body = Vec::new();
-    loop {
-        match response.chunk().await {
-            Ok(Some(chunk)) => {
-                if body.len() + chunk.len() > MAX_SCRAPE_BYTES {
-                    return ScrapeStatus::Oversize;
-                }
-                body.extend_from_slice(&chunk);
-            }
-            Ok(None) => break,
-            Err(err) if err.is_timeout() => return ScrapeStatus::Timeout,
-            Err(_) => return ScrapeStatus::NetworkError,
-        }
-    }
-    ScrapeStatus::Ok { dialect, body }
-}
-
-pub struct PrometheusInput {
-    targets: Vec<Target>,
-    interval: Duration,
-    timeout: Duration,
-    headers: HeaderMap,
-    client: reqwest::Client,
+/// Scrape mode's half of the [`ScrapeDecoder`] seam: the exposition dialect chosen per response
+/// from its `Content-Type`, the text and OpenMetrics parse, and the `instance`/target resource.
+#[derive(Default)]
+pub struct PrometheusScrapeDecoder {
     /// Kept across ticks so the decoder's throttled diagnostics (a malformed line, non-monotonic
     /// histogram buckets) accumulate occurrence counts over the component's lifetime.
     decoder: PrometheusDecoder,
-    telemetry: Telemetry,
-    diag: Diagnostics,
 }
 
-impl PrometheusInput {
-    /// `targets` become the scrape list, each with a `Resource` built once here (this module's
-    /// "Resource identity" section).
-    pub fn new(targets: Vec<String>, interval: Duration) -> Self {
-        let targets = targets
-            .into_iter()
-            .enumerate()
-            .map(|(index, url)| {
-                let resource = Arc::new(build_resource(index, &url));
-                let redacted_url = redact_url(index, &url);
-                Target { url, redacted_url, resource }
-            })
-            .collect();
-        Self {
-            targets,
-            interval,
-            timeout: Duration::from_secs(10),
-            headers: HeaderMap::new(),
-            client: reqwest::Client::new(),
-            decoder: PrometheusDecoder::new(),
-            telemetry: Telemetry::default(),
-            diag: Diagnostics::default(),
-        }
+impl ScrapeDecoder for PrometheusScrapeDecoder {
+    type Error = logit_proto::CodecError;
+
+    fn kind(&self) -> &'static str {
+        "prometheus_in"
     }
 
-    /// Overrides the default 10s per-request timeout. Applied per scrape via
-    /// `RequestBuilder::timeout`, not baked into the client, so it composes with
-    /// [`PrometheusInput::with_tls`] in either call order.
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
-        self
+    fn accept(&self) -> &'static str {
+        ACCEPT_HEADER_VALUE
     }
 
-    /// Sets the extra headers sent on every scrape request (`headers:` in config). Fails, as
-    /// `otlp_out`'s `with_headers` does, on an illegal name or value, or two names that collide
-    /// case-insensitively. Rule 40 already rejects a header this input sets itself (`accept`,
-    /// `user-agent`, the other protocol-owned names); this catches the lexical faults the graph
-    /// can't, and [`scrape_target`] still inserts `Accept`/`User-Agent` last.
-    pub fn with_headers(mut self, headers: &HashMap<String, String>) -> anyhow::Result<Self> {
-        let mut map = HeaderMap::with_capacity(headers.len());
-        for (name, value) in headers {
-            let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|err| {
-                anyhow::anyhow!("prometheus_in: {name:?} is not a legal header name: {err}")
-            })?;
-            let header_value = HeaderValue::from_str(value).map_err(|err| {
-                anyhow::anyhow!("prometheus_in: header {name:?} has an invalid value: {err}")
-            })?;
-            if map.insert(header_name, header_value).is_some() {
-                anyhow::bail!(
-                    "prometheus_in: header {name:?} collides with another entry in 'headers' \
-                     once case is ignored -- HTTP header names are case-insensitive, so which \
-                     value would actually be sent is undefined"
-                );
-            }
-        }
-        self.headers = map;
-        Ok(self)
+    fn max_body_bytes(&self) -> usize {
+        MAX_SCRAPE_BYTES
     }
 
-    /// Sets client-side TLS (`scrape_tls:` in config) for any `https://` target; a no-op if
-    /// `settings` is empty. The `rustls::ClientConfig` comes from
-    /// `logit_pipeline::tls::build_client_config`, as every sink's does, so a rotated `ca_file` or
-    /// client certificate reaches the next full handshake without a rebuilt client.
-    ///
-    /// Registers the files with `reloader` under this input's diagnostics and telemetry as they
-    /// are when this runs, so call it after `with_diagnostics` and `with_telemetry`.
-    pub fn with_tls(
-        mut self,
-        settings: &TlsClientSettings,
-        base_dir: &Path,
-        reloader: &logit_pipeline::tls::TlsReloader,
-    ) -> anyhow::Result<Self> {
-        if settings.is_empty() {
-            return Ok(self);
-        }
-        if settings.insecure_skip_verify {
-            self.diag.warn(
-                "scrape_tls.insecure_skip_verify is set -- the connection is encrypted, but \
-                 this input will accept any certificate a scraped target presents, self-signed \
-                 or otherwise",
-            );
-        }
-        let cfg = logit_pipeline::tls::build_client_config(
-            settings,
-            base_dir,
-            reloader,
-            &self.diag,
-            &self.telemetry,
-        )?;
-        let cfg = logit_pipeline::tls::with_http_alpn(&cfg);
-        self.client =
-            reqwest::Client::builder().use_preconfigured_tls(cfg).build().map_err(|err| {
-                anyhow::anyhow!("prometheus_in: building a TLS-configured client: {err}")
-            })?;
-        Ok(self)
+    fn resource(&self, index: usize, url: &str) -> Resource {
+        build_resource(index, url)
     }
 
-    pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
-        self.diag = diag.clone();
-        self.decoder = self.decoder.with_diagnostics(diag);
-        self
+    fn set_diagnostics(&mut self, diag: Diagnostics) {
+        self.decoder = std::mem::take(&mut self.decoder).with_diagnostics(diag);
     }
 
-    pub fn with_telemetry(mut self, telemetry: Telemetry) -> Self {
-        self.telemetry = telemetry.clone();
-        self.decoder = self.decoder.with_telemetry(telemetry);
-        self
+    fn set_telemetry(&mut self, telemetry: Telemetry) {
+        self.decoder = std::mem::take(&mut self.decoder).with_telemetry(telemetry);
     }
 
-    /// One scrape cycle: every target fetched concurrently (a [`JoinSet`]), then one `EventBatch`
-    /// per target, decoded series plus the three synthetic metrics, built and sent sequentially on
-    /// this task so `self.decoder`/`self.diag`/`self.telemetry` need no synchronization. A plain
-    /// method, callable from a test with a canned server and a bare `Fanout`, like `internal.rs`'s
-    /// `tick`.
-    async fn tick(&mut self, sink: &Fanout) {
-        let received_at = now_nanos();
-        // Cloned, not borrowed, so the loop below can hold `&mut self.decoder`/`&mut self.diag`
-        // while reading each target. A few `String` + `Arc<Resource>` clones per tick.
-        let targets = self.targets.clone();
-
-        let mut set = JoinSet::new();
-        for (idx, target) in targets.iter().enumerate() {
-            let client = self.client.clone();
-            let url = target.url.clone();
-            let headers = self.headers.clone();
-            let timeout = self.timeout;
-            let _handle = set.spawn(async move {
-                let started = Instant::now();
-                let status = scrape_target(client, url, headers, timeout).await;
-                (idx, status, started.elapsed())
-            });
-        }
-
-        let mut outcomes: Vec<Option<(ScrapeStatus, Duration)>> =
-            (0..targets.len()).map(|_| None).collect();
-        while let Some(joined) = set.join_next().await {
-            // A `JoinError` means the task panicked, which `scrape_target` doesn't. It falls
-            // through as a network error (`up: 0`) below rather than propagating: one target's
-            // failure can't take down the others.
-            if let Ok((idx, status, elapsed)) = joined {
-                outcomes[idx] = Some((status, elapsed));
-            }
-        }
-
-        for (target, outcome) in targets.iter().zip(outcomes) {
-            let (status, elapsed) = outcome.unwrap_or((ScrapeStatus::NetworkError, Duration::ZERO));
-            let (class, up, samples, mut events) = match status {
-                ScrapeStatus::Ok { dialect, body } => {
-                    match text::parse_with(&body, dialect, &mut self.decoder) {
-                        Ok(families) => {
-                            let events =
-                                families_to_events(&families, received_at, &mut self.decoder);
-                            let samples = events.len();
-                            ("2xx", 1.0, samples, events)
-                        }
-                        Err(err) => {
-                            self.diag.warn_throttled(
-                                "scrape_failed",
-                                format_args!(
-                                    "prometheus_in: scraping {} succeeded but its response body \
-                                     failed to parse: {err}",
-                                    target.redacted_url
-                                ),
-                            );
-                            ("parse_error", 0.0, 0, Vec::new())
-                        }
-                    }
-                }
-                ScrapeStatus::Http(status_code) => {
-                    self.diag.warn_throttled(
-                        "scrape_failed",
-                        format_args!(
-                            "prometheus_in: scraping {} returned HTTP {status_code}",
-                            target.redacted_url
-                        ),
-                    );
-                    (status_class(status_code), 0.0, 0, Vec::new())
-                }
-                ScrapeStatus::NetworkError => {
-                    self.diag.warn_throttled(
-                        "scrape_failed",
-                        format_args!(
-                            "prometheus_in: scraping {} failed: connection error",
-                            target.redacted_url
-                        ),
-                    );
-                    ("network_error", 0.0, 0, Vec::new())
-                }
-                ScrapeStatus::Timeout => {
-                    self.diag.warn_throttled(
-                        "scrape_failed",
-                        format_args!("prometheus_in: scraping {} timed out", target.redacted_url),
-                    );
-                    ("timeout", 0.0, 0, Vec::new())
-                }
-                ScrapeStatus::Oversize => {
-                    self.diag.warn_throttled(
-                        "scrape_failed",
-                        format_args!(
-                            "prometheus_in: scraping {} exceeded the {MAX_SCRAPE_BYTES}-byte \
-                             scrape limit",
-                            target.redacted_url
-                        ),
-                    );
-                    ("oversize", 0.0, 0, Vec::new())
-                }
-            };
-
-            self.telemetry.count("logit.input.scrapes", 1.0, &[("class", class)]);
-            self.telemetry.timing("logit.input.scrape.duration", elapsed, &[]);
-            self.telemetry.count("logit.input.samples", samples as f64, &[]);
-
-            events.push(synthetic_event(received_at, "up", up));
-            events.push(synthetic_event(
-                received_at,
-                "scrape_duration_seconds",
-                elapsed.as_secs_f64(),
-            ));
-            events.push(synthetic_event(received_at, "scrape_samples_scraped", samples as f64));
-
-            sink.send(EventBatch { resource: target.resource.clone(), scope: None, events }).await;
-        }
+    fn decode(
+        &mut self,
+        body: &[u8],
+        content_type: Option<&str>,
+        timestamp: i64,
+    ) -> Result<Vec<Event>, Self::Error> {
+        let dialect = content_type.map(Dialect::from_content_type).unwrap_or(Dialect::Text0_0_4);
+        let families = text::parse_with(body, dialect, &mut self.decoder)?;
+        Ok(families_to_events(&families, timestamp, &mut self.decoder))
     }
 }
 
-#[async_trait::async_trait]
-impl Input for PrometheusInput {
-    async fn run(&mut self, sink: Fanout) -> anyhow::Result<()> {
-        let mut ticker = tokio::time::interval(self.interval);
-        // `Delay`, not `Burst`: a multi-interval downstream stall is ordinary here, and `Burst`
-        // would then hit each target N times back-to-back with near-identical `received_at`,
-        // inflating `logit.input.scrapes`/`samples` and the synthetic series. The module doc's
-        // "Modeled on `internal.rs`" section has the rest.
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // Swallow the immediate first tick: the first scrape is one `interval` after start.
-        ticker.tick().await;
-        loop {
-            ticker.tick().await;
-            self.tick(&sink).await;
-        }
-    }
-}
+/// `prometheus_in`'s scrape mode: the scrape driver over [`PrometheusScrapeDecoder`].
+pub type PrometheusInput = ScrapeInput<PrometheusScrapeDecoder>;
 
 // -------------------------------------------------------------------------------------------------
 // Bind mode: the remote-write receiver
@@ -1945,13 +1578,15 @@ fn with_written_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scrape::USER_AGENT_VALUE;
     use bytes::Bytes;
+    use http::header::{ACCEPT, USER_AGENT};
     use http_body_util::Full;
     use hyper::body::Incoming;
     use hyper::service::service_fn;
     use hyper::{Request, Response};
     use hyper_util::rt::TokioIo;
-    use logit_core::{MetricKind, Registry};
+    use logit_core::{MetricKind, MetricRecord, Registry};
     use logit_pipeline::test_util::{self, expect_closed, TelemetryProbe};
     use logit_pipeline::Delivered;
     use rustls_pki_types::pem::PemObject;
@@ -2471,15 +2106,6 @@ mod tests {
         let headers = captured.lock().unwrap();
         let auth = headers[0].get(http::header::AUTHORIZATION).and_then(|v| v.to_str().ok());
         assert!(auth.is_some(), "expected an Authorization header from the URL's userinfo");
-    }
-
-    #[test]
-    fn redact_url_strips_userinfo_and_query_but_keeps_the_path() {
-        assert_eq!(
-            redact_url(0, "http://user:pass@example.com:9100/metrics?token=x"),
-            "http://example.com:9100/metrics"
-        );
-        assert_eq!(redact_url(0, "https://example.com/metrics"), "https://example.com/metrics");
     }
 
     #[test]

@@ -13,6 +13,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
+pub mod apache_status;
 pub mod collectd;
 pub mod cri;
 pub mod datadog;
@@ -29,12 +30,14 @@ pub mod kafka;
 pub mod lines;
 mod listener;
 pub mod logit;
+pub mod nginx_status;
 pub mod otlp;
 pub mod peer;
 mod procstat;
 pub mod prometheus;
 pub mod replay;
 mod replay_decompress;
+pub mod scrape;
 pub mod splunk;
 pub mod statsd;
 pub mod syslog;
