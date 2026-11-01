@@ -28,11 +28,13 @@ Reading: 0 Writing: 1 Waiting: 0
 ```
 
 Lines 1, 3, and 4 end in a space. `accepts`, `handled`, and `requests` are counters; the other four
-are gauges, and `active` covers the other three. The counters live in shared memory, so they survive
+are gauges. `active` counts every client connection, stream and mail connections and a TLS
+handshake in progress included, so it overlaps the other three and isn't their sum. Under HTTP/2
+each stream is its own request, so `reading + writing` can exceed `active`. The counters live in shared memory, so they survive
 `nginx -s reload` and reset when the master process restarts (both tested). The request that reads
 the page counts toward `requests` and `Writing`. freenginx and Angie print the same format string.
-Tengine prints it too unless built with `T_NGX_HTTP_STUB_STATUS`, which adds a fourth column,
-`request_time`, to the header and number lines. Open-source nginx has no other format and no
+Tengine's build always defines `T_NGX_HTTP_STUB_STATUS`, so its page always adds a fourth column,
+`request_time`, to the header and number lines; its handler accumulates the value in milliseconds. Open-source nginx has no other format and no
 Prometheus exposition; NGINX Plus's JSON API isn't open source.
 
 The page carries three things the access log can't: connection state, including idle keepalives and
@@ -54,7 +56,8 @@ things:
   provider.
 
 Captures from httpd 2.4.69 under `event`, `prefork`, `ExtendedStatus Off`, and `mod_ssl` with
-`shmcb` show each variant. Numbers use C's `%g`, so `.0689655` has no leading zero. A graceful
+`shmcb` show each variant. APR's `%g` (`apr_vformatter`, reached through `ap_rprintf`) writes the
+numbers, so `.0689655` has no leading zero; `Load1`, `Load5`, and `Load15` use `%.2f`. A graceful
 restart keeps the scoreboard and every total. A full restart zeroes the request, traffic, and
 duration totals and the uptime, but not the CPU totals, which come from per-process times (both
 tested). Apache has no Prometheus exposition: `modules/` holds no such module.
@@ -105,9 +108,9 @@ HAProxy will get no kind; section 14 points an operator at `prometheus_in`.
 
 A new module, `crates/logit-inputs/src/scrape.rs`, will hold a generic `ScrapeInput<D:
 ScrapeDecoder>`, shaped like `UdpListener<D>` and `TcpListener<D>`. `prometheus_in`'s scrape mode
-will move onto it with no change in behavior apart from two validation changes in section 3: the
+will move onto it with no change in behavior apart from one validation change in section 3: the
 same attributes, synthetics, telemetry, and diagnostic text, with its existing tests passing
-unchanged apart from paths, type names, and those two changes.
+unchanged apart from paths, type names, and that change.
 
 The driver will own everything that isn't the page's format:
 
@@ -147,7 +150,7 @@ checks, so one validation rule covers all three kinds and a block copied between
 | `interval` | `15s` | scrape cadence; `0s` is rejected (graph rule 9's table will gain both kinds) |
 | `timeout` | `10s` | per-request timeout; `0s` is rejected |
 | `headers` | `{}` | extra request headers; a name the driver reserves is rejected |
-| `scrape_tls` | `{}` | client TLS for `https://` targets; accepted, with no effect, when no target is `https://` |
+| `scrape_tls` | `{}` | client TLS for `https://` targets; rejected when no target is `https://` |
 
 `scrape_tls` will keep its prefix although these kinds have one mode, so that no scrape kind has a
 bare `tls:` key. Each kind's config struct will carry `deny_unknown_fields`.
@@ -155,9 +158,9 @@ bare `tls:` key. Each kind's config struct will carry `deny_unknown_fields`.
 Graph rule 40's scrape-target checks will become shared across the three kinds, and the
 reserved-header list will become the driver's: `accept`, `user-agent`, and the connection-management
 names rule 40 lists today, plus `accept-encoding`, so the driver alone decides which content
-encodings a target may answer in. Rule 40 will also stop rejecting a non-empty `scrape_tls:` with no
-`https://` target: the block has no effect there, and validation doesn't reject a config for being
-pointless. Those two are the only changes to `prometheus_in`'s validation. Rule 55 will stay
+encodings a target may answer in. The shared checks keep rejecting a non-empty `scrape_tls:` with no
+`https://` target, as the other sinks and inputs whose scheme selects TLS do. That one is the only
+change to `prometheus_in`'s validation. Rule 55 will stay
 `prometheus_in`'s, since only it has two modes.
 
 ### 4. Resource identity
@@ -283,7 +286,7 @@ Trailing spaces or a `\r` before a line's `\n` will be ignored. The final `\n` i
 `ngx_http_stub_status_handler` ends every line it writes with one, so a body without it was cut
 short. The header line may instead read `server accepts handled requests request_time`, Tengine's
 form, and then the number line must hold four numbers; the fourth will be read, checked as a number,
-and not emitted, since the Collector has no name for it and its unit isn't documented. Any other
+and not emitted, since the Collector has no name for it. Any other
 body, including a missing final `\n`, a number count that doesn't match the header, a missing line,
 an extra non-empty line, or a non-digit, will be a `parse_error`: the page is fixed-format, so a
 mismatch means the target isn't a `stub_status` page or the body was cut, and no partial reading
@@ -308,7 +311,7 @@ wraps at 2^32, which a downstream reads as a reset.
 | `Waiting` | `nginx.connections_current` | `Gauge` | `I64` | `{connections}` | `state` = `waiting` | same |
 | Tengine `request_time` | not mapped | | | | | no Collector name |
 
-Each row will be one event. `state` = `active` covers the other three states, so summing
+Each row will be one event. `state` = `active` overlaps the other three states, so summing
 `nginx.connections_current` across `state` double-counts.
 
 ### 10. `apache_status_in`: grammar, validation, and mapping
@@ -372,15 +375,16 @@ keys against `scraper.go`):
 | `ConnsAsyncKeepAlive` | `apache.connection.status` | `Gauge` | `I64` | `{connection}` | `apache.connection.state` = `keepalive` | same |
 | `ConnsAsyncClosing` | `apache.connection.status` | `Gauge` | `I64` | `{connection}` | `apache.connection.state` = `closing` | same |
 | `Scoreboard` | `apache.worker.status` | `Gauge` | `I64` | `{worker}` | `apache.worker.state` (below) | `Gauge` (section 7); unit, not `1` (section 8) |
-| `Scoreboard` | `apache.worker.limit` | `Gauge` | `I64` | `{worker}` | — | `Gauge` (section 7); the scoreboard's length |
+| `Scoreboard` | `apache.worker.limit` | `Gauge` | `I64` | `{worker}` | — | `Gauge` (section 7); the scoreboard's length (section 10) |
 | the `mod_ssl` session-cache block (`CacheType`, `CacheSharedMemory`, `Cache*Count`, and the rest) | not mapped | | | | | each cache provider prints its own keys; the Collector maps none |
 
 `Scoreboard` will map each character to an `apache.worker.state` as the Collector's
 `parseScoreboard` does: `_` `waiting`, `S` `starting`, `R` `reading`, `W` `sending`, `K`
 `keepalive`, `D` `dnslookup`, `C` `closing`, `L` `logging`, `G` `finishing`, `I` `idle_cleanup`, `.`
 `open`, and any other character `unknown`. Every state but `unknown` will be emitted each scrape,
-`0` included; `unknown` only when nonzero. A slot the configuration disables isn't printed, so the
-length is the configured worker limit.
+`0` included; `unknown` only when nonzero. `mod_status` (2.4.69) marks a slot disabled, and doesn't print it, only
+when it is past the configured worker limit and its process is dead. So the length is the configured
+worker limit plus any slot past it whose process is still running.
 
 ### 11. Body caps
 
@@ -499,7 +503,7 @@ extend to the new kinds, and the workstream that adds each kind will name it in 
   doc will point at the driver for the shared parts. A later scrape kind will be a decoder and a
   config struct.
 - Two kinds will join `ComponentKind`, the schema, the registry, `AGENTS.md`'s inputs table, and
-  graph rules 9 and 40. Section 3's two validation changes reach `prometheus_in` too.
+  graph rules 9 and 40. Section 3's validation change reaches `prometheus_in` too.
 - Two decoders will join `logit-proto` with fuzz targets, seeds, and recorded corpora, which
   `script/record-fixtures` can re-record.
 - Section 15's known gaps will grow to name the new kinds. Closing the redirect gap in the driver

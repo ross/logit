@@ -18,7 +18,7 @@ numbers; this plan says which workstream will land each one and how it will be t
 Goals:
 
 - A scrape driver that `prometheus_in`'s scrape mode will run on with no change in behavior apart
-  from two validation changes (ADR section 3), and that a new scrape kind will use by supplying a
+  from one validation change (ADR section 3), and that a new scrape kind will use by supplying a
   decoder (ADR section 2).
 - `nginx_stub_status_in` and `apache_status_in` will read their pages into the Collector's metric
   names, with `prometheus_in`'s config keys, synthetics, and telemetry (ADR sections 3 to 10).
@@ -38,7 +38,7 @@ Each workstream will be one PR on branch `status/w<N>`, stacked on the one befor
 | WS | Branch | Scope | Depends on | State |
 |---|---|---|---|---|
 | W0 | `status/w0` | the ADR and this plan, and their index rows | — | Planned |
-| W1 | `status/w1` | `crates/logit-inputs/src/scrape.rs`: `ScrapeInput<D: ScrapeDecoder>` and the driver's share of the work (ADR section 2); `prometheus_in`'s scrape mode on it with its dialect choice behind its decoder, and the kind's name in the `headers:` and `scrape_tls:` construction errors; graph rule 40's checks and the reserved-header list made shared (section 3); its two intentional changes to `prometheus_in`'s validation (section 3): `accept-encoding` joins the reserved headers, and a `scrape_tls:` with no `https://` target is no longer rejected, with the field doc in `logit-config` and the schema updated to match; `prometheus.rs`'s module doc pointing at the driver | W0 | Planned |
+| W1 | `status/w1` | `crates/logit-inputs/src/scrape.rs`: `ScrapeInput<D: ScrapeDecoder>` and the driver's share of the work (ADR section 2); `prometheus_in`'s scrape mode on it with its dialect choice behind its decoder, and the kind's name in the `headers:` and `scrape_tls:` construction errors; graph rule 40's checks and the reserved-header list made shared (section 3); its one intentional change to `prometheus_in`'s validation (section 3): `accept-encoding` joins the reserved headers; `prometheus.rs`'s module doc pointing at the driver | W0 | Planned |
 | W2 | `status/w2` | `nginx_stub_status_in` end to end: `logit_proto::nginx_status` (section 9) and its module doc; the `nginx_status` fuzz target, seeds, and `FUZZ_TARGETS` row (section 12); a `script/record-fixtures nginx-status` producer and `testdata/interop/nginx-status/`; the `ComponentKind` variant, config struct, and schema; rule 9's table and rule 40 (section 3); the resource (section 4); the registry arm; a `stub_status` location on an internal listener in `fixtures/nginx/nginx.conf` and `fixtures/nginx-stub-status.yaml`; `AGENTS.md`, `docs/deploying.md`'s new section (section 14), `docs/design/internal-telemetry.md`, and the known-gaps entries (section 15) | W1 | Planned |
 | W3 | `status/w3` | `apache_status_in` end to end: `logit_proto::apache_status` (section 10) and its module doc, with the `?auto` hint in its HTML-body diagnostic; the `apache_status` fuzz target, seeds, and `FUZZ_TARGETS` row; a `script/record-fixtures apache-status` producer and `testdata/interop/apache-status/`; the kind, config, schema, and registry arm; rules 9 and 40; an `examples/` config covering both kinds, with its rendered graph; the Apache and HAProxy parts of `docs/deploying.md`'s section; `AGENTS.md` and the known-gaps entries | W2 | Planned |
 
@@ -54,10 +54,8 @@ tests do. Each regression test will be run once with its fix reverted, and the P
 - **W1, the driver.** The proof of no change in behavior will be `prometheus_in`'s existing scrape
   tests (synthetics, every status class, `oversize`, TLS and its reload, header precedence,
   redaction, `instance` defaults, the missed-tick behavior) and its rule 40 tests passing unchanged
-  apart from paths and type names, except for W1's two intentional validation changes. Each of those
-  gets a test: a `headers:` entry naming `accept-encoding` rejected, and a `scrape_tls:` with only
-  `http://` targets accepted; the existing test that asserted the old rejection is the one rule 40
-  test whose body changes. The PR body will list every test whose body changed and why. New tests
+  apart from paths and type names, except for W1's one intentional validation change, which
+  gets a test: a `headers:` entry naming `accept-encoding` rejected. The PR body will list every test whose body changed and why. New tests
   will cover only what the seam adds: a stub decoder's `Accept` value and body cap reaching the
   request and the read, and its kind's name in a `scrape_failed` message and in each construction
   error.
