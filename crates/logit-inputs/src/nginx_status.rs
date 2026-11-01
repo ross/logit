@@ -173,16 +173,18 @@ Reading: 1 Writing: 1 Waiting: 3 \n";
 
     #[tokio::test]
     async fn a_body_past_64_kib_is_oversize() {
+        // A literal, not `MAX_BODY_BYTES`, so a changed cap fails here.
+        const SIXTY_FOUR_KIB: usize = 65536;
         let mut probe = TelemetryProbe::new();
         let mut body = PAGE.to_vec();
-        body.resize(MAX_BODY_BYTES + 1, b'\n');
+        body.resize(SIXTY_FOUR_KIB + 1, b'\n');
         let (batch, _) = tick_once(Bytes::from(body), &probe).await;
 
         assert_eq!(gauge(&batch, "up"), Some(0.0));
         assert_eq!(probe.sum("logit.input.scrapes", &[("class", "oversize")]), 1.0);
 
         let mut at_cap = PAGE.to_vec();
-        at_cap.resize(MAX_BODY_BYTES, b'\n');
+        at_cap.resize(SIXTY_FOUR_KIB, b'\n');
         let (batch, _) = tick_once(Bytes::from(at_cap), &probe).await;
         assert_eq!(gauge(&batch, "up"), Some(1.0));
     }
