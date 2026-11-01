@@ -4884,8 +4884,10 @@ value.
 
 The fixture's `http.client.request.duration` carries the inbound request's attributes, not
 semconv's client set: `server.address` is the virtual host, and `http.response.status_code` is
-nginx's own downstream status. The upstream is in `upstream.address` and its answer in
-`upstream.status`. Real client attributes need their own `kv_metrics` and `keep` branch.
+nginx's own downstream status. The event at `kv_metrics` also carries the upstream as
+`upstream.address` and its answer as `upstream.status`, but the fixture's `trimmed` `keep` drops
+both, so the stored series has neither. Real client attributes need their own `kv_metrics` and
+`keep` branch that keeps them.
 
 ### Counters and units at each sink
 
