@@ -1,7 +1,7 @@
 //! One scraped body through `nginx_status::parse` and `StubStatus::to_events`, as
 //! `nginx_stub_status_in` decodes it. Oracles, over every input the parser accepts:
 //! - the body's maximal runs of ASCII digits are the page's numbers in page order, seven, or
-//!   eight under Tengine's header, and each mapped field is `Some` exactly when its run fits an
+//!   eight under Tengine's header, and each mapped field is `Some` if and only if its run fits an
 //!   `i64`, with that value;
 //! - `to_events` gives one event per field that fits, `7 - out_of_range()` in all, each a single
 //!   `I64` point whose value is its field's;
