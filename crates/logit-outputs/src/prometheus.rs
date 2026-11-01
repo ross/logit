@@ -650,6 +650,13 @@ impl Output for PrometheusOutput {
         }
     }
 
+    fn bound_addr(&self) -> Option<SocketAddr> {
+        match self {
+            PrometheusOutput::Expose(output) => output.bound_addr(),
+            PrometheusOutput::Send(output) => output.bound_addr(),
+        }
+    }
+
     fn observe_batch(&mut self, ctx: BatchContext, seq: SeqId) {
         match self {
             PrometheusOutput::Expose(output) => output.observe_batch(ctx, seq),
@@ -885,6 +892,10 @@ impl ExposeOutput {
 
 #[async_trait::async_trait]
 impl Output for ExposeOutput {
+    fn bound_addr(&self) -> Option<std::net::SocketAddr> {
+        self.local_addr()
+    }
+
     /// Opens the socket and starts serving. Idempotent, so the runtime's pre-spawn pass and
     /// `run_output`'s lazy call don't bind twice ([`Output::bind`]'s contract).
     ///

@@ -28,6 +28,18 @@ pub trait Input {
         Ok(())
     }
 
+    /// The socket address this listener holds after [`Input::bind`], `None` before it or for an
+    /// input with no network socket. A test binds `127.0.0.1:0` and reads the OS-assigned port
+    /// here, through a boxed `dyn Input`, instead of choosing a port first and racing other
+    /// processes for it.
+    ///
+    /// An input with several sockets reports its TCP socket (the stream listener, not a Unix
+    /// socket or a second bind). Concrete types keep their inherent `local_addr`; this method has
+    /// its own name so the two never shadow each other.
+    fn bound_addr(&self) -> Option<std::net::SocketAddr> {
+        None
+    }
+
     async fn run(&mut self, sink: Fanout) -> anyhow::Result<()>;
 
     /// Runs until `shutdown` flips, with the opportunity to drain buffered work first

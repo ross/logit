@@ -353,6 +353,10 @@ impl DatadogInput {
 
 #[async_trait::async_trait]
 impl Input for DatadogInput {
+    fn bound_addr(&self) -> Option<std::net::SocketAddr> {
+        self.local_addr()
+    }
+
     async fn bind(&mut self) -> anyhow::Result<()> {
         if self.listener.is_some() {
             return Ok(()); // idempotent, per `Input::bind`'s contract

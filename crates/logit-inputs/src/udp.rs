@@ -458,6 +458,10 @@ impl<D: Decoder + Send> UdpListener<D> {
 
 #[async_trait::async_trait]
 impl<D: Decoder + Send> Input for UdpListener<D> {
+    fn bound_addr(&self) -> Option<std::net::SocketAddr> {
+        self.local_addr()
+    }
+
     async fn bind(&mut self) -> anyhow::Result<()> {
         if self.socket.is_some() {
             return Ok(()); // idempotent, per `Input::bind`'s contract

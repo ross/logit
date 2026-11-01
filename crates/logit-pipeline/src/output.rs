@@ -65,6 +65,13 @@ pub trait Output {
         Ok(())
     }
 
+    /// The socket address this sink serves on after [`Output::bind`], `None` before it or for a
+    /// sink that listens on nothing. A test binds `127.0.0.1:0` and reads the OS-assigned port
+    /// here through a boxed `dyn Output`. A wrapping `Output` must forward it.
+    fn bound_addr(&self) -> Option<std::net::SocketAddr> {
+        None
+    }
+
     /// One delivery attempt at `batch`. `write_loop` calls it once per attempt and owns the retry
     /// (the trait doc). The contract:
     ///

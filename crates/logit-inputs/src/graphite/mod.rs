@@ -384,6 +384,10 @@ impl GraphiteInput {
 
 #[async_trait::async_trait]
 impl Input for GraphiteInput {
+    fn bound_addr(&self) -> Option<std::net::SocketAddr> {
+        self.local_addr()
+    }
+
     /// Idempotent, per `Input::bind`'s contract. Also where the framing reaches the stream driver
     /// (see the `max_line_bytes` field).
     async fn bind(&mut self) -> anyhow::Result<()> {

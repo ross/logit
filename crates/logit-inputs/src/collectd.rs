@@ -149,6 +149,10 @@ impl CollectdInput {
 
 #[async_trait::async_trait]
 impl Input for CollectdInput {
+    fn bound_addr(&self) -> Option<std::net::SocketAddr> {
+        self.local_addr()
+    }
+
     async fn bind(&mut self) -> anyhow::Result<()> {
         self.inner.bind().await
     }
