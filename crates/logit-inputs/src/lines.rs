@@ -318,6 +318,10 @@ impl LinesInput {
 
 #[async_trait::async_trait]
 impl Input for LinesInput {
+    fn bound_addr(&self) -> Option<std::net::SocketAddr> {
+        self.local_addr()
+    }
+
     async fn bind(&mut self) -> anyhow::Result<()> {
         match &mut self.inner {
             Inner::Udp(listener) => listener.bind().await,

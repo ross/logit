@@ -643,6 +643,10 @@ impl<D: Decoder + Clone + Send + 'static> TcpListener<D> {
 
 #[async_trait::async_trait]
 impl<D: Decoder + Clone + Send + 'static> Input for TcpListener<D> {
+    fn bound_addr(&self) -> Option<std::net::SocketAddr> {
+        self.local_addr()
+    }
+
     async fn bind(&mut self) -> anyhow::Result<()> {
         if self.listener.is_some() {
             return Ok(()); // idempotent, per `Input::bind`'s contract

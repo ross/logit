@@ -1,6 +1,6 @@
 ---
 created: 2026-09-28
-updated: 2026-10-19
+updated: 2026-11-01
 ---
 
 # Test timing: wait on an observable, size every sleep, and share one set of helpers
@@ -40,9 +40,11 @@ Tests follow these rules. A reviewer can check each one on a diff.
    happened. A sleep only sizes a negative window ("nothing arrives in this time"). Its comment
    names the interval it covers, and it is at least 3x that interval.
 2. **Bind before spawn.** A test calls `bind().await`, reads `local_addr()`, then spawns the
-   input. It never binds a port, drops it, and binds it again. An exception (a boxed `dyn Input`
-   with no `local_addr`) says so in a comment. A child process binds port `0` and reports the
-   port it got; see "Amendment: a child process picks its own port".
+   input. It never binds a port, drops it, and binds it again. A test that builds a component
+   through `build_spec` reads the address from `Input::bound_addr` or `Output::bound_addr` on the
+   boxed trait object; see "Amendment: a boxed `dyn Input` reports its address". A child
+   process binds port `0` and reports the port it got; see "Amendment: a child process picks its
+   own port".
 3. **A timing constant states its interval, its margin, and what each side of the margin
    protects.** Commit 47142b7b's comment is the model. A wall-clock bound over work that scales
    with CPU is at least 10x a gap measured under load, or it bounds progress instead of time.
@@ -124,3 +126,23 @@ A retry at the spawn was the alternative: re-pick every port and respawn when th
 `Address already in use`. It keeps the race and hides it behind a bounded retry, and every test
 would need its config built from a closure over the ports. Reporting the bound address removes
 the window, and an operator gets the same line for a `:0` bind outside tests.
+
+## Amendment: a boxed `dyn Input` reports its address (2026-11-01)
+
+Rule 2 no longer has a boxed-`dyn Input` exception. `Input` and `Output` each have a provided
+method, `bound_addr`, that returns the socket address the component holds after `bind()`, `None`
+by default. Every listener that has an inherent `local_addr` overrides it, and `PrometheusOutput`,
+which wraps its two modes, forwards it. A test configures `127.0.0.1:0`, calls `bind().await`
+on the boxed component, reads the address from `bound_addr`, then spawns it.
+
+The exception let `crates/logit-cli/src/pipeline.rs`'s tests pick a port with a `free_port()`
+helper that bound `127.0.0.1:0`, read the port, dropped the socket, and wrote the port into the
+config. Between the drop and `input.bind()`, another test in the parallel nextest run could take
+the port. CI run 41327638407 failed that way:
+`build_spec_wires_auth_into_each_listener_that_takes_it` panicked with `bind should succeed:
+Address already in use (os error 98)`. That test chose three ports up front and ran HTTP round
+trips on the first before binding the others, which widened the window. `free_port()` is gone.
+
+`bound_addr` has its own name, not `local_addr`, so a concrete type's inherent `local_addr` and
+the trait method never shadow each other. An input with several sockets reports its TCP socket
+(a Unix socket reports `None`).

@@ -449,6 +449,10 @@ impl DatadogTraceInput {
 
 #[async_trait::async_trait]
 impl Input for DatadogTraceInput {
+    fn bound_addr(&self) -> Option<std::net::SocketAddr> {
+        self.local_addr()
+    }
+
     /// Binds whichever of the TCP listener and the Unix socket is configured and not yet bound.
     async fn bind(&mut self) -> anyhow::Result<()> {
         if self.bind.is_none() && self.socket.is_none() {

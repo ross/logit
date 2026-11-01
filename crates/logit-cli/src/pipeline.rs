@@ -4820,21 +4820,14 @@ mod tests {
     // produces: a 50ms budget closes a silent connection within the 1s read, where the 5s default
     // wouldn't.
 
-    /// A free loopback port, bound and released. This is the boxed-`dyn Input` exception to
-    /// `docs/adr/test-timing-and-observables.md`'s bind-before-spawn rule: a boxed `Input` can't
-    /// report its `local_addr`, so the port is chosen first and handed to its config.
-    async fn free_port() -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        listener.local_addr().unwrap().to_string()
-    }
-
     /// Spawns a built `NodeSpec::Input` and asserts it closes a silent connection within 1s.
-    async fn assert_closes_a_silent_connection(spec: NodeSpec, addr: &str) {
+    async fn assert_closes_a_silent_connection(spec: NodeSpec) {
         let NodeSpec::Input(mut input, _) = spec else { panic!("expected NodeSpec::Input") };
         input.bind().await.expect("bind should succeed");
+        let addr = input.bound_addr().expect("a bound listener reports its address").to_string();
         tokio::spawn(async move { input.run(logit_pipeline::Fanout::new(vec![])).await });
 
-        let mut silent = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut silent = tokio::net::TcpStream::connect(&addr).await.unwrap();
         let mut buf = [0u8; 1];
         let result = tokio::time::timeout(
             Duration::from_secs(1),
@@ -4851,7 +4844,6 @@ mod tests {
 
     #[tokio::test]
     async fn build_spec_wires_handshake_timeout_into_a_tcp_syslog_input() {
-        let addr = free_port().await;
         let component = ResolvedComponent {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
@@ -4859,7 +4851,7 @@ mod tests {
             targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::SyslogIn {
-                bind: addr.clone(),
+                bind: "127.0.0.1:0".to_string(),
                 transport: logit_config::SyslogTransport::Tcp,
                 framing: None,
                 tls: None,
@@ -4872,12 +4864,11 @@ mod tests {
             },
         };
         let spec = build_spec("in", &component, Path::new(""), None).unwrap().0;
-        assert_closes_a_silent_connection(spec, &addr).await;
+        assert_closes_a_silent_connection(spec).await;
     }
 
     #[tokio::test]
     async fn build_spec_wires_handshake_timeout_into_a_logit_input() {
-        let addr = free_port().await;
         let component = ResolvedComponent {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
@@ -4885,7 +4876,7 @@ mod tests {
             targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::LogitIn {
-                bind: addr.clone(),
+                bind: "127.0.0.1:0".to_string(),
                 tls: None,
                 max_frame_bytes: None,
                 handshake_timeout: Duration::from_millis(50),
@@ -4895,13 +4886,12 @@ mod tests {
             },
         };
         let spec = build_spec("in", &component, Path::new(""), None).unwrap().0;
-        assert_closes_a_silent_connection(spec, &addr).await;
+        assert_closes_a_silent_connection(spec).await;
     }
 
     /// `otlp_in`'s knob bounds only the TLS accept, so this needs a real `tls:` block.
     #[tokio::test]
     async fn build_spec_wires_handshake_timeout_into_an_otlp_input() {
-        let addr = free_port().await;
         let component = ResolvedComponent {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
@@ -4909,7 +4899,7 @@ mod tests {
             targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::OtlpIn {
-                bind: addr.clone(),
+                bind: "127.0.0.1:0".to_string(),
                 protocol: logit_config::OtlpProtocol::Http,
                 tls: Some(logit_config::TlsServerConfig {
                     cert_file: "server.pem".to_string(),
@@ -4927,7 +4917,7 @@ mod tests {
             },
         };
         let spec = build_spec("in", &component, &testdata_tls_dir(), None).unwrap().0;
-        assert_closes_a_silent_connection(spec, &addr).await;
+        assert_closes_a_silent_connection(spec).await;
     }
 
     /// Resolves a one-listener-per-entry graph, each listener feeding one shared sink.
@@ -5004,13 +4994,13 @@ mod tests {
     // `max_connections: 1`, holds the one permit with a first connection, and asserts the second is
     // turned away, which the 1024 default never would.
 
-    /// Builds `kind` as component `in`, spawns it with telemetry from a fresh registry, and opens
-    /// a first connection that holds the one permit. Returns the registry and that connection.
+    /// Builds `kind` (bound on port 0) as component `in`, spawns it with telemetry from a fresh
+    /// registry, and opens a first connection that holds the one permit. Returns the registry, the
+    /// bound address, and that connection.
     async fn spawn_capped_listener(
         kind: ComponentKind,
-        addr: &str,
         base_dir: &Path,
-    ) -> (Arc<Registry>, tokio::net::TcpStream) {
+    ) -> (Arc<Registry>, String, tokio::net::TcpStream) {
         let component = ResolvedComponent {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
@@ -5023,6 +5013,7 @@ mod tests {
         let (spec, _) = build_spec("in", &component, base_dir, Some(&registry)).unwrap();
         let NodeSpec::Input(mut input, _) = spec else { panic!("expected NodeSpec::Input") };
         input.bind().await.expect("bind should succeed");
+        let addr = input.bound_addr().expect("a bound listener reports its address").to_string();
         let (sink, rx) = logit_pipeline::test_util::fanout_channel(16);
         tokio::spawn(async move {
             let _consumer = rx;
@@ -5033,9 +5024,9 @@ mod tests {
         // answering `400` and returning the permit; syslog and `logit_in` wait for more bytes
         // either way. The accept loop takes permits one accept at a time in the kernel queue's
         // order, so this holds the one permit before any later connection is accepted.
-        let mut first = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut first = tokio::net::TcpStream::connect(&addr).await.unwrap();
         tokio::io::AsyncWriteExt::write_all(&mut first, b"P").await.unwrap();
-        (registry, first)
+        (registry, addr, first)
     }
 
     /// Waits for `in`'s `logit.input.connections.rejected{reason="limit"}` to reach 1.
@@ -5051,9 +5042,8 @@ mod tests {
 
     #[tokio::test]
     async fn build_spec_wires_max_connections_into_a_tcp_syslog_input() {
-        let addr = free_port().await;
         let kind = ComponentKind::SyslogIn {
-            bind: addr.clone(),
+            bind: "127.0.0.1:0".to_string(),
             transport: logit_config::SyslogTransport::Tcp,
             framing: None,
             tls: None,
@@ -5064,7 +5054,7 @@ mod tests {
             reuse_port: false,
             proxy_protocol: false,
         };
-        let (registry, first) = spawn_capped_listener(kind, &addr, Path::new("")).await;
+        let (registry, addr, first) = spawn_capped_listener(kind, Path::new("")).await;
 
         let mut second = tokio::net::TcpStream::connect(&addr).await.unwrap();
         logit_pipeline::test_util::expect_closed(&mut second, "a past-the-cap connection").await;
@@ -5074,12 +5064,12 @@ mod tests {
 
     #[tokio::test]
     async fn build_spec_wires_max_connections_into_a_tcp_lines_input() {
-        let addr = free_port().await;
-        let mut kind = lines_in_kind(addr.clone(), logit_config::LinesTransport::Tcp, None);
+        let mut kind =
+            lines_in_kind("127.0.0.1:0".to_string(), logit_config::LinesTransport::Tcp, None);
         if let ComponentKind::LinesIn { max_connections, .. } = &mut kind {
             *max_connections = 1;
         }
-        let (registry, first) = spawn_capped_listener(kind, &addr, Path::new("")).await;
+        let (registry, addr, first) = spawn_capped_listener(kind, Path::new("")).await;
 
         let mut second = tokio::net::TcpStream::connect(&addr).await.unwrap();
         logit_pipeline::test_util::expect_closed(&mut second, "a past-the-cap connection").await;
@@ -5090,9 +5080,8 @@ mod tests {
     /// `logit_in` tells a past-the-cap peer why: a `Reject{INTERNAL}` control frame, then a close.
     #[tokio::test]
     async fn build_spec_wires_max_connections_into_a_logit_input() {
-        let addr = free_port().await;
         let kind = ComponentKind::LogitIn {
-            bind: addr.clone(),
+            bind: "127.0.0.1:0".to_string(),
             tls: None,
             max_frame_bytes: None,
             handshake_timeout: logit_config::default_handshake_timeout(),
@@ -5100,7 +5089,7 @@ mod tests {
             max_connections: 1,
             reuse_port: false,
         };
-        let (registry, first) = spawn_capped_listener(kind, &addr, Path::new("")).await;
+        let (registry, addr, first) = spawn_capped_listener(kind, Path::new("")).await;
 
         let mut second = tokio::net::TcpStream::connect(&addr).await.unwrap();
         let mut wire = Vec::new();
@@ -5129,9 +5118,8 @@ mod tests {
 
     #[tokio::test]
     async fn build_spec_wires_max_connections_into_an_otlp_input() {
-        let addr = free_port().await;
         let kind = ComponentKind::OtlpIn {
-            bind: addr.clone(),
+            bind: "127.0.0.1:0".to_string(),
             protocol: logit_config::OtlpProtocol::Http,
             tls: None,
             auth: Default::default(),
@@ -5143,7 +5131,7 @@ mod tests {
             proxy_protocol: false,
             forwarded: None,
         };
-        let (registry, first) = spawn_capped_listener(kind, &addr, Path::new("")).await;
+        let (registry, addr, first) = spawn_capped_listener(kind, Path::new("")).await;
 
         let mut second = tokio::net::TcpStream::connect(&addr).await.unwrap();
         logit_pipeline::test_util::expect_closed(&mut second, "a past-the-cap connection").await;
@@ -5274,13 +5262,10 @@ mod tests {
 
     #[tokio::test]
     async fn build_spec_wires_auth_into_each_listener_that_takes_it() {
-        let otlp = free_port().await;
-        let receiver = free_port().await;
-        let exposition = free_port().await;
         let inputs = [
             (
                 ComponentKind::OtlpIn {
-                    bind: otlp.clone(),
+                    bind: "127.0.0.1:0".to_string(),
                     protocol: logit_config::OtlpProtocol::Http,
                     tls: None,
                     auth: bearer_auth(),
@@ -5292,7 +5277,7 @@ mod tests {
                     proxy_protocol: false,
                     forwarded: None,
                 },
-                format!("http://{otlp}/v1/traces"),
+                "/v1/traces",
             ),
             (
                 ComponentKind::PrometheusIn {
@@ -5301,7 +5286,7 @@ mod tests {
                     timeout: logit_config::default_prometheus_scrape_timeout(),
                     headers: HashMap::new(),
                     scrape_tls: logit_config::TlsClientConfig::default(),
-                    bind: Some(receiver.clone()),
+                    bind: Some("127.0.0.1:0".to_string()),
                     path: "/api/v1/write".to_string(),
                     bind_tls: None,
                     bind_auth: bearer_auth(),
@@ -5313,14 +5298,16 @@ mod tests {
                     forwarded: None,
                     reuse_port: false,
                 },
-                format!("http://{receiver}/api/v1/write"),
+                "/api/v1/write",
             ),
         ];
-        for (kind, url) in inputs {
+        for (kind, path) in inputs {
             let component = resolved(kind, vec![], vec!["out".to_string()]);
             let (spec, _) = build_spec("in", &component, Path::new(""), None).unwrap();
             let NodeSpec::Input(mut input, _) = spec else { panic!("expected NodeSpec::Input") };
             input.bind().await.expect("bind should succeed");
+            let addr = input.bound_addr().expect("a bound listener reports its address");
+            let url = format!("http://{addr}{path}");
             let (sink, rx) = logit_pipeline::test_util::fanout_channel(16);
             tokio::spawn(async move {
                 let _consumer = rx;
@@ -5331,7 +5318,7 @@ mod tests {
         }
 
         let kind = ComponentKind::PrometheusOut {
-            bind: Some(exposition.clone()),
+            bind: Some("127.0.0.1:0".to_string()),
             path: logit_config::default_prometheus_path(),
             expire_after: logit_config::default_prometheus_expire_after(),
             max_series: logit_config::default_prometheus_max_series(),
@@ -5352,7 +5339,8 @@ mod tests {
         let (spec, _) = build_spec("out", &component, Path::new(""), None).unwrap();
         let NodeSpec::Output(mut output, _, _) = spec else { panic!("expected NodeSpec::Output") };
         output.bind().await.expect("bind should succeed");
-        let url = format!("http://{exposition}/metrics");
+        let addr = output.bound_addr().expect("a bound sink reports its address");
+        let url = format!("http://{addr}/metrics");
         assert_eq!(status_of("GET", &url, None).await, 401);
         assert_eq!(status_of("GET", &url, Some("Bearer token-a")).await, 200);
     }
@@ -5364,12 +5352,13 @@ mod tests {
 
     /// Spawns a built `NodeSpec::Input`, sends `wire`, and asserts the server closes the connection
     /// within 1s of it going quiet.
-    async fn assert_closes_a_quiet_connection(spec: NodeSpec, addr: &str, wire: &[u8]) {
+    async fn assert_closes_a_quiet_connection(spec: NodeSpec, wire: &[u8]) {
         let NodeSpec::Input(mut input, _) = spec else { panic!("expected NodeSpec::Input") };
         input.bind().await.expect("bind should succeed");
+        let addr = input.bound_addr().expect("a bound listener reports its address").to_string();
         tokio::spawn(async move { input.run(logit_pipeline::Fanout::new(vec![])).await });
 
-        let mut quiet = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut quiet = tokio::net::TcpStream::connect(&addr).await.unwrap();
         tokio::io::AsyncWriteExt::write_all(&mut quiet, wire).await.unwrap();
 
         let mut buf = [0u8; 1];
@@ -5388,7 +5377,6 @@ mod tests {
 
     #[tokio::test]
     async fn build_spec_wires_idle_timeout_into_a_tcp_syslog_input() {
-        let addr = free_port().await;
         let component = ResolvedComponent {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
@@ -5396,7 +5384,7 @@ mod tests {
             targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::SyslogIn {
-                bind: addr.clone(),
+                bind: "127.0.0.1:0".to_string(),
                 transport: logit_config::SyslogTransport::Tcp,
                 framing: None,
                 tls: None,
@@ -5409,12 +5397,11 @@ mod tests {
             },
         };
         let spec = build_spec("in", &component, Path::new(""), None).unwrap().0;
-        assert_closes_a_quiet_connection(spec, &addr, b"<13>hello\n").await;
+        assert_closes_a_quiet_connection(spec, b"<13>hello\n").await;
     }
 
     #[tokio::test]
     async fn build_spec_wires_idle_timeout_into_a_tcp_graphite_input() {
-        let addr = free_port().await;
         let component = ResolvedComponent {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
@@ -5422,7 +5409,7 @@ mod tests {
             targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::GraphiteIn {
-                bind: addr.clone(),
+                bind: "127.0.0.1:0".to_string(),
                 transport: logit_config::GraphiteTransport::Tcp,
                 protocol: logit_config::GraphiteProtocol::Plaintext,
                 tls: None,
@@ -5437,12 +5424,11 @@ mod tests {
             },
         };
         let spec = build_spec("in", &component, Path::new(""), None).unwrap().0;
-        assert_closes_a_quiet_connection(spec, &addr, b"some.path 1 1700000000\n").await;
+        assert_closes_a_quiet_connection(spec, b"some.path 1 1700000000\n").await;
     }
 
     #[tokio::test]
     async fn build_spec_wires_idle_timeout_into_a_tcp_statsd_input() {
-        let addr = free_port().await;
         let component = ResolvedComponent {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
@@ -5450,7 +5436,7 @@ mod tests {
             targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::StatsdIn {
-                bind: addr.clone(),
+                bind: "127.0.0.1:0".to_string(),
                 transport: logit_config::StatsdTransport::Tcp,
                 tls: None,
                 handshake_timeout: logit_config::default_handshake_timeout(),
@@ -5463,18 +5449,18 @@ mod tests {
             },
         };
         let spec = build_spec("in", &component, Path::new(""), None).unwrap().0;
-        assert_closes_a_quiet_connection(spec, &addr, b"some.counter:1|c\n").await;
+        assert_closes_a_quiet_connection(spec, b"some.counter:1|c\n").await;
     }
 
     #[tokio::test]
     async fn build_spec_wires_idle_timeout_into_a_tcp_lines_input() {
-        let addr = free_port().await;
-        let mut kind = lines_in_kind(addr.clone(), logit_config::LinesTransport::Tcp, None);
+        let mut kind =
+            lines_in_kind("127.0.0.1:0".to_string(), logit_config::LinesTransport::Tcp, None);
         if let ComponentKind::LinesIn { idle_timeout, .. } = &mut kind {
             *idle_timeout = Some(Duration::from_millis(50));
         }
         let spec = build_spec("in", &input_component(kind), Path::new(""), None).unwrap().0;
-        assert_closes_a_quiet_connection(spec, &addr, b"a line\n").await;
+        assert_closes_a_quiet_connection(spec, b"a line\n").await;
     }
 
     /// `logit_in` arms the idle clock after its handshake and closes with `Reject{GOING_AWAY}`,
@@ -5485,7 +5471,6 @@ mod tests {
         use logit_proto::native::{self, control};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let addr = free_port().await;
         let component = ResolvedComponent {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
@@ -5493,7 +5478,7 @@ mod tests {
             targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::LogitIn {
-                bind: addr.clone(),
+                bind: "127.0.0.1:0".to_string(),
                 tls: None,
                 max_frame_bytes: None,
                 handshake_timeout: logit_config::default_handshake_timeout(),
@@ -5508,6 +5493,7 @@ mod tests {
             panic!("expected NodeSpec::Input")
         };
         input.bind().await.expect("bind should succeed");
+        let addr = input.bound_addr().expect("a bound listener reports its address").to_string();
         tokio::spawn(async move { input.run(logit_pipeline::Fanout::new(vec![])).await });
 
         /// Reads and decodes one control frame. Hand-rolled: a real `logit_out` would reconnect
@@ -5567,7 +5553,6 @@ mod tests {
     /// answered instead (`docs/adr/idle-connection-timeout.md`).
     #[tokio::test]
     async fn build_spec_wires_idle_timeout_into_an_otlp_input() {
-        let addr = free_port().await;
         let component = ResolvedComponent {
             buffer: logit_config::BufferConfig::default(),
             receive: logit_config::ReceiveConfig::default(),
@@ -5575,7 +5560,7 @@ mod tests {
             targets: Vec::new(),
             consumers: vec!["out".to_string()],
             kind: ComponentKind::OtlpIn {
-                bind: addr.clone(),
+                bind: "127.0.0.1:0".to_string(),
                 protocol: logit_config::OtlpProtocol::Http,
                 tls: None,
                 auth: Default::default(),
@@ -5589,7 +5574,7 @@ mod tests {
             },
         };
         let spec = build_spec("in", &component, Path::new(""), None).unwrap().0;
-        assert_closes_a_quiet_connection(spec, &addr, b"P").await;
+        assert_closes_a_quiet_connection(spec, b"P").await;
     }
 
     #[test]
@@ -6990,8 +6975,8 @@ mod tests {
     /// next line on the connection is the first one delivered.
     #[tokio::test]
     async fn build_spec_wires_max_line_bytes_into_a_lines_input() {
-        let addr = free_port().await;
-        let mut kind = lines_in_kind(addr.clone(), logit_config::LinesTransport::Tcp, None);
+        let mut kind =
+            lines_in_kind("127.0.0.1:0".to_string(), logit_config::LinesTransport::Tcp, None);
         if let ComponentKind::LinesIn { max_line_bytes, .. } = &mut kind {
             *max_line_bytes = 4;
         }
@@ -7000,6 +6985,7 @@ mod tests {
             build_spec("in", &input_component(kind), Path::new(""), Some(&registry)).unwrap();
         let NodeSpec::Input(mut input, _) = spec else { panic!("expected NodeSpec::Input") };
         input.bind().await.expect("bind should succeed");
+        let addr = input.bound_addr().expect("a bound listener reports its address").to_string();
         let (sink, mut rx) = logit_pipeline::test_util::fanout_channel(16);
         let handle = tokio::spawn(async move { input.run(sink).await });
 

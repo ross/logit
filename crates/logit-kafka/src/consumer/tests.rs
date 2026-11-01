@@ -372,6 +372,26 @@ async fn two_members_split_the_partitions_through_a_late_join_and_a_leave() {
     assert_eq!(cluster.state().groups[GROUP].state, GroupState::Empty);
 }
 
+/// A stop that lands while the join's offset fetch retries, after JoinGroup and SyncGroup made
+/// the broker count the member and before the membership installs, still sends LeaveGroup, so
+/// the group doesn't wait out the member's session.
+#[tokio::test]
+async fn a_stop_mid_join_still_leaves_the_group() {
+    let cluster = cluster(1, &[0]).await;
+    for _ in 0..1000 {
+        cluster.script(Step::api(ApiKey::OffsetFetch, Action::Error(code::UNSTABLE_OFFSET_COMMIT)));
+    }
+    let probe = TelemetryProbe::new();
+    let c = drive(consumer(&probe, "in", settings(&cluster, &["t"])));
+    wait_until("the offset fetch retries inside the join", || {
+        requests(&cluster, ApiKey::OffsetFetch) >= 2 && stable_with(&cluster, 1)
+    })
+    .await;
+    c.leave().await;
+    wait_until("the broker saw the leave", || requests(&cluster, ApiKey::LeaveGroup) == 1).await;
+    assert_eq!(cluster.state().groups[GROUP].state, GroupState::Empty);
+}
+
 #[tokio::test]
 async fn a_caller_that_never_accepts_keeps_its_session() {
     let cluster = cluster(1, &[0]).await;
