@@ -1,0 +1,15 @@
+# Mounts the run's shared directory, `<run>/shared`, which the driver creates with mode 0777
+# and names in SOAK_SHARED_DIR, into the writer and the SUT at /shared: the pod log root the
+# writer writes and `cri_in` reads. `:z` relabels it for SELinux. The generator runs
+# soaklib/criwriter.py in the stand-in's Python image in place of `logit`, with the JSON config
+# the base file mounts at /config.yaml, as an unprivileged user.
+services:
+  logit:
+    volumes: ["${SOAK_SHARED_DIR:?set by script/soak}:/shared:z"]
+  generator:
+    image: python:3.13.16-alpine3.24
+    entrypoint: ["python", "-u", "/criwriter.py", "/config.yaml"]
+    user: "65534:65534"
+    volumes:
+      - ./soaklib/criwriter.py:/criwriter.py:ro,z
+      - ${SOAK_SHARED_DIR:?set by script/soak}:/shared:z

@@ -1003,9 +1003,14 @@ returned nonzero has none, so nothing after it is excused.
   then 52.6, then about 32 MiB for over 100 s after a 45 s partition, and a fit over those
   plateaus beside its 18 MiB baseline read +240 MiB/h. `fd_slope` keeps `recovery_bound`: it
   compares single samples with the warmup median rather than fitting a line, and a connection's
-  fd closes when the connection does, with no allocator in between. A service with samples
-  after warmup but none outside the widened windows WARNs on coverage, and the row SKIPs for
-  want of a fit only when the run after warmup is shorter than the 60 s a fit needs. From W8c both
+  fd closes when the connection does, with no allocator in between. `rss_slope` also skips
+  each life's first 120 s, fits a life over 12 samples spanning 60 s at least past them, and
+  judges a fit over T s against the limit plus 1.5 × 3 MiB × 3600 / T: a started `logit` gains
+  6 to 10 MiB in its first 30 s, and a 3 MiB allocator step within a fit over T s biases it by
+  that much (the ADR's "Amendment: `rss_slope` skips each life's warm-up and scales its limit by
+  the fit's span"). A service with no life to fit SKIPs when the schedule left none of its lives
+  60 s past the warm-up outside the widened windows, and WARNs on coverage when it did; the row
+  SKIPs when every service does. From W8c both
   rows judge each `logit` service apart, the SUT and every generator, with one detail line per
   service and the worst status, as the per-sink rows do; a generator that interns what the SUT
   interns grows beside it, and one verdict for both would say nothing about the SUT. A

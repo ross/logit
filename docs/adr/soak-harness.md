@@ -873,3 +873,34 @@ the tree's `F` records, gzip files decompressed, and that count plus the lines t
 rotations removed, which it reports, must equal G. `cri_in` never reads a `.gz`, so a SUT down
 across two rotations, or paused across three, loses a file's unread tail, and the row FAILs such a
 window as the scenario's fault.
+
+## Amendment: `rss_slope` skips each life's warm-up and scales its limit by the fit's span (2026-10-31)
+
+`cri-rotate` restarts the SUT four times a cycle, so its only steady samples sat 40 to 100 s into
+a fresh life, and `rss_slope` fit a line over 60 s of them. Over an hour of 33 lives the SUT's RSS
+stayed between 26 and 35 MiB and jemalloc's allocated bytes between 4 and 7 MB, yet those fits read
+from −186 to +135 MiB/h, and the row FAILed. A started `logit` gains 6 to 10 MiB in its first
+30 s and moves up to 3 MiB more until about 70 s. Past that its RSS still steps by up to 2.8 MiB
+within 60 s at a 5 s drain, and a step of A MiB in the middle of a span of T s biases a
+least-squares slope by 1.5 × A / T: 270 MiB/h for a 3 MiB step over 60 s.
+
+- **A life's first 120 s isn't fitted.** The warm-up runs from the life's start, read from its
+  uptime, and applies to every life, the first included, on top of the run's warmup.
+- **A fit needs 12 samples over 60 s past the warm-up.** Over 60 s a 3 MiB step's bias, 270
+  MiB/h, is a 4.5 MiB rise, still below a gross leak's 10 MiB a minute at 600 MiB/h; under
+  60 s it grows past that. An `[[expect]]` `slope` keeps its 6 samples over 60 s.
+- **A fit over T s is judged against `rss_growth_mib_per_hour` + 1.5 × 3 MiB × 3600 / T.** The
+  bias adds to the limit rather than replacing it, because a leak at the limit with one step in
+  its fit reads as their sum. Over 300 s the limit is 54 MiB/h above the scenario's, over an
+  hour 4.5, so a scenario built to judge memory judges at about its own limit, and a
+  fault-dense one keeps a check for a gross leak. The row prints each fit's limit.
+- **A service with no life to fit SKIPs when the schedule left none of its lives 60 s past the
+  warm-up outside the widened fault windows**, naming the longest such stretch, and the row
+  SKIPs when every service does. Where one was left, a service with no fit still WARNs on
+  coverage, since something other than the schedule took its fit away. This replaces the
+  coverage WARN for a schedule that excuses every sample. Judged slopes covering under 5% of
+  the run still WARN.
+- **Few scenarios lose a verdict.** At default durations only `native-hop`, `native-hop-spans`,
+  and `statsd-vm-lost-total` leave the SUT no life to fit, and `cri-rotate` at 20 minutes. The
+  scenarios built to judge memory, `cardinality`, `cardinality-capped`, `partition-rss`,
+  `tail-rotate-delete`, and `cri-rotate-rss`, fit every service against about their own limit.
