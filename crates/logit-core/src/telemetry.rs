@@ -758,11 +758,19 @@ impl Registry {
         }
     }
 
-    /// Drains every buffer, in registration order (sorted by id, so reproducible), into one list.
+    /// Drains every buffer into one list in timestamp order, a tie keeping registration order
+    /// (sorted by id, so reproducible).
+    ///
+    /// A log keeps its capture time and a span its start, while a point takes `now`. A drain after
+    /// a long blocked tick holds events hours apart, and a destination that requires a stream in
+    /// time order (Loki) rejects an entry behind a newer one in the same batch. The sort is
+    /// stable, so the points, all stamped `now`, stay grouped by component.
     pub fn drain(&self, now: i64) -> Vec<Event> {
         // Clone the `Arc`s rather than hold the registry lock across each buffer's drain.
         let buffers = self.buffers.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
-        buffers.iter().flat_map(|buf| buf.drain(now)).collect()
+        let mut events: Vec<Event> = buffers.iter().flat_map(|buf| buf.drain(now)).collect();
+        events.sort_by_key(|event| event.timestamp);
+        events
     }
 }
 
@@ -1232,6 +1240,49 @@ mod tests {
         b.count("m", 1.0, &[]);
 
         assert_eq!(registry.drain(0).len(), 2);
+    }
+
+    #[test]
+    fn drained_logs_are_in_timestamp_order_across_components() {
+        let registry = Registry::new();
+        registry.telemetry_for("a", "statsd_in", "listener");
+        registry.telemetry_for("b", "influxdb_out", "sink");
+        let log = |ts: i64| PendingLog {
+            ts,
+            level: Severity::Warn,
+            key: "k".to_string(),
+            message: "m".to_string(),
+        };
+        registry.push_log("a", log(3_000));
+        registry.push_log("b", log(1_000));
+        registry.push_log("b", log(2_000));
+
+        let events = registry.drain(10_000);
+        let stamps: Vec<i64> =
+            events.iter().filter(|e| e.log.is_some()).map(|e| e.timestamp).collect();
+        assert_eq!(stamps, vec![1_000, 2_000, 3_000], "logs must drain oldest first");
+    }
+
+    #[test]
+    fn drained_spans_are_in_start_order_not_finish_order() {
+        let registry = Registry::with_span_sampling(1.0);
+        let a = registry.telemetry_for("a", "x", "transform");
+        let b = registry.telemetry_for("b", "x", "transform");
+
+        set_test_clock(2_000);
+        let later = a.span("late", SpanKind::Internal, trace_id(1), span_id(1), None);
+        set_test_clock(1_000);
+        let earlier = b.span("early", SpanKind::Internal, trace_id(2), span_id(2), None);
+        // "a"'s span finishes first, though it started second.
+        set_test_clock(3_000);
+        drop(later);
+        drop(earlier);
+        clear_test_clock();
+
+        let events = registry.drain(10_000);
+        let stamps: Vec<i64> =
+            events.iter().filter(|e| e.span.is_some()).map(|e| e.timestamp).collect();
+        assert_eq!(stamps, vec![1_000, 2_000], "spans must drain in start order");
     }
 
     #[test]
