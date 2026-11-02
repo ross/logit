@@ -1,6 +1,7 @@
 //! `internal`: `logit` observing itself. On each `interval` it drains every component's
 //! per-component self-telemetry buffer ([`logit_core::telemetry`]) and sends the result as one
-//! ordinary batch, so any downstream component works on it (`docs/design/internal-telemetry.md`,
+//! ordinary batch in timestamp order (`logit_core::telemetry::Registry::drain`), so any downstream
+//! component works on it (`docs/design/internal-telemetry.md`,
 //! `docs/adr/internal-telemetry-as-pipeline-events.md`). Graph rule 13 allows at most one
 //! `internal`: a second would split the one process-wide buffer set between them.
 //!
