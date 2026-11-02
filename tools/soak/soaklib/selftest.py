@@ -14942,6 +14942,121 @@ def _cri_gone():
                "a stop past its bound excuses nothing")
 
 
+def _backstop_ledger():
+    """The ledger on a send the runtime's shutdown backstop cut at life 0's stop
+    (docs/adr/shutdown-accounting-and-cancellation-safety.md, decisions 17 to 20): a tailer's
+    batch its checkpoint never passed, deferred and read again by life 1, widens the file and
+    `cri` replay bands and excuses its residual in `ledger.egress`; an HTTP listener's cut
+    request, counted dropped and never sent, stays out of X; a listener's drop never excuses a
+    sink's gap; and across a hop the ingress listener's cut batch is X's, not `drops`'s."""
+    last0 = 100  # life 0's last drain, which carries its shutdown counts
+    cut = 1_500  # the cut batches' lines, two of `batch_max_events`' 1,000 at most
+
+    def deferred(n=2):
+        return _line(_stamp(T0 + last0), checks.DEFERRED, "sum", n, component="in")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # A tailer: life 0 read and sent the lines, `window` never had them, and life 1 reads
+        # and sends them again, so W − G and life 0's residual are each the cut's lines.
+        def file_run(name, extra=()):
+            run_dir = _ledger_run(tmp, name, shutdown_drops=0, life0_extra=30 + cut,
+                                  end_extra=cut, sut_extra=extra)
+            return {r.id: r for r in checks.run_all(_as_file_wire(run_dir, w_minus_g=cut))}
+
+        tail = file_run("backstop-file", [deferred()])
+        for row in ("ledger.wire", "ledger.intake", "ledger.egress", "ledger.summary", "drops"):
+            expect(tail[row].status == checks.PASS,
+                   f"{row} PASSes a tailer's deferred cut read again, got {tail[row]}")
+        expect("against the replay band [0, 2,001]" in tail["ledger.wire"].detail
+               and "life 0: [0, +2,000]: Q 2 deferred batch(es), up to 2,000 lines read "
+               "again, a send the shutdown backstop cut that the checkpoint never passed"
+               in tail["ledger.wire"].lines,
+               f"a deferred cut widens a file wire's band by Q's lines, got "
+               f"{tail['ledger.wire']} {tail['ledger.wire'].lines}")
+        expect("life 0: ok" in tail["ledger.egress"].detail
+               or "deferred" in tail["ledger.egress"].detail,
+               f"ledger.egress excuses a stopped life's deferred lines, got {tail['ledger.egress']}")
+        bare = file_run("backstop-file-uncounted")
+        expect(bare["ledger.wire"].status == checks.FAIL
+               and bare["ledger.egress"].status == checks.FAIL,
+               f"the same replay with no deferred batch FAILs both rows, got "
+               f"{bare['ledger.wire']}, {bare['ledger.egress']}")
+
+        # `cri_in`: W is its events sent, so the cut's lines count in life 0's W and E. They
+        # land a drain before the last, which sets the pin's cap from its rate.
+        def cri_run(name, extra=()):
+            sent = _line(_stamp(T0 + last0 - 5), "logit.component.events.sent", "sum", cut,
+                         component="in")
+            run_dir = _ledger_run(tmp, name, shutdown_drops=0, life0_extra=0, v0_extra=0,
+                                  end_extra=cut, sut_extra=[sent, *extra])
+            return {r.id: r for r in checks.run_all(_as_cri_wire(run_dir, w_minus_g=cut))}
+
+        cri = cri_run("backstop-cri", [deferred()])
+        for row in ("ledger.wire", "ledger.intake", "ledger.egress", "ledger.summary", "drops"):
+            expect(cri[row].status == checks.PASS,
+                   f"{row} PASSes cri_in's deferred cut read again, got {cri[row]}")
+        expect("against the replay band [0, 3,201]" in cri["ledger.wire"].detail,
+               f"a deferred cut widens the cri band by Q's lines, got {cri['ledger.wire']}")
+        bare = cri_run("backstop-cri-uncounted")
+        expect(bare["ledger.wire"].status == checks.FAIL
+               and bare["ledger.egress"].status == checks.FAIL,
+               f"the same replay with no deferred batch FAILs both rows, got "
+               f"{bare['ledger.wire']}, {bare['ledger.egress']}")
+        # A file wire's deferred batch was counted in E, so it excuses no final-life intake gap.
+        final = file_run("backstop-file-final", [
+            _line(_stamp(T0 + 320), checks.DEFERRED, "sum", 1, component="in"),
+            _line(_stamp(T0 + 320), "logit.input.lines", "sum", 5, component="in")])
+        expect(final["ledger.intake"].status == checks.FAIL,
+               f"a tailer's deferred batch doesn't excuse W − D past E + B, got "
+               f"{final['ledger.intake']}")
+
+        # `influxdb_in`: a request cut out of its deadline send counts 300 events dropped and
+        # none sent; the client resends it, so it isn't X and life 0's residual stays 0.
+        def http_run(name, reason="shutdown"):
+            dropped = _line(_stamp(T0 + last0), "logit.component.events.dropped", "sum", 300,
+                            component="in", attrs={"reason": reason})
+            return {r.id: r for r in checks.run_all(_http_run(
+                tmp, name, life0_dropped=1, dropped_at="in", dropped_reason=reason,
+                sut_extra=[dropped]))}
+
+        http = http_run("backstop-http")
+        for row in ("ledger.wire", "ledger.intake", "ledger.egress", "ledger.summary", "drops"):
+            expect(http[row].status == checks.PASS,
+                   f"{row} PASSes an HTTP request the backstop cut, got {http[row]}")
+        refused = http_run("backstop-http-closed", reason="closed_consumer")
+        expect(refused["ledger.intake"].status == checks.FAIL,
+               f"a closed_consumer drop is still X on an HTTP wire, got "
+               f"{refused['ledger.intake']}")
+
+        # A UDP listener's cut batch was sent and is X; with V 10 short of what life 0
+        # absorbed, the listener's drop can't call that gap counted.
+        def udp_run(name, v0_extra):
+            dropped = _line(_stamp(T0 + last0), "logit.component.events.dropped", "sum", 100,
+                            component="in", attrs={"reason": "shutdown"})
+            sent = _line(_stamp(T0 + last0), "logit.component.events.sent", "sum", 100,
+                         component="in")
+            return {r.id: r for r in checks.run_all(_ledger_run(
+                tmp, name, life0_extra=150, v0_extra=v0_extra, life0_dropped=1,
+                dropped_at="in", sut_extra=[dropped, sent]))}
+
+        udp = udp_run("backstop-udp", 30)
+        for row in ("ledger.intake", "ledger.egress", "ledger.summary", "drops"):
+            expect(udp[row].status == checks.PASS,
+                   f"{row} PASSes a UDP listener's cut batch, counted, got {udp[row]}")
+        short = udp_run("backstop-udp-short", 20)["ledger.egress"]
+        expect(short.status == checks.FAIL and "uncounted" in short.detail,
+               f"a listener's shutdown drop doesn't excuse a sink's gap, got {short}")
+
+        # Across a hop, the ingress listener's cut batch counts a batch and its events.
+        hop = {r.id: r for r in checks.run_all(_two_sut_run(
+            tmp, "backstop-hop", kill_on=None, collector_lives=1, drops=(
+                ("logit", "logit.component.batches.dropped", "in", "shutdown"),
+                ("logit", "logit.component.events.dropped", "in", "shutdown"))))}
+        expect(hop["drops"].lines == [
+                   "collector window: logit.component.events.dropped{reason=\"stale\"} 1"],
+               f"drops leaves an ingress listener's cut batch to X, got {hop['drops'].lines}")
+
+
 def run(root, quiet=False):
     """Returns 0 when every expectation holds, else prints the failures and returns 1."""
     root = Path(root)
@@ -14964,7 +15079,7 @@ def run(root, quiet=False):
                      _http_ledger, _http_rules, _file_ledger, _file_rules,
                      _kafka_wire_ledger, _kafka_wire_rules,
                      _cri_count, _cri_writer, _cri_rules, _cri_ledger, _cri_dangles,
-                     _cri_gone,
+                     _cri_gone, _backstop_ledger,
                      _file_ops, _file_action_rules, _copytruncate_ledger, _two_sut_rules,
                      _two_sut_driver, _two_sut_checks, _relay_rules, _relay_driver,
                      _relay_checks, _per_service, _slope_edges,
