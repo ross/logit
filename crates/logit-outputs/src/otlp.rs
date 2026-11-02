@@ -72,8 +72,9 @@
 //! endpoint is `https://` and the server picks h2 through ALPN; otherwise they open up to
 //! `concurrency` connections. Batches can land out of order.
 //! Spans are stored as received. Logs sent to Loki can reach it out of order for one stream, and
-//! Loki rejects an entry more than half its `max_chunk_age` (one hour by default) behind the
-//! newest it accepted for that stream, dropping the batch whole as "entry too far behind".
+//! Loki rejects each entry more than half its `max_chunk_age` (one hour by default) behind the
+//! newest it accepted for that stream ("entry too far behind"), so a batch wholly behind that
+//! line is lost.
 //! Metrics sent to a Prometheus-backed receiver can reach it out of timestamp order for one
 //! series, which a receiver without an out-of-order window rejects;
 //! [`crate::prometheus`]'s "Concurrency" table says which receivers accept it.
