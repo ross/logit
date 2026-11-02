@@ -63,7 +63,7 @@ use logit_core::random_id_bytes;
 use logit_core::telemetry::Timer;
 use logit_core::{EventBatch, Provenance, SpanKind, Symbol, Telemetry};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 
@@ -314,36 +314,79 @@ pub struct Fanout {
     /// provenance passes through unchanged.
     component: Option<Symbol>,
     /// Set only on a listener's `Fanout`, so `run_input` can tell whether the grace backstop
-    /// dropped a send. Every other node pays a `None` check per send.
-    in_flight: Option<SendsInFlight>,
+    /// cut a send. Every other node pays a `None` check per send. A clone shares the counter;
+    /// [`Fanout::for_connection`] mints its own.
+    in_flight: Option<Arc<InFlightCounter>>,
 }
 
-/// The sends in flight on a listener's [`Fanout`] and its clones, which a listener's connection
-/// tasks share: one word, the batch count in the high 24 bits and their events in the low 40, so
-/// a send costs one `fetch_add` and one `fetch_sub`. A send leaves the word when it returns or
-/// when its future is dropped, so a reader sees a cancelled send only before the future that
-/// holds it drops (`run_input` reads it with the listener's future still alive).
+/// Every counter of sends in flight a listener's [`Fanout`] and its per-connection copies hold,
+/// read by `run_input` when its grace backstop stops the listener.
+///
+/// Each counter is one word: the batch count in the high 24 bits and their events in the low 40,
+/// so a send costs one `fetch_add` and one `fetch_sub` on its own copy's counter. A send leaves
+/// the word when it returns or when its future is dropped, so a reader sees a cancelled send only
+/// while the future that holds it is alive (`run_input` reads with the listener's future alive).
+/// The registry's lock is taken only by [`Fanout::for_connection`] and by a read.
 #[derive(Clone, Default)]
-pub struct SendsInFlight(Arc<AtomicU64>);
+pub struct SendsInFlight(Arc<Mutex<Vec<Weak<InFlightCounter>>>>);
 
 const EVENTS_BITS: u32 = 40;
 const EVENTS_MASK: u64 = (1 << EVENTS_BITS) - 1;
 
 impl SendsInFlight {
-    /// The batches and events in sends that haven't returned.
+    /// The batches and events in sends that haven't returned, summed over every live counter.
     pub fn load(&self) -> (u64, u64) {
-        let word = self.0.load(Ordering::Relaxed);
-        (word >> EVENTS_BITS, word & EVENTS_MASK)
+        self.each().into_iter().fold((0, 0), |(b, e), (nb, ne)| (b + nb, e + ne))
     }
 
-    fn enter(&self, n: usize) -> InFlight<'_> {
-        let add = (1 << EVENTS_BITS) | (n as u64).min(EVENTS_MASK);
-        self.0.fetch_add(add, Ordering::Relaxed);
-        InFlight { word: &self.0, add }
+    /// The batches and events in flight on each live counter: the listener's own `Fanout`, then
+    /// one per connection that called [`Fanout::for_connection`], in registration order.
+    pub fn each(&self) -> Vec<(u64, u64)> {
+        let counters = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        counters
+            .iter()
+            .filter_map(Weak::upgrade)
+            .map(|c| {
+                let word = c.word.load(Ordering::Relaxed);
+                (word >> EVENTS_BITS, word & EVENTS_MASK)
+            })
+            .collect()
+    }
+
+    /// How many counters the registry holds, dropped ones not yet pruned included.
+    #[cfg(test)]
+    fn registered(&self) -> usize {
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).len()
+    }
+
+    /// A new counter in this registry, pruning the counters whose copies have all dropped.
+    fn register(&self) -> Arc<InFlightCounter> {
+        let counter = Arc::new(InFlightCounter { word: AtomicU64::new(0), registry: self.clone() });
+        let mut counters = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        counters.retain(|c| c.strong_count() > 0);
+        counters.push(Arc::downgrade(&counter));
+        counter
     }
 }
 
-/// One send's share of [`SendsInFlight`], removed on drop.
+/// One copy's in-flight word. Aligned to 128 bytes so two connections' counters, allocated side
+/// by side, never share a cache line (128 covers x86-64's adjacent-line prefetch and Apple's
+/// 128-byte lines).
+#[repr(align(128))]
+struct InFlightCounter {
+    word: AtomicU64,
+    registry: SendsInFlight,
+}
+
+impl InFlightCounter {
+    fn enter(&self, n: usize) -> InFlight<'_> {
+        let add = (1 << EVENTS_BITS) | (n as u64).min(EVENTS_MASK);
+        self.word.fetch_add(add, Ordering::Relaxed);
+        InFlight { word: &self.word, add }
+    }
+}
+
+/// One send's share of an [`InFlightCounter`], removed on drop.
 struct InFlight<'a> {
     word: &'a AtomicU64,
     add: u64,
@@ -379,15 +422,39 @@ impl Fanout {
         self
     }
 
-    /// Tracks every async send on this `Fanout` and its clones in `in_flight`.
-    pub fn with_sends_in_flight(mut self, in_flight: SendsInFlight) -> Self {
-        self.in_flight = Some(in_flight);
+    /// Tracks every async send on this `Fanout` and its clones in a new counter in `in_flight`.
+    pub fn with_sends_in_flight(mut self, in_flight: &SendsInFlight) -> Self {
+        self.in_flight = Some(in_flight.register());
         self
     }
 
-    /// Enters `n` events into [`SendsInFlight`] until the returned guard drops, when tracked.
+    /// A copy for one connection's task: a clone with its own in-flight counter, so sends on two
+    /// connections never touch one word. A listener calls it once per accepted connection, not
+    /// per request: it allocates and takes the registry's lock. Its own clones (a request's, a
+    /// detached delivery's) share its counter. Untracked, it is a plain clone.
+    pub fn for_connection(&self) -> Self {
+        let mut copy = self.clone();
+        if let Some(counter) = &self.in_flight {
+            copy.in_flight = Some(counter.registry.register());
+        }
+        copy
+    }
+
+    /// A copy for a task that outlives the listener's future, such as a detached delivery: a
+    /// clone with no in-flight counter. `run_input`'s backstop doesn't cut that task's sends, so
+    /// it mustn't count them.
+    pub fn detached(&self) -> Self {
+        Self {
+            consumers: self.consumers.clone(),
+            telemetry: self.telemetry.clone(),
+            component: self.component,
+            in_flight: None,
+        }
+    }
+
+    /// Enters `n` events into this copy's counter until the returned guard drops, when tracked.
     fn in_flight(&self, n: usize) -> Option<InFlight<'_>> {
-        self.in_flight.as_ref().map(|t| t.enter(n))
+        self.in_flight.as_ref().map(|c| c.enter(n))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -866,6 +933,46 @@ mod tests {
         assert_eq!(std::mem::size_of::<Delivered>(), 72);
         // The niche is still available one level up.
         assert_eq!(std::mem::size_of::<Option<Delivered>>(), 72);
+    }
+
+    /// A clone shares its copy's counter, `for_connection` registers its own, and a copy's
+    /// counter leaves the registry once every clone of it drops.
+    #[tokio::test]
+    async fn each_connection_copy_counts_its_own_sends_in_flight() {
+        let (tx, _rx) = mpsc::channel(1);
+        let in_flight = SendsInFlight::default();
+        let root = Fanout::new(vec![tx]).with_sends_in_flight(&in_flight);
+        let _request = root.clone();
+        assert_eq!(in_flight.each(), [(0, 0)], "a clone shares the root's counter");
+
+        assert!(root.send(batch(1)).await, "fills the one slot");
+        let connection = root.for_connection();
+        let mut parked = Box::pin(connection.send(batch(2)));
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        assert!(std::future::Future::poll(parked.as_mut(), &mut cx).is_pending());
+        assert_eq!(in_flight.each(), [(0, 0), (1, 2)]);
+        assert_eq!(in_flight.load(), (1, 2));
+
+        drop(parked);
+        drop(connection);
+        let _next = root.for_connection();
+        assert_eq!(in_flight.each(), [(0, 0), (0, 0)]);
+        assert_eq!(in_flight.registered(), 2, "the dropped copy was pruned");
+    }
+
+    /// A detached copy's sends outlive the listener, so they never enter a counter.
+    #[tokio::test]
+    async fn a_detached_copy_counts_no_sends_in_flight() {
+        let (tx, _rx) = mpsc::channel(1);
+        let in_flight = SendsInFlight::default();
+        let root = Fanout::new(vec![tx]).with_sends_in_flight(&in_flight);
+        assert!(root.send(batch(1)).await, "fills the one slot");
+        let detached = root.detached();
+        let mut parked = Box::pin(detached.send(batch(2)));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(parked.as_mut(), &mut cx).is_pending());
+        assert_eq!(in_flight.load(), (0, 0));
     }
 
     /// `BatchContext` adds no padding to `TraceContext` + `Provenance` (pinned in `logit-core`).

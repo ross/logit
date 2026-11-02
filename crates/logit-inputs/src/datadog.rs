@@ -432,7 +432,7 @@ impl Input for DatadogInput {
                 continue;
             };
 
-            let (sink, telemetry) = (sink.clone(), self.telemetry.clone());
+            let (sink, telemetry) = (sink.for_connection(), self.telemetry.clone());
             let api_keys = Arc::clone(&self.api_keys);
             let busy_after = self.busy_after;
             let mut diag = self.diag.clone();

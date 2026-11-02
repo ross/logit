@@ -711,7 +711,7 @@ that recorded the point.
 | `buffer_full` | warn | A sink's buffer, or a datagram listener's receive queue, found no room for a push. Names the bound and the `overflow` policy; repeats at most once a minute while it stays full, with what was shed or how long intake has been held. On a sink with every send its `concurrency` allows in flight, it also names that concurrency and the last send's duration. |
 | `buffer_recovered` | warn | A full buffer's utilization fell below its `recover_below`. Carries the episode's duration and totals. |
 | `buffer_full_at_shutdown` | warn | A sink or listener stopped with its buffer still full. |
-| `shutdown_backstop` | warn | A listener didn't finish within its shutdown grace (`receive.shutdown_grace`, 5 s by default) and was stopped. Names the listener's kind and the grace. If the listener was waiting to send a batch downstream, the line says the batch was dropped, with its event count, and the batch is counted `batches.dropped`/`events.dropped{reason="shutdown"}`; otherwise it says no batch was in a send, and nothing is counted. A `tail_in`, `docker_in`, `cri_in`, or `kafka_in` restart reads that batch again from its checkpoint or committed offset. |
+| `shutdown_backstop` | warn | A listener didn't finish within its shutdown grace (`receive.shutdown_grace`, 5 s by default) and was stopped. Names the listener's kind and the grace. If the listener was waiting to send a batch downstream, the line names the batch and its event count. `kafka_in`, and `tail_in`, `docker_in`, or `cri_in` with a `checkpoint_path`, count it `logit.input.batches.deferred`, and the line says the next run reads it again from the committed offset or checkpoint. Every other listener counts it `batches.dropped`/`events.dropped{reason="shutdown"}`, and the line says it's lost. The batch was already counted `batches.sent`. With no batch in a send, the line says so, and nothing is counted. |
 | `telemetry left undrained at exit` | debug/warn | One line per internal metric point no `internal` drain exported, logged after every node has exited and before `exiting`, on exit `0` or `2` alike. `warn` for any nonzero `*.dropped` count, whatever its `reason`; `debug` for everything else, including timings and routine counts. Only with an `internal` component. |
 | `exiting` | info/error | The process is about to exit — `info` at `0`, `error` at any failure code (`1` or `2`). A config error that fails before the pipeline starts exits without this line. |
 
@@ -850,7 +850,8 @@ isn't keeping up and loss may follow:
 
 - `logit.input.batches.deferred`: an HTTP listener answered `503` and the client kept the data to
   retry. A client with a short retry window, such as a dd-trace tracer, drops its payload once it
-  gives up, and `logit` can't count that.
+  gives up, and `logit` can't count that. `kafka_in` and a checkpointed `tail_in`, `docker_in`, or
+  `cri_in` also count a batch shutdown stopped them sending, which the next run reads again.
 - `logit.component.retrying` (gauge, on a sink): `1` while the sink retries a failing head. A hold
   drops nothing, so `*.dropped` doesn't move until the queue behind it overflows or shutdown
   cuts it. Alert on this gauge staying at `1`.

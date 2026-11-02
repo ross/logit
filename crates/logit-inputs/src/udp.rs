@@ -5140,7 +5140,7 @@ mod tests {
 
     /// A batch whose fan-out is cut off mid-`Fanout::deliver` reaches a prefix of the consumers,
     /// and the listener counts it `sent` and `receive.flushed` but never dropped. Under
-    /// `run_input`, the grace backstop counts it dropped from the `Fanout`'s sends in flight.
+    /// `run_input`, the grace backstop counts it dropped from the listener's sends in flight.
     #[tokio::test(start_paused = true)]
     async fn a_batch_cut_off_mid_fan_out_reaches_a_prefix_of_consumers() {
         let registry = logit_core::Registry::new();

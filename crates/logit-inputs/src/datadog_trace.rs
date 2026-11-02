@@ -586,7 +586,7 @@ impl AcceptContext {
 
     fn shared(&self, peer: ConnectionPeer) -> Arc<Shared> {
         Arc::new(Shared {
-            sink: self.sink.clone(),
+            sink: self.sink.for_connection(),
             telemetry: self.telemetry.clone(),
             diag: self.diag.clone(),
             busy_after: self.busy_after,

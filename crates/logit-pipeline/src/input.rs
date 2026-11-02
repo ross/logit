@@ -28,6 +28,15 @@ pub trait Input {
         Ok(())
     }
 
+    /// Whether the next process reads again a batch this listener was sending when shutdown
+    /// stopped it: its source keeps what the listener hasn't confirmed, as a tail checkpoint or an
+    /// uncommitted Kafka offset does. When `run_input`'s grace backstop cuts a send, a `true`
+    /// listener's batch counts `logit.input.batches.deferred` and a `false` one's counts
+    /// `batches.dropped`/`events.dropped{reason="shutdown"}`. The default is `false`.
+    fn rereads_after_restart(&self) -> bool {
+        false
+    }
+
     /// The socket address this listener holds after [`Input::bind`], `None` before it or for an
     /// input with no network socket. A test binds `127.0.0.1:0` and reads the OS-assigned port
     /// here, through a boxed `dyn Input`, instead of choosing a port first and racing other

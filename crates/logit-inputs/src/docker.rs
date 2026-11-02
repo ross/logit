@@ -771,6 +771,11 @@ impl logit_pipeline::Input for DockerInput {
         self.inner.bind().await
     }
 
+    /// Only with a checkpoint: without one, a restart starts each file at `read_from`.
+    fn rereads_after_restart(&self) -> bool {
+        self.inner.config().checkpoint_path.is_some()
+    }
+
     async fn run(&mut self, sink: Fanout) -> anyhow::Result<()> {
         let (_tx, rx) = shutdown_watch::channel(false);
         self.inner.run_until_shutdown(sink, rx).await
@@ -803,6 +808,34 @@ mod tests {
 
     fn line(json: &str) -> Bytes {
         Bytes::copy_from_slice(json.as_bytes())
+    }
+
+    /// The three tailing kinds tell `run_input`'s backstop that a cut batch is read again only
+    /// when a checkpoint will resume it; with none, a restart starts each file at `read_from`.
+    #[test]
+    fn a_tailing_input_rereads_after_restart_only_with_a_checkpoint() {
+        use logit_pipeline::Input;
+        for checkpoint in [None, Some(PathBuf::from("/var/lib/logit/checkpoint.json"))] {
+            let config =
+                TailConfig { checkpoint_path: checkpoint.clone(), ..TailConfig::default() };
+            let tail = crate::tail::TailInput::new(vec![], config.clone());
+            let docker = DockerInput::new(
+                PathBuf::from("/var/lib/docker/containers"),
+                ContainerFilter::new(vec![], true),
+                vec![],
+                config.clone(),
+            );
+            let cri = crate::cri::CriInput::new(
+                PathBuf::from("/var/log/pods"),
+                PathBuf::from("/var/log/containers"),
+                Duration::from_secs(1),
+                config,
+            );
+            let rereads = checkpoint.is_some();
+            assert_eq!(tail.rereads_after_restart(), rereads, "tail_in, {checkpoint:?}");
+            assert_eq!(docker.rereads_after_restart(), rereads, "docker_in, {checkpoint:?}");
+            assert_eq!(cri.rereads_after_restart(), rereads, "cri_in, {checkpoint:?}");
+        }
     }
 
     // -- DockerDecoder ------------------------------------------------------------------------

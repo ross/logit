@@ -515,7 +515,7 @@ impl Input for OtlpInput {
                 continue;
             };
 
-            let sink = sink.clone();
+            let sink = sink.for_connection();
             let transport = self.transport;
             let mut diag = self.diag.clone();
             let telemetry = self.telemetry.clone();

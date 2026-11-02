@@ -407,7 +407,8 @@ impl Input for LogitInput {
                 );
             }
 
-            let sink = sink.clone();
+            // A detached task: it outlives the listener's future, so the backstop never cuts it.
+            let sink = sink.detached();
             let mut diag = self.diag.clone();
             let telemetry = self.telemetry.clone();
             let tls_acceptor = tls_acceptor.clone();

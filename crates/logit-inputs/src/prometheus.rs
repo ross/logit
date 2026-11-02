@@ -1011,7 +1011,7 @@ impl Input for PrometheusReceiver {
                 continue;
             };
 
-            let sink = sink.clone();
+            let sink = sink.for_connection();
             let path = Arc::clone(&self.path);
             let mut diag = self.diag.clone();
             let telemetry = self.telemetry.clone();

@@ -82,7 +82,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
   `apache_status_in` (the scrape in flight, and each target's batch still to send), and
   `generate_in`. It needs a downstream that's full when the signal fires. `run_input`'s grace
   backstop, which drops a listener still draining after its grace, counts the same loss as
-  `batches.dropped{reason="shutdown"}` from the `Fanout`'s sends in flight. Counting this one
+  `batches.dropped{reason="shutdown"}` (or `logit.input.batches.deferred`, for a listener whose
+  source keeps it) from the `Fanout`'s sends in flight. Counting this one
   needs the default to read the same record before it drops `run`. `docs/design/pipeline-graph.md`'s "Cancellation points" table lists each
   site.
 - **A batch sent into a closed sink inbox after the sweep's bound runs out is lost uncounted.**

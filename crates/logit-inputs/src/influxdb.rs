@@ -385,7 +385,7 @@ impl Input for InfluxDbInput {
                 continue;
             };
 
-            let (sink, telemetry) = (sink.clone(), self.telemetry.clone());
+            let (sink, telemetry) = (sink.for_connection(), self.telemetry.clone());
             let tokens = Arc::clone(&self.tokens);
             let (max_request_bytes, busy_after) = (self.max_request_bytes, self.busy_after);
             let resources = Arc::clone(&resources);

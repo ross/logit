@@ -284,6 +284,12 @@ fn same_group(last: &EventBatch, next: &EventBatch) -> bool {
 
 #[async_trait::async_trait]
 impl Input for KafkaInput {
+    /// An offset is committed only once its batch is in every downstream inbox, so the group's
+    /// next reader reads a cut batch again.
+    fn rereads_after_restart(&self) -> bool {
+        true
+    }
+
     /// Builds the consumer, which checks every bootstrap broker is a `host:port`; nothing is
     /// dialed until the run.
     async fn bind(&mut self) -> anyhow::Result<()> {

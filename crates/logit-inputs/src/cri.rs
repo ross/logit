@@ -692,6 +692,11 @@ impl logit_pipeline::Input for CriInput {
         self.inner.bind().await
     }
 
+    /// Only with a checkpoint: without one, a restart starts each file at `read_from`.
+    fn rereads_after_restart(&self) -> bool {
+        self.inner.config().checkpoint_path.is_some()
+    }
+
     async fn run(&mut self, sink: Fanout) -> anyhow::Result<()> {
         let (_tx, rx) = shutdown_watch::channel(false);
         self.inner.run_until_shutdown(sink, rx).await

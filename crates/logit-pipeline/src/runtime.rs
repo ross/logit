@@ -638,8 +638,10 @@ pub async fn run_with_options(
 /// `shutdown_grace`.
 ///
 /// When the backstop wins, the listener's future is still alive, so its [`SendsInFlight`] still
-/// holds any send it was parked in. That send's batch is lost with the future: it's logged with
-/// the `shutdown_backstop` warn and counted as [`count_shutdown_drop`] counts a sink's.
+/// holds any send it was parked in. That send's batch goes with the future, and the
+/// `shutdown_backstop` warn names it. A listener whose source keeps it
+/// ([`Input::rereads_after_restart`]) counts it `logit.input.batches.deferred`; any other counts
+/// it lost through [`count_shutdown_drop`], as a sink's shutdown drop is.
 ///
 /// `biased`, input arm first; `unconstrained` backstop: see `docs/design/pipeline-graph.md`'s
 /// "Cancellation points".
@@ -652,8 +654,9 @@ async fn run_input(
     telemetry: Telemetry,
     shutdown_dropped_batches: Arc<AtomicU64>,
 ) -> anyhow::Result<()> {
+    let rereads = input.rereads_after_restart();
     let in_flight = SendsInFlight::default();
-    let fanout = fanout.with_sends_in_flight(in_flight.clone());
+    let fanout = fanout.with_sends_in_flight(&in_flight);
     let deadline = std::sync::OnceLock::new();
     // `async_trait` boxes the future, so `drop(running)` below drops the listener.
     let mut running = input.run_until_shutdown(fanout, shutdown.clone());
@@ -667,25 +670,25 @@ async fn run_input(
     let (batches, events) = in_flight.load();
     drop(running);
     let kind = telemetry.component().map_or("unknown", |(_, kind)| kind);
-    let diag = Diagnostics::new(id.clone());
-    if batches == 0 {
-        diag.warn_keyed(
-            "shutdown_backstop",
-            format!(
-                "{kind} didn't finish within its shutdown grace ({shutdown_grace:?}) and was \
-                 stopped; no batch was in a send"
-            ),
-        );
+    let outcome = if batches == 0 {
+        "no batch was in a send".to_string()
+    } else if rereads {
+        telemetry.count("logit.input.batches.deferred", batches as f64, &[]);
+        format!(
+            "deferred {batches} batch(es) ({events} event(s)) it was sending, which its source \
+             keeps for the next run to read again"
+        )
     } else {
         count_shutdown_drop(&telemetry, &shutdown_dropped_batches, batches, events);
-        diag.warn_keyed(
-            "shutdown_backstop",
-            format!(
-                "{kind} didn't finish within its shutdown grace ({shutdown_grace:?}) and was \
-                 stopped; dropped {batches} batch(es) ({events} event(s)) it was sending"
-            ),
-        );
-    }
+        format!("dropped {batches} batch(es) ({events} event(s)) it was sending, which are lost")
+    };
+    Diagnostics::new(id).warn_keyed(
+        "shutdown_backstop",
+        format!(
+            "{kind} didn't finish within its shutdown grace ({shutdown_grace:?}) and was stopped; \
+             {outcome}"
+        ),
+    );
     Ok(())
 }
 
@@ -4462,9 +4465,11 @@ mod tests {
         assert!(message.contains("boom"), "got: {message}");
     }
 
-    /// On shutdown, sends each of `batches` in turn, then returns.
+    /// On shutdown, sends each of `batches` in turn, then returns. `rereads` is its answer to
+    /// `Input::rereads_after_restart`.
     struct SendOnShutdownInput {
         batches: Vec<EventBatch>,
+        rereads: bool,
     }
 
     #[async_trait::async_trait]
@@ -4472,6 +4477,10 @@ mod tests {
         async fn run(&mut self, _sink: Fanout) -> anyhow::Result<()> {
             std::future::pending::<()>().await;
             unreachable!("pending() never resolves")
+        }
+
+        fn rereads_after_restart(&self) -> bool {
+            self.rereads
         }
 
         async fn run_until_shutdown(
@@ -4487,6 +4496,30 @@ mod tests {
         }
     }
 
+    /// On shutdown, fills the one-slot inbox, then sends one batch on each of two connection
+    /// copies at once, each parking on the full inbox.
+    struct TwoConnectionsInput;
+
+    #[async_trait::async_trait]
+    impl Input for TwoConnectionsInput {
+        async fn run(&mut self, _sink: Fanout) -> anyhow::Result<()> {
+            std::future::pending::<()>().await;
+            unreachable!("pending() never resolves")
+        }
+
+        async fn run_until_shutdown(
+            &mut self,
+            sink: Fanout,
+            mut shutdown: watch::Receiver<bool>,
+        ) -> anyhow::Result<()> {
+            let _ = shutdown.wait_for(|&due| due).await;
+            sink.send(batch_of(1)).await;
+            let (a, b) = (sink.for_connection(), sink.for_connection());
+            tokio::join!(a.send(batch_of(2)), b.send(batch_of(3)));
+            Ok(())
+        }
+    }
+
     fn batch_of(n: usize) -> EventBatch {
         EventBatch {
             resource: Arc::new(Resource::default()),
@@ -4495,12 +4528,20 @@ mod tests {
         }
     }
 
-    /// What `run_input` reported for `input` under a 5 s grace into a one-slot inbox nobody
-    /// reads: its `shutdown_backstop` lines, the listener's `batches.dropped` and
-    /// `events.dropped{reason="shutdown"}`, and the runtime's shutdown tally.
-    async fn backstop_report(
-        input: Box<dyn Input + Send>,
-    ) -> (Vec<(tracing::Level, String)>, f64, f64, u64) {
+    /// What `run_input` reported under a 5 s grace into a one-slot inbox nobody reads.
+    #[derive(Debug, PartialEq)]
+    struct Backstop {
+        /// Every `shutdown_backstop` line.
+        lines: Vec<(tracing::Level, String)>,
+        /// The listener's `batches.dropped` and `events.dropped{reason="shutdown"}`.
+        dropped: (f64, f64),
+        /// The listener's `logit.input.batches.deferred`.
+        deferred: f64,
+        /// The runtime's shutdown tally.
+        tally: u64,
+    }
+
+    async fn backstop_report(input: Box<dyn Input + Send>) -> Backstop {
         let (lines, _guard) = crate::buffer_full::test_support::capture();
         let (tx, _rx) = mpsc::channel(1);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -4519,49 +4560,85 @@ mod tests {
         shutdown_tx.send(true).expect("receiver should still be alive");
         handle.await.expect("task should not panic").expect("the backstop resolves Ok");
         let shutdown = [("reason", "shutdown")];
-        (
-            lines.with_key("shutdown_backstop"),
-            probe.sum("logit.component.batches.dropped", &shutdown),
-            probe.sum("logit.component.events.dropped", &shutdown),
-            tally.load(std::sync::atomic::Ordering::Relaxed),
-        )
+        Backstop {
+            lines: lines.with_key("shutdown_backstop"),
+            dropped: (
+                probe.sum("logit.component.batches.dropped", &shutdown),
+                probe.sum("logit.component.events.dropped", &shutdown),
+            ),
+            deferred: probe.sum("logit.input.batches.deferred", &[]),
+            tally: tally.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    fn warned(line: &str) -> Vec<(tracing::Level, String)> {
+        let head = "statsd_in didn't finish within its shutdown grace (5s) and was stopped; ";
+        vec![(tracing::Level::WARN, format!("{head}{line}"))]
     }
 
     /// The second batch parks on the full inbox, and the backstop drops it with the future.
     #[tokio::test(start_paused = true)]
     async fn a_listener_parked_in_a_send_at_the_backstop_logs_and_counts_its_batch() {
-        let input = SendOnShutdownInput { batches: vec![batch_of(1), batch_of(3)] };
-        let (lines, batches, events, tally) = backstop_report(Box::new(input)).await;
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        assert_eq!(lines[0].0, tracing::Level::WARN);
-        assert_eq!(
-            lines[0].1,
-            "statsd_in didn't finish within its shutdown grace (5s) and was stopped; dropped 1 \
-             batch(es) (3 event(s)) it was sending"
-        );
-        assert_eq!((batches, events, tally), (1.0, 3.0, 1));
+        let input = SendOnShutdownInput { batches: vec![batch_of(1), batch_of(3)], rereads: false };
+        let report = backstop_report(Box::new(input)).await;
+        let expected = Backstop {
+            lines: warned("dropped 1 batch(es) (3 event(s)) it was sending, which are lost"),
+            dropped: (1.0, 3.0),
+            deferred: 0.0,
+            tally: 1,
+        };
+        assert_eq!(report, expected);
+    }
+
+    /// A source that keeps the batch: deferred, never dropped, and out of the shutdown tally.
+    #[tokio::test(start_paused = true)]
+    async fn a_rereading_listener_parked_in_a_send_at_the_backstop_counts_its_batch_deferred() {
+        let input = SendOnShutdownInput { batches: vec![batch_of(1), batch_of(3)], rereads: true };
+        let report = backstop_report(Box::new(input)).await;
+        let expected = Backstop {
+            lines: warned(
+                "deferred 1 batch(es) (3 event(s)) it was sending, which its source keeps for \
+                 the next run to read again",
+            ),
+            dropped: (0.0, 0.0),
+            deferred: 1.0,
+            tally: 0,
+        };
+        assert_eq!(report, expected);
+    }
+
+    /// Each connection copy has its own counter; the backstop sums every live one.
+    #[tokio::test(start_paused = true)]
+    async fn the_backstop_counts_the_sends_parked_on_every_connection_copy() {
+        let report = backstop_report(Box::new(TwoConnectionsInput)).await;
+        let expected = Backstop {
+            lines: warned("dropped 2 batch(es) (5 event(s)) it was sending, which are lost"),
+            dropped: (2.0, 5.0),
+            deferred: 0.0,
+            tally: 2,
+        };
+        assert_eq!(report, expected);
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_listener_stopped_by_the_backstop_outside_a_send_logs_and_counts_nothing() {
         let input = DrainingInput { drain_for: Duration::from_secs(3600), batch: None };
-        let (lines, batches, events, tally) = backstop_report(Box::new(input)).await;
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        assert_eq!(lines[0].0, tracing::Level::WARN);
-        assert_eq!(
-            lines[0].1,
-            "statsd_in didn't finish within its shutdown grace (5s) and was stopped; no batch was \
-             in a send"
-        );
-        assert_eq!((batches, events, tally), (0.0, 0.0, 0));
+        let report = backstop_report(Box::new(input)).await;
+        let expected = Backstop {
+            lines: warned("no batch was in a send"),
+            dropped: (0.0, 0.0),
+            deferred: 0.0,
+            tally: 0,
+        };
+        assert_eq!(report, expected);
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_listener_finishing_within_its_grace_logs_and_counts_nothing() {
         let input = DrainingInput { drain_for: Duration::from_secs(2), batch: Some(batch_of(1)) };
-        let (lines, batches, events, tally) = backstop_report(Box::new(input)).await;
-        assert!(lines.is_empty(), "{lines:?}");
-        assert_eq!((batches, events, tally), (0.0, 0.0, 0));
+        let report = backstop_report(Box::new(input)).await;
+        let expected = Backstop { lines: vec![], dropped: (0.0, 0.0), deferred: 0.0, tally: 0 };
+        assert_eq!(report, expected);
     }
 
     /// A single-consumer `Fanout` delivers `Delivered::Owned`, never an `Arc`.

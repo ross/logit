@@ -1168,3 +1168,13 @@ fn decode_record_batches_fails_on_a_stray_tail_shorter_than_a_batch_header() {
         assert!(err.contains("stray tail"), "{tail} bytes: {err}");
     }
 }
+
+/// An offset is committed only once its batch is in every downstream inbox, so `run_input`'s
+/// backstop counts a cut batch deferred, not dropped.
+#[tokio::test]
+async fn kafka_in_rereads_after_restart() {
+    use logit_pipeline::Input;
+    let cluster = cluster().await;
+    let probe = TelemetryProbe::new();
+    assert!(input(&probe, settings(&cluster, KafkaInFormat::Json)).rereads_after_restart());
+}
