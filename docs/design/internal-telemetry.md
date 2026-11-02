@@ -338,8 +338,12 @@ ComponentKind::Internal { interval: Duration, span_sample_rate: f64, logs: Inter
 `internal` is a listener (`Role::Listener`: no `sources`, needs ≥1 consumer), like `statsd_in`.
 `interval` serves two purposes:
 
-1. **Drain cadence.** Every registered component's buffer is drained and its points emitted as one
-   batch.
+1. **Drain cadence.** Every registered component's buffer is drained and its events emitted as one
+   batch, in timestamp order across components. A log keeps its capture time and a span its start,
+   so after a long blocked tick one drain holds events hours apart, and a destination that
+   requires a stream in time order (Loki) rejects an entry behind a newer one in the same batch.
+   A tie keeps registration order, so the points, all stamped with the drain time, stay grouped by
+   component.
 2. **Sampling tick for process-level metrics**, facts tied to no occurrence, so nothing else has a
    reason to push them: resident memory, CPU time, threads, open files, interner size, and uptime.
    See [Process-level metrics](#process-level-metrics).
