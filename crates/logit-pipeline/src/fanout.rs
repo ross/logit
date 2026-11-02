@@ -342,6 +342,13 @@ impl Fanout {
         self.consumers.is_empty()
     }
 
+    /// Each consumer's component id and kind, from the telemetry handle on its edge, in edge
+    /// order. An edge built without a live handle is left out, so a `Fanout` from
+    /// [`Fanout::new`] lists none.
+    pub fn consumer_components(&self) -> impl Iterator<Item = (&str, &'static str)> {
+        self.consumers.iter().filter_map(|edge| edge.telemetry.component())
+    }
+
     /// The stamping rule for every non-relaying send: `origin` is set once and never overwritten,
     /// `previous` is always rewritten to this node's id. See [`Fanout::stamp_relayed`] for
     /// `logit_in`'s rule.

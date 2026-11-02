@@ -10,9 +10,16 @@
 //! ([`InternalInput::run_until_shutdown`]).
 //!
 //! A drain yields three kinds of event: metric points (timestamped at the drain), spans (at their
-//! own start), and captured logs (at capture). Logs arrive only when `logs:` isn't `off`:
-//! `logit-cli` activates `logit_core::TelemetryLayer` at that threshold (`warn`, the default, or
-//! `error`).
+//! own start), and captured logs (at capture). A counter or timing point also carries the previous
+//! drain's time as its `start_timestamp`, the start of the interval it covers. Logs arrive only
+//! when `logs:` isn't `off`: `logit-cli` activates `logit_core::TelemetryLayer` at that threshold
+//! (`warn`, the default, or `error`).
+//!
+//! No tick runs while a send is parked on a full consumer, so a blocked self sink stalls the
+//! drain and points coalesce until it clears: one counter point then covers the whole block. A
+//! send still parked after one `interval` logs a `warn`, and its completion a second one
+//! (`InternalInput::send_watching_for_a_block`). `internal` keeps no queue of its own; the sink's
+//! buffer is the buffer (`docs/design/internal-telemetry.md`'s "When the self sink blocks").
 //!
 //! `interval` is also the sampling tick for the `logit.process.*` metrics (resident memory, CPU
 //! time, threads, open files, interner size, uptime), which no occurrence would ever push. They
@@ -28,6 +35,7 @@ use logit_pipeline::Fanout;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
+use tokio::time::MissedTickBehavior;
 
 pub struct InternalInput {
     interval: Duration,
@@ -43,6 +51,9 @@ pub struct InternalInput {
     telemetry: Telemetry,
     diag: Diagnostics,
     process: ProcessSampler,
+    /// The previous drain's time in Unix nanos, else when this input started: the start of the
+    /// interval the next drain's counters and timings cover.
+    last_drain: i64,
 }
 
 impl InternalInput {
@@ -64,6 +75,7 @@ impl InternalInput {
             telemetry: Telemetry::default(),
             diag: Diagnostics::default(),
             process: ProcessSampler::new(),
+            last_drain: now_nanos(),
         }
     }
 
@@ -132,7 +144,12 @@ impl Input for InternalInput {
         mut shutdown: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
         let started = Instant::now();
+        self.last_drain = now_nanos();
         let mut ticker = tokio::time::interval(self.interval);
+        // After a send blocked for many intervals, `Burst` would fire every missed tick back to
+        // back, each drain sending a batch of process gauges; `Delay` drains once and resumes the
+        // cadence from there.
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         // Skip `interval`'s immediate first tick, so the first drain is one interval in.
         ticker.tick().await;
         loop {
@@ -158,7 +175,9 @@ impl InternalInput {
         self.process.sample(&self.telemetry, &self.diag);
 
         let drain_timer = self.telemetry.timer("logit.internal.drain.duration");
-        let events = self.registry.drain(now_nanos());
+        let now = now_nanos();
+        let events = self.registry.drain_since(self.last_drain, now);
+        self.last_drain = now;
         drop(drain_timer);
         if events.is_empty() {
             return;
@@ -189,12 +208,72 @@ impl InternalInput {
             self.telemetry.count("logit.internal.logs.emitted", logs_emitted as f64, &[]);
         }
 
-        sink.send(EventBatch {
+        let send = sink.send(EventBatch {
             resource: self.resource.clone(),
             scope: Some(self.scope.clone()),
             events,
-        })
-        .await;
+        });
+        self.send_watching_for_a_block(send, sink).await;
+    }
+
+    /// Awaits `send` to completion, warning once if it's still parked after one `interval` and
+    /// once more when it completes.
+    ///
+    /// No tick runs while a send is parked, so the drain stalls and every point coalesces until
+    /// it completes (`docs/design/internal-telemetry.md`'s "When the self sink blocks"). The pair
+    /// says so while it's happening. The sleep is raced against a pinned `send` that's polled
+    /// again after the sleep wins: dropping it part way would leave the batch with some consumers
+    /// and not others (`Fanout`'s module doc).
+    ///
+    /// Both lines share `send_blocked`'s throttle: the recovered line follows only a blocked line
+    /// that reported, so a sink flapping a little past one interval logs at powers of two of its
+    /// episodes, not a pair per tick.
+    async fn send_watching_for_a_block(
+        &mut self,
+        send: impl std::future::Future<Output = bool>,
+        sink: &Fanout,
+    ) {
+        tokio::pin!(send);
+        let blocked_since = tokio::time::Instant::now();
+        tokio::select! {
+            biased;
+            _ = &mut send => return,
+            () = tokio::time::sleep(self.interval) => {}
+        }
+        let consumers = consumer_list(sink);
+        let reported = self.diag.warn_throttled(
+            "send_blocked",
+            format_args!(
+                "internal's send has been blocked for over one interval ({:?}) waiting on {consumers}; \
+                 no self-telemetry is drained until it completes",
+                self.interval
+            ),
+        );
+        send.await;
+        if reported {
+            let blocked = blocked_since.elapsed();
+            let intervals = blocked.as_secs_f64() / self.interval.as_secs_f64();
+            self.diag.warn_keyed(
+                "send_recovered",
+                format_args!(
+                    "internal's send to {consumers} recovered after blocking for {:.1}s \
+                     ({intervals:.1} intervals); the drain that follows covers the whole block",
+                    blocked.as_secs_f64()
+                ),
+            );
+        }
+    }
+}
+
+/// Names `sink`'s consumers as `'id' (kind)`, for the blocked-send warnings. `Fanout` doesn't
+/// record which consumer a send is parked on, so a fan-out lists them all.
+fn consumer_list(sink: &Fanout) -> String {
+    let named: Vec<String> =
+        sink.consumer_components().map(|(id, kind)| format!("'{id}' ({kind})")).collect();
+    match named.len() {
+        0 => "its consumers".to_string(),
+        1 => format!("consumer {}", named[0]),
+        _ => format!("one of its consumers {}", named.join(", ")),
     }
 }
 
@@ -856,5 +935,203 @@ mod tests {
 
         assert!(!handle.is_finished(), "run should keep ticking, not return on its own");
         handle.abort();
+    }
+
+    /// After a send blocked for many intervals, the ticker drains once and resumes its cadence
+    /// rather than firing every missed tick back to back.
+    #[tokio::test(start_paused = true)]
+    async fn after_a_long_blocked_send_the_ticker_drains_once_not_once_per_missed_tick() {
+        let registry = Registry::new();
+        let own = registry.telemetry_for("self", "internal", "listener");
+        let interval = Duration::from_secs(10);
+        // A live handle gauges uptime every tick, so no drain is empty.
+        let mut input = InternalInput::new(interval, registry, "test-host").with_telemetry(own);
+        let (tx, mut rx) = mpsc::channel(1);
+        let fanout = Fanout::new(vec![tx]);
+        let handle = tokio::spawn(async move { input.run(fanout).await });
+
+        tokio::task::yield_now().await;
+        // The first tick's batch takes the inbox's one slot; the second tick's send parks.
+        tokio::time::advance(interval).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(interval).await;
+        tokio::task::yield_now().await;
+        // Ten intervals pass with the send parked.
+        tokio::time::advance(interval * 10).await;
+        tokio::task::yield_now().await;
+
+        // Unblock, and count what arrives at this instant: the clock doesn't move from here.
+        let mut sent = 0;
+        for _ in 0..100 {
+            while rx.try_recv().is_ok() {
+                sent += 1;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(sent, 3, "the first batch, the parked one, and one catch-up drain");
+        handle.abort();
+    }
+
+    /// The second of two drains stamps its counters and timings with the first drain's time as
+    /// their start; a gauge carries none.
+    #[tokio::test]
+    async fn drained_counters_and_timings_start_at_the_previous_drain_and_a_gauge_has_none() {
+        let registry = Registry::new();
+        let component = registry.telemetry_for("statsd_in", "statsd_in", "listener");
+        let mut input = InternalInput::new(Duration::from_millis(1), registry, "test-host");
+        let (tx, mut rx) = mpsc::channel(2);
+        let fanout = Fanout::new(vec![tx]);
+
+        component.count("logit.input.datagrams", 1.0, &[]);
+        input.tick(Instant::now(), &fanout).await;
+        let first = batch_of(rx.try_recv().expect("the first drain should send a batch"));
+        let first_drain = first.events[0].timestamp;
+        assert_ne!(
+            first.events[0].metrics[0].start_timestamp, 0,
+            "the first drain's counter starts when the input did"
+        );
+
+        component.count("logit.input.datagrams", 1.0, &[]);
+        component.timing("logit.input.decode.duration", Duration::from_millis(1), &[]);
+        component.gauge("logit.input.queue.depth", 3.0, &[]);
+        input.tick(Instant::now(), &fanout).await;
+        let second = batch_of(rx.try_recv().expect("the second drain should send a batch"));
+
+        let starts: Vec<(&str, i64)> = second
+            .events
+            .iter()
+            .flat_map(|e| e.metrics.iter())
+            .map(|m| (logit_core::interner::resolve(m.name), m.start_timestamp))
+            .collect();
+        assert_eq!(starts.len(), 3, "{starts:?}");
+        for (name, start) in starts {
+            match name {
+                "logit.input.datagrams" | "logit.input.decode.duration" => {
+                    assert_eq!(
+                        start, first_drain,
+                        "{name} covers the interval since the first drain"
+                    )
+                }
+                "logit.input.queue.depth" => assert_eq!(start, 0, "a gauge has no start"),
+                other => panic!("unexpected point {other}"),
+            }
+        }
+        assert!(
+            second.events[0].timestamp >= first_drain,
+            "the point itself is stamped at the drain"
+        );
+    }
+
+    /// Self-log output rendered on this thread while the guard lives.
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Captured {
+        fn start() -> (Self, tracing::subscriber::DefaultGuard) {
+            let captured = Captured::default();
+            let writer = captured.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .finish();
+            (captured, tracing::subscriber::set_default(subscriber))
+        }
+
+        fn lines_with(&self, needle: &str) -> Vec<String> {
+            String::from_utf8_lossy(&self.0.lock().unwrap())
+                .lines()
+                .filter(|line| line.contains(needle))
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    const BLOCKED: &str = "blocked for over one interval";
+    const RECOVERED: &str = "recovered after blocking";
+
+    /// A `tick` whose send parks: `sink`'s one inbox slot is already taken. The spawned task
+    /// runs on the test's thread (`tokio::test` is single-threaded), so the caller's
+    /// `Captured` sees its log lines.
+    async fn spawn_blocked_tick(
+        interval: Duration,
+    ) -> (tokio::task::JoinHandle<()>, mpsc::Receiver<logit_pipeline::Delivered>) {
+        let registry = Registry::new();
+        registry.telemetry_for("statsd_in", "statsd_in", "listener").count(
+            "logit.input.datagrams",
+            1.0,
+            &[],
+        );
+        let sink = registry.telemetry_for("sink", "otlp_out", "sink");
+        let mut input = InternalInput::new(interval, registry, "test-host")
+            .with_diagnostics(Diagnostics::new("self"));
+        let (tx, rx) = mpsc::channel(1);
+        let fanout =
+            Fanout::from_edges(vec![logit_pipeline::fanout::Edge::new(tx).with_telemetry(sink)]);
+        let filler = EventBatch { resource: Arc::default(), scope: None, events: Vec::new() };
+        assert!(fanout.send(filler).await, "fills the inbox's one slot");
+        let handle = tokio::spawn(async move { input.tick(Instant::now(), &fanout).await });
+        tokio::task::yield_now().await;
+        (handle, rx)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_send_blocked_past_one_interval_warns_once_naming_its_consumer_and_not_before() {
+        let (captured, _guard) = Captured::start();
+        let interval = Duration::from_secs(10);
+        let (handle, mut rx) = spawn_blocked_tick(interval).await;
+
+        tokio::time::advance(interval - Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(captured.lines_with(BLOCKED).is_empty(), "not blocked a full interval yet");
+
+        tokio::time::advance(Duration::from_millis(2)).await;
+        tokio::task::yield_now().await;
+        let blocked = captured.lines_with(BLOCKED);
+        assert_eq!(blocked.len(), 1, "{blocked:?}");
+        assert!(blocked[0].contains("WARN"), "{}", blocked[0]);
+        assert!(blocked[0].contains("consumer 'sink' (otlp_out)"), "{}", blocked[0]);
+
+        tokio::time::advance(interval * 5).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            captured.lines_with(BLOCKED).len(),
+            1,
+            "once per blocked send, not per interval"
+        );
+
+        rx.try_recv().expect("the filler batch");
+        handle.await.expect("the tick should finish once the slot frees");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_blocked_send_warns_once_with_its_duration_when_it_recovers() {
+        let (captured, _guard) = Captured::start();
+        let interval = Duration::from_secs(10);
+        let (handle, mut rx) = spawn_blocked_tick(interval).await;
+
+        tokio::time::advance(interval * 3).await;
+        tokio::task::yield_now().await;
+        assert!(captured.lines_with(RECOVERED).is_empty(), "still blocked");
+
+        rx.try_recv().expect("the filler batch");
+        handle.await.expect("the tick should finish once the slot frees");
+        let recovered = captured.lines_with(RECOVERED);
+        assert_eq!(recovered.len(), 1, "{recovered:?}");
+        assert!(recovered[0].contains("WARN"), "{}", recovered[0]);
+        assert!(
+            recovered[0].contains("after blocking for 30.0s (3.0 intervals)"),
+            "{}",
+            recovered[0]
+        );
     }
 }

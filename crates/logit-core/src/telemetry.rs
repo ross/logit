@@ -246,6 +246,11 @@ impl Telemetry {
         self.buf.is_some()
     }
 
+    /// The id and kind of the component this handle records for, or `None` for a disabled handle.
+    pub fn component(&self) -> Option<(&str, &'static str)> {
+        self.buf.as_ref().map(|buf| (buf.id.as_str(), buf.kind))
+    }
+
     /// Whether [`Telemetry::span`] would record a span for `trace_id`: the verdict it reaches for
     /// this trace, so a caller can decide before it has a span to open. The native hop writes its
     /// trace field only for a trace this process records. A disabled handle samples nothing.
@@ -610,7 +615,10 @@ impl ComponentBuffer {
     /// with its capture time, never `now`**: `Event::timestamp` is a span's start
     /// (`SpanRecord`'s doc), and the drain time would make both look later by however long they
     /// sat here.
-    fn drain(&self, now: i64) -> Vec<Event> {
+    ///
+    /// A counter (a delta `Sum`) and a timing (a `Distribution`) cover `since..now`, so each gets
+    /// `since` as its `start_timestamp`; a gauge is a reading at `now` and gets none.
+    fn drain(&self, since: i64, now: i64) -> Vec<Event> {
         let points = {
             let mut points = self.points.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             std::mem::take(&mut *points)
@@ -645,12 +653,14 @@ impl ComponentBuffer {
             attrs.insert("component", self.id.as_str());
             attrs.insert("kind", self.kind);
             attrs.insert("role", self.role);
-            let kind = match pending {
-                Pending::Count(v) => MetricKind::counter(v),
-                Pending::Gauge(v) => MetricKind::gauge(v),
-                Pending::Timing(sketch) => MetricKind::Distribution(sketch),
+            let (kind, start) = match pending {
+                Pending::Count(v) => (MetricKind::counter(v), since),
+                Pending::Gauge(v) => (MetricKind::gauge(v), 0),
+                Pending::Timing(sketch) => (MetricKind::Distribution(sketch), since),
             };
-            events.push(Event::metric(now, attrs, MetricRecord::new(intern(key.name), kind)));
+            let mut record = MetricRecord::new(intern(key.name), kind);
+            record.start_timestamp = start;
+            events.push(Event::metric(now, attrs, record));
         }
         if dropped > 0 {
             let mut attrs = self.base_attrs();
@@ -658,10 +668,7 @@ impl ComponentBuffer {
             events.push(Event::metric(
                 now,
                 attrs,
-                MetricRecord::new(
-                    intern("logit.internal.points.dropped"),
-                    MetricKind::counter(dropped as f64),
-                ),
+                delta_counter("logit.internal.points.dropped", dropped, since),
             ));
         }
         for span in spans {
@@ -673,10 +680,7 @@ impl ComponentBuffer {
             events.push(Event::metric(
                 now,
                 attrs,
-                MetricRecord::new(
-                    intern("logit.internal.spans.dropped"),
-                    MetricKind::counter(spans_dropped as f64),
-                ),
+                delta_counter("logit.internal.spans.dropped", spans_dropped, since),
             ));
         }
         for log in logs {
@@ -702,14 +706,18 @@ impl ComponentBuffer {
             events.push(Event::metric(
                 now,
                 attrs,
-                MetricRecord::new(
-                    intern("logit.internal.logs.dropped"),
-                    MetricKind::counter(logs_dropped as f64),
-                ),
+                delta_counter("logit.internal.logs.dropped", logs_dropped, since),
             ));
         }
         events
     }
+}
+
+/// A drop counter's record: a delta over `since..` the drain, like a buffered count.
+fn delta_counter(name: &'static str, n: u64, since: i64) -> MetricRecord {
+    let mut record = MetricRecord::new(intern(name), MetricKind::counter(n as f64));
+    record.start_timestamp = since;
+    record
 }
 
 /// The process-wide set of component buffers, built once per run only when the config has an
@@ -765,10 +773,20 @@ impl Registry {
     /// a long blocked tick holds events hours apart, and a destination that requires a stream in
     /// time order (Loki) rejects an entry behind a newer one in the same batch. The sort is
     /// stable, so the points, all stamped `now`, stay grouped by component.
+    ///
+    /// Leaves every `start_timestamp` `0` (unknown). `internal` calls [`Registry::drain_since`]
+    /// instead; this form is for a caller that reads the values and never sends them on.
     pub fn drain(&self, now: i64) -> Vec<Event> {
+        self.drain_since(0, now)
+    }
+
+    /// [`Registry::drain`], with every counter and timing point's `start_timestamp` set to
+    /// `since`, the previous drain's `now`: each is a delta over `since..now`, OTLP's convention
+    /// for a delta point. A gauge keeps `0`.
+    pub fn drain_since(&self, since: i64, now: i64) -> Vec<Event> {
         // Clone the `Arc`s rather than hold the registry lock across each buffer's drain.
         let buffers = self.buffers.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
-        let mut events: Vec<Event> = buffers.iter().flat_map(|buf| buf.drain(now)).collect();
+        let mut events: Vec<Event> = buffers.iter().flat_map(|buf| buf.drain(since, now)).collect();
         events.sort_by_key(|event| event.timestamp);
         events
     }
