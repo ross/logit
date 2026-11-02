@@ -221,9 +221,8 @@ impl InternalInput {
     ///
     /// No tick runs while a send is parked, so the drain stalls and every point coalesces until
     /// it completes (`docs/design/internal-telemetry.md`'s "When the self sink blocks"). The pair
-    /// says so while it's happening. The sleep is raced against a pinned `send` that's polled
-    /// again after the sleep wins: dropping it part way would leave the batch with some consumers
-    /// and not others (`Fanout`'s module doc).
+    /// says so while it's happening. The `select!` is listed in
+    /// `docs/design/pipeline-graph.md`'s "Cancellation points" table.
     ///
     /// Both lines share `send_blocked`'s throttle: the recovered line follows only a blocked line
     /// that reported, so a sink flapping a little past one interval logs at powers of two of its
