@@ -343,7 +343,10 @@ ComponentKind::Internal { interval: Duration, span_sample_rate: f64, logs: Inter
    so after a long blocked tick one drain holds events hours apart, and a destination that
    requires a stream in time order (Loki) rejects an entry behind a newer one in the same batch.
    A tie keeps registration order, so the points, all stamped with the drain time, stay grouped by
-   component.
+   component. A counter or timing point also carries the previous drain's time as its
+   `start_timestamp` (the first drain's, the time `internal` started), so each is a delta over
+   the interval it covers, start to end as OTLP writes one. A gauge is a reading at the drain and
+   carries no start time.
 2. **Sampling tick for process-level metrics**, facts tied to no occurrence, so nothing else has a
    reason to push them: resident memory, CPU time, threads, open files, interner size, and uptime.
    See [Process-level metrics](#process-level-metrics).
@@ -399,6 +402,32 @@ clients count their own packets sent/dropped the same way. `logs.emitted` is cou
 `points.emitted` for the same reason `spans.emitted` is: a log event carries neither `metrics` nor
 `span`, so it would otherwise be miscounted as a point
 (`crates/logit-inputs/src/internal.rs::tick`'s fold checks `event.log.is_some()` first).
+
+### When the self sink blocks
+
+Each tick awaits its send, so when the sink behind `internal` has a full queue under
+`buffer.overflow: block`, the send parks and no tick runs until it completes. A blocked self sink
+stalls the drain:
+
+- The component buffers keep coalescing, so the drain that follows carries one point per key for
+  the whole block. A counter's delta covers the block, and its `start_timestamp` says so. A gauge
+  keeps only its last value.
+- Spans and logs past a component's cap are dropped and counted as
+  `logit.internal.spans.dropped` and `logit.internal.logs.dropped`.
+- A send still parked after one `interval` logs a `warn` naming `internal`'s consumers, and its
+  completion logs a second `warn` with the block's length in seconds and in intervals. Both reach
+  the pipeline under the default `logs: warn`. They share one throttle key, so a sink that keeps
+  blocking a little past one interval logs a pair at the 1st, 2nd, 4th, and later powers of two of its
+  episodes, not one per tick.
+- The ticker skips the ticks the block missed (`MissedTickBehavior::Delay`): one drain follows
+  the block, then the cadence resumes.
+
+`internal` keeps no queue of its own: the sink's buffer is the buffer. To keep the drain on its
+cadence through a destination outage, give `internal` a dedicated sink with
+`buffer.overflow: drop_newest`, or `buffer.disk:` when self-telemetry can't be lost.
+[`docs/deploying.md`](../deploying.md#give-internal-a-dedicated-pipeline) has the recipe and
+[ADR `internal-telemetry-as-pipeline-events`](../adr/internal-telemetry-as-pipeline-events.md)'s
+"Amendment: a blocked self sink stalls the drain" has the reasoning.
 
 ### Process-level metrics
 

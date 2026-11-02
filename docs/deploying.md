@@ -803,6 +803,29 @@ components:
     endpoint: http://collector:4318
 ```
 
+**Set the dedicated sink's `buffer.overflow` so a destination outage can't stall `internal`.**
+Under the default `block`, a full queue parks `internal`'s send, and no drain runs until it
+completes. Every point then coalesces across the outage: a counter's whole delta lands in one
+point, a gauge keeps only its last value, and spans and logs past each component's cap are
+dropped and counted. `internal` logs a `warn` once its send has been blocked for one `interval`,
+and another when it recovers, giving the block's length. It keeps no queue of its own, so choose
+what its sink does when full:
+
+- `drop_newest` keeps the batches from the outage's onset, usually the most diagnostic part, and
+  counts the rest as `logit.component.batches.dropped{reason="overflow_newest"}` on the sink. The
+  send never blocks, so the drain keeps its cadence.
+- `buffer.disk:` is for self-telemetry you can't lose. The spool holds the outage's batches up
+  to `disk.max_bytes`, then follows `overflow`.
+
+```yaml
+  self_out:
+    type: otlp_out
+    sources: [self]
+    endpoint: http://collector:4318
+    buffer:
+      overflow: drop_newest
+```
+
 A dedicated pipeline can have transforms, such as a `keep_signals` or an `aggregate`, between
 `internal` and its sinks. See [`docs/design/internal-telemetry.md`](design/internal-telemetry.md)
 and the [ADR `shutdown-accounting-and-cancellation-safety`](adr/shutdown-accounting-and-cancellation-safety.md)'s
