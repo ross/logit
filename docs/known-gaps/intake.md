@@ -161,20 +161,13 @@ Entry format and the other areas: [the known-gaps index](README.md).
   it.** Every datagram reconciles at shutdown: `logit.input.datagrams` equals the
   `receive.latency` sample count plus `datagrams.dropped` under every reason, `shutdown` included
   ([ADR `shutdown-accounting-and-cancellation-safety`](../adr/shutdown-accounting-and-cancellation-safety.md),
-  decision 1). Past that point the unit is events, and two event-level losses stay uncounted when
-  `run_input`'s backstop drops a listener still draining after `receive.shutdown_grace`:
-  - The events in the `BatchAccumulator` and the batch parked in `emit`'s `Fanout::send`. Their
-    datagrams already count as decoded, so the datagram contract still holds, but no event-level
-    counter records them.
-  - A batch cut off partway through `Fanout::deliver`. It sends to each consumer in turn, so a
-    drop mid-fan-out reaches a prefix of the consumers. The batch still counts as `batches.sent`
-    and `receive.flushed`, never as a drop, and the consumers after the prefix never see it.
-    `a_batch_cut_off_mid_fan_out_reaches_a_prefix_of_consumers`
-    (`crates/logit-inputs/src/udp.rs`) pins this.
-
-  Both need a downstream that stays full for the whole grace (5 s by default). Counting them would
-  need an event-level drop counter on the accumulator and a per-consumer delivery record in
-  `Fanout`, for a loss the grace already bounds.
+  decision 1). Past that point the unit is events. When `run_input`'s backstop drops a listener
+  still draining after `receive.shutdown_grace`, the batch parked in `emit`'s `Fanout::send` is
+  counted `batches.dropped`/`events.dropped{reason="shutdown"}`, a mid-fan-out cut included, but
+  the events in the `BatchAccumulator` stay uncounted. Their datagrams already count as decoded,
+  so the datagram contract still holds, but no event-level counter records them. It needs a
+  downstream that stays full for the whole grace (5 s by default). Counting them would need an
+  event-level drop counter on the accumulator, for a loss the grace already bounds.
 - **A UDP socket's kernel receive queue at the instant it closes is lost uncounted.** When the
   drain starts, the read loop returns at the shutdown signal and the socket closes at once, before
   the decode loop drains the queue in user space (`crates/logit-inputs/src/udp.rs`), so an

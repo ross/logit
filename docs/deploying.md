@@ -704,13 +704,14 @@ that recorded the point.
 | `shutdown signal received` | info | A SIGTERM/SIGINT arrived. |
 | `shutdown delay elapsed` | info | `shutdown.delay` has run out after a SIGTERM/SIGINT and the drain is starting. Carries `delay`. Not logged when the delay is `0s`, when the signal arrived before `ready`, or when a node failure started the drain first. |
 | `reopen signal received` | info | A SIGHUP arrived. Carries `generation` (SIGHUPs so far) and `config_reloaded=false`: the config isn't reloaded. Logged during a drain too. |
-| `drain complete` | info/warn | Every node has exited after a shutdown or failure — `warn` if any batch was dropped for shutdown. Its `batches_dropped` field sums `logit.component.batches.dropped{reason="shutdown"}` across sinks and Lua nodes. It doesn't include events refused as `closed_consumer`, UDP datagram drops, queue overflow evictions, or a disk sink's shutdown sweep failing to push. |
+| `drain complete` | info/warn | Every node has exited after a shutdown or failure — `warn` if any batch was dropped for shutdown. Its `batches_dropped` field sums `logit.component.batches.dropped{reason="shutdown"}` across sinks, Lua nodes, and listeners. It doesn't include events refused as `closed_consumer`, UDP datagram drops, queue overflow evictions, or a disk sink's shutdown sweep failing to push. |
 | `degraded` | warn | A sink's first dropped batch since it was last healthy. |
 | `retrying` | error | A sink's held head failed a retryable send; logged on the first failure, then at most once a minute while the head keeps failing. |
 | `recovered` | warn | A sink's first successful delivery after `degraded` or a retried failure. |
 | `buffer_full` | warn | A sink's buffer, or a datagram listener's receive queue, found no room for a push. Names the bound and the `overflow` policy; repeats at most once a minute while it stays full, with what was shed or how long intake has been held. On a sink with every send its `concurrency` allows in flight, it also names that concurrency and the last send's duration. |
 | `buffer_recovered` | warn | A full buffer's utilization fell below its `recover_below`. Carries the episode's duration and totals. |
 | `buffer_full_at_shutdown` | warn | A sink or listener stopped with its buffer still full. |
+| `shutdown_backstop` | warn | A listener didn't finish within its shutdown grace (`receive.shutdown_grace`, 5 s by default) and was stopped. Names the listener's kind and the grace. If the listener was waiting to send a batch downstream, the line says the batch was dropped, with its event count, and the batch is counted `batches.dropped`/`events.dropped{reason="shutdown"}`; otherwise it says no batch was in a send, and nothing is counted. A `tail_in`, `docker_in`, `cri_in`, or `kafka_in` restart reads that batch again from its checkpoint or committed offset. |
 | `telemetry left undrained at exit` | debug/warn | One line per internal metric point no `internal` drain exported, logged after every node has exited and before `exiting`, on exit `0` or `2` alike. `warn` for any nonzero `*.dropped` count, whatever its `reason`; `debug` for everything else, including timings and routine counts. Only with an `internal` component. |
 | `exiting` | info/error | The process is about to exit — `info` at `0`, `error` at any failure code (`1` or `2`). A config error that fails before the pipeline starts exits without this line. |
 
@@ -727,6 +728,9 @@ pipeline](#give-internal-a-dedicated-pipeline) exports every data node's shutdow
   carrying `internal`'s output records while it shuts down, at `warn` under that node's component
   id. That node shuts down after `internal`'s final drain, so no topology can export the count. `drain complete` includes it in
   `batches_dropped`.
+- `internal`'s own `batches.dropped` and `events.dropped{reason="shutdown"}`, at `warn`, when its
+  final send was still waiting on a full downstream at the end of its grace. That batch held the
+  telemetry the final drain took, and the `shutdown_backstop` line names it.
 
 A mixed pipeline, where `internal` shares a sink or transform with data, also leaves data drop
 counts here: that sink's `batches.dropped{reason="shutdown"}` and a UDP listener's
@@ -1328,8 +1332,10 @@ can't report the second number at all.
   deliver what's still queued. Datagrams still queued at that deadline are dropped and counted
   `logit.component.datagrams.dropped{reason="shutdown"}`
   ([ADR `shutdown-accounting-and-cancellation-safety`](adr/shutdown-accounting-and-cancellation-safety.md)).
-  Events already decoded at that deadline, in a batch still being assembled or one waiting for a
-  downstream inbox, are dropped uncounted.
+  A batch waiting for a downstream inbox at that deadline is dropped and counted
+  `logit.component.batches.dropped`/`events.dropped{reason="shutdown"}`, with a
+  `shutdown_backstop` warn. Events already decoded into a batch still being assembled are dropped
+  uncounted.
 
 ### Listener sizing and `SO_RCVBUF`
 

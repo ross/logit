@@ -15,7 +15,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
   waits on the downstream. Against a slow or stalled downstream, `run_input`'s grace backstop can
   drop the task first, with no final flush and no final checkpoint. Nothing is lost: the restart
   resumes from the last interval checkpoint, which lands between passes even under a backlog, so
-  it replays at most one `checkpoint_interval` or one 64 KiB chunk per file.
+  it replays at most one `checkpoint_interval` or one 64 KiB chunk per file. The batch an `emit`
+  was parked in still counts `batches.dropped{reason="shutdown"}`, because this process lost it
+  and only a restart replays it.
 - **A file removed or rotated out of every pattern before `tail_in` read it to its end, at a stop
   or while `tail_in` is down, loses its unread tail, and the loss is counted only as far as the
   last checkpoint knew.** The checkpoint records the file's inode, offset, and length, but the

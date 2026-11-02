@@ -62,6 +62,7 @@ use logit_core::interner::intern;
 use logit_core::random_id_bytes;
 use logit_core::telemetry::Timer;
 use logit_core::{EventBatch, Provenance, SpanKind, Symbol, Telemetry};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
@@ -312,6 +313,46 @@ pub struct Fanout {
     /// path. `None` (a `Fanout` built without `with_component`, as tests do) makes stamping inert:
     /// provenance passes through unchanged.
     component: Option<Symbol>,
+    /// Set only on a listener's `Fanout`, so `run_input` can tell whether the grace backstop
+    /// dropped a send. Every other node pays a `None` check per send.
+    in_flight: Option<SendsInFlight>,
+}
+
+/// The sends in flight on a listener's [`Fanout`] and its clones, which a listener's connection
+/// tasks share: one word, the batch count in the high 24 bits and their events in the low 40, so
+/// a send costs one `fetch_add` and one `fetch_sub`. A send leaves the word when it returns or
+/// when its future is dropped, so a reader sees a cancelled send only before the future that
+/// holds it drops (`run_input` reads it with the listener's future still alive).
+#[derive(Clone, Default)]
+pub struct SendsInFlight(Arc<AtomicU64>);
+
+const EVENTS_BITS: u32 = 40;
+const EVENTS_MASK: u64 = (1 << EVENTS_BITS) - 1;
+
+impl SendsInFlight {
+    /// The batches and events in sends that haven't returned.
+    pub fn load(&self) -> (u64, u64) {
+        let word = self.0.load(Ordering::Relaxed);
+        (word >> EVENTS_BITS, word & EVENTS_MASK)
+    }
+
+    fn enter(&self, n: usize) -> InFlight<'_> {
+        let add = (1 << EVENTS_BITS) | (n as u64).min(EVENTS_MASK);
+        self.0.fetch_add(add, Ordering::Relaxed);
+        InFlight { word: &self.0, add }
+    }
+}
+
+/// One send's share of [`SendsInFlight`], removed on drop.
+struct InFlight<'a> {
+    word: &'a AtomicU64,
+    add: u64,
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.word.fetch_sub(self.add, Ordering::Relaxed);
+    }
 }
 
 impl Fanout {
@@ -322,7 +363,7 @@ impl Fanout {
 
     /// A `Fanout` over edges that each carry their consumer's telemetry handle.
     pub fn from_edges(edges: Vec<Edge>) -> Self {
-        Self { consumers: edges, telemetry: Telemetry::default(), component: None }
+        Self { consumers: edges, telemetry: Telemetry::default(), component: None, in_flight: None }
     }
 
     /// Attaches the producing component's telemetry handle.
@@ -336,6 +377,17 @@ impl Fanout {
     pub fn with_component(mut self, id: &str) -> Self {
         self.component = Some(intern(id));
         self
+    }
+
+    /// Tracks every async send on this `Fanout` and its clones in `in_flight`.
+    pub fn with_sends_in_flight(mut self, in_flight: SendsInFlight) -> Self {
+        self.in_flight = Some(in_flight);
+        self
+    }
+
+    /// Enters `n` events into [`SendsInFlight`] until the returned guard drops, when tracked.
+    fn in_flight(&self, n: usize) -> Option<InFlight<'_>> {
+        self.in_flight.as_ref().map(|t| t.enter(n))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -429,6 +481,7 @@ impl Fanout {
         let ctx = self.stamp(ctx);
         let Some((last, rest)) = self.consumers.split_last() else { return false };
         let n = batch.events.len();
+        let _in_flight = self.in_flight(n);
         self.record_send(n);
         let timer = self.telemetry.timer("logit.component.send.blocked.duration");
         let taken = self.offer_shared(rest, last, batch, ctx, n).await;
@@ -469,6 +522,7 @@ impl Fanout {
         if self.consumers.is_empty() {
             return Ok(false);
         }
+        let _in_flight = self.in_flight(batch.events.len());
         let timer = self.telemetry.timer("logit.component.send.blocked.duration");
         // Until every slot is held, a timeout or a dropped future discards both unrecorded.
         let mut unsent = Unsent(Some((span, timer)));
@@ -551,6 +605,7 @@ impl Fanout {
         if self.consumers.is_empty() {
             return Ok(false);
         }
+        let _in_flight = self.in_flight(batch.events.len());
         if reservation.blocked.is_none() {
             reservation.blocked =
                 Some(self.telemetry.timer("logit.component.send.blocked.duration"));
@@ -650,6 +705,7 @@ impl Fanout {
     async fn deliver(&self, batch: EventBatch, ctx: BatchContext) -> bool {
         let Some((last, rest)) = self.consumers.split_last() else { return false };
         let n = batch.events.len();
+        let _in_flight = self.in_flight(n);
         self.record_send(n);
         let timer = self.telemetry.timer("logit.component.send.blocked.duration");
         if rest.is_empty() {

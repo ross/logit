@@ -9,7 +9,7 @@
 //! `docs/design/pipeline-graph.md`'s "Cancellation points" table: what each losing arm drops, and
 //! why that loses nothing or what counts it.
 
-use crate::fanout::{BatchContext, Delivered, TraceContext};
+use crate::fanout::{BatchContext, Delivered, SendsInFlight, TraceContext};
 use crate::graph::{Graph, Role};
 use crate::output::{classify, is_head_only, is_retryable, DeliveryPosture, Fault, HeadOnly};
 #[cfg(test)]
@@ -395,6 +395,8 @@ pub async fn run_with_options(
                     fanout,
                     shutdown_rx_for(&id),
                     input_config.shutdown_grace,
+                    node_telemetry,
+                    shutdown_dropped_batches.clone(),
                 ));
                 node_ids.insert(handle.id(), id.clone());
                 stages.spawned(&id, &waiting_tx);
@@ -635,6 +637,10 @@ pub async fn run_with_options(
 /// an override still working at the deadline is cancelled by drop, a loss now bounded by
 /// `shutdown_grace`.
 ///
+/// When the backstop wins, the listener's future is still alive, so its [`SendsInFlight`] still
+/// holds any send it was parked in. That send's batch is lost with the future: it's logged with
+/// the `shutdown_backstop` warn and counted as [`count_shutdown_drop`] counts a sink's.
+///
 /// `biased`, input arm first; `unconstrained` backstop: see `docs/design/pipeline-graph.md`'s
 /// "Cancellation points".
 async fn run_input(
@@ -643,16 +649,44 @@ async fn run_input(
     fanout: Fanout,
     mut shutdown: watch::Receiver<bool>,
     shutdown_grace: Duration,
+    telemetry: Telemetry,
+    shutdown_dropped_batches: Arc<AtomicU64>,
 ) -> anyhow::Result<()> {
+    let in_flight = SendsInFlight::default();
+    let fanout = fanout.with_sends_in_flight(in_flight.clone());
     let deadline = std::sync::OnceLock::new();
+    // `async_trait` boxes the future, so `drop(running)` below drops the listener.
+    let mut running = input.run_until_shutdown(fanout, shutdown.clone());
     tokio::select! {
         biased;
-        result = input.run_until_shutdown(fanout, shutdown.clone())
-            => result.with_context(|| format!("component '{id}'")),
+        result = &mut running => return result.with_context(|| format!("component '{id}'")),
         () = tokio::task::unconstrained(
             shutdown_grace_expired(&mut shutdown, &deadline, shutdown_grace),
-        ) => Ok(()),
+        ) => {}
     }
+    let (batches, events) = in_flight.load();
+    drop(running);
+    let kind = telemetry.component().map_or("unknown", |(_, kind)| kind);
+    let diag = Diagnostics::new(id.clone());
+    if batches == 0 {
+        diag.warn_keyed(
+            "shutdown_backstop",
+            format!(
+                "{kind} didn't finish within its shutdown grace ({shutdown_grace:?}) and was \
+                 stopped; no batch was in a send"
+            ),
+        );
+    } else {
+        count_shutdown_drop(&telemetry, &shutdown_dropped_batches, batches, events);
+        diag.warn_keyed(
+            "shutdown_backstop",
+            format!(
+                "{kind} didn't finish within its shutdown grace ({shutdown_grace:?}) and was \
+                 stopped; dropped {batches} batch(es) ({events} event(s)) it was sending"
+            ),
+        );
+    }
+    Ok(())
 }
 
 /// A sink node's drain-and-deliver pair, decoupled through a [`SinkStore`]
@@ -812,8 +846,8 @@ const SWEEP_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 /// Counts `batches` batches (`events` events) dropped for shutdown: the only site that counts
 /// `batches.dropped`/`events.dropped{reason="shutdown"}` and the only one that adds to
 /// `drain_total`, the sum the `drain complete` log reports (`run_with_telemetry`). Callers:
-/// `run_output`'s sweep, [`finish_and_flush`], [`write_loop`]'s grace-cut send, and
-/// [`revoke_lua_io`].
+/// `run_output`'s sweep, [`finish_and_flush`], [`write_loop`]'s grace-cut send,
+/// [`revoke_lua_io`], and [`run_input`]'s backstop.
 fn count_shutdown_drop(telemetry: &Telemetry, drain_total: &AtomicU64, batches: u64, events: u64) {
     if batches == 0 {
         return;
@@ -4296,6 +4330,8 @@ mod tests {
             fanout,
             shutdown_rx,
             huge_grace,
+            Telemetry::default(),
+            Arc::new(AtomicU64::new(0)),
         ));
 
         // Let the spawned task start and park inside the default `run_until_shutdown`'s `select!`.
@@ -4331,7 +4367,9 @@ mod tests {
             Box::new(DrainingInput { drain_for: Duration::from_secs(2), batch: Some(batch) }),
             fanout,
             shutdown_rx,
-            Duration::from_secs(10), // grace comfortably longer than the 2s drain
+            Duration::from_secs(10), // grace comfortably longer than the 2s drain,
+            Telemetry::default(),
+            Arc::new(AtomicU64::new(0)),
         ));
 
         tokio::task::yield_now().await;
@@ -4360,6 +4398,8 @@ mod tests {
             fanout,
             shutdown_rx,
             grace,
+            Telemetry::default(),
+            Arc::new(AtomicU64::new(0)),
         ));
 
         tokio::task::yield_now().await;
@@ -4387,6 +4427,8 @@ mod tests {
             fanout,
             shutdown_rx,
             Duration::from_secs(60),
+            Telemetry::default(),
+            Arc::new(AtomicU64::new(0)),
         ));
         tokio::task::yield_now().await;
         shutdown_tx.send(true).expect("receiver should still be alive");
@@ -4410,12 +4452,116 @@ mod tests {
             fanout,
             shutdown_rx,
             Duration::from_secs(60),
+            Telemetry::default(),
+            Arc::new(AtomicU64::new(0)),
         )
         .await
         .expect_err("should propagate the input's own error");
         let message = format!("{err:#}");
         assert!(message.contains("component 'bad'"), "got: {message}");
         assert!(message.contains("boom"), "got: {message}");
+    }
+
+    /// On shutdown, sends each of `batches` in turn, then returns.
+    struct SendOnShutdownInput {
+        batches: Vec<EventBatch>,
+    }
+
+    #[async_trait::async_trait]
+    impl Input for SendOnShutdownInput {
+        async fn run(&mut self, _sink: Fanout) -> anyhow::Result<()> {
+            std::future::pending::<()>().await;
+            unreachable!("pending() never resolves")
+        }
+
+        async fn run_until_shutdown(
+            &mut self,
+            sink: Fanout,
+            mut shutdown: watch::Receiver<bool>,
+        ) -> anyhow::Result<()> {
+            let _ = shutdown.wait_for(|&due| due).await;
+            for batch in self.batches.drain(..) {
+                sink.send(batch).await;
+            }
+            Ok(())
+        }
+    }
+
+    fn batch_of(n: usize) -> EventBatch {
+        EventBatch {
+            resource: Arc::new(Resource::default()),
+            scope: None,
+            events: (0..n).map(|_| counter_event("hits", 1.0)).collect(),
+        }
+    }
+
+    /// What `run_input` reported for `input` under a 5 s grace into a one-slot inbox nobody
+    /// reads: its `shutdown_backstop` lines, the listener's `batches.dropped` and
+    /// `events.dropped{reason="shutdown"}`, and the runtime's shutdown tally.
+    async fn backstop_report(
+        input: Box<dyn Input + Send>,
+    ) -> (Vec<(tracing::Level, String)>, f64, f64, u64) {
+        let (lines, _guard) = crate::buffer_full::test_support::capture();
+        let (tx, _rx) = mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut probe = TelemetryProbe::new();
+        let tally = Arc::new(AtomicU64::new(0));
+        let handle = tokio::spawn(run_input(
+            "in".to_string(),
+            input,
+            Fanout::new(vec![tx]),
+            shutdown_rx,
+            Duration::from_secs(5),
+            probe.telemetry("in", "statsd_in", "input"),
+            tally.clone(),
+        ));
+        tokio::task::yield_now().await;
+        shutdown_tx.send(true).expect("receiver should still be alive");
+        handle.await.expect("task should not panic").expect("the backstop resolves Ok");
+        let shutdown = [("reason", "shutdown")];
+        (
+            lines.with_key("shutdown_backstop"),
+            probe.sum("logit.component.batches.dropped", &shutdown),
+            probe.sum("logit.component.events.dropped", &shutdown),
+            tally.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// The second batch parks on the full inbox, and the backstop drops it with the future.
+    #[tokio::test(start_paused = true)]
+    async fn a_listener_parked_in_a_send_at_the_backstop_logs_and_counts_its_batch() {
+        let input = SendOnShutdownInput { batches: vec![batch_of(1), batch_of(3)] };
+        let (lines, batches, events, tally) = backstop_report(Box::new(input)).await;
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0].0, tracing::Level::WARN);
+        assert_eq!(
+            lines[0].1,
+            "statsd_in didn't finish within its shutdown grace (5s) and was stopped; dropped 1 \
+             batch(es) (3 event(s)) it was sending"
+        );
+        assert_eq!((batches, events, tally), (1.0, 3.0, 1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_listener_stopped_by_the_backstop_outside_a_send_logs_and_counts_nothing() {
+        let input = DrainingInput { drain_for: Duration::from_secs(3600), batch: None };
+        let (lines, batches, events, tally) = backstop_report(Box::new(input)).await;
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0].0, tracing::Level::WARN);
+        assert_eq!(
+            lines[0].1,
+            "statsd_in didn't finish within its shutdown grace (5s) and was stopped; no batch was \
+             in a send"
+        );
+        assert_eq!((batches, events, tally), (0.0, 0.0, 0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_listener_finishing_within_its_grace_logs_and_counts_nothing() {
+        let input = DrainingInput { drain_for: Duration::from_secs(2), batch: Some(batch_of(1)) };
+        let (lines, batches, events, tally) = backstop_report(Box::new(input)).await;
+        assert!(lines.is_empty(), "{lines:?}");
+        assert_eq!((batches, events, tally), (0.0, 0.0, 0));
     }
 
     /// A single-consumer `Fanout` delivers `Delivered::Owned`, never an `Arc`.
@@ -10305,6 +10451,8 @@ mod tests {
             Fanout::new(vec![tx]),
             shutdown_rx,
             grace,
+            Telemetry::default(),
+            Arc::new(AtomicU64::new(0)),
         ));
         tokio::task::yield_now().await;
         shutdown_tx.send(true).unwrap();
@@ -10357,6 +10505,8 @@ mod tests {
                 Fanout::new(vec![tx]),
                 shutdown_rx,
                 grace,
+                Telemetry::default(),
+                Arc::new(AtomicU64::new(0)),
             ));
             tokio::task::yield_now().await;
             shutdown_tx.send(true).unwrap();

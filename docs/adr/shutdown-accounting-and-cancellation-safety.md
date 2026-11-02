@@ -1,6 +1,6 @@
 ---
 created: 2026-09-26
-updated: 2026-10-29
+updated: 2026-11-02
 ---
 
 # Shutdown accounting and cancellation safety: every shutdown loss counted, and one table of cancellation points
@@ -672,3 +672,42 @@ to a script error is new loss under `events.dropped{reason="script_error"}` and 
 Under [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md), `logit.input.datagrams.truncated` is removed. The UDP read side counts a datagram
 the kernel truncated as `logit.component.datagrams.dropped{reason="truncated"}` and never queues
 it, so it now appears in the sum this record describes, as one more reason.
+
+## Amendment: the listener backstop logs and counts a dropped send (2026-11-02)
+
+Decision 1 named two backstop losses as uncounted exceptions: a UDP listener's batch parked in
+`emit`'s `Fanout::send`, and a batch cut off mid-`Fanout::deliver`. The Consequences listed a
+third, `internal`'s drained batch parked in its send. All three are one case, and it reaches every
+listener: `run_input`'s backstop drops a future parked in a `Fanout` send, and that send's batch
+goes with it. These decisions close that case, continuing the numbering above.
+
+17. **A listener's `Fanout` records its sends in flight.** `run_input` gives each listener's
+    `Fanout` a `SendsInFlight`, one atomic word shared by its clones: the batch count in the high
+    24 bits and their events in the low 40. Each async send adds its batch on entry and removes
+    it when it returns or its future drops, one `fetch_add` and one `fetch_sub`. Every other
+    node's `Fanout` carries none and pays a `None` check per send.
+18. **The backstop reads the word before it drops the listener.** `run_input` keeps the
+    listener's future pinned outside its `select!`, so when the backstop wins, a parked send still
+    holds its entry. `run_input` reads the word, then drops the future.
+19. **Every backstop stop logs `shutdown_backstop` at `warn`**, naming the listener's id and kind
+    and its grace, never its config. With a send in flight, the line names the batches and events
+    dropped, and `count_shutdown_drop` counts them under the listener's id as
+    `batches.dropped`/`events.dropped{reason="shutdown"}`. They join decision 2's
+    `shutdown_dropped_batches`, so `drain complete`'s `batches_dropped` includes them. With none,
+    the line says no batch was in a send, and nothing is counted.
+
+The name and reason are the ones a sink and a Lua node already count for a batch shutdown cut
+off, so an operator who alerts on `batches.dropped{reason="shutdown"}` sees a listener's too.
+
+Consequences:
+
+- The batch still counts `batches.sent`, which `Fanout` records before it awaits a consumer, and a
+  fan-out cut partway reached a prefix of its consumers. Both counts are true: the listener sent
+  the batch, and shutdown dropped it before every consumer had it.
+- `internal`'s drop lands after its final drain, so a dedicated pipeline never exports it. The
+  exit summary logs it at `warn` as `telemetry left undrained at exit` (decision 16).
+- A tailing listener and `kafka_in` read the batch again after a restart, from the last
+  checkpoint or committed offset. The count still records it, because this process lost it.
+- The UDP listener's events still in its `BatchAccumulator` stay uncounted
+  (`docs/known-gaps/intake.md`). So does a send dropped by `Input::run_until_shutdown`'s default
+  at the signal, which isn't the backstop (`docs/known-gaps/runtime.md`).
