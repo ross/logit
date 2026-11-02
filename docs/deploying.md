@@ -3335,15 +3335,23 @@ distinguishes.
 ### Sending logs to Loki
 
 `logit` promises no timestamp order within a batch or across batches. Loki drops a log entry more
-than half its `max_chunk_age` (one hour by default) behind the newest entry it accepted for the
-stream, and `otlp_out` counts the whole request dropped
+than half its `max_chunk_age` (two hours by default, so one hour) behind the newest entry it
+accepted for the stream and stores the rest, and `otlp_out` counts the whole request dropped, so
+the counter overstates the loss
 ([ADR `sink-request-concurrency`](adr/sink-request-concurrency.md#amendment-loki-rejects-a-late-log-batch-2026-11-01)).
-Loki builds a stream's labels from the resource attributes it indexes (`service.name` among them),
-so give each producer its own stream: one input per producer, each followed by a `set` of an
-indexed resource attribute. Keep `concurrency` at 1, and keep arrival time (no `timestamp`
-transform) on a listener that mixes senders with skewed clocks. The
-[known-gaps entry](known-gaps/runtime.md#pipeline-runtime-and-graph) on timestamp order lists
-which inputs disorder a batch.
+To keep entries inside that window:
+
+- Give each producer its own stream: one input per producer, each followed by a `set` of a
+  resource attribute Loki indexes as a label. An attribute Loki doesn't index lands in structured
+  metadata and doesn't split the stream. `set` overwrites what the wire carried, so on an
+  `otlp_in` or `datadog_in` leg pick an indexed attribute the producer doesn't set, not its
+  `service.name`.
+- Keep `otlp_out`'s `concurrency` at 1.
+- On a listener that mixes senders with skewed clocks, keep arrival time: no `timestamp`
+  transform ahead of Loki.
+
+The [known-gaps entry](known-gaps/runtime.md#pipeline-runtime-and-graph) on timestamp order lists
+which inputs build a batch out of order.
 
 ## `datadog_in`: standing in for Datadog's intake
 
