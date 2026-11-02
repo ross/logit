@@ -71,10 +71,14 @@
 //! batch's calls share one HTTP/2 connection as concurrent streams. Over HTTP they do too when the
 //! endpoint is `https://` and the server picks h2 through ALPN; otherwise they open up to
 //! `concurrency` connections. Batches can land out of order.
-//! Spans are stored as received. Logs sent to Loki can reach it out of order for one stream, and
-//! Loki rejects each entry more than half its `max_chunk_age` (one hour by default) behind the
-//! newest it accepted for that stream ("entry too far behind"), so a batch wholly behind that
-//! line is lost.
+//! Spans are stored as received. Logs sent to Loki can reach it out of order for one stream.
+//! Loki drops each entry more than half its `max_chunk_age` (which defaults to two hours) behind
+//! the newest entry it accepted for that stream ("entry too far behind"), stores the rest, and
+//! answers `400`. The sink reads that as `Rejected` and counts every log record in the request
+//! under `logit.output.records.dropped{signal="logs", reason="rejected"}`, the kept ones included,
+//! so the counter overstates the loss. Up to `concurrency` consecutive batches are in flight
+//! together and any can land after any other, so keep it at 1 ahead of Loki unless the log
+//! timestamps of any `concurrency` consecutive batches stay inside that window.
 //! Metrics sent to a Prometheus-backed receiver can reach it out of timestamp order for one
 //! series, which a receiver without an out-of-order window rejects;
 //! [`crate::prometheus`]'s "Concurrency" table says which receivers accept it.

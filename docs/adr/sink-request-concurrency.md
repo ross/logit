@@ -332,7 +332,11 @@ them.
 
 ## Amendment: Loki rejects a late log batch (2026-11-01)
 
-The `otlp_out` row's "Logs and traces: safe" holds for traces only. Loki rejects each log entry
-more than half its `max_chunk_age` (one hour by default) behind the newest entry it accepted for
-the stream, so above 1 a batch that lands behind a newer one across a longer gap is lost. Keep
-`concurrency` at 1 ahead of Loki unless adjacent batches stay inside that window.
+The `otlp_out` row's "Logs and traces: safe" holds for traces only. Loki drops each log entry
+more than half its `max_chunk_age` (which defaults to two hours) behind the newest entry it
+accepted for the stream, stores the rest, and answers `400`. The sink reads that as `Rejected` and
+counts every log record in the request under
+`logit.output.records.dropped{signal="logs", reason="rejected"}`, the kept ones included, so the
+counter overstates the loss. Up to `concurrency` consecutive batches are in flight together and
+any can land after any other. Keep `concurrency` at 1 ahead of Loki unless the log timestamps of
+any `concurrency` consecutive batches stay inside that window.
