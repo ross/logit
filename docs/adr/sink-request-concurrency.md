@@ -75,6 +75,12 @@ accepts an older sample after a newer one:
 | `otlp_out` | Logs and traces: safe. Metrics into a Prometheus-backed receiver: as remote write. |
 | `prometheus_out` remote write | Both specs require one series' samples in timestamp order. A receiver with no out-of-order window answers `400`, the sink reads `Rejected`, and the batch drops ([`docs/deploying.md`](../deploying.md)'s remote-write sender notes). Which receivers accept out-of-order samples, and under what setting, is the receiver table in `crates/logit-outputs/src/prometheus.rs`'s module doc, "Concurrency". |
 
+Amendment (2026-11-01): the `otlp_out` row's "Logs and traces: safe" holds for traces only. Loki
+rejects a log entry more than half its `max_chunk_age` (one hour by default) behind the newest
+entry it accepted for the stream, so above 1 a batch that lands behind a newer one across a longer
+gap drops whole. Keep `concurrency` at 1 ahead of Loki unless adjacent batches stay inside that
+window.
+
 A single chain into one `prometheus_out` can't draw an out-of-order `400` today, because
 batches leave in order. Concurrency would turn that chain into the fan-in case those notes
 describe.
