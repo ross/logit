@@ -2862,9 +2862,12 @@ class Ledger:
         stop, restart, or `exit` ended emits each file's unterminated line at shutdown and the
         rest of it after the restart, one line more per file it had open
         (`logit.input.files.open` at its last drain), above (docs/known-gaps/tailing.md's
-        split-line entry). A life whose shutdown backstop cut a tailer's send, which the
-        tailer's checkpoint never passed, counts that batch in Q, and the next life reads it
-        again: Q at `batch_max_events`, above (`deferred`). The final life adds nothing.
+        split-line entry). A life whose shutdown backstop cut a tailer's send counts that batch in
+        Q, and the cut also keeps the tailer from writing its shutdown checkpoint, so the next
+        life reads again the batch and everything read since the last periodic checkpoint: Q at
+        `batch_max_events` (`deferred`) plus a killed life's allowance above, its rate taken
+        from the life's peak drain interval, since a tailer parked on a full inbox reads nothing
+        in its last ones. The final life adds nothing.
 
         A `cri_in` listener keeps one checkpoint position per file, pinned at a held `P` run's
         first record while it waits for its `F` or for `partial_timeout`, and the other
@@ -2963,11 +2966,39 @@ class Ledger:
                 lines.append(f"life {life} (stopped): [0, +{files}]: one split line per file "
                              f"open at its last drain")
             deferred = self.deferred(life, listeners)
-            if deferred:
+            if deferred and life in inn.killed:
                 high += deferred
                 lines.append(f"life {life}: [0, +{_n(deferred)}]: "
                              f"{self.deferred_text(life, listeners, 'lines')}, a send the "
                              "shutdown backstop cut that the checkpoint never passed")
+            elif deferred:
+                # The backstop drops the tailer before its shutdown checkpoint, so the next life
+                # also reads again what this one read since its last periodic checkpoint, as
+                # after a kill. A parked tailer reads nothing, so the rate is the life's peak
+                # drain interval's, from before the stall.
+                checkpoint = max((component_duration(text, listener, "checkpoint_interval")
+                                  or DEFAULT_TAIL_CHECKPOINT_INTERVAL_S)
+                                 for listener in listeners)
+                read = {}
+                for listener in listeners:
+                    for ts, v, point_life in self.ingress.counter_points(
+                            self.wires[listener].w, component=listener):
+                        if point_life == life:
+                            read[ts] = read.get(ts, 0) + v
+                peak = max((read.get(b, 0) / (b - a) for a, b in zip(drains, drains[1:])
+                            if b > a), default=0.0)
+                reread = round(peak * checkpoint) if gaps else last
+                chunks = chunk_lines * TAIL_REPLAY_FILES * len(listeners)
+                above = deferred + reread + chunks
+                high += above
+                lines.append(f"life {life}: [0, +{_n(above)}]: "
+                             f"{self.deferred_text(life, listeners, 'lines')}, a send the "
+                             "shutdown backstop cut that the checkpoint never passed, and the "
+                             "reads since the last checkpoint, which the cut kept from being "
+                             f"written: {_n(reread)} lines, {peak:,.0f} lines/s at the life's "
+                             f"peak drain interval x a {checkpoint:g}s checkpoint_interval, plus "
+                             f"{TAIL_REPLAY_FILES} file(s) x one 64 KiB read of "
+                             f"{_n(chunk_lines)} lines")
         if cri and dangles is None:
             lines.append(f"no dangle log ({SHARED_DIR}/{criwriter.DANGLE_LOG}), so every "
                          "stopped and killed life takes the pin's cap")
@@ -3281,10 +3312,13 @@ class Ledger:
 
         With one SUT the listeners' drops are left out too: X takes their events out of the
         residual, so none can explain the gap, and a send the shutdown backstop cut would
-        otherwise excuse a stopped life's uncounted loss."""
+        otherwise excuse a stopped life's uncounted loss. With a hop the far `logit_in`'s are
+        left out: a frame its backstop cut stays unacknowledged, and `logit_out` resends it."""
         others = self._others(sinks)
         if self.hop is None:
             others |= set(self.listeners)
+        elif self.hop.get("listener"):
+            others.add(self.hop["listener"])
         return self._drops(life, lambda component: component not in others)
 
     def cued_rejections(self, life, sinks):
@@ -3671,9 +3705,14 @@ def _wire_buckets(data, led, source, combined=None, anchors_out=None):
         if wire_name == HTTP_WIRE:
             # A batch the listener sent and answered `503` for, every consumer having closed,
             # is in W and its events in X, and the client still holds it, so G never counts it.
+            # A request the shutdown backstop cut was never in W, and its client resends it, so
+            # its `shutdown` drops stay out, as they do from X (`HTTP_LISTENERS`).
             for ts, value, _ in sut.counter_points("logit.component.events.dropped",
                                                    component=listener):
                 counts[ts] = counts.get(ts, 0) - value
+            for ts, value, _ in sut.counter_points("logit.component.events.dropped",
+                                                   component=listener, reason="shutdown"):
+                counts[ts] = counts.get(ts, 0) + value
         drains = sorted(set(sut.drains) | set(counts))
         sut_starts = led.inn.life_starts
         previous = sut_starts[0] if sut_starts else (drains[0] if drains else 0)

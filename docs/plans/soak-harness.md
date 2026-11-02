@@ -1113,7 +1113,7 @@ and takes the worst status; `report.py` is unchanged.
 | F | per listener, SUT `logit.input.frames.dropped`: on a TCP wire (W11a) under the framer's reasons, `truncated`, `oversize`, `drained`, and `malformed`; on a file wire (W11b) under `oversize` and `truncated`; on a `cri` wire under `oversize`, `truncated`, and `malformed`; else 0 |
 | D | per listener, SUT `logit.component.datagrams.dropped` under every reason, from telemetry; the listener's stderr shutdown lines only cross-check its `shutdown` part, and a killed life counts none |
 | B | per listener, SUT `logit.input.messages.dropped{reason=malformed}` plus `logit.input.frames.dropped{reason=undecodable}` plus `logit.input.frames.dropped{reason=oversize}` (W8b): a line the decoder refused, a datagram it refused whole, and a line over `lines_in`'s `max_line_bytes`, which its decoder drops with a throttled diagnostic and no decoder error. Each is 0 on a listener with no such rule. On a Kafka wire, `logit.input.records.dropped` and `logit.input.records.skipped` under every reason, the client's own drops (`corrupt`, `oversize`, `legacy_format`, `retention`, `aborted`) included |
-| Q | on a Kafka wire, per listener, SUT `logit.input.batches.deferred`: batches deferred at a revoke or shutdown, each in W, in neither E nor B, and read again, up to `batch_max_events` records each. On a file or `cri` wire, the batches the shutdown backstop cut out of a tailer's send with a `checkpoint_path`, each in W and E, never in A, and read again by the next life, up to `batch_max_events` lines each; else 0 |
+| Q | on a Kafka wire, per listener, SUT `logit.input.batches.deferred`: batches deferred at a revoke or shutdown, each in W, in neither E nor B, and read again, up to `batch_max_events` records each. On a file or `cri` wire, the batches the shutdown backstop cut out of a tailer's send with a `checkpoint_path`, each in W and E, never in A, and read again by the next life, up to `batch_max_events` lines each, with the reads since the last periodic checkpoint, which the cut kept the tailer from passing, as after a kill; else 0 |
 | E | per listener, SUT `logit.component.events.sent{component=<sut_listener>}` |
 | X | per listener, SUT `logit.component.events.dropped{component=<sut_listener>}` under every reason (W7a): events the listener counted as sent and then dropped, such as a batch sent into the inbox of a node that has failed (`closed_consumer`), or one the shutdown backstop cut out of its send (`shutdown`). On an HTTP wire, less `shutdown`: a cut request was never counted sent, and its client resends it |
 | Y | on a scrape wire (W25), per listener, 3 × SUT `logit.input.scrapes{component=<sut_listener>}` under every class: the synthetic samples E counts and W leaves out; else 0 |
@@ -1438,7 +1438,8 @@ The rows:
   line per life, a failed identity first;
   a killed life is reported unjudged, and a listener whose kind the SUT config doesn't give is
   reported. Under `split = "target"` (W15) the residual ends at the router, and a stopped
-  earlier life's must be 0; see "The target split (W15)".
+  earlier life's must be 0, or at most Q's events when the shutdown backstop cut a send; see
+  "The target split (W15)".
 - `ledger.edge`: E == A, a single-consumer edge, for the final life; from W8b ΣE == A, E summed
   over the listeners, which every source's events reach. A source's `sut_transforms` (W8b) are
   judged hop by hop: its listener's E == T_in[first node], T_in − T_disc == T_out at every node
@@ -1483,7 +1484,9 @@ The rows:
   reason with its count, such as `counted (batches dropped: overflow_oldest 12, shutdown 2)`.
   The two are never reconciled: the count is of batches, and under `temporality: cumulative` a
   dropped batch loses only the increments since its series' last delivered total, which no log
-  line states. A drop can explain a group's gap at any node but a sink outside the group: under
+  line states. A drop can explain a group's gap at any node but a sink outside the group or a
+  listener (with one SUT X already took a listener's drops out, and with a hop a frame the far
+  `logit_in`'s backstop cut is resent): under
   `copy` (W7b), each sink is its own group, so a drop at the script, `aggregate`, or the sink
   itself counts the sink's gap, and another sink's drop doesn't, since that sink's copy is all
   it lost; under `route`, the group holds every sink and every node's drops count the summed
@@ -1651,7 +1654,8 @@ component that fills it; and refuses the split beside `sut_script`, a hop,
 
 - The listeners' rows end at the router. `ledger.edge` judges Σ(sent into router) == R_in, and
   `ledger.intake`'s residual is W − D − B − X (less ΣT_disc) − R_in: in [0, R] for a killed
-  life, and 0 for a stopped one, whose final drain runs after every data node has exited.
+  life, and 0, or at most Q's events, for a stopped one, whose final drain runs after every
+  data node has exited.
   Nothing else judges a stopped life's ingress, since each sink's egress starts at its target.
 - The router balances as R_in + R_copied − R_disc == R_fwd + ΣT_sent, in `ledger.edge`, judged
   in the final life and in every stopped earlier one. A target's T_sent counts every

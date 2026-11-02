@@ -14958,21 +14958,30 @@ def _backstop_ledger():
     with tempfile.TemporaryDirectory() as tmp:
         # A tailer: life 0 read and sent the lines, `window` never had them, and life 1 reads
         # and sends them again, so W − G and life 0's residual are each the cut's lines.
-        def file_run(name, extra=()):
-            run_dir = _ledger_run(tmp, name, shutdown_drops=0, life0_extra=30 + cut,
-                                  end_extra=cut, sut_extra=extra)
-            return {r.id: r for r in checks.run_all(_as_file_wire(run_dir, w_minus_g=cut))}
+        def file_run(name, extra=(), lines=cut):
+            run_dir = _ledger_run(tmp, name, shutdown_drops=0, life0_extra=30 + lines,
+                                  end_extra=lines, sut_extra=extra)
+            return {r.id: r for r in checks.run_all(_as_file_wire(run_dir, w_minus_g=lines))}
 
         tail = file_run("backstop-file", [deferred()])
         for row in ("ledger.wire", "ledger.intake", "ledger.egress", "ledger.summary", "drops"):
             expect(tail[row].status == checks.PASS,
                    f"{row} PASSes a tailer's deferred cut read again, got {tail[row]}")
-        expect("against the replay band [0, 2,001]" in tail["ledger.wire"].detail
-               and "life 0: [0, +2,000]: Q 2 deferred batch(es), up to 2,000 lines read "
-               "again, a send the shutdown backstop cut that the checkpoint never passed"
-               in tail["ledger.wire"].lines,
-               f"a deferred cut widens a file wire's band by Q's lines, got "
-               f"{tail['ledger.wire']} {tail['ledger.wire'].lines}")
+        expect("against the replay band [0, 5,911]" in tail["ledger.wire"].detail
+               and any(line.startswith(
+                   "life 0: [0, +5,910]: Q 2 deferred batch(es), up to 2,000 lines read "
+                   "again, a send the shutdown backstop cut that the checkpoint never passed, "
+                   "and the reads since the last checkpoint, which the cut kept from being "
+                   "written: 2,530 lines, 506 lines/s at the life's peak drain interval x a "
+                   "5s checkpoint_interval") for line in tail["ledger.wire"].lines),
+               f"a deferred cut widens a file wire's band by Q's lines and a killed life's "
+               f"allowance, got {tail['ledger.wire']} {tail['ledger.wire'].lines}")
+        # The cut also kept life 0's shutdown checkpoint from being written, so life 1 read
+        # again everything since the last periodic one, far more than the one batch Q holds.
+        reread = file_run("backstop-file-reread", [deferred(n=1)], lines=3_900)
+        expect(reread["ledger.wire"].status == checks.PASS,
+               f"a cut tailer's re-read since its last checkpoint is inside the band, got "
+               f"{reread['ledger.wire']}")
         expect("life 0: ok" in tail["ledger.egress"].detail
                or "deferred" in tail["ledger.egress"].detail,
                f"ledger.egress excuses a stopped life's deferred lines, got {tail['ledger.egress']}")
@@ -14995,7 +15004,7 @@ def _backstop_ledger():
         for row in ("ledger.wire", "ledger.intake", "ledger.egress", "ledger.summary", "drops"):
             expect(cri[row].status == checks.PASS,
                    f"{row} PASSes cri_in's deferred cut read again, got {cri[row]}")
-        expect("against the replay band [0, 3,201]" in cri["ledger.wire"].detail,
+        expect("against the replay band [0, 7,081]" in cri["ledger.wire"].detail,
                f"a deferred cut widens the cri band by Q's lines, got {cri['ledger.wire']}")
         bare = cri_run("backstop-cri-uncounted")
         expect(bare["ledger.wire"].status == checks.FAIL
@@ -15006,14 +15015,30 @@ def _backstop_ledger():
         final = file_run("backstop-file-final", [
             _line(_stamp(T0 + 320), checks.DEFERRED, "sum", 1, component="in"),
             _line(_stamp(T0 + 320), "logit.input.lines", "sum", 5, component="in")])
-        expect(final["ledger.intake"].status == checks.FAIL,
+        expect(final["ledger.intake"].status == checks.FAIL
+               and final["ledger.summary"].status == checks.FAIL,
                f"a tailer's deferred batch doesn't excuse W − D past E + B, got "
-               f"{final['ledger.intake']}")
+               f"{final['ledger.intake']} / {final['ledger.summary']}")
+
+        # Under `split = "target"` a stopped life's residual at the router may be up to Q's
+        # lines, which the tailer reads again, and no more.
+        def target_run(name, unread, extra=()):
+            run_dir = _to_targets(_ledger_run(tmp, name, life0_extra=20 + unread,
+                                              shutdown_drops=20, v0_extra=0), adds=extra)
+            return {r.id: r for r in checks.run_all(_as_file_wire(run_dir, w_minus_g=unread))}
+
+        q = [(last0, checks.DEFERRED, 1, "in", None)]
+        held = target_run("backstop-target", 500, q)["ledger.intake"]
+        expect(held.status == checks.PASS and "(Q's 1,000 records allowed)" in held.detail,
+               f"a stopped life's residual at the router may be Q's lines, got {held}")
+        over = target_run("backstop-target-over", 1_200, q)["ledger.intake"]
+        expect(over.status == checks.FAIL,
+               f"a residual past Q's lines at the router FAILs, got {over}")
 
         # `influxdb_in`: a request cut out of its deadline send counts 300 events dropped and
         # none sent; the client resends it, so it isn't X and life 0's residual stays 0.
-        def http_run(name, reason="shutdown"):
-            dropped = _line(_stamp(T0 + last0), "logit.component.events.dropped", "sum", 300,
+        def http_run(name, reason="shutdown", events=300):
+            dropped = _line(_stamp(T0 + last0), "logit.component.events.dropped", "sum", events,
                             component="in", attrs={"reason": reason})
             return {r.id: r for r in checks.run_all(_http_run(
                 tmp, name, life0_dropped=1, dropped_at="in", dropped_reason=reason,
@@ -15023,6 +15048,10 @@ def _backstop_ledger():
         for row in ("ledger.wire", "ledger.intake", "ledger.egress", "ledger.summary", "drops"):
             expect(http[row].status == checks.PASS,
                    f"{row} PASSes an HTTP request the backstop cut, got {http[row]}")
+        # A cut past the wire's per-drain tolerance stays out of W in each drain too.
+        large = http_run("backstop-http-large", events=1_500)
+        expect(large["ledger.wire"].status == checks.PASS,
+               f"ledger.wire leaves a large cut request out of W, got {large['ledger.wire']}")
         refused = http_run("backstop-http-closed", reason="closed_consumer")
         expect(refused["ledger.intake"].status == checks.FAIL,
                f"a closed_consumer drop is still X on an HTTP wire, got "
