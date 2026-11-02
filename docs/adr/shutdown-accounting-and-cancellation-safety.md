@@ -689,12 +689,15 @@ goes with it. These decisions close that case, continuing the numbering above.
     touches.
     - A clone shares its copy's counter, so a per-request clone costs what it did before.
     - `Fanout::for_connection` registers a new counter. A listener calls it once per accepted
-      connection: the stream driver (`tcp.rs`), and `otlp_in`, `datadog_in`, `datadog_trace_in`,
-      `splunk_hec_in`, `influxdb_in`, and `prometheus_in`'s receiver. The registry's lock is taken
+      connection: `otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, `influxdb_in`,
+      and `prometheus_in`'s receiver. The registry's lock is taken
       only there and by a read, which prunes counters whose copies have all dropped.
     - `Fanout::detached` is a copy with no counter, for a task that outlives the listener's
-      future, whose sends the backstop doesn't cut: `http.rs`'s `deliver_detached` and each
-      `logit_in` connection, which `tokio::spawn` runs outside the listener's future.
+      future, whose sends the backstop doesn't cut: `http.rs`'s `deliver_detached`, each
+      `logit_in` connection, and each connection of the stream driver (`tcp.rs`), which
+      `tokio::spawn` runs outside the listener's future. The stream driver's
+      `run_until_shutdown` returns at the signal without waiting for its connections, so the
+      backstop never reads their sends.
     - Every other node's `Fanout` carries no counter and pays a `None` check per send. The field
       is one pointer, 8 bytes.
 18. **The backstop reads the registry before it drops the listener.** `run_input` keeps the
@@ -724,12 +727,29 @@ Consequences:
   the listener sent the batch, and shutdown cut it before every consumer had it. A cut
   `send_with_deadline` or `send_resumable` (`kafka_in`) counts sent only once every slot is held,
   so its batch counts only dropped or deferred.
-- A sender that resends what it wasn't answered for keeps a cut batch too, but its listener
-  answers `false`: an HTTP client's cut request is counted dropped, though a retrying client
-  resends it. The count records a batch this process lost, whatever the client does next.
-- `hyper` spawns an HTTP/2 stream's task, which outlives the listener's future: a handler's send
-  there (`datadog_in`, `datadog_trace_in`, `influxdb_in`, and `splunk_hec_in`'s first batch,
-  bounded by `busy_after`) is counted when the backstop fires, though it may still finish.
+- **An HTTP request the backstop cuts counts dropped, by decision.** Whether its batch comes
+  back depends on the client: a retrying client resends a request it got no answer for, and
+  another client doesn't. The listener can't tell which it has, so it answers
+  `rereads_after_restart` with `false` and counts the batch lost, and a resend arrives as a new
+  batch. Counting a resent batch dropped is the safe error, because the other choice hides a real
+  loss from an operator who alerts on `*.dropped`.
+- **An HTTP handler's send races the read, a documented race.** The abort doesn't reach an HTTP/2
+  stream's task, which `hyper` spawns, but the dropped connection closes the stream: h2 0.4.19's
+  `Connection` drop marks every stream broken and wakes it, and hyper 1.11.1's `H2Stream` then
+  fails its reset poll and ends. So a handler's send there (`datadog_in`, `datadog_trace_in`,
+  `influxdb_in`, and `splunk_hec_in`'s first group) is polled once more and then dropped, and
+  delivers its batch only if every consumer had room at that poll. The backstop reads the
+  registry before that poll, which leaves two narrow races:
+  - A send that completes in that last poll was already counted, so its batch counts dropped
+    though it was delivered.
+  - A multi-batch request (`datadog_in`, `splunk_hec_in`'s first group) can complete the counted
+    batch in that poll and park the next one, which is then cut uncounted.
+
+  Both need the downstream to free a slot between the read and that poll. The same races apply
+  to an HTTP/1 connection task on a multi-threaded runtime, because `ConnectionTasks`' abort is
+  asynchronous: a task running on another worker finishes its current poll. A listener that sends
+  from its own future (UDP, `internal`, `tail_in`, `docker_in`, `cri_in`, `kafka_in`) has neither
+  race, since the drop stops its send where the read found it.
 - `internal`'s drop lands after its final drain, so a dedicated pipeline never exports it. The
   exit summary logs it at `warn` as `telemetry left undrained at exit` (decision 16).
 - `kafka_in`'s own drain counts what its drain deadline defers. The backstop counts only a send
