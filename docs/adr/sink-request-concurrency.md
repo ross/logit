@@ -1,6 +1,6 @@
 ---
 created: 2026-10-25
-updated: 2026-10-25
+updated: 2026-11-01
 ---
 
 # Sink request concurrency: a per-sink `concurrency:` keeps several batches in flight, each settled on its own
@@ -74,6 +74,8 @@ accepts an older sample after a newer one:
 | `datadog_trace_out`, `splunk_hec_out` | Safe. Nothing at the destination depends on order across requests. Splunk's `Clean`-before-acceptance rows depend on order within one `send`, which stays sequential. |
 | `otlp_out` | Logs and traces: safe. Metrics into a Prometheus-backed receiver: as remote write. |
 | `prometheus_out` remote write | Both specs require one series' samples in timestamp order. A receiver with no out-of-order window answers `400`, the sink reads `Rejected`, and the batch drops ([`docs/deploying.md`](../deploying.md)'s remote-write sender notes). Which receivers accept out-of-order samples, and under what setting, is the receiver table in `crates/logit-outputs/src/prometheus.rs`'s module doc, "Concurrency". |
+
+The `otlp_out` row's "Logs and traces: safe" is amended below.
 
 A single chain into one `prometheus_out` can't draw an out-of-order `400` today, because
 batches leave in order. Concurrency would turn that chain into the fan-in case those notes
@@ -327,3 +329,14 @@ them.
 - **Idle connections.** Decision 7's `idle_timeout:` on the six sinks, its graph rule 56 check,
   and the two soak scenarios that exercise it; `docs/known-gaps/sinks.md`'s idle-connection
   entry narrows to the residual.
+
+## Amendment: Loki rejects a late log batch (2026-11-01)
+
+The `otlp_out` row's "Logs and traces: safe" holds for traces only. Loki drops each log entry
+more than half its `max_chunk_age` (which defaults to two hours) behind the newest entry it
+accepted for the stream, stores the rest, and answers `400`. The sink reads that as `Rejected` and
+counts every log record in the request under
+`logit.output.records.dropped{signal="logs", reason="rejected"}`, the kept ones included, so the
+counter overstates the loss. Up to `concurrency` consecutive batches are in flight together and
+any can land after any other. Keep `concurrency` at 1 ahead of Loki unless the log timestamps of
+any `concurrency` consecutive batches stay inside that window.

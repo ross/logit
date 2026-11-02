@@ -3930,10 +3930,15 @@ pub enum ComponentKind {
         /// in flight is its own unknown outcome: one whose send fails that way is dropped alone.
         /// Defaults to `1`; must be between `1` and `1024`.
         ///
-        /// Logs and traces don't depend on order. Metrics sent to a Prometheus-backed receiver
-        /// need it to accept a series' samples out of timestamp order: VictoriaMetrics does with no
-        /// setting, while Prometheus and Mimir do only with their out-of-order time window open,
-        /// which is off by default, and reject a late sample otherwise.
+        /// Traces don't depend on order. Logs do at Loki, which drops each entry more than half
+        /// its `max_chunk_age` (two hours by default) behind the newest entry it has accepted for
+        /// the stream, stores the rest, and answers `400`; this sink reads that as a rejection and
+        /// counts every log record in the request dropped, the ones Loki kept included. Keep it at
+        /// `1` ahead of Loki unless the log timestamps of any `concurrency` consecutive batches
+        /// stay inside that window. Metrics sent to a Prometheus-backed receiver need it to
+        /// accept a series' samples out of timestamp order: VictoriaMetrics does with no setting,
+        /// while Prometheus and Mimir do only with their out-of-order time window open, which is
+        /// off by default, and reject a late sample otherwise.
         #[serde(default = "default_sink_concurrency")]
         concurrency: u32,
         /// How long a pooled connection may sit idle before this sink closes it instead of
