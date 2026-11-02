@@ -1697,7 +1697,8 @@ pub(crate) async fn write_loop(
     // same `select!`, reads it.
     let shutdown_deadline = std::sync::OnceLock::new();
     // Turns a stream of failures into two edge events: `degraded` on the first drop, `recovered`
-    // on the next success after a drop or a retried failure.
+    // on the next success after a drop or a retried failure. Both log at `warn`, because
+    // `internal`'s default captures only `warn` and above and must see both edges.
     let mut degraded = false;
     let mut in_flight = InFlight::default();
     // The signal itself, for a collecting window's fill; `shutdown` stays the grace arms'.
@@ -1878,7 +1879,7 @@ pub(crate) async fn write_loop(
                 last_success = Some(tokio::time::Instant::now());
                 if degraded || retrying.is_retrying() {
                     degraded = false;
-                    diag.info("recovered", "delivery succeeded after a prior failure");
+                    diag.warn_keyed("recovered", "delivery succeeded after a prior failure");
                 }
                 retrying.settle();
             }
@@ -6638,6 +6639,11 @@ mod tests {
         );
         assert_eq!(log_lines("refused_block", "(held 0ns, failure 1, "), 1, "the first failure");
         assert_eq!(log_lines("refused_block", "delivery succeeded after a prior failure"), 1);
+        assert_eq!(
+            log_lines("refused_block", "WARN logit: delivery succeeded after a prior failure"),
+            1,
+            "recovered logs at warn, so internal's default captures it"
+        );
     }
 
     /// The `retrying` line is written on a head's first failure, then at most once per interval

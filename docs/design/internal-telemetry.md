@@ -709,7 +709,7 @@ class and the destination's error text:
 - `send_failed` (warn, throttled to the 1st, 2nd, 4th, ... occurrence): each dropped batch, with
   the time since the last success.
 - `degraded` (warn): the first drop since the sink was last healthy.
-- `recovered` (info): the first success after a drop or a retried failure.
+- `recovered` (warn): the first success after a drop or a retried failure.
 
 No send outcome ends the process: a sink that can't deliver holds or drops, and the diagnostics and
 the `retrying` gauge are how it shows.

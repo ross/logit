@@ -707,7 +707,7 @@ that recorded the point.
 | `drain complete` | info/warn | Every node has exited after a shutdown or failure — `warn` if any batch was dropped for shutdown. Its `batches_dropped` field sums `logit.component.batches.dropped{reason="shutdown"}` across sinks and Lua nodes. It doesn't include events refused as `closed_consumer`, UDP datagram drops, queue overflow evictions, or a disk sink's shutdown sweep failing to push. |
 | `degraded` | warn | A sink's first dropped batch since it was last healthy. |
 | `retrying` | error | A sink's held head failed a retryable send; logged on the first failure, then at most once a minute while the head keeps failing. |
-| `recovered` | info | A sink's first successful delivery after `degraded` or a retried failure. |
+| `recovered` | warn | A sink's first successful delivery after `degraded` or a retried failure. |
 | `buffer_full` | warn | A sink's buffer, or a datagram listener's receive queue, found no room for a push. Names the bound and the `overflow` policy; repeats at most once a minute while it stays full, with what was shed or how long intake has been held. On a sink with every send its `concurrency` allows in flight, it also names that concurrency and the last send's duration. |
 | `buffer_recovered` | warn | A full buffer's utilization fell below its `recover_below`. Carries the episode's duration and totals. |
 | `buffer_full_at_shutdown` | warn | A sink or listener stopped with its buffer still full. |
@@ -979,7 +979,7 @@ An error the sink attaches no fault to is treated as `Rejected`.
   a minute while it keeps failing, however long the hold lasts. It names the fault class, the
   destination's error text, how long the head has been held, the failure count, and how many
   batches are queued.
-- `degraded` (warn, on the first drop) and `recovered` (info, on the first success after a drop or
+- `degraded` (warn, on the first drop) and `recovered` (warn, on the first success after a drop or
   a retried failure) mark the edges.
 
 The status-only default for HTTP sinks is the `classify_status` table in

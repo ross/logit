@@ -161,3 +161,7 @@ does, so it follows. [ADR `internal-telemetry-as-pipeline-events`](internal-tele
 `internal`'s own blocked and recovered pair. The decision's body above reads at the new levels.
 Nothing else about the lines changes: the keys, fields, and pacing are the same, and none of
 them counts in `logit.component.diagnostics`.
+
+A sink's `recovered` line moves with them, for the same reason. It pairs with `degraded` (`warn`,
+on the first drop) and was `info`, so a pipeline saw a sink degrade and never saw it recover. It is
+unthrottled, as before, and its key, message, and pacing don't change.
