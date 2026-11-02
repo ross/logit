@@ -191,8 +191,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
     `syslog_in`, `lines_in`, and `tail_in` stamp arrival time and stay monotone within a batch;
     `docker_in` carries record time in order per file; `cri_in` does too, except that a partial
     run, stamped with its first record's time, comes out after the other stream's lines written
-    while it was held (up to `partial_timeout`). The operator's workaround is
-    in [Deploying `logit`](../deploying.md)'s "Sending logs to Loki".
+    while it was held: up to `partial_timeout`, or the writer's whole stall under
+    `partial_timeout: 0s`. The operator's workaround is in [Deploying `logit`](../deploying.md)'s
+    "Sending logs to Loki".
   - **To close:** an opt-in native `sort` transform, a stable sort by `Event::timestamp` in
     `Transform::begin_batch` with no state across batches, as `dedup_timestamps` has. It needs an
     allocation pin (`crates/logit-bench/tests/allocations.rs`, `docs/design/memory.md`); a stable
