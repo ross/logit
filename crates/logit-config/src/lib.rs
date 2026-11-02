@@ -3933,7 +3933,7 @@ pub enum ComponentKind {
         /// Traces don't depend on order. Logs do at Loki, which rejects an entry more than half
         /// its `max_chunk_age` (one hour by default) behind the newest entry it has accepted for
         /// the stream, so above `1` a batch that lands behind a newer one across a longer gap
-        /// drops whole. Keep it at `1` ahead of Loki unless adjacent batches stay inside that
+        /// is lost. Keep it at `1` ahead of Loki unless adjacent batches stay inside that
         /// window. Metrics sent to a Prometheus-backed receiver need it to accept a series'
         /// samples out of timestamp order: VictoriaMetrics does with no setting, while
         /// Prometheus and Mimir do only with their out-of-order time window open, which is off
