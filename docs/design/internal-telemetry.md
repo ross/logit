@@ -725,9 +725,9 @@ its backend:
   been held. Written while the write loop has every batch its concurrency allows in flight, it
   ends with that concurrency and the last send's duration (`sending at its concurrency of 1, the
   last send took 200ms`), naming the round trip as what bounds the sink.
-- `buffer_recovered` (info): utilization fell below `buffer.recover_below` (default `0.75`), with
+- `buffer_recovered` (warn): utilization fell below `buffer.recover_below` (default `0.75`), with
   the episode's duration and totals.
-- `buffer_full_at_shutdown` (info): the sink finished with the buffer still full.
+- `buffer_full_at_shutdown` (warn): the sink finished with the buffer still full.
 
 None of them counts in `logit.component.diagnostics`; the `*.dropped` rows above stay the record of
 loss.

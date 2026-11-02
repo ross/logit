@@ -13,9 +13,13 @@
 //!   bound, and so opens and closes an episode per item, still writes at most one warn line a
 //!   minute. An episode that opens inside that minute stays unannounced until the clock allows a
 //!   line; if it closes first, its counts ride on the next `buffer_full` line.
-//! - `buffer_recovered` (info): when an announced episode closes, with its duration and totals.
-//! - `buffer_full_at_shutdown` (info): when the queue's owner finishes it with an announced
+//! - `buffer_recovered` (warn): when an announced episode closes, with its duration and totals.
+//! - `buffer_full_at_shutdown` (warn): when the queue's owner finishes it with an announced
 //!   episode still open.
+//!
+//! Every line is `warn` so a reader who sees one finds its pair: `internal`'s default `logs: warn`
+//! captures only `warn` and above, and a pipeline that got `buffer_full` alone would never see
+//! the episode end.
 //!
 //! On a sink's buffer, a `buffer_full` line written while the write loop has as many batches in
 //! flight as its concurrency allows also names that limit and the last send's duration
@@ -210,10 +214,9 @@ impl Drop for Waiting<'_> {
     }
 }
 
-enum Line {
-    Warn(String),
-    Info(&'static str, String),
-}
+/// A self-log line: its key and message. Every line of an episode is `warn`, so `internal`'s
+/// default `logs: warn` captures the opening and the close of one.
+struct Line(&'static str, String);
 
 impl FullWatch {
     pub(crate) fn new(
@@ -360,7 +363,7 @@ impl FullWatch {
             let Some(episode) = state.episode.take() else { return };
             self.open.store(false, Ordering::Release);
             if episode.announced {
-                Some(Line::Info(
+                Some(Line(
                     "buffer_recovered",
                     format!(
                         "{} below {}% of its bounds after {}; overflow {} {}",
@@ -391,7 +394,7 @@ impl FullWatch {
             let Some(episode) = state.episode.take() else { return };
             self.open.store(false, Ordering::Release);
             episode.announced.then(|| {
-                Line::Info(
+                Line(
                     "buffer_full_at_shutdown",
                     format!(
                         "{} still full at shutdown after {}; overflow {} {}",
@@ -471,7 +474,7 @@ impl FullWatch {
         if let Some(episode) = state.episode.as_mut() {
             episode.announced = true;
         }
-        Some(Line::Warn(msg))
+        Some(Line("buffer_full", msg))
     }
 
     /// What the episode did: `is holding intake` or `is shedding ...` as it opens, and its totals
@@ -513,10 +516,8 @@ impl FullWatch {
     }
 
     fn emit(&self, line: Option<Line>) {
-        match line {
-            Some(Line::Warn(msg)) => self.diag.warn_keyed("buffer_full", msg),
-            Some(Line::Info(key, msg)) => self.diag.info(key, msg),
-            None => {}
+        if let Some(Line(key, msg)) = line {
+            self.diag.warn_keyed(key, msg);
         }
     }
 }
@@ -680,6 +681,24 @@ mod tests {
                 format!("{base}{}", cause.unwrap_or_default()),
                 "{limit}/{in_flight}"
             );
+        }
+    }
+
+    /// `internal`'s default `logs: warn` captures only `warn` and above, so every line of an
+    /// episode must be `warn` or the pipeline sees an episode open and never close.
+    #[tokio::test]
+    async fn every_line_of_an_episode_logs_at_warn() {
+        let (lines, _guard) = capture();
+        let w = watch(OverflowPolicy::DropNewest, Telemetry::default());
+        w.dropped("overflow_newest", 1, Bound::Items);
+        w.utilization(0.5);
+        let closing = watch(OverflowPolicy::DropNewest, Telemetry::default());
+        closing.dropped("overflow_newest", 1, Bound::Items);
+        closing.finish();
+        for key in ["buffer_full", "buffer_recovered", "buffer_full_at_shutdown"] {
+            let found = lines.with_key(key);
+            assert!(!found.is_empty(), "{key} was not written");
+            assert!(found.iter().all(|(level, _)| *level == tracing::Level::WARN), "{found:?}");
         }
     }
 

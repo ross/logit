@@ -1,6 +1,6 @@
 ---
 created: 2026-10-21
-updated: 2026-10-25
+updated: 2026-11-02
 ---
 
 # Full-buffer diagnostics: a full sink buffer or receive queue logs once a minute, and a gauge reads a blocked push live
@@ -42,8 +42,8 @@ implements it once for all three; its module doc is the canonical statement of t
    (`buffer.max_batches 1024`, `buffer.max_bytes 64MiB`, `buffer.disk.max_bytes 1GiB`,
    `receive.max_datagrams 10000`, `receive.max_bytes 32MiB`) and the `overflow` policy. It repeats
    at most once a minute while the episode stays open, with the items and units shed so far, or
-   how long intake has been held. `buffer_recovered` (info) when an announced episode ends, with its
-   duration and totals. `buffer_full_at_shutdown` (info) when the queue's owner finishes with an
+   how long intake has been held. `buffer_recovered` (warn) when an announced episode ends, with its
+   duration and totals. `buffer_full_at_shutdown` (warn) when the queue's owner finishes with an
    announced episode still open.
    A sink's `buffer_full` also names its concurrency and its last send's duration when every
    batch the concurrency allows is in flight ("Amendment: the line names a saturated
@@ -149,3 +149,15 @@ written. A retried send reads as saturated only while it's in flight, never duri
 where `retrying` names the cause. A receive queue has no write loop and gets no suffix. The line
 names the limit, not the remedy: raising `concurrency:` reorders batches at the destination, which
 each sink's docs weigh.
+
+## Amendment: the closing lines log at warn (2026-11-02)
+
+`buffer_recovered` and `buffer_full_at_shutdown` log at `warn`, as `buffer_full` does. They were
+`info`, and `internal`'s default `logs: warn` captures only `warn` and above, so a pipeline got
+`buffer_full` and never the line that ended the episode. A reader who sees one line of the pair
+expects the other. `buffer_full_at_shutdown` closes an announced episode as `buffer_recovered`
+does, so it follows. [ADR `internal-telemetry-as-pipeline-events`](internal-telemetry-as-pipeline-events.md)'s
+"Amendment: a blocked self sink stalls the drain (2026-11-01)", item 3, made the same call for
+`internal`'s own blocked and recovered pair. The decision's body above reads at the new levels.
+Nothing else about the lines changes: the keys, fields, and pacing are the same, and none of
+them counts in `logit.component.diagnostics`.

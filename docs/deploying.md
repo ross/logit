@@ -709,8 +709,8 @@ that recorded the point.
 | `retrying` | error | A sink's held head failed a retryable send; logged on the first failure, then at most once a minute while the head keeps failing. |
 | `recovered` | info | A sink's first successful delivery after `degraded` or a retried failure. |
 | `buffer_full` | warn | A sink's buffer, or a datagram listener's receive queue, found no room for a push. Names the bound and the `overflow` policy; repeats at most once a minute while it stays full, with what was shed or how long intake has been held. On a sink with every send its `concurrency` allows in flight, it also names that concurrency and the last send's duration. |
-| `buffer_recovered` | info | A full buffer's utilization fell below its `recover_below`. Carries the episode's duration and totals. |
-| `buffer_full_at_shutdown` | info | A sink or listener stopped with its buffer still full. |
+| `buffer_recovered` | warn | A full buffer's utilization fell below its `recover_below`. Carries the episode's duration and totals. |
+| `buffer_full_at_shutdown` | warn | A sink or listener stopped with its buffer still full. |
 | `telemetry left undrained at exit` | debug/warn | One line per internal metric point no `internal` drain exported, logged after every node has exited and before `exiting`, on exit `0` or `2` alike. `warn` for any nonzero `*.dropped` count, whatever its `reason`; `debug` for everything else, including timings and routine counts. Only with an `internal` component. |
 | `exiting` | info/error | The process is about to exit — `info` at `0`, `error` at any failure code (`1` or `2`). A config error that fails before the pipeline starts exits without this line. |
 

@@ -2919,7 +2919,7 @@ mod full_buffer_tests {
         q.commit().expect("2 of 4 left");
         let recovered = lines.with_key("buffer_recovered");
         assert_eq!(recovered.len(), 1);
-        assert_eq!(recovered[0].0, tracing::Level::INFO);
+        assert_eq!(recovered[0].0, tracing::Level::WARN);
         assert_eq!(
             recovered[0].1,
             "buffer below 75% of its bounds after 1m0s; overflow block held intake for 1m0s"
