@@ -707,6 +707,11 @@ goes with it. These decisions close that case, continuing the numbering above.
     defaults to `false`. `kafka_in` answers `true`, because it commits an offset only once its
     batch is in every downstream inbox. `tail_in`, `docker_in`, and `cri_in` answer `true` only
     with a `checkpoint_path`, since without one a restart starts each file at `read_from`.
+    Without a checkpoint they answer `false`, and so does `replay_in`. A restart may read the cut
+    batch again (`read_from: beginning`, or `replay_in` reading its file from the start), but
+    nothing guarantees it: a file rotated or removed in between isn't read again. So the batch
+    counts dropped, the safe count, by the same rule as an HTTP request the backstop cuts
+    (Consequences).
 20. **Every backstop stop logs `shutdown_backstop` at `warn`**, naming the listener's id and
     kind and its grace, never its config. With a send in flight:
     - A listener that rereads counts the batches as `logit.input.batches.deferred`, untagged as

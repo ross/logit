@@ -162,9 +162,9 @@
 //! `Fanout::send` on its connection task (`crate::http`'s module doc). The abort doesn't reach an
 //! h2 stream's task, but the dropped connection closes the stream, so its handler is polled once
 //! more and then dropped. Detached deliveries outlive the abort, bounded by the downstream
-//! draining or closing (`docs/design/pipeline-graph.md`'s "Cancellation points"). ADR `idle-connection-timeout`'s
-//! "Amendment: shutdown is the second trigger of the close sequence (2026-10-07)" records the
-//! decision.
+//! draining or closing (`docs/design/pipeline-graph.md`'s "Cancellation points"). ADR
+//! `idle-connection-timeout`'s "Amendment: shutdown is the second trigger of the close sequence
+//! (2026-10-07)" records the decision.
 //!
 //! *Why not hyper's `http1().header_read_timeout(..)`.* In the pinned hyper 1.11.1
 //! (`src/proto/h1/conn.rs`) that timer is armed at the *top* of `poll_read_head`, before a header
