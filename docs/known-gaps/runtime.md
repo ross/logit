@@ -189,7 +189,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
       clock puts an older entry after newer ones.
 
     `syslog_in`, `lines_in`, and `tail_in` stamp arrival time and stay monotone within a batch;
-    `docker_in` and `cri_in` carry record time, in order per file. The operator's workaround is
+    `docker_in` carries record time in order per file; `cri_in` does too, except that a partial
+    run, stamped with its first record's time, comes out after the other stream's lines written
+    while it was held (up to `partial_timeout`). The operator's workaround is
     in [Deploying `logit`](../deploying.md)'s "Sending logs to Loki".
   - **To close:** an opt-in native `sort` transform, a stable sort by `Event::timestamp` in
     `Transform::begin_batch` with no state across batches, as `dedup_timestamps` has. It needs an
