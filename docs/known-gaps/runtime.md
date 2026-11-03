@@ -165,6 +165,41 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Revisit trigger:** work on the native protocol, or a deployment that can't do either
     workaround.
 
+- **A batch's events are in no promised timestamp order, and neither are the batches.** Nothing
+  on a log's path sorts: `route_signals`, `lua` (`process(event)` sees one event at a time), and
+  `otlp_out`'s log encoder keep the order events arrive in. `internal` sorts its own drain
+  (`Registry::drain`) and is the exception. A `logit_pipeline::BatchAccumulator` cuts a batch
+  whenever the resource or scope changes, so a batch carries one resource.
+  - **Consequence:** a destination that rejects out-of-order entries drops them, as Loki does
+    for an entry an hour behind the stream's newest, whether that came in an earlier push or
+    earlier in the same one ([ADR `sink-request-concurrency`](../adr/sink-request-concurrency.md#amendment-loki-rejects-a-late-log-batch-2026-11-01)). One Loki stream can
+    absorb many batches, since its labels come from resource attributes. These can build a batch
+    out of order by more than seconds:
+    - the inputs that pass a producer's order and record time through: `kafka_in`, `otlp_in`,
+      `datadog_in`, `splunk_hec_in`'s `/event`, `replay_in`, `logit_in`, and over UDP, where one
+      accumulator mixes every sender, `collectd_in`'s notifications and `statsd_in`'s `|T`
+      metric lines and `d:` events and service checks;
+    - any input followed by a `timestamp` transform, which rewrites times in place and keeps
+      arrival order (`max_skew` defaults to 24 hours): after UDP `syslog_in`, a sender with a slow
+      clock puts an older entry after newer ones.
+
+    `syslog_in`, `lines_in`, and `tail_in` stamp arrival time and stay monotone within a batch;
+    `docker_in` carries record time in order per file; `cri_in` does too, except that a partial
+    run, stamped with its first record's time, comes out after the other stream's lines written
+    while it was held: up to `partial_timeout`, or the writer's whole stall under
+    `partial_timeout: 0s`. The operator's workaround is in [Deploying `logit`](../deploying.md)'s
+    "Sending logs to Loki".
+  - **To close:** an opt-in native `sort` transform, a stable sort by `Event::timestamp` in
+    `Transform::begin_batch` with no state across batches, as `dedup_timestamps` has. It needs an
+    allocation pin (`crates/logit-bench/tests/allocations.rs`, `docs/design/memory.md`); a stable
+    sort of whole `Event`s moves 864 bytes per element and can allocate scratch per call, so it
+    would sort a reused (timestamp, index) permutation and apply it in place. It fixes disorder
+    inside one batch only: Loki compares against the stream's newest entry across pushes, so a
+    sender more than an hour behind is dropped whatever the order, and sources catching up at
+    different speeds into one stream disorder across batches.
+  - **Revisit trigger:** a deployment that hits the within-batch case, such as a burst after a
+    stall.
+
 ## Event model and interner
 
 - **`HyperLogLog::from_bytes` (`crates/logit-core/src/metric.rs`) works around an upstream

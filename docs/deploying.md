@@ -3369,6 +3369,27 @@ OTLP specification's non-retryable list (2026-10-04)", and the table in
 [`otlp.rs`](../crates/logit-outputs/src/otlp.rs)'s module doc for every answer `otlp_out`
 distinguishes.
 
+### Sending logs to Loki
+
+`logit` promises no timestamp order within a batch or across batches. Loki drops a log entry more
+than half its `max_chunk_age` (two hours by default, so one hour) behind the newest entry it
+accepted for the stream and stores the rest, and `otlp_out` counts the whole request dropped, so
+the counter overstates the loss
+([ADR `sink-request-concurrency`](adr/sink-request-concurrency.md#amendment-loki-rejects-a-late-log-batch-2026-11-01)).
+To keep entries inside that window:
+
+- Give each producer its own stream: one input per producer, each followed by a `set` of a
+  resource attribute Loki indexes as a label. An attribute Loki doesn't index lands in structured
+  metadata and doesn't split the stream. `set` overwrites what the wire carried, so on an
+  `otlp_in` or `datadog_in` leg pick an indexed attribute the producer doesn't set, not its
+  `service.name`.
+- Keep `otlp_out`'s `concurrency` at 1.
+- On a listener that mixes senders with skewed clocks, keep arrival time: no `timestamp`
+  transform ahead of Loki.
+
+The [known-gaps entry](known-gaps/runtime.md#pipeline-runtime-and-graph) on timestamp order lists
+which inputs build a batch out of order.
+
 ## `datadog_in`: standing in for Datadog's intake
 
 To choose between this and the other Datadog topologies, and for the rules that lose data when
