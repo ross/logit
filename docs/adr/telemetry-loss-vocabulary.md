@@ -418,10 +418,16 @@ for `input.batches.deferred` carries the wider meaning.
 A loss that showed only in a counter was invisible to an operator reading stderr, or `internal`'s
 `logs: warn` stream, until something drained and graphed the counter. So the vocabulary's rule
 that a loss reported only by a diagnostic gets a `*.dropped` counter beside it now runs both ways:
-**every counted loss also logs a `warn` line**, with the exceptions listed at the end of this
-amendment. The counter stays the record of how much; the line says that it happened and why, and
-names the component. A loss that recurs per batch or per record is throttled, and one that
+**every counted loss in a sink, its codec, its disk spool, `prometheus_out`'s registry, the
+pipeline runtime, or `internal` also logs a `warn` line**, save the one exception at the end of
+this amendment. The counter stays the record of how much; the line says that it happened and why,
+and names the component. A loss that recurs per batch or per record is throttled, and one that
 repeats for one lasting cause logs once for that cause, so the line never becomes a flood.
+
+Those are the places the audit behind this amendment covered. Listeners and their decoders
+weren't audited, and several of their `input.*.dropped` counts still have no line
+([docs/known-gaps/telemetry.md](../known-gaps/telemetry.md)'s "Listener and decoder losses have
+no line"); whether to add them is open.
 
 ### Sinks, their codecs, and the disk spool
 
@@ -459,7 +465,7 @@ other sink-side `*.dropped` already had one.
 ### The registry, the pipeline, and `internal`
 
 An audit of the losses outside the sinks' encode paths found one counter outside the vocabulary
-and five counted losses that wrote no line:
+and six counted losses that wrote no line:
 
 | Loss | Counter | Line |
 |---|---|---|
@@ -469,30 +475,34 @@ and five counted losses that wrote no line:
 | Events a wedged `lua` node produced after its channels were revoked | `component.events.dropped{reason="closed_consumer"}` under the node, unchanged | `closed_consumer`, one per edge the events were bound for, naming the node and the consumer; a revoked node exits, so this is once per edge |
 | A buffer or receive queue that shed data in a full episode the throttle never announced, then finished | the overflow `*.dropped` counters, unchanged | `buffer_shed_unannounced` at shutdown ([ADR `buffer-full-diagnostics`](buffer-full-diagnostics.md)'s "Amendment: shutdown reports what no line announced (2026-11-02)") |
 | A point or span `internal`'s per-component buffer couldn't hold | `internal.points.dropped{reason="cardinality"}`, `internal.spans.dropped{reason="buffer_full"}`, unchanged | `telemetry_points_capped`, `telemetry_spans_capped`, once per component per cap |
+| The items a cancelled `push_many` never reached, its `CountedDrain` dropped at shutdown | the queue's `items_dropped`/`units_dropped{reason="shutdown"}` (for a UDP listener's receive queue, `component.datagrams.dropped`/`bytes.dropped`), unchanged | `shutdown_push_cut`, naming the queue's component and the counts; a cancelled push happens once per queue at shutdown |
 
-The two registry lines are throttled as the sinks' are. The other four log once per lasting
-cause: a closed edge stays closed, a revoked node exits, a queue finishes once, and a component
-over its cap stays over it.
+The two registry lines are throttled as the sinks' are. The other five log once per lasting
+cause: a closed edge stays closed, a revoked node exits, a queue finishes once, a component over
+its cap stays over it, and a push is cut once, at shutdown.
+
+`CountedDrain`'s remainder stays out of `drain complete`'s `batches_dropped`. That field sums
+`batches.dropped{reason="shutdown"}`, and the one production caller of `push_many` is a UDP
+listener's receive queue, whose items are datagrams, not batches.
+
+A wedged or failed Lua node's inbox sweep (`revoke_lua_io`, on a wedge past the shutdown grace,
+a `max_memory` failure, or another error that fails the node) counts `batches.dropped{reason="shutdown"}` through
+the same path a sink's abandoned inbox does, so `drain complete` logs it, as the sink section's
+"A line already in the path covers its drop" allows.
 
 The type-conflict rename reverses the 2026-10-13 close-out's "`output.metrics.type_conflict` keeps
 its name": that series was live data the registry removed, which is loss, and the codec already
 counts a record a type conflict drops within a batch under the same reason and unit. There's no
 alias.
 
-### Exceptions
+### The exception
 
-Three counted losses have no line of their own:
-
-- **`internal.logs.dropped{reason="buffer_full"}`.** The line would be a `logit` log that
-  `TelemetryLayer` captures back into the same full buffer, where it would be dropped in turn,
-  and the log that was dropped has already been written to stderr under the operator's
-  `--log-level`: only its copy in the pipeline is lost.
-  [internal-telemetry.md](../design/internal-telemetry.md)'s "Logs" section carries the same
-  statement.
-- **`revoke_lua_io`'s `shutdown` sweep of a wedged Lua node's inbox**, which sums into `drain
-  complete` beside the node's own failure.
-- **`CountedDrain`'s `shutdown` count of a cancelled `push_many`'s remainder**, which sums into
-  `drain complete` too.
+**`internal.logs.dropped{reason="buffer_full"}`** has no line. The line would be a `logit` log that
+`TelemetryLayer` captures back into the same full buffer, where it would be dropped in turn, and
+the log that was dropped has already been written to stderr under the operator's `--log-level`:
+only its copy in the pipeline is lost.
+[internal-telemetry.md](../design/internal-telemetry.md)'s "Logs" section carries the same
+statement.
 
 ## Migration record
 The classification of every `*.dropped`, `*.skipped`, `*.degraded`, `*.truncated`, and loss-related

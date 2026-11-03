@@ -5517,18 +5517,24 @@ Third-party crates in play (from the three `Cargo.toml`s): `lz4_flex`, `crc32c`,
 
 ### WIRE-18 — `prometheus_out` exposition registry: upsert, type conflict, expiry sweep, one-pass cap
 - **Location:** `crates/logit-outputs/src/prometheus.rs` (`Clock`, `LabelKey`, `Stored`,
-  `StoredFamily`, `Registry`; `Registry::len`, `upsert`, `sweep`, `enforce_cap`, `families`,
-  `render`; `ExposeOutput::send`; `lock`; the render-side critical section in `handle`)
+  `StoredFamily`, `Registry`; `Registry::len`, `upsert`, `settle_collisions`, `sweep`,
+  `enforce_cap`, `families`, `render`; `ExposeOutput::send`; `lock`; the render-side critical
+  section in `handle`)
 - **What it does:** `send` converts the batch under the **encoder** lock, releases it, then takes
   the **registry** lock once for the whole batch: upsert every family (latest wins per rendered
-  label set; a type change clears the family's series and counts `type_conflict`), sweep anything
+  label set; a family new to the registry or re-typed first goes through
+  `Registry::settle_collisions`, which settles a `# TYPE` name collision in either dialect and
+  counts the loser's series `metrics.dropped{reason="name_collision"}`; a type change then drops
+  the old type's series, counted `metrics.dropped{reason="type_conflict"}` once per series, even
+  when the collision refused the new type's), sweep anything
   past `expire_after`, then evict least-recently-updated down to `max_series` in one
   `select_nth_unstable_by` pass. A scrape takes encoder-then-registry in the same order, sweeps
   again, and renders.
 - **Why sensitive:** concurrency (two `std::sync::Mutex`es with a stated lock order, taken from
   both an async sink task and an async HTTP handler); data-loss (eviction and type conflict
   silently discard series an operator is watching); hot-path (per-batch upsert, per-scrape full
-  deep copy); accounting (`series` gauge, `series.evicted{reason}`, `metrics.type_conflict`).
+  deep copy); accounting (`series` gauge, `series.evicted{reason}`,
+  `metrics.dropped{reason="type_conflict"|"name_collision"}`, each with a throttled warning).
 - **Invariants to verify:**
   - **Lock order is always encoder → registry**, on both paths (`ExposeOutput::send` releases the
     encoder before taking the registry; `handle` takes both in order). Any future third caller must not invert it.

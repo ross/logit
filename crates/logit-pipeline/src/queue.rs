@@ -172,9 +172,15 @@ impl From<SinkQueueConfig> for QueueConfig {
 /// `reason` is `"shutdown"` at every call site: the shutdown race and the grace backstop are the
 /// only production cancellers of a future that holds one.
 ///
-/// The drop calls only `Telemetry::count`, never the queue lock. `Telemetry::count` takes its own
-/// buffer's lock, which is never held across an await or while a `CountedDrain` drops
-/// (`docs/adr/shutdown-accounting-and-cancellation-safety.md`, "Alternatives considered").
+/// A drop that counts anything also logs one `shutdown_push_cut` warn line naming the queue's
+/// component, the counts, and the counter. The remainder isn't in `drain complete`'s
+/// `batches_dropped`: that tally sums batches, and the one production caller, a UDP listener's
+/// receive queue, holds datagrams.
+///
+/// The drop calls only `Telemetry::count` and the log, never the queue lock. `Telemetry::count`
+/// takes its own buffer's lock, which is never held across an await or while a `CountedDrain`
+/// drops (`docs/adr/shutdown-accounting-and-cancellation-safety.md`, "Alternatives considered"),
+/// and so does the log's capture into `internal`.
 pub struct CountedDrain<'a, T: Queued> {
     drain: Peekable<vec::Drain<'a, T>>,
     telemetry: &'a Telemetry,
@@ -221,6 +227,16 @@ impl<T: Queued> Drop for CountedDrain<'_, T> {
             let tags = [("reason", self.reason)];
             self.telemetry.count(self.metrics.items_dropped, items as f64, &tags);
             self.telemetry.count(self.metrics.units_dropped, units as f64, &tags);
+            let component = self.telemetry.component().map_or("<unnamed>", |(id, _)| id);
+            tracing::warn!(
+                target: "logit",
+                component = %component,
+                key = "shutdown_push_cut",
+                "dropped {items} item(s) ({units} unit(s)) a cancelled push never reached the \
+                 queue; counted in {}{{reason=\"{}\"}}",
+                self.metrics.items_dropped,
+                self.reason,
+            );
         }
     }
 }
@@ -1955,6 +1971,7 @@ mod tests {
     /// exact.
     #[tokio::test(start_paused = true)]
     async fn a_cancelled_push_many_keeps_its_prefix_and_counts_its_remainder_as_shutdown_drops() {
+        let (lines, _guard) = crate::test_util::capture_lines();
         let (registry, q) = recording_queue(2, u64::MAX, OverflowPolicy::Block);
         let mut items = batch_of(&[(1, 1), (1, 2), (1, 3), (1, 4)]);
 
@@ -1981,6 +1998,16 @@ mod tests {
             metric_sum(&events, TEST_METRICS.items_dropped, None),
             2.0,
             "nothing else is counted: the prefix was admitted, not dropped"
+        );
+        assert_eq!(lines.components_with_key("shutdown_push_cut"), ["test"]);
+        assert_eq!(
+            lines.with_key("shutdown_push_cut"),
+            [(
+                tracing::Level::WARN,
+                "dropped 2 item(s) (7 unit(s)) a cancelled push never reached the queue; counted \
+                 in test.queue.items.dropped{reason=\"shutdown\"}"
+                    .to_string()
+            )]
         );
 
         // Exact accounting: once drained, the queue takes a full batch without evicting.

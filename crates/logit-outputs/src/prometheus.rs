@@ -91,11 +91,13 @@
 //!   `aggregate`'s `max_retained_series`.
 //!
 //! **Type conflicts.** The exposition grammar allows one `# TYPE` per family name, so a `gauge`
-//! arriving for a name registered as a `counter` can't sit beside it. The new type wins: the
-//! family's type is replaced, and every series stored under the old type is dropped, counted
+//! arriving for a name registered as a `counter` can't sit beside it. The new type wins: every
+//! series stored under the old type is dropped, counted
 //! `logit.output.metrics.dropped{reason="type_conflict"}` once per series, with a throttled
-//! `family_retyped` warning naming the family. Keeping the old type would drop live data in favour
-//! of data that may already have expired.
+//! `family_retyped` warning naming the family, and the family takes the new type. When a name
+//! collision refuses the new type's series (below), the old type's are dropped all the same and
+//! the name holds nothing. Keeping the old type would drop live data in favour of data that may
+//! already have expired.
 //!
 //! **Name collisions.** Two families with different model names can write one `# TYPE` name: a
 //! text 0.0.4 counter `foo` and a gauge `foo_total` both write `# TYPE foo_total`, and an
@@ -468,6 +470,31 @@ struct StoredFamily {
     series: BTreeMap<LabelKey, Stored>,
 }
 
+/// Counts and warns the `evicted` series a re-type of `name` from `previous` to `kind` dropped:
+/// `metrics.dropped{reason="type_conflict"}` and a throttled `family_retyped`.
+fn retyped(
+    name: &str,
+    kind: FamilyType,
+    previous: FamilyType,
+    evicted: usize,
+    telemetry: &Telemetry,
+    diag: &mut Diagnostics,
+) {
+    if evicted == 0 {
+        return;
+    }
+    telemetry.count(METRICS_DROPPED, evicted as f64, &[("reason", "type_conflict")]);
+    diag.warn_throttled(
+        "family_retyped",
+        format_args!(
+            "metric family {name} arrived as a {} and dropped the {evicted} series held as a \
+             {}: a family name carries one type, and the newest wins",
+            kind.as_str(),
+            previous.as_str(),
+        ),
+    );
+}
+
 /// What a scrape renders. `BTreeMap` at both levels, so families iterate by name and series by
 /// label set; [`text::write`] orders families by their `# TYPE` name when it renders them.
 #[derive(Debug, Default)]
@@ -483,8 +510,9 @@ impl Registry {
     /// Upserts one family's series, latest wins. A family new to the registry, or re-typed, first
     /// settles a `# TYPE` name collision with the families held (module doc's "Name
     /// collisions"); then a type change drops every series stored under the old type (module
-    /// doc's "Type conflicts"). Both losses count and warn here, once per batch that causes them,
-    /// never per scrape.
+    /// doc's "Type conflicts"), even when the collision refuses the new type's series, so a
+    /// name's old type never outlives the arrival of its new one. Both losses count and warn
+    /// here, once per batch that causes them, never per scrape.
     fn upsert(
         &mut self,
         family: MetricFamily,
@@ -496,6 +524,12 @@ impl Registry {
         let held = self.families.get(&name).map(|stored| stored.kind);
         if held != Some(kind) && !self.settle_collisions(&name, kind, series.len(), telemetry, diag)
         {
+            // Refused for a collision, but still the newest type for its name: the old type's
+            // series go too.
+            if let Some(stored) = self.families.remove(&name) {
+                let evicted = stored.series.len();
+                retyped(&name, kind, stored.kind, evicted, telemetry, diag);
+            }
             return;
         }
         if let Some(stored) = self.families.get_mut(&name).filter(|stored| stored.kind != kind) {
@@ -503,18 +537,7 @@ impl Registry {
             let evicted = stored.series.len();
             stored.kind = kind;
             stored.series.clear();
-            if evicted > 0 {
-                telemetry.count(METRICS_DROPPED, evicted as f64, &[("reason", "type_conflict")]);
-                diag.warn_throttled(
-                    "family_retyped",
-                    format_args!(
-                        "metric family {name} arrived as a {} and dropped the {evicted} series \
-                         held as a {}: a family name carries one type, and the newest wins",
-                        kind.as_str(),
-                        previous.as_str(),
-                    ),
-                );
-            }
+            retyped(&name, kind, previous, evicted, telemetry, diag);
         }
         let entry = self.families.entry(name).or_insert_with(|| StoredFamily {
             kind,
@@ -2465,6 +2488,43 @@ mod tests {
             assert_eq!(probe.sum("logit.output.metrics.dropped", &collision), 1.0, "{body}");
             assert_eq!(diag.occurrences("family_name_collision"), 1, "{body}");
         }
+    }
+
+    /// A re-typed family refused for a collision still evicts its old type. Gauges `a` and
+    /// `a_total` share no `# TYPE` name, but a counter `a_total` is `# TYPE a` in OpenMetrics, so
+    /// `a`, sorting first, refuses it; the gauge `a_total` it re-types goes too, and only `a` is
+    /// left.
+    #[tokio::test]
+    async fn a_retype_refused_for_a_collision_still_drops_the_old_type() {
+        let mut probe = TelemetryProbe::new();
+        let telemetry = probe.telemetry("out", "prometheus_out", "sink");
+        let diag = Diagnostics::new("out");
+        let mut sink = ExposeOutput::new("127.0.0.1:0")
+            .with_expire_after(Duration::ZERO)
+            .with_diagnostics(diag.clone())
+            .with_telemetry(telemetry);
+        sink.send(&batch(vec![
+            metric_event("a", MetricKind::gauge(7.0), &[]),
+            metric_event("a_total", MetricKind::gauge(8.0), &[]),
+        ]))
+        .await
+        .unwrap();
+        sink.send(&batch(vec![metric_event("a_total", cumulative_counter(1.0), &[])]))
+            .await
+            .unwrap();
+
+        let (_sink, url) = bound(sink).await;
+        for accept in ["", "application/openmetrics-text"] {
+            let body = get(&format!("{url}/metrics"), &[("accept", accept)]).await.text().await;
+            let body = body.unwrap();
+            assert!(body.starts_with("# TYPE a gauge\na 7\n"), "{accept:?}: {body}");
+            assert!(!body.contains("a_total"), "{accept:?}: {body}");
+        }
+        let mut dropped = |reason| probe.sum("logit.output.metrics.dropped", &[("reason", reason)]);
+        assert_eq!(dropped("name_collision"), 1.0, "the arriving counter's series");
+        assert_eq!(dropped("type_conflict"), 1.0, "the held gauge's series");
+        assert_eq!(diag.occurrences("family_name_collision"), 1);
+        assert_eq!(diag.occurrences("family_retyped"), 1);
     }
 
     /// The sink's encoder is wired to the component's `Telemetry`, so codec drops are counted.
