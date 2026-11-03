@@ -1,6 +1,6 @@
 ---
 created: 2026-09-11
-updated: 2026-10-25
+updated: 2026-11-02
 ---
 
 # Prometheus scrape ingestion and exposition: transports, dialects, and the model mapping
@@ -700,3 +700,32 @@ The "Security posture" above no longer holds. `prometheus_out`'s exposition take
 is rendered and counted `logit.output.scrapes{class="unauthorized"}`), each rejected beside
 `endpoint:` by graph rule 56 ([ADR `listener-authentication`](listener-authentication.md)). The
 example configs still bind `127.0.0.1`, for the reason that section gives.
+
+## Amendment (2026-11-02): the registry settles a family's losses when it stores it
+
+Two of the registry's losses move from the scrape to the store, so each counts and warns once per
+batch that causes it, never once per scrape:
+
+- **A `# TYPE` name collision is settled when a family is stored.** The decision's "Two families
+  whose `# TYPE` names coincide write once" rule held at render time, so a registry holding such a
+  pair dropped and counted the loser's series again on every scrape. `prometheus_out`'s registry
+  now checks a family new to it, or re-typed, against the families it holds, in both dialects
+  since one registry serves both, and applies the same rule there: the family whose model name
+  sorts first stays. An arriving loser is never stored, and a held loser is removed. Each series
+  counts `logit.output.metrics.dropped{reason="name_collision"}`, with a throttled
+  `family_name_collision` warning naming both families. A pair that collides only in OpenMetrics
+  (a counter `foo_total` and a gauge `foo`, both `# TYPE foo`) is settled for a text 0.0.4
+  scraper too, which loses a family it could have read; settling per dialect would need the
+  per-scrape resolution this amendment removes. The writer keeps the rule for a caller with no
+  registry.
+- **A type conflict across batches is counted as loss.** The decision's
+  `logit.output.metrics.type_conflict`, one count per re-typed family, is now
+  `logit.output.metrics.dropped{reason="type_conflict"}`, one count per series the re-type drops:
+  the reason and unit the codec already uses for a record a type conflict drops within a batch.
+  A throttled `family_retyped` warning names the family. The new type still wins, and the old
+  name has no alias
+  ([ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)'s "Amendment (2026-11-02):
+  loss outside the vocabulary, and loss no line reported").
+
+`crates/logit-outputs/src/prometheus.rs`'s "Type conflicts" and "Name collisions" are the
+canonical statement.

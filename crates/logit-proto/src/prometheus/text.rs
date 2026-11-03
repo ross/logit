@@ -123,7 +123,9 @@
 //! - two families whose `# TYPE` lines would carry one name (a text 0.0.4 counter `foo` and a gauge
 //!   `foo_total`) can't both be written, since a second `# TYPE` line for a name makes Prometheus
 //!   reject the scrape: the one whose model name sorts first is written, and each series of the
-//!   other is counted `logit.output.metrics.dropped{reason="name_collision"}`;
+//!   other is counted `logit.output.metrics.dropped{reason="name_collision"}`. A caller that
+//!   holds families across writes settles the pair before it writes, with [`type_names_collide`],
+//!   so the drop counts once rather than once per write;
 //! - a family with no line to write (every series stale, or a summary holding only a `_created`
 //!   in text 0.0.4) loses its metadata lines too.
 //!
@@ -983,6 +985,45 @@ pub fn exposed_exemplar_keys(record: &logit_core::MetricRecord) -> Vec<Vec<Strin
         .collect()
 }
 
+/// Whether families `a` and `b`, each a model name and a type, would write one `# TYPE` name in
+/// either dialect, so [`write_with`] would write one of them and drop the other as a
+/// `name_collision`. A family is never its own collider: two different model names are compared.
+///
+/// `prometheus_out`'s registry calls it when it stores a family, so the registry never holds a
+/// pair a scrape would have to resolve.
+pub fn type_names_collide(a: (&str, FamilyType), b: (&str, FamilyType)) -> bool {
+    a.0 != b.0
+        && [Dialect::Text0_0_4, Dialect::OpenMetrics1_0].into_iter().any(|dialect| {
+            TypeName::of_parts(a.0, a.1, dialect) == TypeName::of_parts(b.0, b.1, dialect)
+        })
+}
+
+/// Every model name a family could carry and collide with `name` of `kind` under
+/// [`type_names_collide`]: each dialect's `# TYPE` name for it, that name with `_total` added, and
+/// that name with `_total` or `_info` removed. A candidate is only a name to look up; the caller
+/// confirms a collision with [`type_names_collide`] against the stored family's type.
+pub fn collision_candidates(name: &str, kind: FamilyType) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for dialect in [Dialect::Text0_0_4, Dialect::OpenMetrics1_0] {
+        let TypeName(prefix, suffix) = TypeName::of_parts(name, kind, dialect);
+        let written = format!("{prefix}{suffix}");
+        let mut push = |candidate: String| {
+            if candidate != name && !candidate.is_empty() && !out.contains(&candidate) {
+                out.push(candidate);
+            }
+        };
+        push(format!("{written}_total"));
+        if let Some(base) = written.strip_suffix("_total") {
+            push(base.to_string());
+        }
+        if let Some(base) = written.strip_suffix("_info") {
+            push(base.to_string());
+        }
+        push(written);
+    }
+    out
+}
+
 /// The name a family's `# TYPE` line carries in `dialect`, which is not always the model name
 /// ([`super`]'s "Family naming" table): a prefix of the model name and a suffix, so the writer
 /// orders and compares names without building them.
@@ -991,8 +1032,11 @@ struct TypeName<'a>(&'a str, &'static str);
 
 impl<'a> TypeName<'a> {
     fn of(family: &'a MetricFamily, dialect: Dialect) -> Self {
-        let name = family.name.as_str();
-        match (family.kind, dialect.is_openmetrics()) {
+        Self::of_parts(&family.name, family.kind, dialect)
+    }
+
+    fn of_parts(name: &'a str, kind: FamilyType, dialect: Dialect) -> Self {
+        match (kind, dialect.is_openmetrics()) {
             // A counter's value sample always ends in `_total`; only the family name differs.
             // OpenMetrics names the family without the suffix, text 0.0.4 with it.
             (FamilyType::Counter, true) => {
