@@ -318,7 +318,7 @@ pub async fn run_with_options(
         // Captured here, before the spawn loop's `telemetry.remove`, so a producer sorted after
         // its consumer still finds the consumer's handle.
         let consumer = telemetry.get(id).cloned().unwrap_or_default();
-        edges.insert(id.clone(), Edge::new(tx).with_telemetry(consumer));
+        edges.insert(id.clone(), Edge::new(tx).with_telemetry(consumer).with_consumer(id));
         inboxes.insert(id.clone(), rx);
     }
 
