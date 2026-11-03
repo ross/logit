@@ -23,8 +23,10 @@ use anyhow::Context;
 use logit_core::{Diagnostics, Event, EventBatch, Resource, Scope, SpanKind, Telemetry};
 use logit_proto::native::SeqId;
 use logit_script::{Heartbeat, ProcessOutcome, ScriptWorker};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::future::Future;
+use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
@@ -2556,10 +2558,17 @@ async fn run_flush(transform: &mut (dyn Transform + Send), fanout: &Fanout, tele
 /// [`watch_lua_thread`] awaits `done_rx` as the node's `JoinSet` entry, so the join loop treats a
 /// Lua exit like any task's. The loop runs under `catch_unwind` so a panic becomes a message, not
 /// a dropped sender; `AssertUnwindSafe` because `ScriptWorker` holds `Lua` and `Rc<RefCell>`s and
-/// nothing is used after the unwind. A script's own `process()`/`flush()` errors are logged and
-/// counted in [`run_lua_loop`] and never end the node. `done_tx` sends only after the [`LuaIo`]
-/// is taken out of `io` and dropped, so the downstream cascade is already underway when the
-/// watcher resolves.
+/// nothing is used after the unwind but `in_hand`, a `Cell` the loop only ever sets whole. A
+/// script's own `process()`/`flush()` errors are logged and counted in [`run_lua_loop`] and never
+/// end the node. `done_tx` sends only after the [`LuaIo`] is taken out of `io` and dropped, so
+/// the downstream cascade is already underway when the watcher resolves.
+///
+/// Any outcome but a clean return (a panic or a returned failure) counts what the node can no
+/// longer forward as `batches.dropped`/`events.dropped{reason="shutdown"}` through
+/// [`count_shutdown_drop`], so the `drain complete` line reports it: the batches still queued in
+/// its inbox (swept by [`revoke_lua_io`]) and, after a panic during a batch's `process()` pass,
+/// that batch, none of which was sent. A panic outside that pass (in a send or a `flush()`) loses
+/// what the loop held uncounted (`docs/known-gaps/transforms.md`).
 ///
 /// `io` is shared with the watcher so it can revoke the node's channels without the thread's
 /// cooperation (see [`LuaIo`]); `heartbeat` is how the watcher tells a working script from a
@@ -2607,6 +2616,8 @@ fn run_lua(
     let me = logit_core::interner::intern(&id);
 
     let loop_io = io.clone();
+    let in_hand: Rc<Cell<Option<u64>>> = Rc::default();
+    let loop_in_hand = in_hand.clone();
     let heartbeat_for_report = heartbeat.clone();
     let (sweep_telemetry, sweep_runtime) = (telemetry.clone(), runtime.clone());
     let verdict = max_memory.map(|cap| MemoryVerdict::new(cap, verdict_spacing));
@@ -2616,6 +2627,7 @@ fn run_lua(
             me,
             configured_interval,
             loop_io,
+            loop_in_hand,
             heartbeat,
             verdict,
             telemetry,
@@ -2627,17 +2639,24 @@ fn run_lua(
     // after shutdown could report a wedge before it reads the panic from `done_rx`.
     heartbeat_for_report.leave();
     // Dropped here, after a return or a panic alike, so the downstream cascade is underway
-    // before `done_tx` reports. `None` already if the watcher revoked it. A loop that failed the
-    // node left its inbox open with batches still queued, so those are swept and counted, as
-    // the watcher's revocation counts them. Counted `reason="shutdown"` whether or not a signal
-    // came first: the node is leaving the graph, and its failure starts the drain if none has.
+    // before `done_tx` reports. `None` already if the watcher revoked it, which counted the inbox
+    // itself. A loop that panicked or failed the node left its inbox open with batches still
+    // queued, so those are swept and counted, as the watcher's revocation counts them. Counted
+    // `reason="shutdown"` whether or not a signal came first: the node is leaving the graph,
+    // and its failure starts the drain if none has.
     let leftover = lock_io(&io).take();
-    let failed = matches!(outcome, Ok(Err(_)));
-    match leftover {
-        Some(io) if failed => {
-            sweep_runtime.block_on(revoke_lua_io(io, &sweep_telemetry, &shutdown_dropped))
+    let held = in_hand.take();
+    if matches!(outcome, Ok(Ok(()))) {
+        drop(leftover);
+    } else {
+        // `Some` only after a panic during a batch's `process()` pass: that batch, none of which
+        // was sent. It had left the inbox, so neither sweep counts it a second time.
+        if let Some(events) = held {
+            count_shutdown_drop(&sweep_telemetry, &shutdown_dropped, 1, events);
         }
-        leftover => drop(leftover),
+        if let Some(io) = leftover {
+            sweep_runtime.block_on(revoke_lua_io(io, &sweep_telemetry, &shutdown_dropped));
+        }
     }
     let panicked = outcome.is_err();
     let report = thread_outcome(outcome);
@@ -2982,12 +3001,17 @@ enum FlushOutcome {
 /// The heartbeat is busy only inside a script call: `enter()` before each `process()` and around
 /// `flush()`, `leave()` before anything is sent. A thread parked in a send is therefore never
 /// read as stalled, and never holds `io`'s lock while busy.
+///
+/// `in_hand` holds the received batch's event count for its `process()` pass and is `None`
+/// everywhere else, so after a panic [`run_lua`] can count the batch the pass lost. Nothing is
+/// sent during the pass, so the whole batch is lost.
 #[allow(clippy::too_many_arguments)]
 fn run_lua_loop(
     worker: ScriptWorker,
     me: logit_core::Symbol,
     configured_interval: Option<Duration>,
     io: SharedLuaIo,
+    in_hand: Rc<Cell<Option<u64>>>,
     heartbeat: Arc<Heartbeat>,
     mut verdict: Option<MemoryVerdict>,
     telemetry: Telemetry,
@@ -3219,6 +3243,7 @@ fn run_lua_loop(
         let mut discarded: u64 = 0;
         let mut errors: u64 = 0;
         let slots = scratch.dests.len();
+        in_hand.set(Some(batch.events.len() as u64));
         for event in batch.events {
             heartbeat.enter();
             let outcome = worker.process(event);
@@ -3247,6 +3272,7 @@ fn run_lua_loop(
             }
         }
         heartbeat.leave();
+        in_hand.set(None);
         drop(process_timer);
         worker.expire_registry_values();
         // Once per batch: how a script leaking VM-side state becomes visible
@@ -11448,6 +11474,134 @@ mod tests {
         let snapshot = rx.borrow().clone();
         assert_eq!(snapshot.phase, Phase::Failed);
         assert_eq!(snapshot.components.get("err_in"), Some(&NodeState::Failed));
+    }
+
+    /// What a `run_lua` thread fed a pre-filled inbox left behind once it reported.
+    struct QueuedLuaRun {
+        report: Result<(), String>,
+        telemetry: Totals,
+        /// The run's shutdown-drop tally, the sum `drain complete` reports.
+        tally: u64,
+        /// Events the node sent on its own edge.
+        sent: usize,
+    }
+
+    /// Runs `script` on a real `run_lua` thread whose inbox already holds `batches`, with
+    /// `targets` handed to the VM and no target edges behind them, and waits for its report.
+    async fn run_lua_with_queued(
+        script: &str,
+        interval: Option<Duration>,
+        targets: Vec<String>,
+        batches: Vec<EventBatch>,
+    ) -> QueuedLuaRun {
+        let (inbox_tx, inbox) = mpsc::channel(batches.len().max(1));
+        for batch in batches {
+            let delivered = Delivered::Owned(batch, TraceContext::new_root().into());
+            inbox_tx.send(delivered).await.expect("the inbox has room for every batch");
+        }
+        let (fanout, mut out_rx) = crate::test_util::fanout_channel(16);
+        let io: SharedLuaIo = Arc::new(std::sync::Mutex::new(Some(LuaIo {
+            inbox,
+            fanout,
+            target_fanouts: Vec::new(),
+        })));
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("enrich", "x", "x");
+        let tally = Arc::new(AtomicU64::new(0));
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (done_tx, done_rx) = oneshot::channel();
+        let (script, thread_tally, runtime) =
+            (script.to_string(), tally.clone(), tokio::runtime::Handle::current());
+        std::thread::spawn(move || {
+            run_lua(
+                "enrich".to_string(),
+                script,
+                Default::default(),
+                false,
+                interval,
+                targets,
+                ready_tx,
+                done_tx,
+                io,
+                Arc::new(Heartbeat::new()),
+                None,
+                LuaRuntimeConfig::default().min_verdict_spacing,
+                telemetry,
+                thread_tally,
+                runtime,
+            )
+        });
+        ready_rx.await.unwrap().expect("the script loads");
+        let report = tokio::time::timeout(RECV_TIMEOUT, done_rx)
+            .await
+            .expect("the thread reports")
+            .expect("the thread sends its report");
+        drop(inbox_tx);
+        let mut sent = 0;
+        while let Ok(delivered) = out_rx.try_recv() {
+            sent += unwrap_batch(delivered).events.len();
+        }
+        QueuedLuaRun {
+            report,
+            telemetry: Totals::of(registry.drain(0)),
+            tally: tally.load(std::sync::atomic::Ordering::Relaxed),
+            sent,
+        }
+    }
+
+    /// A Lua thread that panics with batches queued in its inbox counts each of them as a
+    /// shutdown drop, into the tally `drain complete` reports, as a `max_memory` failure does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_panicked_lua_nodes_queued_batches_are_counted_as_shutdown_drops() {
+        // The panic vector `a_lua_thread_panicking_after_ready_flips_failed_and_returns_runtime`
+        // uses: a zero interval panics in `advance_flush_deadline` before the first receive.
+        let run = run_lua_with_queued(
+            "function process(event) return event end",
+            Some(Duration::ZERO),
+            Vec::new(),
+            (0..3).map(|_| counter_batch_of(4)).collect(),
+        )
+        .await;
+
+        let message = run.report.expect_err("a panic fails the node");
+        assert!(message.contains("panicked"), "{message}");
+        assert_eq!(run.telemetry.sum("logit.component.events.received", &[]), 0.0);
+        assert_eq!(run.sent, 0);
+        let shutdown = [("reason", "shutdown")];
+        assert_eq!(run.telemetry.sum("logit.component.batches.dropped", &shutdown), 3.0);
+        assert_eq!(run.telemetry.sum("logit.component.events.dropped", &shutdown), 12.0);
+        assert_eq!(run.tally, 3, "the sweep reaches the drain complete tally");
+    }
+
+    /// A Lua thread that panics inside a `process()` call counts the batch those calls were
+    /// working through as a shutdown drop, beside the batches still queued behind it.
+    ///
+    /// The panic vector is `lua_slot_of`'s `debug_assert`: the VM knows a target the node has
+    /// no edge for, which the runtime never builds, so only a debug build panics on it.
+    #[cfg(debug_assertions)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lua_node_panicking_mid_batch_counts_the_batch_in_hand_as_a_shutdown_drop() {
+        let run = run_lua_with_queued(
+            r#"function process(event) return event:to("t") end"#,
+            None,
+            vec!["t".to_string()],
+            (0..3).map(|_| counter_batch_of(4)).collect(),
+        )
+        .await;
+
+        let message = run.report.expect_err("a panic fails the node");
+        assert!(message.contains("target slot"), "the slot assertion panicked: {message}");
+        assert_eq!(run.telemetry.sum("logit.component.batches.received", &[]), 1.0);
+        assert_eq!(run.telemetry.sum("logit.component.events.received", &[]), 4.0);
+        assert_eq!(run.sent, 0);
+        let shutdown = [("reason", "shutdown")];
+        assert_eq!(
+            run.telemetry.sum("logit.component.batches.dropped", &shutdown),
+            3.0,
+            "the batch in hand and the two queued behind it"
+        );
+        assert_eq!(run.telemetry.sum("logit.component.events.dropped", &shutdown), 12.0);
+        assert_eq!(run.tally, 3);
     }
 
     /// A Lua thread panicking after `Ready` fails the run like a task: `Runtime`, others drained.

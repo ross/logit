@@ -481,10 +481,14 @@ its cap stays over it, and a push is cut once, at shutdown.
 `batches.dropped{reason="shutdown"}`, and the one production caller of `push_many` is a UDP
 listener's receive queue, whose items are datagrams, not batches.
 
-A wedged or failed Lua node's inbox sweep (`revoke_lua_io`, on a wedge past the shutdown grace,
-a `max_memory` failure, or another error that fails the node) counts `batches.dropped{reason="shutdown"}` through
-the same path a sink's abandoned inbox does, so `drain complete` logs it, as the sink section's
-"A line already in the path covers its drop" allows.
+A wedged, failed, or panicked Lua node's inbox sweep (`revoke_lua_io`, on a wedge past the
+shutdown grace, a `max_memory` failure, a panic on the node's thread, or another error that fails
+the node) counts `batches.dropped{reason="shutdown"}` through the same path a sink's abandoned
+inbox does, so `drain complete` logs it, as the sink section's "A line already in the path covers
+its drop" allows. A panic during a batch's `process()` pass also counts that batch there, since
+the pass sends nothing until it ends; a panic outside the pass, in a send or a `flush()`, loses
+what the thread held uncounted, a gap [`docs/known-gaps/transforms.md`](../known-gaps/transforms.md) keeps open. The
+`thread_panicked` error line says the node failed and leaves the count to `drain complete`.
 
 The type-conflict rename reverses the 2026-10-13 close-out's "`output.metrics.type_conflict` keeps
 its name": that series was live data the registry removed, which is loss, and the codec already

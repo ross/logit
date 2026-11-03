@@ -116,7 +116,9 @@ was missing was executable evidence under real concurrency, and the shutdown acc
    `max_memory` failure can land before the drain or after it has begun (`run_lua_loop`'s
    `flush_now` and `check_at_close` verdicts). Either way the revoked inbox's contents are
    dropped because the node is leaving the graph, on or after the drain's start, so the label
-   stays `shutdown`.
+   stays `shutdown`. [Since [ADR `lua-runaway-script-bounds`](lua-runaway-script-bounds.md)'s
+   2026-11-02 amendment, `run_lua` sweeps after a panic on its thread too, and calls
+   `count_shutdown_drop` itself for the batch a panicked `process()` pass held.]
 
    The field doesn't include events a `Fanout` drops as `closed_consumer`, UDP datagram drops (a
    different unit), overflow evictions during the drain, or the disk sweep's push failures

@@ -337,7 +337,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **Workaround:** a script that wants that relationship tracks contributing contexts itself
     inside `process()`.
 - **A batch sent into a revoked Lua inbox after `REVOKE_DRAIN_TIMEOUT` is lost uncounted.**
-  `revoke_lua_io`, run when the watcher revokes a wedged node or when the Lua thread's loop fails,
+  `revoke_lua_io`, run when the watcher revokes a wedged node or when the Lua thread's loop fails
+  or panics,
   closes the inbox and counts each batch it still receives as `batches.dropped{reason="shutdown"}`
   under the node's id. It receives for `REVOKE_DRAIN_TIMEOUT` (250 ms) only.
   - **Consequence:** a producer that reserved its permit before the close and is still blocked on
@@ -347,6 +348,16 @@ Entry format and the other areas: [the known-gaps index](README.md).
     decision 1.
   - **Revisit trigger:** a revoked node's `dropped` count falls short of its producers' `sent` in
     practice.
+- **What a Lua node held outside a `process()` pass when its thread panicked is lost uncounted.**
+  A panic sweeps and counts the node's inbox, and a panic during a batch's `process()` pass counts
+  that batch, both as `batches.dropped{reason="shutdown"}`
+  ([ADR `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md)'s 2026-11-02
+  amendment). A panic in a send or in a `flush()` loses what the thread held there with no count.
+  - **Consequence:** in a send, the partitions not yet sent; in a `flush()`, the events it
+    returned. A send cut partway has delivered some partitions, so counting the whole batch would
+    count delivered events as lost, and a `flush()`'s events come from no input batch.
+  - **Revisit trigger:** a panic in either place in practice. Either is a bug in `logit`, not a
+    script's fault, and the fix is the bug's.
 - **A caught error from a Rust callback other than `Event.new` costs a walk of the script's
   global tables.** mlua 0.9.9 builds a traceback for every error a Rust callback returns, and
   mlua-sys 0.6.8's compat53 `luaL_traceback`, which it binds for LuaJIT, names an anonymous C
