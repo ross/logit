@@ -150,9 +150,12 @@ for internally generated points.
 **Cardinality is capped.** A component's buffer holds at most 1024 distinct `(name, tags)` keys
 (`telemetry::MAX_KEYS_PER_COMPONENT`). A new key beyond the cap is dropped and counted as
 `logit.internal.points.dropped{reason="cardinality"}` under that component's own
-`component`/`kind`/`role` attributes. This is the bound-and-count-the-drop convention every mature
-statsd client uses for its own send failures, and it makes a component that violates the tag
-convention visible instead of silently growing the interner. Under the tag convention the cap never
+`component`/`kind`/`role` attributes. The first drop also logs a `telemetry_points_capped` warn
+line naming the component and the point's name, once per component for the process's life: a
+component over the cap stays over it, so later drops are counted only. This is the
+bound-and-count-the-drop convention every mature statsd client uses for its own send failures, and
+it makes a component that violates the tag convention visible instead of silently growing the
+interner. Under the tag convention the cap never
 fires in practice, because cardinality is bounded by the metric names and constant tag values in a
 component's code, not by traffic.
 
@@ -265,7 +268,8 @@ identity to coalesce on, so `ComponentBuffer` holds spans in a separate, unkeyed
 how many spans accumulate except drain interval × sample rate. `SpanGuard::link`/`links` also cap
 each span's own link list at `MAX_LINKS_PER_SPAN` (32). Both count rather than grow: a span past
 the buffer cap is lost, as `logit.internal.spans.dropped{reason="buffer_full"}` (drained alongside
-`points.dropped`), and a link past the span's cap is left off a span that's still exported, as
+`points.dropped`), and the first one logs a `telemetry_spans_capped` warn line, once per component
+for the process's life, as the points cap does. A link past the span's cap is left off a span that's still exported, as
 `logit.internal.span.links.omitted{reason="cardinality"}`, recorded immediately on the guard.
 
 ### Span versus point, side by side
@@ -328,6 +332,14 @@ Where an event lands:
 many accumulate except drain interval × how chatty a component's diagnostics are. The drained
 `Event::timestamp` is capture time, not drain time, as for spans: a log line that looks later than
 it was would be actively misleading.
+
+Unlike the points and spans caps, this one logs no line when it drops. The line would be one more
+`logit` warning, which `TelemetryLayer` captures straight back into the full buffer, where it would
+be dropped in turn. And the log that was dropped has already been written to stderr under the
+operator's `--log-level`: only its copy in the pipeline is lost, which `logs.dropped` counts. It's
+the one counted loss with no line
+([ADR `telemetry-loss-vocabulary`](../adr/telemetry-loss-vocabulary.md)'s "Amendment (2026-11-02):
+loss outside the vocabulary, and loss no line reported").
 
 ## `internal`: the drain
 
@@ -570,7 +582,7 @@ every producer the send-side numbers for free:
 | `logit.component.batches.sent` | count | one per `Fanout::send` call, regardless of fan-out width. A `Fanout::send_with_deadline` (`datadog_in`) that times out sends nothing and counts nothing, span and `send.blocked.duration` included |
 | `logit.component.events.sent` | count | events in that batch |
 | `logit.component.send.blocked.duration` | timing | time spent inside one `Fanout::send` call (all consumers) |
-| `logit.component.events.dropped{reason="closed_consumer"}` | count | a consumer's channel was already closed |
+| `logit.component.events.dropped{reason="closed_consumer"}` | count | a consumer's channel was already closed. The first drop on each edge, one producer to one consumer, also logs a `closed_consumer` warn line naming both; later drops on that edge are counted only |
 
 #### Inbox side: recorded under the consumer
 
@@ -728,6 +740,9 @@ its backend:
 - `buffer_recovered` (warn): utilization fell below `buffer.recover_below` (default `0.75`), with
   the episode's duration and totals.
 - `buffer_full_at_shutdown` (warn): the sink finished with the buffer still full.
+- `buffer_shed_unannounced` (warn): the sink finished after episodes no `buffer_full` line had
+  announced, because the once-a-minute limit held it back, shed data. It carries their count and
+  totals, and notes when the last was still open.
 
 None of them counts in `logit.component.diagnostics`; the `*.dropped` rows above stay the record of
 loss.
@@ -817,9 +832,10 @@ Three naming choices, because the obvious names collide with existing ones:
 - **`push.blocked.duration` records only under `overflow: block`**, which is never the receive
   queue's default (see the ADR).
 
-The receive queue writes the sink store's `buffer_full`, `buffer_recovered`, and
-`buffer_full_at_shutdown` keys (see "Sinks: `SinkStore`"), naming `receive.max_datagrams` or
-`receive.max_bytes`, counting datagrams and bytes, and recovering below `receive.recover_below`.
+The receive queue writes the sink store's `buffer_full`, `buffer_recovered`,
+`buffer_full_at_shutdown`, and `buffer_shed_unannounced` keys (see "Sinks: `SinkStore`"), naming
+`receive.max_datagrams` or `receive.max_bytes`, counting datagrams and bytes, and recovering below
+`receive.recover_below`.
 
 #### TCP listeners: the kernel accept queue
 
@@ -2729,8 +2745,12 @@ object's close to its answer, are layer 2's
 - Registry state, which no push sink holds: `logit.output.series` (gauge, series held after each
   `send`); `logit.output.series.evicted{reason="expired"|"cardinality"}` (the `expire_after` sweep,
   run on every `send` *and* every scrape, and the `max_series` LRU cap); and
-  `logit.output.metrics.type_conflict` (a family re-typed across batches, evicting every series
-  held under the old type).
+  `logit.output.metrics.dropped{reason="type_conflict"|"name_collision"}` for the series the
+  registry drops when it stores a family: every series held under a family's old type when a
+  later batch re-types it, and the series of whichever of two families writing one `# TYPE` name
+  sorts second. Each counts once per series, in the batch that causes it, never per scrape, with
+  a throttled `family_retyped` or `family_name_collision` warning naming the families
+  (`crates/logit-outputs/src/prometheus.rs`'s "Type conflicts" and "Name collisions").
 
 **Sender mode (`endpoint:`)** is the ordinary push shape and uses `otlp_out`'s vocabulary
 **exactly**, because it reuses that transport's own `Fault` table as code
@@ -2770,8 +2790,10 @@ it takes (the class table above).
 - `logit.output.metrics.dropped{reason="unresolved_delta"|"unresolved_gauge_delta"|
   "type_conflict"|"name_collision"}`: a delta `Sum` or `Histogram`, or a `GaugeDelta`, with no
   `aggregate` upstream to resolve it, a delta `Summary`, which only `cumulative_to_delta` makes
-  and no Prometheus family can carry, and two records that can't share one family. The last two
-  reasons are *within* one batch, distinct from the cross-batch `type_conflict` counter above.
+  and no Prometheus family can carry, and two records that can't share one family. The codec
+  counts the last two reasons for records *within* one batch; the registry counts the same two
+  across batches, above. A render meets no `name_collision` in registry mode: the registry never
+  holds a colliding pair.
 - `logit.output.metrics.skipped{metric_kind="exponential_histogram"}` in registry mode, where
   neither text dialect has a form for one, and `{reason="no_recorded_value"}`.
 - `logit.output.metrics.degraded{metric_kind="non_monotonic_sum"|"distribution"|"samples"|"set"|

@@ -1,6 +1,6 @@
 ---
 created: 2026-10-13
-updated: 2026-10-30
+updated: 2026-11-02
 ---
 
 # Telemetry loss vocabulary: any nonzero `*.dropped` is loss, and intended outcomes use other words
@@ -199,6 +199,7 @@ same date has the bounds of the count and how it enters the sink identity.
 - **`output.metrics.type_conflict` keeps its name** (a row in the Outputs table). It counts a
   family `prometheus_out`'s registry replaced because a later batch re-typed it: the new type
   wins and the old type's series are evicted, because exposition allows one type per family.
+  The 2026-11-02 amendment below renames it to `output.metrics.dropped{reason="type_conflict"}`.
 - **The soak harness reads every `*.dropped` as loss.** Its `drops` row surfaces every
   `logit.*.dropped` counter the system under test emits that no ledger row balances
   ([ADR `soak-harness`](soak-harness.md), `tools/soak/README.md`).
@@ -411,6 +412,35 @@ same reason a `503` is, so the name stays outside `*.dropped`.
 
 [internal-telemetry.md](../design/internal-telemetry.md#loss-vocabulary)'s "Loss vocabulary" row
 for `input.batches.deferred` carries the wider meaning.
+
+## Amendment (2026-11-02): loss outside the vocabulary, and loss no line reported
+
+An audit of losses that never reach stderr found one counter outside the vocabulary and four
+counted losses that write no line. The rule this amendment holds them to: **every counted loss
+also logs a `warn` line**, so an operator reading only `logit`'s log, or only `internal`'s
+default `logs: warn` capture, learns of it. The counter stays the record of how much; the line
+says that it happened and why. A loss that repeats for one lasting cause logs once for that cause,
+and one that recurs per batch is throttled, so the line never becomes a flood.
+
+| Loss | Counter | Line |
+|---|---|---|
+| A `prometheus_out` registry family re-typed across batches, its old series dropped | `output.metrics.type_conflict` (untagged, one per family) is renamed `output.metrics.dropped{reason="type_conflict"}`, one per series dropped | `family_retyped`, throttled |
+| Two `prometheus_out` registry families writing one `# TYPE` name | `output.metrics.dropped{reason="name_collision"}`, counted once per batch when the family is stored, where it was counted again on every scrape | `family_name_collision`, throttled |
+| A `Fanout` send into a closed consumer | `component.events.dropped{reason="closed_consumer"}`, unchanged | `closed_consumer`, once per producer and consumer pair, naming both |
+| A buffer or receive queue that shed data in a full episode the throttle never announced, then finished | the overflow `*.dropped` counters, unchanged | `buffer_shed_unannounced` at shutdown ([ADR `buffer-full-diagnostics`](buffer-full-diagnostics.md)'s "Amendment: shutdown reports what no line announced (2026-11-02)") |
+| A point or span `internal`'s per-component buffer couldn't hold | `internal.points.dropped{reason="cardinality"}`, `internal.spans.dropped{reason="buffer_full"}`, unchanged | `telemetry_points_capped`, `telemetry_spans_capped`, once per component per cap |
+
+The type-conflict rename reverses the 2026-10-13 close-out's "`output.metrics.type_conflict` keeps
+its name": that series was live data the registry removed, which is loss, and the codec already
+counts a record a type conflict drops within a batch under the same reason and unit. There's no
+alias.
+
+`internal.logs.dropped{reason="buffer_full"}` is the one counted loss with no line. The line
+would be a `logit` log that `TelemetryLayer` captures back into the same full buffer, where it
+would be dropped in turn, and the log that was dropped has already been written to stderr under
+the operator's `--log-level`: only its copy in the pipeline is lost.
+[internal-telemetry.md](../design/internal-telemetry.md)'s "Logs" section carries the same
+statement.
 
 ## Migration record
 The classification of every `*.dropped`, `*.skipped`, `*.degraded`, `*.truncated`, and loss-related
