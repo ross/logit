@@ -1,6 +1,6 @@
 ---
 created: 2026-10-08
-updated: 2026-10-31
+updated: 2026-11-03
 ---
 
 # A soak harness: real containers over ordinary config, one-shot netem, and a reset-aware ledger as the loss oracle
@@ -810,6 +810,30 @@ in the middle of a `logit` life, such as the queue of its own sink at a kill, ch
 stored total, so the egress rows see it only when it holds a life's last value. That's the
 property the scenario soaks: a cumulative relay through a stateless hop. A relay can't be
 combined with a hop, every sink names the same one, and the target is local.
+
+## Amendment: a relay balances its own lives (2026-11-03)
+
+The relay amendment above judged a relay's losses only through V, so a loss inside it showed
+only when it held a `logit` life's last value. A relay now gets a row of its own,
+`ledger.relay`, read on its own lives, which no other row reads. Each `[[ledger.sink]]` that
+names a `relay` also names the relay's listener it writes to, `relay_listener`, and the relay's
+sink that listener alone feeds, directly, `relay_sink`; `load()` checks both against the
+relay's config. Per relay life, the listener's events sent less its counted drops must equal
+the sink's events received, and those its events delivered plus its counted drops.
+
+- **Exact, where the life ended cleanly.** A life a stop or a restart ended, and the final life
+  the end sequence stopped, end with a drain after every data node has exited, so both gaps
+  must be 0, as a stopped life's residual is under `split = "target"`. A life a kill or an
+  `exit` ended loses its last drain interval and its sink's queue, and its gaps are reported.
+- **The HTTP listener rule carries over.** On an `HTTP_LISTENERS` kind, such as `otlp_in`, a
+  request the shutdown backstop cut was never counted sent, so its `shutdown` drop stays out
+  of the listener's drops, as it does on an HTTP wire.
+- **A counted drop balances; a fault drop FAILs.** A drop at either end leaves no gap, and a
+  `rejected` or `disk_corrupt` batch drop at the relay sink FAILs, as at a SUT sink. `drops`
+  still lists the relay's drops beside the row.
+- **The hop into the relay stays V's.** `logit`'s sink and the relay's listener are two
+  processes whose lives don't pair, and an ambiguous resend reaches the relay twice, so the row
+  doesn't compare them.
 
 ## Amendment: OTLP and HEC stand-ins overwrite under cumulative temporality, and name loss by position (2026-10-29)
 

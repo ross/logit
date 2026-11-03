@@ -672,7 +672,10 @@ services:
   in `relay`, there is no hop, and `logit` holds `sut_aggregate` and the sinks
   (`Scenario.sink_sut`, recorded as `sink_sut`), so every ledger row reads `logit`'s lives
   and V splits on them. The relay passes the sinks' writes on to their backend with `logit`'s
-  timestamps (item 25's `otlp-grpc-egress`).
+  timestamps (item 25's `otlp-grpc-egress`). Each such sink also names `relay_listener`, the
+  relay's listener it writes to, and `relay_sink`, the relay's sink that listener alone feeds,
+  directly; `load()` checks both against the relay's config, and `ledger.relay` (§6) balances
+  the relay between them.
 - From W10b a second SUT service needs a `[[ledger.hop]]` naming the native hop that joins it to
   `logit`, and a scenario has at most one hop, so at most two SUT services ("The native hop
   (W10b)" in §8d). From W12b an `[overlap]` table instead runs two or more instances of one
@@ -1616,6 +1619,15 @@ The rows:
   `tail-outage-stop` and `kafka-outage-stop`. A `min` of 1 says only that the drop happened, not
   how large it was: the excuse leaves its size unbounded by design, and a `max` on the same
   expectation bounds it.
+- `ledger.relay`, for a sink with a `relay` only, else no row: per relay life, in events,
+  E_r − X_r == S_r and S_r == Del_r + Drop_r, E_r and X_r the `relay_listener`'s events sent
+  and dropped (`shutdown` left out of X_r on an `HTTP_LISTENERS` kind, as on an HTTP wire),
+  S_r, Del_r, and Drop_r the `relay_sink`'s events received, delivered, and dropped. A life a
+  stop or a restart ended, and the final life once the end sequence stopped the relay, ends
+  with a drain after every data node has exited, so both gaps must be 0; a life a kill or an
+  `exit` ended, or a final life the end sequence didn't stop, is reported. A `rejected` or
+  `disk_corrupt` batch drop at the relay sink FAILs. V still judges what the relay stored, and
+  `drops` still lists the relay's drops.
 - `ledger.overlap` (W12b), under `[overlap]` only, else no row: the run's G − Σ(W + K + F)
   against what the instances' socket closes could discard. Under `[overlap]` the per-life rows
   judge each instance on its own lives and the wire, `progress`, and `recovery` judge them
@@ -3298,6 +3310,11 @@ that items 3, 7, and 11 need.
   paths with minted `ackId`s and `/ack` replies, their V and `ledger.standin` rules, self-test
   fixtures for each, a scenario per shape with a run recorded under "Findings", and AGENTS.md's
   response-class invariant extended to both sinks.
+
+- **Round-3 follow-ups** (`soak/round3-followups`, off `main`): a self-test case for W25's
+  X / 3 cap on a scrape's dropped batches, and the `ledger.relay` row with its
+  `relay_listener` and `relay_sink` keys, an amendment to ADR `soak-harness`, and self-test
+  fixtures for each rule. W28's finding that a relay had no row of its own is the second.
 
 §10's follow-ups to items 11 and 12, and its list deferred to a later round, have no workstream
 yet.

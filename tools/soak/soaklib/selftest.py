@@ -124,7 +124,12 @@ listener rows on `logit`'s lives and the rows from `aggregate` on on `collector`
 pause and within its allowance for a killed side's tail and a send window of duplicates after a
 kill or a pause of `collector`, a counted hop drop, a rejected hop batch, `ledger.summary`'s
 end-to-end bound, the hop sink's replay band and identity, `recovery` on each side's own drains,
-`drops` keyed on service, and an end-sequence phase read for its own service.
+`drops` keyed on service, and an end-sequence phase read for its own service. For a relay, it
+covers every rule its sink's `relay`, `relay_listener`, and `relay_sink` are held to against the
+relay's config, the end sequence stopping the relay last, every ledger row reading `logit`'s
+lives across it, and `ledger.relay` over the relay's own lives: balanced, a gap into or past its
+sink FAILing, a counted drop at either end balancing, an `otlp_in` `shutdown` drop left out, a
+rejected batch FAILing, a stopped life judged, and a killed or unstopped one reported.
 
 For a stand-in target, it covers the Snappy decoder against blocks `snap::raw` wrote
 (`standin/snap-vectors.json`) and the malformed blocks it refuses, the `WriteRequest` walker,
@@ -8475,6 +8480,44 @@ def _relay_rules(root):
     ext["ledger"]["sink"][0]["relay"] = "collector"
     _refused(ext_path, ext, "`relay` carries a sink's writes to a backend, and the external "
              "target has none", "a relay to an external target")
+    sink_edits = (
+        (lambda sink: sink.pop("relay_listener"), "it's missing `relay_listener`",
+         "a relay sink with no relay_listener"),
+        (lambda sink: sink.update(relay_sink=5), "`relay_sink` must name a component id",
+         "a relay_sink that isn't an id"),
+        (lambda sink: sink.update(relay_listener="victoria_metrics"),
+         "`relay_listener` victoria_metrics must be a listener in logit-collector.yaml, and "
+         "it's a prometheus_out", "a relay_listener that isn't a listener"),
+        (lambda sink: sink.update(relay_sink="nowhere"),
+         "`relay_sink` nowhere isn't a component in logit-collector.yaml",
+         "a relay_sink the relay doesn't run"),
+        (lambda sink: sink.update(relay_sink="telemetry"),
+         "`relay_sink` telemetry must take `relay_listener` otlp's events directly",
+         "a relay_sink the listener doesn't feed"),
+        (lambda sink: (sink.pop("relay"), sink.pop("relay_sink")),
+         "`relay_listener` names a relay's component, and the sink names no `relay`",
+         "relay_listener with no relay"),
+    )
+    for edit, needle, what in sink_edits:
+        _refused(path, mutate(lambda r, edit=edit: edit(r["ledger"]["sink"][0])), needle, what)
+    _refused(path, mutate(lambda r: r["ledger"]["sink"].append(
+        {**r["ledger"]["sink"][0], "id": "other"})),
+             "`relay_listener` otlp is another sink's too", "two sinks on one relay listener")
+    with tempfile.TemporaryDirectory() as tmp:
+        copied = Path(tmp) / "otlp-grpc-egress"
+        shutil.copytree(path.parent, copied)
+        relay_file = copied / "logit-collector.yaml"
+        relay_file.write_text(relay_file.read_text().replace(
+            "  self: {", "  archive:\n    type: stdio_out\n    sources:\n      - otlp\n"
+            "  self: {", 1))
+        _refused(copied / "scenario.toml", copy.deepcopy(raw),
+                 "`relay_listener` otlp feeds archive too; `relay_sink` victoria_metrics must "
+                 "take its events alone", "a relay listener feeding a second component")
+    expect(scenario.config_sources("  a:\n    sources: [x, 'y']\n", "a") == ["x", "y"]
+           and scenario.config_sources("  a:\n    sources:\n      - x  # one\n      - y\n"
+                                       "  b: {}\n", "a") == ["x", "y"]
+           and scenario.config_sources("  a: { type: null_out }\n", "a") == [],
+           "config_sources reads flow and block lists, and [] for none")
     over_path = root / "scenarios" / "rolling-overlap" / "scenario.toml"
     over = tomllib.loads(over_path.read_text())
     over["ledger"]["sink"][0]["relay"] = "logit-b"
@@ -8533,31 +8576,65 @@ def _relay_driver(root):
                f"logit stops once the sink the relay carries on is drained, got {drained}")
 
 
+RELAY_KILL = (203, 213)
+RELAY_CONFIG = ("components:\n"
+                "  otlp: { type: otlp_in, bind: 0.0.0.0:4317, protocol: grpc }\n"
+                "  victoria_metrics:\n"
+                "    type: prometheus_out\n"
+                "    sources: [otlp]\n"
+                "    endpoint: http://victoria-metrics:8428/api/v1/write\n"
+                "  self: { type: internal, interval: 5s }\n"
+                "  telemetry: { type: stdio_out, sources: [self], format: json }\n")
+RELAY_PER_DRAIN = 100
+
+
+def _relay_run(tmp, name, action="kill", extra=(), stopped=True, keys=True):
+    """`_ledger_run`'s two-life run with its sink's writes carried on by a relay, `collector`,
+    whose `action` (a `kill` or a `stop`) over `RELAY_KILL` gives it two lives. Each 5 s drain
+    the relay's `otlp` sends `RELAY_PER_DRAIN` events on to `victoria_metrics`, which receives
+    and delivers them, plus `extra` lines; with `stopped` the end sequence stopped it, and with
+    `keys` its sink names `relay_listener` and `relay_sink`."""
+    kill = RELAY_KILL
+    relay_timeline = [_action("apply", "c0s2", action, "collector", kill[0]),
+                      _action("revert", "c0s2", action, "collector", kill[1] - 1, kill[1]),
+                      _ready("c0s2", "collector", kill[1] + 1)]
+    if stopped:
+        relay_timeline.append(_phase("sut_stopped", 325, service="collector"))
+    run_dir = _ledger_run(tmp, name, timeline_extra=relay_timeline)
+    resolved_path = run_dir / "scenario.resolved.json"
+    resolved = json.loads(resolved_path.read_text())
+    resolved["suts"] = ["logit", "collector"]
+    resolved["sink_sut"] = "logit"
+    resolved["services"] = dict(TWO_SUT_ROLES)
+    resolved["configs"] = {**(resolved.get("configs") or {}), "collector": "collector.yaml"}
+    resolved["ledger"]["sink"][0]["relay"] = "collector"
+    if keys:
+        resolved["ledger"]["sink"][0].update(relay_listener="otlp", relay_sink="victoria_metrics")
+    resolved_path.write_text(json.dumps(resolved))
+    (run_dir / "configs").mkdir(exist_ok=True)
+    (run_dir / "configs" / "collector.yaml").write_text(RELAY_CONFIG)
+    relay = []
+    for offset in range(5, 321, 5):
+        if kill[0] <= offset < kill[1]:
+            continue
+        start = kill[1] if offset >= kill[1] else -1
+        stamp = _stamp(T0 + offset)
+        relay.append(_line(stamp, "logit.process.uptime", "gauge", float(offset - start)))
+        relay.append(_line(stamp, "logit.component.events.sent", "sum", RELAY_PER_DRAIN,
+                           component="otlp"))
+        for metric in ("logit.component.events.received", "logit.component.events.delivered"):
+            relay.append(_line(stamp, metric, "sum", RELAY_PER_DRAIN,
+                               component="victoria_metrics"))
+    (run_dir / "logs" / "collector.stdout").write_text("\n".join(relay + list(extra)) + "\n")
+    return run_dir
+
+
 def _relay_checks():
     """A run whose sink's writes a relay carries on: every ledger row reads `logit`, which holds
     the listener, `aggregate`, and the sink, and V splits on `logit`'s lives, while a kill of the
-    relay gives it two lives of its own that no row reads."""
+    relay gives it two lives of its own, which only `ledger.relay` reads."""
     with tempfile.TemporaryDirectory() as tmp:
-        kill = (203, 213)
-        relay_timeline = [_action("apply", "c0s2", "kill", "collector", kill[0]),
-                          _action("revert", "c0s2", "kill", "collector", kill[1] - 1, kill[1]),
-                          _ready("c0s2", "collector", kill[1] + 1)]
-        run_dir = _ledger_run(tmp, "relay", timeline_extra=relay_timeline)
-        resolved_path = run_dir / "scenario.resolved.json"
-        resolved = json.loads(resolved_path.read_text())
-        resolved["suts"] = ["logit", "collector"]
-        resolved["sink_sut"] = "logit"
-        resolved["services"] = dict(TWO_SUT_ROLES)
-        resolved["ledger"]["sink"][0]["relay"] = "collector"
-        resolved_path.write_text(json.dumps(resolved))
-        relay = []
-        for offset in range(5, 321, 5):
-            if kill[0] <= offset < kill[1]:
-                continue
-            start = kill[1] if offset >= kill[1] else -1
-            relay.append(_line(_stamp(T0 + offset), "logit.process.uptime", "gauge",
-                               float(offset - start)))
-        (run_dir / "logs" / "collector.stdout").write_text("\n".join(relay) + "\n")
+        run_dir = _relay_run(tmp, "relay")
         data = checks.RunData(run_dir)
         led = checks.Ledger(data)
         expect(data.sut_out == "logit" and led.problems == [] and not led.across
@@ -8570,6 +8647,96 @@ def _relay_checks():
             expect(rows[row].status == checks.PASS,
                    f"{row} reads logit's lives across a relay, got {rows[row].status}: "
                    f"{rows[row].detail}")
+
+
+def _relay_ledger():
+    """`ledger.relay` over `_relay_run`: per relay life, the listener's sends less its drops
+    against the relay sink's receipts, and those against its deliveries and drops; a stopped
+    life and a final life the end sequence stopped judged at 0, a killed one reported, a counted
+    drop at either end balancing, a listener's `shutdown` drop left out of X_r, and a rejected
+    batch FAILing."""
+    def at(offset, metric, value, component="victoria_metrics", **attrs):
+        return _line(_stamp(T0 + offset), metric, "sum", value, component=component,
+                     attrs=attrs or None)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        def row(name, **kwargs):
+            found = [r for r in checks.run_all(_relay_run(tmp, name, **kwargs))
+                     if r.id == "ledger.relay"]
+            return found[0] if len(found) == 1 else None
+
+        clean = row("relay-clean")
+        expect(clean is not None and clean.status == checks.PASS
+               and "collector life 1 (final): E_r − X_r 2,200 − 0 − S_r 2,200 = 0; "
+                   "S_r − Del_r − Drop_r 2,200 − 2,200 − 0 = 0, balanced" in clean.detail
+               and "collector life 0: E_r − X_r 4,000 − 0 − S_r 4,000 = 0" in clean.detail
+               and "reported: a kill loses" in clean.detail,
+               f"a relay that passes on every event it took balances, its killed life reported, "
+               f"got {clean}")
+
+        lost = [at(250, "logit.component.events.delivered", -10)]
+        uncounted = row("relay-uncounted", extra=lost)
+        expect(uncounted is not None and uncounted.status == checks.FAIL
+               and "past the sink 10 uncounted" in uncounted.detail
+               and uncounted.detail.startswith("sink to collector life 1 (final)"),
+               f"events the relay sink received and neither delivered nor counted FAIL, got "
+               f"{uncounted}")
+        surplus = row("relay-surplus", extra=[at(250, "logit.component.events.received", 5),
+                                              at(250, "logit.component.events.delivered", 5)])
+        expect(surplus is not None and surplus.status == checks.FAIL
+               and "into the sink 5 a surplus" in surplus.detail,
+               f"a relay sink receiving more than its listener sent FAILs, got {surplus}")
+
+        counted = row("relay-counted", extra=lost + [
+            at(250, "logit.component.events.dropped", 10, reason="overflow_newest")])
+        expect(counted is not None and counted.status == checks.PASS
+               and "Del_r − Drop_r 2,200 − 2,190 − 10 = 0 (Drop_r: overflow_newest 10), "
+                   "balanced, the drops counted" in counted.detail,
+               f"a relay sink's counted drop balances, got {counted}")
+        closed = row("relay-closed-consumer", extra=[
+            at(250, "logit.component.events.dropped", 10, component="otlp",
+               reason="closed_consumer"),
+            at(250, "logit.component.events.received", -10),
+            at(250, "logit.component.events.delivered", -10)])
+        expect(closed is not None and closed.status == checks.PASS
+               and "E_r − X_r 2,200 − 10 − S_r 2,190 = 0" in closed.detail,
+               f"a relay listener's counted drop balances, got {closed}")
+        cut = row("relay-listener-shutdown", extra=[
+            at(320, "logit.component.events.dropped", 10, component="otlp", reason="shutdown")])
+        expect(cut is not None and cut.status == checks.PASS
+               and "E_r − X_r 2,200 − 0 − S_r 2,200 = 0" in cut.detail,
+               f"an otlp_in request the shutdown backstop cut was never counted sent, so its "
+               f"drop leaves X_r, got {cut}")
+        rejected = row("relay-rejected", extra=lost + [
+            at(250, "logit.component.events.dropped", 10, reason="rejected"),
+            at(250, "logit.component.batches.dropped", 1, reason="rejected")])
+        expect(rejected is not None and rejected.status == checks.FAIL
+               and "FAIL: collector victoria_metrics: 1 batch(es) rejected by the destination"
+               in rejected.detail,
+               f"a batch the relay's destination rejected FAILs, though counted, got {rejected}")
+
+        early = row("relay-stopped-short", action="stop",
+                    extra=[at(100, "logit.component.events.delivered", -10)])
+        expect(early is not None and early.status == checks.FAIL
+               and "collector life 0: E_r − X_r 4,000 − 0 − S_r 4,000 = 0; S_r − Del_r − "
+                   "Drop_r 4,000 − 3,990 − 0 = 10, past the sink 10 uncounted" in early.detail,
+               f"a life a stop ended is judged, got {early}")
+        killed = row("relay-killed-short",
+                     extra=[at(100, "logit.component.events.delivered", -10)])
+        expect(killed is not None and killed.status == checks.PASS
+               and "= 10, reported: a kill loses" in killed.detail,
+               f"a killed life's gap is reported, not judged, got {killed}")
+        unstopped = row("relay-unstopped", stopped=False, extra=lost)
+        expect(unstopped is not None and unstopped.status == checks.PASS
+               and "reported: the end sequence didn't stop the relay" in unstopped.detail,
+               f"a final life the end sequence didn't stop is reported, got {unstopped}")
+        unnamed = row("relay-unnamed", keys=False)
+        expect(unnamed is not None and unnamed.status == checks.SKIP
+               and "no `relay_listener` and `relay_sink`" in unnamed.detail,
+               f"a resolved scenario without the relay's components SKIPs, got {unnamed}")
+        no_relay = [r for r in checks.run_all(_ledger_run(tmp, "relay-none"))
+                    if r.id == "ledger.relay"]
+        expect(no_relay == [], f"a run with no relay has no ledger.relay row, got {no_relay}")
 
 
 # Two SUT services: `logit` holds the listener `in` and a `hop` sink, `collector` holds
@@ -15242,7 +15409,7 @@ def run(root, quiet=False):
                      _cri_gone, _backstop_ledger,
                      _file_ops, _file_action_rules, _copytruncate_ledger, _two_sut_rules,
                      _two_sut_driver, _two_sut_checks, _relay_rules, _relay_driver,
-                     _relay_checks, _per_service, _slope_edges,
+                     _relay_checks, _relay_ledger, _per_service, _slope_edges,
                      _rss_settle_rules, _rss_settle_checks, _rss_life_warmup,
                      _expected_rules, _slope_reducer, _standin_codec, _standin_record_parts,
                      _standin_server, _respond_rules, _standin_count, _standin_idle_timeout,

@@ -358,9 +358,13 @@ ROUTER_KINDS = ("route", "route_signals")
 # selector V is read with (both local only), under `split = "route"` or `"target"` the `target`
 # feeding it, and under `"target"` its own `aggregate` and the `transforms` between the target
 # and that `aggregate`, in order. A local sink may add `vm_absent_selector`, a selector its
-# backend must hold no series for at the end (checks.py's `check_ledger_absent`).
+# backend must hold no series for at the end (checks.py's `check_ledger_absent`). A sink whose
+# writes a further SUT service carries on names it in `relay`, with `relay_listener`, the relay's
+# listener the sink writes to, and `relay_sink`, the relay's sink that listener alone feeds,
+# which `ledger.relay` balances per relay life (checks.py's `check_ledger_relay`).
 SINK_KEYS = {"id", "backend", "vm_selector", "target", "aggregate", "transforms",
-             "vm_absent_selector", "relay"}
+             "vm_absent_selector", "relay", "relay_listener", "relay_sink"}
+RELAY_SINK_KEYS = ("relay_listener", "relay_sink")
 _COMPONENT_ID = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
 THRESHOLD_KEYS = {"progress_window", "rss_growth_mib_per_hour", "fd_growth"}
 EXPECT_KEYS = {"name", "service", "metric", "component", "attrs", "step", "window", "reduce",
@@ -999,6 +1003,7 @@ def from_dict(raw, path):
         if overlap is None:
             problems += _hop_problems(ledger, extra_suts)
             problems += _relay_problems(ledger, extra_suts, target["kind"])
+            problems += _relay_config_problems(ledger, configs, path.parent)
         else:
             if _relays(ledger):
                 problems.append("[overlap] can't be combined with a sink's `relay`: each "
@@ -2091,6 +2096,21 @@ def _hop_problems(ledger, extra_suts):
     return problems
 
 
+def config_sources(text, component):
+    """The `sources:` component `component` lists in a YAML config, flow (`[a, b]`) or block
+    style, or [] when it lists none. Comments are ignored."""
+    for block in component_blocks(text, component):
+        body = "\n".join(re.sub(r"(^|\s)#.*$", "", line) for line in block.splitlines())
+        flow = re.search(r"\bsources\s*:\s*\[([^\]]*)\]", body)
+        if flow:
+            return [one.strip().strip("\"'") for one in flow.group(1).split(",") if one.strip()]
+        listed = re.search(r"\bsources\s*:\s*\n((?:\s*-\s*\S+\s*\n?)+)", body)
+        if listed:
+            return [line.strip().lstrip("-").strip().strip("\"'")
+                    for line in listed.group(1).splitlines() if line.strip()]
+    return []
+
+
 def _relays(ledger):
     """The `relay` each `[[ledger.sink]]` table names, in order."""
     sinks = ledger.get("sink") if isinstance(ledger.get("sink"), list) else []
@@ -2120,6 +2140,65 @@ def _relay_problems(ledger, extra_suts, kind):
     if ledger.get("hop") is not None:
         problems.append("ledger.hop and a sink's `relay` can't be combined: a hop puts "
                         f"`aggregate` in the far SUT, a relay keeps it in {SUT_SERVICE}")
+    return problems
+
+
+def _relay_config_problems(ledger, configs, directory):
+    """What a `[[ledger.sink]]`'s `relay_listener` and `relay_sink` break: each is a component
+    id, set together and only beside `relay`; no two sinks share a `relay_listener`; and, in the
+    relay's config, the listener is an `_in` kind whose events the named sink alone takes, from
+    the listener directly, so `ledger.relay`'s balance has no node or copy between the two."""
+    sinks = ledger.get("sink") if isinstance(ledger.get("sink"), list) else []
+    problems = []
+    listeners = []
+    for index, sink in enumerate(sinks):
+        if not isinstance(sink, dict):
+            continue
+        where = f"ledger.sink {index + 1}"
+        named = [key for key in RELAY_SINK_KEYS if key in sink]
+        if "relay" not in sink:
+            if named:
+                problems.append(f"{where}: `{named[0]}` names a relay's component, and the "
+                                "sink names no `relay`")
+            continue
+        missing = [key for key in RELAY_SINK_KEYS if key not in sink]
+        if missing:
+            problems.append(f"{where}: a sink with a `relay` names the relay's "
+                            f"`relay_listener` and `relay_sink`; it's missing `{missing[0]}`")
+            continue
+        ids = {key: sink[key] for key in RELAY_SINK_KEYS}
+        bad = [key for key, value in ids.items()
+               if not isinstance(value, str) or not _COMPONENT_ID.match(value)]
+        if bad:
+            problems.append(f"{where}: `{bad[0]}` must name a component id")
+            continue
+        listener, relay_sink = ids["relay_listener"], ids["relay_sink"]
+        if listener in listeners:
+            problems.append(f"{where}: `relay_listener` {listener} is another sink's too; each "
+                            "sink writes to a relay listener of its own")
+        listeners.append(listener)
+        relay = sink["relay"]
+        name = configs.get(relay) if isinstance(configs, dict) and isinstance(relay, str) else None
+        if not isinstance(name, str) or not (directory / name).is_file():
+            continue
+        text = (directory / name).read_text()
+        kind = listener_wire(text, listener)[1]
+        if kind is None or not kind.endswith("_in"):
+            problems.append(f"{where}: `relay_listener` {listener} must be a listener in "
+                            f"{name}" + (f", and it's a {kind}" if kind else ", which has no "
+                                         "such component"))
+        if listener_wire(text, relay_sink)[1] is None:
+            problems.append(f"{where}: `relay_sink` {relay_sink} isn't a component in {name}")
+            continue
+        if listener not in config_sources(text, relay_sink):
+            problems.append(f"{where}: `relay_sink` {relay_sink} must take `relay_listener` "
+                            f"{listener}'s events directly, in its `sources:`")
+        ids_in_file = re.findall(r"^  ([A-Za-z0-9_][A-Za-z0-9_.-]*)\s*:", text, re.M)
+        others = [one for one in ids_in_file
+                  if one != relay_sink and listener in config_sources(text, one)]
+        if others:
+            problems.append(f"{where}: `relay_listener` {listener} feeds {others[0]} too; "
+                            f"`relay_sink` {relay_sink} must take its events alone")
     return problems
 
 
