@@ -44,7 +44,8 @@ implements it once for all three; its module doc is the canonical statement of t
    at most once a minute while the episode stays open, with the items and units shed so far, or
    how long intake has been held. `buffer_recovered` (warn) when an announced episode ends, with its
    duration and totals. `buffer_full_at_shutdown` (warn) when the queue's owner finishes with an
-   announced episode still open.
+   announced episode still open. A fourth, `buffer_shed_unannounced`, reports at shutdown what
+   unannounced episodes shed ("Amendment: shutdown reports what no line announced (2026-11-02)").
    A sink's `buffer_full` also names its concurrency and its last send's duration when every
    batch the concurrency allows is in flight ("Amendment: the line names a saturated
    concurrency (2026-10-25)").
@@ -128,7 +129,8 @@ implements it once for all three; its module doc is the canonical statement of t
   episode late, by the same reading its `utilization` gauge gives.
 - **A spool reopened full opens no episode** until a push finds no room.
 - **An unannounced episode that's never followed by another line** leaves its counts only in the
-  `*.dropped` counters.
+  `*.dropped` counters. "Amendment: shutdown reports what no line announced (2026-11-02)" below
+  closes this for an episode that shed data.
 - The consumer side pays one atomic load per gauge update while no episode is open. No allocation
   pin moved: the episode's bookkeeping runs only when a push finds no room or an episode is open.
 
@@ -165,3 +167,26 @@ them counts in `logit.component.diagnostics`.
 A sink's `recovered` line moves with them, for the same reason. It pairs with `degraded` (`warn`,
 on the first drop) and was `info`, so a pipeline saw a sink degrade and never saw it recover. It is
 unthrottled, as before, and its key, message, and pacing don't change.
+
+## Amendment: shutdown reports what no line announced (2026-11-02)
+
+Decision 5 lets an episode that opens inside the minute go unannounced, its counts riding on the
+next `buffer_full`. When no next line comes, because the queue's owner finishes first, a queue
+that shed data wrote nothing about it: the episode still open at shutdown, and any closed ones
+waiting to ride, reached only the `*.dropped` counters. That broke
+[ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)'s "Amendment (2026-11-02): loss
+outside the vocabulary, and loss no line reported", that every counted loss logs.
+
+`FullWatch::finish` now writes a fourth key, `buffer_shed_unannounced` (`warn`), when the episodes
+no line announced shed anything:
+
+```text
+buffer full in 2 episode(s) no earlier line reported, the last still open at shutdown; overflow drop_newest shed 2 batch(es) (9 event(s))
+```
+
+It counts every unannounced episode since the last line, open or closed, in the totals decision 2's
+lines use. The `, the last still open at shutdown` clause appears only when one was. Unannounced
+episodes that only held intake lost nothing and write nothing, as before. An announced episode
+still open at shutdown writes `buffer_full_at_shutdown`, unchanged; its announcement already
+carried the closed episodes before it. Like the other three keys, it's unthrottled and uncounted
+in `logit.component.diagnostics`, and it's written at most once, by the one `finish` call.

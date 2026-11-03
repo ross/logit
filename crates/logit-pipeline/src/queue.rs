@@ -309,7 +309,8 @@ impl<T: Queued> BoundedQueue<T> {
     }
 
     /// Ends a full-buffer episode still open once nothing will push again, writing
-    /// `buffer_full_at_shutdown` if the episode was announced. A no-op with no episode open.
+    /// `buffer_full_at_shutdown` if the episode was announced, else `buffer_shed_unannounced` if
+    /// an episode no line announced shed anything (`buffer_full`'s module doc).
     pub fn finish_full_episode(&self) {
         self.watch.finish();
     }
