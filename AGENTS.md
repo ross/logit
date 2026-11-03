@@ -859,9 +859,8 @@ the operator-facing account of all of this.
   `spool-kill-replay` kills the SUT with SIGKILL during a sink outage and checks that its
   `buffer.disk:` spool is replayed by the next process. `sink-outage-stop` stops the SUT inside
   a sink outage that has backed the chain up to its listener, so the shutdown backstop cuts the
-  listener's parked send; `tail-outage-stop`, `kafka-outage-stop`, and `http-outage-stop` do the
-  same to `tail_in`, which defers the cut batch, `kafka_in`, which defers its own, and
-  `influxdb_in`, which answers its parked request `503` first. `lua-path`, `lua-stall`, and
+  listener's parked send; `tail-outage-stop` and `kafka-outage-stop` do the same to `tail_in`,
+  which defers the cut batch, and `kafka_in`, which defers its own. `lua-path`, `lua-stall`, and
   `lua-memory` put a `lua` stage in the path (`[ledger] sut_script`): a rewrite with script
   drops and errors, a busy loop that `/readyz` reads as `stalled` inside a `mark` step, and a
   `max_memory` exit 2 inside an `exit` step that restarts the SUT. `lua-path-jit`,

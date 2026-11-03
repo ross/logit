@@ -1613,7 +1613,7 @@ The rows:
   falls inside that expectation's windows: the scenario requires the drop, and
   `expect.<name>` judges it. `sink-outage-stop` excuses `aggregate`'s `closed_consumer` drop
   into the sink its stop closed this way, and so do its variants on other listeners,
-  `tail-outage-stop`, `kafka-outage-stop`, and `http-outage-stop`. A `min` of 1 says only that the drop happened, not
+  `tail-outage-stop` and `kafka-outage-stop`. A `min` of 1 says only that the drop happened, not
   how large it was: the excuse leaves its size unbounded by design, and a `max` on the same
   expectation bounds it.
 - `ledger.overlap` (W12b), under `[overlap]` only, else no row: the run's G − Σ(W + K + F)
@@ -6639,23 +6639,27 @@ What the runs showed about `logit` and the harness:
 - **Self-test**: 2,375 expectations after the merges. Each new rule was reverted in turn and
   failed at least one expectation; the PR lists them.
 
-### Backstop variants: a tailer, a Kafka consumer, and an HTTP listener (2026-11-02)
+### Backstop variants: a tailer and a Kafka consumer (2026-11-02)
 
 `sink-outage-stop` soaks the shutdown backstop cutting `statsd_in`'s UDP send on the root
-`Fanout`. `tail-outage-stop`, `kafka-outage-stop`, and `http-outage-stop` stop the SUT inside the
-same backed-up VictoriaMetrics outage behind other listeners. Each ran at its default length on
-the development host (`sailfish`, 32 cores, Linux 7.2.13) against `logit:soak-bsv`, built from
-`origin/main` at `744be0ad`; `test/soak-backstop-variants` touches no product code. Other agents'
-soak runs shared the daemon.
+`Fanout`. `tail-outage-stop` and `kafka-outage-stop` stop the SUT inside the same backed-up
+VictoriaMetrics outage behind other listeners. Each ran at its default length on the development
+host (`sailfish`, 32 cores, Linux 7.2.13) against `logit:soak-bsv`, built from `origin/main` at
+`744be0ad`; `test/soak-backstop-variants` touches no product code. Other agents' soak runs shared
+the daemon.
 
 | Run | Scenario | Verdict |
 |---|---|---|
 | `20261103T032921Z` | `tail-outage-stop` | FAIL: `expect.listener-batch-deferred`, a scenario defect, below |
-| `20261103T033732Z` | `tail-outage-stop` | PASS |
+| `20261103T033732Z` | `tail-outage-stop` | PASS, with the backstop and the sink's drop 5 µs apart, below |
 | `20261103T032929Z-2` | `kafka-outage-stop` | PASS |
-| `20261103T032929Z` | `http-outage-stop` | PASS |
+| `20261103T034725Z` | `sink-outage-stop` | PASS, with the sink's 10 s `shutdown_grace` |
+| `20261103T034729Z` | `tail-outage-stop` | PASS, with the sink's 10 s `shutdown_grace` |
+| `20261103T035441Z` | `tail-outage-stop` | PASS, the same |
+| `20261103T040153Z` | `tail-outage-stop` | FAIL: the generator got a shutdown signal at +21 s from outside the harness, and the end sequence spanned a 10-hour host suspend; not judged |
+| `20261103T141343Z` | `tail-outage-stop` | PASS, the same |
 
-`tail-outage-stop`, `20261103T033732Z`:
+`tail-outage-stop`, `20261103T141343Z`:
 
 | Check | Status | Detail |
 |---|---|---|
@@ -6666,12 +6670,12 @@ soak runs shared the daemon.
 | `self_log` | PASS | 3 sink fault line(s) inside fault windows, 0 outside, 0 expected-exit line(s), 0 other ERROR, 0 non-JSON |
 | `ready` | PASS | 39 readiness sample(s) read ok outside fault windows; 1 start(s) or unpause(s) ready in time, slowest ready 0.1s |
 | `progress` | PASS | 5 30s window(s) outside fault windows, judged per sink, each freshness sample under 30s: victoria_metrics: deliveries in 5 of 5, 6 freshness sample(s); 120s of 310s after warmup judged (39%; WARN under 5%) |
-| `rss_slope` | PASS | generator PASS: MiB/h life 0 -16.1 (limit 189); each limit is 64 plus a 3 MiB step's bias over the fit's span; 130s of 310s after warmup judged (42%; WARN under 5%) \| logit PASS: MiB/h life 1 -1.9 (limit 280); each limit is 64 plus a 3 MiB step's bias over the fit's span; 75s of 310s after warmup judged (24%; WARN under 5%) |
+| `rss_slope` | PASS | generator PASS: MiB/h life 0 +6.4 (limit 189); each limit is 64 plus a 3 MiB step's bias over the fit's span; 130s of 310s after warmup judged (42%; WARN under 5%) \| logit PASS: MiB/h life 1 +7.3 (limit 295); each limit is 64 plus a 3 MiB step's bias over the fit's span; 70s of 310s after warmup judged (23%; WARN under 5%) |
 | `fd_slope` | PASS | generator PASS: warmup median 15 -> end 15 (limit +16) \| logit PASS: warmup median 17 -> end 25 (limit +16) |
 | `ledger.wire` | PASS | G 375,700 (shared directory: 375,700 lines in 9 files) vs W 377,800 + counted 0: W + F − G 2,100 against the replay band [0, 7,386]; the tailers reached G at the end with W 377,800 |
 | `cri.dangles` | SKIP | no cri source |
 | `ledger.intake` | PASS | final life 1: W − D 245,500 vs E + B 245,500; life 0: W − D − B − X − ΣT_disc − Ab 100 within [0, R + Q's 1,000 records] (R 327,000 = 0 + 262 x 1,000 + 65 x 1,000) |
-| `ledger.edge` | PASS | final life 1: E[tail] 245,500 == T_in[parse] 245,500 (into parse); T_in[parse] 245,500 − T_disc[parse] 0 = 245,500 == T_out[parse] 245,500 (parse sends what it doesn't discard); T_out[parse] 245,500 == T_in[labels] 245,500 (into labels); T_in[labels] 245,500 − T_disc[labels] 0 = 245,500 == T_out[labels] 245,500 (labels sends what it doesn't discard); T_out[labels] 245,500 == T_in[count] 245,500 (into count); T_in[count] 245,500 − T_disc[count] 0 = 245,500 == T_out[count] 245,500 (count sends what it doesn't discard); T_out[count] 245,500 == T_in[metrics_only] 245,500 (into metrics_only); T_in[metrics_only] 245,500 − T_disc[metrics_only] 0 = 245,500 == T_out[metrics_only] 245,500 (metrics_only sends what it doesn't discard); Σ(sent into aggregate) 245,500 == A 245,500 (listeners to aggregate); A_sent 400 == S_in[victoria_metrics] 400 (aggregate to victoria_metrics) |
+| `ledger.edge` | PASS | final life 1: E[tail] 245,500 == T_in[parse] 245,500 (into parse); T_in[parse] 245,500 − T_disc[parse] 0 = 245,500 == T_out[parse] 245,500 (parse sends what it doesn't discard); T_out[parse] 245,500 == T_in[labels] 245,500 (into labels); T_in[labels] 245,500 − T_disc[labels] 0 = 245,500 == T_out[labels] 245,500 (labels sends what it doesn't discard); T_out[labels] 245,500 == T_in[count] 245,500 (into count); T_in[count] 245,500 − T_disc[count] 0 = 245,500 == T_out[count] 245,500 (count sends what it doesn't discard); T_out[count] 245,500 == T_in[metrics_only] 245,500 (into metrics_only); T_in[metrics_only] 245,500 − T_disc[metrics_only] 0 = 245,500 == T_out[metrics_only] 245,500 (metrics_only sends what it doesn't discard); Σ(sent into aggregate) 245,500 == A 245,500 (listeners to aggregate); A_sent 401 == S_in[victoria_metrics] 401 (aggregate to victoria_metrics) |
 | `ledger.script` | SKIP | no [ledger] sut_script |
 | `ledger.aggregate` | PASS | final life 1: Ab 245,500 == A 245,500 (every event absorbed) |
 | `ledger.egress` | PASS | victoria_metrics: life 0: W − D − B − X − ΣT_disc − V 66,900 = residual 100 + Ab − V 66,800, counted (batches dropped: shutdown 67); life 1 (final): Ab 245,500 − V[victoria_metrics] 245,500 = 0, ok (split copy; R 327,000 = 0 + 262 x 1,000 + 65 x 1,000) |
@@ -6683,21 +6687,63 @@ soak runs shared the daemon.
 | `ledger.sent` | SKIP | local target: ledger.egress judges delivery against the backends |
 | `ledger.topic` | SKIP | victoria-metrics target: no topic |
 | `ledger.standin` | SKIP | victoria-metrics target: no stand-in |
-| `identity.sink` | PASS | final life 1 at +375s: victoria_metrics: received 400 vs delivered 400 + dropped 0 + buffer.batches 0, gap 0 (one batch in flight allowed) |
+| `identity.sink` | PASS | final life 1 at +375s: victoria_metrics: received 401 vs delivered 401 + dropped 0 + buffer.batches 0, gap 0 (one batch in flight allowed) |
 | `drops` | PASS | no *.dropped count outside the ledger and the sink rows; excused: window: logit.component.events.dropped{reason="closed_consumer"} 3, required by expect.aggregate-closed-consumer |
 | `recovery` | PASS | 2 of 2 fault(s) judged at 1 sink(s), each recovered within recovery_bound 45s of its end; warmup rate 1,000/s |
 | `file.reopen` | SKIP | the scenario has no rename step |
 | `tls.served` | SKIP | the scenario has no probe step |
 | `expect.sink-queue-fills` | PASS | max of logit.component.buffer.batches{component=victoria_metrics} on logit, during c0s1: c0s1 (+60s, +190s]: 2 (3 sample(s) and the value in force at its start), want >= 2 |
-| `expect.aggregate-inbox-full` | PASS | delta of logit.component.inbox.full{component=window} on logit, during c0s1: c0s1 (+60s, +190s]: 2 (over 24 drain(s)), want >= 1 |
-| `expect.listener-batch-deferred` | PASS | delta of logit.input.batches.deferred{component=tail} on logit, during c0s2: c0s2 (+150s, +170s]: 1 (over 2 drain(s)), want >= 1 |
-| `expect.listener-drops-nothing` | PASS | delta of logit.component.batches.dropped{component=tail, reason=shutdown} on logit, during c0s2: c0s2 (+150s, +170s]: 0 (over 2 drain(s)), want <= 0 |
-| `expect.sink-drops-at-shutdown` | PASS | delta of logit.component.batches.dropped{component=victoria_metrics, reason=shutdown} on logit, during c0s2: c0s2 (+150s, +170s]: 67 (over 2 drain(s)), want >= 1 |
-| `expect.aggregate-closed-consumer` | PASS | delta of logit.component.events.dropped{component=window, reason=closed_consumer} on logit, during c0s2: c0s2 (+150s, +170s]: 3 (over 2 drain(s)), want >= 1 |
-| `expect.sink-holds-after-restart` | PASS | delta of logit.component.batches.dropped{component=victoria_metrics} on logit, after c0s2: c0s2 (+170s, +215s]: 0 (over 9 drain(s)), want <= 0 |
+| `expect.aggregate-inbox-full` | PASS | delta of logit.component.inbox.full{component=window} on logit, during c0s1: c0s1 (+60s, +190s]: 1 (over 25 drain(s)), want >= 1 |
+| `expect.listener-batch-deferred` | PASS | delta of logit.input.batches.deferred{component=tail} on logit, during c0s2: c0s2 (+150s, +170s]: 1 (over 3 drain(s)), want >= 1 |
+| `expect.listener-drops-nothing` | PASS | delta of logit.component.batches.dropped{component=tail, reason=shutdown} on logit, during c0s2: c0s2 (+150s, +170s]: 0 (over 3 drain(s)), want <= 0 |
+| `expect.sink-drops-at-shutdown` | PASS | delta of logit.component.batches.dropped{component=victoria_metrics, reason=shutdown} on logit, during c0s2: c0s2 (+150s, +170s]: 67 (over 3 drain(s)), want >= 1 |
+| `expect.aggregate-closed-consumer` | PASS | delta of logit.component.events.dropped{component=window, reason=closed_consumer} on logit, during c0s2: c0s2 (+150s, +170s]: 3 (over 3 drain(s)), want >= 1 |
+| `expect.sink-holds-after-restart` | PASS | delta of logit.component.batches.dropped{component=victoria_metrics} on logit, after c0s2: c0s2 (+170s, +215s]: 0 (over 8 drain(s)), want <= 0 |
 | `expect.retrying-clears` | PASS | last of logit.component.retrying{component=victoria_metrics} on logit, after c0s1: c0s1 (+190s, +235s]: 0 (1 sample(s) and the value in force at its start), want <= 0 |
-| `expect.no-resume-rejected` | PASS | delta of logit.input.files.resume_rejected{component=tail} on logit, run: run (+60s, +370s]: 0 (over 59 drain(s)), want <= 0 |
-| `expect.no-checkpoint-errors` | PASS | delta of logit.input.checkpoint.errors{component=tail} on logit, run: run (+60s, +370s]: 0 (over 59 drain(s)), want <= 0 |
+| `expect.no-resume-rejected` | PASS | delta of logit.input.files.resume_rejected{component=tail} on logit, run: run (+60s, +370s]: 0 (over 60 drain(s)), want <= 0 |
+| `expect.no-checkpoint-errors` | PASS | delta of logit.input.checkpoint.errors{component=tail} on logit, run: run (+60s, +370s]: 0 (over 60 drain(s)), want <= 0 |
+
+`sink-outage-stop`, `20261103T034725Z`:
+
+| Check | Status | Detail |
+|---|---|---|
+| `run` | PASS | ran from start through end_end |
+| `timeline` | PASS | 4 apply/revert action(s) returned 0; 1 start(s) or unpause(s) each probed; no fail fast |
+| `exit` | PASS | 3 exit(s) of the logit services, each a scheduled stop with code 0 |
+| `restarts` | PASS | 2 start(s), each a scheduled start or restart |
+| `self_log` | PASS | 3 sink fault line(s) inside fault windows, 0 outside, 0 expected-exit line(s), 0 other ERROR, 0 non-JSON |
+| `ready` | PASS | 39 readiness sample(s) read ok outside fault windows; 1 start(s) or unpause(s) ready in time, slowest ready 0.1s |
+| `progress` | PASS | 5 30s window(s) outside fault windows, judged per sink, each freshness sample under 30s: victoria_metrics: deliveries in 5 of 5, 6 freshness sample(s); 120s of 280s after warmup judged (43%; WARN under 5%) |
+| `rss_slope` | PASS | generator PASS: MiB/h life 0 +9.6 (limit 189); each limit is 64 plus a 3 MiB step's bias over the fit's span; 130s of 280s after warmup judged (46%; WARN under 5%) \| logit PASS: MiB/h life 1 -43.7 (limit 280); each limit is 64 plus a 3 MiB step's bias over the fit's span; 75s of 280s after warmup judged (27%; WARN under 5%) |
+| `fd_slope` | PASS | generator PASS: warmup median 16 -> end 16 (limit +8) \| logit PASS: warmup median 16 -> end 16 (limit +8) |
+| `ledger.wire` | PASS | G 691,300 = W 665,300 + K 0 + wire 26,000 (by design: 25,991 in UDP-affecting windows, -8 steady, 17 at the end; steady loss judged 0, each run at 0 or more, against limit 300); the generator's counted drop_newest loss, not in G: 0 event(s) in 0 batch(es) |
+| `cri.dangles` | SKIP | no cri source |
+| `ledger.intake` | PASS | final life 1: W − D 414,300 vs E + B 414,300; life 0: W − D − B − X − Ab 0 within [0, R] (R 77,000 = 10,000 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.edge` | PASS | final life 1: E 414,300 == A 414,300 (listener to aggregate); A_sent 39,900 == S_in[victoria_metrics] 39,900 (aggregate to victoria_metrics) |
+| `ledger.script` | SKIP | no [ledger] sut_script |
+| `ledger.aggregate` | PASS | final life 1: Ab 414,300 == A 414,300 (every event absorbed) |
+| `ledger.egress` | PASS | victoria_metrics: life 0: W − D − B − X − V 80,800 = residual 0 + Ab − V 80,800, counted (batches dropped: shutdown 67); life 1 (final): Ab 414,300 − V[victoria_metrics] 414,300 = 0, ok (split copy; R 77,000 = 10,000 + 2 x 1,000 + 65 x 1,000) |
+| `ledger.windows` | SKIP | not enabled ([ledger] vm_every_window) |
+| `ledger.absent` | SKIP | no [[ledger.sink]] sets vm_absent_selector |
+| `ledger.replay` | SKIP | no killed life followed by another |
+| `ledger.summary` | PASS | final life 1: uncounted 0 = W − D − E − B 0 + E − A 0 + A − Ab 0 + Ab − V[victoria_metrics] 0; wire G − (W + K) 26,000 over the run, by design |
+| `ledger.value` | SKIP | no [ledger] sut_delta, so V counts increments and ledger.egress judges them |
+| `ledger.sent` | SKIP | local target: ledger.egress judges delivery against the backends |
+| `ledger.topic` | SKIP | victoria-metrics target: no topic |
+| `ledger.standin` | SKIP | victoria-metrics target: no stand-in |
+| `identity.sink` | PASS | final life 1 at +340s: victoria_metrics: received 398 vs delivered 397 + dropped 0 + buffer.batches 1, gap 0 (one batch in flight allowed) |
+| `drops` | PASS | no *.dropped count outside the ledger and the sink rows; excused: window: logit.component.events.dropped{reason="closed_consumer"} 300, required by expect.aggregate-closed-consumer |
+| `recovery` | PASS | 2 of 2 fault(s) judged at 1 sink(s), each recovered within recovery_bound 45s of its end; warmup rate 2,000/s |
+| `file.reopen` | SKIP | the scenario has no rename step |
+| `tls.served` | SKIP | the scenario has no probe step |
+| `expect.sink-queue-fills` | PASS | max of logit.component.buffer.batches{component=victoria_metrics} on logit, during c0s1: c0s1 (+60s, +160s]: 2 (3 sample(s) and the value in force at its start), want >= 2 |
+| `expect.aggregate-inbox-full` | PASS | delta of logit.component.inbox.full{component=window} on logit, during c0s1: c0s1 (+60s, +160s]: 1 (over 19 drain(s)), want >= 1 |
+| `expect.listener-batch-cut` | PASS | delta of logit.component.batches.dropped{component=statsd, reason=shutdown} on logit, during c0s2: c0s2 (+120s, +140s]: 1 (over 3 drain(s)), want >= 1 |
+| `expect.listener-events-cut` | PASS | delta of logit.component.events.dropped{component=statsd, reason=shutdown} on logit, during c0s2: c0s2 (+120s, +140s]: 200 (over 3 drain(s)), want >= 1 |
+| `expect.sink-drops-at-shutdown` | PASS | delta of logit.component.batches.dropped{component=victoria_metrics, reason=shutdown} on logit, during c0s2: c0s2 (+120s, +140s]: 67 (over 3 drain(s)), want >= 1 |
+| `expect.aggregate-closed-consumer` | PASS | delta of logit.component.events.dropped{component=window, reason=closed_consumer} on logit, during c0s2: c0s2 (+120s, +140s]: 300 (over 3 drain(s)), want >= 1 |
+| `expect.sink-holds-after-restart` | PASS | delta of logit.component.batches.dropped{component=victoria_metrics} on logit, after c0s2: c0s2 (+140s, +185s]: 0 (over 8 drain(s)), want <= 0 |
+| `expect.retrying-clears` | PASS | last of logit.component.retrying{component=victoria_metrics} on logit, after c0s1: c0s1 (+160s, +205s]: 0 (1 sample(s) and the value in force at its start), want <= 0 |
 
 `kafka-outage-stop`, `20261103T032929Z-2`:
 
@@ -6744,49 +6790,6 @@ soak runs shared the daemon.
 | `expect.lag-after-outage-p0` | PASS | last of logit.input.lag{component=consume, partition=0, topic=soak-in} on logit, after c0s1: c0s1 (+160s, +220s]: 0 (12 sample(s) and the value in force at its start), want <= 0 |
 | `expect.lag-after-outage-p1` | PASS | last of logit.input.lag{component=consume, partition=1, topic=soak-in} on logit, after c0s1: c0s1 (+160s, +220s]: 0 (12 sample(s) and the value in force at its start), want <= 0 |
 
-`http-outage-stop`, `20261103T032929Z`:
-
-| Check | Status | Detail |
-|---|---|---|
-| `run` | PASS | ran from start through end_end |
-| `timeline` | PASS | 4 apply/revert action(s) returned 0; 1 start(s) or unpause(s) each probed; no fail fast |
-| `exit` | PASS | 3 exit(s) of the logit services, each a scheduled stop with code 0 |
-| `restarts` | PASS | 2 start(s), each a scheduled start or restart |
-| `self_log` | PASS | 3 sink fault line(s) inside fault windows, 0 outside, 0 expected-exit line(s), 0 other ERROR, 0 non-JSON |
-| `ready` | PASS | 39 readiness sample(s) read ok outside fault windows; 1 start(s) or unpause(s) ready in time, slowest ready 0.1s |
-| `progress` | PASS | 5 30s window(s) outside fault windows, judged per sink, each freshness sample under 30s: victoria_metrics: deliveries in 5 of 5, 6 freshness sample(s); 120s of 280s after warmup judged (43%; WARN under 5%) |
-| `rss_slope` | PASS | generator PASS: MiB/h life 0 -19.7 (limit 189); each limit is 64 plus a 3 MiB step's bias over the fit's span; 130s of 280s after warmup judged (46%; WARN under 5%) \| logit PASS: MiB/h life 1 +12.5 (limit 280); each limit is 64 plus a 3 MiB step's bias over the fit's span; 75s of 280s after warmup judged (27%; WARN under 5%) |
-| `fd_slope` | PASS | generator PASS: warmup median 15 -> end 15 (limit +8) \| logit PASS: warmup median 17 -> end 17 (limit +8) |
-| `ledger.wire` | PASS | G 614,800 (acknowledged of 691,300 attempted) = W 614,800 − X 0 + gap 0 (0 in reported windows, 67 in judged HTTP-affecting windows, 1 steady, -67 at the end; loss judged 67, each run at 0 or more, against limit 500); the generator's requests: 0 transport-error attempt(s), 6 connect failure(s), 4 answered 5xx and retried; the listener's busy 503s 4 and batches.deferred 4, a retry, not loss; its counted loss, not in G: 76,500 event(s) in 765 batch(es) (overflow_newest 765) |
-| `cri.dangles` | SKIP | no cri source |
-| `ledger.intake` | PASS | final life 1: W − D 403,100 vs E + B 403,100; life 0: logit.input.requests{route=write} ok 2,117 + closed_consumer 0 == batches.sent 2,117; life 0: busy 4 == batches.deferred 4; final life 1: logit.input.requests{route=write} ok 4,031 + closed_consumer 0 == batches.sent 4,031; final life 1: busy 0 == batches.deferred 0; life 0: W − D − B − X − ΣT_disc − Ab 0 within [0, R] (R 132,000 = 0 + 67 x 1,000 + 65 x 1,000) |
-| `ledger.edge` | PASS | final life 1: E[influx] 403,100 == T_in[count] 403,100 (into count); T_in[count] 403,100 − T_disc[count] 0 = 403,100 == T_out[count] 403,100 (count sends what it doesn't discard); Σ(sent into aggregate) 403,100 == A 403,100 (listeners to aggregate); A_sent 40,000 == S_in[victoria_metrics] 40,000 (aggregate to victoria_metrics) |
-| `ledger.script` | SKIP | no [ledger] sut_script |
-| `ledger.aggregate` | PASS | final life 1: Ab 403,100 == A 403,100 (every event absorbed) |
-| `ledger.egress` | PASS | victoria_metrics: life 0: W − D − B − X − ΣT_disc − V 80,900 = residual 0 + Ab − V 80,900, counted (batches dropped: shutdown 67); life 1 (final): Ab 403,100 − V[victoria_metrics] 403,100 = 0, ok (split copy; R 132,000 = 0 + 67 x 1,000 + 65 x 1,000) |
-| `ledger.windows` | SKIP | not enabled ([ledger] vm_every_window) |
-| `ledger.absent` | SKIP | no [[ledger.sink]] sets vm_absent_selector |
-| `ledger.replay` | SKIP | no killed life followed by another |
-| `ledger.summary` | PASS | final life 1: uncounted 0 = W − D − E − B 0 + E − ΣT_disc − A 0 + A − Ab 0 + Ab − V[victoria_metrics] 0; the transforms' ΣT_disc 0, counted; wire G − (W + K + F) 0 over the run, F 0 counted; ledger.wire judges the rest; end to end over the run, G 614,800 less counted loss 0 plus a resend allowance 0: victoria_metrics: V 533,900 <= G − counted + resent 614,800 |
-| `ledger.value` | SKIP | no [ledger] sut_delta, so V counts increments and ledger.egress judges them |
-| `ledger.sent` | SKIP | local target: ledger.egress judges delivery against the backends |
-| `ledger.topic` | SKIP | victoria-metrics target: no topic |
-| `ledger.standin` | SKIP | victoria-metrics target: no stand-in |
-| `identity.sink` | PASS | final life 1 at +340s: victoria_metrics: received 399 vs delivered 398 + dropped 0 + buffer.batches 1, gap 0 (one batch in flight allowed) |
-| `drops` | PASS | no *.dropped count outside the ledger and the sink rows; excused: window: logit.component.events.dropped{reason="closed_consumer"} 300, required by expect.aggregate-closed-consumer |
-| `recovery` | PASS | 2 of 2 fault(s) judged at 1 sink(s), each recovered within recovery_bound 45s of its end; warmup rate 2,000/s |
-| `file.reopen` | SKIP | the scenario has no rename step |
-| `tls.served` | SKIP | the scenario has no probe step |
-| `expect.sink-queue-fills` | PASS | max of logit.component.buffer.batches{component=victoria_metrics} on logit, during c0s1: c0s1 (+60s, +160s]: 2 (3 sample(s) and the value in force at its start), want >= 2 |
-| `expect.aggregate-inbox-full` | PASS | delta of logit.component.inbox.full{component=window} on logit, during c0s1: c0s1 (+60s, +160s]: 1 (over 18 drain(s)), want >= 1 |
-| `expect.listener-defers` | PASS | delta of logit.input.batches.deferred{component=influx} on logit, during c0s2: c0s2 (+120s, +140s]: 1 (over 2 drain(s)), want >= 1 |
-| `expect.listener-cuts-nothing` | PASS | delta of logit.component.events.dropped{component=influx, reason=shutdown} on logit, during c0s2: c0s2 (+120s, +140s]: 0 (over 2 drain(s)), want <= 0 |
-| `expect.generator-retries-503s` | PASS | delta of logit.output.requests{class=5xx, component=influx} on generator, through c0s1: c0s1 (+60s, +205s]: 4 (over 29 drain(s)), want >= 1 |
-| `expect.sink-drops-at-shutdown` | PASS | delta of logit.component.batches.dropped{component=victoria_metrics, reason=shutdown} on logit, during c0s2: c0s2 (+120s, +140s]: 67 (over 2 drain(s)), want >= 1 |
-| `expect.aggregate-closed-consumer` | PASS | delta of logit.component.events.dropped{component=window, reason=closed_consumer} on logit, during c0s2: c0s2 (+120s, +140s]: 300 (over 2 drain(s)), want >= 1 |
-| `expect.sink-holds-after-restart` | PASS | delta of logit.component.batches.dropped{component=victoria_metrics} on logit, after c0s2: c0s2 (+140s, +185s]: 0 (over 8 drain(s)), want <= 0 |
-| `expect.retrying-clears` | PASS | last of logit.component.retrying{component=victoria_metrics} on logit, after c0s1: c0s1 (+160s, +205s]: 0 (1 sample(s) and the value in force at its start), want <= 0 |
-
 What the runs showed:
 
 - **The chain to a tailer takes longer to back up.** The first `tail-outage-stop` run stopped
@@ -6794,31 +6797,34 @@ What the runs showed:
   no `shutdown_backstop` line: the four transforms between `window` and `tail_in` each hold 64
   batches, about 5 s of lines, and the last drain before the stop showed `parse`'s inbox never
   full and the tailer still sending. The scenario now stops VictoriaMetrics 130 s and the SUT
-  90 s in. The rerun logged `tail_in didn't finish within its shutdown grace (5s) and was
-  stopped; deferred 1 batch(es) (100 event(s))`, and `ledger.wire` held the next life's re-read,
-  W + F − G 2,100, inside the cut tailer's band of 7,386.
-- **The backstop and the sink's drop race at the same 5 s.** The listener's grace and the sink's
-  `shutdown_grace` both start at the signal. The sink's drop unblocks the chain, and a tailer
-  whose send completes before its own deadline fires returns with nothing to cut. In the rerun
-  the sink's `buffer_full_at_shutdown` line and the backstop's came 5 µs apart, 5.0015 s after
-  the signal; a run the sink wins reads `expect.listener-batch-deferred` 0, so a FAIL of that
-  row alone wants its two lines' order checked before anything else.
+  90 s in. Each later run logged `tail_in didn't finish within its shutdown grace (5s) and was
+  stopped; deferred 1 batch(es) (100 event(s))`, and `ledger.wire` held the next life's re-read
+  inside the cut tailer's band.
+- **The backstop raced the sink's drop, so the sink now waits longer.** The listener's grace and
+  the sink's `shutdown_grace` both defaulted to 5 s from the signal. The sink's drop unblocks the
+  chain, and a tailer whose send completes before its own deadline fires returns with nothing to
+  cut: in `20261103T033732Z` the sink's `buffer_full_at_shutdown` line and the backstop's came 5 µs apart,
+  so a run the sink won would read `expect.listener-batch-deferred` 0. `sink-outage-stop` had the
+  same race between `statsd_in`'s backstop and its sink. Both SUTs' sinks now set
+  `buffer.shutdown_grace: 10s`, so the chain stays blocked until the backstop has cut, and the
+  shutdown still ends inside the harness's 30 s `docker stop` timeout. In every run since, the
+  backstop's line came 5.00 s after the signal and the sink's 10.00 s: `sink-outage-stop` cut 1
+  batch of 200 events, and each `tail-outage-stop` run deferred 1 batch of 100.
 - **`kafka_in` defers its own parked send, so the backstop never cuts it.** At the signal its
   delivery loop gives the batch in flight the lesser of `drain_timeout` and half its shutdown
   grace, 2.5 s by default, counts it and every batch behind it `logit.input.batches.deferred`,
   then commits and leaves the group, all inside the grace: the run logged no `shutdown_backstop`
-  line. One batch was deferred, and `ledger.wire` read W − G 100 against the band's 1,000.
-- **`influxdb_in`'s parked request is answered before the backstop can cut it.** Its 5 s
-  `busy_after` deadline passes before the listener's 5 s grace does, since a request parked at the signal started its send before it:
-  the request is answered `503` and deferred, and the client resends it. Neither value is a config field, and `otlp_in`, `splunk_hec_in`'s later batches, and
-  `prometheus_in`'s receiver send on `crate::http::deliver_detached`'s task, which the backstop
-  never reads, so no HTTP listener's cut is reachable short of a request whose send starts after
-  the signal. `expect.listener-cuts-nothing` reads 0, and the 4 busy `503`s equal the listener's
-  4 `batches.deferred`.
-- In all three, the sink dropped its 67 queued batches `shutdown` and `aggregate`'s send into the
-  closed sink was dropped `closed_consumer`, which each scenario's expectation requires and
+  line. One batch was deferred, and `ledger.wire` read W − G 100 against the band's 1,000. Its
+  sink keeps the default grace, since no backstop races it.
+- **No HTTP variant, because no HTTP listener's send is cuttable.** `influxdb_in`, `datadog_in`,
+  and `datadog_trace_in` answer a parked request busy at a 5 s `BUSY_AFTER` from the start of its
+  send, no later than the 5 s grace, and `otlp_in`, `prometheus_in`'s receiver, and
+  `splunk_hec_in`'s later batches send from a detached task the backstop never reads;
+  `http-ingress` already covers the busy `503` path.
+- In each scenario the sink dropped its 67 queued batches `shutdown` and `aggregate`'s send into
+  the closed sink was dropped `closed_consumer`, which each scenario's expectation requires and
   `drops` excuses.
 - **Self-test**: `_backstop_ledger` gained a Kafka-wire case: a stopped life's deferred batches
   widen the band and are read again, and a final life's excuse W − D past E + B. Taking
   `KAFKA_WIRE` out of `DEFERRED_WIRES` fails four of its expectations, and out of
-  `DEFERRED_UNSENT_WIRES` two; 2,744 expectations pass.
+  `DEFERRED_UNSENT_WIRES` two; 2,742 expectations pass.
