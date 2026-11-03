@@ -903,6 +903,10 @@ the operator-facing account of all of this.
   first at most 1 over the run, 0 around the SUT's pause, stop, kill, and partition and the
   generator's stop, and at least 1 around a `reset` step, which closes the generator's connection with `ss -K` from a
   one-shot container in its network namespace (a kernel with `CONFIG_INET_DIAG_DESTROY`).
+  `syslog-stall-kill` and `syslog-stall-kill-default` kill the SUT inside a pause (a stalled
+  kill), with each socket buffer capped at 256 KiB and at Linux's default maxima, and
+  `ledger.wire` holds the lines the frozen listener's connections held to each connection's two
+  buffers (the source's `socket_buffers`, checked against the compose override's sysctls).
   `http-ingress` sends InfluxDB points from `influxdb_out` into `influxdb_in`, its source
   declared `wire = "http"`: G is the points the listener answered `204` for and W its
   `events.sent`, a busy `503` and `logit.input.batches.deferred` are a retry, not loss, and only

@@ -255,7 +255,15 @@ SOURCE_LEDGER_KEYS = ("generator_input", "generator_sink", "sut_listener")
 # generator that sends several UDP flows has one input and one sink per flow.
 SOURCE_KEYS = {"service", "generator_input", "generator_sink", "sut_listener"}
 LISTED_SOURCE_KEYS = ("generator_input", "generator_sink")
-OPTIONAL_SOURCE_KEYS = {"sut_transforms", "wire", "fan_out", "merge"}
+OPTIONAL_SOURCE_KEYS = {"sut_transforms", "wire", "fan_out", "merge", "socket_buffers"}
+# A `tcp` source's `socket_buffers`: the most bytes one connection's receive buffer on the SUT
+# (`receive`) and send buffer on the generator (`send`) can hold, which `ledger.wire` bounds a
+# stalled kill's loss by (checks.py's `_stalled_kill_bound`). Each must equal the maximum the
+# scenario's compose override sets for that end (`SOCKET_SYSCTLS`): a new network namespace
+# copies the host's values, which a scenario can't know. A source needs it when a `kill` lands
+# inside a `pause` of the SUT.
+SOCKET_BUFFER_KEYS = ("receive", "send")
+SOCKET_SYSCTLS = {"receive": "net.ipv4.tcp_rmem", "send": "net.ipv4.tcp_wmem"}
 # The one transform kind `fan_out` may name: it emits one event per point of a parent's message
 # and counts the lines it loses in `logit.transform.lines.dropped` (checks.py's
 # `Ledger.through`).
@@ -997,6 +1005,10 @@ def from_dict(raw, path):
             problems.append(f"compose: {compose} not found beside {path.name}")
     overlap = _parse_overlap(raw["overlap"], problems) if "overlap" in raw else None
     if isinstance(ledger, dict):
+        override = path.parent / compose if compose is not None else None
+        problems += _socket_buffer_problems(
+            ledger, override.read_text() if override is not None and override.is_file()
+            else None)
         problems += _sink_problems(ledger, target["kind"])
         problems += _source_problems(ledger)
         sut_config = configs.get(SUT_CONFIG_KEY) if isinstance(configs, dict) else None
@@ -1629,6 +1641,62 @@ def source_pairs(source):
     return list(zip(source_ids(source, "generator_input"), source_ids(source, "generator_sink")))
 
 
+def compose_sysctls(text):
+    """`{service: {name: value}}`: each service's `sysctls:` in compose text `text`, written as
+    a map or as a list of `name=value`, comments removed and quotes stripped."""
+    out = {}
+    stack = []
+    for line in _uncommented(text).splitlines():
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip())
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        body = line.strip()
+        keys = [key for _, key in stack]
+        if len(keys) == 3 and keys[0] == "services" and keys[2] == "sysctls":
+            item = body[2:].strip() if body.startswith("- ") else body
+            found = re.match(r"^[\"']?([\w.]+)[\"']?\s*[:=]\s*(.*)$", item)
+            if found:
+                out.setdefault(keys[1], {})[found.group(1)] = (
+                    found.group(2).strip().strip("\"'"))
+            continue
+        found = re.match(r"^([\w.-]+)\s*:", body)
+        if found:
+            stack.append((indent, found.group(1)))
+    return out
+
+
+def _socket_buffer_problems(ledger, override_text):
+    """Each source's `socket_buffers` must equal the maximum its scenario's compose override
+    sets for each end: `receive` the third value of `net.ipv4.tcp_rmem` on `logit`, and `send`
+    of `net.ipv4.tcp_wmem` on the source's generator (`SOCKET_SYSCTLS`)."""
+    problems = []
+    sources = ledger.get("source")
+    for index, source in enumerate(sources if isinstance(sources, list) else []):
+        buffers = source.get("socket_buffers") if isinstance(source, dict) else None
+        if not isinstance(buffers, dict):
+            continue
+        where = f"ledger.source {index + 1}"
+        if override_text is None:
+            problems.append(f"{where}: `socket_buffers` needs a compose override that sets "
+                            "each end's buffer maximum: a namespace's default copies the "
+                            "host's")
+            continue
+        sysctls = compose_sysctls(override_text)
+        for key, service in (("receive", SUT_SERVICE), ("send", source.get("service"))):
+            name = SOCKET_SYSCTLS[key]
+            words = str(sysctls.get(service, {}).get(name, "")).split()
+            if len(words) != 3 or not words[2].isdigit():
+                problems.append(f"{where}: socket_buffers.{key} needs the compose override to "
+                                f"set {name} on {service}, three byte counts")
+            elif int(words[2]) != buffers.get(key):
+                problems.append(f"{where}: socket_buffers.{key} is {buffers.get(key)}, and the "
+                                f"compose override's {name} on {service} allows up to "
+                                f"{words[2]}")
+    return problems
+
+
 def component_kind(text, component):
     """The `type:` of `component` in config `text`, or None when no block of it names one.
     Comments are ignored."""
@@ -1863,6 +1931,17 @@ def _source_problems(ledger):
                 problems.append(f"{where}: `{key}` must name a component id")
         if "wire" in source and source["wire"] not in WIRES:
             problems.append(f"{where}: `wire` must be one of {', '.join(WIRES)}")
+        if "socket_buffers" in source:
+            buffers = source["socket_buffers"]
+            if source.get("wire") != "tcp":
+                problems.append(f"{where}: `socket_buffers` is for a `tcp` wire, whose "
+                                "connection's buffers a stalled kill loses")
+            if (not isinstance(buffers, dict) or set(buffers) != set(SOCKET_BUFFER_KEYS)
+                    or not all(isinstance(v, int) and not isinstance(v, bool) and v > 0
+                               for v in buffers.values())):
+                problems.append(f"{where}: `socket_buffers` must be a table of "
+                                f"{' and '.join(SOCKET_BUFFER_KEYS)}, each a byte count above "
+                                "0, such as { receive = 262144, send = 262144 }")
         listed = [isinstance(source.get(key), list) for key in LISTED_SOURCE_KEYS]
         if any(listed) and not (all(listed) and len(source["generator_input"])
                                 == len(source["generator_sink"])):
@@ -2763,6 +2842,34 @@ def _parse_random(table, problems, dur):
     return RandomSpec(seed=seed, gap_min=gap_min, gap_max=gap_max, faults=templates)
 
 
+def stalled_kills(steps):
+    """`[(pause, kill)]`: each `kill` step that starts inside a `pause` step on the same service,
+    after the pause starts, and ends when the pause does. The kill lands on a frozen process, so
+    nothing reads the connection's buffers before it dies (faults.py's `pause_revert`)."""
+    pauses = [spec for spec in steps if spec.action == "pause"]
+    found = []
+    for kill in steps:
+        if kill.action != "kill":
+            continue
+        for pause in pauses:
+            if (pause.on == kill.on and pause.at < kill.at < pause.at + pause.for_
+                    and kill.at + kill.for_ == pause.at + pause.for_):
+                found.append((pause, kill))
+    return found
+
+
+def _stalled_kill_problems(scenario):
+    """A `tcp` source names `socket_buffers` when a stalled kill lands on `logit`, whose
+    listener holds every source: `ledger.wire` bounds what the kill loses by them."""
+    if not any(kill.on == SUT_SERVICE for _, kill in stalled_kills(scenario.steps)):
+        return []
+    return [f"ledger.source {index + 1}: a kill inside a pause of {SUT_SERVICE} loses what its "
+            "connections' buffers hold, so a tcp source names `socket_buffers`, the bound "
+            "ledger.wire holds that loss to"
+            for index, source in enumerate(scenario.sources)
+            if source.get("wire") == "tcp" and "socket_buffers" not in source]
+
+
 def validate(scenario, duration=None, seed=None):
     """Raises `ScenarioError` listing every rule `scenario` breaks for a run of `duration`
     seconds (the scenario's own when None), drawn with `seed` (from `--seed`) for a random
@@ -2820,7 +2927,9 @@ def validate(scenario, duration=None, seed=None):
 
     # Two faults on one container may not overlap. A netem overlapping a stop, kill, pause,
     # restart, or partition of its container gets its own message: the qdisc is lost with the
-    # namespace, and a one-shot netem container needs a running target.
+    # namespace, and a one-shot netem container needs a running target. A kill may start inside
+    # a pause of its container and end with it: a stalled kill (`stalled_kills()`).
+    stalled = {(pause.index, kill.index) for pause, kill in stalled_kills(scenario.steps)}
     by_service = {}
     for spec in scenario.steps:
         by_service.setdefault(spec.on, []).append(spec)
@@ -2831,6 +2940,16 @@ def validate(scenario, duration=None, seed=None):
                 if second.at < first.at + first.for_:
                     pair = {first.action, second.action}
                     if first.action in HOLDING_ACTIONS and second.action in HELD_ACTIONS:
+                        continue
+                    if (first.index, second.index) in stalled:
+                        continue
+                    if pair == {"pause", "kill"}:
+                        problems.append(
+                            f"steps {first.index + 1} and {second.index + 1}: a kill inside a "
+                            f"pause on {service} starts after the pause and ends when it does, "
+                            "since the kill's revert starts the container and the pause has "
+                            "nothing left to unpause"
+                        )
                         continue
                     held = pair & set(HELD_ACTIONS)
                     if held and pair & set(INSTANCE_HOLD_ACTIONS):
@@ -2853,6 +2972,7 @@ def validate(scenario, duration=None, seed=None):
 
     problems += _expect_problems(scenario, duration)
     problems += _overlap_step_problems(scenario)
+    problems += _stalled_kill_problems(scenario)
 
     run_duration = scenario.duration if duration is None else duration
     problems += _rename_problems(scenario, run_duration)

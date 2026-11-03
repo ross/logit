@@ -121,7 +121,11 @@ Entry format and the other areas: [the known-gaps index](README.md).
     400 lines, the error of the estimate, of what the listener read after its last export
     ([plan `soak-harness`](../plans/soak-harness.md)'s "Findings"). A receiver stalled behind a
     full receive buffer when it's killed would lose the whole buffer, up to several MiB under
-    Linux's default autotuning, and no scenario measures that.
+    Linux's default autotuning. `syslog-stall-kill` and `syslog-stall-kill-default` are the
+    measurement, with each buffer capped at 256 KiB and at Linux's default maxima, and
+    `graphite-egress`'s kills of VictoriaMetrics measure the same loss at a backend
+    ([plan `soak-harness`](../plans/soak-harness.md)'s "A backend kill's tail and a stalled
+    receiver"); neither has run yet.
 
 - **A kept-alive connection a destination closed first reads as `Ambiguous`.** An HTTP sink
   closes a pooled connection idle past its `idle_timeout:` (30 s by default) before reusing it,

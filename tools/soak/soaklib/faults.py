@@ -29,6 +29,10 @@ Facts a maintainer needs here (docs/plans/soak-harness.md, "Netem scope"):
   `internal` drain, no shutdown drops, and no `exiting` or `drain complete` line, and the container
   exits with `KILL_EXIT_CODE`. Its revert is a `docker start`, as a `stop`'s is. The container is
   never recreated, so its filesystem, a disk spool under `/tmp` included, survives the kill.
+- A `kill` may land inside a `pause` of its container and end with it (a stalled kill). Docker
+  signals a paused container and then thaws it, and the process dies on the pending SIGKILL
+  before it runs again, so it never reads what its sockets hold. The pause's revert then finds
+  the container exited or started again and unpauses nothing.
 - A `respond` sets a stand-in's answer: its apply POSTs the step's cue to the stand-in's
   control port and its revert POSTs an empty cue, which restores the default. A refused or
   failed POST is the record's `rc` 1, so `timeline` FAILs it and the step gets no window.
@@ -201,11 +205,25 @@ def reset_apply(ctx, step):
     return record
 
 
+def _started_at(ctx, service):
+    return ((ctx.docker.inspect(ctx.ids[service]) or {}).get("State") or {}).get("StartedAt")
+
+
 def pause_apply(ctx, step):
+    ctx.state[step.id] = _started_at(ctx, step.on)
     return _record(ctx.docker.run(["pause", ctx.ids[step.on]]))
 
 
 def pause_revert(ctx, step):
+    """Unpauses the container, unless a stalled kill inside the pause ended it
+    (scenario.py's `stalled_kills()`): a container no longer paused that has exited or started
+    again since the pause's apply has nothing to unpause, and the record says so (`unpaused`
+    false). Any other container that isn't paused fails the unpause."""
+    paused_at = ctx.state.pop(step.id, None)
+    state = (ctx.docker.inspect(ctx.ids[step.on]) or {}).get("State") or {}
+    if state and not state.get("Paused") and (
+            state.get("Status") == "exited" or state.get("StartedAt") != paused_at):
+        return {"rc": 0, "stderr": "", "unpaused": False, "status": state.get("Status")}
     return _record(ctx.docker.run(["unpause", ctx.ids[step.on]]))
 
 

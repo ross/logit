@@ -102,7 +102,12 @@ framer's counted drop as wire loss kept out of `drops`, the same lines uncounted
 generator netem judged on TCP but not on UDP, a SUT netem judged, a judged window's surplus
 against its ambiguous attempts under either posture and not a drop alone, a partition judged
 or reported by its address, `recovery` and a killed life's band reading the frames, and a
-source naming `wire = "udp"` scoring as one naming none. For `kill_unflushed`, it
+source naming `wire = "udp"` scoring as one naming none. For a stalled kill, a `kill` inside a
+`pause` of the SUT, it covers its overlap rules, `socket_buffers` against its wire, its shape,
+and the compose override's maxima (`compose_sysctls()`), the key required on a tcp source a
+stalled kill ends, the pause's revert unpausing nothing through a fake Docker with no
+readiness probe in the driver or `timeline`, and the fault run's loss held to its bound, past
+it, and unbounded without the key or the generator's bytes per line. For `kill_unflushed`, it
 covers its rules (a duration above 0, `vm_every_window`, a `graphite_out` sink, a local
 target) and a backend kill refused without it, and `ledger.tail` on a three-life run: exact,
 within a backend kill's bound, past it, a loss with no kill, a surplus, and `ledger.windows`
@@ -3628,7 +3633,8 @@ def _rss_settle_rules(root):
                  f"rss_settle = {value!r}")
     # Only these schedules opt in; every other shipped scenario keeps recovery_bound alone.
     opted_in = {"fanin": 60.0, "tcp-ingress": 60.0, "partition-rss": 120.0,
-                "cri-rotate-rss": 120.0, "syslog-tcp-ingress": 60.0, "syslog-tls-ingress": 60.0}
+                "cri-rotate-rss": 120.0, "syslog-tcp-ingress": 60.0, "syslog-tls-ingress": 60.0,
+                "syslog-stall-kill": 60.0, "syslog-stall-kill-default": 60.0}
     for path_one in sorted((root / "scenarios").glob("*/scenario.toml")):
         name = path_one.parent.name
         want = opted_in.get(name, 0.0)
@@ -4074,6 +4080,69 @@ def _exit_driver():
     run.after("revert", step, {"rc": 0, "started": False})
     expect(not run.pending_ready and run.started_at["logit"] == "first",
            "a revert that started nothing probes nothing")
+
+
+class _PauseDocker:
+    """Answers `inspect` with the next of `states` and records each `run`."""
+
+    def __init__(self, states):
+        self.states = list(states)
+        self.calls = []
+
+    def inspect(self, cid):
+        return {"State": self.states.pop(0)}
+
+    def run(self, args, timeout=None):
+        self.calls.append(list(args))
+        return docker.Result(0, "", "")
+
+    def __getattr__(self, name):
+        raise AssertionError(f"_PauseDocker.{name} called")
+
+
+def _stalled_pause():
+    """A pause's revert after a stalled kill: the container exited or started again since the
+    apply, so it unpauses nothing and says so, and neither the driver nor `timeline` waits for
+    a readiness probe it would have queued; a container still paused, or one not paused that
+    neither exited nor restarted, is unpaused."""
+    step = scenario.Step("c0s1", 0, 0, "pause", "logit", "", 0.0, 60.0)
+    paused = {"Paused": True, "Status": "paused", "StartedAt": "first"}
+    running = {"Paused": False, "Status": "running", "StartedAt": "first"}
+    for what, after, unpaused in (
+            ("started again", dict(running, StartedAt="second"), False),
+            ("exited", {"Paused": False, "Status": "exited", "StartedAt": "first"}, False),
+            ("stayed paused", paused, None),
+            ("stayed running", running, None)):
+        fake = _PauseDocker([{"Status": "running", "StartedAt": "first"}, after])
+        ctx = faults.Context(docker=fake, ids={"logit": "sut"}, netem_image="netem")
+        faults.ACTIONS["pause"].apply(ctx, step)
+        result = faults.ACTIONS["pause"].revert(ctx, step)
+        calls = [["pause", "sut"]] + ([] if unpaused is False else [["unpause", "sut"]])
+        expect(fake.calls == calls and result.get("unpaused") is unpaused
+               and result["rc"] == 0,
+               f"a pause's revert when the container has {what}: {calls}, got {fake.calls} "
+               f"{result}")
+
+    for result, probes in (({"rc": 0, "unpaused": False}, False), ({"rc": 0}, True)):
+        run = driver.Run.__new__(driver.Run)
+        run.down, run.paused, run.exiting = set(), set(), set()
+        run.pending_ready, run.fail_fast = {}, None
+        run.roles = dict(scenario.BASE_ROLES)
+        run.after("apply", step, {"rc": 0})
+        run.after("revert", step, result)
+        expect(("logit" in run.pending_ready) is probes and "logit" not in run.paused,
+               f"a pause's revert {result} probes readiness: {probes}, got {run.pending_ready}")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        for name, extra, status in (("stalled", {"unpaused": False}, checks.PASS),
+                                    ("unprobed", {}, checks.FAIL)):
+            timeline = [_phase("start", 0, t0=T0),
+                        _action("apply", "c0s1", "pause", "logit", 60),
+                        _action("revert", "c0s1", "pause", "logit", 120, **extra),
+                        _phase("end_begin", 400), _phase("end_end", 450)]
+            got = _status(_run_dir(tmp, name, timeline), checks.check_timeline)
+            expect(got.status == status,
+                   f"timeline on a pause revert {extra} with no probe: {status}, got {got}")
 
 
 def _health(offset, word, start=None):
@@ -6431,6 +6500,171 @@ def _tcp_run(tmp, name, sut_edit=None, gen_edit=None, datagrams=False, wire="tcp
     resolved["ledger"]["source"] = [source]
     (run_dir / "scenario.resolved.json").write_text(json.dumps(resolved))
     return run_dir
+
+
+STALL_PAUSE = (86, 131)
+STALL_KILL = (101, 131)
+
+
+def _stall_run(tmp, name, redials=0, buffers=(150_000, 150_000), per_line=100, sized=True):
+    """`_tcp_run`'s two-life run with its stop replaced by a stalled kill: a pause of the SUT
+    over `STALL_PAUSE` and a kill inside it over `STALL_KILL`, both TCP-affecting, the pause's
+    revert finding nothing to unpause. The SUT writes no drain while paused, so its last before
+    the pause is at +85. The generator's sink counts `per_line` bytes per line
+    (`logit.output.batch.bytes`) when `sized`, and `redials` reconnects at +105; the source
+    names `buffers` as its `socket_buffers` (`(receive, send)`, None for none)."""
+    pause_ts = (T0 + STALL_PAUSE[0], T0 + STALL_KILL[0])
+
+    def sut_edit(record):
+        ts = telemetry.parse_rfc3339(record["timestamp"])
+        return None if pause_ts[0] < ts < pause_ts[1] else record
+
+    def gen_edit(record):
+        if record["metrics"][0]["name"] != "logit.output.messages":
+            return record
+        extra = []
+        if sized:
+            extra.append(json.loads(_line(record["timestamp"], "logit.output.batch.bytes",
+                                          "sum", PER_DRAIN * per_line, component="out")))
+        if redials and record["timestamp"] == _stamp(T0 + 105):
+            extra.append(json.loads(_line(record["timestamp"], "logit.output.reconnects",
+                                          "sum", redials, component="out")))
+        return [record, *extra]
+
+    run_dir = _tcp_run(tmp, name, sut_edit=sut_edit, gen_edit=gen_edit)
+    timeline = []
+    for line in (run_dir / "timeline.jsonl").read_text().splitlines():
+        record = json.loads(line)
+        if record.get("step") == "c0s1" and record["event"] in ("apply", "revert"):
+            if record["event"] == "apply":
+                timeline.append(_action("apply", "c0s1", "pause", "logit", STALL_PAUSE[0],
+                                        affects_tcp_ingress=True, affects_udp_ingress=True))
+                timeline.append(_action("apply", "c0s2", "kill", "logit", STALL_KILL[0],
+                                        STALL_KILL[0] + 0.1, affects_tcp_ingress=True,
+                                        affects_udp_ingress=True))
+            else:
+                timeline.append(_action("revert", "c0s2", "kill", "logit", STALL_KILL[1] - 1,
+                                        STALL_KILL[1], affects_tcp_ingress=True,
+                                        affects_udp_ingress=True))
+                timeline.append(_action("revert", "c0s1", "pause", "logit", STALL_PAUSE[1],
+                                        STALL_PAUSE[1] + 0.1, affects_tcp_ingress=True,
+                                        affects_udp_ingress=True, unpaused=False))
+            continue
+        timeline.append(record)
+    (run_dir / "timeline.jsonl").write_text("".join(json.dumps(r) + "\n" for r in timeline))
+    resolved = json.loads((run_dir / "scenario.resolved.json").read_text())
+    source = dict(resolved["ledger"]["source"][0])
+    if buffers is not None:
+        source["socket_buffers"] = {"receive": buffers[0], "send": buffers[1]}
+    resolved["ledger"]["source"] = [source]
+    (run_dir / "scenario.resolved.json").write_text(json.dumps(resolved))
+    return run_dir
+
+
+def _stall_ledger():
+    """`ledger.wire` on a stalled kill: the fault run holding it reports its loss and holds it
+    to G from the SUT's last drain to the pause, plus each connection's two `socket_buffers`
+    in lines, plus a batch per edge; a loss past that FAILs, and without `socket_buffers` or
+    the generator's bytes per line the loss is reported unbounded."""
+    with tempfile.TemporaryDirectory() as tmp:
+        def wire(name, **kwargs):
+            return checks.check_ledger_wire(checks.RunData(_stall_run(tmp, name, **kwargs)))
+
+        within = wire("stall-within", redials=2)
+        expect(within.status == checks.PASS
+               and "stalled kill [+85s, +180s]: lost 9,000, within its bound 9,400, uncounted "
+               "by design; c0s2 inside c0s1: G 200 from the SUT's last drain at +85s to the "
+               "pause" in within.detail
+               and "bound 9,400 = 200 + 3 connection(s) (2 redial(s)) x (150,000 + 150,000) "
+               "bytes at 100.0 bytes per line (9,000) + 2 edge(s) x one 100-line batch"
+               in within.detail,
+               f"wire holds a stalled kill's loss to its connections' buffers, got {within}")
+        over = wire("stall-over")
+        expect(over.status == checks.FAIL
+               and over.detail.startswith("stalled kill [+85s, +180s]: lost 9,000, over its "
+                                          "bound 3,400")
+               and over.detail.count("over its bound") == 1
+               and "1 connection(s) (0 redial(s))" in over.detail,
+               f"wire FAILs a stalled kill's loss past one connection's buffers, got {over}")
+        smaller = wire("stall-small-buffers", redials=2, buffers=(100_000, 100_000))
+        expect(smaller.status == checks.FAIL and "over its bound 6,400" in smaller.detail,
+               f"the bound follows socket_buffers, got {smaller}")
+        unnamed = wire("stall-no-buffers", buffers=None)
+        expect(unnamed.status == checks.PASS
+               and "stalled kill [+85s, +180s]: lost 9,000; c0s2 inside c0s1: not bounded: the "
+               "source names no socket_buffers" in unnamed.detail,
+               f"wire reports a stalled kill unbounded without socket_buffers, got {unnamed}")
+        unsized = wire("stall-no-bytes", redials=2, sized=False)
+        expect(unsized.status == checks.PASS
+               and "not bounded: the generator's sink counted no logit.output.batch.bytes"
+               in unsized.detail,
+               f"wire reports a stalled kill unbounded without bytes per line, got {unsized}")
+
+
+def _stall_rules(root):
+    """A stalled kill's rules: syslog-stall-kill and its default-buffer twin load with two kills
+    inside pauses of the SUT; a kill inside a pause that starts with it or ends before it is
+    refused; `socket_buffers` is held to a tcp wire, its shape, and the compose override's
+    maxima, and is required on a tcp source a stalled kill on the SUT ends; and
+    `compose_sysctls()` reads a map and a list."""
+    for name, buffers in (("syslog-stall-kill", {"receive": 262144, "send": 262144}),
+                          ("syslog-stall-kill-default", {"receive": 6291456, "send": 4194304})):
+        path = root / "scenarios" / name / "scenario.toml"
+        loaded = scenario.load(path)
+        pairs = [(pause.index, kill.index) for pause, kill in scenario.stalled_kills(loaded.steps)]
+        expect(pairs == [(0, 1), (2, 3)] and loaded.sources[0]["socket_buffers"] == buffers,
+               f"{name} loads with two stalled kills and its buffers, got {pairs} "
+               f"{loaded.sources[0].get('socket_buffers')}")
+        try:
+            scenario.check_services(loaded, scenario.base_roles(loaded))
+            expect(True, "")
+        except scenario.ScenarioError as err:
+            expect(False, f"{name}'s services are refused: {err.problems}")
+
+    path = root / "scenarios" / "syslog-stall-kill" / "scenario.toml"
+    raw = tomllib.loads(path.read_text())
+
+    def mutate(edit):
+        changed = copy.deepcopy(raw)
+        edit(changed)
+        return changed
+
+    def step(index, **changes):
+        return lambda r: r["step"][index].update(changes)
+
+    def source(**changes):
+        return lambda r: r["ledger"]["source"][0].update(changes)
+
+    overlap = "steps 1 and 2: a kill inside a pause on logit starts after the pause and ends"
+    cases = [
+        (step(1, **{"for": "20s"}), overlap, "a kill ending before its pause"),
+        (step(1, at="0s", **{"for": "60s"}), overlap, "a kill starting with its pause"),
+        (source(wire="udp"), "ledger.source 1: `socket_buffers` is for a `tcp` wire",
+         "socket_buffers on a udp wire"),
+        (source(socket_buffers={"receive": 262144}),
+         "`socket_buffers` must be a table of receive and send", "socket_buffers missing send"),
+        (source(socket_buffers={"receive": 262144, "send": 0}),
+         "`socket_buffers` must be a table of receive and send", "a zero buffer"),
+        (source(socket_buffers={"receive": 262144, "send": 131072}),
+         "socket_buffers.send is 131072, and the compose override's net.ipv4.tcp_wmem on "
+         "generator allows up to 262144", "a buffer the override doesn't set"),
+        (lambda r: r["ledger"]["source"][0].pop("socket_buffers"),
+         "ledger.source 1: a kill inside a pause of logit loses what its connections' buffers "
+         "hold", "a stalled kill on a tcp source with no socket_buffers"),
+        (lambda r: r.pop("compose"), "`socket_buffers` needs a compose override",
+         "socket_buffers with no override"),
+    ]
+    for edit, needle, what in cases:
+        _refused(path, mutate(edit), needle, what)
+
+    listed = ("services:\n  logit:\n    sysctls:\n      - net.ipv4.tcp_rmem=4096 65536 262144\n"
+              "  generator:\n    image: x  # not a sysctl\n    sysctls:\n"
+              "      net.ipv4.tcp_wmem: '4096 16384 262144'\n      net.core.somaxconn: 4096\n")
+    expect(scenario.compose_sysctls(listed)
+           == {"logit": {"net.ipv4.tcp_rmem": "4096 65536 262144"},
+               "generator": {"net.ipv4.tcp_wmem": "4096 16384 262144",
+                             "net.core.somaxconn": "4096"}},
+           f"compose_sysctls reads a list and a map, got {scenario.compose_sysctls(listed)}")
 
 
 def _fault_pair(step, action, on, start, end, udp=False, tcp=False, **extra):
@@ -15722,7 +15956,7 @@ def run(root, quiet=False):
                      _log_capture, _signals, _deadlines, _stalled, _stall_abort,
                      _retry_stalled, _run_dir_claim, _hung_inspect, _inspect_redacted,
                      _ndjson, _stderr, _slope, _checks, _vm_resets, _ledger_checks,
-                     _kill_watchdog, _kill_ledger, _tail_ledger,
+                     _kill_watchdog, _stalled_pause, _kill_ledger, _tail_ledger,
                      _expect_checks, _gauge_lives, _target_rules,
                      _sink_drain, _external_checks, _kafka_rules, _kafka_topic, _kafka_checks,
                      _otlp_walker, _otlp_topic, _otlp_checks,
@@ -15730,7 +15964,8 @@ def run(root, quiet=False):
                      _script_ledger, _sink_ledger, _target_ledger, _roles, _sink_rules,
                      _tail_rules,
                      _driver_roles,
-                     _sources_ledger, _source_rules, _fanin_driver, _tcp_ledger, _tcp_rules,
+                     _sources_ledger, _source_rules, _fanin_driver, _tcp_ledger, _stall_ledger,
+                     _tcp_rules, _stall_rules,
                      _http_ledger, _http_rules, _file_ledger, _file_rules,
                      _kafka_wire_ledger, _kafka_wire_rules,
                      _cri_count, _cri_writer, _cri_rules, _cri_ledger, _cri_dangles,
@@ -15763,7 +15998,8 @@ def run(root, quiet=False):
                               _expected_event_rules,
                               _shipped, _roles, _sink_rules, _tail_rules, _driver_roles,
                               _source_rules,
-                              _fanin_driver, _tcp_rules, _http_rules, _file_rules, _kafka_wire_rules,
+                              _fanin_driver, _tcp_rules, _stall_rules, _http_rules, _file_rules,
+                              _kafka_wire_rules,
                               _cri_rules,
                               _two_sut_rules,
                               _two_sut_driver, _file_action_rules, _relay_rules, _relay_driver,

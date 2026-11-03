@@ -1,0 +1,12 @@
+# Sets the socket buffers on each end of the TCP connection to Linux's own defaults, in each
+# container's own network namespace: a new namespace copies the host's maxima, which a scenario
+# can't know, and a tuned host's (`tcp_rmem` up to 32 MiB) aren't the autotuning most
+# deployments run. With these, autotuning may grow a receive buffer to 6 MiB and a send buffer
+# to 4 MiB, which the scenario's `socket_buffers` names.
+services:
+  logit:
+    sysctls:
+      net.ipv4.tcp_rmem: "4096 131072 6291456"
+  generator:
+    sysctls:
+      net.ipv4.tcp_wmem: "4096 16384 4194304"

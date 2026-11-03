@@ -888,6 +888,29 @@ the next window's total covers a lost one, and `ledger.windows` sees the gap but
   excuses a gap overlapping a kill's span on such a sink and lists it, leaving its size to
   `ledger.tail`.
 
+## Amendment: a stalled kill bounds what a frozen receiver's buffers lose (2026-11-03)
+
+A receiver killed while it keeps up loses little: `syslog-tcp-ingress`'s kills fell within the
+estimate's error. A receiver stalled behind full buffers when it dies loses all of them, and
+the generator counted every line in them as written.
+
+- **A kill may start inside a pause and end with it.** Docker signals a paused container and
+  then thaws it, so the process dies on the pending SIGKILL before it reads again. The kill's
+  revert starts the container; the pause's revert finds it exited or started since its apply,
+  unpauses nothing, records `unpaused: false`, and the driver and `timeline` expect no
+  readiness probe for it. Any other overlap of the two stays refused.
+- **The loss is bounded by the buffers.** On a `tcp` source the stalled kill's fault run is
+  reported as a kill's is, and its G − W is held to G from the SUT's last drain to the pause,
+  plus each connection the generator opened before the kill times the source's
+  `socket_buffers`, in lines at the generator's bytes per line, plus a batch per edge. A write
+  stalled past `connect_timeout` drops its connection, and the redial completes into the frozen
+  listener's accept queue and fills another pair, so the connections are 1 plus the generator
+  sink's reconnects through the stall. Past the bound the row FAILs.
+- **The buffers are the override's.** A new network namespace copies the host's maxima, so a
+  scenario's compose override sets `net.ipv4.tcp_rmem` on the SUT and `tcp_wmem` on the
+  generator, and `load()` holds `socket_buffers` to them. `syslog-stall-kill` caps both at
+  256 KiB; `syslog-stall-kill-default` sets Linux's default maxima.
+
 ## Amendment: OTLP and HEC stand-ins overwrite under cumulative temporality, and name loss by position (2026-10-29)
 
 A stand-in target can play OTLP/HTTP's metrics route (`[target] shape = "otlp"`) and Splunk's

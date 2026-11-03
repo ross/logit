@@ -639,6 +639,13 @@ sut_transforms = ["parse", "labels", "count", "metrics_only"]   # optional, in o
   whose discards are merges, each merged record credited back as delivered (§6, M).
   `load()` checks each node's kind against the SUT config, and refuses `merge` beside a
   `fan_out` and under `split = "target"`, whose rows read one `aggregate` per sink.
+- `socket_buffers`, optional on a `tcp` source, is a table of `receive` and `send`, the most
+  bytes one connection's receive buffer on the SUT and send buffer on the generator hold: the
+  third value of `net.ipv4.tcp_rmem` on `logit` and of `net.ipv4.tcp_wmem` on the generator,
+  which the scenario's compose override sets, since a new network namespace copies the host's
+  maxima. `load()` checks both values against the override (`scenario.compose_sysctls`). A
+  `tcp` source needs it when a stalled kill, a `kill` inside a `pause` of the SUT, is on the
+  schedule, because `ledger.wire` bounds that kill's loss by it (§6).
 - With the role map: every source's `service` is a `generator`, and every `generator` in the
   stack has a source, because a generator with none would put lines into a listener with no
   G behind them.
@@ -1291,6 +1298,21 @@ The rows:
   `at_most_once` posture it drops the batch `ambiguous_at_most_once`. A partition's label carries the address before and after it. The detail
   names the generator's counted loss by reason (`overflow_newest`, `ambiguous_at_most_once`)
   beside the gap; none of it is in G.
+
+  A stalled kill, a `kill` that starts inside a `pause` of the SUT and ends with it, lands on a
+  frozen process: Docker signals a paused container and then thaws it, and the process dies on
+  the pending SIGKILL before it reads anything more. Its fault run is reported as a kill's is,
+  and its loss, G − W over the run, is also held to a bound (`checks._stalled_kill_bound`):
+  G from the SUT's last drain to the pause, read and never exported or still in the buffers,
+  plus each connection the generator opened before the kill times the source's
+  `socket_buffers` receive and send bytes, in lines at the generator sink's
+  `logit.output.batch.bytes` per `output.messages`, plus one batch per edge. A write stalled
+  past the generator's `connect_timeout` drops its connection, and the redial completes into
+  the frozen listener's accept queue, since the kernel finishes the handshake, and fills
+  another pair of buffers; the connections are 1 plus the generator sink's
+  `logit.output.reconnects` from the pause to one generator drain past the kill. A loss past
+  the bound FAILs; without `socket_buffers` or the generator's bytes the loss is reported with
+  no bound.
 
   On an HTTP wire (W14) the row judges G − (W − X), and every lifecycle fault, `partition`,
   and netem of the ingress SUT or of a generator, and a `mark` or `exit` on the ingress SUT,
@@ -6876,3 +6898,27 @@ What the runs showed:
   widen the band and are read again, and a final life's excuse W − D past E + B. Taking
   `KAFKA_WIRE` out of `DEFERRED_WIRES` fails six of its expectations, and out of
   `DEFERRED_UNSENT_WIRES` two; 2,742 expectations pass.
+
+### A backend kill's tail and a stalled receiver (not yet run)
+
+Two measurements of the loss a TCP stream sink can't count, the bytes its receiver dies holding
+(`docs/known-gaps/sinks.md`, "A stream sink doesn't count the bytes its peer never
+acknowledged"). Neither has run; the numbers are owed.
+
+- **`graphite-egress`'s backend kills.** Its cycle adds two SIGKILLs of VictoriaMetrics, at
+  11m15s and 13m20s, half a 10 s window apart in phase, under `-inmemoryDataFlushInterval=5s` and
+  `kill_unflushed = "6s"`. `ledger.tail` will show, per SUT life, the lines `graphite_out`
+  counted written against the samples stored, each kill's loss against its bound, and
+  `ledger.windows` the gaps it leaves to that row; `reconnects-after-kill` and
+  `reconnects-after-second-kill` show the sink redialed. Owed: each kill's M − S, its bound,
+  and how much of the loss is VictoriaMetrics' unsaved memory rather than its socket. One run:
+  `script/soak run graphite-egress`, 18 minutes 35 seconds.
+- **`syslog-stall-kill` and `syslog-stall-kill-default`.** Each pauses the SUT for 60 s and
+  kills it 30 s in, pauses it for 120 s and kills it 90 s in, and kills it unpaused, with each
+  end's TCP buffers capped at 256 KiB, then at Linux's default maxima (6 MiB receive, 4 MiB
+  send). `ledger.wire` will show each stalled kill's loss with its connections, redials, and
+  bound; the expectations show the generator overflowed and held a batch during each stall.
+  Owed: each stalled kill's loss, its redials and bound, the unpaused kill's loss beside it,
+  and whether the default buffers' autotuning grows past the capped run's before the stall
+  fills them. One run each, `script/soak run syslog-stall-kill` and
+  `script/soak run syslog-stall-kill-default`, 11 minutes 30 seconds each.
