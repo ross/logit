@@ -6803,9 +6803,9 @@ What the runs showed:
 - **The backstop raced the sink's drop, so the sink now waits longer.** The listener's grace and
   the sink's `shutdown_grace` both defaulted to 5 s from the signal. The sink's drop unblocks the
   chain, and a tailer whose send completes before its own deadline fires returns with nothing to
-  cut: in `20261103T033732Z` the sink's `buffer_full_at_shutdown` line and the backstop's came 5 µs apart,
-  so a run the sink won would read `expect.listener-batch-deferred` 0. `sink-outage-stop` had the
-  same race between `statsd_in`'s backstop and its sink. Both SUTs' sinks now set
+  cut: in `20261103T033732Z` the sink's `buffer_full_at_shutdown` line and the backstop's came
+  5 µs apart, so a run the sink won would read `expect.listener-batch-deferred` 0.
+  `sink-outage-stop` had the same race between `statsd_in`'s backstop and its sink. Both SUTs' sinks now set
   `buffer.shutdown_grace: 10s`, so the chain stays blocked until the backstop has cut, and the
   shutdown still ends inside the harness's 30 s `docker stop` timeout. In every run since, the
   backstop's line came 5.00 s after the signal and the sink's 10.00 s: `sink-outage-stop` cut 1
