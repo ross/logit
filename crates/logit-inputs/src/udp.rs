@@ -2104,6 +2104,47 @@ pub(crate) fn now_nanos() -> i64 {
 mod tests {
     use super::*;
     use logit_core::{AttrMap, Resource};
+
+    /// A dropped [`Undecoded`] counts what it never yielded and logs its own line, never the
+    /// `shutdown_push_cut` a cancelled push logs: its datagrams were popped off the queue.
+    #[test]
+    fn a_dropped_undecoded_batch_logs_no_push_cut() {
+        let (lines, _guard) = logit_pipeline::test_util::capture_lines();
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("in", "statsd_in", "listener");
+        let diag = Diagnostics::new("in");
+        let mut popped: Vec<Datagram> = (0..3)
+            .map(|i| Datagram { bytes: Bytes::from(format!("m{i}")), received_at: i, peer: None })
+            .collect();
+        {
+            let mut undecoded = Undecoded {
+                drain: CountedDrain::new(
+                    &mut popped,
+                    &telemetry,
+                    &RECEIVE_QUEUE_METRICS,
+                    "shutdown",
+                ),
+                left: 3,
+                diag: &diag,
+            };
+            undecoded.next().expect("one is decoded");
+        }
+        let dropped: f64 = registry
+            .drain(0)
+            .iter()
+            .filter(|e| e.attributes.get("reason").and_then(|v| v.as_str()) == Some("shutdown"))
+            .flat_map(|e| e.metrics.iter())
+            .filter(|m| {
+                logit_core::interner::resolve(m.name) == RECEIVE_QUEUE_METRICS.items_dropped
+            })
+            .map(|m| match &m.kind {
+                logit_core::MetricKind::Sum(sum) => sum.value.as_f64(),
+                _ => 0.0,
+            })
+            .sum();
+        assert_eq!(dropped, 2.0, "the two never yielded are counted");
+        assert!(lines.with_key("shutdown_push_cut").is_empty(), "no push was cut");
+    }
     use logit_pipeline::unwrap_batch;
     use logit_proto::CodecError;
     use tokio::net::UdpSocket;

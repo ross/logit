@@ -172,10 +172,12 @@ impl From<SinkQueueConfig> for QueueConfig {
 /// `reason` is `"shutdown"` at every call site: the shutdown race and the grace backstop are the
 /// only production cancellers of a future that holds one.
 ///
-/// A drop that counts anything also logs one `shutdown_push_cut` warn line naming the queue's
-/// component, the counts, and the counter. The remainder isn't in `drain complete`'s
-/// `batches_dropped`: that tally sums batches, and the one production caller, a UDP listener's
-/// receive queue, holds datagrams.
+/// Built by [`BoundedQueue::push_many`] ([`CountedDrain::push_cut`]), a drop that counts
+/// anything also logs one `shutdown_push_cut` warn line naming the queue's component, the counts,
+/// and the counter. The remainder isn't in `drain complete`'s `batches_dropped`: that tally sums
+/// batches, and `push_many`'s one production caller, a UDP listener's receive queue, holds
+/// datagrams. One built by [`CountedDrain::new`] only counts, since what it holds may never have
+/// been a push (a UDP listener's popped, undecoded batch logs its own line).
 ///
 /// The drop calls only `Telemetry::count` and the log, never the queue lock. `Telemetry::count`
 /// takes its own buffer's lock, which is never held across an await or while a `CountedDrain`
@@ -186,6 +188,8 @@ pub struct CountedDrain<'a, T: Queued> {
     telemetry: &'a Telemetry,
     metrics: &'static QueueMetrics,
     reason: &'static str,
+    /// Whether a counting drop logs `shutdown_push_cut`: set only by [`Self::push_cut`].
+    push_cut: bool,
 }
 
 impl<'a, T: Queued> CountedDrain<'a, T> {
@@ -196,7 +200,19 @@ impl<'a, T: Queued> CountedDrain<'a, T> {
         metrics: &'static QueueMetrics,
         reason: &'static str,
     ) -> Self {
-        Self { drain: items.drain(..).peekable(), telemetry, metrics, reason }
+        Self { drain: items.drain(..).peekable(), telemetry, metrics, reason, push_cut: false }
+    }
+
+    /// [`Self::new`] for a push into the queue: a counting drop also logs `shutdown_push_cut`.
+    fn push_cut(
+        items: &'a mut Vec<T>,
+        telemetry: &'a Telemetry,
+        metrics: &'static QueueMetrics,
+        reason: &'static str,
+    ) -> Self {
+        let mut drain = Self::new(items, telemetry, metrics, reason);
+        drain.push_cut = true;
+        drain
     }
 
     /// The next item without yielding it. A peeked item that is never yielded is counted.
@@ -227,6 +243,9 @@ impl<T: Queued> Drop for CountedDrain<'_, T> {
             let tags = [("reason", self.reason)];
             self.telemetry.count(self.metrics.items_dropped, items as f64, &tags);
             self.telemetry.count(self.metrics.units_dropped, units as f64, &tags);
+            if !self.push_cut {
+                return;
+            }
             let component = self.telemetry.component().map_or("<unnamed>", |(id, _)| id);
             tracing::warn!(
                 target: "logit",
@@ -467,7 +486,8 @@ impl<T: Queued> BoundedQueue<T> {
         // wait and keep evicted datagrams alive for it.
         let mut dropped: Vec<(&'static str, T, Bound)> = Vec::new();
         let (len, total_weight) = {
-            let mut drain = CountedDrain::new(items, &self.telemetry, self.metrics, "shutdown");
+            let mut drain =
+                CountedDrain::push_cut(items, &self.telemetry, self.metrics, "shutdown");
             // The head item's weight, computed once however many times the wait loop re-examines
             // it.
             let mut head_weight: Option<u64> = None;
