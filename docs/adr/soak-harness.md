@@ -864,6 +864,30 @@ kernel sends each peer a reset: the side the step is `on` reads `ECONNABORTED`, 
 - **A namespace fault.** Under `[overlap]` or beside an `idp` it goes on the holder, as `netem`
   and `partition` do, since a member shares the holder's namespace.
 
+## Amendment: a backend kill is allowed on a tailed sink, and `ledger.tail` measures it (2026-11-03)
+
+A `kill` was for the SUT only. A stream sink can't count what it wrote that its receiver dies
+holding, and a graceful stop of VictoriaMetrics drains what its kernel took, so no scenario
+showed that loss. Killing the backend does, but under a cumulative `aggregate` V doesn't move:
+the next window's total covers a lost one, and `ledger.windows` sees the gap but not its size.
+
+- **What shows the loss.** `graphite_out` writes one carbon line per stored sample, and a resend
+  rewrites the same `(series, timestamp)`. So per SUT life, M − S, the lines the sink counted in
+  `logit.output.messages` less the distinct samples the export holds, is what it counted written
+  and the backend never stored. `ledger.tail` judges it; the key is limited to `graphite_out`
+  until another sink's lines map one to one onto stored samples.
+- **The bound includes the backend's own memory.** VictoriaMetrics buffers ingested rows for
+  up to a second and holds them as in-memory parts until `-inmemoryDataFlushInterval`, so a
+  SIGKILL also loses rows it read. The sink's `kill_unflushed` names that span (1 s plus the
+  flag), and the bound is the lines the sink counted in the drains from that span plus one
+  aggregate interval before each kill to two SUT drain periods after it. Past the bound, in a
+  life with no backend kill, or below 0, the row FAILs. The row can't split socket loss from
+  memory loss; the scenario shortens the flush interval to 5 s to keep the memory part small.
+- **The rules that hold it.** A `kill` of a backend needs `kill_unflushed` on a sink
+  delivering there, and the key needs `vm_every_window` and a local target. `ledger.windows`
+  excuses a gap overlapping a kill's span on such a sink and lists it, leaving its size to
+  `ledger.tail`.
+
 ## Amendment: OTLP and HEC stand-ins overwrite under cumulative temporality, and name loss by position (2026-10-29)
 
 A stand-in target can play OTLP/HTTP's metrics route (`[target] shape = "otlp"`) and Splunk's

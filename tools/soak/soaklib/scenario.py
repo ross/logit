@@ -365,8 +365,18 @@ ROUTER_KINDS = ("route", "route_signals")
 # writes a further SUT service carries on names it in `relay`, with `relay_listener`, the relay's
 # listener the sink writes to, and `relay_sink`, the relay's sink that listener alone feeds
 # and whose only source it is, which `ledger.relay` balances per relay life (checks.py's `check_ledger_relay`).
+# A local sink whose backend a `kill` step ends names `kill_unflushed`, how long the backend
+# holds what it ingested before that survives a SIGKILL, which `ledger.tail` bounds the kill's
+# loss by (checks.py's `check_ledger_tail`).
 SINK_KEYS = {"id", "backend", "vm_selector", "target", "aggregate", "transforms",
-             "vm_absent_selector", "relay", "relay_listener", "relay_sink"}
+             "vm_absent_selector", "relay", "relay_listener", "relay_sink", "kill_unflushed"}
+# The sink kinds `kill_unflushed` may name: a stream sink of one line per stored sample, so its
+# `logit.output.messages` counts the samples it wrote and the export's distinct samples count
+# what was stored.
+TAIL_SINK_KINDS = ("graphite_out",)
+# The actions that may name a backend: a `kill`, when a `[[ledger.sink]]` on that backend
+# names `kill_unflushed`.
+BACKEND_KILL_ACTIONS = ("kill",)
 RELAY_SINK_KEYS = ("relay_listener", "relay_sink")
 _COMPONENT_ID = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
 THRESHOLD_KEYS = {"progress_window", "rss_growth_mib_per_hour", "fd_growth"}
@@ -993,6 +1003,7 @@ def from_dict(raw, path):
         if isinstance(sut_config, str) and (path.parent / sut_config).is_file():
             sut_text = (path.parent / sut_config).read_text()
             problems += _wire_problems(ledger, sut_text)
+            problems += _tail_problems(ledger, sut_text)
             problems += _route_problems(ledger, sut_text)
             problems += _transform_problems(ledger, sut_text)
             problems += _delta_problems(ledger, sut_text, target, "overlap" in raw)
@@ -1216,7 +1227,8 @@ def _sink_problems(ledger, kind):
         else:
             ids.append(sink_id)
         if no_backend:
-            for key in sorted({"backend", "vm_selector", "vm_absent_selector"} & set(sink)):
+            for key in sorted({"backend", "vm_selector", "vm_absent_selector",
+                               "kill_unflushed"} & set(sink)):
                 problems.append(f"{where}: `{key}` names a backend query, and the {kind} "
                                 "target has no backend")
         else:
@@ -1229,6 +1241,20 @@ def _sink_problems(ledger, kind):
                                                  or absent == sink.get("vm_selector")):
                 problems.append(f"{where}: `vm_absent_selector` must be a selector other than "
                                 "`vm_selector`, for series the backend must never hold")
+            if "kill_unflushed" in sink:
+                try:
+                    unflushed = parse_duration(sink["kill_unflushed"])
+                except ValueError as err:
+                    problems.append(f"{where}.kill_unflushed: {err}")
+                else:
+                    if unflushed <= 0:
+                        problems.append(f"{where}.kill_unflushed must be longer than 0s")
+                    sink["kill_unflushed"] = unflushed
+                if ledger.get("vm_every_window") is not True:
+                    problems.append(f"{where}: `kill_unflushed` needs [ledger] vm_every_window "
+                                    "= true: under a cumulative aggregate a sample a backend "
+                                    "kill loses changes no total, and only a missing window "
+                                    "shows it")
         target = sink.get("target")
         if split in ("route", TARGET_SPLIT):
             if not isinstance(target, str) or not _COMPONENT_ID.match(target):
@@ -1601,6 +1627,33 @@ def source_pairs(source):
     """`[(generator_input, generator_sink)]`: each sink with the input that feeds it, by position
     when both keys list components, which `load()` holds to one length."""
     return list(zip(source_ids(source, "generator_input"), source_ids(source, "generator_sink")))
+
+
+def component_kind(text, component):
+    """The `type:` of `component` in config `text`, or None when no block of it names one.
+    Comments are ignored."""
+    for block in component_blocks(text, component):
+        found = re.search(r"\btype\s*:\s*[\"']?([a-z_]+)", _uncommented(block))
+        if found:
+            return found.group(1)
+    return None
+
+
+def _tail_problems(ledger, sut_text):
+    """A `[[ledger.sink]]` naming `kill_unflushed` must be one of `TAIL_SINK_KINDS` in the SUT
+    config `sut_text`, whose messages count its stored samples."""
+    problems = []
+    for index, sink in enumerate(ledger.get("sink") or []):
+        if not isinstance(sink, dict) or "kill_unflushed" not in sink:
+            continue
+        kind = (component_kind(sut_text, sink["id"]) if isinstance(sink.get("id"), str)
+                else None)
+        if kind not in TAIL_SINK_KINDS:
+            problems.append(f"ledger.sink {index + 1}: `kill_unflushed` is for a "
+                            f"{' or '.join(TAIL_SINK_KINDS)}, one line per stored sample, and "
+                            f"{sink.get('id')!r} is "
+                            + (f"a {kind}" if kind else "no component of the SUT config"))
+    return problems
 
 
 def _writer_problems(ledger, configs, directory):
@@ -3542,8 +3595,8 @@ def role_problems(roles, suts=(SUT_SERVICE,), holder=None):
 def service_problems(scenario, roles, modes=None):
     """Every rule that needs the stack's services, against `roles` (`{service: role}`): the
     role map's own rules; each step's and random fault's `on` a service of the stack, with a
-    `kill` or an `exit` on a SUT service only, or a `kill` on a scrape wire's generator, and a
-    `respond`, or a `stop` with a `class`, on a
+    `kill` or an `exit` on a SUT service only, or a `kill` on a scrape wire's generator or on a
+    backend a sink names `kill_unflushed` for, and a `respond`, or a `stop` with a `class`, on a
     stand-in only; each `[[expect]]` service one that runs `logit`; for a Kafka target, the
     broker `kafka`; for a stand-in target, the stand-in `standin`; each `[[ledger.source]]`
     service a generator, and every generator a source's; and each local sink's `backend` a
@@ -3567,6 +3620,9 @@ def service_problems(scenario, roles, modes=None):
 
     scraped = {source.get("service") for source in scenario.sources
                if source.get("wire") == SCRAPE_WIRE}
+    # The backends a `[[ledger.sink]]` names `kill_unflushed` for, which `ledger.tail` judges a
+    # kill of.
+    tailed = {sink.get("backend") for sink in scenario.sinks if "kill_unflushed" in sink}
 
     def on_problems(on, action, where, reason=True, classed=False):
         if on not in roles:
@@ -3574,8 +3630,14 @@ def service_problems(scenario, roles, modes=None):
         if action in NO_WINDOW_ACTIONS and roles[on] not in LOGIT_ROLES:
             return [f"{where}: {action} is for a service that runs logit; the stack's are "
                     f"{', '.join(logit_services(roles))}"]
+        if (action in BACKEND_KILL_ACTIONS and roles[on] == BACKEND_ROLE
+                and on not in tailed):
+            return [f"{where}: a {action} of backend {on} loses what it ingested and hadn't "
+                    "yet saved, so a [[ledger.sink]] on it names `kill_unflushed`, which "
+                    "ledger.tail bounds that loss by"]
         if action in SUT_ONLY_ACTIONS and roles[on] != SUT_ROLE and not (
-                action in SCRAPED_GENERATOR_ACTIONS and on in scraped):
+                action in SCRAPED_GENERATOR_ACTIONS and on in scraped) and not (
+                action in BACKEND_KILL_ACTIONS and on in tailed):
             why = f": {SUT_ONLY_ACTIONS[action]}" if reason else ""
             return [f"{where}: {action} is for {' or '.join(scenario.suts)} only{why}"]
         if (action == "respond" or classed) and roles[on] != STANDIN_ROLE:

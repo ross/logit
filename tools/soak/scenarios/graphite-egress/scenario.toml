@@ -1,16 +1,18 @@
 # statsd-vm's stream into a cumulative `aggregate` and out through `graphite_out` to
 # VictoriaMetrics' carbon plaintext listener, which the override turns on. The faults are the
-# backend's stop and restart, which make the stream driver redial, and netem and a partition on
-# the SUT. The schema is docs/plans/soak-harness.md's "The scenario schema".
+# backend's stop and restart, which make the stream driver redial, netem and a partition on the
+# SUT, and two kills of the backend, which measure the frames the sink counted written that
+# never reached storage (docs/known-gaps/sinks.md, "A stream sink doesn't count the bytes its
+# peer never acknowledged"). The schema is docs/plans/soak-harness.md's "The scenario schema".
 
 name = "graphite-egress"
 description = "generator -> statsd_in (UDP) -> aggregate 10s cumulative -> graphite_out plaintext TCP -> VictoriaMetrics :2003"
-duration = "15m"          # warmup + one cycle + cooldown
+duration = "18m35s"       # warmup + one cycle + cooldown
 warmup = "60s"
 cooldown = "120s"         # >= recovery_bound
 recovery_bound = "45s"    # retry_max_delay 10s + two aggregate windows + a drain
-cycle = "12m"             # >= last recovery (11m) + 2 x progress_window
-compose = "compose.override.yaml"   # VictoriaMetrics' -graphiteListenAddr
+cycle = "15m35s"          # >= last recovery (14m35s) + 2 x progress_window
+compose = "compose.override.yaml"   # VictoriaMetrics' -graphiteListenAddr and flush interval
 
 [configs]
 sut = "logit-sut.yaml"
@@ -20,7 +22,8 @@ generator = "logit-generator.yaml"
 sut_aggregate = "window"
 wire_loss_outside_faults = 0.0
 # Under `temporality: cumulative` V reads each life's last value, so only this row sees a lost
-# middle window, such as one a stream sink counted delivered as the backend went down.
+# middle window, such as one a stream sink counted delivered as the backend went down, and
+# ledger.tail counts the samples a backend kill loses.
 vm_every_window = true
 
 [[ledger.source]]
@@ -35,6 +38,10 @@ sut_listener = "statsd"
 id = "victoria_metrics"
 backend = "victoria-metrics"
 vm_selector = '{__name__=~"soak_requests_[0-9]+"}'
+# What a SIGKILL of VictoriaMetrics can lose of what it ingested: up to a second in memory, then
+# the override's -inmemoryDataFlushInterval 5s before it's on disk. ledger.tail bounds each
+# kill's loss by the lines the sink counted from this long before the kill.
+kill_unflushed = "6s"
 
 [thresholds]
 progress_window = "30s"
@@ -75,7 +82,24 @@ action = "partition"
 on = "logit"
 for = "45s"
 
-# The sink connects again after each of the backend's stop and restart.
+# A SIGKILL of the backend while windows flow, twice, half a 10 s window apart in phase:
+# the kernel closes its connection, so the sink's next send probes it closed and redials, and
+# each redial fails until the revert starts VictoriaMetrics again. What it ingested and hadn't
+# saved, and anything still in its socket, is gone with nothing counting it; ledger.tail holds
+# the sink's written lines to the stored samples, and ledger.windows leaves the gap to it.
+[[step]]
+at = "11m15s"
+action = "kill"
+on = "victoria-metrics"
+for = "30s"
+
+[[step]]
+at = "13m20s"
+action = "kill"
+on = "victoria-metrics"
+for = "30s"
+
+# The sink connects again after each of the backend's stop and restart, and after each kill.
 [[expect]]
 name = "reconnects-after-stop"
 service = "logit"
@@ -92,6 +116,26 @@ service = "logit"
 metric = "logit.output.reconnects"
 component = "victoria_metrics"
 step = "c0s4"
+window = "through"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "reconnects-after-kill"
+service = "logit"
+metric = "logit.output.reconnects"
+component = "victoria_metrics"
+step = "c0s6"
+window = "through"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "reconnects-after-second-kill"
+service = "logit"
+metric = "logit.output.reconnects"
+component = "victoria_metrics"
+step = "c0s7"
 window = "through"
 reduce = "delta"
 min = 1

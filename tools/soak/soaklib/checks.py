@@ -6240,6 +6240,10 @@ def check_ledger_windows(data):
     idle = {}
     problems = []
     widest = 0.0
+    # A gap across a backend kill's span is the kill's tail loss, which `ledger.tail` counts
+    # and bounds.
+    tails = {sink: tail_spans(data, sink, interval, period) for sink in led.sinks}
+    tailed = {}
     every = [(sink, one) for sink in led.sinks for one in led.series[sink]]
     for sink, one in every:
         name = f"{sink} {vm.series_name(one)}"
@@ -6257,6 +6261,10 @@ def check_ledger_windows(data):
                     widest = max(widest, b - a)
                     continue
                 gap = f"life {life} gap {b - a:g}s from {data.offset(a)} to {data.offset(b)}"
+                tail = next((kill for lo, hi, kill in tails[sink] if a < hi and b > lo), None)
+                if tail is not None:
+                    tailed.setdefault((sink, tail.step), []).append(b - a)
+                    continue
                 if not idle_rule:
                     widest = max(widest, b - a)
                     problems.append(f"{name}: {gap}")
@@ -6299,6 +6307,13 @@ def check_ledger_windows(data):
         shown = "; ".join(line.removeprefix("idle gap excused: ") for line in excused[:3])
         more = f"; {len(excused) - 3} more in the lines" if len(excused) > 3 else ""
         rules += f"; {len(excused)} idle gap(s) excused: {shown}{more}"
+    tail_lines = [f"tail gap excused: {sink} {step}, {len(widths)} gap(s), widest "
+                  f"{max(widths):g}s, across the kill's span; ledger.tail judges its loss"
+                  for (sink, step), widths in sorted(tailed.items())]
+    if tail_lines:
+        rules += "; " + "; ".join(line.removeprefix("tail gap excused: ")
+                                  for line in tail_lines)
+    excused += tail_lines
     if problems:
         return Result("ledger.windows", FAIL,
                       f"missing windows, {len(problems)} finding(s), first: {problems[0]} "
@@ -6307,6 +6322,100 @@ def check_ledger_windows(data):
                   f"{len(every)} series over {len(led.sinks)} sink(s) x {len(led.lives)} "
                   "life/lives, widest gap "
                   f"{widest:g}s ({rules})", excused)
+
+
+def _drain_period(tel):
+    """The median gap between a telemetry's drains, or None with fewer than two."""
+    gaps = [b - a for a, b in zip(tel.drains, tel.drains[1:]) if b > a]
+    return statistics.median(gaps) if gaps else None
+
+
+def tail_spans(data, sink, interval, period):
+    """`[(start, end, kill)]` for each `kill` of a `kill_unflushed` sink's backend: the span
+    whose stored samples the kill can lose, from `kill_unflushed` and one `aggregate`
+    `interval` before the kill, since a sample is stamped with its window, to two SUT drain
+    `period`s after it, in which the sink can still count a write the backend never read
+    (`check_ledger_tail`). Empty for a sink without `kill_unflushed`."""
+    one = next((one for one in data.ledger.get("sink") or [] if one.get("id") == sink), {})
+    if "kill_unflushed" not in one:
+        return []
+    unflushed = float(one["kill_unflushed"])
+    return [(f.start - unflushed - (interval or 0.0), f.start + 2 * (period or 0.0), f)
+            for f in data.faults if f.action == "kill" and f.on == one.get("backend")]
+
+
+def check_ledger_tail(data):
+    """Under a `[[ledger.sink]]`'s `kill_unflushed`, per SUT life: M, the lines the sink counted
+    written (`logit.output.messages`), against S, the distinct `(series, timestamp)` samples its
+    export holds in that life (`stored_samples_by_life`). The sink writes one line per sample
+    (scenario.py's `TAIL_SINK_KINDS`) and a resend rewrites the same sample, so M − S is what
+    it counted written and the backend never stored: the frames a stream sink can't count
+    (docs/known-gaps/sinks.md), with what the backend held in memory when killed. Under a
+    cumulative `aggregate` V and `ledger.egress` can't see it, since the next window's total
+    covers a lost one. 0 passes; a life holding a kill of the sink's backend passes up to its
+    bound, the lines the sink counted in the drains from `kill_unflushed` before each kill to
+    two drain periods after it: what the backend had ingested and not yet saved, or never read
+    from its socket, and the writes the sink counted before it saw the connection close. A gap
+    past the bound, any gap in a life with no such kill, and a sample the sink never counted
+    FAIL. A killed SUT life is reported, since its last drain doesn't hold all of M."""
+    tailed = [one for one in data.ledger.get("sink") or [] if "kill_unflushed" in one]
+    if not tailed:
+        return Result("ledger.tail", SKIP, "no [[ledger.sink]] names kill_unflushed")
+    if not data.has_vm:
+        return Result("ledger.tail", SKIP, no_vm_reason(data))
+    led = _ledger(data)
+    skipped = _skip_without_sut("ledger.tail", led)
+    if skipped:
+        return skipped
+    period = _drain_period(led.sut)
+    status, groups, lines = PASS, [], []
+    for one in tailed:
+        sink = one["id"]
+        if not led.series.get(sink):
+            status = FAIL
+            groups.append(f"{sink}: no series in vm-export/{sink}.jsonl")
+            continue
+        written = led.sut.counter_points("logit.output.messages", component=sink)
+        counted = led.sut.counter_by_life("logit.output.messages", component=sink)
+        stored = stored_samples_by_life(led.series[sink], led.life_starts)
+        spans = tail_spans(data, sink, led.interval, period)
+        parts = []
+        for life in led.lives:
+            m, v = counted.get(life, 0), stored.get(life, 0)
+            lost = m - v
+            kills = [(a, b, kill) for a, b, kill in spans
+                     if vm.life_at(led.life_starts, kill.start) == life]
+            bound = sum(value for ts, value, _ in written
+                        if any(a < ts <= b for a, b, _ in kills))
+            each = "; ".join(
+                f"{kill.step} kill of {kill.on} at {data.offset(kill.start)}: "
+                f"{_n(sum(value for ts, value, _ in written if a < ts <= b))} line(s) counted "
+                f"from {data.offset(a)} to {data.offset(b)}" for a, b, kill in kills)
+            if life in led.killed and life != led.final:
+                verdict = "reported: a killed SUT life's last drain doesn't hold all of M"
+            elif lost < 0:
+                status = FAIL
+                verdict = (f"a surplus: {_n(-lost)} stored sample(s) the sink never counted "
+                           "written")
+            elif lost == 0:
+                verdict = "exact"
+            elif kills and lost <= bound:
+                verdict = (f"tail loss within the bound {_n(bound)}, uncounted by design: "
+                           "written, never stored")
+            elif kills:
+                status = FAIL
+                verdict = f"lost past the bound {_n(bound)}"
+            else:
+                status = FAIL
+                verdict = "uncounted loss in a life with no kill of the backend"
+            part = (f"life {life}{' (final)' if life == led.final else ''}: M {_n(m)} − S "
+                    f"{_n(v)} = {_n(lost)}, {verdict}" + (f" ({each})" if each else ""))
+            parts.append(part)
+            lines.append(f"{sink}: {part}")
+        groups.append(f"{sink}: " + "; ".join(parts))
+    return Result("ledger.tail", status,
+                  " | ".join(groups) + " (M the sink's output.messages, S the distinct stored "
+                  "samples)", lines)
 
 
 def check_ledger_replay(data):
@@ -8219,7 +8328,8 @@ CHECKS = (
     check_ledger_overlap,
     check_ledger_intake, check_ledger_edge, check_ledger_hop, check_ledger_relay,
     check_ledger_script, check_ledger_aggregate,
-    check_ledger_egress, check_ledger_windows, check_ledger_absent, check_ledger_replay,
+    check_ledger_egress, check_ledger_windows, check_ledger_tail, check_ledger_absent,
+    check_ledger_replay,
     check_ledger_summary, check_ledger_value,
     check_ledger_sent, check_ledger_topic, check_ledger_standin, check_identity_sink, check_drops, check_recovery,
     check_file_reopen, check_tls_served, check_expect,

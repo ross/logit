@@ -102,7 +102,11 @@ framer's counted drop as wire loss kept out of `drops`, the same lines uncounted
 generator netem judged on TCP but not on UDP, a SUT netem judged, a judged window's surplus
 against its ambiguous attempts under either posture and not a drop alone, a partition judged
 or reported by its address, `recovery` and a killed life's band reading the frames, and a
-source naming `wire = "udp"` scoring as one naming none. On an HTTP wire it covers the
+source naming `wire = "udp"` scoring as one naming none. For `kill_unflushed`, it
+covers its rules (a duration above 0, `vm_every_window`, a `graphite_out` sink, a local
+target) and a backend kill refused without it, and `ledger.tail` on a three-life run: exact,
+within a backend kill's bound, past it, a loss with no kill, a surplus, and `ledger.windows`
+excusing a gap across the kill's span and no other. On an HTTP wire it covers the
 generator sink's kind checked at load either way, the fault predicates and judgments,
 `prometheus_in`'s wire keyed on its mode, and runs into `influxdb_in`, `otlp_in`,
 `splunk_hec_in`, `datadog_in`, and `prometheus_in`: G from the
@@ -334,7 +338,7 @@ def _rules(root):
 
     _refused(path, mutate(netem_in_kill), "netem on logit during its kill",
              "netem during a kill")
-    _refused(path, mutate(kill_vm), "kill is for logit only", "a kill on victoria-metrics")
+    _refused(path, mutate(kill_vm), "names `kill_unflushed`", "a kill on victoria-metrics")
     _refused(path, mutate(kill_generator), "with no G behind them", "a kill on the generator")
     try:
         loaded = scenario.from_dict(mutate(kill_sut), path)
@@ -2629,7 +2633,8 @@ def _roles(root):
              "an expectation on a backend")
     _refused(path, mutate(lambda r: r["step"].append(
         {"at": "11m10s", "action": "kill", "on": "victoria-metrics-b", "for": "20s"})),
-             "kill is for logit only", "a kill on a second backend",
+             "a kill of backend victoria-metrics-b loses what it ingested",
+             "a kill on a second backend with no sink naming `kill_unflushed`",
              roles={**scenario.BASE_ROLES, "victoria-metrics-b": "backend"})
     _refused(path, raw, "one generator service", "a scenario run on a stack with no generator",
              roles={"logit": "sut", "victoria-metrics": "backend"})
@@ -2716,6 +2721,55 @@ def _sink_rules(root):
                f"two routed sinks with distinct targets load, got {routed.sinks}")
     except scenario.ScenarioError as err:
         expect(False, f"two routed sinks are refused: {err.problems}")
+
+
+def _tail_rules(root):
+    """`kill_unflushed` on a `[[ledger.sink]]`: graphite-egress loads with it and its backend
+    kills, and `load()` and `service_problems()` refuse it unparsed, at 0, without
+    `vm_every_window`, or on a sink of another kind, and a backend kill on a sink without it."""
+    path = root / "scenarios" / "graphite-egress" / "scenario.toml"
+    raw = tomllib.loads(path.read_text())
+    loaded = scenario.load(path)
+    expect(loaded.sinks[0]["kill_unflushed"] == 6.0
+           and [s.at for s in loaded.steps if s.action == "kill"] == [675.0, 800.0],
+           f"graphite-egress parses kill_unflushed and kills its backend twice, got "
+           f"{loaded.sinks} {[(s.action, s.at) for s in loaded.steps]}")
+    try:
+        scenario.check_services(loaded, scenario.base_roles(loaded))
+        expect(True, "")
+    except scenario.ScenarioError as err:
+        expect(False, f"a kill of a backend whose sink names kill_unflushed is refused: "
+                      f"{err.problems}")
+
+    def mutate(edit):
+        changed = copy.deepcopy(raw)
+        edit(changed)
+        return changed
+
+    def sink(**changes):
+        return lambda r: r["ledger"]["sink"][0].update(changes)
+
+    cases = [
+        (sink(kill_unflushed="6"), "ledger.sink 1.kill_unflushed:", "an unparsed duration"),
+        (sink(kill_unflushed="0s"), "ledger.sink 1.kill_unflushed must be longer than 0s",
+         "a zero duration"),
+        (lambda r: r["ledger"].pop("vm_every_window"),
+         "`kill_unflushed` needs [ledger] vm_every_window = true", "no vm_every_window"),
+        (lambda r: r["ledger"]["sink"][0].pop("kill_unflushed"),
+         "a kill of backend victoria-metrics loses what it ingested and hadn't yet saved",
+         "a backend kill with no kill_unflushed"),
+    ]
+    for edit, needle, what in cases:
+        _refused(path, mutate(edit), needle, what)
+    sut = (path.parent / "logit-sut.yaml").read_text()
+    other = sut.replace("type: graphite_out", "type: statsd_out")
+    expect(other != sut
+           and scenario._tail_problems(loaded.to_json()["ledger"], sut) == []
+           and any("`kill_unflushed` is for a graphite_out" in p and "'victoria_metrics' is a "
+                   "statsd_out" in p
+                   for p in scenario._tail_problems(loaded.to_json()["ledger"], other)),
+           f"kill_unflushed is refused on a sink that isn't graphite_out, got "
+           f"{scenario._tail_problems(loaded.to_json()['ledger'], other)}")
 
 
 class _ConfigDocker:
@@ -4363,6 +4417,81 @@ def _kill_run(tmp, name, kill_gap=1500, stray_drop=False, replayed=3, queued=Non
     return run_dir
 
 
+def _tail_run(tmp, name, kill=True, unflushed=6.0, short=0, **kwargs):
+    """`_kill_run`'s three-life run with a `graphite_out`-style sink: the SUT counts
+    `logit.output.messages` for `sink`, two lines per aggregate flush (one per series), and
+    the sink names `kill_unflushed` (`unflushed`, None for none). With `kill`, a `kill` of
+    victoria-metrics runs over +240..+270 in life 2. `short` lines go uncounted in the drain at
+    +250. Its span is (+240 − 6 − 10, +240 + 2 x 5] = (+224, +250], which holds the flushes at
+    +230, +240, and +250: a bound of 6."""
+    flushes = (*range(10, 101, 10), *range(140, 201, 10), *range(220, 321, 10))
+    messages = [_line(_stamp(T0 + s), "logit.output.messages", "sum",
+                      2 - (short if s == 250 else 0), component="sink") for s in flushes]
+    run_dir = _kill_run(tmp, name, sut_extra=messages,
+                        silence=("victoria-metrics", "kill") if kill else None, **kwargs)
+    resolved = json.loads((run_dir / "scenario.resolved.json").read_text())
+    if unflushed is not None:
+        resolved["ledger"]["sink"] = [{**one, "kill_unflushed": unflushed}
+                                      for one in resolved["ledger"]["sink"]]
+    (run_dir / "scenario.resolved.json").write_text(json.dumps(resolved))
+    return run_dir
+
+
+def _tail_ledger():
+    """`ledger.tail`: per SUT life, the sink's counted lines M against the export's distinct
+    samples S, 0 exact, a backend kill's loss up to its bound, and every other gap FAILs; and
+    `ledger.windows` excuses a gap across the kill's span."""
+    with tempfile.TemporaryDirectory() as tmp:
+        def tail(name, **kwargs):
+            run_dir = _tail_run(tmp, name, **kwargs)
+            return {r.id: r for r in (checks.check_ledger_tail(checks.RunData(run_dir)),
+                                      checks.check_ledger_windows(checks.RunData(run_dir)))}
+
+        exact = tail("tail-exact")
+        detail = exact["ledger.tail"].detail
+        expect(exact["ledger.tail"].status == checks.PASS
+               and "life 0: M 20 − S 20 = 0, exact" in detail
+               and "life 1: M 14 − S 14 = 0, reported: a killed SUT life" in detail
+               and "life 2 (final): M 22 − S 22 = 0, exact (c0s3 kill of victoria-metrics at "
+               "+240s: 6 line(s) counted from +224s to +250s)" in detail,
+               f"tail PASSes a kill that lost nothing and states its bound, got "
+               f"{exact['ledger.tail']}")
+        within = tail("tail-within", drop=(230, 240, 250))
+        expect(within["ledger.tail"].status == checks.PASS
+               and "life 2 (final): M 22 − S 16 = 6, tail loss within the bound 6, uncounted by "
+               "design" in within["ledger.tail"].detail,
+               f"tail PASSes a backend kill's loss up to its bound, got {within['ledger.tail']}")
+        expect(within["ledger.windows"].status == checks.PASS
+               and "tail gap excused: sink c0s3, 2 gap(s), widest 40s, across the kill's span; "
+               "ledger.tail judges its loss" in within["ledger.windows"].lines,
+               f"windows excuses a gap across the kill's span, got {within['ledger.windows']}")
+        past = tail("tail-past", drop=(220, 230, 240, 250))
+        expect(past["ledger.tail"].status == checks.FAIL
+               and "M 22 − S 14 = 8, lost past the bound 6" in past["ledger.tail"].detail,
+               f"tail FAILs a loss past its bound, got {past['ledger.tail']}")
+        unkilled = tail("tail-no-kill", kill=False, drop=(240,))
+        expect(unkilled["ledger.tail"].status == checks.FAIL
+               and "M 22 − S 20 = 2, uncounted loss in a life with no kill of the backend"
+               in unkilled["ledger.tail"].detail
+               and unkilled["ledger.windows"].status == checks.FAIL,
+               f"tail and windows FAIL a lost sample with no backend kill, got "
+               f"{unkilled['ledger.tail']} {unkilled['ledger.windows']}")
+        surplus = tail("tail-surplus", short=1)
+        expect(surplus["ledger.tail"].status == checks.FAIL
+               and "M 21 − S 22 = -1, a surplus: 1 stored sample(s) the sink never counted"
+               in surplus["ledger.tail"].detail,
+               f"tail FAILs a stored sample the sink never counted, got {surplus['ledger.tail']}")
+        unset = tail("tail-unset", unflushed=None, drop=(240,))
+        expect(unset["ledger.tail"].status == checks.SKIP
+               and unset["ledger.windows"].status == checks.FAIL,
+               f"without kill_unflushed tail SKIPs and windows excuses no gap, got "
+               f"{unset['ledger.tail']} {unset['ledger.windows']}")
+        far = tail("tail-far", drop=(290,))
+        expect(far["ledger.windows"].status == checks.FAIL
+               and "tail gap excused" not in far["ledger.windows"].detail,
+               f"windows FAILs a gap outside the kill's span, got {far['ledger.windows']}")
+
+
 def _kill_ledger():
     rows = ("ledger.wire", "ledger.intake", "ledger.edge", "ledger.aggregate", "ledger.egress",
             "ledger.windows", "ledger.replay", "ledger.summary", "identity.sink", "recovery")
@@ -4614,6 +4743,8 @@ def _target_rules(root):
          "`vm_selector` names a backend query", "vm_selector on an external target"),
         (base, lambda raw: raw["ledger"]["sink"][0].update(backend="victoria-metrics"),
          "`backend` names a backend query", "a backend on an external target"),
+        (base, lambda raw: raw["ledger"]["sink"][0].update(kill_unflushed="6s"),
+         "`kill_unflushed` names a backend query", "kill_unflushed on an external target"),
         (base, lambda raw: raw["ledger"].update(vm_every_window=True),
          "ledger.vm_every_window names a VictoriaMetrics query",
          "vm_every_window on an external target"),
@@ -15591,11 +15722,14 @@ def run(root, quiet=False):
                      _log_capture, _signals, _deadlines, _stalled, _stall_abort,
                      _retry_stalled, _run_dir_claim, _hung_inspect, _inspect_redacted,
                      _ndjson, _stderr, _slope, _checks, _vm_resets, _ledger_checks,
-                     _kill_watchdog, _kill_ledger, _expect_checks, _gauge_lives, _target_rules,
+                     _kill_watchdog, _kill_ledger, _tail_ledger,
+                     _expect_checks, _gauge_lives, _target_rules,
                      _sink_drain, _external_checks, _kafka_rules, _kafka_topic, _kafka_checks,
                      _otlp_walker, _otlp_topic, _otlp_checks,
                      _report, _expected_event_rules, _exit_driver, _ready_words, _exit_watchdog,
-                     _script_ledger, _sink_ledger, _target_ledger, _roles, _sink_rules, _driver_roles,
+                     _script_ledger, _sink_ledger, _target_ledger, _roles, _sink_rules,
+                     _tail_rules,
+                     _driver_roles,
                      _sources_ledger, _source_rules, _fanin_driver, _tcp_ledger, _tcp_rules,
                      _http_ledger, _http_rules, _file_ledger, _file_rules,
                      _kafka_wire_ledger, _kafka_wire_rules,
@@ -15627,7 +15761,8 @@ def run(root, quiet=False):
                               _stalled, _stall_abort,
                               _target_rules, _sink_drain, _kafka_rules, _otlp_walker,
                               _expected_event_rules,
-                              _shipped, _roles, _sink_rules, _driver_roles, _source_rules,
+                              _shipped, _roles, _sink_rules, _tail_rules, _driver_roles,
+                              _source_rules,
                               _fanin_driver, _tcp_rules, _http_rules, _file_rules, _kafka_wire_rules,
                               _cri_rules,
                               _two_sut_rules,
