@@ -77,9 +77,12 @@ exists or a contract other `logit` processes depend on:
 - **Any nonzero `*.dropped` is loss someone should look into**, and it's always tagged `reason`.
   An outcome the config asked for never uses the word: it's `events.discarded`, `*.omitted`,
   `*.skipped`, `*.evicted`, or `input.batches.deferred`. A loss reported only by a diagnostic gets
-  a `*.dropped` counter beside it, and every counted loss gets a `warn` line beside it, throttled
-  or once per lasting cause, and on a sink gated as its counter is, save the few the ADR exempts.
-  Operators and the soak harness alert on the name alone, with no list of reasons to exclude
+  a `*.dropped` counter beside it. A counted loss in a sink, its codec or spool,
+  `prometheus_out`'s registry, the pipeline runtime, or `internal` gets a `warn` line beside it,
+  throttled or once per lasting cause, and on a sink gated as its counter is; `internal.logs.dropped`
+  is the one exception, and listener and decoder losses aren't covered yet
+  (`docs/known-gaps/telemetry.md`). Operators and the soak harness alert on the name alone, with
+  no list of reasons to exclude
   ([ADR `telemetry-loss-vocabulary`](docs/adr/telemetry-loss-vocabulary.md),
   [internal-telemetry.md](docs/design/internal-telemetry.md)'s "Loss vocabulary").
 

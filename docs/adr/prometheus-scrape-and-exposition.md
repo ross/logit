@@ -723,7 +723,8 @@ batch that causes it, never once per scrape:
   `logit.output.metrics.dropped{reason="type_conflict"}`, one count per series the re-type drops:
   the reason and unit the codec already uses for a record a type conflict drops within a batch.
   A throttled `family_retyped` warning names the family. The new type still wins, and the old
-  name has no alias
+  type's series go even when a name collision refuses the new type's, so a name never keeps a type
+  that something newer has replaced. The old counter name has no alias
   ([ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)'s "Amendment (2026-11-02):
   every counted loss leaves a warn line").
 

@@ -613,23 +613,32 @@ pub fn write_with(
         base: String::new(),
         used: Vec::new(),
     };
-    let mut previous: Option<TypeName<'_>> = None;
+    let mut previous: Option<(TypeName<'_>, &str)> = None;
     for (base, family) in order {
         // Two families with one `# TYPE` name (a text 0.0.4 counter `foo` and a gauge
         // `foo_total`) can't both be written: a second `# TYPE` line for one name makes Prometheus
         // reject the whole scrape. The one whose model name sorts first is written, as
         // `events_to_families` resolves a sanitized-name collision, and each series of the other
-        // is counted.
-        if previous.is_some_and(|previous| previous == base) {
+        // is counted, with a line. `prometheus_out`'s registry settles such a pair when it stores
+        // it, so its renders never reach this arm.
+        if let Some((_, kept)) = previous.filter(|(previous, _)| *previous == base) {
             for _ in &family.series {
                 writer.encoder.not_encoded(NotEncoded::NameCollision);
             }
+            let wire = format!("{}{}", base.0, base.1);
+            super::warn_name_collision(
+                writer.encoder,
+                &wire,
+                &family.name,
+                kept,
+                family.series.len(),
+            );
             continue;
         }
         writer.base.clear();
         writer.base.push_str(base.0);
         writer.base.push_str(base.1);
-        previous = Some(base);
+        previous = Some((base, &family.name));
         writer.family(family);
     }
     if dialect.is_openmetrics() {
@@ -2738,6 +2747,51 @@ mod tests {
         let (families, reasons) = parse_reasons("# just a comment\n#\nfoo 1\n", Dialect::Text0_0_4);
         assert_eq!(family_names(&families), vec!["foo"]);
         assert!(reasons.is_empty(), "{reasons:?}");
+    }
+
+    /// Two families whose `# TYPE` lines carry one name: the one whose model name sorts first is
+    /// written, and the other's series are counted with one warn line naming both.
+    #[test]
+    fn a_type_name_collision_on_write_is_counted_with_a_line() {
+        let families = [
+            MetricFamily {
+                series: vec![Series::new(Vec::new(), Point::Counter(1.0))],
+                ..MetricFamily::new("foo", FamilyType::Counter)
+            },
+            MetricFamily {
+                series: vec![
+                    Series::new(vec![("a".to_string(), "1".to_string())], Point::Gauge(2.0)),
+                    Series::new(vec![("a".to_string(), "2".to_string())], Point::Gauge(3.0)),
+                ],
+                ..MetricFamily::new("foo_total", FamilyType::Gauge)
+            },
+        ];
+        let registry = Registry::new();
+        let diagnostics = logit_core::Diagnostics::new("prometheus_out");
+        let mut encoder = PrometheusEncoder::new()
+            .with_telemetry(registry.telemetry_for("prometheus", "prometheus_out", "sink"))
+            .with_diagnostics(diagnostics.clone());
+        let mut out = Vec::new();
+        write_with(&families, Dialect::Text0_0_4, &mut out, &mut encoder);
+        let text = String::from_utf8(out).expect("exposition must be utf-8");
+
+        assert_eq!(text.matches("# TYPE foo_total").count(), 1, "{text}");
+        assert!(text.contains("# TYPE foo_total counter"), "{text}");
+        let dropped: f64 = registry
+            .drain(0)
+            .iter()
+            .filter(|e| {
+                e.attributes.get("reason").and_then(|v| v.as_str()) == Some("name_collision")
+            })
+            .flat_map(|e| e.metrics.iter())
+            .filter(|m| resolve(m.name) == "logit.output.metrics.dropped")
+            .map(|m| match &m.kind {
+                logit_core::MetricKind::Sum(sum) => sum.value.as_f64(),
+                _ => 0.0,
+            })
+            .sum();
+        assert_eq!(dropped, 2.0);
+        assert_eq!(diagnostics.occurrences("name_collision"), 1);
     }
 
     /// The writer drops a `Stale` series and counts it rather than write a bare `NaN` line.
