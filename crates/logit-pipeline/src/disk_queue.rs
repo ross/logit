@@ -853,7 +853,7 @@ impl DiskQueue {
             diag.warn_throttled(
                 "disk_corrupt",
                 format_args!(
-                    "found {corrupt_skipped_total} corrupt record(s) in the disk buffer at {} \
+                    "found {corrupt_skipped_total} corrupt region(s) in the disk buffer at {} \
                      on open; they're skipped and dropped",
                     config.dir.display()
                 ),
@@ -1521,7 +1521,7 @@ impl DiskQueue {
                 self.diagnose(
                     "disk_corrupt",
                     format_args!(
-                        "skipped {skipped} corrupt record(s) reading the disk buffer; they're \
+                        "skipped {skipped} corrupt region(s) reading the disk buffer; they're \
                          dropped"
                     ),
                 );
@@ -2971,8 +2971,10 @@ mod tests {
     }
 
     /// Segment 0 holds `a` and then a corrupt record with nothing after it; segment 1 holds `c`.
+    /// The head skips the span's bytes, counted with a `disk_corrupt` line.
     #[tokio::test]
     async fn peek_at_past_corruption_stops_the_read_ahead_until_the_corrupt_span_is_the_head() {
+        let (lines, _guard) = crate::test_util::capture_lines();
         let dir = scratch_dir("peek-at-corrupt");
         std::fs::create_dir_all(&dir).unwrap();
         let mut corrupted = raw_record(&batch("bad"), ctx());
@@ -3004,6 +3006,16 @@ mod tests {
             1.0,
             "the span is counted once, when the head skips it"
         );
+        // The open's own `disk_corrupt` line comes first, so the skip's is the key's second
+        // occurrence, which the throttle marks.
+        let skip = format!("skipped {} corrupt byte(s) reading the disk buffer", corrupted.len());
+        let skipped: Vec<String> = lines
+            .with_key("disk_corrupt")
+            .into_iter()
+            .map(|(_, m)| m)
+            .filter(|m| m.starts_with(&skip))
+            .collect();
+        assert_eq!(skipped.len(), 1, "the byte skip logs one line: {skipped:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
