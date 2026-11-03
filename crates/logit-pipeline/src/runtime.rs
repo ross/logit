@@ -852,7 +852,8 @@ const SWEEP_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 /// `batches.dropped`/`events.dropped{reason="shutdown"}` and the only one that adds to
 /// `drain_total`, the sum the `drain complete` log reports (`run_with_telemetry`). Callers:
 /// `run_output`'s sweep, [`finish_and_flush`], [`write_loop`]'s grace-cut send,
-/// [`revoke_lua_io`], and [`run_input`]'s backstop.
+/// [`revoke_lua_io`], [`run_lua`] for the batch a panicked Lua thread held, and
+/// [`run_input`]'s backstop.
 fn count_shutdown_drop(telemetry: &Telemetry, drain_total: &AtomicU64, batches: u64, events: u64) {
     if batches == 0 {
         return;
@@ -2566,9 +2567,9 @@ async fn run_flush(transform: &mut (dyn Transform + Send), fanout: &Fanout, tele
 /// Any outcome but a clean return (a panic or a returned failure) counts what the node can no
 /// longer forward as `batches.dropped`/`events.dropped{reason="shutdown"}` through
 /// [`count_shutdown_drop`], so the `drain complete` line reports it: the batches still queued in
-/// its inbox (swept by [`revoke_lua_io`]) and, after a panic during a batch's `process()` pass,
-/// that batch, none of which was sent. A panic outside that pass (in a send or a `flush()`) loses
-/// what the loop held uncounted (`docs/known-gaps/transforms.md`).
+/// its inbox (swept by [`revoke_lua_io`]) and, after a panic between a batch's receive and its
+/// `process()` pass's counts, that batch, none of which was sent. A panic in a send or a
+/// `flush()` loses what the loop held uncounted (`docs/known-gaps/transforms.md`).
 ///
 /// `io` is shared with the watcher so it can revoke the node's channels without the thread's
 /// cooperation (see [`LuaIo`]); `heartbeat` is how the watcher tells a working script from a
@@ -2649,8 +2650,8 @@ fn run_lua(
     if matches!(outcome, Ok(Ok(()))) {
         drop(leftover);
     } else {
-        // `Some` only after a panic during a batch's `process()` pass: that batch, none of which
-        // was sent. It had left the inbox, so neither sweep counts it a second time.
+        // `Some` only after a panic between a batch's receive and its pass's counts: that batch,
+        // none of which was sent. It had left the inbox, so neither sweep counts it a second time.
         if let Some(events) = held {
             count_shutdown_drop(&sweep_telemetry, &shutdown_dropped, 1, events);
         }
@@ -3002,9 +3003,9 @@ enum FlushOutcome {
 /// `flush()`, `leave()` before anything is sent. A thread parked in a send is therefore never
 /// read as stalled, and never holds `io`'s lock while busy.
 ///
-/// `in_hand` holds the received batch's event count for its `process()` pass and is `None`
-/// everywhere else, so after a panic [`run_lua`] can count the batch the pass lost. Nothing is
-/// sent during the pass, so the whole batch is lost.
+/// `in_hand` holds the received batch's event count from its receive until the `process()` pass's
+/// own counts, and is `None` everywhere else, so after a panic [`run_lua`] can count the batch
+/// lost. Nothing is sent in that span, so the whole batch is lost.
 #[allow(clippy::too_many_arguments)]
 fn run_lua_loop(
     worker: ScriptWorker,
@@ -3205,6 +3206,12 @@ fn run_lua_loop(
             }
             return Ok(());
         };
+        // Held from here until the pass's own counts below, so a panic anywhere in between
+        // counts the whole batch, and none of it is counted twice (see `run_lua`).
+        in_hand.set(Some(match &batch {
+            Delivered::Owned(batch, _) => batch.events.len(),
+            Delivered::Shared(batch, _) => batch.events.len(),
+        } as u64));
         // As in `run_transform`: this batch is the unambiguous parent of everything emitted
         // below, provenance passes through, and the context is minted once here so the span's
         // `span_id` matches the outgoing `Delivered`'s.
@@ -3243,7 +3250,6 @@ fn run_lua_loop(
         let mut discarded: u64 = 0;
         let mut errors: u64 = 0;
         let slots = scratch.dests.len();
-        in_hand.set(Some(batch.events.len() as u64));
         for event in batch.events {
             heartbeat.enter();
             let outcome = worker.process(event);
@@ -3272,12 +3278,13 @@ fn run_lua_loop(
             }
         }
         heartbeat.leave();
-        in_hand.set(None);
         drop(process_timer);
         worker.expire_registry_values();
         // Once per batch: how a script leaking VM-side state becomes visible
         // (`docs/design/internal-telemetry.md`).
         telemetry.gauge("logit.script.vm.memory", worker.used_memory() as f64, &[]);
+        // The pass's discards and errors are counted next, so the batch is no longer in hand.
+        in_hand.set(None);
         if discarded > 0 {
             telemetry.count("logit.component.events.discarded", discarded as f64, &[]);
         }

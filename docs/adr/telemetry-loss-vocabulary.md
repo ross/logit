@@ -211,7 +211,8 @@ same date has the bounds of the count and how it enters the sink identity.
 ## Amendment (2026-10-13): counters for `kafka_out`'s text format and `docker_in`'s decoder
 
 The last two entries leave [Loss with no counter](#loss-with-no-counter), which is now empty
-(`influxdb_out` counts under [ADR `influxdb-line-protocol-relay`](influxdb-line-protocol-relay.md)):
+(`influxdb_out` counts under [ADR `influxdb-line-protocol-relay`](influxdb-line-protocol-relay.md))
+[it holds one entry again since the 2026-11-02 amendment's Lua panic case]:
 
 | Loss | Counter |
 |---|---|
@@ -485,8 +486,8 @@ A wedged, failed, or panicked Lua node's inbox sweep (`revoke_lua_io`, on a wedg
 shutdown grace, a `max_memory` failure, a panic on the node's thread, or another error that fails
 the node) counts `batches.dropped{reason="shutdown"}` through the same path a sink's abandoned
 inbox does, so `drain complete` logs it, as the sink section's "A line already in the path covers
-its drop" allows. A panic during a batch's `process()` pass also counts that batch there, since
-the pass sends nothing until it ends; a panic outside the pass, in a send or a `flush()`, loses
+its drop" allows. A panic between a batch's receive and its `process()` pass's counts also counts
+that batch there, since nothing is sent in that span; a panic in a send or a `flush()` loses
 what the thread held uncounted, a gap [`docs/known-gaps/transforms.md`](../known-gaps/transforms.md) keeps open. The
 `thread_panicked` error line says the node failed and leaves the count to `drain complete`.
 
@@ -654,5 +655,13 @@ series route, `prometheus_out`'s exposition dialects, and `splunk_hec_out`'s
 | `internal` | `internal.span.links.dropped` (`cardinality`) | `internal.span.links.omitted` (`cardinality`) |
 
 ### Loss with no counter
-None remain. Each entry this list held now counts under the vocabulary; the amendments above
+One remains. Each other entry this list held now counts under the vocabulary; the amendments above
 record where each one went.
+
+- **What a `lua` node's thread held in a send or a `flush()` when it panicked.** A panic there is a
+  bug in `logit`, not a script's fault. It's reported by `thread_panicked` at `error` and a failed
+  run (exit `2`), not by a counter: part of a batch in a send may already be counted or delivered,
+  and a `flush()`'s events come from no input batch, so no count is both whole and never doubled.
+  A panic anywhere else on the thread counts what it held
+  ([ADR `lua-runaway-script-bounds`](lua-runaway-script-bounds.md)'s 2026-11-02 amendment).
+  [`docs/known-gaps/transforms.md`](../known-gaps/transforms.md) keeps it open.

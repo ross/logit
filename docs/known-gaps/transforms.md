@@ -348,9 +348,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
     decision 1.
   - **Revisit trigger:** a revoked node's `dropped` count falls short of its producers' `sent` in
     practice.
-- **What a Lua node held outside a `process()` pass when its thread panicked is lost uncounted.**
-  A panic sweeps and counts the node's inbox, and a panic during a batch's `process()` pass counts
-  that batch, both as `batches.dropped{reason="shutdown"}`
+- **What a Lua node held in a send or a `flush()` when its thread panicked is lost uncounted.**
+  A panic sweeps and counts the node's inbox, and a panic between a batch's receive and its
+  `process()` pass's counts counts that batch, both as `batches.dropped{reason="shutdown"}`
   ([ADR `lua-runaway-script-bounds`](../adr/lua-runaway-script-bounds.md)'s 2026-11-02
   amendment). A panic in a send or in a `flush()` loses what the thread held there with no count.
   - **Consequence:** in a send, the partitions not yet sent; in a `flush()`, the events it

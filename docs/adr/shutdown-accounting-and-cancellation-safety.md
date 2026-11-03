@@ -118,7 +118,7 @@ was missing was executable evidence under real concurrency, and the shutdown acc
    dropped because the node is leaving the graph, on or after the drain's start, so the label
    stays `shutdown`. [Since [ADR `lua-runaway-script-bounds`](lua-runaway-script-bounds.md)'s
    2026-11-02 amendment, `run_lua` sweeps after a panic on its thread too, and calls
-   `count_shutdown_drop` itself for the batch a panicked `process()` pass held.]
+   `count_shutdown_drop` itself for the batch its thread held when it panicked.]
 
    The field doesn't include events a `Fanout` drops as `closed_consumer`, UDP datagram drops (a
    different unit), overflow evictions during the drain, or the disk sweep's push failures

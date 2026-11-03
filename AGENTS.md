@@ -77,7 +77,8 @@ exists or a contract other `logit` processes depend on:
 - **Any nonzero `*.dropped` is loss someone should look into**, and it's always tagged `reason`.
   An outcome the config asked for never uses the word: it's `events.discarded`, `*.omitted`,
   `*.skipped`, `*.evicted`, or `input.batches.deferred`. A loss reported only by a diagnostic gets
-  a `*.dropped` counter beside it. A counted loss in a listener, its decoder, a sink, its codec or
+  a `*.dropped` counter beside it, save the one case the ADR's "Loss with no counter" names (a
+  `lua` thread's panic in a send or a `flush()`). A counted loss in a listener, its decoder, a sink, its codec or
   spool, `prometheus_out`'s registry, the pipeline runtime, or `internal` gets a `warn` line beside
   it, throttled or once per lasting cause, logged only in the branch that counts, and on a sink
   gated as its counter is; `internal.logs.dropped` is the one exception. Operators and the soak

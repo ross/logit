@@ -421,12 +421,14 @@ dropped unswept, and every batch in it was lost with no count.
   watcher's revocation of a wedged node does, so `drain complete` reports them. A clean return
   leaves nothing queued and sweeps nothing, and a node the watcher already revoked has nothing
   left to sweep, so no batch counts twice.
-- **The batch a `process()` pass held counts too.** The thread records the received batch's event
-  count for the pass and clears it when the pass ends. The pass sends nothing until it ends, so a
-  panic during it loses the whole batch, which counts as one more shutdown drop.
-- **A panic outside the pass stays uncounted.** In a send, some of the batch's partitions may
-  have gone out, and a `flush()` emits events no input batch accounts for, so neither has a count
-  that is both whole and never doubled. A panic there is a bug in `logit`, not a script's fault;
+- **The batch in hand counts too.** The thread records a batch's event count as it receives the
+  batch and clears it just before counting its `process()` pass's discards and errors. Nothing is
+  sent in that span, so a panic there loses the whole batch, which counts as one more shutdown
+  drop. Clearing it any later would count the pass's discarded and failed events twice.
+- **A panic in a send or a `flush()` stays uncounted.** From the pass's counts through its send,
+  some of the batch's events are already counted discarded or failed and some partitions may have
+  gone out, and a `flush()` emits events no input batch accounts for, so neither has a count that
+  is both whole and never doubled. A panic there is a bug in `logit`, not a script's fault;
   [`docs/known-gaps/transforms.md`](../known-gaps/transforms.md) keeps it.
 - **`thread_panicked` keeps its message.** The `drain complete` line already sums the count, as
   [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)'s 2026-11-02 amendment allows.
