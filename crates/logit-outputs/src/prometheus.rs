@@ -3922,6 +3922,10 @@ mod tests {
             metric_event("a.b", MetricKind::gauge(2.0), &[]),
             metric_event("hits", MetricKind::gauge(1.0), &[]),
             metric_event("hits", cumulative_counter(1.0), &[]),
+            // `.` sorts before `_`, so `a.b` displaces the earlier `a_b` and the later `x_y` loses
+            // to `x.y`: one drop on each arm.
+            metric_event("x.y", MetricKind::gauge(1.0), &[]),
+            metric_event("x_y", MetricKind::gauge(2.0), &[]),
         ]);
         let (url, log) = scripted_receiver(&[503, 200]).await;
         let mut probe = TelemetryProbe::new();
@@ -3936,12 +3940,19 @@ mod tests {
         )
         .await;
         assert_eq!(log.lock().unwrap().len(), 2, "the batch is retried");
-        for key in ["name_collision", "type_conflict"] {
+        for (key, losers) in [
+            ("name_collision", &["dropped 1 series of 'a_b'", "dropped 1 series of 'x_y'"][..]),
+            ("type_conflict", &["reading of 'hits'"][..]),
+        ] {
             let found = lines.with_key(key);
-            assert_eq!(found.len(), 1, "{key}: {found:?}");
-            assert_eq!(found[0].0, logit_pipeline::test_util::Level::WARN, "{key}");
+            assert_eq!(found.len(), losers.len(), "{key}: {found:?}");
+            for (line, loser) in found.iter().zip(losers) {
+                assert_eq!(line.0, logit_pipeline::test_util::Level::WARN, "{key}");
+                assert!(line.1.contains(loser), "{key}: {}", line.1);
+            }
             let dropped = [("reason", key)];
-            assert_eq!(sum_of(&sums, "logit.output.metrics.dropped", &dropped), 1.0, "{key}");
+            let n = losers.len() as f64;
+            assert_eq!(sum_of(&sums, "logit.output.metrics.dropped", &dropped), n, "{key}");
         }
     }
 
