@@ -4574,7 +4574,7 @@ mod tests {
     }
 
     async fn backstop_report(input: Box<dyn Input + Send>) -> Backstop {
-        let (lines, _guard) = crate::buffer_full::test_support::capture();
+        let (lines, _guard) = crate::test_util::capture_lines();
         let (tx, _rx) = mpsc::channel(1);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut probe = TelemetryProbe::new();
@@ -8419,7 +8419,7 @@ mod tests {
             }
         }
 
-        let (lines, _guard) = crate::buffer_full::test_support::capture();
+        let (lines, _guard) = crate::test_util::capture_lines();
         let started = Arc::new(AtomicU64::new(0));
         let release = Arc::new(tokio::sync::Notify::new());
         let mut output = Slow { started: Arc::clone(&started), release: Arc::clone(&release) };
@@ -11869,7 +11869,7 @@ mod tests {
     /// that lost any, naming the node and the consumer, beside the count.
     #[test]
     fn a_revoked_lua_node_warns_per_edge_it_drops_on_naming_both_ends() {
-        let (lines, _guard) = crate::buffer_full::test_support::capture();
+        let (lines, _guard) = crate::test_util::capture_lines();
         let edge = |id| Edge::new(mpsc::channel(1).0).with_consumer(id);
         let own = Fanout::from_edges(vec![edge("windowed"), edge("archive")]);
         let targets =

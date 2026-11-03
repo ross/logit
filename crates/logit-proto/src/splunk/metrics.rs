@@ -40,13 +40,13 @@
 //! | a non-finite value | the string `"+Inf"`, `"-Inf"`, or `"NaN"` | -- |
 //! | an `I64` or `U64` value | a JSON integer, in its own digits | -- |
 //! | a `Bool` value | `1` or `0` | `logit.output.metrics.normalized{reason="bool_value"}` |
-//! | `GaugeDelta` | dropped: not a Splunk concept, and an `aggregate` resolves it upstream | `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}` |
+//! | `GaugeDelta` | dropped: not a Splunk concept, and an `aggregate` resolves it upstream | `logit.output.metrics.dropped{reason="unresolved_gauge_delta"}` + diag `gauge_delta_unresolved` |
 //! | `ExponentialHistogram` | skipped under both `MultiValue` settings, as the exporter does | `logit.output.metrics.skipped{metric_kind="exponential_histogram"}` |
 //! | a record flagged `NO_RECORDED_VALUE` | skipped | `skipped{reason="no_recorded_value"}` |
 //! | `Samples`, `Distribution`, `Set`, `SetMembers`, `Histogram`, `Summary` under `MultiValue::Skip` | skipped | `skipped{metric_kind="samples"\|"distribution"\|"set"\|"set_members"\|"histogram"\|"summary"}` |
 //! | the same under `MultiValue::Expand` | the table below | `degraded{metric_kind=…}`, once per record, and a `Histogram` with a `NaN` bound also `degraded{reason="non_finite_component"}` |
 //! | a name outside `[A-Za-z0-9_.:]`, starting with a digit or `_`, or containing `metric_name` | each other character → `_`, `metric_name` → `metricname`, then an `m` prefix on a leading digit or `_` | `logit.output.metrics.normalized{reason="name_sanitized"}` |
-//! | a name another record of the same object already wrote (after sanitizing) | dropped | `dropped{reason="duplicate_name"}` |
+//! | a name another record of the same object already wrote (after sanitizing) | dropped | `dropped{reason="duplicate_name"}` + diag `duplicate_name`, naming one |
 //! | a `metric_name`, `_value`, or `metric_name:*` attribute; a `metric_type` attribute on an event with a `Sum`; an `le` or `qt` attribute on an expanded bucket or quantile object | omitted from that object | `logit.output.tags.omitted{reason="reserved_key"}` |
 //!
 //! `unit`, `description`, `start_timestamp`, `exemplars`, and `flags` have no HEC field.
@@ -222,6 +222,8 @@ struct MetricObject {
 struct Objects {
     objects: Vec<MetricObject>,
     duplicates: usize,
+    /// The first duplicated name, for the diagnostic.
+    first_duplicate: Option<String>,
 }
 
 impl Objects {
@@ -246,6 +248,7 @@ impl Objects {
         let values = &mut self.objects[at].values;
         if values.iter().any(|(n, _)| *n == name) {
             self.duplicates += 1;
+            self.first_duplicate.get_or_insert(name);
         } else {
             values.push((name, value));
         }
@@ -317,7 +320,14 @@ impl SplunkEncoder {
                     self.count_bool(sum.value);
                     objects.scalar(&sum_type, name, sum.value);
                 }
-                MetricKind::GaugeDelta(_) => self.unencoded(Unencoded::UnresolvedGaugeDelta, 1),
+                MetricKind::GaugeDelta(_) => {
+                    self.unencoded(Unencoded::UnresolvedGaugeDelta, 1);
+                    self.diagnostics.warn_throttled(
+                        "gauge_delta_unresolved",
+                        "a relative gauge adjustment reached a sink unresolved -- add an \
+                         `aggregate` component between the statsd input and this output",
+                    );
+                }
                 MetricKind::ExponentialHistogram(_) => {
                     self.unencoded(Unencoded::Kind("exponential_histogram"), 1);
                 }
@@ -344,6 +354,15 @@ impl SplunkEncoder {
         }
         if objects.duplicates > 0 {
             self.unencoded(Unencoded::DuplicateName, objects.duplicates);
+            let name = objects.first_duplicate.as_deref().unwrap_or_default();
+            self.diagnostics.warn_throttled(
+                "duplicate_name",
+                format_args!(
+                    "dropped {} metric(s) whose name another record of the same event already \
+                     wrote, such as {name}: one HEC object holds one value per name",
+                    objects.duplicates
+                ),
+            );
         }
 
         for object in &objects.objects {

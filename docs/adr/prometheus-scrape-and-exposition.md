@@ -725,7 +725,7 @@ batch that causes it, never once per scrape:
   A throttled `family_retyped` warning names the family. The new type still wins, and the old
   name has no alias
   ([ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)'s "Amendment (2026-11-02):
-  loss outside the vocabulary, and loss no line reported").
+  every counted loss leaves a warn line").
 
 `crates/logit-outputs/src/prometheus.rs`'s "Type conflicts" and "Name collisions" are the
 canonical statement.

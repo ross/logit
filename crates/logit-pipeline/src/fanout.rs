@@ -1158,7 +1158,7 @@ mod tests {
     /// of its own, and every send path warns through the same edge flag.
     #[tokio::test]
     async fn a_closed_consumer_warns_once_per_edge_naming_both_ends() {
-        let (lines, _guard) = crate::buffer_full::test_support::capture();
+        let (lines, _guard) = crate::test_util::capture_lines();
         let (tx, rx) = mpsc::channel(1);
         drop(rx);
         let (open_tx, mut open_rx) = mpsc::channel(16);

@@ -592,88 +592,9 @@ fn fmt_duration(d: Duration) -> String {
 }
 
 #[cfg(test)]
-pub(crate) mod test_support {
-    //! A thread-local capture of self-log lines, for tests on a `current_thread` runtime.
-
-    use std::sync::{Arc, Mutex};
-    use tracing_subscriber::layer::SubscriberExt;
-
-    /// One captured line: its level, `key`, `component`, and message.
-    type Captured = (tracing::Level, String, String, String);
-
-    #[derive(Clone, Default)]
-    pub(crate) struct Lines(Arc<Mutex<Vec<Captured>>>);
-
-    impl Lines {
-        /// The `(level, message)` of every captured line whose key is `key`.
-        pub(crate) fn with_key(&self, key: &str) -> Vec<(tracing::Level, String)> {
-            let lines = self.0.lock().unwrap();
-            lines
-                .iter()
-                .filter(|(_, k, _, _)| k == key)
-                .map(|(l, _, _, m)| (*l, m.clone()))
-                .collect()
-        }
-
-        /// The `component` of every captured line whose key is `key`.
-        pub(crate) fn components_with_key(&self, key: &str) -> Vec<String> {
-            let lines = self.0.lock().unwrap();
-            lines.iter().filter(|(_, k, _, _)| k == key).map(|(_, _, c, _)| c.clone()).collect()
-        }
-    }
-
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Lines {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            #[derive(Default)]
-            struct Visitor {
-                key: String,
-                component: String,
-                message: String,
-            }
-            impl tracing::field::Visit for Visitor {
-                fn record_debug(
-                    &mut self,
-                    field: &tracing::field::Field,
-                    value: &dyn std::fmt::Debug,
-                ) {
-                    self.record_str(field, &format!("{value:?}"));
-                }
-                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-                    match field.name() {
-                        "key" => self.key = value.trim_matches('"').to_string(),
-                        "component" => self.component = value.trim_matches('"').to_string(),
-                        "message" => self.message = value.to_string(),
-                        _ => {}
-                    }
-                }
-            }
-            let mut visitor = Visitor::default();
-            event.record(&mut visitor);
-            self.0.lock().unwrap().push((
-                *event.metadata().level(),
-                visitor.key,
-                visitor.component,
-                visitor.message,
-            ));
-        }
-    }
-
-    /// Captures every line logged on this thread until the guard drops.
-    pub(crate) fn capture() -> (Lines, tracing::subscriber::DefaultGuard) {
-        let lines = Lines::default();
-        let subscriber = tracing_subscriber::registry().with(lines.clone());
-        (lines.clone(), tracing::subscriber::set_default(subscriber))
-    }
-}
-
-#[cfg(test)]
 mod tests {
-    use super::test_support::capture;
     use super::*;
+    use crate::test_util::capture_lines as capture;
 
     static LABELS: FullLabels = FullLabels {
         what: "buffer",

@@ -826,9 +826,14 @@ fn resource_entry(v: &Value) -> Option<(String, String)> {
 }
 
 impl DatadogEncoder {
-    pub(super) fn metric_not_sent(&self, outcome: MetricOut) {
+    /// Counts `outcome` and raises its throttled diagnostic, if it has one
+    /// ([`MetricOut::diagnostic`]).
+    pub(super) fn metric_not_sent(&mut self, outcome: MetricOut) {
         let (metric, tag) = outcome.counter();
         self.telemetry.count(metric, 1.0, &[tag]);
+        if let Some((key, message)) = outcome.diagnostic() {
+            self.diagnostics.warn_throttled(key, message);
+        }
     }
 
     pub(super) fn out_degraded(&self, reason: &'static str) {

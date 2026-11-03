@@ -3984,7 +3984,15 @@ mod tests {
             metric_event("free.mem", MetricKind::gauge(1.0), &both),
             metric_event("free.mem", MetricKind::gauge(2.0), &both),
         ]);
+        let (lines, guard) = logit_pipeline::test_util::capture_lines();
         sink.send(&b).await.unwrap();
+        drop(guard);
+        let collision = lines.with_key("name_collision");
+        assert_eq!(collision.len(), 1, "{collision:?}");
+        assert!(collision[0].1.contains("dropped 1 series of 'a_b'"), "{}", collision[0].1);
+        let conflict = lines.with_key("type_conflict");
+        assert_eq!(conflict.len(), 1, "{conflict:?}");
+        assert!(conflict[0].1.contains("reading of 'hits'"), "{}", conflict[0].1);
         let renamed = probe.sum("logit.output.metrics.normalized", &[("reason", "name_sanitized")]);
         assert_eq!(renamed, 2.0, "`a.b` and the later `free.mem`");
         let dropped = probe.sum("logit.output.metrics.dropped", &[("reason", "name_collision")]);
@@ -4061,6 +4069,49 @@ mod tests {
         assert_eq!(one[0], bodies[1]);
         assert_eq!(sum_of(&retried, "logit.component.diagnostics", &[REJECTED]), 1.0);
         assert_counted_once_per_batch(&single, &retried, &ENCODE_SIDE, &PER_ATTEMPT);
+    }
+
+    /// A name collision and a type conflict in a remote-write batch each log one warn line, and
+    /// a retry doesn't repeat them: the codec raises them through the gated handle.
+    #[tokio::test]
+    async fn a_remote_write_retry_logs_each_collision_once() {
+        let b = batch(vec![
+            metric_event("a_b", MetricKind::gauge(1.0), &[]),
+            metric_event("a.b", MetricKind::gauge(2.0), &[]),
+            metric_event("hits", MetricKind::gauge(1.0), &[]),
+            metric_event("hits", cumulative_counter(1.0), &[]),
+            // `.` sorts before `_`, so `a.b` displaces the earlier `a_b` and the later `x_y` loses
+            // to `x.y`: one drop on each arm.
+            metric_event("x.y", MetricKind::gauge(1.0), &[]),
+            metric_event("x_y", MetricKind::gauge(2.0), &[]),
+        ]);
+        let (url, log) = scripted_receiver(&[503, 200]).await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = instrumented_sender(&url, &probe);
+        let (lines, _guard) = logit_pipeline::test_util::capture_lines();
+        let sums = sums_through_write_loop(
+            &mut output,
+            &mut probe,
+            "prometheus_out",
+            vec![b],
+            fast_retry(),
+        )
+        .await;
+        assert_eq!(log.lock().unwrap().len(), 2, "the batch is retried");
+        for (key, losers) in [
+            ("name_collision", &["dropped 1 series of 'a_b'", "dropped 1 series of 'x_y'"][..]),
+            ("type_conflict", &["reading of 'hits'"][..]),
+        ] {
+            let found = lines.with_key(key);
+            assert_eq!(found.len(), losers.len(), "{key}: {found:?}");
+            for (line, loser) in found.iter().zip(losers) {
+                assert_eq!(line.0, logit_pipeline::test_util::Level::WARN, "{key}");
+                assert!(line.1.contains(loser), "{key}: {}", line.1);
+            }
+            let dropped = [("reason", key)];
+            let n = losers.len() as f64;
+            assert_eq!(sum_of(&sums, "logit.output.metrics.dropped", &dropped), n, "{key}");
+        }
     }
 
     /// A rejection answered on a retry is the receiver's verdict on that attempt, counted and

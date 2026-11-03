@@ -174,8 +174,8 @@ Decision 5 lets an episode that opens inside the minute go unannounced, its coun
 next `buffer_full`. When no next line comes, because the queue's owner finishes first, a queue
 that shed data wrote nothing about it: the episode still open at shutdown, and any closed ones
 waiting to ride, reached only the `*.dropped` counters. That broke
-[ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)'s "Amendment (2026-11-02): loss
-outside the vocabulary, and loss no line reported", that every counted loss logs.
+[ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)'s "Amendment (2026-11-02): every
+counted loss leaves a warn line".
 
 `FullWatch::finish` now writes a fourth key, `buffer_shed_unannounced` (`warn`), when the episodes
 no line announced shed anything:

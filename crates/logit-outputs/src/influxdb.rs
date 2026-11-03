@@ -30,7 +30,9 @@
 //! batch, and [`InfluxDbOutput::send`] makes one attempt and classifies the outcome as a
 //! [`logit_pipeline::Fault`]; retry timing belongs to `logit-pipeline`'s writer
 //! (`docs/adr/buffered-sink-delivery.md`). The sink emits the encoder's [`EncodeStats`] as
-//! telemetry once per batch ([`emit_encode_stats`]).
+//! telemetry once per batch ([`emit_encode_stats`]), with one throttled warning per
+//! `metrics.dropped` reason the encoder doesn't diagnose itself (`unencodable_value`,
+//! `unencodable_key`, `reserved_key`, `oversize_value`), carrying the batch's count.
 //!
 //! The client, the status bucket, and the transport classifier are [`crate::http`]'s, so
 //! redirects are off ([`crate::http::build_client`] says why) and a `3xx` is the misconfigured
@@ -455,6 +457,7 @@ fn prepare(
     // it.
     if first {
         emit_encode_stats(telemetry, encoder.stats());
+        diagnose_encode_drops(diag, encoder.stats());
     }
     if body.is_empty() {
         // Nothing had a line-protocol encoding (log- or span-only events, or every metric was
@@ -628,6 +631,39 @@ impl Output for InfluxDbOutput {
     async fn flush(&mut self) -> anyhow::Result<()> {
         self.slots.cancel();
         Ok(())
+    }
+}
+
+/// Raises one throttled diagnostic per reason for what [`emit_encode_stats`] counts
+/// `metrics.dropped` and the encoder doesn't diagnose itself, with the batch's count. Called on
+/// the batch's first encode only, beside the counters.
+fn diagnose_encode_drops(diag: &mut Diagnostics, stats: &EncodeStats) {
+    let rows: [(usize, &'static str, &str); 4] = [
+        (
+            stats.dropped_unencodable_value,
+            "unencodable_value",
+            "field(s) with a NaN or infinite value, which line protocol can't write",
+        ),
+        (
+            stats.dropped_unencodable_key,
+            "unencodable_key",
+            "field(s) whose measurement or field key has no line-protocol spelling",
+        ),
+        (
+            stats.dropped_reserved_key,
+            "reserved_key",
+            "string field(s) named `time`, which influxd refuses",
+        ),
+        (
+            stats.dropped_oversize_value,
+            "oversize_value",
+            "string field(s) over influxd's 1 MiB value cap",
+        ),
+    ];
+    for (count, key, why) in rows {
+        if count > 0 {
+            diag.warn_throttled(key, format_args!("dropped {count} {why}"));
+        }
     }
 }
 
@@ -1300,6 +1336,61 @@ mod tests {
         assert_eq!(sum_of(retried, "logit.output.requests", &[("class", "5xx")]), 1.0);
         assert_eq!(sum_of(retried, "logit.output.requests", &[("class", "2xx")]), 1.0);
         assert_counted_once_per_batch(single, retried, &ENCODE_SIDE, &[]);
+    }
+
+    /// Each encode-side drop reason logs one warn line per batch with the batch's count, and a
+    /// retry doesn't repeat it: the line goes out with the counters, on the first encode.
+    #[tokio::test]
+    async fn each_encode_side_drop_logs_one_line_across_a_retry() {
+        use crate::test_support::{fast_retry, sum_of, sums_through_write_loop};
+        use logit_pipeline::test_util::{capture_lines, Level, TelemetryProbe};
+
+        let mut carrier = Event::empty(0, AttrMap::new());
+        carrier.attributes.insert(logit_proto::influxdb::ATTR_MEASUREMENT, "cpu");
+        for field in ["cpu.time", "cpu.idle"] {
+            carrier.metrics.push(MetricRecord::new(
+                logit_core::interner::intern(field),
+                MetricKind::gauge(1.0),
+            ));
+        }
+        let big = "a".repeat(1024 * 1024 + 1);
+        carrier.attributes.insert("_logit.field.big", big.as_str());
+        let batch = batch_with(vec![
+            metric_event("nan", MetricKind::counter(f64::NAN), &[]),
+            metric_event("nan", MetricKind::counter(f64::INFINITY), &[]),
+            metric_event("bad\\", MetricKind::counter(1.0), &[]),
+            carrier,
+        ]);
+        let (addr, _count) = canned_server(vec![RESP_503, RESP_204]).await;
+        let mut probe = TelemetryProbe::new();
+        let telemetry = probe.telemetry("out", "influxdb_out", "sink");
+        let mut output = output_against(addr)
+            .await
+            .with_diagnostics(Diagnostics::new("out").with_telemetry(telemetry.clone()))
+            .with_telemetry(telemetry);
+        let (lines, _guard) = capture_lines();
+        let sums = sums_through_write_loop(
+            &mut output,
+            &mut probe,
+            "influxdb_out",
+            vec![batch],
+            fast_retry(),
+        )
+        .await;
+        assert_eq!(sum_of(&sums, "logit.output.requests", &[("class", "5xx")]), 1.0);
+        for (key, text, n) in [
+            ("unencodable_value", "dropped 2 field(s) with a NaN or infinite value", 2.0),
+            ("unencodable_key", "dropped 1 field(s) whose measurement", 1.0),
+            ("reserved_key", "dropped 1 string field(s) named `time`", 1.0),
+            ("oversize_value", "dropped 1 string field(s) over influxd's 1 MiB", 1.0),
+        ] {
+            let found = lines.with_key(key);
+            assert_eq!(found.len(), 1, "{key}: {found:?}");
+            assert_eq!(found[0].0, Level::WARN, "{key}");
+            assert!(found[0].1.contains(text), "{key}: {}", found[0].1);
+            let dropped = [("reason", key)];
+            assert_eq!(sum_of(&sums, "logit.output.metrics.dropped", &dropped), n, "{key}");
+        }
     }
 
     /// Each event with nothing to write counts once, a log-only one and an empty one alike, and

@@ -1269,9 +1269,10 @@ rotation renames each retained file; `logit validate` rejects a larger value.
 
 **What to watch.** The metrics above still apply, with these differences:
 `buffer.utilization`/`.bytes` are sized against `buffer.disk.max_bytes`; `batches.dropped` gains
-the `reason`s `frame_too_large`, `disk_corrupt`, `disk_torn`, `disk_full`, and `disk_io_error`;
-and a disk-backed sink emits `reason="shutdown"` only under `at_most_once`, when the shutdown grace cuts
-off the batches in flight (an ambiguous outcome that posture drops). Nothing else is dropped at
+the `reason`s `frame_too_large`, `disk_corrupt`, `disk_torn`, `disk_full`, and `disk_io_error`,
+each with a throttled `warn` self-log line; and a disk-backed sink emits
+`reason="shutdown"` only under `at_most_once`, when the shutdown grace cuts off the batches in
+flight (an ambiguous outcome that posture drops). Nothing else is dropped at
 shutdown, because the spool keeps it. Also watch:
 
 - `logit.component.buffer.disk.segments` (gauge): segment files currently on disk.

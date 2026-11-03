@@ -413,14 +413,53 @@ same reason a `503` is, so the name stays outside `*.dropped`.
 [internal-telemetry.md](../design/internal-telemetry.md#loss-vocabulary)'s "Loss vocabulary" row
 for `input.batches.deferred` carries the wider meaning.
 
-## Amendment (2026-11-02): loss outside the vocabulary, and loss no line reported
+## Amendment (2026-11-02): every counted loss leaves a warn line
 
-An audit of losses that never reach stderr found one counter outside the vocabulary and four
-counted losses that write no line. The rule this amendment holds them to: **every counted loss
-also logs a `warn` line**, so an operator reading only `logit`'s log, or only `internal`'s
-default `logs: warn` capture, learns of it. The counter stays the record of how much; the line
-says that it happened and why. A loss that repeats for one lasting cause logs once for that cause,
-and one that recurs per batch is throttled, so the line never becomes a flood.
+A loss that showed only in a counter was invisible to an operator reading stderr, or `internal`'s
+`logs: warn` stream, until something drained and graphed the counter. So the vocabulary's rule
+that a loss reported only by a diagnostic gets a `*.dropped` counter beside it now runs both ways:
+**every counted loss also logs a `warn` line**, with the exceptions listed at the end of this
+amendment. The counter stays the record of how much; the line says that it happened and why, and
+names the component. A loss that recurs per batch or per record is throttled, and one that
+repeats for one lasting cause logs once for that cause, so the line never becomes a flood.
+
+### Sinks, their codecs, and the disk spool
+
+Every `*.dropped` a sink, its codec, or its `buffer.disk:` spool counts has a throttled `warn`
+line beside it. Each line added here is keyed on its counter's `reason`, except
+`gauge_delta_unresolved` for `reason="unresolved_gauge_delta"`, the key every other sink already
+uses; an older line may carry a broader key (`disk_io_error` for `disk_full`, `encode_error` for
+`comment_measurement`). The line gives the count or an example.
+
+- **Throttled, never per event.** The line goes through `Diagnostics::warn_throttled`, which
+  reports a key's 1st, 2nd, 4th, 8th, ... occurrence. Where a sink tallies a reason per batch
+  (`datadog_out`'s plan, `influxdb_out`'s encode stats), the line is one per batch and carries the
+  batch's count; where a codec decides per record, it's one occurrence per record.
+- **Gated like its counter.** An encode-side line goes through the `Diagnostics::gated` handle,
+  or with the counter on the batch's first encode, so a retry or a bisection re-encode doesn't
+  repeat it ([ADR `sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md),
+  decision 1). A drop the destination's verdict decides logs on the ungated handle, once per
+  attempt that decides it.
+- **A line already in the path covers its drop.** A batch `write_loop` drops after a final fault
+  logs `send_failed` and `degraded`, so a sink's `ambiguous_at_most_once` count for that batch's
+  records needs no line of its own. `kafka_out`'s does, since a refused partition beside the
+  ambiguous one holds the batch and `write_loop` drops nothing. A shutdown drop sums into the
+  `drain complete` line.
+
+The line was added to `datadog_out` (`stale`, `needs_agent_processing`, `not_datadog_origin`,
+`non_finite_value`, `non_monotonic_bounds`, `sketch_range`, `invalid_status`,
+`unresolved_gauge_delta`, and the stats route's `unrecognized_record`), `splunk_hec_out`
+(`duplicate_name`, `unresolved_gauge_delta`), `influxdb_out` (`unencodable_value`,
+`unencodable_key`, `reserved_key`, `oversize_value`), `prometheus_out`'s codec (`type_conflict` and
+`name_collision` within one batch's encode, and remote-write's `no_timestamp` and
+`invalid_labels`), `kafka_out` (`ambiguous_at_most_once` beside a refused batch), and the disk spool
+(`disk_torn` and `disk_corrupt` at open, `disk_corrupt` on a live read, `frame_too_large`). Every
+other sink-side `*.dropped` already had one.
+
+### The registry, the pipeline, and `internal`
+
+An audit of the losses outside the sinks' encode paths found one counter outside the vocabulary
+and five counted losses that wrote no line:
 
 | Loss | Counter | Line |
 |---|---|---|
@@ -431,17 +470,29 @@ and one that recurs per batch is throttled, so the line never becomes a flood.
 | A buffer or receive queue that shed data in a full episode the throttle never announced, then finished | the overflow `*.dropped` counters, unchanged | `buffer_shed_unannounced` at shutdown ([ADR `buffer-full-diagnostics`](buffer-full-diagnostics.md)'s "Amendment: shutdown reports what no line announced (2026-11-02)") |
 | A point or span `internal`'s per-component buffer couldn't hold | `internal.points.dropped{reason="cardinality"}`, `internal.spans.dropped{reason="buffer_full"}`, unchanged | `telemetry_points_capped`, `telemetry_spans_capped`, once per component per cap |
 
+The two registry lines are throttled as the sinks' are. The other four log once per lasting
+cause: a closed edge stays closed, a revoked node exits, a queue finishes once, and a component
+over its cap stays over it.
+
 The type-conflict rename reverses the 2026-10-13 close-out's "`output.metrics.type_conflict` keeps
 its name": that series was live data the registry removed, which is loss, and the codec already
 counts a record a type conflict drops within a batch under the same reason and unit. There's no
 alias.
 
-`internal.logs.dropped{reason="buffer_full"}` is the one counted loss with no line. The line
-would be a `logit` log that `TelemetryLayer` captures back into the same full buffer, where it
-would be dropped in turn, and the log that was dropped has already been written to stderr under
-the operator's `--log-level`: only its copy in the pipeline is lost.
-[internal-telemetry.md](../design/internal-telemetry.md)'s "Logs" section carries the same
-statement.
+### Exceptions
+
+Three counted losses have no line of their own:
+
+- **`internal.logs.dropped{reason="buffer_full"}`.** The line would be a `logit` log that
+  `TelemetryLayer` captures back into the same full buffer, where it would be dropped in turn,
+  and the log that was dropped has already been written to stderr under the operator's
+  `--log-level`: only its copy in the pipeline is lost.
+  [internal-telemetry.md](../design/internal-telemetry.md)'s "Logs" section carries the same
+  statement.
+- **`revoke_lua_io`'s `shutdown` sweep of a wedged Lua node's inbox**, which sums into `drain
+  complete` beside the node's own failure.
+- **`CountedDrain`'s `shutdown` count of a cancelled `push_many`'s remainder**, which sums into
+  `drain complete` too.
 
 ## Migration record
 The classification of every `*.dropped`, `*.skipped`, `*.degraded`, `*.truncated`, and loss-related
