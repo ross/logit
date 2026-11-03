@@ -375,7 +375,7 @@ impl Input for LogitInput {
                 accepted = accept_queue.accept(&listener) => accepted,
                 _ = shutdown.wait_for(|&due| due) => return Ok(()),
             };
-            let (stream, _peer) = match accepted {
+            let (stream, peer) = match accepted {
                 Ok(accepted) => accepted,
                 Err(err) => {
                     // `biased`, absorb first: see `docs/design/pipeline-graph.md`'s
@@ -425,6 +425,7 @@ impl Input for LogitInput {
                             Ok(Ok(tls_stream)) => {
                                 reject_or_serve(
                                     tls_stream,
+                                    peer,
                                     permit,
                                     sink,
                                     telemetry.clone(),
@@ -447,6 +448,7 @@ impl Input for LogitInput {
                     None => {
                         reject_or_serve(
                             stream,
+                            peer,
                             permit,
                             sink,
                             telemetry.clone(),
@@ -481,6 +483,7 @@ impl Input for LogitInput {
 #[allow(clippy::too_many_arguments)] // one small helper is clearer here than a params struct for 10 mostly-unrelated threaded-through values
 async fn reject_or_serve<S: AsyncRead + AsyncWrite + Unpin + Send>(
     mut stream: S,
+    peer: std::net::SocketAddr,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
     sink: Fanout,
     telemetry: Telemetry,
@@ -504,6 +507,7 @@ async fn reject_or_serve<S: AsyncRead + AsyncWrite + Unpin + Send>(
     let _live = live_connections.enter();
     serve_connection(
         stream,
+        peer,
         sink,
         telemetry.clone(),
         diag,
@@ -547,6 +551,7 @@ fn decode_error_reason(err: &CodecError) -> &'static str {
 #[allow(clippy::too_many_arguments)] // threaded through from `reject_or_serve`, which has the same allow
 async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
     mut stream: S,
+    peer: std::net::SocketAddr,
     sink: Fanout,
     telemetry: Telemetry,
     mut diag: Diagnostics,
@@ -575,6 +580,7 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
     // holds the graph's cancel-by-drop shutdown open.
     let ended = serve_frames(
         &mut stream,
+        peer,
         sink,
         &telemetry,
         &mut diag,
@@ -623,6 +629,7 @@ async fn close_lingering<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S, boun
 #[allow(clippy::too_many_arguments)] // threaded through from `serve_connection`
 async fn serve_frames<S: AsyncRead + AsyncWrite + Unpin + Send>(
     stream: &mut S,
+    peer: std::net::SocketAddr,
     sink: Fanout,
     telemetry: &Telemetry,
     diag: &mut Diagnostics,
@@ -636,6 +643,7 @@ async fn serve_frames<S: AsyncRead + AsyncWrite + Unpin + Send>(
     let mut pending = None;
     let ended = frame_loop(
         stream,
+        peer,
         &mut pending,
         sink,
         telemetry,
@@ -670,6 +678,7 @@ struct PendingAck {
 #[allow(clippy::too_many_arguments)] // threaded through from `serve_frames`
 async fn frame_loop<S: AsyncRead + AsyncWrite + Unpin + Send>(
     stream: &mut S,
+    peer: std::net::SocketAddr,
     pending: &mut Option<PendingAck>,
     sink: Fanout,
     telemetry: &Telemetry,
@@ -905,8 +914,8 @@ async fn frame_loop<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 diag.warn_throttled(
                     "closed_consumer",
                     format_args!(
-                        "dropped the batch of sender sequence {}: no consumer took it, so the \
-                         connection closes with GOING_AWAY",
+                        "dropped the batch of sender sequence {} from {peer}: no consumer took \
+                         it, so the connection closes with GOING_AWAY",
                         seq.seq
                     ),
                 );
@@ -1629,6 +1638,12 @@ mod tests {
     use rustls_pki_types::pem::PemObject;
     use rustls_pki_types::CertificateDer;
     use std::sync::Arc;
+
+    /// The peer address a test hands a connection it serves over an in-memory pipe.
+    const TEST_PEER: std::net::SocketAddr = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+        std::net::Ipv4Addr::new(192, 0, 2, 7),
+        4100,
+    ));
     use tokio::net::TcpStream;
     use tokio::sync::mpsc;
 
@@ -2941,6 +2956,7 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let task = tokio::spawn(reject_or_serve(
             server,
+            TEST_PEER,
             Some(permit),
             sink,
             telemetry,
@@ -3008,6 +3024,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let task = tokio::spawn(serve_connection(
             server,
+            TEST_PEER,
             sink,
             telemetry,
             Diagnostics::default(),
@@ -3110,6 +3127,7 @@ mod tests {
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
             let task = tokio::spawn(serve_connection(
                 server,
+                TEST_PEER,
                 sink,
                 Telemetry::default(),
                 Diagnostics::default(),
@@ -3165,6 +3183,7 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let task = tokio::spawn(serve_connection(
             server,
+            TEST_PEER,
             sink,
             telemetry,
             Diagnostics::default(),
@@ -3203,9 +3222,10 @@ mod tests {
         );
         // The listener's own line, beside the fan-out's once-per-edge `closed_consumer` line.
         let found = lines.with_key("closed_consumer");
-        let own: Vec<_> = found.iter().filter(|(_, l)| l.contains("no consumer took it")).collect();
+        let own: Vec<_> = found.iter().filter(|(_, l)| l.contains("no consumer took")).collect();
         assert_eq!(own.len(), 1, "{found:?}");
         assert_eq!(own[0].0, logit_pipeline::test_util::Level::WARN);
+        assert!(own[0].1.contains(&format!("from {TEST_PEER}:")), "{own:?}");
     }
 
     // ---- control writes over TLS ----------------------------------------------------------------
@@ -3254,6 +3274,7 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         tokio::spawn(serve_connection(
             server,
+            TEST_PEER,
             sink,
             Telemetry::default(),
             Diagnostics::default(),
@@ -3344,6 +3365,7 @@ mod tests {
             let _keep = (rx, shutdown_tx);
             serve_connection(
                 server,
+                TEST_PEER,
                 sink,
                 telemetry,
                 Diagnostics::default(),

@@ -494,9 +494,9 @@ alias.
 ### Listeners and their decoders
 
 Every `input.*.dropped` a listener or its decoder counts, and a UDP listener's truncated
-`component.datagrams.dropped`/`bytes.dropped` pair, has a throttled `warn` line keyed on its
-reason. Prometheus's `non_monotonic_buckets` keeps its older `prometheus_non_monotonic_buckets`
-key.
+`component.datagrams.dropped`/`bytes.dropped` pair, has a throttled `warn` line beside it. Each
+line added here is keyed on its counter's `reason`; an older line keeps its own key, often the
+fault's name rather than the reason.
 
 - **Nothing to pay when nothing drops.** A decoder logs inside the branch that counts, so a clean
   body costs no format and no call. Where a decoder tallies a reason across a body (statsd's
