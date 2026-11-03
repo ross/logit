@@ -122,7 +122,7 @@ impl DatadogDecoder {
         ))
     }
 
-    fn skip_check(&self, outcome: MetricIn) {
+    fn skip_check(&mut self, outcome: MetricIn) {
         self.metric_not_decoded(outcome, 1);
     }
 }

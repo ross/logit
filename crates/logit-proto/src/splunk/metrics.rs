@@ -19,10 +19,10 @@
 //! | `metric_type` `"Gauge"` or absent | every record `Gauge`; the field is consumed | -- |
 //! | `metric_type` any other value (the exporter's `Histogram`, `Summary`) | every record `Gauge`; the field stays an attribute, verbatim | -- |
 //! | every other field | an attribute, as the parent module's table says | -- |
-//! | `metric_name:` with an empty name | the record is dropped | `logit.input.metrics.dropped{reason="bad_name"}` |
-//! | a value that is neither a number, one of the three strings, nor a string holding a finite number | the record is dropped | `dropped{reason="bad_value"}` |
-//! | the single-metric form naming a record the multi-metric form already carries | the multi-metric record wins | `dropped{reason="duplicate_name"}` |
-//! | `metric_name` without `_value`, `_value` without `metric_name`, or a non-string or empty `metric_name` | the pair is dropped | `dropped{reason="incomplete_single_metric"}` |
+//! | `metric_name:` with an empty name | the record is dropped | `logit.input.metrics.dropped{reason="bad_name"}` + diag `bad_name` |
+//! | a value that is neither a number, one of the three strings, nor a string holding a finite number | the record is dropped | `dropped{reason="bad_value"}` + diag `bad_value` |
+//! | the single-metric form naming a record the multi-metric form already carries | the multi-metric record wins | `dropped{reason="duplicate_name"}` + diag `duplicate_name` |
+//! | `metric_name` without `_value`, `_value` without `metric_name`, or a non-string or empty `metric_name` | the pair is dropped | `dropped{reason="incomplete_single_metric"}` + diag `incomplete_single_metric` |
 //! | a metric event left with no record | the event is skipped | `logit.input.events.skipped{reason="no_metric"}` |
 //!
 //! ## Encode

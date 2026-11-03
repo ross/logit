@@ -65,8 +65,9 @@
 //! - any content after `# EOF`.
 //!
 //! Everything else is dropped at line or series granularity and counted
-//! `logit.input.metrics.dropped{reason=...}` on the [`PrometheusDecoder`]'s telemetry -- a scrape of
-//! a mostly-good endpoint is worth keeping:
+//! `logit.input.metrics.dropped{reason=...}` on the [`PrometheusDecoder`]'s telemetry, with a
+//! throttled line keyed on the reason on its diagnostics -- a scrape of a mostly-good endpoint is
+//! worth keeping:
 //!
 //! | Reason | What it counts |
 //! |---|---|

@@ -713,7 +713,7 @@ that recorded the point.
 | `buffer_full_at_shutdown` | warn | A sink or listener stopped with its buffer still full. |
 | `buffer_shed_unannounced` | warn | A sink or listener stopped after its buffer shed data in a full episode no `buffer_full` line had announced yet, because the once-a-minute limit held it back. Carries the episodes' count and what they shed. |
 | `shutdown_push_cut` | warn | Shutdown cut a listener's push into its receive queue partway, so the datagrams it hadn't reached were dropped. Names the listener and the counts, which are in its `logit.component.datagrams.dropped`/`bytes.dropped{reason="shutdown"}`. Logged at most once per listener, at shutdown. Not in `drain complete`'s `batches_dropped`, which counts batches. |
-| `closed_consumer` | warn | A component sent a batch to a consumer that has stopped taking batches, or a wedged `lua` node's channels were revoked after its shutdown grace, leaving what it produced afterward with nowhere to go. Names both; logged once per producer and consumer, with every drop counted in `logit.component.events.dropped{reason="closed_consumer"}`. |
+| `closed_consumer` | warn | A component sent a batch to a consumer that has stopped taking batches, or a wedged `lua` node's channels were revoked after its shutdown grace, leaving what it produced afterward with nowhere to go. Names both; logged once per producer and consumer, with every drop counted in `logit.component.events.dropped{reason="closed_consumer"}`. A listener that refuses a request or a `logit_in` frame because no consumer took its batch logs its own throttled `closed_consumer` line naming the peer, with the batch counted in `logit.input.batches.dropped{reason="closed_consumer"}`. |
 | `telemetry_points_capped`, `telemetry_spans_capped` | warn | `internal`'s buffer for one component dropped a point (more than 1024 distinct name and tag pairs between drains) or a span (more than 512 between drains). Logged once per component per cap; counted in `logit.internal.points.dropped` and `logit.internal.spans.dropped`. Only with an `internal` component. |
 | `shutdown_backstop` | warn | A listener didn't finish within its shutdown grace (`receive.shutdown_grace`, 5 s by default) and was stopped. Names the listener's kind and the grace. If the listener was waiting to send a batch downstream, the line names the batch and its event count. `kafka_in`, and `tail_in`, `docker_in`, or `cri_in` with a `checkpoint_path`, count it `logit.input.batches.deferred`, and the line says the next run reads it again from the committed offset or checkpoint. Every other listener counts it `batches.dropped`/`events.dropped{reason="shutdown"}`, and the line says it's lost. A batch cut in a plain send was already counted `batches.sent`. One cut in a send that reserves room in every consumer first (an HTTP listener's `busy_after` send, or `kafka_in`'s) wasn't. With no batch in a send, the line says so, and nothing is counted. |
 | `telemetry left undrained at exit` | debug/warn | One line per internal metric point no `internal` drain exported, logged after every node has exited and before `exiting`, on exit `0` or `2` alike. `warn` for any nonzero `*.dropped` count, whatever its `reason`; `debug` for everything else, including timings and routine counts. Only with an `internal` component. |
@@ -1444,12 +1444,14 @@ For a UDP listener:
   read slot, which the kernel cut short, so the listener drops it rather than decode a partial
   payload. It happens only on an **IPv6** listener, which permits a 65,527-byte payload, or a Unix
   datagram socket. Anything but zero means a sender is emitting datagrams larger than any IPv4 path
-  could carry; fix it at the sender.
+  could carry; fix it at the sender. Each read that drops one also logs a throttled `truncated`
+  warn line.
 - `logit.input.kernel.dropped{reason="socket"}` (count, Linux only): datagrams the *kernel* discarded before
   `recv_from` could return them, read from the listening socket itself. It is the same number
   `/proc/net/udp`'s `drops` column shows for this socket. It is a separate loss from the queue
   counter above; the two add up. Any nonzero count is loss; a sustained rate means datagrams arrive
-  faster than this process takes them off the socket.
+  faster than this process takes them off the socket. Each once-a-second sample that sees new
+  drops logs a throttled `socket` warn line with the count.
 - `logit.input.receive_buffer.utilization` (gauge), with
   `logit.input.receive_buffer.used.bytes` / `.bytes` behind it: how full the kernel's socket buffer
   is, sampled once a second. It is the leading indicator for `kernel.dropped`: the kernel drops at

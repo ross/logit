@@ -696,7 +696,16 @@ impl DatadogDecoder {
                 Ok(sketch) => {
                     records.push(MetricRecord::new(intern(name), MetricKind::Distribution(sketch)))
                 }
-                Err(SketchError::Interpolation) => self.stats_not_decoded(StatsIn::Interpolation),
+                Err(SketchError::Interpolation) => {
+                    self.stats_not_decoded(StatsIn::Interpolation);
+                    self.diagnostics.warn_throttled(
+                        StatsIn::Interpolation.reason(),
+                        format_args!(
+                            "datadog stats: {name} dropped: its sketch's interpolation isn't \
+                             NONE, which this decoder doesn't read"
+                        ),
+                    );
+                }
                 Err(SketchError::Malformed(why)) => {
                     self.stats_not_decoded(StatsIn::BadSketch);
                     self.diagnostics.warn_throttled(
@@ -1566,7 +1575,9 @@ mod tests {
 
     #[test]
     fn a_bad_or_interpolated_summary_drops_only_that_record() {
-        let (mut d, registry) = decoder();
+        let (d, registry) = decoder();
+        let diagnostics = logit_core::Diagnostics::new("datadog_in");
+        let mut d = d.with_diagnostics(diagnostics.clone());
         let linear = pb_sketch(Interpolation::Linear, sparse(&[(1, 1.0)]), Store::default(), 0.0);
         let g = ClientGroupedStats {
             name: "n".into(),
@@ -1588,6 +1599,7 @@ mod tests {
         assert_eq!(count(dropped, "bad_sketch"), 1);
         assert_eq!(count(dropped, "interpolation"), 1);
         assert_eq!(count(skipped, "bad_sketch") + count(skipped, "interpolation"), 0);
+        assert_eq!(diagnostics.occurrences("interpolation"), 1);
     }
 
     /// A hand-written v0.6 body: keys out of order, an unknown key, `nil`s for zero values, a

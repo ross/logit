@@ -150,7 +150,17 @@ impl DatadogDecoder {
         let payload = AgentPayload::decode(body).map_err(|e| {
             CodecError::Malformed(format!("datadog AgentPayload does not decode: {e}"))
         })?;
-        self.span_dropped("idx_payload", payload.idx_tracer_payloads.len());
+        let idx = payload.idx_tracer_payloads.len();
+        self.span_dropped("idx_payload", idx);
+        if idx > 0 {
+            self.diagnostics.warn_throttled(
+                "idx_payload",
+                format_args!(
+                    "dropped {idx} `idxTracerPayloads` entr(ies) of an AgentPayload, a form this \
+                     decoder doesn't read"
+                ),
+            );
+        }
         let mut agent = WireAgent {
             host_name: payload.host_name,
             env: payload.env,
@@ -514,7 +524,8 @@ mod tests {
     fn an_agent_payload_decodes_one_batch_per_tracer_payload() {
         let registry = Registry::new();
         let t = registry.telemetry_for("dd", "datadog", "listener");
-        let mut d = DatadogDecoder::new().with_telemetry(t);
+        let diagnostics = logit_core::Diagnostics::new("dd");
+        let mut d = DatadogDecoder::new().with_diagnostics(diagnostics.clone()).with_telemetry(t);
         let batches = d.decode_agent_payload(&payload().encode_to_vec(), 0).unwrap();
         assert_eq!(batches.len(), 2);
         for b in &batches {
@@ -550,6 +561,7 @@ mod tests {
         }
         let has = |c: &str| counters.contains(&c.to_string());
         assert!(has("logit.input.spans.dropped{idx_payload}"), "{counters:?}");
+        assert_eq!(diagnostics.occurrences("idx_payload"), 1, "one line for the payload's entries");
         assert!(has("logit.input.spans.degraded{negative_duration}"), "{counters:?}");
     }
 

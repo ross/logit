@@ -575,9 +575,13 @@ impl PrometheusDecoder {
     }
 
     /// `logit.input.metrics.dropped{reason}` -- one greppable counter for every sample or series
-    /// the decoder stepped over.
-    pub(crate) fn dropped(&self, reason: DecodeDrop) {
+    /// the decoder stepped over -- and its throttled line, keyed on the reason. A
+    /// `non_monotonic_buckets` drop logs its own line naming the bucket, at its call site.
+    pub(crate) fn dropped(&mut self, reason: DecodeDrop) {
         self.telemetry.count("logit.input.metrics.dropped", 1.0, &[("reason", reason.reason())]);
+        if let Some(why) = reason.why() {
+            self.diagnostics.warn_throttled(reason.reason(), format_args!("dropped {why}"));
+        }
     }
 
     /// `logit.input.metrics.degraded{reason}` -- the input was kept, but something in it was
@@ -644,6 +648,25 @@ impl DecodeDrop {
             DecodeDrop::InvalidLabels => "invalid_labels",
             DecodeDrop::NativeHistogram => "native_histogram",
         }
+    }
+
+    /// What [`PrometheusDecoder::dropped`]'s line says was dropped, or `None` for a reason whose
+    /// call site logs its own line.
+    fn why(self) -> Option<&'static str> {
+        Some(match self {
+            DecodeDrop::MalformedLine => "a sample line this decoder can't read",
+            DecodeDrop::MalformedMetadata => "a `# HELP`, `# TYPE`, or `# UNIT` line with a missing or bad name or type",
+            DecodeDrop::DuplicateType => "a second type for a family that disagrees with its first; the first wins",
+            DecodeDrop::DuplicateMetadata => "a second help or unit for a family that disagrees with its first; the first wins",
+            DecodeDrop::DuplicateSeries => "a sample that repeats a series already read; the first wins",
+            DecodeDrop::DuplicateLabel => "a sample whose label set names one label twice",
+            DecodeDrop::UnknownSuffix => "a sample whose name suffix its declared family's type has no meaning for",
+            DecodeDrop::IncompleteSeries => "a series with no value for its type, such as a counter with only a `_created`",
+            DecodeDrop::EmptyHistogram => "a histogram with no buckets",
+            DecodeDrop::NonMonotonicBuckets => return None,
+            DecodeDrop::InvalidLabels => "a remote-write series with no `__name__`, an empty label name or value, or a repeated label name",
+            DecodeDrop::NativeHistogram => "a native histogram, which this decoder doesn't map yet",
+        })
     }
 }
 
@@ -2671,6 +2694,29 @@ mod tests {
                 "{reason:?}: a reason never contains `dropped`, which names loss in a metric name"
             );
         }
+    }
+
+    /// Every decode drop raises a throttled line keyed on its reason, save
+    /// `non_monotonic_buckets`, whose call site logs its own.
+    #[test]
+    fn every_decode_drop_raises_its_diagnostic() {
+        for reason in DecodeDrop::ALL {
+            let diagnostics = Diagnostics::new("prometheus_in");
+            PrometheusDecoder::new().with_diagnostics(diagnostics.clone()).dropped(reason);
+            let expected = u64::from(reason != DecodeDrop::NonMonotonicBuckets);
+            assert_eq!(diagnostics.occurrences(reason.reason()), expected, "{reason:?}");
+        }
+    }
+
+    /// A body's drops through the text parser raise the same lines, one occurrence per drop.
+    #[test]
+    fn a_parsed_bodys_drops_raise_their_diagnostics() {
+        let diagnostics = Diagnostics::new("prometheus_in");
+        let mut decoder = PrometheusDecoder::new().with_diagnostics(diagnostics.clone());
+        let body = b"good 1\n1bad 2\nalso_bad\ngood 1\n";
+        text::parse_with(body, text::Dialect::Text0_0_4, &mut decoder).unwrap();
+        assert_eq!(diagnostics.occurrences("malformed_line"), 2);
+        assert_eq!(diagnostics.occurrences("duplicate_series"), 1);
     }
 
     #[test]

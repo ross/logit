@@ -336,10 +336,14 @@ fn series_batch(events: Vec<Event>) -> EventBatch {
 }
 
 impl DatadogDecoder {
-    pub(super) fn metric_not_decoded(&self, outcome: MetricIn, n: usize) {
+    /// Counts `n` of `outcome`, and logs its throttled line where [`MetricIn::diagnostic`] has one.
+    pub(super) fn metric_not_decoded(&mut self, outcome: MetricIn, n: usize) {
         if n > 0 {
             let reason = outcome.reason();
             self.telemetry.count(outcome.metric(), n as f64, &[("reason", reason)]);
+            if let Some(what) = outcome.diagnostic() {
+                self.diagnostics.warn_throttled(reason, format_args!("dropped {n} {what}"));
+            }
         }
     }
 

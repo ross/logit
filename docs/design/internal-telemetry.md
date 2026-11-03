@@ -555,18 +555,18 @@ reason says why (`rejected`, `truncated`), and the name says what happened. Diag
 (`gauge_delta_unresolved`, say) name a self-log line, not a count, and don't follow this
 vocabulary.
 
-A counted loss in a sink, its codec or disk spool, `prometheus_out`'s registry, the pipeline
-runtime, or `internal` also leaves a `warn` self-log line, so it shows on stderr and in
-`internal`'s `logs: warn` stream before anything graphs the counter. Listeners and their decoders
-aren't covered yet ([known-gaps](../known-gaps/telemetry.md)'s "Listener and decoder losses have
-no line"). A `*.dropped` a sink, its codec, or its disk spool counts has a throttled line, usually
-keyed on its `reason`, and an encode-side line is gated as its counter is, so a retry doesn't
-repeat it. A batch `write_loop` drops after a final
-fault is covered by its `send_failed` and `degraded` lines, and a shutdown drop by `drain
-complete`. A loss with one lasting cause logs once for it: a closed consumer once per edge
-(`closed_consumer`), an `internal` cap once per component (`telemetry_points_capped`,
-`telemetry_spans_capped`), and a queue's unannounced shedding once at shutdown
-(`buffer_shed_unannounced`), and a cancelled push's remainder once at shutdown
+A counted loss in a listener, its decoder, a sink, its codec or disk spool, `prometheus_out`'s
+registry, the pipeline runtime, or `internal` also leaves a `warn` self-log line, so it shows on
+stderr and in `internal`'s `logs: warn` stream before anything graphs the counter. A `*.dropped` a
+listener, a decoder, a sink, its codec, or its disk spool counts has a throttled line, usually keyed
+on its `reason`, logged only in the branch that counts, so a clean body pays nothing. An
+encode-side line is gated as its counter is, so a retry doesn't repeat it. The kernel's
+`input.kernel.dropped` logs once per once-a-second sample that shows new drops. A batch
+`write_loop` drops after a final fault is covered by its `send_failed` and `degraded` lines, and a
+shutdown drop by `drain complete`. A loss with one lasting cause logs once for it: a closed
+consumer once per edge (`closed_consumer`), an `internal` cap once per component
+(`telemetry_points_capped`, `telemetry_spans_capped`), a queue's unannounced shedding once at
+shutdown (`buffer_shed_unannounced`), and a cancelled push's remainder once at shutdown
 (`shutdown_push_cut`). `internal.logs.dropped` has no line, for the reason "Logs" below gives
 ([ADR `telemetry-loss-vocabulary`](../adr/telemetry-loss-vocabulary.md)'s "Amendment (2026-11-02):
 every counted loss leaves a warn line").

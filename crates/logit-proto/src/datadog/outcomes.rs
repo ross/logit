@@ -79,6 +79,27 @@ impl MetricIn {
             | MetricIn::InvalidStatus => INPUT_METRICS_DROPPED,
         }
     }
+
+    /// What [`super::DatadogDecoder::metric_not_decoded`]'s line says was dropped, or `None`: a
+    /// skip logs nothing, and `bad_series`, `bad_sketch`, and a service check's `malformed` log
+    /// their own line, naming the fault, at their call sites.
+    pub(super) fn diagnostic(self) -> Option<&'static str> {
+        match self {
+            MetricIn::BadPoint => Some("point(s) that aren't a timestamp and a value"),
+            MetricIn::NonFiniteValue => Some("point(s) whose value isn't a finite number"),
+            MetricIn::LegacyDistribution => {
+                Some("legacy `distributions` sketch entries, which this decoder doesn't read")
+            }
+            MetricIn::NoName => Some("service check(s) with no `check` name"),
+            MetricIn::InvalidStatus => Some("service check(s) whose `status` isn't 0 to 3"),
+            MetricIn::BadSeries
+            | MetricIn::BadSketch
+            | MetricIn::Malformed
+            | MetricIn::NullValue
+            | MetricIn::EmptyDistribution
+            | MetricIn::EmptySketch => None,
+        }
+    }
 }
 
 /// An element of an APM stats payload the decoder didn't turn into a stats event.
@@ -296,6 +317,34 @@ mod tests {
             let dropped = outcome.counter().0 == OUTPUT_METRICS_DROPPED;
             let raised = outcome.diagnostic().is_some() || own.contains(&outcome);
             assert_eq!(dropped, raised, "{outcome:?}");
+        }
+    }
+
+    /// The decode side's twin: every dropped input outcome logs a line, from
+    /// `metric_not_decoded` or, for the three that name their fault, at the call site, and a skip
+    /// logs none.
+    #[test]
+    fn every_dropped_input_outcome_has_a_diagnostic() {
+        let own = [MetricIn::BadSeries, MetricIn::BadSketch, MetricIn::Malformed];
+        for outcome in MetricIn::ALL {
+            let dropped = outcome.metric() == INPUT_METRICS_DROPPED;
+            let raised = outcome.diagnostic().is_some() || own.contains(&outcome);
+            assert_eq!(dropped, raised, "{outcome:?}");
+        }
+    }
+
+    /// `metric_not_decoded` raises an outcome's line once per call that counts it, keyed on its
+    /// reason, and nothing for a count of zero.
+    #[test]
+    fn metric_not_decoded_raises_the_outcomes_diagnostic() {
+        for outcome in MetricIn::ALL {
+            let diagnostics = logit_core::Diagnostics::new("datadog_in");
+            let mut decoder =
+                super::super::DatadogDecoder::new().with_diagnostics(diagnostics.clone());
+            decoder.metric_not_decoded(outcome, 0);
+            decoder.metric_not_decoded(outcome, 2);
+            let expected = u64::from(outcome.diagnostic().is_some());
+            assert_eq!(diagnostics.occurrences(outcome.reason()), expected, "{outcome:?}");
         }
     }
 

@@ -54,7 +54,8 @@
 //! listener has one (`crate::udp`). A frame no consumer took, because every consumer of this
 //! listener has closed, is never acked: it is answered `Reject{GOING_AWAY}`, the connection closes,
 //! its sender's mark stays where it was, and the frame's batch is counted
-//! `logit.input.batches.dropped{reason="closed_consumer"}`.
+//! `logit.input.batches.dropped{reason="closed_consumer"}`, beside a throttled
+//! `closed_consumer` line.
 //!
 //! **Deduplication.** Every data frame's payload opens with its sender's identity and sequence
 //! (`docs/adr/native-hop-identity-and-sequence.md`, `docs/adr/native-hop-ack-status.md`); a frame
@@ -900,6 +901,14 @@ async fn frame_loop<S: AsyncRead + AsyncWrite + Unpin + Send>(
                     "logit.input.batches.dropped",
                     1.0,
                     &[("reason", "closed_consumer")],
+                );
+                diag.warn_throttled(
+                    "closed_consumer",
+                    format_args!(
+                        "dropped the batch of sender sequence {}: no consumer took it, so the \
+                         connection closes with GOING_AWAY",
+                        seq.seq
+                    ),
                 );
                 going_away(
                     stream,
@@ -3148,6 +3157,7 @@ mod tests {
     #[tokio::test]
     async fn a_frame_no_consumer_takes_is_answered_going_away_and_never_acked() {
         let registry = Registry::new();
+        let (lines, _guard) = logit_pipeline::test_util::capture_lines();
         let telemetry = registry.telemetry_for("logit_in", "logit_in", "listener");
         let (mut client, server) = tokio::io::duplex(1 << 16);
         let (sink, rx) = fanout_into_channel(16);
@@ -3191,6 +3201,11 @@ mod tests {
                 .sum("logit.input.batches.dropped", &[("reason", "closed_consumer")]),
             1.0
         );
+        // The listener's own line, beside the fan-out's once-per-edge `closed_consumer` line.
+        let found = lines.with_key("closed_consumer");
+        let own: Vec<_> = found.iter().filter(|(_, l)| l.contains("no consumer took it")).collect();
+        assert_eq!(own.len(), 1, "{found:?}");
+        assert_eq!(own[0].0, logit_pipeline::test_util::Level::WARN);
     }
 
     // ---- control writes over TLS ----------------------------------------------------------------

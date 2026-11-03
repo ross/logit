@@ -105,27 +105,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
     ([ADR `sink-send-path-and-attempt-accounting`](../adr/sink-send-path-and-attempt-accounting.md),
     decision 4).
 
-- **Listener and decoder losses have no line.** [ADR
-  `telemetry-loss-vocabulary`](../adr/telemetry-loss-vocabulary.md)'s "Amendment (2026-11-02):
-  every counted loss leaves a warn line" covers the sinks, their codecs, the disk spool,
-  `prometheus_out`'s registry, the pipeline runtime, and `internal`. Listeners and their decoders
-  weren't audited, and these counts are known to have no `warn` line beside them:
-  - `logit.input.kernel.dropped{reason="socket"}` and the truncated
-    `logit.component.datagrams.dropped`/`bytes.dropped{reason="truncated"}` pair
-    (`crates/logit-inputs/src/udp.rs`).
-  - `logit.input.batches.dropped{reason="closed_consumer"}` on `logit_in`
-    (`crates/logit-inputs/src/logit.rs`), and on `otlp_in` through `Undelivered::record`
-    (`crates/logit-inputs/src/http.rs`).
-  - `logit.input.metrics.dropped{reason="out_of_range"}` on `nginx_stub_status_in` and
-    `logit.input.lines.dropped{reason="truncated"}` on `apache_status_in`.
-  - The decoders' `input.*.dropped` in `logit_proto`'s statsd, splunk, prometheus, and datadog
-    codecs: `PrometheusDecoder::dropped` (`input.metrics.dropped`) and the statsd decoder's
-    `input.fields.dropped{reason="malformed"}` among them.
-  - **Consequence:** an operator reading only stderr, or `internal`'s `logs: warn` stream, learns
-    of these losses only from the counters.
-  - **Revisit trigger:** deciding whether listener and decoder losses get a line, and auditing
-    the other decoders' counts the same way.
-
 ## Load-test harness and perf tooling
 
 - **`script/perf compare` has no cross-run noise model beyond bimodality.** It diffs two results

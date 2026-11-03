@@ -94,8 +94,8 @@
 //!   read wrongly. The decode reads every series' labels, and the metadata and exemplars of each
 //!   series whose labels are valid; a series dropped as `invalid_labels` has neither read.
 //!
-//! Anything wrong with *one series* is a counted drop instead, because a request from a real sender
-//! is worth keeping the rest of:
+//! Anything wrong with *one series* is a counted drop instead, each with a throttled line keyed on
+//! its reason, because a request from a real sender is worth keeping the rest of:
 //!
 //! | Reason | What it counts |
 //! |---|---|

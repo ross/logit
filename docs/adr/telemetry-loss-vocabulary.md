@@ -418,16 +418,12 @@ for `input.batches.deferred` carries the wider meaning.
 A loss that showed only in a counter was invisible to an operator reading stderr, or `internal`'s
 `logs: warn` stream, until something drained and graphed the counter. So the vocabulary's rule
 that a loss reported only by a diagnostic gets a `*.dropped` counter beside it now runs both ways:
-**every counted loss in a sink, its codec, its disk spool, `prometheus_out`'s registry, the
-pipeline runtime, or `internal` also logs a `warn` line**, save the one exception at the end of
-this amendment. The counter stays the record of how much; the line says that it happened and why,
-and names the component. A loss that recurs per batch or per record is throttled, and one that
-repeats for one lasting cause logs once for that cause, so the line never becomes a flood.
-
-Those are the places the audit behind this amendment covered. Listeners and their decoders
-weren't audited, and several of their `input.*.dropped` counts still have no line
-([docs/known-gaps/telemetry.md](../known-gaps/telemetry.md)'s "Listener and decoder losses have
-no line"); whether to add them is open.
+**every counted loss in a listener, its decoder, a sink, its codec, its disk spool,
+`prometheus_out`'s registry, the pipeline runtime, or `internal` also logs a `warn` line**, save
+the one exception at the end of this amendment. The counter stays the record of how much; the line
+says that it happened and why, and names the component. A loss that recurs per batch or per record
+is throttled, and one that repeats for one lasting cause logs once for that cause, so the line
+never becomes a flood.
 
 ### Sinks, their codecs, and the disk spool
 
@@ -494,6 +490,40 @@ The type-conflict rename reverses the 2026-10-13 close-out's "`output.metrics.ty
 its name": that series was live data the registry removed, which is loss, and the codec already
 counts a record a type conflict drops within a batch under the same reason and unit. There's no
 alias.
+
+### Listeners and their decoders
+
+Every `input.*.dropped` a listener or its decoder counts, and a UDP listener's truncated
+`component.datagrams.dropped`/`bytes.dropped` pair, has a throttled `warn` line keyed on its
+reason. Prometheus's `non_monotonic_buckets` keeps its older `prometheus_non_monotonic_buckets`
+key.
+
+- **Nothing to pay when nothing drops.** A decoder logs inside the branch that counts, so a clean
+  body costs no format and no call. Where a decoder tallies a reason across a body (statsd's
+  unread `|c:` items), the line is one per body and carries the count.
+- **A decoder logs on the handle it already holds.** Every `logit_proto` decoder that counts a
+  loss carries a `Diagnostics` its listener sets, through `with_diagnostics` or the scrape seam's
+  `set_diagnostics`, as a sink's codec gets one. None needed a channel back to its listener.
+- **The kernel's count logs per sample.** `input.kernel.dropped{reason="socket"}` is read once a
+  second. Each sample that shows new drops is one occurrence, so a sustained overflow logs on the
+  throttle's schedule rather than every second.
+- **A closed consumer logs at the listener too.** `Fanout`'s `closed_consumer` line names the edge
+  once. A listener that refuses a request or a frame because no consumer took its batch also logs
+  its own line naming the peer, as the other HTTP listeners already did, since the refusal is per
+  request and the peer is what an operator looks for.
+- **A line already in the path covers its drop.** `cri_in`'s and `docker_in`'s decoder counts a
+  truncated file's held fragment as the tail driver logs its `truncated` line for that file.
+
+The line was added to the UDP driver (`truncated`, and `socket` for the kernel's count),
+`logit_in` and `otlp_in` (`closed_consumer`), `nginx_stub_status_in` (`out_of_range`),
+`apache_status_in` (`truncated`), the statsd decoder (`fields.dropped{reason="malformed"}`), the
+Prometheus decoder on both scrape and remote-write (every reason but `non_monotonic_buckets`), the
+Splunk decoder (`no_event`, `blank_event`, `bad_name`, `bad_value`, `duplicate_name`,
+`incomplete_single_metric`), and the Datadog decoder (`bad_point`, `non_finite_value`,
+`legacy_distribution`, `no_name`, `invalid_status`, `no_message`, `no_title`, `idx_payload`, and the
+stats route's `interpolation`). Every other listener and decoder count already had one: collectd,
+graphite, syslog, the stream framer's `framing_error`, the tail driver and its decoders, `replay_in`,
+`kafka_in`, and the other HTTP listeners' closed consumer. The InfluxDB decoder counts no drop.
 
 ### The exception
 

@@ -134,6 +134,14 @@ impl Decoder for StatsdDecoder {
                 omitted.unreadable as f64,
                 &[("reason", "malformed")],
             );
+            self.diag.warn_throttled(
+                "malformed",
+                format_args!(
+                    "dropped {} `|c:` list item(s) that are neither `ci-` nor `in-`, which the \
+                     Datadog Agent ignores; their lines were delivered",
+                    omitted.unreadable
+                ),
+            );
         }
         // statsd has no instrumentation scope.
         Ok((self.resource.clone(), None))
@@ -1478,7 +1486,9 @@ mod tests {
     #[test]
     fn an_unreadable_c_list_item_is_dropped_and_counted() {
         let registry = logit_core::Registry::new();
+        let diag = Diagnostics::new("statsd_in");
         let mut decoder = StatsdDecoder::new(Arc::new(Resource::default()))
+            .with_diagnostics(diag.clone())
             .with_telemetry(registry.telemetry_for("statsd_in", "statsd_in", "listener"));
         let datagram = "a:1|c|c:in-7,cid-x,pu-9
                         b:1|c|c:abc,ci-def
@@ -1488,6 +1498,7 @@ mod tests {
         assert_eq!(attr_str(&events[1], "container.id"), Some("def"));
         assert_eq!(attr_str(&events[2], "container.id"), Some("pu-9"));
         assert_eq!(input_counter(&registry, "logit.input.fields.dropped", "malformed"), 3.0);
+        assert_eq!(diag.occurrences("malformed"), 1, "one line for the datagram's three items");
     }
 
     /// A valued `env:`, `version:`, or `service:` tag is its standard key on every line kind, a

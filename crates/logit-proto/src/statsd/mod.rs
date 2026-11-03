@@ -165,9 +165,9 @@
 //!   an inode names a container only on the host that sent it, so it isn't `container.id`.
 //! - **A `,`-separated list** (`ci-<id>,in-<inode>`) yields both, the last item of each kind
 //!   winning. Its other items, a bare id or a `cid-` one included, the Agent ignores, so they're
-//!   dropped, counted `logit.input.fields.dropped{reason="malformed"}` per item; the line is
-//!   delivered. An empty field, or an
-//!   empty id or inode, is nothing.
+//!   dropped, counted `logit.input.fields.dropped{reason="malformed"}` per item, with one throttled
+//!   `malformed` diagnostic per datagram or packet that drops any; the line is delivered. An empty
+//!   field, or an empty id or inode, is nothing.
 //! - **A `container.id` tag beside a container id the field names is omitted**, counted
 //!   `logit.input.tags.omitted{reason="reserved_key"}` once per wire tag, as a `host.name` tag
 //!   beside the line's host is. On a line whose `|c:` names no container id, a `container.id` tag

@@ -4,7 +4,8 @@
 //! and `url.path`.
 //!
 //! Beyond the driver's counters, the decoder counts each field whose digits don't fit an `i64` as
-//! `logit.input.metrics.dropped{reason="out_of_range"}`, and leaves `up` at `1` for that page.
+//! `logit.input.metrics.dropped{reason="out_of_range"}` beside a throttled `out_of_range` line,
+//! and leaves `up` at `1` for that page.
 //! A body that isn't a `stub_status` page is the driver's `parse_error` class.
 
 use crate::scrape::{server_resource, ScrapeDecoder, ScrapeInput};
@@ -18,6 +19,7 @@ pub const MAX_BODY_BYTES: usize = 64 * 1024;
 /// `nginx_stub_status_in`'s half of the [`ScrapeDecoder`] seam.
 pub struct NginxStatusDecoder {
     telemetry: Telemetry,
+    diag: Diagnostics,
 }
 
 impl ScrapeDecoder for NginxStatusDecoder {
@@ -39,7 +41,9 @@ impl ScrapeDecoder for NginxStatusDecoder {
         server_resource(index, url)
     }
 
-    fn set_diagnostics(&mut self, _diag: Diagnostics) {}
+    fn set_diagnostics(&mut self, diag: Diagnostics) {
+        self.diag = diag;
+    }
 
     fn set_telemetry(&mut self, telemetry: Telemetry) {
         self.telemetry = telemetry;
@@ -59,6 +63,13 @@ impl ScrapeDecoder for NginxStatusDecoder {
                 out_of_range as f64,
                 &[("reason", "out_of_range")],
             );
+            self.diag.warn_throttled(
+                "out_of_range",
+                format_args!(
+                    "nginx_stub_status_in: dropped {out_of_range} of the page's fields, whose \
+                     value doesn't fit a signed 64-bit integer"
+                ),
+            );
         }
         Ok(status.to_events(timestamp))
     }
@@ -69,7 +80,8 @@ pub type NginxStubStatusInput = ScrapeInput<NginxStatusDecoder>;
 
 /// An input over `targets`, scraped every `interval`.
 pub fn input(targets: Vec<String>, interval: std::time::Duration) -> NginxStubStatusInput {
-    let decoder = NginxStatusDecoder { telemetry: Telemetry::default() };
+    let decoder =
+        NginxStatusDecoder { telemetry: Telemetry::default(), diag: Diagnostics::default() };
     ScrapeInput::with_decoder(decoder, targets, interval)
 }
 
@@ -92,11 +104,10 @@ Reading: 1 Writing: 1 Waiting: 3 \n";
     async fn tick_once(body: Bytes, probe: &TelemetryProbe) -> (EventBatch, String) {
         let (addr, _) = canned_server(body).await;
         let url = format!("http://{addr}/nginx_status?k=v");
-        let mut input = input(vec![url], Duration::MAX).with_telemetry(probe.telemetry(
-            "nginx",
-            "nginx_stub_status_in",
-            "listener",
-        ));
+        let telemetry = probe.telemetry("nginx", "nginx_stub_status_in", "listener");
+        let mut input = input(vec![url], Duration::MAX)
+            .with_diagnostics(Diagnostics::new("nginx").with_telemetry(telemetry.clone()))
+            .with_telemetry(telemetry);
         let (tx, mut rx) = mpsc::channel(4);
         input.tick(&Fanout::new(vec![tx])).await;
         (sent_batch(&mut rx), addr.port().to_string())
@@ -169,6 +180,7 @@ Reading: 1 Writing: 1 Waiting: 3 \n";
         assert_eq!(gauge(&batch, "scrape_samples_scraped"), Some(6.0));
         assert_eq!(batch.events.len(), 9);
         assert_eq!(probe.sum("logit.input.metrics.dropped", &[("reason", "out_of_range")]), 1.0);
+        assert_eq!(probe.sum("logit.component.diagnostics", &[("key", "out_of_range")]), 1.0);
     }
 
     #[tokio::test]
