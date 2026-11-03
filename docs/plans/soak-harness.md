@@ -1608,7 +1608,11 @@ The rows:
   `metrics.dropped`, which `ledger.sent` judges. A `rejected` or `disk_corrupt` reason FAILs;
   any other WARNs. On an external target `ledger.egress` SKIPs, so `ledger.sent` FAILs a
   `rejected` or `disk_corrupt` batch drop at a sink, and one at any other node stays in this
-  row.
+  row. A count an `[[expect]]` matches on all of (service, metric, `component`, and `reason`, with
+  `reduce = "delta"` and `min` of 1 or more) is excused and listed when the run's whole count
+  falls inside that expectation's windows: the scenario requires the drop, and
+  `expect.<name>` judges it. `sink-outage-stop` excuses `aggregate`'s `closed_consumer` drop
+  into the sink its stop closed this way.
 - `ledger.overlap` (W12b), under `[overlap]` only, else no row: the run's G − Σ(W + K + F)
   against what the instances' socket closes could discard. Under `[overlap]` the per-life rows
   judge each instance on its own lives and the wire, `progress`, and `recovery` judge them
