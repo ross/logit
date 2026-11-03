@@ -6912,16 +6912,17 @@ acknowledged"). Each scenario ran once at its default length on the development 
 - **Two backend kills lost 300 datapoints, within a bound of 400.** `graphite-egress`
   (`20261103T225804Z`, 18 minutes 35 seconds) killed VictoriaMetrics at +735 s and +860 s, under
   `-inmemoryDataFlushInterval=5s` and `kill_unflushed = "6s"`. `ledger.tail` read M 11,000 −
-  S 10,700 = 300 for the SUT's one life, against a bound of 400. The sink counted 200
-  datapoints written in the 26 s around each kill, so the backend's unsaved memory and its
-  socket together held back no more than that per kill. `ledger.windows` left each kill's gap of 100 series, widest
-  20 s and 30 s, to that row, and `reconnects-after-kill` and `reconnects-after-second-kill`
-  each read 1.
+  S 10,700 = 300 for the SUT's one life, against a bound of 400. The first kill lost 100
+  datapoints, one sample on each of the 100 series, and the second lost 200, every datapoint
+  the sink counted in that kill's span (200 in the 26 s around each). `ledger.tail` can't tell
+  VictoriaMetrics' unsaved memory from its socket. `ledger.windows` excused 100 gaps per kill,
+  one per series, the widest 20 s and 30 s, and `reconnects-after-kill` and
+  `reconnects-after-second-kill` each read 1.
 - **A stalled receiver's loss grows with the stall, and one buffer pair is not a ceiling.**
   `syslog-stall-kill` (`20261103T231800Z`, buffers capped at 256 KiB) lost 21,339 lines, about
   1.3 MB at 62.8 bytes a line, to a kill 30 s into a 30 s stall, against a bound of 50,847, with
   5 redials. A kill 90 s into a 90 s stall lost 71,586 lines, about 4.5 MB, against 151,430, with
-  16 redials. The plain kill beside them lost about 9,700 lines, as the unstalled kills in W27
+  16 redials. The plain kill beside them lost 9,728 lines (the unpaused `c0s5` fault run), as the unstalled kills in W27
   did. A write stalled past `connect_timeout` drops its connection and redials into the frozen
   listener's accept queue, which fills another pair of buffers, so the loss rose with the
   redials and the length of the stall.
@@ -6933,7 +6934,7 @@ acknowledged"). Each scenario ran once at its default length on the development 
   expectations passed, so the generator's buffers did fill and its sink held a batch. Linux
   grows a socket's receive buffer only in `recvmsg`, so a receiver that is never read stays near
   its initial size. The default run lost 1.6 times the capped run's lines in both stalls, with
-  fewer redials (4 and 12 against 5 and 16). The plain kill lost about 9,700 lines again.
+  fewer redials (4 and 12 against 5 and 16). The plain kill lost 9,703.
 - **Per stalled kill the loss was uncounted by design.** `ledger.wire` reported each as `lost`
   within its bound, and the run's steady-state loss read 50 and 61 lines against a limit
   of 700.
@@ -6947,7 +6948,7 @@ acknowledged"). Each scenario ran once at its default length on the development 
   at the relay. `ledger.egress` read Ab − V of 0 on both lives, and no batch was dropped over
   the run.
 - **`syslog-tcp-ingress` with the `reset` step passed on its rerun** (`20261103T230043Z`, 15
-  minutes 15 seconds). Its first run (`20261103T222138Z`) failed one row: SELinux confined the
+  minutes 15 seconds). Its first run (`20261103T222138Z`) failed `timeline` and `reset-counted`: SELinux confined the
   netem container and blocked its `sock_diag` socket, so `ss -K` never applied and
   `reset-counted` read "never applied cleanly". The reset one-shot now runs with
   `label=disable`, and the step fails on a denied `ss`. On the rerun `reset-counted` read 1 and
@@ -6955,13 +6956,13 @@ acknowledged"). Each scenario ran once at its default length on the development 
   and SUT kill each read 0 resets. The wire loss read 40 lines against a limit of 2,100.
 - **The 8-hour `kafka-sasl-reauth` run passed** (`20261103T141635Z`, 28,800 s, on the
   development host). The sink redialed 1,069 times, 133.9 an hour, inside [80, 300], and 74
-  attempts, 9.3 an hour, were `ambiguous` against a limit of 40; none was `refused` and no batch
+  attempts, 9.3 an hour, were `ambiguous` against a limit of 40 an hour; none was `refused` and no batch
   was dropped. The topic held 144,040 distinct records with 0 duplicate copies, equal to the
   records the sink saw accepted, and G, W, and Ab each read 57,611,200. `rss_slope` read +0.0
   MiB/h on the generator and +0.2 on `logit` against 65, from one life each, and descriptors held
   at 17 on `logit`. All 221 faults recovered within 45 s over 147 starts.
 - **The 8-hour `tail-rotate-delete` run passed** (`20261103T141647Z`, 28,800 s). The tailer
-  rotated 3,714 files while the writer deleted 652, read no lost bytes, and logged no checkpoint
+  rotated 3,714 files while the driver counted 646 deletions (the writer rotated 652 times), read no lost bytes, and logged no checkpoint
   error. `files.open` peaked at 10 against a limit of 10 and ended at 8, process descriptors
   peaked at 28 against 31, and watches peaked at 11 against 11. `logit` rose from a median of 20
   descriptors after warmup to 26 at the end, inside the +10 limit; `rss_slope` read -28.8 to

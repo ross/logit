@@ -124,7 +124,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
     accept queue and fills another pair. In `syslog-stall-kill` (256 KiB buffers) a kill 30 s
     into a stall lost 21,339 lines, about 1.3 MB, and one 90 s into a stall lost 71,586, about
     4.5 MB. Under Linux's default autotuning (`syslog-stall-kill-default`) the losses were 35,163
-    and 113,899 lines, about 2.2 MB and 7.2 MB, far below the 6 MiB and 4 MiB maxima, because a
+    and 113,899 lines, about 2.2 MB and 7.2 MB, far below the maxima: about half a megabyte per
+    connection (2.2 MB over 5 connections, 7.2 MB over 13) against a pair's 10 MiB, because a
     receiver that is never read grows its buffer only in `recvmsg`. The harness's bound is about
     20 times the loss there. At a backend, two kills of VictoriaMetrics under `graphite-egress`
     lost 300 datapoints against a bound of 400 ([plan `soak-harness`](../plans/soak-harness.md)'s
