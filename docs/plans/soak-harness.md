@@ -5750,6 +5750,7 @@ development host. Overall PASS, with only inapplicable SKIPs.
 The 1 h runs, here and in W18, are shorter than the 4-hour or 8-hour length the scenarios allow.
 A leak in either path grows per redial or per deletion, not with wall time, and an hour is the
 shortest run whose `rss_slope` gives a verdict instead of a WARN.
+8-hour runs of both scenarios have since passed ("Round 3 follow-ups").
 
 ### W18: a deleting rotation (2026-10-18)
 
@@ -6901,26 +6902,71 @@ What the runs showed:
   `KAFKA_WIRE` out of `DEFERRED_WIRES` fails six of its expectations, and out of
   `DEFERRED_UNSENT_WIRES` two; 2,742 expectations pass.
 
-### A backend kill's tail and a stalled receiver (not yet run)
+### A backend kill's tail and a stalled receiver (2026-11-03)
 
 Two measurements of the loss a TCP stream sink can't count, the bytes its receiver dies holding
 (`docs/known-gaps/sinks.md`, "A stream sink doesn't count the bytes its peer never
-acknowledged"). Neither has run; the numbers are owed.
+acknowledged"). Each scenario ran once at its default length on the development host, against
+`logit:soak` built from `soak/round3-measure`. Every row of the three runs passed.
 
-- **`graphite-egress`'s backend kills.** Its cycle adds two SIGKILLs of VictoriaMetrics, at
-  11m15s and 13m20s, half a 10 s window apart in phase, under `-inmemoryDataFlushInterval=5s` and
-  `kill_unflushed = "6s"`. `ledger.tail` will show, per SUT life, the datapoints `graphite_out`
-  counted written against the samples stored, each kill's loss against its bound, and
-  `ledger.windows` the gaps it leaves to that row; `reconnects-after-kill` and
-  `reconnects-after-second-kill` show the sink redialed. Owed: each kill's M − S, its bound,
-  and how much of the loss is VictoriaMetrics' unsaved memory rather than its socket. One run:
-  `script/soak run graphite-egress`, 18 minutes 35 seconds.
-- **`syslog-stall-kill` and `syslog-stall-kill-default`.** Each pauses the SUT for 60 s and
-  kills it 30 s in, pauses it for 120 s and kills it 90 s in, and kills it unpaused, with each
-  end's TCP buffers capped at 256 KiB, then at Linux's default maxima (6 MiB receive, 4 MiB
-  send). `ledger.wire` will show each stalled kill's loss with its connections, redials, and
-  bound; the expectations show the generator overflowed and held a batch during each stall.
-  Owed: each stalled kill's loss, its redials and bound, the unpaused kill's loss beside it,
-  and whether the default buffers' autotuning grows past the capped run's before the stall
-  fills them. One run each, `script/soak run syslog-stall-kill` and
-  `script/soak run syslog-stall-kill-default`, 11 minutes 30 seconds each.
+- **Two backend kills lost 300 datapoints, within a bound of 400.** `graphite-egress`
+  (`20261103T225804Z`, 18 minutes 35 seconds) killed VictoriaMetrics at +735 s and +860 s, under
+  `-inmemoryDataFlushInterval=5s` and `kill_unflushed = "6s"`. `ledger.tail` read M 11,000 −
+  S 10,700 = 300 for the SUT's one life, against a bound of 400. The sink counted 200
+  datapoints written in the 26 s around each kill, so the backend's unsaved memory and its
+  socket together held back no more than that per kill. `ledger.windows` left each kill's gap of 100 series, widest
+  20 s and 30 s, to that row, and `reconnects-after-kill` and `reconnects-after-second-kill`
+  each read 1.
+- **A stalled receiver's loss grows with the stall, and one buffer pair is not a ceiling.**
+  `syslog-stall-kill` (`20261103T231800Z`, buffers capped at 256 KiB) lost 21,339 lines, about
+  1.3 MB at 62.8 bytes a line, to a kill 30 s into a 30 s stall, against a bound of 50,847, with
+  5 redials. A kill 90 s into a 90 s stall lost 71,586 lines, about 4.5 MB, against 151,430, with
+  16 redials. The plain kill beside them lost about 9,700 lines, as the unstalled kills in W27
+  did. A write stalled past `connect_timeout` drops its connection and redials into the frozen
+  listener's accept queue, which fills another pair of buffers, so the loss rose with the
+  redials and the length of the stall.
+- **Under default autotuning the buffers stay far below their maxima, and the bound is loose by
+  about 20 times.** `syslog-stall-kill-default` (`20261103T233050Z`, 6 MiB receive and 4 MiB send
+  maxima) lost 35,163 lines, about 2.2 MB, to the 30 s stall against a bound of 835,700 (about
+  52 MB), with 4 redials, and 113,899 lines, about 7.2 MB, to the 90 s stall against 2,180,394
+  (about 137 MB), with 12 redials. The bound was 24 and 19 times the loss. The stall
+  expectations passed, so the generator's buffers did fill and its sink held a batch. Linux
+  grows a socket's receive buffer only in `recvmsg`, so a receiver that is never read stays near
+  its initial size. The default run lost 1.6 times the capped run's lines in both stalls, with
+  fewer redials (4 and 12 against 5 and 16). The plain kill lost about 9,700 lines again.
+- **Per stalled kill the loss was uncounted by design.** `ledger.wire` reported each as `lost`
+  within its bound, and the run's steady-state loss read 50 and 61 lines against a limit
+  of 700.
+
+### Round 3 follow-ups, on `soak/round3-followups` (2026-11-03)
+
+- **`otlp-grpc-egress` passed with `ledger.relay` balanced** (`20261103T223813Z`, 17 minutes).
+  `ledger.relay` balanced on all three `collector` lives: life 0 read E_r 4,700 = S_r 4,700 =
+  Del_r 4,700, life 1 (killed) 1,600 on each, and life 2 4,300 on each, with no relay drop.
+  The cross line read ΣE_r 10,600 against Del 10,000 less 100, so no point `logit` delivered went missing
+  at the relay. `ledger.egress` read Ab − V of 0 on both lives, and no batch was dropped over
+  the run.
+- **`syslog-tcp-ingress` with the `reset` step passed on its rerun** (`20261103T230043Z`, 15
+  minutes 15 seconds). Its first run (`20261103T222138Z`) failed one row: SELinux confined the
+  netem container and blocked its `sock_diag` socket, so `ss -K` never applied and
+  `reset-counted` read "never applied cleanly". The reset one-shot now runs with
+  `label=disable`, and the step fails on a denied `ss`. On the rerun `reset-counted` read 1 and
+  `resets-run` read 1 against a limit of 1, and the pause, partition, generator stop, SUT stop,
+  and SUT kill each read 0 resets. The wire loss read 40 lines against a limit of 2,100.
+- **The 8-hour `kafka-sasl-reauth` run passed** (`20261103T141635Z`, 28,800 s, on the
+  development host). The sink redialed 1,069 times, 133.9 an hour, inside [80, 300], and 74
+  attempts, 9.3 an hour, were `ambiguous` against a limit of 40; none was `refused` and no batch
+  was dropped. The topic held 144,040 distinct records with 0 duplicate copies, equal to the
+  records the sink saw accepted, and G, W, and Ab each read 57,611,200. `rss_slope` read +0.0
+  MiB/h on the generator and +0.2 on `logit` against 65, from one life each, and descriptors held
+  at 17 on `logit`. All 221 faults recovered within 45 s over 147 starts.
+- **The 8-hour `tail-rotate-delete` run passed** (`20261103T141647Z`, 28,800 s). The tailer
+  rotated 3,714 files while the writer deleted 652, read no lost bytes, and logged no checkpoint
+  error. `files.open` peaked at 10 against a limit of 10 and ended at 8, process descriptors
+  peaked at 28 against 31, and watches peaked at 11 against 11. `logit` rose from a median of 20
+  descriptors after warmup to 26 at the end, inside the +10 limit; `rss_slope` read -28.8 to
+  +0.9 MiB/h across its lives against 69. `ledger.wire` read W + F − G of -900 inside the replay
+  band [-80,002, 102,239] over 16 kills, and all 40 faults recovered within 45 s.
+
+The 8-hour runs close the gap the 1 h runs of W17 and W18 left: a leak that grows per redial or
+per deletion did not show in either path over 8 hours.

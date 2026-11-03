@@ -115,17 +115,20 @@ Entry format and the other areas: [the known-gaps index](README.md).
     unacknowledged bytes) says how much the peer never acknowledged, and the driver could count
     that as loss. The receiver's part, acknowledged by its kernel and never read, can't be seen
     from the sender without an application acknowledgment such as RELP's.
-  - **Unmeasured, a stalled receiver:** against a reader that keeps up, the loss is too small to
+  - **Measured, a stalled receiver:** against a reader that keeps up, the loss is too small to
     see. In `syslog-tcp-ingress` and `syslog-tls-ingress`, at 2,000 lines a second with each
     buffer capped at 256 KiB, four kills' gaps of 9,800 to 9,916 lines each fell within about
-    400 lines, the error of the estimate, of what the listener read after its last export
-    ([plan `soak-harness`](../plans/soak-harness.md)'s "Findings"). A receiver stalled behind a
-    full receive buffer when it's killed would lose the whole buffer, up to several MiB under
-    Linux's default autotuning. `syslog-stall-kill` and `syslog-stall-kill-default` are the
-    measurement, with each buffer capped at 256 KiB and at Linux's default maxima, and
-    `graphite-egress`'s kills of VictoriaMetrics measure the same loss at a backend
-    ([plan `soak-harness`](../plans/soak-harness.md)'s "A backend kill's tail and a stalled
-    receiver"); neither has run yet.
+    400 lines, the error of the estimate, of what the listener read after its last export. A
+    receiver stalled behind a full receive buffer loses what its buffers hold, and the loss grows
+    with the stall: each write stalled past `connect_timeout` redials into the frozen listener's
+    accept queue and fills another pair. In `syslog-stall-kill` (256 KiB buffers) a kill 30 s
+    into a stall lost 21,339 lines, about 1.3 MB, and one 90 s into a stall lost 71,586, about
+    4.5 MB. Under Linux's default autotuning (`syslog-stall-kill-default`) the losses were 35,163
+    and 113,899 lines, about 2.2 MB and 7.2 MB, far below the 6 MiB and 4 MiB maxima, because a
+    receiver that is never read grows its buffer only in `recvmsg`. The harness's bound is about
+    20 times the loss there. At a backend, two kills of VictoriaMetrics under `graphite-egress`
+    lost 300 datapoints against a bound of 400 ([plan `soak-harness`](../plans/soak-harness.md)'s
+    "A backend kill's tail and a stalled receiver").
 
 - **A kept-alive connection a destination closed first reads as `Ambiguous`.** An HTTP sink
   closes a pooled connection idle past its `idle_timeout:` (30 s by default) before reusing it,
