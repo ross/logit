@@ -866,6 +866,56 @@ kernel sends each peer a reset: the side the step is `on` reads `ECONNABORTED`, 
 - **A namespace fault.** Under `[overlap]` or beside an `idp` it goes on the holder, as `netem`
   and `partition` do, since a member shares the holder's namespace.
 
+## Amendment: a backend kill is allowed on a tailed sink, and `ledger.tail` measures it (2026-11-03)
+
+A `kill` was for the SUT only. A stream sink can't count what it wrote that its receiver dies
+holding, and a graceful stop of VictoriaMetrics drains what its kernel took, so no scenario
+showed that loss. Killing the backend does, but under a cumulative `aggregate` V doesn't move:
+the next window's total covers a lost one, and `ledger.windows` sees the gap but not its size.
+
+- **What shows the loss.** `graphite_out` writes one carbon datapoint per stored sample, and a
+  resend rewrites the same `(series, timestamp)`. So per SUT life, M − S, the datapoints the sink
+  counted in `logit.output.datapoints` less the distinct samples the export holds, is what it
+  counted written and the backend never stored. M is datapoints, not `logit.output.messages`,
+  which counts frames: one per datapoint under plaintext, one per many under pickle.
+  `ledger.tail` judges it; the key is limited to `graphite_out` until another sink's counts map
+  one to one onto stored samples.
+- **The bound includes the backend's own memory.** VictoriaMetrics buffers ingested rows for
+  up to a second and holds them as in-memory parts until `-inmemoryDataFlushInterval`, so a
+  SIGKILL also loses rows it read. The sink's `kill_unflushed` names that span (1 s plus the
+  flag), and the bound is the datapoints the sink counted in the drains from that span plus one
+  aggregate interval before each kill to two SUT drain periods after it. Past the bound, in a
+  life with no backend kill, or below 0, the row FAILs. The row can't split socket loss from
+  memory loss; the scenario pins the flag at its 5 s default, so `kill_unflushed` (1 s plus
+  the flag) names a known value.
+- **The rules that hold it.** A `kill` of a backend needs `kill_unflushed` on a sink
+  delivering there, and the key needs `vm_every_window` and a local target. `ledger.windows`
+  excuses a gap overlapping a kill's span on such a sink and lists it, leaving its size to
+  `ledger.tail`.
+
+## Amendment: a stalled kill bounds what a frozen receiver's buffers lose (2026-11-03)
+
+A receiver killed while it keeps up loses little: `syslog-tcp-ingress`'s kills fell within the
+estimate's error. A receiver stalled behind full buffers when it dies loses all of them, and
+the generator counted every line in them as written.
+
+- **A kill may start inside a pause and end with it.** Docker signals a paused container and
+  then thaws it, so the process dies on the pending SIGKILL before it reads again. The kill's
+  revert starts the container; the pause's revert finds it exited or started since its apply,
+  unpauses nothing, records `unpaused: false`, and the driver and `timeline` expect no
+  readiness probe for it. Any other overlap of the two stays refused.
+- **The loss is bounded by the buffers.** On a `tcp` source the stalled kill's fault run is
+  reported as a kill's is, and its G − W is held to G from the SUT's last drain to the pause,
+  plus each connection the generator opened before the kill times the source's
+  `socket_buffers`, in lines at the generator's bytes per line, plus a batch per edge. A write
+  stalled past `connect_timeout` drops its connection, and the redial completes into the frozen
+  listener's accept queue and fills another pair, so the connections are 1 plus the generator
+  sink's reconnects through the stall. Past the bound the row FAILs.
+- **The buffers are the override's.** A new network namespace copies the host's maxima, so a
+  scenario's compose override sets `net.ipv4.tcp_rmem` on the SUT and `tcp_wmem` on the
+  generator, and `load()` holds `socket_buffers` to them. `syslog-stall-kill` caps both at
+  256 KiB; `syslog-stall-kill-default` sets Linux's default maxima.
+
 ## Amendment: OTLP and HEC stand-ins overwrite under cumulative temporality, and name loss by position (2026-10-29)
 
 A stand-in target can play OTLP/HTTP's metrics route (`[target] shape = "otlp"`) and Splunk's

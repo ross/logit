@@ -1,0 +1,11 @@
+# Caps the socket buffers on each end of the TCP connection, in each container's own network
+# namespace, as syslog-tcp-ingress's override does, so the scenario's `socket_buffers` names
+# what one connection can hold: a new namespace copies the host's maxima, which a scenario
+# can't know.
+services:
+  logit:
+    sysctls:
+      net.ipv4.tcp_rmem: "4096 65536 262144"
+  generator:
+    sysctls:
+      net.ipv4.tcp_wmem: "4096 16384 262144"

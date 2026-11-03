@@ -639,6 +639,13 @@ sut_transforms = ["parse", "labels", "count", "metrics_only"]   # optional, in o
   whose discards are merges, each merged record credited back as delivered (§6, M).
   `load()` checks each node's kind against the SUT config, and refuses `merge` beside a
   `fan_out` and under `split = "target"`, whose rows read one `aggregate` per sink.
+- `socket_buffers`, optional on a `tcp` source, is a table of `receive` and `send`, the most
+  bytes one connection's receive buffer on the SUT and send buffer on the generator hold: the
+  third value of `net.ipv4.tcp_rmem` on `logit` and of `net.ipv4.tcp_wmem` on the generator,
+  which the scenario's compose override sets, since a new network namespace copies the host's
+  maxima. `load()` checks both values against the override (`scenario.compose_sysctls`). A
+  `tcp` source needs it when a stalled kill, a `kill` inside a `pause` of the SUT, is on the
+  schedule, because `ledger.wire` bounds that kill's loss by it (§6).
 - With the role map: every source's `service` is a `generator`, and every `generator` in the
   stack has a source, because a generator with none would put lines into a listener with no
   G behind them.
@@ -697,6 +704,15 @@ services:
 has a sample in every `aggregate` window of every SUT life that `aggregate` emitted. Set it only
 when every series is written in every window, because `aggregate` emits a series only in a
 window that updated it, and the row excuses a gap only when the whole component was idle.
+
+**`kill_unflushed`**, optional on a local `[[ledger.sink]]` whose component is a
+`graphite_out`, is a duration: how long before a `kill` of the sink's backend the backend may
+hold what it ingested unsaved. VictoriaMetrics buffers ingested rows for up to a second, then
+holds them as in-memory parts for `-inmemoryDataFlushInterval`, so it's 1 s plus that flag. It
+needs `vm_every_window`, and a `kill` of a backend needs it on a sink delivering there: a
+backend kill loses what it hadn't saved, and `ledger.tail` (§6) is the row that sees it. Only a
+`graphite_out` writes one datapoint per stored sample and counts each in
+`logit.output.datapoints`, under plaintext and pickle alike, which the row's comparison needs.
 
 The expected rate is never configured. It is measured from the generator's own `events.sent`
 over the warmup.
@@ -1284,6 +1300,21 @@ The rows:
   names the generator's counted loss by reason (`overflow_newest`, `ambiguous_at_most_once`)
   beside the gap; none of it is in G.
 
+  A stalled kill, a `kill` that starts inside a `pause` of the SUT and ends with it, lands on a
+  frozen process: Docker signals a paused container and then thaws it, and the process dies on
+  the pending SIGKILL before it reads anything more. Its fault run is reported as a kill's is,
+  and its loss, G − W over the run, is also held to a bound (`checks._stalled_kill_bound`):
+  G from the SUT's last drain to the pause, read and never exported or still in the buffers,
+  plus each connection the generator opened before the kill times the source's
+  `socket_buffers` receive and send bytes, in lines at the generator sink's
+  `logit.output.batch.bytes` per `output.messages`, plus one batch per edge. A write stalled
+  past the generator's `connect_timeout` drops its connection, and the redial completes into
+  the frozen listener's accept queue, since the kernel finishes the handshake, and fills
+  another pair of buffers; the connections are 1 plus the generator sink's
+  `logit.output.reconnects` from the pause to one generator drain past the kill. A loss past
+  the bound FAILs; without `socket_buffers` or the generator's bytes the loss is reported with
+  no bound.
+
   On an HTTP wire (W14) the row judges G − (W − X), and every lifecycle fault, `partition`,
   and netem of the ingress SUT or of a generator, and a `mark` or `exit` on the ingress SUT,
   affects the wire: netem on either end can hold a request or its answer past the writer's
@@ -1546,7 +1577,21 @@ The rows:
   pause, so none could be lost. The count is per component, not per series, so a series idle
   while others flush FAILs; set `vm_every_window` only where every series is written in every
   window. The detail names each excused gap with its offsets, its series count, and the
-  batches and drains counted.
+  batches and drains counted. A gap that overlaps a backend kill's span on a sink with
+  `kill_unflushed` (`ledger.tail`'s) is excused and listed as a tail gap: that row judges it.
+- `ledger.tail`, only for a sink with `kill_unflushed`, else SKIP: per SUT life, M − S, M the
+  datapoints the sink counted written (`logit.output.datapoints`, one per sample whether a frame
+  carries one or, under pickle, many) and S the distinct
+  `(series, timestamp)` samples its export holds in that life. A resend rewrites the same sample,
+  so M − S is what the sink counted written and the backend never stored: the bytes a stream
+  sink can't count (`docs/known-gaps/sinks.md`), with what the backend held unsaved when
+  killed. Under a cumulative `aggregate` V and `ledger.egress` can't see it, since the next
+  window's total covers a lost one, and `ledger.windows` sees a gap but not its size. 0 passes;
+  a life with a kill of the backend passes up to its bound, the datapoints the sink counted in the
+  drains from `kill_unflushed` plus one aggregate interval before each kill (a sample is stamped
+  with its window's time) to two SUT drain periods after it (writes the sink counted before it
+  saw the close). A surplus, a gap past the bound, and any gap in a life with no backend kill
+  FAIL. A killed SUT life is reported, since its last drain doesn't hold all of M.
 - `ledger.absent` (W22), only for a sink with a `vm_absent_selector`, else SKIP: the driver
   exports what the selector matches at the end into `vm-export/<sink>.absent.jsonl` and
   records `vm_absent_exported`, and the row FAILs any series there, naming the SUT lives its
@@ -5705,6 +5750,7 @@ development host. Overall PASS, with only inapplicable SKIPs.
 The 1 h runs, here and in W18, are shorter than the 4-hour or 8-hour length the scenarios allow.
 A leak in either path grows per redial or per deletion, not with wall time, and an hour is the
 shortest run whose `rss_slope` gives a verdict instead of a WARN.
+8-hour runs of both scenarios have since passed ("Round 3 follow-ups").
 
 ### W18: a deleting rotation (2026-10-18)
 
@@ -6855,3 +6901,73 @@ What the runs showed:
   widen the band and are read again, and a final life's excuse W − D past E + B. Taking
   `KAFKA_WIRE` out of `DEFERRED_WIRES` fails six of its expectations, and out of
   `DEFERRED_UNSENT_WIRES` two; 2,742 expectations pass.
+
+### A backend kill's tail and a stalled receiver (2026-11-03)
+
+Two measurements of the loss a TCP stream sink can't count, the bytes its receiver dies holding
+(`docs/known-gaps/sinks.md`, "A stream sink doesn't count the bytes its peer never
+acknowledged"). Each scenario ran once at its default length on the development host, against
+`logit:soak` built from `soak/round3-measure`. Every row of the three runs passed.
+
+- **Two backend kills lost 300 datapoints, within a bound of 400.** `graphite-egress`
+  (`20261103T225804Z`, 18 minutes 35 seconds) killed VictoriaMetrics at +735 s and +860 s, under
+  `-inmemoryDataFlushInterval=5s` and `kill_unflushed = "6s"`. `ledger.tail` read M 11,000 −
+  S 10,700 = 300 for the SUT's one life, against a bound of 400. The first kill lost 100
+  datapoints, one sample on each of the 100 series, and the second lost 200, every datapoint
+  the sink counted in that kill's span (200 in the 26 s around each). `ledger.tail` can't tell
+  VictoriaMetrics' unsaved memory from its socket. `ledger.windows` excused 100 gaps per kill,
+  one per series, the widest 20 s and 30 s, and `reconnects-after-kill` and
+  `reconnects-after-second-kill` each read 1.
+- **A stalled receiver's loss grows with the stall, and one buffer pair is not a ceiling.**
+  `syslog-stall-kill` (`20261103T231800Z`, buffers capped at 256 KiB) lost 21,339 lines, about
+  1.3 MB at 62.8 bytes a line, to a kill 30 s into a 30 s stall, against a bound of 50,847, with
+  5 redials. A kill 90 s into a 90 s stall lost 71,586 lines, about 4.5 MB, against 151,430, with
+  16 redials. The plain kill beside them lost 9,728 lines (the unpaused `c0s5` fault run), as the unstalled kills in W27
+  did. A write stalled past `connect_timeout` drops its connection and redials into the frozen
+  listener's accept queue, which fills another pair of buffers, so the loss rose with the
+  redials and the length of the stall.
+- **Under default autotuning the buffers stay far below their maxima, and the bound is loose by
+  about 20 times.** `syslog-stall-kill-default` (`20261103T233050Z`, 6 MiB receive and 4 MiB send
+  maxima) lost 35,163 lines, about 2.2 MB, to the 30 s stall against a bound of 835,700 (about
+  52 MB), with 4 redials, and 113,899 lines, about 7.2 MB, to the 90 s stall against 2,180,394
+  (about 137 MB), with 12 redials. The bound was 24 and 19 times the loss. The stall
+  expectations passed, so the generator's buffers did fill and its sink held a batch. Linux
+  grows a socket's receive buffer only in `recvmsg`, so a receiver that is never read stays near
+  its initial size. The default run lost 1.6 times the capped run's lines in both stalls, with
+  fewer redials (4 and 12 against 5 and 16). The plain kill lost 9,703.
+- **Per stalled kill the loss was uncounted by design.** `ledger.wire` reported each as `lost`
+  within its bound, and the run's steady-state loss read 50 and 61 lines against a limit
+  of 700.
+
+### Round 3 follow-ups, on `soak/round3-followups` (2026-11-03)
+
+- **`otlp-grpc-egress` passed with `ledger.relay` balanced** (`20261103T223813Z`, 17 minutes).
+  `ledger.relay` balanced on all three `collector` lives: life 0 read E_r 4,700 = S_r 4,700 =
+  Del_r 4,700, life 1 (killed) 1,600 on each, and life 2 4,300 on each, with no relay drop.
+  The cross line read ΣE_r 10,600 against Del 10,000 less 100, so no point `logit` delivered went missing
+  at the relay. `ledger.egress` read Ab − V of 0 on both lives, and no batch was dropped over
+  the run.
+- **`syslog-tcp-ingress` with the `reset` step passed on its rerun** (`20261103T230043Z`, 15
+  minutes 15 seconds). Its first run (`20261103T222138Z`) failed `timeline` and `reset-counted`: SELinux confined the
+  netem container and blocked its `sock_diag` socket, so `ss -K` never applied and
+  `reset-counted` read "never applied cleanly". The reset one-shot now runs with
+  `label=disable`, and the step fails on a denied `ss`. On the rerun `reset-counted` read 1 and
+  `resets-run` read 1 against a limit of 1, and the pause, partition, generator stop, SUT stop,
+  and SUT kill each read 0 resets. The wire loss read 40 lines against a limit of 2,100.
+- **The 8-hour `kafka-sasl-reauth` run passed** (`20261103T141635Z`, 28,800 s, on the
+  development host). The sink redialed 1,069 times, 133.9 an hour, inside [80, 300], and 74
+  attempts, 9.3 an hour, were `ambiguous` against a limit of 40 an hour; none was `refused` and no batch
+  was dropped. The topic held 144,040 distinct records with 0 duplicate copies, equal to the
+  records the sink saw accepted, and G, W, and Ab each read 57,611,200. `rss_slope` read +0.0
+  MiB/h on the generator and +0.2 on `logit` against 65, from one life each, and descriptors held
+  at 17 on `logit`. All 221 faults recovered within 45 s over 147 starts.
+- **The 8-hour `tail-rotate-delete` run passed** (`20261103T141647Z`, 28,800 s). The tailer
+  rotated 3,714 files while the driver counted 646 deletions (the writer rotated 652 times), read no lost bytes, and logged no checkpoint
+  error. `files.open` peaked at 10 against a limit of 10 and ended at 8, process descriptors
+  peaked at 28 against 31, and watches peaked at 11 against 11. `logit` rose from a median of 20
+  descriptors after warmup to 26 at the end, inside the +10 limit; `rss_slope` read -28.8 to
+  +0.9 MiB/h across its lives against 69. `ledger.wire` read W + F − G of -900 inside the replay
+  band [-80,002, 102,239] over 16 kills, and all 40 faults recovered within 45 s.
+
+The 8-hour runs close the gap the 1 h runs of W17 and W18 left: a leak that grows per redial or
+per deletion did not show in either path over 8 hours.

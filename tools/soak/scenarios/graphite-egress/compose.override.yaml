@@ -1,8 +1,12 @@
 # graphite-egress's backend, merged onto tools/soak/compose.yaml: VictoriaMetrics with its carbon
 # plaintext listener on 2003, which the SUT's `graphite_out` writes to. Compose replaces a
-# service's `command` whole, so this list repeats the base file's flag.
+# service's `command` whole, so this list repeats the base file's flag. VictoriaMetrics holds
+# what it ingested in memory for up to a second, then saves it to disk every
+# `-inmemoryDataFlushInterval`, set here to its default so the scenario's `kill_unflushed`
+# names its source: a SIGKILL loses up to that much.
 services:
   victoria-metrics:
     command:
       - -retentionPeriod=100y
       - -graphiteListenAddr=:2003
+      - -inmemoryDataFlushInterval=5s

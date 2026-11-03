@@ -625,7 +625,10 @@ class Run:
                 self.paused.add(service)
             else:
                 self.paused.discard(service)
-                if self.roles.get(service) in scenario_mod.LOGIT_ROLES:
+                # A stalled kill's revert starts the container and probes it; this unpaused
+                # nothing.
+                if (self.roles.get(service) in scenario_mod.LOGIT_ROLES
+                        and result.get("unpaused") is not False):
                     self.pending_ready[service] = {"since": _now(), "step": step.id,
                                                    "why": "unpause"}
         elif step.action in faults.STARTS_ON_APPLY and kind == "apply":

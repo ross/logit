@@ -1,0 +1,140 @@
+# A receiver stalled behind a full receive buffer, then killed while it's frozen:
+# syslog-tcp-ingress's stream into `syslog_in` over TCP, with each socket buffer capped at 256 KiB.
+# A pause of the SUT stops it reading while its kernel keeps the connection; the generator writes
+# until both buffers fill, then its write stalls past `connect_timeout`, drops the connection, and
+# redials into the frozen listener's accept queue, filling another pair. A kill inside the pause
+# ends the process before it reads any of them, so every line the generator counted written into
+# those buffers is lost with nothing counting it (docs/known-gaps/sinks.md, "A stream sink doesn't
+# count the bytes its peer never acknowledged"). `ledger.wire` reports each stalled kill's loss and
+# holds it to its bound: what the generator counted after the SUT's last drain before the pause,
+# plus each connection's two buffers at `socket_buffers`. The schema is
+# docs/plans/soak-harness.md's "The scenario schema".
+
+name = "syslog-stall-kill"
+description = "generator syslog_out (TCP, at_least_once) -> syslog_in, each socket buffer capped at 256 KiB -> kv -> kv_metrics -> aggregate 10s cumulative -> prometheus_out RW1 zstd -> VictoriaMetrics; the SUT killed inside two pauses"
+duration = "11m30s"       # warmup + one cycle + cooldown; --duration overrides
+warmup = "60s"            # no faults: baseline rate, RSS, fds
+cooldown = "120s"         # no faults at the end; >= recovery_bound
+recovery_bound = "45s"    # retry_max_delay 10s + two aggregate windows + a drain
+rss_settle = "60s"        # as syslog-tcp-ingress: the generator or SUT releases fault-time memory
+cycle = "8m30s"           # >= last recovery (7m30s) + 2 x progress_window
+compose = "compose.override.yaml"   # caps both ends' TCP socket buffers at 256 KiB
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"
+
+[ledger]                  # component ids the checker reads; no rates here
+sut_aggregate = "window"
+wire_loss_outside_faults = 0.0
+
+[[ledger.source]]
+service = "generator"
+generator_input = "load"
+generator_sink = "syslog"
+sut_listener = "syslog"
+sut_transforms = ["parse", "labels", "count", "metrics_only"]   # messages to aggregate, in order
+wire = "tcp"              # G output.messages, W input.frames, F the framer's counted drops
+# The most one connection's receive buffer on the SUT and send buffer on the generator hold:
+# the override's tcp_rmem and tcp_wmem maxima, which load() checks it against.
+socket_buffers = { receive = 262144, send = 262144 }
+
+[[ledger.sink]]
+id = "victoria_metrics"
+backend = "victoria-metrics"
+vm_selector = '{__name__="soak_lines_total"}'
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64   # WARN under 1h, FAIL above
+fd_growth = 8
+
+# A 30 s stall, then a kill while the SUT is frozen. The kill ends with the pause: its revert
+# starts the SUT, and the pause's revert has nothing to unpause.
+[[step]]
+at = "0s"
+action = "pause"
+on = "logit"
+for = "60s"
+
+[[step]]
+at = "30s"
+action = "kill"
+on = "logit"
+for = "30s"
+
+# A 90 s stall, three times as long, for as many more redials into the frozen listener.
+[[step]]
+at = "2m30s"
+action = "pause"
+on = "logit"
+for = "120s"
+
+[[step]]
+at = "4m"
+action = "kill"
+on = "logit"
+for = "30s"
+
+# A kill of a SUT that keeps up, for comparison: what its buffers hold is little, and the
+# window is reported as syslog-tcp-ingress's kill is.
+[[step]]
+at = "6m15s"
+action = "kill"
+on = "logit"
+for = "30s"
+
+# Each stall backs the generator up: its queue overflows, counted, and its sink holds a batch it
+# can't write.
+[[expect]]
+name = "short-stall-overflows"
+service = "generator"
+metric = "logit.component.batches.dropped"
+component = "syslog"
+attrs = { reason = "overflow_newest" }
+step = "c0s1"
+window = "during"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "short-stall-retrying"
+service = "generator"
+metric = "logit.component.retrying"
+component = "syslog"
+step = "c0s1"
+window = "during"
+reduce = "max"
+min = 1
+
+[[expect]]
+name = "long-stall-overflows"
+service = "generator"
+metric = "logit.component.batches.dropped"
+component = "syslog"
+attrs = { reason = "overflow_newest" }
+step = "c0s3"
+window = "during"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "long-stall-retrying"
+service = "generator"
+metric = "logit.component.retrying"
+component = "syslog"
+step = "c0s3"
+window = "during"
+reduce = "max"
+min = 1
+
+# Under at_least_once the generator resends an ambiguous batch and never drops one.
+[[expect]]
+name = "no-ambiguous-drop"
+service = "generator"
+metric = "logit.component.batches.dropped"
+component = "syslog"
+attrs = { reason = "ambiguous_at_most_once" }
+window = "run"
+reduce = "delta"
+max = 0
