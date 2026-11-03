@@ -656,7 +656,8 @@ A script looping over `Event.new` forever, constructing events, advances the hea
 never stalled or wedged (a loop of refused calls does not advance it): telling it from a large
 `flush()` would take a time limit, which the ADR declines.
 Events it produced after its channels were revoked count as
-`events.dropped{reason="closed_consumer"}` under its own id, and the batches still waiting in its
+`events.dropped{reason="closed_consumer"}` under its own id, with one `closed_consumer` warn line
+per edge they were bound for, naming the node and the consumer, and the batches still waiting in its
 inbox, which it never read, count as `batches.dropped`/`events.dropped{reason="shutdown"}` under
 its own id, as a sink's abandoned inbox does.
 

@@ -431,6 +431,11 @@ impl Drop for InFlight<'_> {
 }
 
 impl Fanout {
+    /// The id of each consumer this fan-out sends to, in edge order, as a warning names it.
+    pub(crate) fn consumer_names(&self) -> Vec<String> {
+        self.consumers.iter().map(|edge| edge.consumer_name().to_string()).collect()
+    }
+
     /// A `Fanout` over bare `Sender`s, every edge with disabled consumer telemetry.
     pub fn new(consumers: Vec<mpsc::Sender<Delivered>>) -> Self {
         Self::from_edges(consumers.into_iter().map(Edge::new).collect())
