@@ -32,12 +32,15 @@ generator_sink = "statsd"
 sut_listener = "statsd"
 
 # `logit`'s `otlp_out`, whose writes `collector` carries to VictoriaMetrics; `prometheus_out`
-# adds the `_total` suffix to a monotonic sum.
+# adds the `_total` suffix to a monotonic sum. `ledger.relay` balances `collector`'s `otlp_in`
+# against its `prometheus_out` per `collector` life.
 [[ledger.sink]]
 id = "collector"
 backend = "victoria-metrics"
 vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'
 relay = "collector"
+relay_listener = "otlp"
+relay_sink = "victoria_metrics"
 
 [thresholds]
 progress_window = "30s"

@@ -2,19 +2,20 @@
 # out to VictoriaMetrics, under faults on the SUT. The generator's `syslog_out` runs its default
 # posture, `at_least_once`, so an ambiguous attempt is resent and never dropped: a judged
 # window allows one batch of surplus per attempt the generator counted
-# `logit.output.requests{class="ambiguous"}`. A stop or kill of the SUT can lose the lines in
-# either side's socket buffers when the connection ends, so `ledger.wire` reports those windows
-# (docs/known-gaps/sinks.md, "A stream sink counts a frame delivered once the kernel takes it").
+# `logit.output.requests{class="ambiguous"}`. A stop or kill of the SUT, or a reset of the
+# connection, can lose the lines in either side's socket buffers when the connection ends, so
+# `ledger.wire` reports those windows (docs/known-gaps/sinks.md, "A stream sink counts a frame
+# delivered once the kernel takes it").
 # The schema is docs/plans/soak-harness.md's "The scenario schema".
 
 name = "syslog-tcp-ingress"
 description = "generator syslog_out (TCP, at_least_once) -> syslog_in -> kv -> kv_metrics -> aggregate 10s cumulative -> prometheus_out RW1 zstd -> VictoriaMetrics"
-duration = "14m"          # warmup + one cycle + cooldown; --duration overrides
+duration = "15m15s"       # warmup + one cycle + cooldown; --duration overrides
 warmup = "60s"            # no faults: baseline rate, RSS, fds
 cooldown = "120s"         # no faults at the end; >= recovery_bound
 recovery_bound = "45s"    # retry_max_delay 10s + two aggregate windows + a drain
 rss_settle = "60s"        # the generator or SUT releases partition-time memory over about 100 s
-cycle = "11m"             # >= last recovery (10m0s) + 2 x progress_window
+cycle = "12m15s"          # >= last recovery (11m15s) + 2 x progress_window
 compose = "compose.override.yaml"   # caps both ends' TCP socket buffers
 
 [configs]
@@ -90,6 +91,17 @@ action = "stop"
 on = "generator"
 for = "30s"
 
+# `ss -K` in the generator's namespace closes its connection to the listener's port, so the
+# kernel sends the listener a reset: reported, since the lines in either side's buffers can be
+# lost. The generator's next write fails and it dials again. Needs a kernel built with
+# CONFIG_INET_DIAG_DESTROY.
+[[step]]
+at = "10m15s"
+action = "reset"
+on = "generator"
+port = 6514
+for = "15s"
+
 # The SUT's pause stalls the generator's write: its queue overflows, counted, and an attempt that
 # failed partway is ambiguous and resent, which the wire's allowance covers.
 [[expect]]
@@ -128,7 +140,19 @@ max = 0
 # A reset after a connection's first byte. The listener never writes to a plaintext peer, so
 # the generator never holds unread bytes, whose close would be a reset: a stalled write's
 # dropped connection, the end of a partition, and the generator's stop each close with a
-# FIN, and a stop or kill of the SUT ends the connection on its own side.
+# FIN, and a stop or kill of the SUT ends the connection on its own side. Only the reset step
+# sends one, to the generator's one connection, so the run counts at most 1, and the
+# pause, partition, both stops, and the kill each 0.
+[[expect]]
+name = "resets-run"
+service = "logit"
+metric = "logit.input.connections.closed"
+component = "syslog"
+attrs = { reason = "reset" }
+window = "run"
+reduce = "delta"
+max = 1
+
 [[expect]]
 name = "no-reset-pause"
 service = "logit"
@@ -163,11 +187,34 @@ reduce = "delta"
 max = 0
 
 [[expect]]
-name = "no-resets"
+name = "no-reset-stop"
 service = "logit"
 metric = "logit.input.connections.closed"
 component = "syslog"
 attrs = { reason = "reset" }
-window = "run"
+step = "c0s3"
+window = "through"
 reduce = "delta"
 max = 0
+
+[[expect]]
+name = "no-reset-kill"
+service = "logit"
+metric = "logit.input.connections.closed"
+component = "syslog"
+attrs = { reason = "reset" }
+step = "c0s4"
+window = "through"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "reset-counted"
+service = "logit"
+metric = "logit.input.connections.closed"
+component = "syslog"
+attrs = { reason = "reset" }
+step = "c0s7"
+window = "through"
+reduce = "delta"
+min = 1

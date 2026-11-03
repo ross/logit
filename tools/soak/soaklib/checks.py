@@ -84,6 +84,8 @@ the sinks name the second as their `relay`: then `logit` holds the listeners, `a
 the sinks, and every row reads its lives alone. The relay passes the sinks' writes on to the
 backend with the timestamps `logit`'s `aggregate` gave them, so V splits on `logit`'s lives
 too, and under `temporality: cumulative` a write the relay loses mid-life changes no total.
+`ledger.relay` balances the relay itself on its own lives, from each sink's `relay_listener` to
+its `relay_sink` (`check_ledger_relay`).
 
 A rolling overlap (`[overlap]`) runs several instances of one pipeline on one shared port: the
 rows about a process life judge each instance on its own lives, and the wire, `progress`,
@@ -1801,9 +1803,9 @@ DEFAULT_FILE_OUT_MAX_FILES = 5
 FILE_RETENTION_ACTIONS = ("pause", "stop", "kill", "restart", "exit")
 _SIZE_UNITS = {"B": 1, "KB": 1000, "MB": 1000 ** 2, "GB": 1000 ** 3,
                "KiB": 1024, "MiB": 1024 ** 2, "GiB": 1024 ** 3}
-# On a TCP wire the actions that end a SUT or generator process, or a partition that moved an
-# address, can lose lines the generator counted as sent: what sat in either side's socket buffers
-# when the connection reset. Their windows are reported, not judged. Every other TCP-affecting
+# On a TCP wire the actions that end a SUT or generator process, a `reset` of a connection, or a
+# partition that moved an address, can lose lines the generator counted as sent: what sat in
+# either side's socket buffers when the connection reset. Their windows are reported, not judged. Every other TCP-affecting
 # window is judged as steady state is, with a surplus allowed of one generator batch per
 # attempt its stream sink counted `logit.output.requests{class="ambiguous"}` in it: a write that
 # failed partway, or a TLS first write that failed, left whole lines the SUT read and the
@@ -1811,7 +1813,7 @@ _SIZE_UNITS = {"B": 1, "KB": 1000, "MB": 1000 ** 2, "GB": 1000 ** 3,
 # `at_most_once` it drops the batch `ambiguous_at_most_once`, one drop per such attempt; either
 # way the attempt leaves at most one batch of surplus (crates/logit-outputs/src/stream.rs's module
 # table).
-TCP_REPORTED_ACTIONS = ("stop", "kill", "restart", "exit")
+TCP_REPORTED_ACTIONS = ("stop", "kill", "restart", "exit", "reset")
 TCP_AMBIGUOUS_CLASS = "ambiguous"
 # On an HTTP wire G counts only points the listener answered with a success, which it does once
 # their batch is in every inbox, after W counted it, so no window can lose a point G counted. A
@@ -3746,7 +3748,8 @@ def check_ledger_wire(data):
     """G − (W + K + F) per source, reported per run of drain intervals and judged outside the
     reported windows of faults that can affect that source's wire and at the end. On UDP that
     loss is by design and every affecting window is reported; on TCP F is the listener's counted
-    framer drops, only a process end or a partition that moved an address is reported, and
+    framer drops, only a process end, a `reset`, or a partition that moved an address is
+    reported, and
     every other affecting window is judged with a surplus allowed for its ambiguous attempts
     (`wire_judgment`); on HTTP G counts acknowledged points against W − X, only a kill or an
     exit is reported, and every other affecting window is judged with a surplus allowed for its
@@ -5946,6 +5949,155 @@ def check_ledger_hop(data):
     return Result("ledger.hop", status, detail, lines)
 
 
+def _relay_reasons(tel, name, component, life):
+    """`{reason: summed delta}` for a `sum` metric of one component in one life."""
+    sums = {}
+    for point in tel.matching(name, component=component):
+        if point.life == life and isinstance(point.value, (int, float)):
+            key = point.attributes.get("reason", "?")
+            sums[key] = sums.get(key, 0) + point.value
+    return {key: value for key, value in sums.items() if value}
+
+
+def check_ledger_relay(data):
+    """Inside a sink's `relay`, per relay life, in events: what its `relay_listener` sent on,
+    less what it counted dropped (E_r − X_r), against what its `relay_sink` received (S_r), and
+    S_r against what that sink delivered and counted dropped (Del_r + Drop_r). On a listener
+    `HTTP_LISTENERS` names, X_r leaves out `shutdown` drops, as X does on an HTTP wire. A life a
+    stop or a restart ended, and the final life once the end sequence stopped the relay, ends
+    with a drain after every data node has exited, so both gaps must be 0: a positive one is
+    uncounted loss and a negative one a surplus. A counted drop is in X_r or Drop_r and leaves
+    no gap, and a `FAULT_DROP_REASONS` batch drop at the relay sink FAILs, as at a sink. A life
+    a kill or an `exit` ended loses its last drain interval's counts and its sink's queue, so
+    its gaps are reported, not judged, as is a final life the end sequence didn't stop. The
+    lives are the relay's own, which no other row reads, and `drops` leaves these terms to this
+    row. Across the two processes, on run totals, the relay listener's ΣE_r is at least what
+    `logit`'s sink counted delivered, less the records its encoder counted dropped or skipped
+    and less, per relay life a kill or an `exit` ended or the end sequence didn't stop, the most
+    E_r one drain interval held among the last ones it moved in (`_relay_tail`): the listener
+    counts an event sent before it answers, and the sink counts it delivered after the answer, so a
+    request the relay took and lost before E_r shows here; a resend only raises E_r. The two count
+    one unit when each delivered event carries one record, as `aggregate`'s output does, since
+    `otlp_out` writes one data point per record and `otlp_in` decodes one event per data point. V
+    judges what the relay stored. A run with no relay has no row."""
+    relayed = [sink for sink in data.ledger.get("sink") or [] if sink.get("relay")]
+    if not relayed:
+        return []
+    led = _ledger(data)
+    skipped = _skip_without_sut("ledger.relay", led)
+    if skipped:
+        return skipped
+    unnamed = [sink["id"] for sink in relayed
+               if not all(sink.get(key) for key in ("relay_listener", "relay_sink"))]
+    if unnamed:
+        return Result("ledger.relay", SKIP, f"{', '.join(unnamed)}: no `relay_listener` and "
+                      "`relay_sink` in the resolved scenario")
+    status, parts, lines = PASS, [], []
+    for sink in relayed:
+        relay, listener, out = sink["relay"], sink["relay_listener"], sink["relay_sink"]
+        view = led.views.get(relay)
+        if view is None or view.tel is None:
+            return Result("ledger.relay", SKIP, f"no telemetry from relay {relay}")
+        tel = view.tel
+        kind = listener_wire(led._sut_config_text(relay), listener)[1]
+        sent = tel.counter_by_life("logit.component.events.sent", component=listener)
+        dropped_in = tel.counter_by_life("logit.component.events.dropped", component=listener)
+        if kind in HTTP_LISTENERS:
+            cut = tel.counter_by_life("logit.component.events.dropped", component=listener,
+                                      reason="shutdown")
+            dropped_in = {life: value - cut.get(life, 0) for life, value in dropped_in.items()}
+        received = tel.counter_by_life("logit.component.events.received", component=out)
+        delivered = tel.counter_by_life("logit.component.events.delivered", component=out)
+        dropped_out = tel.counter_by_life("logit.component.events.dropped", component=out)
+        stopped_at_end = data.sut_phase("sut_stopped", relay) is not None
+        unseen = []
+        for life in view.lives:
+            final = life == view.final
+            e, x, r = sent.get(life, 0), dropped_in.get(life, 0), received.get(life, 0)
+            d, drop = delivered.get(life, 0), dropped_out.get(life, 0)
+            into, onward = e - x - r, r - d - drop
+            reasons = _relay_reasons(tel, "logit.component.events.dropped", out, life)
+            text = (f"{relay} life {life}{' (final)' if final else ''}: E_r − X_r {_n(e)} − "
+                    f"{_n(x)} − S_r {_n(r)} = {_n(into)}; S_r − Del_r − Drop_r {_n(r)} − "
+                    f"{_n(d)} − {_n(drop)} = {_n(onward)}"
+                    + (f" (Drop_r: {_reasons(reasons)})" if reasons else ""))
+            ended = view.ended.get(life)
+            if ((final and not stopped_at_end) or (not final and (
+                    ended is None or ended.action not in ("stop", "restart")))):
+                unseen.append(life)
+            if final and not stopped_at_end:
+                verdict = "reported: the end sequence didn't stop the relay"
+            elif life in view.killed and not final:
+                verdict = "reported: a kill loses its last drain interval and its sink's queue"
+            elif not final and (ended is None or ended.action not in ("stop", "restart")):
+                verdict = "reported: an exit ended it"
+            elif into == 0 and onward == 0:
+                verdict = "balanced" + (", the drops counted" if x or drop else "")
+            else:
+                status = FAIL
+                verdict = ", ".join(
+                    f"{what} {_n(abs(gap))} {'uncounted' if gap > 0 else 'a surplus'}"
+                    for what, gap in (("into the sink", into), ("past the sink", onward))
+                    if gap)
+                parts.insert(0, f"{sink['id']} to {text}, {verdict}")
+                lines.append(f"{text}, {verdict}")
+                continue
+            parts.append(f"{sink['id']} to {text}, {verdict}")
+            lines.append(f"{text}, {verdict}")
+        cross_status, cross = _relay_cross(led, sink["id"], relay, listener, tel, sent, unseen)
+        if cross_status == FAIL:
+            status = FAIL
+            parts.insert(0, cross)
+        else:
+            parts.append(cross)
+        lines.append(cross)
+        drops = _by_attr(tel, "logit.component.batches.dropped", "reason", component=out)
+        fault = ", ".join(f"{_n(drops[reason])} batch(es) {what}"
+                          for reason, what in FAULT_DROP_REASONS.items() if drops.get(reason))
+        if fault:
+            status = FAIL
+            parts.insert(0, f"FAIL: {relay} {out}: {fault}")
+    return Result("ledger.relay", status, "; ".join(parts), lines)
+
+
+# The records an encoder counts at a sink and doesn't write, so a relay never receives them.
+RELAY_UNWRITTEN = ("logit.output.metrics.dropped", "logit.output.metrics.skipped",
+                   "logit.output.records.dropped")
+
+
+def _relay_tail(tel, listener, life):
+    """What a relay life's unseen end can hold of E_r: the highest rate `_commit_rate` reads
+    over the drain intervals the listener last moved in, times the life's median drain
+    interval. The sender's flushes can be sparser than the relay's drains, so the last
+    interval is often empty while a flush the relay answered after it went uncounted."""
+    gaps = [b - a for a, b in zip(tel.life_drains(life), tel.life_drains(life)[1:])]
+    if not gaps:
+        return 0
+    rate, _ = _commit_rate(tel, "logit.component.events.sent", listener, life)
+    return round(rate * statistics.median(gaps))
+
+
+def _relay_cross(led, sink, relay, listener, tel, sent, unseen):
+    """`(status, text)`: `ledger.relay`'s run-total check across the two processes, ΣE_r against
+    what `logit`'s `sink` counted delivered less its unwritten records and less each life in
+    `unseen`'s `_relay_tail`."""
+    delivered = sum(led.sut.counter_by_life("logit.component.events.delivered",
+                                            component=sink).values())
+    unwritten = sum(sum(led.sut.counter_by_life(name, component=sink).values())
+                    for name in RELAY_UNWRITTEN)
+    tail = sum(_relay_tail(tel, listener, life) for life in unseen)
+    total = sum(sent.values())
+    floor = max(0, delivered - unwritten - tail)
+    text = (f"{sink} to {relay} over the run: ΣE_r {_n(total)} against Del {_n(delivered)}"
+            + (f" − unwritten {_n(unwritten)}" if unwritten else "")
+            + (f" − {_n(tail)} (the busiest recent drain interval per relay life whose last "
+               "counts are unseen)" if tail else "") + f" = {_n(floor)}")
+    if total >= floor:
+        return PASS, f"{text}, ok"
+    return FAIL, (f"{text}, {_n(floor - total)} delivered to the relay and never counted "
+                  "sent by its listener")
+
+
 def _torn_upto(sut, sink, life, at):
     """`batches.dropped{reason="disk_torn"}` for one sink and life up to `at`. A spool counts it
     at open for a batch an earlier life received and lost with a torn tail, so like
@@ -7821,7 +7973,7 @@ def _balanced_drop(led, service, name, component, reason, batch_drops, event_dro
     `component`, so `drops` leaves it out. Each term is judged only in the SUT it belongs to:
     the listener terms in the listeners' SUT, the rest of the ledger's in the sinks' SUT, and
     across a hop the hop sink's drops by `ledger.hop`, and `logit_in`'s X_B in the far SUT's
-    `fed`. With one SUT both are the same. `batch_drops` and `event_drops` are the service's
+    `fed`; a relay's listener and sink drops by `ledger.relay`. With one SUT both are the same. `batch_drops` and `event_drops` are the service's
     `(component, reason)` pairs with a nonzero `batches.dropped` and `events.dropped`."""
     sinks_side = service == led.service
     hop_sink = led.hop is not None and service == led.inn.service and component == led.hop.get(
@@ -7833,6 +7985,8 @@ def _balanced_drop(led, service, name, component, reason, batch_drops, event_dro
     # target `ledger.egress` SKIPs and `ledger.summary` reads no fault drop, so a
     # `FAULT_DROP_REASONS` batch drop at a node other than a sink stays here; `ledger.sent`
     # FAILs one at a sink.
+    if _relay_judged(led, service, name, component, reason, event_drops):
+        return True  # `ledger.relay`'s X_r and Drop_r
     if name == "logit.component.batches.dropped":
         if hop_sink:
             return True
@@ -7878,6 +8032,24 @@ def _balanced_drop(led, service, name, component, reason, batch_drops, event_dro
     if (sinks_side and component in led.sinks and led.data.standin
             and (led.data.standin_shape, name, reason) in STANDIN_JUDGED_DROPS):
         return True  # `ledger.standin` judges these against the stand-in's answers
+    return False
+
+
+def _relay_judged(led, service, name, component, reason, event_drops):
+    """Whether `ledger.relay` judges this term of relay `service`: its `relay_listener`'s
+    `events.dropped` (X_r), a `batches.dropped` beside one of the same reason, and its
+    `relay_sink`'s `events.dropped` and `batches.dropped` (Drop_r, and its fault drops)."""
+    for sink in led.data.ledger.get("sink") or []:
+        if sink.get("relay") != service:
+            continue
+        if component == sink.get("relay_listener") and (
+                name == "logit.component.events.dropped"
+                or (name == "logit.component.batches.dropped"
+                    and (component, reason) in event_drops)):
+            return True
+        if component == sink.get("relay_sink") and name in (
+                "logit.component.events.dropped", "logit.component.batches.dropped"):
+            return True
     return False
 
 
@@ -8045,7 +8217,8 @@ CHECKS = (
     check_run, check_timeline, check_exit, check_restarts, check_self_log, check_ready,
     check_progress, check_rss_slope, check_fd_slope, check_ledger_wire, check_cri_dangles,
     check_ledger_overlap,
-    check_ledger_intake, check_ledger_edge, check_ledger_hop, check_ledger_script, check_ledger_aggregate,
+    check_ledger_intake, check_ledger_edge, check_ledger_hop, check_ledger_relay,
+    check_ledger_script, check_ledger_aggregate,
     check_ledger_egress, check_ledger_windows, check_ledger_absent, check_ledger_replay,
     check_ledger_summary, check_ledger_value,
     check_ledger_sent, check_ledger_topic, check_ledger_standin, check_identity_sink, check_drops, check_recovery,

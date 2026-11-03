@@ -124,13 +124,19 @@ listener rows on `logit`'s lives and the rows from `aggregate` on on `collector`
 pause and within its allowance for a killed side's tail and a send window of duplicates after a
 kill or a pause of `collector`, a counted hop drop, a rejected hop batch, `ledger.summary`'s
 end-to-end bound, the hop sink's replay band and identity, `recovery` on each side's own drains,
-`drops` keyed on service, and an end-sequence phase read for its own service.
+`drops` keyed on service, and an end-sequence phase read for its own service. For a relay, it
+covers every rule its sink's `relay`, `relay_listener`, and `relay_sink` are held to against the
+relay's config, the end sequence stopping the relay last, every ledger row reading `logit`'s
+lives across it, and `ledger.relay` over the relay's own lives: balanced, a gap into or past its
+sink FAILing, a counted drop at either end balancing, an `otlp_in` `shutdown` drop left out, a
+rejected batch FAILing, a stopped life judged, and a killed or unstopped one reported.
 
 For a stand-in target, it covers the Snappy decoder against blocks `snap::raw` wrote
 (`standin/snap-vectors.json`) and the malformed blocks it refuses, the `WriteRequest` walker,
 V rebuilt from a record (a later write replacing an earlier one, a same-value resend counted, a
 changed value and an undecodable body named), the stand-in's own handlers on loopback ports (its
-cue rules, each answer, a reset, a wrong path, and the record line each prints), `post_cue`,
+cue rules, each answer, a reset, a wrong path, and the record line each prints), its server's
+silence on a client's reset, `post_cue`,
 every `respond`, `class`, and `[target] kind = "standin"` rule, the stand-in's compose service,
 the driver re-reading its control port and sending a step's cue and an empty one, and the checks
 over a stand-in two-life run: V judged as an export, the black-hole control FAILing as uncounted
@@ -8474,6 +8480,52 @@ def _relay_rules(root):
     ext["ledger"]["sink"][0]["relay"] = "collector"
     _refused(ext_path, ext, "`relay` carries a sink's writes to a backend, and the external "
              "target has none", "a relay to an external target")
+    sink_edits = (
+        (lambda sink: sink.pop("relay_listener"), "it's missing `relay_listener`",
+         "a relay sink with no relay_listener"),
+        (lambda sink: sink.update(relay_sink=5), "`relay_sink` must name a component id",
+         "a relay_sink that isn't an id"),
+        (lambda sink: sink.update(relay_listener="victoria_metrics"),
+         "`relay_listener` victoria_metrics must be a listener in logit-collector.yaml, and "
+         "it's a prometheus_out", "a relay_listener that isn't a listener"),
+        (lambda sink: sink.update(relay_sink="nowhere"),
+         "`relay_sink` nowhere isn't a component in logit-collector.yaml",
+         "a relay_sink the relay doesn't run"),
+        (lambda sink: sink.update(relay_sink="telemetry"),
+         "`relay_sink` telemetry must take `relay_listener` otlp's events directly",
+         "a relay_sink the listener doesn't feed"),
+        (lambda sink: sink.update(relay_sink="self"),
+         "`relay_sink` self must be a sink in logit-collector.yaml, and its kind is internal",
+         "a relay_sink that isn't a sink"),
+        (lambda sink: (sink.pop("relay"), sink.pop("relay_sink")),
+         "`relay_listener` names a relay's component, and the sink names no `relay`",
+         "relay_listener with no relay"),
+    )
+    for edit, needle, what in sink_edits:
+        _refused(path, mutate(lambda r, edit=edit: edit(r["ledger"]["sink"][0])), needle, what)
+    _refused(path, mutate(lambda r: r["ledger"]["sink"].append(
+        {**r["ledger"]["sink"][0], "id": "other"})),
+             "`relay_listener` otlp is another sink's too", "two sinks on one relay listener")
+    with tempfile.TemporaryDirectory() as tmp:
+        copied = Path(tmp) / "otlp-grpc-egress"
+        shutil.copytree(path.parent, copied)
+        relay_file = copied / "logit-collector.yaml"
+        relay_file.write_text(relay_file.read_text().replace(
+            "  self: {", "  archive:\n    type: stdio_out\n    sources:\n      - otlp\n"
+            "  self: {", 1))
+        _refused(copied / "scenario.toml", copy.deepcopy(raw),
+                 "`relay_listener` otlp feeds archive too; `relay_sink` victoria_metrics must "
+                 "take its events alone", "a relay listener feeding a second component")
+        relay_file.write_text((path.parent / "logit-collector.yaml").read_text().replace(
+            "sources: [otlp]", "sources: [otlp, self]", 1))
+        _refused(copied / "scenario.toml", copy.deepcopy(raw),
+                 "`relay_sink` victoria_metrics reads self too; its only source must be "
+                 "`relay_listener` otlp", "a relay_sink reading a second source")
+    expect(scenario.config_sources("  a:\n    sources: [x, 'y']\n", "a") == ["x", "y"]
+           and scenario.config_sources("  a:\n    sources:\n      - x  # one\n      - y\n"
+                                       "  b: {}\n", "a") == ["x", "y"]
+           and scenario.config_sources("  a: { type: null_out }\n", "a") == [],
+           "config_sources reads flow and block lists, and [] for none")
     over_path = root / "scenarios" / "rolling-overlap" / "scenario.toml"
     over = tomllib.loads(over_path.read_text())
     over["ledger"]["sink"][0]["relay"] = "logit-b"
@@ -8532,31 +8584,73 @@ def _relay_driver(root):
                f"logit stops once the sink the relay carries on is drained, got {drained}")
 
 
+RELAY_KILL = (203, 213)
+RELAY_CONFIG = ("components:\n"
+                "  otlp: { type: otlp_in, bind: 0.0.0.0:4317, protocol: grpc }\n"
+                "  victoria_metrics:\n"
+                "    type: prometheus_out\n"
+                "    sources: [otlp]\n"
+                "    endpoint: http://victoria-metrics:8428/api/v1/write\n"
+                "  self: { type: internal, interval: 5s }\n"
+                "  telemetry: { type: stdio_out, sources: [self], format: json }\n")
+RELAY_PER_DRAIN = 100
+
+
+def _relay_run(tmp, name, action="kill", extra=(), stopped=True, keys=True, sut_extra=(),
+               bursty=False):
+    """`_ledger_run`'s two-life run with its sink's writes carried on by a relay, `collector`,
+    whose `action` (a `kill` or a `stop`) over `RELAY_KILL` gives it two lives. Each 5 s drain
+    the relay's `otlp` sends `RELAY_PER_DRAIN` events on to `victoria_metrics`, which receives
+    and delivers them, plus `extra` lines; with `stopped` the end sequence stopped it, and with
+    `keys` its sink names `relay_listener` and `relay_sink`. `sut_extra` lines go to `logit`.
+    Under `bursty` the relay moves `2 × RELAY_PER_DRAIN` at every other drain (+5, +15, ...)
+    and exports no point at the rest, as a 10 s sender into a 5 s drain does, so its killed
+    life's last drain, +200, is empty."""
+    kill = RELAY_KILL
+    relay_timeline = [_action("apply", "c0s2", action, "collector", kill[0]),
+                      _action("revert", "c0s2", action, "collector", kill[1] - 1, kill[1]),
+                      _ready("c0s2", "collector", kill[1] + 1)]
+    if stopped:
+        relay_timeline.append(_phase("sut_stopped", 325, service="collector"))
+    run_dir = _ledger_run(tmp, name, timeline_extra=relay_timeline, sut_extra=sut_extra)
+    resolved_path = run_dir / "scenario.resolved.json"
+    resolved = json.loads(resolved_path.read_text())
+    resolved["suts"] = ["logit", "collector"]
+    resolved["sink_sut"] = "logit"
+    resolved["services"] = dict(TWO_SUT_ROLES)
+    resolved["configs"] = {**(resolved.get("configs") or {}), "collector": "collector.yaml"}
+    resolved["ledger"]["sink"][0]["relay"] = "collector"
+    if keys:
+        resolved["ledger"]["sink"][0].update(relay_listener="otlp", relay_sink="victoria_metrics")
+    resolved_path.write_text(json.dumps(resolved))
+    (run_dir / "configs").mkdir(exist_ok=True)
+    (run_dir / "configs" / "collector.yaml").write_text(RELAY_CONFIG)
+    relay = []
+    for offset in range(5, 321, 5):
+        if kill[0] <= offset < kill[1]:
+            continue
+        start = kill[1] if offset >= kill[1] else -1
+        stamp = _stamp(T0 + offset)
+        relay.append(_line(stamp, "logit.process.uptime", "gauge", float(offset - start)))
+        moved = RELAY_PER_DRAIN
+        if bursty:
+            if offset % 10 == 0:
+                continue
+            moved = 2 * RELAY_PER_DRAIN
+        relay.append(_line(stamp, "logit.component.events.sent", "sum", moved,
+                           component="otlp"))
+        for metric in ("logit.component.events.received", "logit.component.events.delivered"):
+            relay.append(_line(stamp, metric, "sum", moved, component="victoria_metrics"))
+    (run_dir / "logs" / "collector.stdout").write_text("\n".join(relay + list(extra)) + "\n")
+    return run_dir
+
+
 def _relay_checks():
     """A run whose sink's writes a relay carries on: every ledger row reads `logit`, which holds
     the listener, `aggregate`, and the sink, and V splits on `logit`'s lives, while a kill of the
-    relay gives it two lives of its own that no row reads."""
+    relay gives it two lives of its own, which only `ledger.relay` reads."""
     with tempfile.TemporaryDirectory() as tmp:
-        kill = (203, 213)
-        relay_timeline = [_action("apply", "c0s2", "kill", "collector", kill[0]),
-                          _action("revert", "c0s2", "kill", "collector", kill[1] - 1, kill[1]),
-                          _ready("c0s2", "collector", kill[1] + 1)]
-        run_dir = _ledger_run(tmp, "relay", timeline_extra=relay_timeline)
-        resolved_path = run_dir / "scenario.resolved.json"
-        resolved = json.loads(resolved_path.read_text())
-        resolved["suts"] = ["logit", "collector"]
-        resolved["sink_sut"] = "logit"
-        resolved["services"] = dict(TWO_SUT_ROLES)
-        resolved["ledger"]["sink"][0]["relay"] = "collector"
-        resolved_path.write_text(json.dumps(resolved))
-        relay = []
-        for offset in range(5, 321, 5):
-            if kill[0] <= offset < kill[1]:
-                continue
-            start = kill[1] if offset >= kill[1] else -1
-            relay.append(_line(_stamp(T0 + offset), "logit.process.uptime", "gauge",
-                               float(offset - start)))
-        (run_dir / "logs" / "collector.stdout").write_text("\n".join(relay) + "\n")
+        run_dir = _relay_run(tmp, "relay")
         data = checks.RunData(run_dir)
         led = checks.Ledger(data)
         expect(data.sut_out == "logit" and led.problems == [] and not led.across
@@ -8569,6 +8663,150 @@ def _relay_checks():
             expect(rows[row].status == checks.PASS,
                    f"{row} reads logit's lives across a relay, got {rows[row].status}: "
                    f"{rows[row].detail}")
+
+
+def _relay_ledger():
+    """`ledger.relay` over `_relay_run`: per relay life, the listener's sends less its drops
+    against the relay sink's receipts, and those against its deliveries and drops; a stopped
+    life and a final life the end sequence stopped judged at 0, a killed one reported, a counted
+    drop at either end balancing and left out of `drops`, a listener's `shutdown` drop left out
+    of X_r, and a rejected batch FAILing; and, over the run, the listener's sends against what
+    `logit`'s sink counted delivered."""
+    def at(offset, metric, value, component="victoria_metrics", **attrs):
+        return _line(_stamp(T0 + offset), metric, "sum", value, component=component,
+                     attrs=attrs or None)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        seen = {}
+
+        def row(name, **kwargs):
+            results = checks.run_all(_relay_run(tmp, name, **kwargs))
+            seen[name] = {r.id: r for r in results}
+            found = [r for r in results if r.id == "ledger.relay"]
+            return found[0] if len(found) == 1 else None
+
+        def drops_pass(name):
+            got = seen[name].get("drops")
+            return got is not None and got.status == checks.PASS, got
+
+        clean = row("relay-clean")
+        expect(clean is not None and clean.status == checks.PASS
+               and "collector life 1 (final): E_r − X_r 2,200 − 0 − S_r 2,200 = 0; "
+                   "S_r − Del_r − Drop_r 2,200 − 2,200 − 0 = 0, balanced" in clean.detail
+               and "collector life 0: E_r − X_r 4,000 − 0 − S_r 4,000 = 0" in clean.detail
+               and "reported: a kill loses" in clean.detail,
+               f"a relay that passes on every event it took balances, its killed life reported, "
+               f"got {clean}")
+
+        lost = [at(250, "logit.component.events.delivered", -10)]
+        uncounted = row("relay-uncounted", extra=lost)
+        expect(uncounted is not None and uncounted.status == checks.FAIL
+               and "past the sink 10 uncounted" in uncounted.detail
+               and uncounted.detail.startswith("sink to collector life 1 (final)"),
+               f"events the relay sink received and neither delivered nor counted FAIL, got "
+               f"{uncounted}")
+        surplus = row("relay-surplus", extra=[at(250, "logit.component.events.received", 5),
+                                              at(250, "logit.component.events.delivered", 5)])
+        expect(surplus is not None and surplus.status == checks.FAIL
+               and "into the sink 5 a surplus" in surplus.detail,
+               f"a relay sink receiving more than its listener sent FAILs, got {surplus}")
+
+        counted = row("relay-counted", extra=lost + [
+            at(250, "logit.component.events.dropped", 10, reason="overflow_newest"),
+            at(250, "logit.component.batches.dropped", 1, reason="overflow_newest")])
+        expect(counted is not None and counted.status == checks.PASS
+               and "Del_r − Drop_r 2,200 − 2,190 − 10 = 0 (Drop_r: overflow_newest 10), "
+                   "balanced, the drops counted" in counted.detail,
+               f"a relay sink's counted drop balances, got {counted}")
+        ok, got = drops_pass("relay-counted")
+        expect(ok, f"drops leaves a relay sink's events and batches dropped to ledger.relay, "
+                   f"got {got}")
+        closed = row("relay-closed-consumer", extra=[
+            at(250, "logit.component.events.dropped", 10, component="otlp",
+               reason="closed_consumer"),
+            at(250, "logit.component.events.received", -10),
+            at(250, "logit.component.events.delivered", -10)])
+        expect(closed is not None and closed.status == checks.PASS
+               and "E_r − X_r 2,200 − 10 − S_r 2,190 = 0" in closed.detail,
+               f"a relay listener's counted drop balances, got {closed}")
+        ok, got = drops_pass("relay-closed-consumer")
+        expect(ok, f"drops leaves a relay listener's events dropped to ledger.relay, got {got}")
+        cut = row("relay-listener-shutdown", extra=[
+            at(320, "logit.component.events.dropped", 10, component="otlp", reason="shutdown")])
+        expect(cut is not None and cut.status == checks.PASS
+               and "E_r − X_r 2,200 − 0 − S_r 2,200 = 0" in cut.detail,
+               f"an otlp_in request the shutdown backstop cut was never counted sent, so its "
+               f"drop leaves X_r, got {cut}")
+        rejected = row("relay-rejected", extra=lost + [
+            at(250, "logit.component.events.dropped", 10, reason="rejected"),
+            at(250, "logit.component.batches.dropped", 1, reason="rejected")])
+        expect(rejected is not None and rejected.status == checks.FAIL
+               and "FAIL: collector victoria_metrics: 1 batch(es) rejected by the destination"
+               in rejected.detail,
+               f"a batch the relay's destination rejected FAILs, though counted, got {rejected}")
+        ok, got = drops_pass("relay-rejected")
+        expect(ok, f"a relay sink's rejected batch FAILs in ledger.relay alone, got {got}")
+
+        def delivered(value, *more):
+            return [at(100, "logit.component.events.delivered", value, component="sink"),
+                    *more]
+
+        across = row("relay-delivered", sut_extra=delivered(6200))
+        expect(across is not None and across.status == checks.PASS
+               and "sink to collector over the run: ΣE_r 6,200 against Del 6,200 − 100 (the "
+                   "busiest recent drain interval per relay life whose last counts are unseen) "
+                   "= 6,100, ok"
+               in across.detail,
+               f"the relay's listener sent on what logit's sink delivered, less its killed "
+               f"life's last drain interval, got {across}")
+        short = row("relay-delivered-over", sut_extra=delivered(6400))
+        expect(short is not None and short.status == checks.FAIL
+               and short.detail.startswith(
+                   "sink to collector over the run: ΣE_r 6,200 against Del 6,400 − 100")
+               and "= 6,300, 100 delivered to the relay and never counted sent by its "
+                   "listener" in short.detail,
+               f"a write logit's sink saw answered that the relay never counted FAILs, got "
+               f"{short}")
+        stopped = row("relay-delivered-stopped", action="stop", sut_extra=delivered(6250))
+        expect(stopped is not None and stopped.status == checks.FAIL
+               and "ΣE_r 6,200 against Del 6,250 = 6,250, 50 delivered" in stopped.detail,
+               f"with every relay life seen to its last drain no interval is allowed, got "
+               f"{stopped}")
+        burst = row("relay-delivered-bursty", bursty=True, sut_extra=delivered(6400))
+        expect(burst is not None and burst.status == checks.PASS
+               and "ΣE_r 6,200 against Del 6,400 − 200 (the busiest recent drain interval" in
+               burst.detail and "= 6,200, ok" in burst.detail,
+               f"a flush the killed relay answered after its last drain, an empty one, is "
+               f"allowed by the busiest of its recent drain intervals, got {burst}")
+        unwritten = row("relay-delivered-unwritten", sut_extra=delivered(
+            6400, at(100, "logit.output.metrics.skipped", 200, component="sink",
+                     metric_kind="gauge_histogram")))
+        expect(unwritten is not None and unwritten.status == checks.PASS
+               and "Del 6,400 − unwritten 200 − 100" in unwritten.detail,
+               f"records the sink's encoder skipped never reach the relay, got {unwritten}")
+
+        early = row("relay-stopped-short", action="stop",
+                    extra=[at(100, "logit.component.events.delivered", -10)])
+        expect(early is not None and early.status == checks.FAIL
+               and "collector life 0: E_r − X_r 4,000 − 0 − S_r 4,000 = 0; S_r − Del_r − "
+                   "Drop_r 4,000 − 3,990 − 0 = 10, past the sink 10 uncounted" in early.detail,
+               f"a life a stop ended is judged, got {early}")
+        killed = row("relay-killed-short",
+                     extra=[at(100, "logit.component.events.delivered", -10)])
+        expect(killed is not None and killed.status == checks.PASS
+               and "= 10, reported: a kill loses" in killed.detail,
+               f"a killed life's gap is reported, not judged, got {killed}")
+        unstopped = row("relay-unstopped", stopped=False, extra=lost)
+        expect(unstopped is not None and unstopped.status == checks.PASS
+               and "reported: the end sequence didn't stop the relay" in unstopped.detail,
+               f"a final life the end sequence didn't stop is reported, got {unstopped}")
+        unnamed = row("relay-unnamed", keys=False)
+        expect(unnamed is not None and unnamed.status == checks.SKIP
+               and "no `relay_listener` and `relay_sink`" in unnamed.detail,
+               f"a resolved scenario without the relay's components SKIPs, got {unnamed}")
+        no_relay = [r for r in checks.run_all(_ledger_run(tmp, "relay-none"))
+                    if r.id == "ledger.relay"]
+        expect(no_relay == [], f"a run with no relay has no ledger.relay row, got {no_relay}")
 
 
 # Two SUT services: `logit` holds the listener `in` and a `hop` sink, `collector` holds
@@ -9149,7 +9387,6 @@ def _standin_server(root):
     cued status with its body, `apply`, a reset, a write to the wrong path, and the record line
     each prints; and `faults.post_cue` against its control port."""
     import http.client
-    import http.server
     import io
     import threading
     server = _load_standin_server(root)
@@ -9170,8 +9407,8 @@ def _standin_server(root):
            "an empty cue and a full one are accepted")
 
     state = server.State("remote_write", "/api/v1/write")
-    data = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.data_handler(state))
-    control = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.control_handler(state))
+    data = server.Server(("127.0.0.1", 0), server.data_handler(state))
+    control = server.Server(("127.0.0.1", 0), server.control_handler(state))
     threads = [threading.Thread(target=one.serve_forever, daemon=True) for one in (data, control)]
     for thread in threads:
         thread.start()
@@ -9423,7 +9660,6 @@ def _standin_count(root):
     the step's cue and timeline carrying it, and `ledger.standin` FAILing a counted step whose
     cue answered fewer writes than its count."""
     import http.client
-    import http.server
     import io
     import threading
     server = _load_standin_server(root)
@@ -9437,8 +9673,8 @@ def _standin_count(root):
            "a counted reset is accepted")
 
     state = server.State("remote_write", "/api/v1/write")
-    data = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.data_handler(state))
-    control = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.control_handler(state))
+    data = server.Server(("127.0.0.1", 0), server.data_handler(state))
+    control = server.Server(("127.0.0.1", 0), server.control_handler(state))
     for one in (data, control):
         threading.Thread(target=one.serve_forever, daemon=True).start()
     printed = io.StringIO()
@@ -9513,16 +9749,41 @@ def _standin_count(root):
 
 
 
+def _standin_quiet_errors(root):
+    """The stand-in's `Server` prints nothing when a client closes or resets its connection
+    under a handler, and prints any other handler error's traceback."""
+    server = _load_standin_server(root)
+    one = server.Server(("127.0.0.1", 0), server.data_handler(
+        server.State("remote_write", "/api/v1/write")))
+    printed = {}
+    real_stderr = sys.stderr
+    try:
+        for error in (ConnectionResetError(104, "Connection reset by peer"),
+                      BrokenPipeError(32, "Broken pipe"), ValueError("a handler bug")):
+            sys.stderr = io.StringIO()
+            try:
+                raise error
+            except Exception:
+                one.handle_error(None, ("127.0.0.1", 1))
+            printed[type(error).__name__] = sys.stderr.getvalue()
+    finally:
+        sys.stderr = real_stderr
+        one.server_close()
+    expect(printed["ConnectionResetError"] == "" and printed["BrokenPipeError"] == "",
+           f"a client's reset or close prints nothing, got {printed}")
+    expect("ValueError: a handler bug" in printed["ValueError"],
+           f"any other handler error prints its traceback, got {printed['ValueError']!r}")
+
+
 def _standin_idle_timeout(root):
     """`data_handler`'s `idle_timeout`: the stand-in closes a keep-alive connection that stays
     idle past it, which `--idle-timeout` sets."""
-    import http.server
     import io
     import socket
     import threading
     server = _load_standin_server(root)
     state = server.State("remote_write", "/api/v1/write")
-    data = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.data_handler(state, 0.5))
+    data = server.Server(("127.0.0.1", 0), server.data_handler(state, 0.5))
     threading.Thread(target=data.serve_forever, daemon=True).start()
     real_stdout = server.sys.stdout
     server.sys.stdout = io.StringIO()
@@ -9899,7 +10160,6 @@ def _datadog_server(root):
     default `202` on `/api/v2/series`, and a `series_errors` answer whose body `datadog_out`'s
     `series_errors` reads as N entries, recorded with the count."""
     import http.client
-    import http.server
     import io
     import threading
     server = _load_standin_server(root)
@@ -9931,8 +10191,8 @@ def _datadog_server(root):
         return found
 
     state = server.State("datadog", "/api/v2/series")
-    data = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.data_handler(state))
-    control = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.control_handler(state))
+    data = server.Server(("127.0.0.1", 0), server.data_handler(state))
+    control = server.Server(("127.0.0.1", 0), server.control_handler(state))
     for one in (data, control):
         threading.Thread(target=one.serve_forever, daemon=True).start()
     printed = io.StringIO()
@@ -9988,7 +10248,6 @@ def _written_counts(root):
     scenario step, and `ledger.standin` holding a short count to the sink's
     `samples.dropped{reason="not_written"}`."""
     import http.client
-    import http.server
     import io
     import threading
     server = _load_standin_server(root)
@@ -10006,8 +10265,8 @@ def _written_counts(root):
            "a 2xx cue with empty headers is accepted")
 
     state = server.State("remote_write", "/api/v1/write")
-    data = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.data_handler(state))
-    control = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.control_handler(state))
+    data = server.Server(("127.0.0.1", 0), server.data_handler(state))
+    control = server.Server(("127.0.0.1", 0), server.control_handler(state))
     for one in (data, control):
         threading.Thread(target=one.serve_forever, daemon=True).start()
     printed = io.StringIO()
@@ -10547,13 +10806,12 @@ def _influx_server(root):
     `Content-Length` and no body on `/api/v2/write`, a second request on the same connection,
     the query split off the path and recorded, a cued status, and `404` off the path."""
     import http.client
-    import http.server
     import io
     import threading
     server = _load_standin_server(root)
     state = server.State("influxdb", "/api/v2/write")
-    data = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.data_handler(state))
-    control = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.control_handler(state))
+    data = server.Server(("127.0.0.1", 0), server.data_handler(state))
+    control = server.Server(("127.0.0.1", 0), server.control_handler(state))
     for one in (data, control):
         threading.Thread(target=one.serve_forever, daemon=True).start()
     printed = io.StringIO()
@@ -10884,13 +11142,12 @@ def _standin_on_loopback(root, shape, path, exchange):
     where `request(method, path, body, headers)` returns `(status, headers, body)` and
     `cue(obj)` posts a cue; returns the record lines it printed."""
     import http.client
-    import http.server
     import io
     import threading
     server = _load_standin_server(root)
     state = server.State(shape, path)
-    data = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.data_handler(state))
-    control = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.control_handler(state))
+    data = server.Server(("127.0.0.1", 0), server.data_handler(state))
+    control = server.Server(("127.0.0.1", 0), server.control_handler(state))
     for one in (data, control):
         threading.Thread(target=one.serve_forever, daemon=True).start()
     printed = io.StringIO()
@@ -11401,7 +11658,7 @@ def _overlap_rules(root):
     refused(step(at="4m", action="partition", on="logit-b"),
             "so put partition on sut-net", "a partition of an instance")
     refused(step(at="4m", action="stop", on="sut-net"),
-            "the holder takes netem and partition only", "a stop of the holder")
+            "the holder takes netem, partition, and reset only", "a stop of the holder")
     refused(step(at="20s", action="pause", on="logit-b"),
             "stop on logit and pause on logit-b overlap; with every instance held",
             "lifecycle faults on two instances overlapping")
@@ -11791,8 +12048,8 @@ IDP_MODES = {"logit": "service:sut-net", "idp": "service:sut-net"}
 def _idp_rules(root):
     """An `idp`'s namespace: the role map's rules (a holder only beside an idp, an idp only
     beside one holder, never with `[overlap]` or a further SUT), `logit` and the idp in the
-    holder's namespace, netem and partition on the holder only, no lifecycle fault on it, and
-    the fault predicates, under which an idp's lifecycle faults affect egress alone."""
+    holder's namespace, netem, partition, and reset on the holder only, no lifecycle fault on
+    it, and the fault predicates, under which an idp's lifecycle faults affect egress alone."""
     path = root / "scenarios" / "kafka-oauth-reauth" / "scenario.toml"
     raw = tomllib.loads(path.read_text())
     loaded = scenario.load(path)
@@ -11818,7 +12075,7 @@ def _idp_rules(root):
             "idp shares sut-net's network namespace, so put partition on sut-net",
             "a partition of the idp")
     refused(step(at="12m40s", action="stop", on="sut-net"),
-            "the holder takes netem and partition only; any other fault on it takes logit, "
+            "the holder takes netem, partition, and reset only; any other fault on it takes logit, "
             "idp's network away", "a stop of the holder")
     refused(lambda r: None, "an idp shares logit's network namespace through a netns holder, "
             "and the stack has none", "an idp with no holder",
@@ -12324,7 +12581,7 @@ def _tls_rules(root):
         (step(1, cert="statsd"), "`cert` is for rotate and probe only", "cert on a signal"),
         (step(1, days=31), "`days` is for rotate only", "days on a signal"),
         (step(4, broken=True), "`broken` is for rotate only", "broken on a restart"),
-        (step(0, port=8125), "`port` is for probe only", "port on a rotate"),
+        (step(0, port=8125), "`port` is for probe and reset only", "port on a rotate"),
         (step(2, port=None), "probe needs `port`", "a probe with no port"),
         (step(2, port=0), "`port` must be a port number", "port 0"),
         (step(2, port=70000), "`port` must be a port number", "a port past 65535"),
@@ -12424,6 +12681,131 @@ def _tls_rules(root):
                                        "for": {"min": "10s", "max": "20s"}})
         _refused(random_path, raw, f"{action} opens no fault window",
                  f"a {action} in a [random] schedule")
+
+
+class _NetemDocker:
+    """Records each `run_oneshot` call and answers with the next of `answers`."""
+
+    def __init__(self, answers):
+        self.calls = []
+        self.answers = list(answers)
+
+    def run_oneshot(self, args, timeout=None):
+        self.calls.append(list(args))
+        return self.answers.pop(0)
+
+    def __getattr__(self, name):
+        raise AssertionError(f"_NetemDocker.{name} called")
+
+
+def _reset_actions():
+    """A `reset` runs netem.sh's `reset` in the target's namespace with NET_ADMIN, passing its
+    `port` when it has one, and records how many connections `ss -K` closed; one that closed
+    none, printed no count, or failed fails the step; its revert makes no call; and on TCP its
+    window is reported, while on HTTP it's judged."""
+    closed = "10.0.0.3:41000 10.0.0.2:6514\n"
+    fake = _NetemDocker([docker.Result(0, closed + '{"killed": 1}\n', ""),
+                         docker.Result(0, '{"killed": 0}\n', ""),
+                         docker.Result(0, "", ""),
+                         docker.Result(2, "", "usage: netem.sh set ..."),
+                         docker.Result(0, '{"killed": 3}\n', "")])
+    ctx = faults.Context(docker=fake, ids={"generator": "gen"}, netem_image="netem")
+    step = scenario.Step("c0s7", 6, 0, "reset", "generator", "", 675.0, 690.0, port=6514)
+    result = faults.ACTIONS["reset"].apply(ctx, step)
+    expect(fake.calls[-1] == ["--network", "container:gen", "--cap-add", "NET_ADMIN",
+                              "--security-opt", "label=disable", "netem", "reset", "6514"]
+           and result["rc"] == 0 and result["killed"] == 1
+           and result["closed"] == ["10.0.0.3:41000 10.0.0.2:6514"],
+           f"a reset closes the port's connections in the target's namespace, got "
+           f"{fake.calls[-1]} {result}")
+    result = faults.ACTIONS["reset"].apply(ctx, step)
+    expect(result["rc"] == 1 and "closed no established TCP connection on port 6514" in
+           result["stderr"] and "CONFIG_INET_DIAG_DESTROY" in result["stderr"]
+           and "SELinux" in result["stderr"],
+           f"a reset that closed nothing fails the step, got {result}")
+    result = faults.ACTIONS["reset"].apply(ctx, step)
+    expect(result["rc"] == 1 and "printed no count" in result["stderr"],
+           f"a reset with no count fails the step, got {result}")
+    result = faults.ACTIONS["reset"].apply(ctx, step)
+    expect(result["rc"] == 2 and "usage" in result["stderr"],
+           f"a failed reset keeps its rc and stderr, got {result}")
+    every = scenario.Step("c0s8", 7, 0, "reset", "generator", "", 700.0, 710.0)
+    result = faults.ACTIONS["reset"].apply(ctx, every)
+    expect(fake.calls[-1][-1] == "reset" and result["rc"] == 0 and result["killed"] == 3,
+           f"a reset with no port closes every established connection, got {fake.calls[-1]} "
+           f"{result}")
+    calls = len(fake.calls)
+    expect(faults.ACTIONS["reset"].revert(ctx, step) == {"rc": 0, "stderr": ""}
+           and len(fake.calls) == calls, "a reset's revert makes no Docker call")
+    roles = {"logit": "sut", "generator": "generator", "victoria-metrics": "backend"}
+    action = faults.ACTIONS["reset"]
+    on_gen = scenario.Step("x", 0, 0, "reset", "generator", "", 0.0, 1.0)
+    on_vm = scenario.Step("x", 0, 0, "reset", "victoria-metrics", "", 0.0, 1.0)
+    expect(action.affects("tcp", on_gen, roles) and action.affects("http", on_gen, roles)
+           and not action.affects("udp", on_gen, roles)
+           and not action.affects("file", on_gen, roles)
+           and action.affects_egress(on_vm, roles) and not action.affects("tcp", on_vm, roles),
+           "a reset affects TCP and HTTP ingress from a generator, never UDP or a file, and "
+           "egress at a backend")
+    fault = checks.Fault(step="c0s7", action="reset", on="generator", start=0.0, end=1.0,
+                         affects_udp_ingress=False, affects_egress=False)
+    expect(checks.wire_judgment(fault, "tcp") == "fault"
+           and checks.wire_judgment(fault, "http") == "judged",
+           "a reset's window is reported on TCP and judged on HTTP")
+
+
+def _reset_rules(root):
+    """`load()`'s rules for a `reset` step's `port`, a reset under `[overlap]` held to the
+    holder, and the shipped syslog-tcp-ingress scenario's reset with its positive expectation."""
+    path, raw = _base(root)
+
+    def with_step(**fields):
+        changed = copy.deepcopy(raw)
+        changed["step"] = [{"at": "0s", "action": "reset", "on": "logit", "for": "10s",
+                            **fields}]
+        return changed
+
+    for fields in ({}, {"port": 8125}):
+        try:
+            loaded = scenario.from_dict(with_step(**fields), path)
+            scenario.validate(loaded)
+            expect(loaded.steps[0].port == fields.get("port"), "")
+        except scenario.ScenarioError as err:
+            expect(False, f"a reset with {fields or 'no port'} loads, got {err.problems}")
+    for port in (0, 70000, "6514", True):
+        _refused(path, with_step(port=port), "`port` must be a port number, 1 to 65535",
+                 f"a reset's port {port!r}")
+    changed = copy.deepcopy(raw)
+    changed["step"][0]["port"] = 8125
+    _refused(path, changed, "`port` is for probe and reset only",
+             f"port on a {raw['step'][0]['action']}")
+    over_path = root / "scenarios" / "rolling-overlap" / "scenario.toml"
+    over = tomllib.loads(over_path.read_text())
+    holder = over["overlap"]["holder"]
+    member = over["overlap"]["instances"][0]
+    over["step"] = [{"at": "0s", "action": "reset", "on": member, "for": "10s"}]
+    _refused(over_path, over, f"put reset on {holder}", "a reset on an overlap instance",
+             roles=OVERLAP_ROLES)
+
+    shipped = scenario.load(root / "scenarios" / "syslog-tcp-ingress" / "scenario.toml")
+    resets = [one for one in scenario.expand(shipped) if one.action == "reset"]
+    rows = {exp.name: exp.to_json() for exp in shipped.expectations}
+    expect(len(resets) == 1 and resets[0].on == "generator" and resets[0].port == 6514,
+           f"syslog-tcp-ingress resets the generator's connection to the listener's port, got "
+           f"{resets}")
+    counted = rows.get("reset-counted", {})
+    expect(resets and counted.get("step") == resets[0].id and counted.get("min") == 1
+           and counted.get("metric") == "logit.input.connections.closed"
+           and counted.get("attrs") == {"component": "syslog", "reason": "reset"}
+           and all(exp.get("max") == 1 for exp in rows.values()
+                   if exp.get("window") == "run"
+                   and exp.get("attrs", {}).get("reason") == "reset"),
+           f"its reset-counted expectation reads at least one reset in the reset's window, and "
+           f"no run-wide row holds resets below the one the step sends, got {counted}")
+    whole = rows.get("resets-run", {})
+    expect(whole.get("window") == "run" and whole.get("max") == 1
+           and whole.get("attrs") == {"component": "syslog", "reason": "reset"},
+           f"a run-wide row holds the run to the one reset the step sends, got {whole}")
 
 
 class _CertsDocker:
@@ -13606,7 +13988,8 @@ def _scrape_ledger():
     its end band, a killed life's band reaching below 0 and a stopped life's not, a loss or a
     surplus past the band FAILing, a failed scrape losing nothing, V split at the generator's
     lives, the synthetic samples in E as Y, the samples judged from the listener to the stored
-    export, and recovery judged by a sample scraped."""
+    export, the batches the listener dropped capped at X / 3 when a scrape never reached the
+    sink, and recovery judged by a sample scraped."""
     with tempfile.TemporaryDirectory() as tmp:
         def rows(name, **kwargs):
             return {r.id: r for r in checks.run_all(_scrape_run(tmp, name, **kwargs))}
@@ -13703,6 +14086,16 @@ def _scrape_ledger():
                and "W − X 120 − V_n 118 = 2, counted: within the sink's 2 samples dropped"
                in refused["ledger.egress"].detail,
                f"a sink's dropped batch counts its samples, got {refused['ledger.egress']}")
+        # A scrape whose batch the sink's telemetry never counted received, though the sink
+        # stored it, and that no listener drop explains: X is 0, so the batches it dropped are
+        # capped at 0, and the scrape's synthetic samples stay out of W − X.
+        uncounted_batch = [_line(_stamp(T0 + 320), "logit.component.batches.received", "sum",
+                                 -1, component="sink")]
+        unreached = rows("scrape-batch-unreached", sut_extra=uncounted_batch)
+        expect(unreached["ledger.egress"].status == checks.PASS
+               and "W − X 120 − V_n 120 = 0, exact" in unreached["ledger.egress"].detail,
+               f"a scrape that never reached the sink, with no listener drop, adds no "
+               f"synthetic samples to W − X, got {unreached['ledger.egress']}")
         missing = [_line(_stamp(T0 + 100), "logit.input.samples", "sum", 2, component="scrape")]
         past = rows("scrape-sink-dropped-past", sink_dropped=(99,), sut_extra=missing)
         expect(past["ledger.egress"].status == checks.FAIL
@@ -15211,11 +15604,11 @@ def run(root, quiet=False):
                      _cri_gone, _backstop_ledger,
                      _file_ops, _file_action_rules, _copytruncate_ledger, _two_sut_rules,
                      _two_sut_driver, _two_sut_checks, _relay_rules, _relay_driver,
-                     _relay_checks, _per_service, _slope_edges,
+                     _relay_checks, _relay_ledger, _per_service, _slope_edges,
                      _rss_settle_rules, _rss_settle_checks, _rss_life_warmup,
                      _expected_rules, _slope_reducer, _standin_codec, _standin_record_parts,
                      _standin_server, _respond_rules, _standin_count, _standin_idle_timeout,
-                     _standin_driver,
+                     _standin_quiet_errors, _standin_driver,
                      _standin_checks, _class_signatures, _written_counts, _datadog_codec,
                      _datadog_counts, _datadog_server,
                      _datadog_rules, _datadog_checks, _influx_codec, _influx_points,
@@ -15225,6 +15618,7 @@ def run(root, quiet=False):
                      _overlap_driver, _overlap_checks, _idp_rules, _refresh_checks,
                      _signal_rules, _signal_actions, _sighup_driver,
                      _reopen_checks, _tls_rules, _tls_actions, _tls_driver, _tls_checks,
+                     _reset_actions, _reset_rules,
                      _fan_out_ledger, _idle_writer, _boundary_skew, _fan_out_rules,
                      _sampling_vectors, _absent_rules, _absent_checks, _merge_ledger,
                      _merge_rules, _delta_ledger, _delta_rules, _scrape_ledger,
@@ -15241,14 +15635,14 @@ def run(root, quiet=False):
                               _two_sut_driver, _file_action_rules, _relay_rules, _relay_driver,
                               _rss_settle_rules, _expected_rules, _standin_codec, _standin_server,
                               _respond_rules, _standin_count, _standin_idle_timeout,
-                              _standin_driver, _written_counts, _datadog_codec,
+                              _standin_quiet_errors, _standin_driver, _written_counts, _datadog_codec,
                               _datadog_server,
                               _datadog_rules, _influx_codec, _influx_server, _influx_rules,
                               _otlp_standin_codec, _splunk_codec, _otlp_standin_server,
                               _splunk_server, _new_shape_rules,
                               _overlap_rules, _overlap_driver, _idp_rules, _signal_rules,
                               _sighup_driver,
-                              _tls_rules, _tls_driver, _fan_out_rules, _sampling_vectors,
+                              _tls_rules, _tls_driver, _reset_rules, _fan_out_rules, _sampling_vectors,
                               _absent_rules, _merge_rules, _delta_rules, _scrape_rules)
                 part(root) if part in takes_root else part()
             except Exception as err:  # report the part that broke, then keep going

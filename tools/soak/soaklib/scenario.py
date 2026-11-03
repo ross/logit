@@ -92,9 +92,12 @@ STANDIN_ROLES = {"standin": STANDIN_ROLE}
 
 # Every action the scenario schema accepts. faults.py implements them; the names must match its
 # ACTIONS.
-ACTION_NAMES = ("netem", "pause", "stop", "kill", "restart", "partition", "mark", "exit",
-                "respond", "signal", "rename", "rotate", "probe", "copytruncate", "gzip",
+ACTION_NAMES = ("netem", "pause", "stop", "kill", "restart", "partition", "reset", "mark",
+                "exit", "respond", "signal", "rename", "rotate", "probe", "copytruncate", "gzip",
                 "replace")
+# The actions that take `port`: a `probe`, which needs the listener's, and a `reset`, which
+# closes only the connections whose local or remote port it is, and every one without it.
+PORT_ACTIONS = ("probe", "reset")
 # Actions allowed on a SUT service only, each with the reason. A `kill` exists to end a `logit`
 # process with no shutdown; on the generator, the lines it sent after its last telemetry drain
 # reach the SUT with no G behind them, and `ledger.wire` would net them against real loss. An
@@ -330,9 +333,9 @@ OVERLAP_KEYS = {"holder", "instances", "label"}
 _LABEL_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # The actions allowed on a namespace holder, and refused on a service in its namespace (an
 # overlap's instance, or `logit` or an `idp` beside one): a member shares the holder's
-# namespace, so a netem or a partition of it is one of the holder, and a lifecycle fault of the
-# holder would take every member's network away at once.
-HOLDER_ACTIONS = ("netem", "partition")
+# namespace, so a netem, a partition, or a reset of it is one of the holder, and a lifecycle
+# fault of the holder would take every member's network away at once.
+HOLDER_ACTIONS = ("netem", "partition", "reset")
 # The actions that hold an instance's port or process, which may not overlap across instances:
 # with every instance held at once nothing reads the port.
 INSTANCE_HOLD_ACTIONS = ("pause", "stop", "kill", "restart", "exit")
@@ -358,9 +361,13 @@ ROUTER_KINDS = ("route", "route_signals")
 # selector V is read with (both local only), under `split = "route"` or `"target"` the `target`
 # feeding it, and under `"target"` its own `aggregate` and the `transforms` between the target
 # and that `aggregate`, in order. A local sink may add `vm_absent_selector`, a selector its
-# backend must hold no series for at the end (checks.py's `check_ledger_absent`).
+# backend must hold no series for at the end (checks.py's `check_ledger_absent`). A sink whose
+# writes a further SUT service carries on names it in `relay`, with `relay_listener`, the relay's
+# listener the sink writes to, and `relay_sink`, the relay's sink that listener alone feeds
+# and whose only source it is, which `ledger.relay` balances per relay life (checks.py's `check_ledger_relay`).
 SINK_KEYS = {"id", "backend", "vm_selector", "target", "aggregate", "transforms",
-             "vm_absent_selector", "relay"}
+             "vm_absent_selector", "relay", "relay_listener", "relay_sink"}
+RELAY_SINK_KEYS = ("relay_listener", "relay_sink")
 _COMPONENT_ID = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
 THRESHOLD_KEYS = {"progress_window", "rss_growth_mib_per_hour", "fd_growth"}
 EXPECT_KEYS = {"name", "service", "metric", "component", "attrs", "step", "window", "reduce",
@@ -999,6 +1006,7 @@ def from_dict(raw, path):
         if overlap is None:
             problems += _hop_problems(ledger, extra_suts)
             problems += _relay_problems(ledger, extra_suts, target["kind"])
+            problems += _relay_config_problems(ledger, configs, path.parent)
         else:
             if _relays(ledger):
                 problems.append("[overlap] can't be combined with a sink's `relay`: each "
@@ -2091,6 +2099,21 @@ def _hop_problems(ledger, extra_suts):
     return problems
 
 
+def config_sources(text, component):
+    """The `sources:` component `component` lists in a YAML config, flow (`[a, b]`) or block
+    style, or [] when it lists none. Comments are ignored."""
+    for block in component_blocks(text, component):
+        body = "\n".join(re.sub(r"(^|\s)#.*$", "", line) for line in block.splitlines())
+        flow = re.search(r"\bsources\s*:\s*\[([^\]]*)\]", body)
+        if flow:
+            return [one.strip().strip("\"'") for one in flow.group(1).split(",") if one.strip()]
+        listed = re.search(r"\bsources\s*:\s*\n((?:\s*-\s*\S+\s*\n?)+)", body)
+        if listed:
+            return [line.strip().lstrip("-").strip().strip("\"'")
+                    for line in listed.group(1).splitlines() if line.strip()]
+    return []
+
+
 def _relays(ledger):
     """The `relay` each `[[ledger.sink]]` table names, in order."""
     sinks = ledger.get("sink") if isinstance(ledger.get("sink"), list) else []
@@ -2120,6 +2143,75 @@ def _relay_problems(ledger, extra_suts, kind):
     if ledger.get("hop") is not None:
         problems.append("ledger.hop and a sink's `relay` can't be combined: a hop puts "
                         f"`aggregate` in the far SUT, a relay keeps it in {SUT_SERVICE}")
+    return problems
+
+
+def _relay_config_problems(ledger, configs, directory):
+    """What a `[[ledger.sink]]`'s `relay_listener` and `relay_sink` break: each is a component
+    id, set together and only beside `relay`; no two sinks share a `relay_listener`; and, in the
+    relay's config, the listener is an `_in` kind whose events the named `_out` sink alone
+    takes, from the listener directly, and that sink reads no other source, so `ledger.relay`'s
+    balance has no node, copy, or other input between the two."""
+    sinks = ledger.get("sink") if isinstance(ledger.get("sink"), list) else []
+    problems = []
+    listeners = []
+    for index, sink in enumerate(sinks):
+        if not isinstance(sink, dict):
+            continue
+        where = f"ledger.sink {index + 1}"
+        named = [key for key in RELAY_SINK_KEYS if key in sink]
+        if "relay" not in sink:
+            if named:
+                problems.append(f"{where}: `{named[0]}` names a relay's component, and the "
+                                "sink names no `relay`")
+            continue
+        missing = [key for key in RELAY_SINK_KEYS if key not in sink]
+        if missing:
+            problems.append(f"{where}: a sink with a `relay` names the relay's "
+                            f"`relay_listener` and `relay_sink`; it's missing `{missing[0]}`")
+            continue
+        ids = {key: sink[key] for key in RELAY_SINK_KEYS}
+        bad = [key for key, value in ids.items()
+               if not isinstance(value, str) or not _COMPONENT_ID.match(value)]
+        if bad:
+            problems.append(f"{where}: `{bad[0]}` must name a component id")
+            continue
+        listener, relay_sink = ids["relay_listener"], ids["relay_sink"]
+        if listener in listeners:
+            problems.append(f"{where}: `relay_listener` {listener} is another sink's too; each "
+                            "sink writes to a relay listener of its own")
+        listeners.append(listener)
+        relay = sink["relay"]
+        name = configs.get(relay) if isinstance(configs, dict) and isinstance(relay, str) else None
+        if not isinstance(name, str) or not (directory / name).is_file():
+            continue
+        text = (directory / name).read_text()
+        kind = listener_wire(text, listener)[1]
+        if kind is None or not kind.endswith("_in"):
+            problems.append(f"{where}: `relay_listener` {listener} must be a listener in "
+                            f"{name}" + (f", and it's a {kind}" if kind else ", which has no "
+                                         "such component"))
+        sink_kind = listener_wire(text, relay_sink)[1]
+        if sink_kind is None:
+            problems.append(f"{where}: `relay_sink` {relay_sink} isn't a component in {name}")
+            continue
+        if not sink_kind.endswith("_out"):
+            problems.append(f"{where}: `relay_sink` {relay_sink} must be a sink in {name}, "
+                            f"and its kind is {sink_kind}")
+        sources = config_sources(text, relay_sink)
+        if listener not in sources:
+            problems.append(f"{where}: `relay_sink` {relay_sink} must take `relay_listener` "
+                            f"{listener}'s events directly, in its `sources:`")
+        elif sources != [listener]:
+            others = ", ".join(one for one in sources if one != listener)
+            problems.append(f"{where}: `relay_sink` {relay_sink} reads {others} too; its only "
+                            f"source must be `relay_listener` {listener}")
+        ids_in_file = re.findall(r"^  ([A-Za-z0-9_][A-Za-z0-9_.-]*)\s*:", text, re.M)
+        others = [one for one in ids_in_file
+                  if one != relay_sink and listener in config_sources(text, one)]
+        if others:
+            problems.append(f"{where}: `relay_listener` {listener} feeds {others[0]} too; "
+                            f"`relay_sink` {relay_sink} must take its events alone")
     return problems
 
 
@@ -2258,8 +2350,8 @@ def _overlap_problems(overlap, ledger, configs, extra_suts, directory):
 
 
 def _overlap_step_problems(scenario):
-    """What the steps break of `[overlap]`'s rules: on the holder only `netem` and `partition`,
-    on an instance neither, and no two `INSTANCE_HOLD_ACTIONS` steps on different instances
+    """What the steps break of `[overlap]`'s rules: on the holder only `netem`, `partition`, and
+    `reset`, on an instance none of them, and no two `INSTANCE_HOLD_ACTIONS` steps on different instances
     overlapping, since with every instance held nothing reads the port. A `[random]` fault on
     the holder or an instance is held to the first two; its draws never overlap."""
     overlap = scenario.overlap
@@ -2274,7 +2366,7 @@ def _overlap_step_problems(scenario):
                     for t in scenario.random.faults]
     for where, action, on in entries:
         if on == holder and action not in HOLDER_ACTIONS:
-            problems.append(f"{where}: the holder takes {' and '.join(HOLDER_ACTIONS)} only; "
+            problems.append(f"{where}: the holder takes {_listed(HOLDER_ACTIONS)} only; "
                             "any other fault on it takes every instance's network away")
         elif on in instances and action in HOLDER_ACTIONS:
             problems.append(f"{where}: an instance shares {holder}'s network namespace, so put "
@@ -2294,9 +2386,9 @@ def _overlap_step_problems(scenario):
 
 def _idp_namespace_problems(scenario, roles, modes=None):
     """What an `idp`'s namespace breaks, with no `[overlap]`: with `modes`, `logit` and each
-    `idp` in the holder's namespace; on the holder only `netem` and `partition`, and on a member
-    neither. A member shares the holder's namespace, so a netem or a partition of it is one of
-    the holder, and a lifecycle fault of the holder takes every member's network away. A
+    `idp` in the holder's namespace; on the holder only `netem`, `partition`, and `reset`, and
+    on a member none of them. A member shares the holder's namespace, so a netem, a partition,
+    or a reset of it is one of the holder, and a lifecycle fault of the holder takes every member's network away. A
     `[random]` fault is held to the same."""
     netns = [n for n, r in roles.items() if r == NETNS_ROLE]
     idps = sorted(n for n, r in roles.items() if r == IDP_ROLE)
@@ -2319,7 +2411,7 @@ def _idp_namespace_problems(scenario, roles, modes=None):
                     for t in scenario.random.faults]
     for where, action, on in entries:
         if on == holder and action not in HOLDER_ACTIONS:
-            problems.append(f"{where}: the holder takes {' and '.join(HOLDER_ACTIONS)} only; "
+            problems.append(f"{where}: the holder takes {_listed(HOLDER_ACTIONS)} only; "
                             f"any other fault on it takes {', '.join(members)}'s network away")
         elif on in members and action in HOLDER_ACTIONS:
             problems.append(f"{where}: {on} shares {holder}'s network namespace, so put "
@@ -3027,11 +3119,20 @@ def _file_action_problems(scenario, duration):
     return problems
 
 
+def _listed(words):
+    """`a`, `a and b`, or `a, b, and c`."""
+    words = list(words)
+    if len(words) < 3:
+        return " and ".join(words)
+    return ", ".join(words[:-1]) + ", and " + words[-1]
+
+
 def _tls_step_problems(spec, where, tls):
     """What a step breaks of the `rotate` and `probe` keys: `cert`, a `[tls.cert]` name,
     required on both and refused elsewhere; `days`, a whole number above `TLS_INITIAL_DAYS`,
     required on a `rotate`, and `broken`, true or false, allowed on one only; `port`, 1 to
-    65535, required on a `probe` only, whose `cert` is a `server` one. `_rotate_problems()`
+    65535, required on a `probe`, whose `cert` is a `server` one, optional on a `reset`, and
+    refused elsewhere. `_rotate_problems()`
     checks the steps against each other and the configs."""
     problems = []
     certs = tls or {}
@@ -3062,16 +3163,16 @@ def _tls_step_problems(spec, where, tls):
         for name in ("days", "broken"):
             if getattr(spec, name) is not None:
                 problems.append(f"{where}: `{name}` is for rotate only")
-    if spec.action == "probe":
-        if spec.port is None:
-            problems.append(f"{where}: probe needs `port`, the listener's port in its service's "
-                            "network namespace")
-        elif (not isinstance(spec.port, int) or isinstance(spec.port, bool)
-              or not 1 <= spec.port <= 65535):
+    if spec.action == "probe" and spec.port is None:
+        problems.append(f"{where}: probe needs `port`, the listener's port in its service's "
+                        "network namespace")
+    elif spec.action in PORT_ACTIONS and spec.port is not None:
+        if (not isinstance(spec.port, int) or isinstance(spec.port, bool)
+                or not 1 <= spec.port <= 65535):
             problems.append(f"{where}: `port` must be a port number, 1 to 65535, got "
                             f"{spec.port!r}")
     elif spec.port is not None:
-        problems.append(f"{where}: `port` is for probe only")
+        problems.append(f"{where}: `port` is for {' and '.join(PORT_ACTIONS)} only")
     return problems
 
 

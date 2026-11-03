@@ -18,6 +18,14 @@ Facts a maintainer needs here (docs/plans/soak-harness.md, "Netem scope"):
   each network before the disconnect (`ips`) and after the reconnect (`ips_after`): a TCP peer's
   retransmits after a partition reach the container only at the address it had, and the
   reconnect may assign another.
+- A `reset` is a one-shot netem container in the target's network namespace running
+  `netem.sh reset`, which closes its established TCP connections, or those on the step's `port`,
+  with `ss -K`: the kernel sends each peer a reset, and the closing side reads `ECONNABORTED`.
+  `ss -K` needs CAP_NET_ADMIN, which the container gets, a kernel built with
+  `CONFIG_INET_DIAG_DESTROY`, without which it closes nothing, and, under SELinux, an
+  unconfined container (`--security-opt label=disable`, which a `reset` run passes). A reset that closed no
+  connection is `rc` 1, so `timeline` FAILs it and it gets no window. Its revert does nothing:
+  the client dials again on its own.
 - A `kill` is `docker kill -s KILL`: the process gets no shutdown signal, so it writes no final
   `internal` drain, no shutdown drops, and no `exiting` or `drain complete` line, and the container
   exits with `KILL_EXIT_CODE`. Its revert is a `docker start`, as a `stop`'s is. The container is
@@ -159,9 +167,11 @@ def netem_args(args):
 
 def _netem(ctx, step, *argv):
     container = ctx.ids[step.on]
+    # `ss -K` opens a sock_diag netlink socket, which SELinux denies a container_t container.
+    labels = ["--security-opt", "label=disable"] if argv[0] == "reset" else []
     return ctx.docker.run_oneshot(
-        ["--network", f"container:{container}", "--cap-add", "NET_ADMIN", ctx.netem_image,
-         *argv],
+        ["--network", f"container:{container}", "--cap-add", "NET_ADMIN", *labels,
+         ctx.netem_image, *argv],
     )
 
 
@@ -173,6 +183,26 @@ def netem_apply(ctx, step):
 def netem_revert(ctx, step):
     result = _netem(ctx, step, "clear")
     return _record(result, netem_show=result.stdout.strip())
+
+
+def reset_apply(ctx, step):
+    """Closes the target's established TCP connections, or those on `step.port` (netem.sh's
+    `reset`), recording how many it closed (`killed`)."""
+    result = _netem(ctx, step, "reset", *([str(step.port)] if step.port is not None else []))
+    lines = result.stdout.strip().splitlines()
+    try:
+        killed = json.loads(lines[-1]).get("killed") if lines else None
+    except (ValueError, AttributeError):
+        killed = None
+    record = _record(result, killed=killed, closed=lines[:-1][-20:])
+    if result.rc == 0 and not isinstance(killed, int):
+        record.update(rc=1, stderr="netem.sh reset printed no count")
+    elif result.rc == 0 and killed == 0:
+        where = f" on port {step.port}" if step.port is not None else ""
+        record.update(rc=1, stderr=(f"closed no established TCP connection{where}; ss -K closes "
+                                    "nothing on a kernel without CONFIG_INET_DIAG_DESTROY or "
+                                    "under an LSM (SELinux) denial of the sock_diag socket"))
+    return record
 
 
 def pause_apply(ctx, step):
@@ -512,6 +542,18 @@ ACTIONS = {
         apply=partition_apply,
         revert=partition_revert,
         affects_udp_ingress=_lifecycle_on_ingress_sut_or_generator_partition,
+        affects_egress=_on_sut_or_destination,
+        affects_tcp_ingress=_on_ingress_sut_or_generator,
+        affects_file_ingress=_never,
+        affects_http_ingress=_on_ingress_sut_or_generator,
+        affects_kafka_ingress=_on_kafka_path,
+    ),
+    # A reset can lose what sat in either side's socket buffers on any TCP path through the
+    # target: ingress to an ingress SUT or from a generator, a sink's egress, a Kafka fetch.
+    "reset": Action(
+        apply=reset_apply,
+        revert=no_op,
+        affects_udp_ingress=_never,
         affects_egress=_on_sut_or_destination,
         affects_tcp_ingress=_on_ingress_sut_or_generator,
         affects_file_ingress=_never,

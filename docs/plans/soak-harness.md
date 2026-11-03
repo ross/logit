@@ -222,7 +222,11 @@ settle window would leave a life no fit. `fanin` and `tcp-ingress` set `60s`, an
   wire's generator too, which sends nothing. W7a adds `mark` and `exit`
   (below). W9a adds `respond`, on a stand-in only (below). W12c adds `signal` and `rename`, on
   a service that runs `logit` (below), W12d `rotate` and `probe` (below), and `tailid/soak-claim`
-  `copytruncate`, `gzip`, and `replace`, on a file source's writer (below).
+  `copytruncate`, `gzip`, and `replace`, on a file source's writer (below). The round-3
+  follow-ups add `reset`, on any service: a one-shot netem container in its namespace closes
+  its established TCP connections with `ss -K`, or those on the step's optional `port`, 1 to
+  65535, and fails the step when it closed none. Under `[overlap]` or beside an `idp` it goes
+  on the holder, as `netem` and `partition` do.
 - `[ledger] vm_every_window`, optional, is `true` or `false`; `[ledger] sut_script`, optional,
   is a component id.
 - `[[ledger.source]]` (W8b) has the rules under "Sources" below.
@@ -672,7 +676,10 @@ services:
   in `relay`, there is no hop, and `logit` holds `sut_aggregate` and the sinks
   (`Scenario.sink_sut`, recorded as `sink_sut`), so every ledger row reads `logit`'s lives
   and V splits on them. The relay passes the sinks' writes on to their backend with `logit`'s
-  timestamps (item 25's `otlp-grpc-egress`).
+  timestamps (item 25's `otlp-grpc-egress`). Each such sink also names `relay_listener`, the
+  relay's listener it writes to, and `relay_sink`, the relay's sink that listener alone feeds,
+  directly; `load()` checks both against the relay's config, and `ledger.relay` (§6) balances
+  the relay between them.
 - From W10b a second SUT service needs a `[[ledger.hop]]` naming the native hop that joins it to
   `logit`, and a scenario has at most one hop, so at most two SUT services ("The native hop
   (W10b)" in §8d). From W12b an `[overlap]` table instead runs two or more instances of one
@@ -808,7 +815,7 @@ but never recreated. From W4 the driver appends it in chunks during the run (§5
 ### 4. Netem scope (W1a)
 
 Each netem change is a one-shot
-`docker run --rm --network container:<id> --cap-add NET_ADMIN logit-soak-netem set|clear|show`.
+`docker run --rm --network container:<id> --cap-add NET_ADMIN logit-soak-netem set|clear|show|reset`.
 The qdisc outlives the `tc` process, and nothing long-lived joins the target's namespace, so netem
 stays out of `compose up --wait`. The driver appends `limit 100000` unless the spec sets a
 `limit`, as headroom so netem's own queue never drops a packet: a delay on the generator at
@@ -1261,12 +1268,12 @@ The rows:
   line per source; the worst status wins.
 
   On a TCP wire (W11a) a fault is TCP-affecting when it's a lifecycle fault (`pause`, `stop`,
-  `kill`, `restart`) or a `partition` of the ingress SUT or of a generator, a `mark` or an
+  `kill`, `restart`), a `partition`, or a `reset` of the ingress SUT or of a generator, a `mark` or an
   `exit` on the ingress SUT, or netem on the ingress SUT, whose egress carries the ACKs. Netem on
   the generator isn't: TCP retransmits what it delays or drops, so its window is judged as steady
   state. Of the TCP-affecting windows only those that can reset the connection with lines in its
-  socket buffers are reported and not judged: a `stop`, `kill`, `restart`, or `exit`, and a
-  `partition` whose record shows the container's address changed or doesn't show the address
+  socket buffers are reported and not judged: a `stop`, `kill`, `restart`, `exit`, or `reset`,
+  and a `partition` whose record shows the container's address changed or doesn't show the address
   after it (`checks.wire_judgment`). Every other TCP-affecting window is **judged**: its loss
   counts with steady state's, against the same limit and edge tolerance, and its surplus, W + F
   above G, may not exceed one generator batch per ambiguous attempt the generator's stream sink
@@ -1616,6 +1623,19 @@ The rows:
   `tail-outage-stop` and `kafka-outage-stop`. A `min` of 1 says only that the drop happened, not
   how large it was: the excuse leaves its size unbounded by design, and a `max` on the same
   expectation bounds it.
+- `ledger.relay`, for a sink with a `relay` only, else no row: per relay life, in events,
+  E_r − X_r == S_r and S_r == Del_r + Drop_r, E_r and X_r the `relay_listener`'s events sent
+  and dropped (`shutdown` left out of X_r on an `HTTP_LISTENERS` kind, as on an HTTP wire),
+  S_r, Del_r, and Drop_r the `relay_sink`'s events received, delivered, and dropped. A life a
+  stop or a restart ended, and the final life once the end sequence stopped the relay, ends
+  with a drain after every data node has exited, so both gaps must be 0; a life a kill or an
+  `exit` ended, or a final life the end sequence didn't stop, is reported. A `rejected` or
+  `disk_corrupt` batch drop at the relay sink FAILs, and `drops` leaves these terms to the row.
+  On run totals, ΣE_r must be at least the `logit` sink's events delivered, less the records
+  its encoder counted dropped or skipped and, per relay life a kill or an `exit` ended or the
+  end sequence didn't stop, the most E_r one drain interval held among the last
+  `COMMIT_RATE_INTERVALS` it moved in, which catches a request the relay answered and
+  lost before counting it. V still judges what the relay stored.
 - `ledger.overlap` (W12b), under `[overlap]` only, else no row: the run's G − Σ(W + K + F)
   against what the instances' socket closes could discard. Under `[overlap]` the per-life rows
   judge each instance on its own lives and the wire, `progress`, and `recovery` judge them
@@ -2335,8 +2355,8 @@ instance's config `reuse_port: true` on every source's listener, a `shutdown.del
 with a 10 s drain (the listeners' 5 s `shutdown_grace` and `internal`'s 5 s second stage) is
 under `docker stop -t 30`, `admin.socket` with no `admin.bind`, and a `set` stamping `label`
 that every source's `sut_transforms` lists. Two instance configs may differ only in the lines
-that set `label`. With the steps: only `netem` and `partition` on the holder, neither on an
-instance, and no two of `pause`, `stop`, `kill`, `restart`, or `exit` on different instances
+that set `label`. With the steps: only `netem`, `partition`, and `reset` on the holder, none of
+them on an instance, and no two of `pause`, `stop`, `kill`, `restart`, or `exit` on different instances
 overlapping. With the role map: the holder is the stack's one `netns` service, a `netns` service
 needs an `[overlap]` or, from W19, an `idp` ("A token endpoint in the SUT's namespace"), and
 each instance's `network_mode` names the holder (read from `docker compose config` beside the
@@ -3298,6 +3318,13 @@ that items 3, 7, and 11 need.
   paths with minted `ackId`s and `/ack` replies, their V and `ledger.standin` rules, self-test
   fixtures for each, a scenario per shape with a run recorded under "Findings", and AGENTS.md's
   response-class invariant extended to both sinks.
+
+- **Round-3 follow-ups** (`soak/round3-followups`, off `main`): a self-test case for W25's
+  X / 3 cap on a scrape's dropped batches; the `ledger.relay` row with its `relay_listener` and
+  `relay_sink` keys, for W28's finding that a relay had no row of its own; and the `reset`
+  action, for W27's finding that no fault reset a connection, with `syslog-tcp-ingress`'s
+  reset step and its `reset-counted` expectation. Each has an amendment to ADR `soak-harness`
+  and self-test fixtures for its rules. The reset step hasn't run yet.
 
 §10's follow-ups to items 11 and 12, and its list deferred to a later round, have no workstream
 yet.

@@ -1,6 +1,6 @@
 ---
 created: 2026-10-08
-updated: 2026-10-31
+updated: 2026-11-03
 ---
 
 # A soak harness: real containers over ordinary config, one-shot netem, and a reset-aware ledger as the loss oracle
@@ -810,6 +810,61 @@ in the middle of a `logit` life, such as the queue of its own sink at a kill, ch
 stored total, so the egress rows see it only when it holds a life's last value. That's the
 property the scenario soaks: a cumulative relay through a stateless hop. A relay can't be
 combined with a hop, every sink names the same one, and the target is local.
+
+## Amendment: a relay balances its own lives (2026-11-03)
+
+The relay amendment above judged a relay's losses only through V, so a loss inside it showed
+only when it held a `logit` life's last value. A relay now gets a row of its own,
+`ledger.relay`, read on its own lives, which no other row reads. Each `[[ledger.sink]]` that
+names a `relay` also names the relay's listener it writes to, `relay_listener`, and the relay's
+sink that listener alone feeds, directly, `relay_sink`, an `_out` kind with no other
+source; `load()` checks both against the relay's config. Per relay life, the listener's events sent less its counted drops must equal
+the sink's events received, and those its events delivered plus its counted drops.
+
+- **Exact, where the life ended cleanly.** A life a stop or a restart ended, and the final life
+  the end sequence stopped, end with a drain after every data node has exited, so both gaps
+  must be 0, as a stopped life's residual is under `split = "target"`. A life a kill or an
+  `exit` ended loses its last drain interval and its sink's queue, and its gaps are reported.
+- **The HTTP listener rule carries over.** On an `HTTP_LISTENERS` kind, such as `otlp_in`, a
+  request the shutdown backstop cut was never counted sent, so its `shutdown` drop stays out
+  of the listener's drops, as it does on an HTTP wire.
+- **A counted drop balances; a fault drop FAILs.** A drop at either end leaves no gap, and a
+  `rejected` or `disk_corrupt` batch drop at the relay sink FAILs, as at a SUT sink. `drops`
+  leaves these terms to the row, as it leaves a hop sink's to `ledger.hop`.
+- **The hop into the relay is one-sided, on run totals.** `logit`'s sink and the relay's
+  listener are two processes whose lives don't pair, and an ambiguous resend reaches the relay
+  twice, so the row can't equate them. It holds the listener's ΣE_r at or above what the sink
+  counted delivered, less the records the sink's encoder counted dropped or skipped and less
+  the most E_r one drain interval held among the last few it moved in, per relay life a kill or an
+  `exit` ended or the end sequence didn't stop. The sender flushes on its own period, which can
+  span several relay drains, so the last interval alone is often empty while a flush the relay
+  answered after it went uncounted. The listener counts an event sent before it answers and the
+  sink counts it delivered after, so a request the relay answered and then lost before counting it
+  FAILs here, which V can't show mid-life under cumulative temporality. The two count one unit when
+  each delivered event carries one record: `otlp_out` writes one data point per record and
+  `otlp_in` decodes one event per data point, and `aggregate` emits one record per event.
+
+## Amendment: a `reset` step closes TCP connections, reported on a TCP wire (2026-11-03)
+
+No fault reset a TCP connection: a stop, kill, or partition ends one with a FIN or on the
+SUT's own side, so `logit.input.connections.closed{reason="reset"}` could be held at 0 and never
+seen above it. A `reset` step runs `ss -K` in a one-shot netem container joined to the target's
+network namespace, closing its established TCP connections, or those on the step's `port`. The
+kernel sends each peer a reset: the side the step is `on` reads `ECONNABORTED`, and the peer
+`ECONNRESET`, so to make a listener count a reset the step goes on its client.
+
+- **Reported on TCP, judged on HTTP.** A reset can lose what sat in either side's socket
+  buffers, as a stop or a kill can, so `ledger.wire` reports its window on a TCP wire. On an
+  HTTP wire G counts only what the listener answered, so the window is judged with the
+  ambiguous-attempt allowance, as a partition's is.
+- **A reset that closed nothing fails.** `ss -K` needs CAP_NET_ADMIN and a kernel built with
+  `CONFIG_INET_DIAG_DESTROY`, and without the second it closes nothing and reports no error. Under an enforcing SELinux a
+  confined container is also denied the sock_diag socket, so the one-shot runs with
+  `--security-opt label=disable`, and `netem.sh` exits 1 when `ss` fails.
+  The step records how many sockets it closed and is `rc` 1 when that is 0, so `timeline` FAILs
+  a step that did nothing and it gets no window.
+- **A namespace fault.** Under `[overlap]` or beside an `idp` it goes on the holder, as `netem`
+  and `partition` do, since a member shares the holder's namespace.
 
 ## Amendment: OTLP and HEC stand-ins overwrite under cumulative temporality, and name loss by position (2026-10-29)
 
