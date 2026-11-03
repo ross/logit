@@ -858,7 +858,9 @@ kernel sends each peer a reset: the side the step is `on` reads `ECONNABORTED`, 
   HTTP wire G counts only what the listener answered, so the window is judged with the
   ambiguous-attempt allowance, as a partition's is.
 - **A reset that closed nothing fails.** `ss -K` needs CAP_NET_ADMIN and a kernel built with
-  `CONFIG_INET_DIAG_DESTROY`, and without the second it closes nothing and reports no error.
+  `CONFIG_INET_DIAG_DESTROY`, and without the second it closes nothing and reports no error. Under an enforcing SELinux a
+  confined container is also denied the sock_diag socket, so the one-shot runs with
+  `--security-opt label=disable`, and `netem.sh` exits 1 when `ss` fails.
   The step records how many sockets it closed and is `rc` 1 when that is 0, so `timeline` FAILs
   a step that did nothing and it gets no window.
 - **A namespace fault.** Under `[overlap]` or beside an `idp` it goes on the holder, as `netem`

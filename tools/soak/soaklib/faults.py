@@ -21,8 +21,9 @@ Facts a maintainer needs here (docs/plans/soak-harness.md, "Netem scope"):
 - A `reset` is a one-shot netem container in the target's network namespace running
   `netem.sh reset`, which closes its established TCP connections, or those on the step's `port`,
   with `ss -K`: the kernel sends each peer a reset, and the closing side reads `ECONNABORTED`.
-  `ss -K` needs CAP_NET_ADMIN, which the container gets, and a kernel built with
-  `CONFIG_INET_DIAG_DESTROY`, without which it closes nothing. A reset that closed no
+  `ss -K` needs CAP_NET_ADMIN, which the container gets, a kernel built with
+  `CONFIG_INET_DIAG_DESTROY`, without which it closes nothing, and, under SELinux, an
+  unconfined container (`--security-opt label=disable`, which a `reset` run passes). A reset that closed no
   connection is `rc` 1, so `timeline` FAILs it and it gets no window. Its revert does nothing:
   the client dials again on its own.
 - A `kill` is `docker kill -s KILL`: the process gets no shutdown signal, so it writes no final
@@ -166,9 +167,11 @@ def netem_args(args):
 
 def _netem(ctx, step, *argv):
     container = ctx.ids[step.on]
+    # `ss -K` opens a sock_diag netlink socket, which SELinux denies a container_t container.
+    labels = ["--security-opt", "label=disable"] if argv[0] == "reset" else []
     return ctx.docker.run_oneshot(
-        ["--network", f"container:{container}", "--cap-add", "NET_ADMIN", ctx.netem_image,
-         *argv],
+        ["--network", f"container:{container}", "--cap-add", "NET_ADMIN", *labels,
+         ctx.netem_image, *argv],
     )
 
 
@@ -197,7 +200,8 @@ def reset_apply(ctx, step):
     elif result.rc == 0 and killed == 0:
         where = f" on port {step.port}" if step.port is not None else ""
         record.update(rc=1, stderr=(f"closed no established TCP connection{where}; ss -K closes "
-                                    "nothing on a kernel without CONFIG_INET_DIAG_DESTROY"))
+                                    "nothing on a kernel without CONFIG_INET_DIAG_DESTROY or "
+                                    "under an LSM (SELinux) denial of the sock_diag socket"))
     return record
 
 

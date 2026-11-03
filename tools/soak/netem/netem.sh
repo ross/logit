@@ -11,7 +11,8 @@
 #                 or remote port is `port`, with `ss -K`, which sends the peer a reset; print
 #                 each socket it closed, then `{"killed": N}`. `ss -K` needs CAP_NET_ADMIN and a
 #                 kernel built with CONFIG_INET_DIAG_DESTROY; without it, it closes and prints
-#                 nothing, and N is 0.
+#                 nothing, and N is 0. An `ss` that exits non-zero or reports a netlink or
+#                 SOCK_DESTROY error (an LSM denial, say) makes `reset` exit 1 with its stderr.
 
 set -euo pipefail
 
@@ -20,7 +21,14 @@ if [ "${1:-}" = "reset" ]; then
     if [ -n "${2:-}" ]; then
         filter=("(" sport = ":${2}" or dport = ":${2}" ")")
     fi
-    closed="$(ss -K -H -t -n state established "${filter[@]}")"
+    errs="$(mktemp)"
+    status=0
+    closed="$(ss -K -H -t -n state established "${filter[@]}" 2>"${errs}")" || status=$?
+    cat "${errs}" >&2
+    if [ "${status}" -ne 0 ] || grep -q -e 'Cannot talk to rtnetlink' -e 'SOCK_DESTROY answers' "${errs}"; then
+        echo "netem: ss -K failed; a denied socket destroy closes nothing" >&2
+        exit 1
+    fi
     printf '%s\n' "${closed}"
     printf '{"killed": %d}\n' "$(printf '%s' "${closed}" | grep -c . || true)"
     exit 0
