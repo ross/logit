@@ -58,11 +58,12 @@
 //! client refuses the batch on `false`, which is the input's half of
 //! `docs/design/pipeline-graph.md`'s "Open question: a closed downstream".
 
-use logit_core::interner::intern;
+use logit_core::interner::{intern, resolve};
 use logit_core::random_id_bytes;
 use logit_core::telemetry::Timer;
 use logit_core::{EventBatch, Provenance, SpanKind, Symbol, Telemetry};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 
@@ -237,18 +238,50 @@ struct Waiting {
 pub struct Edge {
     tx: mpsc::Sender<Delivered>,
     telemetry: Telemetry,
+    /// The consumer's id, for the `closed_consumer` warning; `None` falls back to the id on
+    /// `telemetry`, which a disabled handle doesn't carry.
+    consumer: Option<Symbol>,
+    /// Whether a send on this edge has warned about a closed consumer. [`Fanout::from_edges`]
+    /// gives each producer's copy of an edge its own flag, so the warning is per producer and
+    /// consumer pair; a `Fanout`'s clones share it.
+    closed_warned: Arc<AtomicBool>,
 }
 
 impl Edge {
     /// An edge into `tx` whose consumer handle is [`Telemetry::default`] (disabled).
     pub fn new(tx: mpsc::Sender<Delivered>) -> Self {
-        Self { tx, telemetry: Telemetry::default() }
+        Self {
+            tx,
+            telemetry: Telemetry::default(),
+            consumer: None,
+            closed_warned: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     /// Attaches the consuming component's telemetry handle.
     pub fn with_telemetry(mut self, consumer: Telemetry) -> Self {
         self.telemetry = consumer;
         self
+    }
+
+    /// Names the consuming component, for the `closed_consumer` warning. Interns `id` once, here.
+    pub fn with_consumer(mut self, id: &str) -> Self {
+        self.consumer = Some(intern(id));
+        self
+    }
+
+    /// This edge as one producer's copy, with a warned flag of its own.
+    fn for_producer(mut self) -> Self {
+        self.closed_warned = Arc::new(AtomicBool::new(false));
+        self
+    }
+
+    /// The consumer's id as the warning names it.
+    fn consumer_name(&self) -> &str {
+        match self.consumer {
+            Some(id) => resolve(id),
+            None => self.telemetry.component().map_or("<unnamed>", |(id, _)| id),
+        }
     }
 
     /// Sends `item`, waiting for room when the inbox is full. `Err` is a closed consumer.
@@ -312,17 +345,113 @@ pub struct Fanout {
     /// path. `None` (a `Fanout` built without `with_component`, as tests do) makes stamping inert:
     /// provenance passes through unchanged.
     component: Option<Symbol>,
+    /// Set only on a listener's `Fanout`, so `run_input` can tell whether the grace backstop
+    /// cut a send. Every other node pays a `None` check per send. A clone shares the counter;
+    /// [`Fanout::for_connection`] mints its own.
+    in_flight: Option<Arc<InFlightCounter>>,
+}
+
+/// Every counter of sends in flight a listener's [`Fanout`] and its per-connection copies hold,
+/// read by `run_input` when its grace backstop stops the listener.
+///
+/// Each counter is one word: the batch count in the high 24 bits and their events in the low 40,
+/// so a send costs one `fetch_add` and one `fetch_sub` on its own copy's counter. A send leaves
+/// the word when it returns or when its future is dropped, so a reader sees a cancelled send only
+/// while the future that holds it is alive (`run_input` reads with the listener's future alive).
+/// The registry's lock is taken only by [`Fanout::for_connection`] and by a read.
+#[derive(Clone, Default)]
+pub struct SendsInFlight(Arc<Mutex<Vec<Weak<InFlightCounter>>>>);
+
+const EVENTS_BITS: u32 = 40;
+const EVENTS_MASK: u64 = (1 << EVENTS_BITS) - 1;
+
+impl SendsInFlight {
+    /// The batches and events in sends that haven't returned, summed over every live counter.
+    pub fn load(&self) -> (u64, u64) {
+        self.each().into_iter().fold((0, 0), |(b, e), (nb, ne)| (b + nb, e + ne))
+    }
+
+    /// The batches and events in flight on each live counter: the listener's own `Fanout`, then
+    /// one per connection that called [`Fanout::for_connection`], in registration order.
+    pub fn each(&self) -> Vec<(u64, u64)> {
+        let counters = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        counters
+            .iter()
+            .filter_map(Weak::upgrade)
+            .map(|c| {
+                let word = c.word.load(Ordering::Relaxed);
+                (word >> EVENTS_BITS, word & EVENTS_MASK)
+            })
+            .collect()
+    }
+
+    /// How many counters the registry holds, dropped ones not yet pruned included.
+    #[cfg(test)]
+    fn registered(&self) -> usize {
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).len()
+    }
+
+    /// A new counter in this registry, pruning the counters whose copies have all dropped.
+    fn register(&self) -> Arc<InFlightCounter> {
+        let counter = Arc::new(InFlightCounter { word: AtomicU64::new(0), registry: self.clone() });
+        let mut counters = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        counters.retain(|c| c.strong_count() > 0);
+        counters.push(Arc::downgrade(&counter));
+        counter
+    }
+}
+
+/// One copy's in-flight word. Aligned to 128 bytes so two connections' counters, allocated side
+/// by side, never share a cache line (128 covers x86-64's adjacent-line prefetch and Apple's
+/// 128-byte lines).
+#[repr(align(128))]
+struct InFlightCounter {
+    word: AtomicU64,
+    registry: SendsInFlight,
+}
+
+impl InFlightCounter {
+    fn enter(&self, n: usize) -> InFlight<'_> {
+        let add = (1 << EVENTS_BITS) | (n as u64).min(EVENTS_MASK);
+        self.word.fetch_add(add, Ordering::Relaxed);
+        InFlight { word: &self.word, add }
+    }
+}
+
+/// One send's share of an [`InFlightCounter`], removed on drop.
+struct InFlight<'a> {
+    word: &'a AtomicU64,
+    add: u64,
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.word.fetch_sub(self.add, Ordering::Relaxed);
+    }
 }
 
 impl Fanout {
+    /// The id of each consumer this fan-out sends to, in edge order, as a warning names it.
+    pub(crate) fn consumer_names(&self) -> Vec<String> {
+        self.consumers.iter().map(|edge| edge.consumer_name().to_string()).collect()
+    }
+
     /// A `Fanout` over bare `Sender`s, every edge with disabled consumer telemetry.
     pub fn new(consumers: Vec<mpsc::Sender<Delivered>>) -> Self {
         Self::from_edges(consumers.into_iter().map(Edge::new).collect())
     }
 
     /// A `Fanout` over edges that each carry their consumer's telemetry handle.
+    ///
+    /// Each edge gets a `closed_consumer` warned flag of its own, so an edge cloned into several
+    /// producers' `Fanout`s warns once per producer.
     pub fn from_edges(edges: Vec<Edge>) -> Self {
-        Self { consumers: edges, telemetry: Telemetry::default(), component: None }
+        Self {
+            consumers: edges.into_iter().map(Edge::for_producer).collect(),
+            telemetry: Telemetry::default(),
+            component: None,
+            in_flight: None,
+        }
     }
 
     /// Attaches the producing component's telemetry handle.
@@ -338,8 +467,50 @@ impl Fanout {
         self
     }
 
+    /// Tracks every async send on this `Fanout` and its clones in a new counter in `in_flight`.
+    pub fn with_sends_in_flight(mut self, in_flight: &SendsInFlight) -> Self {
+        self.in_flight = Some(in_flight.register());
+        self
+    }
+
+    /// A copy for one connection's task: a clone with its own in-flight counter, so sends on two
+    /// connections never touch one word. A listener calls it once per accepted connection, not
+    /// per request: it allocates and takes the registry's lock. Its own clones (a request's, a
+    /// detached delivery's) share its counter. Untracked, it is a plain clone.
+    pub fn for_connection(&self) -> Self {
+        let mut copy = self.clone();
+        if let Some(counter) = &self.in_flight {
+            copy.in_flight = Some(counter.registry.register());
+        }
+        copy
+    }
+
+    /// A copy for a task that outlives the listener's future, such as a detached delivery: a
+    /// clone with no in-flight counter. `run_input`'s backstop doesn't cut that task's sends, so
+    /// it mustn't count them.
+    pub fn detached(&self) -> Self {
+        Self {
+            consumers: self.consumers.clone(),
+            telemetry: self.telemetry.clone(),
+            component: self.component,
+            in_flight: None,
+        }
+    }
+
+    /// Enters `n` events into this copy's counter until the returned guard drops, when tracked.
+    fn in_flight(&self, n: usize) -> Option<InFlight<'_>> {
+        self.in_flight.as_ref().map(|c| c.enter(n))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.consumers.is_empty()
+    }
+
+    /// Each consumer's component id and kind, from the telemetry handle on its edge, in edge
+    /// order. An edge built without a live handle is left out, so a `Fanout` from
+    /// [`Fanout::new`] lists none.
+    pub fn consumer_components(&self) -> impl Iterator<Item = (&str, &'static str)> {
+        self.consumers.iter().filter_map(|edge| edge.telemetry.component())
     }
 
     /// The stamping rule for every non-relaying send: `origin` is set once and never overwritten,
@@ -422,6 +593,7 @@ impl Fanout {
         let ctx = self.stamp(ctx);
         let Some((last, rest)) = self.consumers.split_last() else { return false };
         let n = batch.events.len();
+        let _in_flight = self.in_flight(n);
         self.record_send(n);
         let timer = self.telemetry.timer("logit.component.send.blocked.duration");
         let taken = self.offer_shared(rest, last, batch, ctx, n).await;
@@ -462,6 +634,7 @@ impl Fanout {
         if self.consumers.is_empty() {
             return Ok(false);
         }
+        let _in_flight = self.in_flight(batch.events.len());
         let timer = self.telemetry.timer("logit.component.send.blocked.duration");
         // Until every slot is held, a timeout or a dropped future discards both unrecorded.
         let mut unsent = Unsent(Some((span, timer)));
@@ -497,17 +670,17 @@ impl Fanout {
                     permit.send(Delivered::Owned(batch, ctx));
                     taken = true;
                 }
-                None => self.record_dropped_on_close(n),
+                None => self.record_dropped_on_close(&self.consumers[0], n),
             }
         } else {
             let batch = Arc::new(batch);
-            for permit in permits {
+            for (permit, edge) in permits.into_iter().zip(&self.consumers) {
                 match permit {
                     Some(permit) => {
                         permit.send(Delivered::Shared(batch.clone(), ctx));
                         taken = true;
                     }
-                    None => self.record_dropped_on_close(n),
+                    None => self.record_dropped_on_close(edge, n),
                 }
             }
         }
@@ -544,6 +717,7 @@ impl Fanout {
         if self.consumers.is_empty() {
             return Ok(false);
         }
+        let _in_flight = self.in_flight(batch.events.len());
         if reservation.blocked.is_none() {
             reservation.blocked =
                 Some(self.telemetry.timer("logit.component.send.blocked.duration"));
@@ -593,17 +767,17 @@ impl Fanout {
                     permit.send(Delivered::Owned(batch, ctx));
                     taken = true;
                 }
-                None => self.record_dropped_on_close(n),
+                None => self.record_dropped_on_close(&self.consumers[0], n),
             }
         } else {
             let batch = Arc::new(batch);
-            for permit in permits {
+            for (permit, edge) in permits.zip(&self.consumers) {
                 match permit {
                     Some(permit) => {
                         permit.send(Delivered::Shared(batch.clone(), ctx));
                         taken = true;
                     }
-                    None => self.record_dropped_on_close(n),
+                    None => self.record_dropped_on_close(edge, n),
                 }
             }
         }
@@ -643,11 +817,12 @@ impl Fanout {
     async fn deliver(&self, batch: EventBatch, ctx: BatchContext) -> bool {
         let Some((last, rest)) = self.consumers.split_last() else { return false };
         let n = batch.events.len();
+        let _in_flight = self.in_flight(n);
         self.record_send(n);
         let timer = self.telemetry.timer("logit.component.send.blocked.duration");
         if rest.is_empty() {
             if last.offer(Delivered::Owned(batch, ctx)).await.is_err() {
-                self.record_dropped_on_close(n);
+                self.record_dropped_on_close(last, n);
                 return false;
             }
             return true;
@@ -670,13 +845,13 @@ impl Fanout {
         let mut taken = false;
         for edge in rest {
             if edge.offer(Delivered::Shared(batch.clone(), ctx)).await.is_err() {
-                self.record_dropped_on_close(n);
+                self.record_dropped_on_close(edge, n);
             } else {
                 taken = true;
             }
         }
         if last.offer(Delivered::Shared(batch, ctx)).await.is_err() {
-            self.record_dropped_on_close(n);
+            self.record_dropped_on_close(last, n);
         } else {
             taken = true;
         }
@@ -733,7 +908,7 @@ impl Fanout {
         let timer = self.telemetry.timer("logit.component.send.blocked.duration");
         if rest.is_empty() {
             if last.offer_blocking(Delivered::Owned(batch, ctx)).is_err() {
-                self.record_dropped_on_close(n);
+                self.record_dropped_on_close(last, n);
                 return false;
             }
             return true;
@@ -742,13 +917,13 @@ impl Fanout {
         let mut taken = false;
         for edge in rest {
             if edge.offer_blocking(Delivered::Shared(batch.clone(), ctx)).is_err() {
-                self.record_dropped_on_close(n);
+                self.record_dropped_on_close(edge, n);
             } else {
                 taken = true;
             }
         }
         if last.offer_blocking(Delivered::Shared(batch, ctx)).is_err() {
-            self.record_dropped_on_close(n);
+            self.record_dropped_on_close(last, n);
         } else {
             taken = true;
         }
@@ -763,14 +938,28 @@ impl Fanout {
         self.telemetry.count("logit.component.events.sent", n as f64, &[]);
     }
 
-    /// `n` events that this one consumer's copy of the batch never delivered, because its channel
-    /// was already closed.
-    fn record_dropped_on_close(&self, n: usize) {
+    /// `n` events that `edge`'s consumer never received, because its channel was already closed.
+    /// The first drop on an edge also warns, naming both ends; later ones are counted only. A
+    /// consumer closes its inbox once and for good, so one line says what every later count
+    /// means, and a line per batch would flood the log.
+    fn record_dropped_on_close(&self, edge: &Edge, n: usize) {
         self.telemetry.count(
             "logit.component.events.dropped",
             n as f64,
             &[("reason", "closed_consumer")],
         );
+        if !edge.closed_warned.swap(true, Ordering::Relaxed) {
+            let producer = self.component.map_or("<unnamed>", resolve);
+            tracing::warn!(
+                target: "logit",
+                component = %producer,
+                key = "closed_consumer",
+                "dropped {n} event(s) bound for {}, which has stopped taking batches; later drops \
+                 to it are counted in logit.component.events.dropped{{reason=\"closed_consumer\"}} \
+                 without another line",
+                edge.consumer_name(),
+            );
+        }
     }
 }
 
@@ -803,6 +992,46 @@ mod tests {
         assert_eq!(std::mem::size_of::<Delivered>(), 72);
         // The niche is still available one level up.
         assert_eq!(std::mem::size_of::<Option<Delivered>>(), 72);
+    }
+
+    /// A clone shares its copy's counter, `for_connection` registers its own, and a copy's
+    /// counter leaves the registry once every clone of it drops.
+    #[tokio::test]
+    async fn each_connection_copy_counts_its_own_sends_in_flight() {
+        let (tx, _rx) = mpsc::channel(1);
+        let in_flight = SendsInFlight::default();
+        let root = Fanout::new(vec![tx]).with_sends_in_flight(&in_flight);
+        let _request = root.clone();
+        assert_eq!(in_flight.each(), [(0, 0)], "a clone shares the root's counter");
+
+        assert!(root.send(batch(1)).await, "fills the one slot");
+        let connection = root.for_connection();
+        let mut parked = Box::pin(connection.send(batch(2)));
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        assert!(std::future::Future::poll(parked.as_mut(), &mut cx).is_pending());
+        assert_eq!(in_flight.each(), [(0, 0), (1, 2)]);
+        assert_eq!(in_flight.load(), (1, 2));
+
+        drop(parked);
+        drop(connection);
+        let _next = root.for_connection();
+        assert_eq!(in_flight.each(), [(0, 0), (0, 0)]);
+        assert_eq!(in_flight.registered(), 2, "the dropped copy was pruned");
+    }
+
+    /// A detached copy's sends outlive the listener, so they never enter a counter.
+    #[tokio::test]
+    async fn a_detached_copy_counts_no_sends_in_flight() {
+        let (tx, _rx) = mpsc::channel(1);
+        let in_flight = SendsInFlight::default();
+        let root = Fanout::new(vec![tx]).with_sends_in_flight(&in_flight);
+        assert!(root.send(batch(1)).await, "fills the one slot");
+        let detached = root.detached();
+        let mut parked = Box::pin(detached.send(batch(2)));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(parked.as_mut(), &mut cx).is_pending());
+        assert_eq!(in_flight.load(), (0, 0));
     }
 
     /// `BatchContext` adds no padding to `TraceContext` + `Provenance` (pinned in `logit-core`).
@@ -921,6 +1150,56 @@ mod tests {
             counter_value(&events, "logit.component.events.dropped"),
             Some(4.0),
             "every event in the batch should count as dropped, not just the batch"
+        );
+    }
+
+    /// The first `closed_consumer` drop on an edge warns, naming the producer and the consumer;
+    /// later drops on that edge are counted only. Each producer of a shared consumer has an edge
+    /// of its own, and every send path warns through the same edge flag.
+    #[tokio::test]
+    async fn a_closed_consumer_warns_once_per_edge_naming_both_ends() {
+        let (lines, _guard) = crate::test_util::capture_lines();
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let (open_tx, mut open_rx) = mpsc::channel(16);
+        let edge = Edge::new(tx).with_consumer("out");
+        let open = Edge::new(open_tx).with_consumer("live");
+        let a = Fanout::from_edges(vec![edge.clone(), open]).with_component("a");
+        let b = Fanout::from_edges(vec![edge]).with_component("b");
+
+        for _ in 0..3 {
+            assert!(a.send(batch(2)).await, "the open consumer took it");
+            assert!(!b.send(batch(1)).await);
+        }
+        // A per-connection copy and the other send paths share the edge's flag.
+        let copy = a.for_connection();
+        assert!(copy.send(batch(2)).await);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        assert!(matches!(copy.send_with_deadline(batch(2), deadline).await, Ok(true)));
+        while open_rx.try_recv().is_ok() {}
+
+        assert_eq!(lines.components_with_key("closed_consumer"), ["a", "b"]);
+        let warned = lines.with_key("closed_consumer");
+        assert_eq!(
+            warned,
+            vec![
+                (
+                    tracing::Level::WARN,
+                    "dropped 2 event(s) bound for out, which has stopped taking batches; later \
+                     drops to it are counted in \
+                     logit.component.events.dropped{reason=\"closed_consumer\"} without another \
+                     line"
+                        .to_string()
+                ),
+                (
+                    tracing::Level::WARN,
+                    "dropped 1 event(s) bound for out, which has stopped taking batches; later \
+                     drops to it are counted in \
+                     logit.component.events.dropped{reason=\"closed_consumer\"} without another \
+                     line"
+                        .to_string()
+                ),
+            ]
         );
     }
 

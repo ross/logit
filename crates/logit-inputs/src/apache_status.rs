@@ -9,7 +9,8 @@
 //!   with a throttled `malformed_value` diagnostic naming the key;
 //! - a repeated listed key, `logit.input.metrics.normalized{reason="duplicate_key"}`, once per
 //!   repeat;
-//! - an unterminated last line, `logit.input.lines.dropped{reason="truncated"}`.
+//! - an unterminated last line, `logit.input.lines.dropped{reason="truncated"}`, with a throttled
+//!   `truncated` diagnostic.
 //!
 //! A body with no listed key, such as the HTML page a URL without `?auto` gets, is the driver's
 //! `parse_error` class, and its `scrape_failed` diagnostic says to add `?auto`.
@@ -88,6 +89,11 @@ impl ScrapeDecoder for ApacheStatusDecoder {
         }
         if status.truncated {
             self.telemetry.count("logit.input.lines.dropped", 1.0, &[("reason", "truncated")]);
+            self.diag.warn_throttled(
+                "truncated",
+                "apache_status_in: dropped the page's last line, which has no newline: the body \
+                 was cut short",
+            );
         }
         Ok(status.to_events(timestamp))
     }
@@ -201,6 +207,7 @@ ServerUptimeSeconds: 30\nTotal Accesses: 5\nBusyWorkers: 1\nIdleWorkers: 74\nSco
         );
         assert_eq!(probe.sum("logit.input.lines.dropped", &[("reason", "truncated")]), 1.0);
         assert_eq!(probe.sum("logit.component.diagnostics", &[("key", "malformed_value")]), 1.0);
+        assert_eq!(probe.sum("logit.component.diagnostics", &[("key", "truncated")]), 1.0);
     }
 
     #[tokio::test]

@@ -632,10 +632,12 @@ impl Undelivered {
 /// mid-wait drops this future, and anything counted after it then never runs while the batches
 /// still count `logit.component.batches.sent`. `settle` doesn't run when there are no batches.
 ///
-/// The task holds a `Fanout` clone until the downstream takes the last batch, as a parked handler
-/// does ([`drive_connection`]'s wait-out loop). A panic inside it is resumed here; a task cancelled
-/// by a runtime shutting down reports every batch as undelivered, since which of them went out is
-/// unknown and the client must not be told they all did. `settle` doesn't run for that task.
+/// The task holds a [`logit_pipeline::Fanout::detached`] copy until the downstream takes the last
+/// batch, as a parked handler does ([`drive_connection`]'s wait-out loop). It outlives the
+/// listener's future, so the shutdown backstop doesn't count its sends. A panic inside it is
+/// resumed here; a task cancelled by a runtime shutting down reports every batch as undelivered,
+/// since which of them went out is unknown and the client must not be told they all did. `settle`
+/// doesn't run for that task.
 pub(crate) async fn deliver_detached<F>(
     sink: &logit_pipeline::Fanout,
     batches: Vec<logit_core::EventBatch>,
@@ -648,7 +650,7 @@ where
         return Ok(());
     }
     let total = batches.len();
-    let sink = sink.clone();
+    let sink = sink.detached();
     let delivery = tokio::spawn(async move {
         let mut outcome = Ok(());
         for (sent, batch) in batches.into_iter().enumerate() {

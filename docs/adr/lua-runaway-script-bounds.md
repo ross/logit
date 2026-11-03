@@ -1,6 +1,6 @@
 ---
 created: 2026-09-26
-updated: 2026-10-25
+updated: 2026-11-02
 ---
 
 # Lua scripts: stall detection, a progress-based wedge check, opt-in `max_memory`, and a table-depth cap
@@ -409,3 +409,29 @@ opened LuaJIT's `jit` library, so no trace compiled: every script ran in the int
 - **The decision not to add a hook stands.** The heartbeat already surfaces an accidental hang
   without slowing the VM, and a hook couldn't bound a `jit: true` component's compiled loops.
 - `the_global_table_is_exactly_the_allowlist` now checks the global set with the JIT off and on.
+
+## Amendment: a panicked node's inbox is counted as a failed one's is (2026-11-02)
+
+The batches still queued in a node's inbox were swept and counted only when its loop returned a
+failure (`max_memory`). A panic on the node's thread fails the node the same way, but its inbox was
+dropped unswept, and every batch in it was lost with no count.
+
+- **Any outcome but a clean return sweeps the inbox.** A panic or a returned failure counts each
+  queued batch as `batches.dropped`/`events.dropped{reason="shutdown"}` under the node's id, as the
+  watcher's revocation of a wedged node does, so `drain complete` reports them. A clean return
+  leaves nothing queued and sweeps nothing, and a node the watcher already revoked has nothing
+  left to sweep, so no batch counts twice.
+- **The batch in hand counts too.** The thread records a batch's event count as it receives the
+  batch and clears it just before counting its `process()` pass's discards and errors. Nothing is
+  sent in that span, so a panic there loses the whole batch, which counts as one more shutdown
+  drop. Clearing it any later would count the pass's discarded and failed events twice.
+- **A panic in a send or a `flush()` stays uncounted.** From the pass's counts through its send,
+  some of the batch's events are already counted discarded or failed and some partitions may have
+  gone out, and a `flush()` emits events no input batch accounts for, so neither has a count that
+  is both whole and never doubled. A panic there is a bug in `logit`, not a script's fault;
+  [`docs/known-gaps/transforms.md`](../known-gaps/transforms.md) keeps it.
+- **`thread_panicked` keeps its message.** The `drain complete` line already sums the count, as
+  [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md)'s 2026-11-02 amendment allows.
+- Pinned by `a_panicked_lua_nodes_queued_batches_are_counted_as_shutdown_drops` and
+  `a_lua_node_panicking_mid_batch_counts_the_batch_in_hand_as_a_shutdown_drop`, each failing with
+  its half of the fix reverted.

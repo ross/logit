@@ -77,8 +77,12 @@ exists or a contract other `logit` processes depend on:
 - **Any nonzero `*.dropped` is loss someone should look into**, and it's always tagged `reason`.
   An outcome the config asked for never uses the word: it's `events.discarded`, `*.omitted`,
   `*.skipped`, `*.evicted`, or `input.batches.deferred`. A loss reported only by a diagnostic gets
-  a `*.dropped` counter beside it. Operators and the soak harness alert on the name alone, with no
-  list of reasons to exclude
+  a `*.dropped` counter beside it, save the one case the ADR's "Loss with no counter" names (a
+  `lua` thread's panic in a send or a `flush()`). A counted loss in a listener, its decoder, a sink, its codec or
+  spool, `prometheus_out`'s registry, the pipeline runtime, or `internal` gets a `warn` line beside
+  it, throttled or once per lasting cause, logged only in the branch that counts, and on a sink
+  gated as its counter is; `internal.logs.dropped` is the one exception. Operators and the soak
+  harness alert on the name alone, with no list of reasons to exclude
   ([ADR `telemetry-loss-vocabulary`](docs/adr/telemetry-loss-vocabulary.md),
   [internal-telemetry.md](docs/design/internal-telemetry.md)'s "Loss vocabulary").
 
@@ -853,7 +857,9 @@ the operator-facing account of all of this.
   scenario's `[[expect]]` tables assert its own telemetry around a step, as the four sink-outage
   and UDP-flood scenarios do for queue fill, counted drops, kernel drops, and drain.
   `spool-kill-replay` kills the SUT with SIGKILL during a sink outage and checks that its
-  `buffer.disk:` spool is replayed by the next process. `lua-path`, `lua-stall`, and `lua-memory`
+  `buffer.disk:` spool is replayed by the next process. `sink-outage-stop` stops the SUT inside
+  a sink outage that has backed the chain up to its listener, so the shutdown backstop cuts the
+  listener's parked send. `lua-path`, `lua-stall`, and `lua-memory`
   put a `lua` stage in the path (`[ledger] sut_script`): a rewrite with script drops and errors,
   a busy loop that `/readyz` reads as `stalled` inside a `mark` step, and a `max_memory` exit 2
   inside an `exit` step that restarts the SUT. `lua-path-jit`, `lua-stall-jit`, and

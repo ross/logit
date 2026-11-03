@@ -65,8 +65,9 @@
 //! - any content after `# EOF`.
 //!
 //! Everything else is dropped at line or series granularity and counted
-//! `logit.input.metrics.dropped{reason=...}` on the [`PrometheusDecoder`]'s telemetry -- a scrape of
-//! a mostly-good endpoint is worth keeping:
+//! `logit.input.metrics.dropped{reason=...}` on the [`PrometheusDecoder`]'s telemetry, with a
+//! throttled line keyed on the reason on its diagnostics -- a scrape of a mostly-good endpoint is
+//! worth keeping:
 //!
 //! | Reason | What it counts |
 //! |---|---|
@@ -123,7 +124,9 @@
 //! - two families whose `# TYPE` lines would carry one name (a text 0.0.4 counter `foo` and a gauge
 //!   `foo_total`) can't both be written, since a second `# TYPE` line for a name makes Prometheus
 //!   reject the scrape: the one whose model name sorts first is written, and each series of the
-//!   other is counted `logit.output.metrics.dropped{reason="name_collision"}`;
+//!   other is counted `logit.output.metrics.dropped{reason="name_collision"}`. A caller that
+//!   holds families across writes settles the pair before it writes, with [`type_names_collide`],
+//!   so the drop counts once rather than once per write;
 //! - a family with no line to write (every series stale, or a summary holding only a `_created`
 //!   in text 0.0.4) loses its metadata lines too.
 //!
@@ -611,23 +614,32 @@ pub fn write_with(
         base: String::new(),
         used: Vec::new(),
     };
-    let mut previous: Option<TypeName<'_>> = None;
+    let mut previous: Option<(TypeName<'_>, &str)> = None;
     for (base, family) in order {
         // Two families with one `# TYPE` name (a text 0.0.4 counter `foo` and a gauge
         // `foo_total`) can't both be written: a second `# TYPE` line for one name makes Prometheus
         // reject the whole scrape. The one whose model name sorts first is written, as
         // `events_to_families` resolves a sanitized-name collision, and each series of the other
-        // is counted.
-        if previous.is_some_and(|previous| previous == base) {
+        // is counted, with a line. `prometheus_out`'s registry settles such a pair when it stores
+        // it, so its renders never reach this arm.
+        if let Some((_, kept)) = previous.filter(|(previous, _)| *previous == base) {
             for _ in &family.series {
                 writer.encoder.not_encoded(NotEncoded::NameCollision);
             }
+            let wire = format!("{}{}", base.0, base.1);
+            super::warn_name_collision(
+                writer.encoder,
+                &wire,
+                &family.name,
+                kept,
+                family.series.len(),
+            );
             continue;
         }
         writer.base.clear();
         writer.base.push_str(base.0);
         writer.base.push_str(base.1);
-        previous = Some(base);
+        previous = Some((base, &family.name));
         writer.family(family);
     }
     if dialect.is_openmetrics() {
@@ -983,6 +995,45 @@ pub fn exposed_exemplar_keys(record: &logit_core::MetricRecord) -> Vec<Vec<Strin
         .collect()
 }
 
+/// Whether families `a` and `b`, each a model name and a type, would write one `# TYPE` name in
+/// either dialect, so [`write_with`] would write one of them and drop the other as a
+/// `name_collision`. A family is never its own collider: two different model names are compared.
+///
+/// `prometheus_out`'s registry calls it when it stores a family, so the registry never holds a
+/// pair a scrape would have to resolve.
+pub fn type_names_collide(a: (&str, FamilyType), b: (&str, FamilyType)) -> bool {
+    a.0 != b.0
+        && [Dialect::Text0_0_4, Dialect::OpenMetrics1_0].into_iter().any(|dialect| {
+            TypeName::of_parts(a.0, a.1, dialect) == TypeName::of_parts(b.0, b.1, dialect)
+        })
+}
+
+/// Every model name a family could carry and collide with `name` of `kind` under
+/// [`type_names_collide`]: each dialect's `# TYPE` name for it, that name with `_total` added, and
+/// that name with `_total` or `_info` removed. A candidate is only a name to look up; the caller
+/// confirms a collision with [`type_names_collide`] against the stored family's type.
+pub fn collision_candidates(name: &str, kind: FamilyType) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for dialect in [Dialect::Text0_0_4, Dialect::OpenMetrics1_0] {
+        let TypeName(prefix, suffix) = TypeName::of_parts(name, kind, dialect);
+        let written = format!("{prefix}{suffix}");
+        let mut push = |candidate: String| {
+            if candidate != name && !candidate.is_empty() && !out.contains(&candidate) {
+                out.push(candidate);
+            }
+        };
+        push(format!("{written}_total"));
+        if let Some(base) = written.strip_suffix("_total") {
+            push(base.to_string());
+        }
+        if let Some(base) = written.strip_suffix("_info") {
+            push(base.to_string());
+        }
+        push(written);
+    }
+    out
+}
+
 /// The name a family's `# TYPE` line carries in `dialect`, which is not always the model name
 /// ([`super`]'s "Family naming" table): a prefix of the model name and a suffix, so the writer
 /// orders and compares names without building them.
@@ -991,8 +1042,11 @@ struct TypeName<'a>(&'a str, &'static str);
 
 impl<'a> TypeName<'a> {
     fn of(family: &'a MetricFamily, dialect: Dialect) -> Self {
-        let name = family.name.as_str();
-        match (family.kind, dialect.is_openmetrics()) {
+        Self::of_parts(&family.name, family.kind, dialect)
+    }
+
+    fn of_parts(name: &'a str, kind: FamilyType, dialect: Dialect) -> Self {
+        match (kind, dialect.is_openmetrics()) {
             // A counter's value sample always ends in `_total`; only the family name differs.
             // OpenMetrics names the family without the suffix, text 0.0.4 with it.
             (FamilyType::Counter, true) => {
@@ -2694,6 +2748,51 @@ mod tests {
         let (families, reasons) = parse_reasons("# just a comment\n#\nfoo 1\n", Dialect::Text0_0_4);
         assert_eq!(family_names(&families), vec!["foo"]);
         assert!(reasons.is_empty(), "{reasons:?}");
+    }
+
+    /// Two families whose `# TYPE` lines carry one name: the one whose model name sorts first is
+    /// written, and the other's series are counted with one warn line naming both.
+    #[test]
+    fn a_type_name_collision_on_write_is_counted_with_a_line() {
+        let families = [
+            MetricFamily {
+                series: vec![Series::new(Vec::new(), Point::Counter(1.0))],
+                ..MetricFamily::new("foo", FamilyType::Counter)
+            },
+            MetricFamily {
+                series: vec![
+                    Series::new(vec![("a".to_string(), "1".to_string())], Point::Gauge(2.0)),
+                    Series::new(vec![("a".to_string(), "2".to_string())], Point::Gauge(3.0)),
+                ],
+                ..MetricFamily::new("foo_total", FamilyType::Gauge)
+            },
+        ];
+        let registry = Registry::new();
+        let diagnostics = logit_core::Diagnostics::new("prometheus_out");
+        let mut encoder = PrometheusEncoder::new()
+            .with_telemetry(registry.telemetry_for("prometheus", "prometheus_out", "sink"))
+            .with_diagnostics(diagnostics.clone());
+        let mut out = Vec::new();
+        write_with(&families, Dialect::Text0_0_4, &mut out, &mut encoder);
+        let text = String::from_utf8(out).expect("exposition must be utf-8");
+
+        assert_eq!(text.matches("# TYPE foo_total").count(), 1, "{text}");
+        assert!(text.contains("# TYPE foo_total counter"), "{text}");
+        let dropped: f64 = registry
+            .drain(0)
+            .iter()
+            .filter(|e| {
+                e.attributes.get("reason").and_then(|v| v.as_str()) == Some("name_collision")
+            })
+            .flat_map(|e| e.metrics.iter())
+            .filter(|m| resolve(m.name) == "logit.output.metrics.dropped")
+            .map(|m| match &m.kind {
+                logit_core::MetricKind::Sum(sum) => sum.value.as_f64(),
+                _ => 0.0,
+            })
+            .sum();
+        assert_eq!(dropped, 2.0);
+        assert_eq!(diagnostics.occurrences("name_collision"), 1);
     }
 
     /// The writer drops a `Stale` series and counts it rather than write a bare `NaN` line.

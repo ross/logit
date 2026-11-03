@@ -150,9 +150,12 @@ for internally generated points.
 **Cardinality is capped.** A component's buffer holds at most 1024 distinct `(name, tags)` keys
 (`telemetry::MAX_KEYS_PER_COMPONENT`). A new key beyond the cap is dropped and counted as
 `logit.internal.points.dropped{reason="cardinality"}` under that component's own
-`component`/`kind`/`role` attributes. This is the bound-and-count-the-drop convention every mature
-statsd client uses for its own send failures, and it makes a component that violates the tag
-convention visible instead of silently growing the interner. Under the tag convention the cap never
+`component`/`kind`/`role` attributes. The first drop also logs a `telemetry_points_capped` warn
+line naming the component and the point's name, once per component for the process's life: a
+component over the cap stays over it, so later drops are counted only. This is the
+bound-and-count-the-drop convention every mature statsd client uses for its own send failures, and
+it makes a component that violates the tag convention visible instead of silently growing the
+interner. Under the tag convention the cap never
 fires in practice, because cardinality is bounded by the metric names and constant tag values in a
 component's code, not by traffic.
 
@@ -265,7 +268,8 @@ identity to coalesce on, so `ComponentBuffer` holds spans in a separate, unkeyed
 how many spans accumulate except drain interval × sample rate. `SpanGuard::link`/`links` also cap
 each span's own link list at `MAX_LINKS_PER_SPAN` (32). Both count rather than grow: a span past
 the buffer cap is lost, as `logit.internal.spans.dropped{reason="buffer_full"}` (drained alongside
-`points.dropped`), and a link past the span's cap is left off a span that's still exported, as
+`points.dropped`), and the first one logs a `telemetry_spans_capped` warn line, once per component
+for the process's life, as the points cap does. A link past the span's cap is left off a span that's still exported, as
 `logit.internal.span.links.omitted{reason="cardinality"}`, recorded immediately on the guard.
 
 ### Span versus point, side by side
@@ -329,6 +333,14 @@ many accumulate except drain interval × how chatty a component's diagnostics ar
 `Event::timestamp` is capture time, not drain time, as for spans: a log line that looks later than
 it was would be actively misleading.
 
+Unlike the points and spans caps, this one logs no line when it drops. The line would be one more
+`logit` warning, which `TelemetryLayer` captures straight back into the full buffer, where it would
+be dropped in turn. And the log that was dropped has already been written to stderr under the
+operator's `--log-level`: only its copy in the pipeline is lost, which `logs.dropped` counts. It's
+the exception to the rule that a counted loss logs
+([ADR `telemetry-loss-vocabulary`](../adr/telemetry-loss-vocabulary.md)'s "Amendment (2026-11-02):
+every counted loss leaves a warn line").
+
 ## `internal`: the drain
 
 ```rust
@@ -343,7 +355,10 @@ ComponentKind::Internal { interval: Duration, span_sample_rate: f64, logs: Inter
    so after a long blocked tick one drain holds events hours apart, and a destination that
    requires a stream in time order (Loki) rejects an entry behind a newer one in the same batch.
    A tie keeps registration order, so the points, all stamped with the drain time, stay grouped by
-   component.
+   component. A counter or timing point also carries the previous drain's time as its
+   `start_timestamp` (the first drain's, the time `internal` started), so each is a delta over
+   the interval it covers, start to end as OTLP writes one. A gauge is a reading at the drain and
+   carries no start time.
 2. **Sampling tick for process-level metrics**, facts tied to no occurrence, so nothing else has a
    reason to push them: resident memory, CPU time, threads, open files, interner size, and uptime.
    See [Process-level metrics](#process-level-metrics).
@@ -399,6 +414,32 @@ clients count their own packets sent/dropped the same way. `logs.emitted` is cou
 `points.emitted` for the same reason `spans.emitted` is: a log event carries neither `metrics` nor
 `span`, so it would otherwise be miscounted as a point
 (`crates/logit-inputs/src/internal.rs::tick`'s fold checks `event.log.is_some()` first).
+
+### When the self sink blocks
+
+Each tick awaits its send, so when the sink behind `internal` has a full queue under
+`buffer.overflow: block`, the send parks and no tick runs until it completes. A blocked self sink
+stalls the drain:
+
+- The component buffers keep coalescing, so the drain that follows carries one point per key for
+  the whole block. A counter's delta covers the block, and its `start_timestamp` says so. A gauge
+  keeps only its last value.
+- Spans and logs past a component's cap are dropped and counted as
+  `logit.internal.spans.dropped` and `logit.internal.logs.dropped`.
+- A send still parked after one `interval` logs a `warn` naming `internal`'s consumers, and its
+  completion logs a second `warn` with the block's length in seconds and in intervals. Both reach
+  the pipeline under the default `logs: warn`. They share one throttle key, so a sink that keeps
+  blocking a little past one interval logs a pair at the 1st, 2nd, 4th, and later powers of two of its
+  episodes, not one per tick.
+- The ticker skips the ticks the block missed (`MissedTickBehavior::Delay`): one drain follows
+  the block, then the cadence resumes.
+
+`internal` keeps no queue of its own: the sink's buffer is the buffer. To keep the drain on its
+cadence through a destination outage, give `internal` a dedicated sink with
+`buffer.overflow: drop_newest`, or `buffer.disk:` when self-telemetry can't be lost.
+[`docs/deploying.md`](../deploying.md#give-internal-a-dedicated-pipeline) has the recipe and
+[ADR `internal-telemetry-as-pipeline-events`](../adr/internal-telemetry-as-pipeline-events.md)'s
+"Amendment: a blocked self sink stalls the drain" has the reasoning.
 
 ### Process-level metrics
 
@@ -506,13 +547,29 @@ config asked for never uses the word:
 | `*.skipped` | Nothing was there to carry, the operator chose to leave it out (`multi_value: skip`), or the destination format has no form for the kind. | `reason` or `metric_kind`. |
 | `*.degraded`, `*.truncated`, `*.normalized` | Delivered, but lossy, shortened, or rewritten. `metrics.normalized{reason="duplicate_timestamp"}` counts a state a sink left off beside an equal one it delivered, so nothing is lost. | `reason`, `metric_kind`, or `field`. |
 | `*.evicted`, `*.untracked` | An entry left a bounded bookkeeping table. No data was lost. | `reason` where more than one cause exists. |
-| `logit.input.batches.deferred` | The source keeps the data and offers it again: a listener answered busy (`503`) and the client retries, or `kafka_in` left a batch uncommitted for the partition's next reader. This is back-pressure, not loss. | None. |
+| `logit.input.batches.deferred` | The source keeps the data and offers it again: a listener answered busy (`503`) and the client retries, `kafka_in` left a batch uncommitted for the partition's next reader, or the shutdown backstop cut a send whose source keeps the batch (`kafka_in`, or a checkpointed `tail_in`, `docker_in`, or `cri_in`). This is back-pressure, not loss. | None. |
 | `logit.input.connections.rejected`, `logit.input.requests.rejected` | A listener refused a connection or request and told the peer, which still holds the data. | `reason`. |
 
 A `reason` value never contains `dropped`, so the word appears only in a loss metric's name. A
 reason says why (`rejected`, `truncated`), and the name says what happened. Diagnostic keys
 (`gauge_delta_unresolved`, say) name a self-log line, not a count, and don't follow this
 vocabulary.
+
+A counted loss in a listener, its decoder, a sink, its codec or disk spool, `prometheus_out`'s
+registry, the pipeline runtime, or `internal` also leaves a `warn` self-log line, so it shows on
+stderr and in `internal`'s `logs: warn` stream before anything graphs the counter. A `*.dropped` a
+listener, a decoder, a sink, its codec, or its disk spool counts has a throttled line, usually keyed
+on its `reason`, logged only in the branch that counts, so a clean body pays nothing. An
+encode-side line is gated as its counter is, so a retry doesn't repeat it. The kernel's
+`input.kernel.dropped` logs once per once-a-second sample that shows new drops. A batch
+`write_loop` drops after a final fault is covered by its `send_failed` and `degraded` lines, and a
+shutdown drop by `drain complete`. A loss with one lasting cause logs once for it: a closed
+consumer once per edge (`closed_consumer`), an `internal` cap once per component
+(`telemetry_points_capped`, `telemetry_spans_capped`), a queue's unannounced shedding once at
+shutdown (`buffer_shed_unannounced`), and a cancelled push's remainder once at shutdown
+(`shutdown_push_cut`). `internal.logs.dropped` has no line, for the reason "Logs" below gives
+([ADR `telemetry-loss-vocabulary`](../adr/telemetry-loss-vocabulary.md)'s "Amendment (2026-11-02):
+every counted loss leaves a warn line").
 
 Every point also carries its component's identity as `component`, `kind`, and `role` attributes.
 Those three tag keys are reserved; see [Metrics from Lua scripts](#metrics-from-lua-scripts).
@@ -541,7 +598,7 @@ every producer the send-side numbers for free:
 | `logit.component.batches.sent` | count | one per `Fanout::send` call, regardless of fan-out width. A `Fanout::send_with_deadline` (`datadog_in`) that times out sends nothing and counts nothing, span and `send.blocked.duration` included |
 | `logit.component.events.sent` | count | events in that batch |
 | `logit.component.send.blocked.duration` | timing | time spent inside one `Fanout::send` call (all consumers) |
-| `logit.component.events.dropped{reason="closed_consumer"}` | count | a consumer's channel was already closed |
+| `logit.component.events.dropped{reason="closed_consumer"}` | count | a consumer's channel was already closed. The first drop on each edge, one producer to one consumer, also logs a `closed_consumer` warn line naming both; later drops on that edge are counted only |
 
 #### Inbox side: recorded under the consumer
 
@@ -615,7 +672,8 @@ A script looping over `Event.new` forever, constructing events, advances the hea
 never stalled or wedged (a loop of refused calls does not advance it): telling it from a large
 `flush()` would take a time limit, which the ADR declines.
 Events it produced after its channels were revoked count as
-`events.dropped{reason="closed_consumer"}` under its own id, and the batches still waiting in its
+`events.dropped{reason="closed_consumer"}` under its own id, with one `closed_consumer` warn line
+per edge they were bound for, naming the node and the consumer, and the batches still waiting in its
 inbox, which it never read, count as `batches.dropped`/`events.dropped{reason="shutdown"}` under
 its own id, as a sink's abandoned inbox does.
 
@@ -624,6 +682,13 @@ counts nothing, naming the bytes held, the collections run, and the cap, then fa
 a wedge, with an error naming the node. The batch that crossed the cap has already been sent; the
 batches still waiting in its inbox count as `batches.dropped`/`events.dropped{reason="shutdown"}`
 under its own id. A memory failure is not a panic, so it never logs `thread_panicked`.
+
+**A node whose thread panics logs `thread_panicked`** through `Diagnostics::error`, which counts
+nothing, and fails the run as a memory failure does. The batches still waiting in its inbox, and
+the batch it had received and not yet finished running `process()` over, count as
+`batches.dropped`/`events.dropped{reason="shutdown"}` under its own id, and the `drain complete`
+line sums them. A panic in a send or in `flush()` loses what the node held there uncounted
+([known gaps](../known-gaps/transforms.md)).
 
 **An unrouted event has no counter of its own** ([ADR `target-components`](../adr/target-components.md)).
 Graph rule 50 rejects a router (`route`, or `lua`/`lua_file` with `targets:`) that has no
@@ -669,7 +734,7 @@ disk-backed sink:
 | `logit.component.buffer.push.blocked.duration` | timing | how long a `Block`-policy push waited for room, one sample per wait, recorded when the wait ends (a cancelled push records its time to cancellation); only recorded when a push had to wait. During a long stall it has no sample yet, so read `push.blocked` |
 | `logit.component.buffer.push.blocked` | gauge | `1` while a `Block`-policy push waits for room, re-written about every 500 ms of the wait so each drain window of 1 s or longer holds it (see "Why a constant is re-emitted"); `0` once the wait ends for any reason: room, close, or the push's cancellation |
 | `logit.component.retrying` | gauge | `1` from the held head's first retryable failure while a retry is pending or in flight, `0` once that head is delivered or dropped and when the write loop exits. A hold drops nothing, so `batches.dropped` stays flat while this reads `1` |
-| `logit.component.batches.dropped{reason=...}` / `.events.dropped{reason=...}` | count | `reason` one of `overflow_oldest`/`overflow_newest` (queue eviction), `rejected` (`write_loop`: the destination refused this batch for its own content, or the sink attached no fault), `ambiguous_at_most_once` (`write_loop`: a send of unknown outcome under `delivery: at_most_once`), `shutdown` (`run_output` stopped with an in-memory queue still non-empty, or with batches that never reached the queue: left in the inbox, or held by a push abandoned at shutdown. A disk-backed sink spools those, so it emits `shutdown` only under `delivery: at_most_once`, for a send the shutdown grace cut off mid-flight, which the destination may have taken and which isn't replayed; its sink span carries `fault=ambiguous`), `frame_too_large`/`disk_corrupt`/`disk_torn`/`disk_full`/`disk_io_error` (disk-backed only, see below) |
+| `logit.component.batches.dropped{reason=...}` / `.events.dropped{reason=...}` | count | `reason` one of `overflow_oldest`/`overflow_newest` (queue eviction), `rejected` (`write_loop`: the destination refused this batch for its own content, or the sink attached no fault), `ambiguous_at_most_once` (`write_loop`: a send of unknown outcome under `delivery: at_most_once`), `shutdown` (`run_output` stopped with an in-memory queue still non-empty, or with batches that never reached the queue: left in the inbox, or held by a push abandoned at shutdown. A disk-backed sink spools those, so it emits `shutdown` only under `delivery: at_most_once`, for a send the shutdown grace cut off mid-flight, which the destination may have taken and which isn't replayed; its sink span carries `fault=ambiguous`; on a listener whose source doesn't keep the batch, `run_input`'s grace backstop stopped it while it was waiting to send this batch downstream, logged `shutdown_backstop`; on a `lua` node that panicked, went over its `max_memory`, or was revoked as wedged, the batches left in its inbox, plus, after a panic, the batch it had received and not yet finished running `process()` over. A batch cut in `Fanout::send` already counted `batches.sent` and `events.sent`, so it counts as both sent and dropped, and a fan-out cut partway reached some consumers), `frame_too_large`/`disk_corrupt`/`disk_torn`/`disk_full`/`disk_io_error` (disk-backed only, see below) |
 
 `write_loop` also writes four `Diagnostics` keys. `retrying` and `send_failed` carry the fault
 class and the destination's error text:
@@ -680,7 +745,7 @@ class and the destination's error text:
 - `send_failed` (warn, throttled to the 1st, 2nd, 4th, ... occurrence): each dropped batch, with
   the time since the last success.
 - `degraded` (warn): the first drop since the sink was last healthy.
-- `recovered` (info): the first success after a drop or a retried failure.
+- `recovered` (warn): the first success after a drop or a retried failure.
 
 No send outcome ends the process: a sink that can't deliver holds or drops, and the diagnostics and
 the `retrying` gauge are how it shows.
@@ -696,9 +761,12 @@ its backend:
   been held. Written while the write loop has every batch its concurrency allows in flight, it
   ends with that concurrency and the last send's duration (`sending at its concurrency of 1, the
   last send took 200ms`), naming the round trip as what bounds the sink.
-- `buffer_recovered` (info): utilization fell below `buffer.recover_below` (default `0.75`), with
+- `buffer_recovered` (warn): utilization fell below `buffer.recover_below` (default `0.75`), with
   the episode's duration and totals.
-- `buffer_full_at_shutdown` (info): the sink finished with the buffer still full.
+- `buffer_full_at_shutdown` (warn): the sink finished with the buffer still full.
+- `buffer_shed_unannounced` (warn): the sink finished after episodes no `buffer_full` line had
+  announced, because the once-a-minute limit held it back, shed data. It carries their count and
+  totals, and notes when the last was still open.
 
 None of them counts in `logit.component.diagnostics`; the `*.dropped` rows above stay the record of
 loss.
@@ -788,9 +856,10 @@ Three naming choices, because the obvious names collide with existing ones:
 - **`push.blocked.duration` records only under `overflow: block`**, which is never the receive
   queue's default (see the ADR).
 
-The receive queue writes the sink store's `buffer_full`, `buffer_recovered`, and
-`buffer_full_at_shutdown` keys (see "Sinks: `SinkStore`"), naming `receive.max_datagrams` or
-`receive.max_bytes`, counting datagrams and bytes, and recovering below `receive.recover_below`.
+The receive queue writes the sink store's `buffer_full`, `buffer_recovered`,
+`buffer_full_at_shutdown`, and `buffer_shed_unannounced` keys (see "Sinks: `SinkStore`"), naming
+`receive.max_datagrams` or `receive.max_bytes`, counting datagrams and bytes, and recovering below
+`receive.recover_below`.
 
 #### TCP listeners: the kernel accept queue
 
@@ -1476,6 +1545,7 @@ own read-side counters:
 |---|---|---|
 | `logit.input.lines` / `.line.bytes` | count | the read-side counterpart of `statsd_in`'s per-datagram pair, at line granularity: every line offered to the decoder, a rejected one and the unterminated line emitted at close included, and not a line dropped for `max_line_bytes` |
 | `logit.input.files.open` | gauge | sampled after every `scan` |
+| `logit.input.batches.deferred` | count | with a `checkpoint_path`, a batch `run_input`'s shutdown backstop cut while it waited on the downstream. The checkpoint doesn't cover it, so the next run reads it again. Already counted `logit.component.batches.sent`. Without a checkpoint the batch counts `logit.component.batches.dropped{reason="shutdown"}` instead |
 | `.files.rotated` / `.files.truncated` | count | a known path now naming another inode (each such path in a scan, so a rotation chain under a wildcard counts every renamed name), or the same inode shrinking |
 | `logit.input.bytes.dropped{reason="truncated"}` | count | at a truncation, the bytes the last size observation (a scan's `stat`, an `fstat`, or a read to the end) saw past the read offset, which no read reached; recorded only when nonzero. A floor, usually `0`: what was written after that observation, before the truncate, isn't seen, and under `copytruncate` survives only in the copy. The unterminated line held from before the truncation was already read, so it's in `frames.dropped{reason="truncated"}` and not here. Recorded with that `frames.dropped` point: they're recorded at the end of the second scan that offers the truncated file's state to a claim, whether or not its listing failed, or up to two scans later while a file waiting to claim it could still do so, or at a stop, and a second truncation of the same file records the first's at once. If a new file claims the truncated file's state first (`.files.claimed`), only the bytes past the larger of the copy's length and the pre-truncation read offset are recorded, since they're in neither file, and the `frames.dropped` point isn't; a crash before then records neither. A file whose head is under 64 bytes can't be claimed, so its truncation records both at once. See [ADR `tail-content-identity`](../adr/tail-content-identity.md), decisions 5 and 7 |
 | `.files.claimed` | count | a file no checkpoint entry names that resumed at a candidate's position by content: an unspent checkpoint entry whose inode is gone (a restored backup, a migrated volume), an entry its own inode rejected (a `copytruncate` while `logit` was down), a truncated file's state from before the truncation (a `copytruncate` copy), or a tracked file at its line boundary (a plain copy). Decision 5 of the same ADR |
@@ -1662,7 +1732,7 @@ client hands it; the outcome table in its module doc is the canonical copy. Its 
 | `logit.input.metrics.skipped{metric_kind, reason}`, `logit.input.metrics.degraded{reason}` | count | under `format: otlp_proto` or `otlp_json`, what the OTLP codec counts, as on `otlp_in`: a metric with no data skipped, a histogram whose count isn't its buckets' sum degraded |
 | `logit.input.headers.omitted{reason="invalid_name"}` | count | a header whose name isn't UTF-8, left out of `_logit.kafka.headers` on a record still delivered |
 | `logit.input.batches.dropped{reason="closed_consumer"}` | count | a batch no consumer directly downstream took; the input commits what came before it, leaves the group, and ends |
-| `logit.input.batches.deferred` | count | a batch not accepted by the drain deadline of a revoke or shutdown, and every batch behind it, or the batches behind a `closed_consumer` drop. Nothing past them is committed, so the next owner of the partition reads them again |
+| `logit.input.batches.deferred` | count | a batch not accepted by the drain deadline of a revoke or shutdown, and every batch behind it, the batches behind a `closed_consumer` drop, or a batch `run_input`'s shutdown backstop cut mid-send. Nothing past them is committed, so the next owner of the partition reads them again |
 
 Its own `Diagnostics` keys, throttled: `records_dropped` for an undecodable record, naming the
 topic, partition, and offset, and `closed_consumer`, naming the topic and partition.
@@ -2699,8 +2769,12 @@ object's close to its answer, are layer 2's
 - Registry state, which no push sink holds: `logit.output.series` (gauge, series held after each
   `send`); `logit.output.series.evicted{reason="expired"|"cardinality"}` (the `expire_after` sweep,
   run on every `send` *and* every scrape, and the `max_series` LRU cap); and
-  `logit.output.metrics.type_conflict` (a family re-typed across batches, evicting every series
-  held under the old type).
+  `logit.output.metrics.dropped{reason="type_conflict"|"name_collision"}` for the series the
+  registry drops when it stores a family: every series held under a family's old type when a
+  later batch re-types it, and the series of whichever of two families writing one `# TYPE` name
+  sorts second. Each counts once per series, in the batch that causes it, never per scrape, with
+  a throttled `family_retyped` or `family_name_collision` warning naming the families
+  (`crates/logit-outputs/src/prometheus.rs`'s "Type conflicts" and "Name collisions").
 
 **Sender mode (`endpoint:`)** is the ordinary push shape and uses `otlp_out`'s vocabulary
 **exactly**, because it reuses that transport's own `Fault` table as code
@@ -2740,8 +2814,10 @@ it takes (the class table above).
 - `logit.output.metrics.dropped{reason="unresolved_delta"|"unresolved_gauge_delta"|
   "type_conflict"|"name_collision"}`: a delta `Sum` or `Histogram`, or a `GaugeDelta`, with no
   `aggregate` upstream to resolve it, a delta `Summary`, which only `cumulative_to_delta` makes
-  and no Prometheus family can carry, and two records that can't share one family. The last two
-  reasons are *within* one batch, distinct from the cross-batch `type_conflict` counter above.
+  and no Prometheus family can carry, and two records that can't share one family. The codec
+  counts the last two reasons for records *within* one batch; the registry counts the same two
+  across batches, above. A render meets no `name_collision` in registry mode: the registry never
+  holds a colliding pair.
 - `logit.output.metrics.skipped{metric_kind="exponential_histogram"}` in registry mode, where
   neither text dialect has a form for one, and `{reason="no_recorded_value"}`.
 - `logit.output.metrics.degraded{metric_kind="non_monotonic_sum"|"distribution"|"samples"|"set"|

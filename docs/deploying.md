@@ -704,13 +704,18 @@ that recorded the point.
 | `shutdown signal received` | info | A SIGTERM/SIGINT arrived. |
 | `shutdown delay elapsed` | info | `shutdown.delay` has run out after a SIGTERM/SIGINT and the drain is starting. Carries `delay`. Not logged when the delay is `0s`, when the signal arrived before `ready`, or when a node failure started the drain first. |
 | `reopen signal received` | info | A SIGHUP arrived. Carries `generation` (SIGHUPs so far) and `config_reloaded=false`: the config isn't reloaded. Logged during a drain too. |
-| `drain complete` | info/warn | Every node has exited after a shutdown or failure — `warn` if any batch was dropped for shutdown. Its `batches_dropped` field sums `logit.component.batches.dropped{reason="shutdown"}` across sinks and Lua nodes. It doesn't include events refused as `closed_consumer`, UDP datagram drops, queue overflow evictions, or a disk sink's shutdown sweep failing to push. |
+| `drain complete` | info/warn | Every node has exited after a shutdown or failure — `warn` if any batch was dropped for shutdown. Its `batches_dropped` field sums `logit.component.batches.dropped{reason="shutdown"}` across sinks, Lua nodes, and listeners. It doesn't include events refused as `closed_consumer`, UDP datagram drops, queue overflow evictions, or a disk sink's shutdown sweep failing to push. |
 | `degraded` | warn | A sink's first dropped batch since it was last healthy. |
 | `retrying` | error | A sink's held head failed a retryable send; logged on the first failure, then at most once a minute while the head keeps failing. |
-| `recovered` | info | A sink's first successful delivery after `degraded` or a retried failure. |
+| `recovered` | warn | A sink's first successful delivery after `degraded` or a retried failure. |
 | `buffer_full` | warn | A sink's buffer, or a datagram listener's receive queue, found no room for a push. Names the bound and the `overflow` policy; repeats at most once a minute while it stays full, with what was shed or how long intake has been held. On a sink with every send its `concurrency` allows in flight, it also names that concurrency and the last send's duration. |
-| `buffer_recovered` | info | A full buffer's utilization fell below its `recover_below`. Carries the episode's duration and totals. |
-| `buffer_full_at_shutdown` | info | A sink or listener stopped with its buffer still full. |
+| `buffer_recovered` | warn | A full buffer's utilization fell below its `recover_below`. Carries the episode's duration and totals. |
+| `buffer_full_at_shutdown` | warn | A sink or listener stopped with its buffer still full. |
+| `buffer_shed_unannounced` | warn | A sink or listener stopped after its buffer shed data in a full episode no `buffer_full` line had announced yet, because the once-a-minute limit held it back. Carries the episodes' count and what they shed. |
+| `shutdown_push_cut` | warn | Shutdown cut a listener's push into its receive queue partway, so the datagrams it hadn't reached were dropped. Names the listener and the counts, which are in its `logit.component.datagrams.dropped`/`bytes.dropped{reason="shutdown"}`. Logged at most once per listener, at shutdown. Not in `drain complete`'s `batches_dropped`, which counts batches. |
+| `closed_consumer` | warn | A component sent a batch to a consumer that has stopped taking batches, or a wedged `lua` node's channels were revoked after its shutdown grace, leaving what it produced afterward with nowhere to go. Names both; logged once per producer and consumer, with every drop counted in `logit.component.events.dropped{reason="closed_consumer"}`. A listener that refuses a request or a `logit_in` frame because no consumer took its batch logs its own throttled `closed_consumer` line naming the peer, with the batch counted in `logit.input.batches.dropped{reason="closed_consumer"}`. |
+| `telemetry_points_capped`, `telemetry_spans_capped` | warn | `internal`'s buffer for one component dropped a point (more than 1024 distinct name and tag pairs between drains) or a span (more than 512 between drains). Logged once per component per cap; counted in `logit.internal.points.dropped` and `logit.internal.spans.dropped`. Only with an `internal` component. |
+| `shutdown_backstop` | warn | A listener didn't finish within its shutdown grace (`receive.shutdown_grace`, 5 s by default) and was stopped. Names the listener's kind and the grace. If the listener was waiting to send a batch downstream, the line names the batch and its event count. `kafka_in`, and `tail_in`, `docker_in`, or `cri_in` with a `checkpoint_path`, count it `logit.input.batches.deferred`, and the line says the next run reads it again from the committed offset or checkpoint. Every other listener counts it `batches.dropped`/`events.dropped{reason="shutdown"}`, and the line says it's lost. A batch cut in a plain send was already counted `batches.sent`. One cut in a send that reserves room in every consumer first (an HTTP listener's `busy_after` send, or `kafka_in`'s) wasn't. With no batch in a send, the line says so, and nothing is counted. |
 | `telemetry left undrained at exit` | debug/warn | One line per internal metric point no `internal` drain exported, logged after every node has exited and before `exiting`, on exit `0` or `2` alike. `warn` for any nonzero `*.dropped` count, whatever its `reason`; `debug` for everything else, including timings and routine counts. Only with an `internal` component. |
 | `exiting` | info/error | The process is about to exit — `info` at `0`, `error` at any failure code (`1` or `2`). A config error that fails before the pipeline starts exits without this line. |
 
@@ -727,6 +732,9 @@ pipeline](#give-internal-a-dedicated-pipeline) exports every data node's shutdow
   carrying `internal`'s output records while it shuts down, at `warn` under that node's component
   id. That node shuts down after `internal`'s final drain, so no topology can export the count. `drain complete` includes it in
   `batches_dropped`.
+- `internal`'s own `batches.dropped` and `events.dropped{reason="shutdown"}`, at `warn`, when its
+  final send was still waiting on a full downstream at the end of its grace. That batch held the
+  telemetry the final drain took, and the `shutdown_backstop` line names it.
 
 A mixed pipeline, where `internal` shares a sink or transform with data, also leaves data drop
 counts here: that sink's `batches.dropped{reason="shutdown"}` and a UDP listener's
@@ -803,6 +811,29 @@ components:
     endpoint: http://collector:4318
 ```
 
+**Set the dedicated sink's `buffer.overflow` so a destination outage can't stall `internal`.**
+Under the default `block`, a full queue parks `internal`'s send, and no drain runs until it
+completes. Every point then coalesces across the outage: a counter's whole delta lands in one
+point, a gauge keeps only its last value, and spans and logs past each component's cap are
+dropped and counted. `internal` logs a `warn` once its send has been blocked for one `interval`,
+and another when it recovers, giving the block's length. It keeps no queue of its own, so choose
+what its sink does when full:
+
+- `drop_newest` keeps the batches from the outage's onset, usually the most diagnostic part, and
+  counts the rest as `logit.component.batches.dropped{reason="overflow_newest"}` on the sink. The
+  send never blocks, so the drain keeps its cadence.
+- `buffer.disk:` is for self-telemetry you can't lose. The spool holds the outage's batches up
+  to `disk.max_bytes`, then follows `overflow`.
+
+```yaml
+  self_out:
+    type: otlp_out
+    sources: [self]
+    endpoint: http://collector:4318
+    buffer:
+      overflow: drop_newest
+```
+
 A dedicated pipeline can have transforms, such as a `keep_signals` or an `aggregate`, between
 `internal` and its sinks. See [`docs/design/internal-telemetry.md`](design/internal-telemetry.md)
 and the [ADR `shutdown-accounting-and-cancellation-safety`](adr/shutdown-accounting-and-cancellation-safety.md)'s
@@ -823,7 +854,8 @@ isn't keeping up and loss may follow:
 
 - `logit.input.batches.deferred`: an HTTP listener answered `503` and the client kept the data to
   retry. A client with a short retry window, such as a dd-trace tracer, drops its payload once it
-  gives up, and `logit` can't count that.
+  gives up, and `logit` can't count that. `kafka_in` and a checkpointed `tail_in`, `docker_in`, or
+  `cri_in` also count a batch shutdown stopped them sending, which the next run reads again.
 - `logit.component.retrying` (gauge, on a sink): `1` while the sink retries a failing head. A hold
   drops nothing, so `*.dropped` doesn't move until the queue behind it overflows or shutdown
   cuts it. Alert on this gauge staying at `1`.
@@ -956,7 +988,7 @@ An error the sink attaches no fault to is treated as `Rejected`.
   a minute while it keeps failing, however long the hold lasts. It names the fault class, the
   destination's error text, how long the head has been held, the failure count, and how many
   batches are queued.
-- `degraded` (warn, on the first drop) and `recovered` (info, on the first success after a drop or
+- `degraded` (warn, on the first drop) and `recovered` (warn, on the first success after a drop or
   a retried failure) mark the edges.
 
 The status-only default for HTTP sinks is the `classify_status` table in
@@ -1238,9 +1270,10 @@ rotation renames each retained file; `logit validate` rejects a larger value.
 
 **What to watch.** The metrics above still apply, with these differences:
 `buffer.utilization`/`.bytes` are sized against `buffer.disk.max_bytes`; `batches.dropped` gains
-the `reason`s `frame_too_large`, `disk_corrupt`, `disk_torn`, `disk_full`, and `disk_io_error`;
-and a disk-backed sink emits `reason="shutdown"` only under `at_most_once`, when the shutdown grace cuts
-off the batches in flight (an ambiguous outcome that posture drops). Nothing else is dropped at
+the `reason`s `frame_too_large`, `disk_corrupt`, `disk_torn`, `disk_full`, and `disk_io_error`,
+each with a throttled `warn` self-log line; and a disk-backed sink emits
+`reason="shutdown"` only under `at_most_once`, when the shutdown grace cuts off the batches in
+flight (an ambiguous outcome that posture drops). Nothing else is dropped at
 shutdown, because the spool keeps it. Also watch:
 
 - `logit.component.buffer.disk.segments` (gauge): segment files currently on disk.
@@ -1305,8 +1338,10 @@ can't report the second number at all.
   deliver what's still queued. Datagrams still queued at that deadline are dropped and counted
   `logit.component.datagrams.dropped{reason="shutdown"}`
   ([ADR `shutdown-accounting-and-cancellation-safety`](adr/shutdown-accounting-and-cancellation-safety.md)).
-  Events already decoded at that deadline, in a batch still being assembled or one waiting for a
-  downstream inbox, are dropped uncounted.
+  A batch waiting for a downstream inbox at that deadline is dropped and counted
+  `logit.component.batches.dropped`/`events.dropped{reason="shutdown"}`, with a
+  `shutdown_backstop` warn. Events already decoded into a batch still being assembled are dropped
+  uncounted.
 
 ### Listener sizing and `SO_RCVBUF`
 
@@ -1409,12 +1444,14 @@ For a UDP listener:
   read slot, which the kernel cut short, so the listener drops it rather than decode a partial
   payload. It happens only on an **IPv6** listener, which permits a 65,527-byte payload, or a Unix
   datagram socket. Anything but zero means a sender is emitting datagrams larger than any IPv4 path
-  could carry; fix it at the sender.
+  could carry; fix it at the sender. Each read that drops one also logs a throttled `truncated`
+  warn line.
 - `logit.input.kernel.dropped{reason="socket"}` (count, Linux only): datagrams the *kernel* discarded before
   `recv_from` could return them, read from the listening socket itself. It is the same number
   `/proc/net/udp`'s `drops` column shows for this socket. It is a separate loss from the queue
   counter above; the two add up. Any nonzero count is loss; a sustained rate means datagrams arrive
-  faster than this process takes them off the socket.
+  faster than this process takes them off the socket. Each once-a-second sample that sees new
+  drops logs a throttled `socket` warn line with the count.
 - `logit.input.receive_buffer.utilization` (gauge), with
   `logit.input.receive_buffer.used.bytes` / `.bytes` behind it: how full the kernel's socket buffer
   is, sampled once a second. It is the leading indicator for `kernel.dropped`: the kernel drops at

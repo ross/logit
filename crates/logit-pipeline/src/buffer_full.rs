@@ -13,9 +13,17 @@
 //!   bound, and so opens and closes an episode per item, still writes at most one warn line a
 //!   minute. An episode that opens inside that minute stays unannounced until the clock allows a
 //!   line; if it closes first, its counts ride on the next `buffer_full` line.
-//! - `buffer_recovered` (info): when an announced episode closes, with its duration and totals.
-//! - `buffer_full_at_shutdown` (info): when the queue's owner finishes it with an announced
+//! - `buffer_recovered` (warn): when an announced episode closes, with its duration and totals.
+//! - `buffer_full_at_shutdown` (warn): when the queue's owner finishes it with an announced
 //!   episode still open.
+//! - `buffer_shed_unannounced` (warn): when the owner finishes it and the episodes no line
+//!   announced shed anything, the open one and those whose counts were waiting to ride on the
+//!   next `buffer_full`. No later line would carry them, so without it that loss would show only
+//!   in the `*.dropped` counters. Episodes that only held intake write nothing.
+//!
+//! Every line is `warn` so a reader who sees one finds its pair: `internal`'s default `logs: warn`
+//! captures only `warn` and above, and a pipeline that got `buffer_full` alone would never see
+//! the episode end.
 //!
 //! On a sink's buffer, a `buffer_full` line written while the write loop has as many batches in
 //! flight as its concurrency allows also names that limit and the last send's duration
@@ -210,10 +218,9 @@ impl Drop for Waiting<'_> {
     }
 }
 
-enum Line {
-    Warn(String),
-    Info(&'static str, String),
-}
+/// A self-log line: its key and message. Every line of an episode is `warn`, so `internal`'s
+/// default `logs: warn` captures the opening and the close of one.
+struct Line(&'static str, String);
 
 impl FullWatch {
     pub(crate) fn new(
@@ -360,7 +367,7 @@ impl FullWatch {
             let Some(episode) = state.episode.take() else { return };
             self.open.store(false, Ordering::Release);
             if episode.announced {
-                Some(Line::Info(
+                Some(Line(
                     "buffer_recovered",
                     format!(
                         "{} below {}% of its bounds after {}; overflow {} {}",
@@ -383,15 +390,20 @@ impl FullWatch {
     }
 
     /// Closes an open episode at shutdown, after the last push. Writes
-    /// `buffer_full_at_shutdown` if the episode was announced.
+    /// `buffer_full_at_shutdown` if the episode was announced, else
+    /// `buffer_shed_unannounced` if the episodes no line announced shed anything: the open one,
+    /// and any that closed inside the throttle's minute and were waiting to ride on a later
+    /// `buffer_full`. Without it, a queue that sheds within a minute of its last line and then
+    /// shuts down would report that loss in its `*.dropped` counters alone.
     pub(crate) fn finish(&self) {
         let now = Instant::now();
         let line = {
             let mut state = self.lock();
-            let Some(episode) = state.episode.take() else { return };
+            let open = state.episode.take();
             self.open.store(false, Ordering::Release);
-            episode.announced.then(|| {
-                Line::Info(
+            let mut unannounced = std::mem::take(&mut state.unannounced);
+            match open {
+                Some(episode) if episode.announced => Some(Line(
                     "buffer_full_at_shutdown",
                     format!(
                         "{} still full at shutdown after {}; overflow {} {}",
@@ -400,8 +412,31 @@ impl FullWatch {
                         self.config.policy.as_str(),
                         self.what_happened(&episode, now, true),
                     ),
-                )
-            })
+                )),
+                open => {
+                    let still_open = open.is_some();
+                    if let Some(episode) = open {
+                        let mut totals = episode.totals;
+                        totals.blocked = episode.blocked_so_far(now);
+                        totals.episodes = 1;
+                        unannounced.add(&totals);
+                    }
+                    (unannounced.items > 0).then(|| {
+                        Line(
+                            "buffer_shed_unannounced",
+                            format!(
+                                "{} full in {} episode(s) no earlier line reported{}; overflow \
+                                 {} {}",
+                                self.labels.what,
+                                unannounced.episodes,
+                                if still_open { ", the last still open at shutdown" } else { "" },
+                                self.config.policy.as_str(),
+                                self.totals_text(&unannounced),
+                            ),
+                        )
+                    })
+                }
+            }
         };
         self.emit(line);
     }
@@ -471,7 +506,7 @@ impl FullWatch {
         if let Some(episode) = state.episode.as_mut() {
             episode.announced = true;
         }
-        Some(Line::Warn(msg))
+        Some(Line("buffer_full", msg))
     }
 
     /// What the episode did: `is holding intake` or `is shedding ...` as it opens, and its totals
@@ -513,10 +548,8 @@ impl FullWatch {
     }
 
     fn emit(&self, line: Option<Line>) {
-        match line {
-            Some(Line::Warn(msg)) => self.diag.warn_keyed("buffer_full", msg),
-            Some(Line::Info(key, msg)) => self.diag.info(key, msg),
-            None => {}
+        if let Some(Line(key, msg)) = line {
+            self.diag.warn_keyed(key, msg);
         }
     }
 }
@@ -559,68 +592,9 @@ fn fmt_duration(d: Duration) -> String {
 }
 
 #[cfg(test)]
-pub(crate) mod test_support {
-    //! A thread-local capture of self-log lines, for tests on a `current_thread` runtime.
-
-    use std::sync::{Arc, Mutex};
-    use tracing_subscriber::layer::SubscriberExt;
-
-    #[derive(Clone, Default)]
-    pub(crate) struct Lines(Arc<Mutex<Vec<(tracing::Level, String, String)>>>);
-
-    impl Lines {
-        /// Every captured `(level, key, message)` whose key is `key`.
-        pub(crate) fn with_key(&self, key: &str) -> Vec<(tracing::Level, String)> {
-            let lines = self.0.lock().unwrap();
-            lines.iter().filter(|(_, k, _)| k == key).map(|(l, _, m)| (*l, m.clone())).collect()
-        }
-    }
-
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Lines {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            #[derive(Default)]
-            struct Visitor {
-                key: String,
-                message: String,
-            }
-            impl tracing::field::Visit for Visitor {
-                fn record_debug(
-                    &mut self,
-                    field: &tracing::field::Field,
-                    value: &dyn std::fmt::Debug,
-                ) {
-                    self.record_str(field, &format!("{value:?}"));
-                }
-                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-                    match field.name() {
-                        "key" => self.key = value.trim_matches('"').to_string(),
-                        "message" => self.message = value.to_string(),
-                        _ => {}
-                    }
-                }
-            }
-            let mut visitor = Visitor::default();
-            event.record(&mut visitor);
-            self.0.lock().unwrap().push((*event.metadata().level(), visitor.key, visitor.message));
-        }
-    }
-
-    /// Captures every line logged on this thread until the guard drops.
-    pub(crate) fn capture() -> (Lines, tracing::subscriber::DefaultGuard) {
-        let lines = Lines::default();
-        let subscriber = tracing_subscriber::registry().with(lines.clone());
-        (lines.clone(), tracing::subscriber::set_default(subscriber))
-    }
-}
-
-#[cfg(test)]
 mod tests {
-    use super::test_support::capture;
     use super::*;
+    use crate::test_util::capture_lines as capture;
 
     static LABELS: FullLabels = FullLabels {
         what: "buffer",
@@ -681,6 +655,74 @@ mod tests {
                 "{limit}/{in_flight}"
             );
         }
+    }
+
+    /// `internal`'s default `logs: warn` captures only `warn` and above, so every line of an
+    /// episode must be `warn` or the pipeline sees an episode open and never close.
+    #[tokio::test]
+    async fn every_line_of_an_episode_logs_at_warn() {
+        let (lines, _guard) = capture();
+        let w = watch(OverflowPolicy::DropNewest, Telemetry::default());
+        w.dropped("overflow_newest", 1, Bound::Items);
+        w.utilization(0.5);
+        let closing = watch(OverflowPolicy::DropNewest, Telemetry::default());
+        closing.dropped("overflow_newest", 1, Bound::Items);
+        closing.finish();
+        for key in ["buffer_full", "buffer_recovered", "buffer_full_at_shutdown"] {
+            let found = lines.with_key(key);
+            assert!(!found.is_empty(), "{key} was not written");
+            assert!(found.iter().all(|(level, _)| *level == tracing::Level::WARN), "{found:?}");
+        }
+    }
+
+    /// An episode the throttle left unannounced, open at shutdown or closed and waiting to ride on
+    /// a later line, writes `buffer_shed_unannounced` from `finish` when it shed anything; one that
+    /// only held intake writes nothing.
+    #[tokio::test(start_paused = true)]
+    async fn finish_reports_what_unannounced_episodes_shed() {
+        let (lines, _guard) = capture();
+        let w = watch(OverflowPolicy::DropNewest, Telemetry::default());
+        w.dropped("overflow_newest", 3, Bound::Items);
+        w.utilization(0.5);
+        // Inside the minute: two episodes no line announces, the second still open at shutdown.
+        w.dropped("overflow_newest", 4, Bound::Items);
+        w.utilization(0.5);
+        w.dropped("overflow_newest", 5, Bound::Items);
+        w.finish();
+        assert!(lines.with_key("buffer_full_at_shutdown").is_empty());
+        let shed = lines.with_key("buffer_shed_unannounced");
+        assert_eq!(
+            shed,
+            vec![(
+                tracing::Level::WARN,
+                "buffer full in 2 episode(s) no earlier line reported, the last still open at \
+                 shutdown; overflow drop_newest shed 2 batch(es) (9 event(s))"
+                    .to_string()
+            )]
+        );
+
+        // Closed and unannounced, nothing open at shutdown.
+        let closed = watch(OverflowPolicy::DropOldest, Telemetry::default());
+        closed.dropped("overflow_oldest", 1, Bound::Items);
+        closed.utilization(0.5);
+        closed.dropped("overflow_oldest", 2, Bound::Items);
+        closed.utilization(0.5);
+        closed.finish();
+        let shed = lines.with_key("buffer_shed_unannounced");
+        assert_eq!(shed.len(), 2);
+        assert_eq!(
+            shed[1].1,
+            "buffer full in 1 episode(s) no earlier line reported; overflow drop_oldest shed 1 \
+             batch(es) (2 event(s))"
+        );
+
+        // An unannounced episode that only held intake lost nothing.
+        let held = watch(OverflowPolicy::Block, Telemetry::default());
+        held.dropped("overflow_newest", 1, Bound::Items);
+        held.utilization(0.5);
+        drop(held.waiting(Bound::Items));
+        held.finish();
+        assert_eq!(lines.with_key("buffer_shed_unannounced").len(), 2);
     }
 
     /// `0.57 * 100.0` is `56.99999999999999` in `f64`; the line reads `57%`.

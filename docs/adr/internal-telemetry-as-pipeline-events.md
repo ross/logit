@@ -1,6 +1,6 @@
 ---
 created: 2026-08-31
-updated: 2026-10-25
+updated: 2026-11-01
 ---
 
 # Internal telemetry as ordinary pipeline events, drained from a component-level buffer
@@ -197,3 +197,52 @@ does with any signal source, and `internal` already is "some other input." Nothi
 reversed: a second, out-of-band metrics representation kept in sync by hand is still rejected. A
 sink that happens to speak Prometheus's wire format, driven by the same graph every other sink is,
 is a different thing entirely.
+
+## Amendment: a blocked self sink stalls the drain (2026-11-01)
+
+**A self sink that blocks stalls `internal`'s drain, and that's a decided limit: `internal` keeps
+no queue of its own.** Each tick awaits `Fanout::send`. When the sink behind `internal` has a full
+in-memory queue under `buffer.overflow: block`, that send parks and no tick runs until it
+completes. In one deployment it parked for 105 minutes.
+
+While the send is parked, the component buffers keep coalescing:
+
+- A counter's whole delta for the block lands in one point at the drain that follows.
+- A gauge keeps only its last value, so the block's per-interval resolution is gone.
+- Spans and captured logs past each component's cap are dropped and counted
+  (`logit.internal.spans.dropped`, `logit.internal.logs.dropped`).
+
+`internal` doesn't buffer around this. The sink's buffer is the buffer. A second queue inside
+`internal` would duplicate the sink's queue and its `buffer.disk:` spool, and would need its own
+size and overflow settings to say what happens when it fills too.
+
+Three changes make the block visible and keep its aftermath honest:
+
+1. **The ticker uses `MissedTickBehavior::Delay`.** Under tokio's default `Burst`, every tick missed
+   during the block fired back to back once the send completed, about 630 drains after 105 minutes
+   at a 10 s `interval`. Process gauges mean no drain is empty, so each sent a batch into the sink
+   that had recovered. Under `Delay`, `internal` drains once and resumes its cadence from
+   there.
+2. **A counter or timing point carries the interval it covers.** Each drained counter (a delta
+   `Sum`, including the `*.dropped` counters the buffer adds) and timing (a `Distribution`) gets
+   the previous drain's time as its `start_timestamp`, the first drain getting the time `internal`
+   started. The event's timestamp stays the drain time, so the pair is OTLP's start-to-end for a
+   delta point. A gauge gets no start time. The block-long delta then says how long a span it
+   covers, instead of reading as one interval's worth.
+3. **A `warn` pair marks the episode.** A send still parked after one `interval` logs a `warn`
+   naming `internal`'s consumers, and its completion logs a second `warn` with the block's length
+   and how many intervals it spanned. Both are `warn` so `internal`'s default `logs: warn`
+   captures them into the pipeline too. They share one throttle key, so a sink that flaps a little
+   past one interval doesn't log a pair per tick. No `ticks.missed` counter: the recovered line
+   says how many intervals the block spanned.
+
+To keep self-telemetry flowing through a destination outage, give `internal` a dedicated sink and
+choose its overflow:
+
+- `buffer.overflow: drop_newest` keeps the batches from the outage's onset, the most diagnostic
+  part, and sheds the rest, counted as `logit.component.batches.dropped{reason="overflow_newest"}`.
+  The send never blocks, so the ticks keep their cadence and each point keeps its interval.
+- `buffer.disk:` is for a deployment that can't lose self-telemetry. The spool holds the outage's
+  batches up to `disk.max_bytes`, then follows `buffer.overflow`.
+
+[`docs/deploying.md`](../deploying.md)'s "Give `internal` a dedicated pipeline" has the config.

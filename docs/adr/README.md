@@ -25,7 +25,7 @@ the same date, write the record, then add a row here.
 | [Metric flags: producers set `_logit.metrics.*` flags, and `aggregate` reads flags instead of protocol carriers](metric-flags.md) | 2026-10-22 | 2026-10-23 |
 | [`dedup_timestamps`: collapse readings of one series that share a timestamp, within a batch, before a sink that can't hold both](dedup-timestamps-transform.md) | 2026-10-21 | 2026-10-23 |
 | [Lua `vars`: a component's `vars:` map reaches its script as a plain-table global](lua-script-vars.md) | 2026-10-21 | 2026-10-21 |
-| [Full-buffer diagnostics: a full sink buffer or receive queue logs once a minute, and a gauge reads a blocked push live](buffer-full-diagnostics.md) | 2026-10-21 | 2026-10-25 |
+| [Full-buffer diagnostics: a full sink buffer or receive queue logs once a minute, and a gauge reads a blocked push live](buffer-full-diagnostics.md) | 2026-10-21 | 2026-11-02 |
 | [`datadog_out` maps OTLP metric kinds as Datadog's OTel exporter does, statelessly](datadog-otlp-metric-mapping.md) | 2026-10-20 | 2026-10-23 |
 | [`cumulative_to_delta`: a stateful transform that turns cumulative sums, histograms, and summaries into deltas](cumulative-to-delta-transform.md) | 2026-10-20 | 2026-10-25 |
 | [`influxdb_out` writes histograms and summaries in Telegraf's `prometheus-v1` shape](influxdb-histogram-summary-shape.md) | 2026-10-20 | 2026-10-21 |
@@ -45,7 +45,7 @@ the same date, write the record, then add a row here.
 | [Stale events are filtered by a `drop_stale`/`has_stale` transform pair](stale-event-filtering.md) | 2026-10-13 | 2026-10-13 |
 | [InfluxDB line-protocol relay: fields as typed `Gauge` records under a measurement carrier, strings as attributes, and an all-or-nothing write](influxdb-line-protocol-relay.md) | 2026-10-13 | 2026-10-25 |
 | [Typed metric scalar: `MetricValue { F64, I64, U64, Bool }` replaces the `f64` in `Gauge`, `GaugeDelta`, and `Sum`](typed-metric-scalar.md) | 2026-10-13 | 2026-10-18 |
-| [Telemetry loss vocabulary: any nonzero `*.dropped` is loss, and intended outcomes use other words](telemetry-loss-vocabulary.md) | 2026-10-13 | 2026-10-28 |
+| [Telemetry loss vocabulary: any nonzero `*.dropped` is loss, and intended outcomes use other words](telemetry-loss-vocabulary.md) | 2026-10-13 | 2026-11-02 |
 | [`kafka_out` OTLP formats: one export request per signal per record, a topic per signal, and a producer per topic behind a multi-topic facade](kafka-otlp-formats.md) | 2026-10-12 | 2026-10-13 |
 | [`kafka_out` SASL: PLAIN, SCRAM, OAUTHBEARER, and AWS MSK IAM, authenticated in the dialer and renewed by redial](kafka-sasl.md) | 2026-10-11 | 2026-10-30 |
 | [`kafka_out`: a pure-Rust producer on `kafka-protocol`, with the Java producer's semantics and named divergences](kafka-output.md) | 2026-10-11 | 2026-10-25 |
@@ -79,8 +79,8 @@ the same date, write the record, then add a row here.
 | [`stdio_out`/`file_out`'s human render: an exhaustive, sectioned block per event](human-render-block-format.md) | 2026-09-28 | 2026-10-02 |
 | [`stdio_out`/`file_out` gain `format: json`, and every machine reader of the text render moves to it](stream-json-format.md) | 2026-09-28 | 2026-10-19 |
 | [Test timing: wait on an observable, size every sleep, and share one set of helpers](test-timing-and-observables.md) | 2026-09-28 | 2026-10-19 |
-| [Shutdown accounting and cancellation safety: every shutdown loss counted, and one table of cancellation points](shutdown-accounting-and-cancellation-safety.md) | 2026-09-26 | 2026-10-29 |
-| [Lua scripts: stall detection, a progress-based wedge check, opt-in `max_memory`, and a table-depth cap](lua-runaway-script-bounds.md) | 2026-09-26 | 2026-10-25 |
+| [Shutdown accounting and cancellation safety: every shutdown loss counted, and one table of cancellation points](shutdown-accounting-and-cancellation-safety.md) | 2026-09-26 | 2026-11-02 |
+| [Lua scripts: stall detection, a progress-based wedge check, opt-in `max_memory`, and a table-depth cap](lua-runaway-script-bounds.md) | 2026-09-26 | 2026-11-02 |
 | [Deployment threat model: accidental data inside a trust boundary, not a malicious peer](deployment-threat-model.md) | 2026-09-25 | 2026-10-25 |
 | [Untrusted-input bounds: one set of rules for every decoder and listener a peer can reach](untrusted-input-bounds.md) | 2026-09-25 | 2026-10-25 |
 | [Out-of-CI fuzzing: a `cargo-fuzz` workspace in the unsafe-check image, with every crash landed as a stable test](out-of-ci-fuzzing.md) | 2026-09-25 | 2026-10-18 |
@@ -110,7 +110,7 @@ the same date, write the record, then add a row here.
 | [A load-test harness: the real binary, a declarative event template, and CPU per event as the signal](load-test-harness.md) | 2026-09-12 | 2026-10-23 |
 | [`FramedEncoder`: a third codec trait for sinks that need per-message framing, over a shared `MessageBuf`](framed-encoder.md) | 2026-09-12 | 2026-10-18 |
 | [collectd binary-protocol relay: identity as attributes, value types as `Sum`/`Gauge`, and a packing encoder](collectd-binary-relay.md) | 2026-09-12 | 2026-10-23 |
-| [Prometheus scrape ingestion and exposition: transports, dialects, and the model mapping](prometheus-scrape-and-exposition.md) | 2026-09-11 | 2026-10-25 |
+| [Prometheus scrape ingestion and exposition: transports, dialects, and the model mapping](prometheus-scrape-and-exposition.md) | 2026-09-11 | 2026-11-02 |
 | [Metrics model v2: `Sum` replaces `Counter`, raw/summarized pairs, boxed span fidelity, batch-level `Scope`](metrics-model-v2.md) | 2026-09-11 | 2026-10-18 |
 | [RFC 5424 structured-data convention: nested `syslog.sd`, strict parsing, opt-in PEN-qualified emission](syslog-structured-data-convention.md) | 2026-09-11 | 2026-10-25 |
 | [A shared build cache and one-container check execution for the local development loop](fast-local-development-loop.md) | 2026-09-11 | 2026-09-11 |
@@ -150,7 +150,7 @@ the same date, write the record, then add a row here.
 | [Propagate real trace context on `Delivered`, for the node kinds with one unambiguous parent](trace-context-propagation-on-delivered.md) | 2026-09-01 | 2026-09-15 |
 | [Lua-authored telemetry: cardinality is convention-enforced, not type-system-enforced](lua-authored-telemetry-cardinality.md) | 2026-09-01 | 2026-10-25 |
 | [A separate demo stack, not an extension of the dev stack](demo-stack-separate-from-dev-stack.md) | 2026-09-01 | 2026-10-18 |
-| [Internal telemetry as ordinary pipeline events, drained from a component-level buffer](internal-telemetry-as-pipeline-events.md) | 2026-08-31 | 2026-10-25 |
+| [Internal telemetry as ordinary pipeline events, drained from a component-level buffer](internal-telemetry-as-pipeline-events.md) | 2026-08-31 | 2026-11-01 |
 | [Minimize allocations over event size, when the two conflict](minimize-allocations-over-event-size.md) | 2026-08-31 | 2026-08-31 |
 | [jemalloc as the global allocator](jemalloc-global-allocator.md) | 2026-08-31 | 2026-09-28 |
 | [`Arc<EventBatch>` copy-on-write on channels](arc-eventbatch-copy-on-write.md) | 2026-08-31 | 2026-08-31 |

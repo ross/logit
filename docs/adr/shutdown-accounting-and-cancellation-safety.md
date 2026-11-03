@@ -1,6 +1,6 @@
 ---
 created: 2026-09-26
-updated: 2026-10-29
+updated: 2026-11-02
 ---
 
 # Shutdown accounting and cancellation safety: every shutdown loss counted, and one table of cancellation points
@@ -116,7 +116,9 @@ was missing was executable evidence under real concurrency, and the shutdown acc
    `max_memory` failure can land before the drain or after it has begun (`run_lua_loop`'s
    `flush_now` and `check_at_close` verdicts). Either way the revoked inbox's contents are
    dropped because the node is leaving the graph, on or after the drain's start, so the label
-   stays `shutdown`.
+   stays `shutdown`. [Since [ADR `lua-runaway-script-bounds`](lua-runaway-script-bounds.md)'s
+   2026-11-02 amendment, `run_lua` sweeps after a panic on its thread too, and calls
+   `count_shutdown_drop` itself for the batch its thread held when it panicked.]
 
    The field doesn't include events a `Fanout` drops as `closed_consumer`, UDP datagram drops (a
    different unit), overflow evictions during the drain, or the disk sweep's push failures
@@ -672,3 +674,94 @@ to a script error is new loss under `events.dropped{reason="script_error"}` and 
 Under [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md), `logit.input.datagrams.truncated` is removed. The UDP read side counts a datagram
 the kernel truncated as `logit.component.datagrams.dropped{reason="truncated"}` and never queues
 it, so it now appears in the sum this record describes, as one more reason.
+
+## Amendment: the listener backstop logs and counts a cut send (2026-11-02)
+
+Decision 1 named two backstop losses as uncounted exceptions: a UDP listener's batch parked in
+`emit`'s `Fanout::send`, and a batch cut off mid-`Fanout::deliver`. The Consequences listed a
+third, `internal`'s drained batch parked in its send. All three are one case, and it reaches every
+listener: `run_input`'s backstop drops a future parked in a `Fanout` send, and that send's batch
+goes with it. These decisions close that case, continuing the numbering above.
+
+17. **A listener's `Fanout` records its sends in flight, one counter per connection.**
+    `run_input` gives the listener's `Fanout` a counter in a `SendsInFlight` registry. Each counter
+    is one atomic word, the batch count in the high 24 bits and their events in the low 40, and
+    each async send adds its batch on entry and removes it when it returns or its future drops:
+    one `fetch_add` and one `fetch_sub` on its own copy's counter, which no other connection
+    touches.
+    - A clone shares its copy's counter, so a per-request clone costs what it did before.
+    - `Fanout::for_connection` registers a new counter. A listener calls it once per accepted
+      connection: `otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, `influxdb_in`,
+      and `prometheus_in`'s receiver. The registry's lock is taken
+      only there and by a read, which prunes counters whose copies have all dropped.
+    - `Fanout::detached` is a copy with no counter, for a task that outlives the listener's
+      future, whose sends the backstop doesn't cut: `http.rs`'s `deliver_detached`, each
+      `logit_in` connection, and each connection of the stream driver (`tcp.rs`), which
+      `tokio::spawn` runs outside the listener's future. The stream driver's
+      `run_until_shutdown` returns at the signal without waiting for its connections, so the
+      backstop never reads their sends.
+    - Every other node's `Fanout` carries no counter and pays a `None` check per send. The field
+      is one pointer, 8 bytes.
+18. **The backstop reads the registry before it drops the listener.** `run_input` keeps the
+    listener's future alive past its `select!`, so a parked send still holds its entry, and sums
+    every live counter before dropping the future.
+19. **A listener declares whether its source keeps a cut batch.** `Input::rereads_after_restart`
+    defaults to `false`. `kafka_in` answers `true`, because it commits an offset only once its
+    batch is in every downstream inbox. `tail_in`, `docker_in`, and `cri_in` answer `true` only
+    with a `checkpoint_path`, since without one a restart starts each file at `read_from`.
+    Without a checkpoint they answer `false`, and so does `replay_in`. A restart may read the cut
+    batch again (`read_from: beginning`, or `replay_in` reading its file from the start), but
+    nothing guarantees it: a file rotated or removed in between isn't read again. So the batch
+    counts dropped, the safe count, by the same rule as an HTTP request the backstop cuts
+    (Consequences).
+20. **Every backstop stop logs `shutdown_backstop` at `warn`**, naming the listener's id and
+    kind and its grace, never its config. With a send in flight:
+    - A listener that rereads counts the batches as `logit.input.batches.deferred`, untagged as
+      `kafka_in`'s own deferred count is, and the line says its source keeps them for the next
+      run. They stay out of decision 2's tally, because nothing is lost.
+    - Any other counts them through `count_shutdown_drop` as
+      `batches.dropped`/`events.dropped{reason="shutdown"}`, the name a sink and a Lua node use
+      for a batch shutdown cut off, and they join decision 2's tally, so `drain complete`'s
+      `batches_dropped` includes them. The line says they're lost.
+
+    With none, the line says no batch was in a send, and nothing is counted.
+
+Consequences:
+
+- **A cut batch also counts as sent.** `Fanout::deliver` counts `batches.sent`/`events.sent`
+  before it awaits a consumer, so a batch the backstop cuts there counts both sent and dropped
+  (or deferred). A fan-out cut partway reached a prefix of its consumers. Both counts are true:
+  the listener sent the batch, and shutdown cut it before every consumer had it. A cut
+  `send_with_deadline` or `send_resumable` (`kafka_in`) counts sent only once every slot is held,
+  so its batch counts only dropped or deferred.
+- **An HTTP request the backstop cuts counts dropped, by decision.** Whether its batch comes
+  back depends on the client: a retrying client resends a request it got no answer for, and
+  another client doesn't. The listener can't tell which it has, so it answers
+  `rereads_after_restart` with `false` and counts the batch lost, and a resend arrives as a new
+  batch. Counting a resent batch dropped is the safe error, because the other choice hides a real
+  loss from an operator who alerts on `*.dropped`.
+- **An HTTP handler's send races the read, a documented race.** The abort doesn't reach an HTTP/2
+  stream's task, which `hyper` spawns, but the dropped connection closes the stream: h2 0.4.19's
+  `Connection` drop marks every stream broken and wakes it, and hyper 1.11.1's `H2Stream` then
+  fails its reset poll and ends. So a handler's send there (`datadog_in`, `datadog_trace_in`,
+  `influxdb_in`, and `splunk_hec_in`'s first group) is polled once more and then dropped, and
+  delivers its batch only if every consumer had room at that poll. The backstop reads the
+  registry before that poll, which leaves two narrow races:
+  - A send that completes in that last poll was already counted, so its batch counts dropped
+    though it was delivered.
+  - A multi-batch request (`datadog_in`, `splunk_hec_in`'s first group) can complete the counted
+    batch in that poll and park the next one, which is then cut uncounted.
+
+  Both need the downstream to free a slot between the read and that poll. The same races apply
+  to an HTTP/1 connection task on a multi-threaded runtime, because `ConnectionTasks`' abort is
+  asynchronous: a task running on another worker finishes its current poll. A listener that sends
+  from its own future (UDP, `internal`, `tail_in`, `docker_in`, `cri_in`, `kafka_in`) has neither
+  race, since the drop stops its send where the read found it.
+- `internal`'s drop lands after its final drain, so a dedicated pipeline never exports it. The
+  exit summary logs it at `warn` as `telemetry left undrained at exit` (decision 16).
+- `kafka_in`'s own drain counts what its drain deadline defers. The backstop counts only a send
+  still in flight when it fires, which that path never reaches, so no batch counts twice. The
+  batches behind a cut one aren't in a send and aren't counted.
+- The UDP listener's events still in its `BatchAccumulator` stay uncounted
+  (`docs/known-gaps/intake.md`). So does a send dropped by `Input::run_until_shutdown`'s default
+  at the signal, which isn't the backstop (`docs/known-gaps/runtime.md`).

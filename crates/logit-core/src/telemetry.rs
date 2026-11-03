@@ -34,7 +34,8 @@ pub type Tag = (&'static str, &'static str);
 ///
 /// Repeat points coalesce, so this bounds only a component that ignores the [`Tag`] convention.
 /// A new key past the cap is dropped and counted as
-/// `logit.internal.points.dropped{reason="cardinality"}`.
+/// `logit.internal.points.dropped{reason="cardinality"}`, and the component's first logs
+/// `telemetry_points_capped`.
 const MAX_KEYS_PER_COMPONENT: usize = 1024;
 
 /// Tag keys reserved for a point's component identity (`ComponentBuffer::base_attrs`), filtered
@@ -54,11 +55,13 @@ pub fn is_reserved_tag_key(key: &str) -> bool {
 
 /// Caps spans per component buffer between drains: a volume bound, since spans never coalesce.
 /// A span past the cap is dropped and counted as
-/// `logit.internal.spans.dropped{reason="buffer_full"}`.
+/// `logit.internal.spans.dropped{reason="buffer_full"}`, and the component's first logs
+/// `telemetry_spans_capped`.
 const MAX_SPANS_PER_COMPONENT: usize = 512;
 
 /// Caps logs per component buffer between drains: a volume bound, since logs never coalesce. A log
-/// past the cap is dropped and counted as `logit.internal.logs.dropped{reason="buffer_full"}`.
+/// past the cap is dropped and counted as `logit.internal.logs.dropped{reason="buffer_full"}`, with
+/// no line of its own ([`ComponentBuffer::push_log`] says why).
 const MAX_LOGS_PER_COMPONENT: usize = 256;
 
 /// Caps [`SpanLink`]s per span, so a flush absorbing many batches can't grow one span without
@@ -244,6 +247,11 @@ impl Telemetry {
     /// Whether this handle is live, so a caller can skip building tags or values that aren't free.
     pub fn is_enabled(&self) -> bool {
         self.buf.is_some()
+    }
+
+    /// The id and kind of the component this handle records for, or `None` for a disabled handle.
+    pub fn component(&self) -> Option<(&str, &'static str)> {
+        self.buf.as_ref().map(|buf| (buf.id.as_str(), buf.kind))
     }
 
     /// Whether [`Telemetry::span`] would record a span for `trace_id`: the verdict it reaches for
@@ -504,6 +512,12 @@ pub struct ComponentBuffer {
     logs: Mutex<Vec<PendingLog>>,
     /// Logs rejected by the [`MAX_LOGS_PER_COMPONENT`] cap since the last drain.
     logs_dropped: AtomicU64,
+    /// Whether the first point the [`MAX_KEYS_PER_COMPONENT`] cap rejected has been warned
+    /// about. Once per component for the process's life: a component over the cap stays over it.
+    points_cap_warned: AtomicBool,
+    /// [`ComponentBuffer::points_cap_warned`]'s twin for [`MAX_SPANS_PER_COMPONENT`]. The logs
+    /// cap has none: see [`ComponentBuffer::push_log`].
+    spans_cap_warned: AtomicBool,
     /// Copied from [`Registry`] at construction so [`Telemetry::span`] takes no registry lock.
     span_sample_rate: f64,
 }
@@ -520,22 +534,42 @@ impl ComponentBuffer {
             spans_dropped: AtomicU64::new(0),
             logs: Mutex::new(Vec::new()),
             logs_dropped: AtomicU64::new(0),
+            points_cap_warned: AtomicBool::new(false),
+            spans_cap_warned: AtomicBool::new(false),
             span_sample_rate,
         }
     }
 
-    /// Pushes `span`, or counts it dropped past [`MAX_SPANS_PER_COMPONENT`].
+    /// Pushes `span`, or counts it dropped past [`MAX_SPANS_PER_COMPONENT`] and warns the first
+    /// time.
     fn push_span(&self, span: PendingSpan) {
         let mut spans = self.spans.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if spans.len() >= MAX_SPANS_PER_COMPONENT {
             drop(spans);
             self.spans_dropped.fetch_add(1, Ordering::Relaxed);
+            if !self.spans_cap_warned.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    target: "logit",
+                    component = %self.id,
+                    key = "telemetry_spans_capped",
+                    "internal telemetry dropped a span: this component finished more than {} \
+                     sampled spans between two drains; counted in \
+                     logit.internal.spans.dropped, and warned once",
+                    MAX_SPANS_PER_COMPONENT,
+                );
+            }
             return;
         }
         spans.push(span);
     }
 
     /// Pushes `log`, or counts it dropped past [`MAX_LOGS_PER_COMPONENT`].
+    ///
+    /// Unlike the points and spans caps, this one never warns. The warning would be one more
+    /// `logit` line, which [`TelemetryLayer`] captures straight back into this full buffer, so it
+    /// would be dropped in turn, from inside the layer that's dropping. And the dropped line has
+    /// already reached the stderr log under the operator's own `--log-level`: only its copy in the
+    /// pipeline is lost, which `logit.internal.logs.dropped` counts.
     fn push_log(&self, log: PendingLog) {
         let mut logs = self.logs.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if logs.len() >= MAX_LOGS_PER_COMPONENT {
@@ -589,7 +623,21 @@ impl ComponentBuffer {
             return;
         }
         if points.len() >= MAX_KEYS_PER_COMPONENT {
+            drop(points);
             self.dropped.fetch_add(1, Ordering::Relaxed);
+            // After the lock is released: the line reaches `TelemetryLayer`, which records into
+            // this buffer's logs.
+            if !self.points_cap_warned.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    target: "logit",
+                    component = %self.id,
+                    key = "telemetry_points_capped",
+                    "internal telemetry dropped the point {name}: this component recorded more \
+                     than {} distinct name and tag pairs between two drains; counted in \
+                     logit.internal.points.dropped, and warned once",
+                    MAX_KEYS_PER_COMPONENT,
+                );
+            }
             return;
         }
         points.insert(key, initial());
@@ -610,7 +658,10 @@ impl ComponentBuffer {
     /// with its capture time, never `now`**: `Event::timestamp` is a span's start
     /// (`SpanRecord`'s doc), and the drain time would make both look later by however long they
     /// sat here.
-    fn drain(&self, now: i64) -> Vec<Event> {
+    ///
+    /// A counter (a delta `Sum`) and a timing (a `Distribution`) cover `since..now`, so each gets
+    /// `since` as its `start_timestamp`; a gauge is a reading at `now` and gets none.
+    fn drain(&self, since: i64, now: i64) -> Vec<Event> {
         let points = {
             let mut points = self.points.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             std::mem::take(&mut *points)
@@ -645,12 +696,14 @@ impl ComponentBuffer {
             attrs.insert("component", self.id.as_str());
             attrs.insert("kind", self.kind);
             attrs.insert("role", self.role);
-            let kind = match pending {
-                Pending::Count(v) => MetricKind::counter(v),
-                Pending::Gauge(v) => MetricKind::gauge(v),
-                Pending::Timing(sketch) => MetricKind::Distribution(sketch),
+            let (kind, start) = match pending {
+                Pending::Count(v) => (MetricKind::counter(v), since),
+                Pending::Gauge(v) => (MetricKind::gauge(v), 0),
+                Pending::Timing(sketch) => (MetricKind::Distribution(sketch), since),
             };
-            events.push(Event::metric(now, attrs, MetricRecord::new(intern(key.name), kind)));
+            let mut record = MetricRecord::new(intern(key.name), kind);
+            record.start_timestamp = start;
+            events.push(Event::metric(now, attrs, record));
         }
         if dropped > 0 {
             let mut attrs = self.base_attrs();
@@ -658,10 +711,7 @@ impl ComponentBuffer {
             events.push(Event::metric(
                 now,
                 attrs,
-                MetricRecord::new(
-                    intern("logit.internal.points.dropped"),
-                    MetricKind::counter(dropped as f64),
-                ),
+                delta_counter("logit.internal.points.dropped", dropped, since),
             ));
         }
         for span in spans {
@@ -673,10 +723,7 @@ impl ComponentBuffer {
             events.push(Event::metric(
                 now,
                 attrs,
-                MetricRecord::new(
-                    intern("logit.internal.spans.dropped"),
-                    MetricKind::counter(spans_dropped as f64),
-                ),
+                delta_counter("logit.internal.spans.dropped", spans_dropped, since),
             ));
         }
         for log in logs {
@@ -702,14 +749,18 @@ impl ComponentBuffer {
             events.push(Event::metric(
                 now,
                 attrs,
-                MetricRecord::new(
-                    intern("logit.internal.logs.dropped"),
-                    MetricKind::counter(logs_dropped as f64),
-                ),
+                delta_counter("logit.internal.logs.dropped", logs_dropped, since),
             ));
         }
         events
     }
+}
+
+/// A drop counter's record: a delta over `since..` the drain, like a buffered count.
+fn delta_counter(name: &'static str, n: u64, since: i64) -> MetricRecord {
+    let mut record = MetricRecord::new(intern(name), MetricKind::counter(n as f64));
+    record.start_timestamp = since;
+    record
 }
 
 /// The process-wide set of component buffers, built once per run only when the config has an
@@ -765,10 +816,20 @@ impl Registry {
     /// a long blocked tick holds events hours apart, and a destination that requires a stream in
     /// time order (Loki) rejects an entry behind a newer one in the same batch. The sort is
     /// stable, so the points, all stamped `now`, stay grouped by component.
+    ///
+    /// Leaves every `start_timestamp` `0` (unknown). `internal` calls [`Registry::drain_since`]
+    /// instead; this form is for a caller that reads the values and never sends them on.
     pub fn drain(&self, now: i64) -> Vec<Event> {
+        self.drain_since(0, now)
+    }
+
+    /// [`Registry::drain`], with every counter and timing point's `start_timestamp` set to
+    /// `since`, the previous drain's `now`: each is a delta over `since..now`, OTLP's convention
+    /// for a delta point. A gauge keeps `0`.
+    pub fn drain_since(&self, since: i64, now: i64) -> Vec<Event> {
         // Clone the `Arc`s rather than hold the registry lock across each buffer's drain.
         let buffers = self.buffers.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
-        let mut events: Vec<Event> = buffers.iter().flat_map(|buf| buf.drain(now)).collect();
+        let mut events: Vec<Event> = buffers.iter().flat_map(|buf| buf.drain(since, now)).collect();
         events.sort_by_key(|event| event.timestamp);
         events
     }
@@ -1683,6 +1744,59 @@ mod tests {
         assert_eq!(record.message.as_str(), Some("malformed input"));
         assert_eq!(record.body_format, BodyFormat::Raw);
         assert!(record.trace.is_none());
+    }
+
+    /// The points and spans caps each warn the first time they drop, once per component for the
+    /// process's life, not once per drain. The warning goes through `TelemetryLayer` back into
+    /// the same component's buffer, so this also shows that the cap's own line neither deadlocks
+    /// on the buffer's locks nor repeats. The logs cap never warns (`ComponentBuffer::push_log`).
+    #[test]
+    fn the_points_and_spans_caps_warn_once_per_component_through_the_layer() {
+        let registry = Registry::with_span_sampling(1.0);
+        let telemetry = registry.telemetry_for("noisy", "lua", "transform");
+        let quiet = registry.telemetry_for("quiet", "json", "transform");
+        let layer = TelemetryLayer::new();
+        layer.activate(registry.clone(), Severity::Warn, "self");
+
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let mut warned: Vec<String> = Vec::new();
+        tracing::subscriber::with_default(subscriber, || {
+            for _drain in 0..2 {
+                for i in 0..MAX_KEYS_PER_COMPONENT + 3 {
+                    let value: &'static str = Box::leak(i.to_string().into_boxed_str());
+                    telemetry.count("m", 1.0, &[("i", value)]);
+                }
+                for i in 0..MAX_SPANS_PER_COMPONENT + 3 {
+                    let seed = (i % 256) as u8;
+                    let span = telemetry.span(
+                        "process",
+                        SpanKind::Internal,
+                        trace_id(seed),
+                        span_id(seed),
+                        None,
+                    );
+                    drop(span);
+                }
+                // Over the logs cap: its drops write no line.
+                for _ in 0..MAX_LOGS_PER_COMPONENT + 3 {
+                    tracing::warn!(target: "logit", component = "noisy", key = "chatty", "x");
+                }
+                quiet.count("m", 1.0, &[]);
+                for event in registry.drain(0) {
+                    let Some(key) = event.attributes.get("key").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    if key.starts_with("telemetry_") {
+                        let component = event.attributes.get("component").and_then(|v| v.as_str());
+                        assert_eq!(component, Some("noisy"));
+                        assert_eq!(event.log.as_ref().unwrap().severity, Some(Severity::Warn));
+                        warned.push(key.to_string());
+                    }
+                }
+            }
+        });
+        warned.sort();
+        assert_eq!(warned, ["telemetry_points_capped", "telemetry_spans_capped"]);
     }
 
     #[test]

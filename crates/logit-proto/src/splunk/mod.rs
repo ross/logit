@@ -62,8 +62,8 @@
 //! | `fields` object | event attributes (a span's: resource attributes), each value typed as [`crate::json`] converts it, a nested map flattened to dotted keys by [`crate::json::flatten_into`] (an empty map dropped, an array holding a container as its JSON text) | -- |
 //! | objects with an equal resource | one batch, in first-appearance order | -- |
 //! | `event` absent or `null`, with a `metric_name:<n>` field or both `metric_name` and `_value` | a metric event ([`metrics`]), as Splunk indexes it | see [`metrics`] |
-//! | `event` absent or `null` otherwise | dropped; the rest delivered | `logit.input.events.dropped{reason="no_event"}` |
-//! | `event` `""` | dropped; the rest delivered | `dropped{reason="blank_event"}` |
+//! | `event` absent or `null` otherwise | dropped; the rest delivered | `logit.input.events.dropped{reason="no_event"}` + diag `no_event` |
+//! | `event` `""` | dropped; the rest delivered | `dropped{reason="blank_event"}` + diag `blank_event` |
 //! | `event` `"metric"` with a `metric_name:<n>` field, or both `metric_name` and `_value` | a metric event ([`metrics`]) | see [`metrics`] |
 //! | `event` an object carrying valid `trace_id`, `span_id`, `start_time`, `end_time` | a span event ([`spans`]) | see [`spans`] |
 //! | any other `event` | a log event ([`logs`]) | see [`logs`] |
@@ -631,9 +631,13 @@ impl SplunkDecoder {
         self.telemetry.count("logit.input.events.degraded", 1.0, &[("reason", reason)]);
     }
 
-    pub(super) fn undecoded(&self, why: Undecoded) {
+    /// Counts `why`, and for a loss logs its throttled line, keyed on the reason.
+    pub(super) fn undecoded(&mut self, why: Undecoded) {
         let (metric, reason) = why.counter();
         self.telemetry.count(metric, 1.0, &[("reason", reason)]);
+        if let Some(what) = why.what() {
+            self.diagnostics.warn_throttled(reason, format_args!("dropped {what}"));
+        }
     }
 }
 
@@ -675,6 +679,24 @@ impl Undecoded {
             Self::DuplicateName => (METRICS_DROPPED, "duplicate_name"),
             Self::IncompleteSingleMetric => (METRICS_DROPPED, "incomplete_single_metric"),
         }
+    }
+
+    /// What [`SplunkDecoder::undecoded`]'s line says was dropped, or `None` for `no_metric`,
+    /// which is `skipped`, not loss.
+    fn what(self) -> Option<&'static str> {
+        Some(match self {
+            Self::NoEvent => "an HEC object with no `event` field",
+            Self::BlankEvent => "an HEC object whose `event` is an empty string",
+            Self::NoMetric => return None,
+            Self::BadName => "a metric field named `metric_name:` with nothing after the prefix",
+            Self::BadValue => "a metric whose value isn't a number",
+            Self::DuplicateName => {
+                "a `metric_name` that a `metric_name:` field of the same object already names"
+            }
+            Self::IncompleteSingleMetric => {
+                "a `metric_name` with no `_value`, or a `_value` with no name"
+            }
+        })
     }
 }
 
@@ -1563,5 +1585,29 @@ pub(crate) mod tests {
             assert!(!loss || key == "reason", "{why:?}: a loss is tagged reason, not {key}");
             assert!(!value.contains("dropped") && !value.contains("skipped"), "{why:?}");
         }
+    }
+
+    /// Every undecoded loss logs a line keyed on its reason, and a `no_metric` skip logs none.
+    #[test]
+    fn every_undecoded_loss_raises_its_diagnostic() {
+        for why in Undecoded::ALL {
+            let diagnostics = Diagnostics::new("splunk_hec_in");
+            SplunkDecoder::new().with_diagnostics(diagnostics.clone()).undecoded(why);
+            let (metric, reason) = why.counter();
+            let expected = u64::from(metric.ends_with(".dropped"));
+            assert_eq!(diagnostics.occurrences(reason), expected, "{why:?}");
+        }
+    }
+
+    /// A body's losses through the decoder raise their lines, one occurrence per loss.
+    #[test]
+    fn a_decoded_bodys_losses_raise_their_diagnostics() {
+        let diagnostics = Diagnostics::new("splunk_hec_in");
+        let mut decoder = SplunkDecoder::new().with_diagnostics(diagnostics.clone());
+        let body = r#"{"time":1}{"event":"metric","fields":{"metric_name:":1,"metric_name:a":"x","metric_name:b":2}}"#;
+        decoder.decode_events(body.as_bytes(), RECEIVED_AT).expect("decodes");
+        assert_eq!(diagnostics.occurrences("no_event"), 1);
+        assert_eq!(diagnostics.occurrences("bad_name"), 1);
+        assert_eq!(diagnostics.occurrences("bad_value"), 1);
     }
 }

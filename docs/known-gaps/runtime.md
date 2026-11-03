@@ -73,24 +73,19 @@ Entry format and the other areas: [the known-gaps index](README.md).
 
   Either is real work. **Revisit** when the output path's allocation cost becomes worth chasing.
 
-- **A batch parked in `Fanout::send` when a listener's future is dropped is lost, already counted
-  `sent`.** `Fanout::deliver` counts `batches.sent`/`events.sent` before it awaits the first
-  consumer's channel. A send dropped while a full downstream parks it reaches no consumer, or only
-  a prefix of them, and no counter records the difference. A listener's future is dropped in two
-  places:
-  - `Input::run_until_shutdown`'s default races `run` against the signal with no grace, so the
-    drop comes the instant shutdown fires. That covers the scrape driver's kinds,
-    `prometheus_in` in scrape mode, `nginx_stub_status_in`, and `apache_status_in` (the scrape in
-    flight, and each target's batch still to send), and `generate_in`.
-  - `run_input`'s grace backstop drops a listener still draining after its grace: the UDP
-    listeners (under [UDP intake](intake.md#udp-intake)), `internal` (under
-    [Internal telemetry and self-logging](telemetry.md#internal-telemetry-and-self-logging)), and
-    `tail_in`, whose restart replays the batch from the last checkpoint (under
-    [File tailing and Docker logs](tailing.md)).
-
-  Both need a downstream that stays full at shutdown. Counting the loss needs `Fanout` to record a
-  delivery per consumer, the fix the UDP entry names. `docs/design/pipeline-graph.md`'s
-  "Cancellation points" table lists each site.
+- **A batch parked in `Fanout::send` when `Input::run_until_shutdown`'s default drops a
+  listener's `run` is lost uncounted, already counted `sent`.** `Fanout::deliver` counts
+  `batches.sent`/`events.sent` before it awaits the first consumer's channel. The default races
+  `run` against the signal with no grace, so the drop comes the instant shutdown fires, and a
+  send a full downstream parks there reaches no consumer, or only a prefix of them. That covers
+  the scrape driver's kinds, `prometheus_in` in scrape mode, `nginx_stub_status_in`, and
+  `apache_status_in` (the scrape in flight, and each target's batch still to send), and
+  `generate_in`. It needs a downstream that's full when the signal fires. `run_input`'s grace
+  backstop, which drops a listener still draining after its grace, counts the same loss as
+  `batches.dropped{reason="shutdown"}` (or `logit.input.batches.deferred`, for a listener whose
+  source keeps it) from the `Fanout`'s sends in flight. Counting this one
+  needs the default to read the same record before it drops `run`. `docs/design/pipeline-graph.md`'s "Cancellation points" table lists each
+  site.
 - **A batch sent into a closed sink inbox after the sweep's bound runs out is lost uncounted.**
   `run_output` closes its inbox before its shutdown sweep, so a later send fails upstream as
   `closed_consumer`, and a listener with an acknowledgement also refuses that batch to its client.

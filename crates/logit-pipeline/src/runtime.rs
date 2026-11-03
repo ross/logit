@@ -9,7 +9,7 @@
 //! `docs/design/pipeline-graph.md`'s "Cancellation points" table: what each losing arm drops, and
 //! why that loses nothing or what counts it.
 
-use crate::fanout::{BatchContext, Delivered, TraceContext};
+use crate::fanout::{BatchContext, Delivered, SendsInFlight, TraceContext};
 use crate::graph::{Graph, Role};
 use crate::output::{classify, is_head_only, is_retryable, DeliveryPosture, Fault, HeadOnly};
 #[cfg(test)]
@@ -23,8 +23,10 @@ use anyhow::Context;
 use logit_core::{Diagnostics, Event, EventBatch, Resource, Scope, SpanKind, Telemetry};
 use logit_proto::native::SeqId;
 use logit_script::{Heartbeat, ProcessOutcome, ScriptWorker};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::future::Future;
+use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
@@ -318,7 +320,7 @@ pub async fn run_with_options(
         // Captured here, before the spawn loop's `telemetry.remove`, so a producer sorted after
         // its consumer still finds the consumer's handle.
         let consumer = telemetry.get(id).cloned().unwrap_or_default();
-        edges.insert(id.clone(), Edge::new(tx).with_telemetry(consumer));
+        edges.insert(id.clone(), Edge::new(tx).with_telemetry(consumer).with_consumer(id));
         inboxes.insert(id.clone(), rx);
     }
 
@@ -395,6 +397,8 @@ pub async fn run_with_options(
                     fanout,
                     shutdown_rx_for(&id),
                     input_config.shutdown_grace,
+                    node_telemetry,
+                    shutdown_dropped_batches.clone(),
                 ));
                 node_ids.insert(handle.id(), id.clone());
                 stages.spawned(&id, &waiting_tx);
@@ -635,6 +639,12 @@ pub async fn run_with_options(
 /// an override still working at the deadline is cancelled by drop, a loss now bounded by
 /// `shutdown_grace`.
 ///
+/// When the backstop wins, the listener's future is still alive, so its [`SendsInFlight`] still
+/// holds any send it was parked in. That send's batch goes with the future, and the
+/// `shutdown_backstop` warn names it. A listener whose source keeps it
+/// ([`Input::rereads_after_restart`]) counts it `logit.input.batches.deferred`; any other counts
+/// it lost through [`count_shutdown_drop`], as a sink's shutdown drop is.
+///
 /// `biased`, input arm first; `unconstrained` backstop: see `docs/design/pipeline-graph.md`'s
 /// "Cancellation points".
 async fn run_input(
@@ -643,16 +653,45 @@ async fn run_input(
     fanout: Fanout,
     mut shutdown: watch::Receiver<bool>,
     shutdown_grace: Duration,
+    telemetry: Telemetry,
+    shutdown_dropped_batches: Arc<AtomicU64>,
 ) -> anyhow::Result<()> {
+    let rereads = input.rereads_after_restart();
+    let in_flight = SendsInFlight::default();
+    let fanout = fanout.with_sends_in_flight(&in_flight);
     let deadline = std::sync::OnceLock::new();
+    // `async_trait` boxes the future, so `drop(running)` below drops the listener.
+    let mut running = input.run_until_shutdown(fanout, shutdown.clone());
     tokio::select! {
         biased;
-        result = input.run_until_shutdown(fanout, shutdown.clone())
-            => result.with_context(|| format!("component '{id}'")),
+        result = &mut running => return result.with_context(|| format!("component '{id}'")),
         () = tokio::task::unconstrained(
             shutdown_grace_expired(&mut shutdown, &deadline, shutdown_grace),
-        ) => Ok(()),
+        ) => {}
     }
+    let (batches, events) = in_flight.load();
+    drop(running);
+    let kind = telemetry.component().map_or("unknown", |(_, kind)| kind);
+    let outcome = if batches == 0 {
+        "no batch was in a send".to_string()
+    } else if rereads {
+        telemetry.count("logit.input.batches.deferred", batches as f64, &[]);
+        format!(
+            "deferred {batches} batch(es) ({events} event(s)) it was sending, which its source \
+             keeps for the next run to read again"
+        )
+    } else {
+        count_shutdown_drop(&telemetry, &shutdown_dropped_batches, batches, events);
+        format!("dropped {batches} batch(es) ({events} event(s)) it was sending, which are lost")
+    };
+    Diagnostics::new(id).warn_keyed(
+        "shutdown_backstop",
+        format!(
+            "{kind} didn't finish within its shutdown grace ({shutdown_grace:?}) and was stopped; \
+             {outcome}"
+        ),
+    );
+    Ok(())
 }
 
 /// A sink node's drain-and-deliver pair, decoupled through a [`SinkStore`]
@@ -812,8 +851,9 @@ const SWEEP_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 /// Counts `batches` batches (`events` events) dropped for shutdown: the only site that counts
 /// `batches.dropped`/`events.dropped{reason="shutdown"}` and the only one that adds to
 /// `drain_total`, the sum the `drain complete` log reports (`run_with_telemetry`). Callers:
-/// `run_output`'s sweep, [`finish_and_flush`], [`write_loop`]'s grace-cut send, and
-/// [`revoke_lua_io`].
+/// `run_output`'s sweep, [`finish_and_flush`], [`write_loop`]'s grace-cut send,
+/// [`revoke_lua_io`], [`run_lua`] for the batch a panicked Lua thread held, and
+/// [`run_input`]'s backstop.
 fn count_shutdown_drop(telemetry: &Telemetry, drain_total: &AtomicU64, batches: u64, events: u64) {
     if batches == 0 {
         return;
@@ -1697,7 +1737,8 @@ pub(crate) async fn write_loop(
     // same `select!`, reads it.
     let shutdown_deadline = std::sync::OnceLock::new();
     // Turns a stream of failures into two edge events: `degraded` on the first drop, `recovered`
-    // on the next success after a drop or a retried failure.
+    // on the next success after a drop or a retried failure. Both log at `warn`, because
+    // `internal`'s default captures only `warn` and above and must see both edges.
     let mut degraded = false;
     let mut in_flight = InFlight::default();
     // The signal itself, for a collecting window's fill; `shutdown` stays the grace arms'.
@@ -1878,7 +1919,7 @@ pub(crate) async fn write_loop(
                 last_success = Some(tokio::time::Instant::now());
                 if degraded || retrying.is_retrying() {
                     degraded = false;
-                    diag.info("recovered", "delivery succeeded after a prior failure");
+                    diag.warn_keyed("recovered", "delivery succeeded after a prior failure");
                 }
                 retrying.settle();
             }
@@ -2518,10 +2559,17 @@ async fn run_flush(transform: &mut (dyn Transform + Send), fanout: &Fanout, tele
 /// [`watch_lua_thread`] awaits `done_rx` as the node's `JoinSet` entry, so the join loop treats a
 /// Lua exit like any task's. The loop runs under `catch_unwind` so a panic becomes a message, not
 /// a dropped sender; `AssertUnwindSafe` because `ScriptWorker` holds `Lua` and `Rc<RefCell>`s and
-/// nothing is used after the unwind. A script's own `process()`/`flush()` errors are logged and
-/// counted in [`run_lua_loop`] and never end the node. `done_tx` sends only after the [`LuaIo`]
-/// is taken out of `io` and dropped, so the downstream cascade is already underway when the
-/// watcher resolves.
+/// nothing is used after the unwind but `in_hand`, a `Cell` the loop only ever sets whole. A
+/// script's own `process()`/`flush()` errors are logged and counted in [`run_lua_loop`] and never
+/// end the node. `done_tx` sends only after the [`LuaIo`] is taken out of `io` and dropped, so
+/// the downstream cascade is already underway when the watcher resolves.
+///
+/// Any outcome but a clean return (a panic or a returned failure) counts what the node can no
+/// longer forward as `batches.dropped`/`events.dropped{reason="shutdown"}` through
+/// [`count_shutdown_drop`], so the `drain complete` line reports it: the batches still queued in
+/// its inbox (swept by [`revoke_lua_io`]) and, after a panic between a batch's receive and its
+/// `process()` pass's counts, that batch, none of which was sent. A panic in a send or a
+/// `flush()` loses what the loop held uncounted (`docs/known-gaps/transforms.md`).
 ///
 /// `io` is shared with the watcher so it can revoke the node's channels without the thread's
 /// cooperation (see [`LuaIo`]); `heartbeat` is how the watcher tells a working script from a
@@ -2569,6 +2617,8 @@ fn run_lua(
     let me = logit_core::interner::intern(&id);
 
     let loop_io = io.clone();
+    let in_hand: Rc<Cell<Option<u64>>> = Rc::default();
+    let loop_in_hand = in_hand.clone();
     let heartbeat_for_report = heartbeat.clone();
     let (sweep_telemetry, sweep_runtime) = (telemetry.clone(), runtime.clone());
     let verdict = max_memory.map(|cap| MemoryVerdict::new(cap, verdict_spacing));
@@ -2578,6 +2628,7 @@ fn run_lua(
             me,
             configured_interval,
             loop_io,
+            loop_in_hand,
             heartbeat,
             verdict,
             telemetry,
@@ -2589,17 +2640,24 @@ fn run_lua(
     // after shutdown could report a wedge before it reads the panic from `done_rx`.
     heartbeat_for_report.leave();
     // Dropped here, after a return or a panic alike, so the downstream cascade is underway
-    // before `done_tx` reports. `None` already if the watcher revoked it. A loop that failed the
-    // node left its inbox open with batches still queued, so those are swept and counted, as
-    // the watcher's revocation counts them. Counted `reason="shutdown"` whether or not a signal
-    // came first: the node is leaving the graph, and its failure starts the drain if none has.
+    // before `done_tx` reports. `None` already if the watcher revoked it, which counted the inbox
+    // itself. A loop that panicked or failed the node left its inbox open with batches still
+    // queued, so those are swept and counted, as the watcher's revocation counts them. Counted
+    // `reason="shutdown"` whether or not a signal came first: the node is leaving the graph,
+    // and its failure starts the drain if none has.
     let leftover = lock_io(&io).take();
-    let failed = matches!(outcome, Ok(Err(_)));
-    match leftover {
-        Some(io) if failed => {
-            sweep_runtime.block_on(revoke_lua_io(io, &sweep_telemetry, &shutdown_dropped))
+    let held = in_hand.take();
+    if matches!(outcome, Ok(Ok(()))) {
+        drop(leftover);
+    } else {
+        // `Some` only after a panic between a batch's receive and its pass's counts: that batch,
+        // none of which was sent. It had left the inbox, so neither sweep counts it a second time.
+        if let Some(events) = held {
+            count_shutdown_drop(&sweep_telemetry, &shutdown_dropped, 1, events);
         }
-        leftover => drop(leftover),
+        if let Some(io) = leftover {
+            sweep_runtime.block_on(revoke_lua_io(io, &sweep_telemetry, &shutdown_dropped));
+        }
     }
     let panicked = outcome.is_err();
     let report = thread_outcome(outcome);
@@ -2944,12 +3002,17 @@ enum FlushOutcome {
 /// The heartbeat is busy only inside a script call: `enter()` before each `process()` and around
 /// `flush()`, `leave()` before anything is sent. A thread parked in a send is therefore never
 /// read as stalled, and never holds `io`'s lock while busy.
+///
+/// `in_hand` holds the received batch's event count from its receive until the `process()` pass's
+/// own counts, and is `None` everywhere else, so after a panic [`run_lua`] can count the batch
+/// lost. Nothing is sent in that span, so the whole batch is lost.
 #[allow(clippy::too_many_arguments)]
 fn run_lua_loop(
     worker: ScriptWorker,
     me: logit_core::Symbol,
     configured_interval: Option<Duration>,
     io: SharedLuaIo,
+    in_hand: Rc<Cell<Option<u64>>>,
     heartbeat: Arc<Heartbeat>,
     mut verdict: Option<MemoryVerdict>,
     telemetry: Telemetry,
@@ -2971,6 +3034,11 @@ fn run_lua_loop(
     // target count, which revocation never changes.
     let mut scratch =
         RouterScratch::new(lock_io(&io).as_ref().map_or(0, |io| io.target_fanouts.len()));
+    // Each slot's consumers, read while the channels are still here, so a drop after revocation
+    // can name the edges it would have used.
+    let slot_consumers: Vec<Vec<String>> = lock_io(&io).as_ref().map_or_else(Vec::new, |io| {
+        std::iter::once(&io.fanout).chain(&io.target_fanouts).map(Fanout::consumer_names).collect()
+    });
 
     // Mints its own root and records the `flush` span, as `run_flush` does: a Lua `flush()` has
     // no single parent batch (`docs/adr/lua-flush-root-context.md`). The script's batch-scoped
@@ -3033,7 +3101,7 @@ fn run_lua_loop(
                 let guard = lock_io(&io);
                 let Some(io) = guard.as_ref() else {
                     drop(guard);
-                    count_revoked(&mut scratch.dests, &telemetry);
+                    count_revoked(&mut scratch.dests, &slot_consumers, me, &telemetry);
                     return FlushOutcome::Revoked;
                 };
                 let sent = send_lua_partitions(
@@ -3138,6 +3206,12 @@ fn run_lua_loop(
             }
             return Ok(());
         };
+        // Held from here until the pass's own counts below, so a panic anywhere in between
+        // counts the whole batch, and none of it is counted twice (see `run_lua`).
+        in_hand.set(Some(match &batch {
+            Delivered::Owned(batch, _) => batch.events.len(),
+            Delivered::Shared(batch, _) => batch.events.len(),
+        } as u64));
         // As in `run_transform`: this batch is the unambiguous parent of everything emitted
         // below, provenance passes through, and the context is minted once here so the span's
         // `span_id` matches the outgoing `Delivered`'s.
@@ -3209,6 +3283,8 @@ fn run_lua_loop(
         // Once per batch: how a script leaking VM-side state becomes visible
         // (`docs/design/internal-telemetry.md`).
         telemetry.gauge("logit.script.vm.memory", worker.used_memory() as f64, &[]);
+        // The pass's discards and errors are counted next, so the batch is no longer in hand.
+        in_hand.set(None);
         if discarded > 0 {
             telemetry.count("logit.component.events.discarded", discarded as f64, &[]);
         }
@@ -3235,7 +3311,7 @@ fn run_lua_loop(
         let guard = lock_io(&io);
         let Some(io) = guard.as_ref() else {
             drop(guard);
-            count_revoked(&mut scratch.dests, &telemetry);
+            count_revoked(&mut scratch.dests, &slot_consumers, me, &telemetry);
             return Ok(());
         };
         let sent = send_lua_partitions(
@@ -3259,8 +3335,35 @@ fn run_lua_loop(
 /// Counts what a revoked node produced but can no longer send as
 /// `events.dropped{reason="closed_consumer"}`: its consumers are gone, as they would be for a
 /// `Fanout` sending into closed inboxes.
-fn count_revoked(dests: &mut [Vec<Event>], telemetry: &Telemetry) {
-    let lost: usize = dests.iter_mut().map(|d| std::mem::take(d).len()).sum();
+///
+/// Each slot that lost events also logs one `closed_consumer` warn line per edge it would have
+/// sent on, naming `producer` and the consumer from `slot_consumers` (indexed as `dests`), as
+/// `Fanout` does for the first drop on an edge. A revoked node finds its channels gone and exits,
+/// so this runs at most once per node and needs no flag to warn once per edge.
+fn count_revoked(
+    dests: &mut [Vec<Event>],
+    slot_consumers: &[Vec<String>],
+    producer: logit_core::Symbol,
+    telemetry: &Telemetry,
+) {
+    let mut lost: usize = 0;
+    for (slot, dest) in dests.iter_mut().enumerate() {
+        let n = std::mem::take(dest).len();
+        if n == 0 {
+            continue;
+        }
+        lost += n;
+        for consumer in slot_consumers.get(slot).into_iter().flatten() {
+            tracing::warn!(
+                target: "logit",
+                component = %logit_core::interner::resolve(producer),
+                key = "closed_consumer",
+                "dropped {n} event(s) bound for {consumer}: this node's channels were revoked \
+                 after it overran its shutdown grace; counted in \
+                 logit.component.events.dropped{{reason=\"closed_consumer\"}}",
+            );
+        }
+    }
     if lost > 0 {
         telemetry.count(
             "logit.component.events.dropped",
@@ -4295,6 +4398,8 @@ mod tests {
             fanout,
             shutdown_rx,
             huge_grace,
+            Telemetry::default(),
+            Arc::new(AtomicU64::new(0)),
         ));
 
         // Let the spawned task start and park inside the default `run_until_shutdown`'s `select!`.
@@ -4330,7 +4435,9 @@ mod tests {
             Box::new(DrainingInput { drain_for: Duration::from_secs(2), batch: Some(batch) }),
             fanout,
             shutdown_rx,
-            Duration::from_secs(10), // grace comfortably longer than the 2s drain
+            Duration::from_secs(10), // grace comfortably longer than the 2s drain,
+            Telemetry::default(),
+            Arc::new(AtomicU64::new(0)),
         ));
 
         tokio::task::yield_now().await;
@@ -4359,6 +4466,8 @@ mod tests {
             fanout,
             shutdown_rx,
             grace,
+            Telemetry::default(),
+            Arc::new(AtomicU64::new(0)),
         ));
 
         tokio::task::yield_now().await;
@@ -4386,6 +4495,8 @@ mod tests {
             fanout,
             shutdown_rx,
             Duration::from_secs(60),
+            Telemetry::default(),
+            Arc::new(AtomicU64::new(0)),
         ));
         tokio::task::yield_now().await;
         shutdown_tx.send(true).expect("receiver should still be alive");
@@ -4409,12 +4520,190 @@ mod tests {
             fanout,
             shutdown_rx,
             Duration::from_secs(60),
+            Telemetry::default(),
+            Arc::new(AtomicU64::new(0)),
         )
         .await
         .expect_err("should propagate the input's own error");
         let message = format!("{err:#}");
         assert!(message.contains("component 'bad'"), "got: {message}");
         assert!(message.contains("boom"), "got: {message}");
+    }
+
+    /// On shutdown, sends each of `batches` in turn, then returns. `rereads` is its answer to
+    /// `Input::rereads_after_restart`.
+    struct SendOnShutdownInput {
+        batches: Vec<EventBatch>,
+        rereads: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Input for SendOnShutdownInput {
+        async fn run(&mut self, _sink: Fanout) -> anyhow::Result<()> {
+            std::future::pending::<()>().await;
+            unreachable!("pending() never resolves")
+        }
+
+        fn rereads_after_restart(&self) -> bool {
+            self.rereads
+        }
+
+        async fn run_until_shutdown(
+            &mut self,
+            sink: Fanout,
+            mut shutdown: watch::Receiver<bool>,
+        ) -> anyhow::Result<()> {
+            let _ = shutdown.wait_for(|&due| due).await;
+            for batch in self.batches.drain(..) {
+                sink.send(batch).await;
+            }
+            Ok(())
+        }
+    }
+
+    /// On shutdown, fills the one-slot inbox, then sends one batch on each of two connection
+    /// copies at once, each parking on the full inbox.
+    struct TwoConnectionsInput;
+
+    #[async_trait::async_trait]
+    impl Input for TwoConnectionsInput {
+        async fn run(&mut self, _sink: Fanout) -> anyhow::Result<()> {
+            std::future::pending::<()>().await;
+            unreachable!("pending() never resolves")
+        }
+
+        async fn run_until_shutdown(
+            &mut self,
+            sink: Fanout,
+            mut shutdown: watch::Receiver<bool>,
+        ) -> anyhow::Result<()> {
+            let _ = shutdown.wait_for(|&due| due).await;
+            sink.send(batch_of(1)).await;
+            let (a, b) = (sink.for_connection(), sink.for_connection());
+            tokio::join!(a.send(batch_of(2)), b.send(batch_of(3)));
+            Ok(())
+        }
+    }
+
+    fn batch_of(n: usize) -> EventBatch {
+        EventBatch {
+            resource: Arc::new(Resource::default()),
+            scope: None,
+            events: (0..n).map(|_| counter_event("hits", 1.0)).collect(),
+        }
+    }
+
+    /// What `run_input` reported under a 5 s grace into a one-slot inbox nobody reads.
+    #[derive(Debug, PartialEq)]
+    struct Backstop {
+        /// Every `shutdown_backstop` line.
+        lines: Vec<(tracing::Level, String)>,
+        /// The listener's `batches.dropped` and `events.dropped{reason="shutdown"}`.
+        dropped: (f64, f64),
+        /// The listener's `logit.input.batches.deferred`.
+        deferred: f64,
+        /// The runtime's shutdown tally.
+        tally: u64,
+    }
+
+    async fn backstop_report(input: Box<dyn Input + Send>) -> Backstop {
+        let (lines, _guard) = crate::test_util::capture_lines();
+        let (tx, _rx) = mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut probe = TelemetryProbe::new();
+        let tally = Arc::new(AtomicU64::new(0));
+        let handle = tokio::spawn(run_input(
+            "in".to_string(),
+            input,
+            Fanout::new(vec![tx]),
+            shutdown_rx,
+            Duration::from_secs(5),
+            probe.telemetry("in", "statsd_in", "input"),
+            tally.clone(),
+        ));
+        tokio::task::yield_now().await;
+        shutdown_tx.send(true).expect("receiver should still be alive");
+        handle.await.expect("task should not panic").expect("the backstop resolves Ok");
+        let shutdown = [("reason", "shutdown")];
+        Backstop {
+            lines: lines.with_key("shutdown_backstop"),
+            dropped: (
+                probe.sum("logit.component.batches.dropped", &shutdown),
+                probe.sum("logit.component.events.dropped", &shutdown),
+            ),
+            deferred: probe.sum("logit.input.batches.deferred", &[]),
+            tally: tally.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    fn warned(line: &str) -> Vec<(tracing::Level, String)> {
+        let head = "statsd_in didn't finish within its shutdown grace (5s) and was stopped; ";
+        vec![(tracing::Level::WARN, format!("{head}{line}"))]
+    }
+
+    /// The second batch parks on the full inbox, and the backstop drops it with the future.
+    #[tokio::test(start_paused = true)]
+    async fn a_listener_parked_in_a_send_at_the_backstop_logs_and_counts_its_batch() {
+        let input = SendOnShutdownInput { batches: vec![batch_of(1), batch_of(3)], rereads: false };
+        let report = backstop_report(Box::new(input)).await;
+        let expected = Backstop {
+            lines: warned("dropped 1 batch(es) (3 event(s)) it was sending, which are lost"),
+            dropped: (1.0, 3.0),
+            deferred: 0.0,
+            tally: 1,
+        };
+        assert_eq!(report, expected);
+    }
+
+    /// A source that keeps the batch: deferred, never dropped, and out of the shutdown tally.
+    #[tokio::test(start_paused = true)]
+    async fn a_rereading_listener_parked_in_a_send_at_the_backstop_counts_its_batch_deferred() {
+        let input = SendOnShutdownInput { batches: vec![batch_of(1), batch_of(3)], rereads: true };
+        let report = backstop_report(Box::new(input)).await;
+        let expected = Backstop {
+            lines: warned(
+                "deferred 1 batch(es) (3 event(s)) it was sending, which its source keeps for \
+                 the next run to read again",
+            ),
+            dropped: (0.0, 0.0),
+            deferred: 1.0,
+            tally: 0,
+        };
+        assert_eq!(report, expected);
+    }
+
+    /// Each connection copy has its own counter; the backstop sums every live one.
+    #[tokio::test(start_paused = true)]
+    async fn the_backstop_counts_the_sends_parked_on_every_connection_copy() {
+        let report = backstop_report(Box::new(TwoConnectionsInput)).await;
+        let expected = Backstop {
+            lines: warned("dropped 2 batch(es) (5 event(s)) it was sending, which are lost"),
+            dropped: (2.0, 5.0),
+            deferred: 0.0,
+            tally: 2,
+        };
+        assert_eq!(report, expected);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_listener_stopped_by_the_backstop_outside_a_send_logs_and_counts_nothing() {
+        let input = DrainingInput { drain_for: Duration::from_secs(3600), batch: None };
+        let report = backstop_report(Box::new(input)).await;
+        let expected = Backstop {
+            lines: warned("no batch was in a send"),
+            dropped: (0.0, 0.0),
+            deferred: 0.0,
+            tally: 0,
+        };
+        assert_eq!(report, expected);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_listener_finishing_within_its_grace_logs_and_counts_nothing() {
+        let input = DrainingInput { drain_for: Duration::from_secs(2), batch: Some(batch_of(1)) };
+        let report = backstop_report(Box::new(input)).await;
+        let expected = Backstop { lines: vec![], dropped: (0.0, 0.0), deferred: 0.0, tally: 0 };
+        assert_eq!(report, expected);
     }
 
     /// A single-consumer `Fanout` delivers `Delivered::Owned`, never an `Arc`.
@@ -6638,6 +6927,11 @@ mod tests {
         );
         assert_eq!(log_lines("refused_block", "(held 0ns, failure 1, "), 1, "the first failure");
         assert_eq!(log_lines("refused_block", "delivery succeeded after a prior failure"), 1);
+        assert_eq!(
+            log_lines("refused_block", "WARN logit: delivery succeeded after a prior failure"),
+            1,
+            "recovered logs at warn, so internal's default captures it"
+        );
     }
 
     /// The `retrying` line is written on a head's first failure, then at most once per interval
@@ -8158,7 +8452,7 @@ mod tests {
             }
         }
 
-        let (lines, _guard) = crate::buffer_full::test_support::capture();
+        let (lines, _guard) = crate::test_util::capture_lines();
         let started = Arc::new(AtomicU64::new(0));
         let release = Arc::new(tokio::sync::Notify::new());
         let mut output = Slow { started: Arc::clone(&started), release: Arc::clone(&release) };
@@ -10299,6 +10593,8 @@ mod tests {
             Fanout::new(vec![tx]),
             shutdown_rx,
             grace,
+            Telemetry::default(),
+            Arc::new(AtomicU64::new(0)),
         ));
         tokio::task::yield_now().await;
         shutdown_tx.send(true).unwrap();
@@ -10351,6 +10647,8 @@ mod tests {
                 Fanout::new(vec![tx]),
                 shutdown_rx,
                 grace,
+                Telemetry::default(),
+                Arc::new(AtomicU64::new(0)),
             ));
             tokio::task::yield_now().await;
             shutdown_tx.send(true).unwrap();
@@ -11185,6 +11483,134 @@ mod tests {
         assert_eq!(snapshot.components.get("err_in"), Some(&NodeState::Failed));
     }
 
+    /// What a `run_lua` thread fed a pre-filled inbox left behind once it reported.
+    struct QueuedLuaRun {
+        report: Result<(), String>,
+        telemetry: Totals,
+        /// The run's shutdown-drop tally, the sum `drain complete` reports.
+        tally: u64,
+        /// Events the node sent on its own edge.
+        sent: usize,
+    }
+
+    /// Runs `script` on a real `run_lua` thread whose inbox already holds `batches`, with
+    /// `targets` handed to the VM and no target edges behind them, and waits for its report.
+    async fn run_lua_with_queued(
+        script: &str,
+        interval: Option<Duration>,
+        targets: Vec<String>,
+        batches: Vec<EventBatch>,
+    ) -> QueuedLuaRun {
+        let (inbox_tx, inbox) = mpsc::channel(batches.len().max(1));
+        for batch in batches {
+            let delivered = Delivered::Owned(batch, TraceContext::new_root().into());
+            inbox_tx.send(delivered).await.expect("the inbox has room for every batch");
+        }
+        let (fanout, mut out_rx) = crate::test_util::fanout_channel(16);
+        let io: SharedLuaIo = Arc::new(std::sync::Mutex::new(Some(LuaIo {
+            inbox,
+            fanout,
+            target_fanouts: Vec::new(),
+        })));
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("enrich", "x", "x");
+        let tally = Arc::new(AtomicU64::new(0));
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (done_tx, done_rx) = oneshot::channel();
+        let (script, thread_tally, runtime) =
+            (script.to_string(), tally.clone(), tokio::runtime::Handle::current());
+        std::thread::spawn(move || {
+            run_lua(
+                "enrich".to_string(),
+                script,
+                Default::default(),
+                false,
+                interval,
+                targets,
+                ready_tx,
+                done_tx,
+                io,
+                Arc::new(Heartbeat::new()),
+                None,
+                LuaRuntimeConfig::default().min_verdict_spacing,
+                telemetry,
+                thread_tally,
+                runtime,
+            )
+        });
+        ready_rx.await.unwrap().expect("the script loads");
+        let report = tokio::time::timeout(RECV_TIMEOUT, done_rx)
+            .await
+            .expect("the thread reports")
+            .expect("the thread sends its report");
+        drop(inbox_tx);
+        let mut sent = 0;
+        while let Ok(delivered) = out_rx.try_recv() {
+            sent += unwrap_batch(delivered).events.len();
+        }
+        QueuedLuaRun {
+            report,
+            telemetry: Totals::of(registry.drain(0)),
+            tally: tally.load(std::sync::atomic::Ordering::Relaxed),
+            sent,
+        }
+    }
+
+    /// A Lua thread that panics with batches queued in its inbox counts each of them as a
+    /// shutdown drop, into the tally `drain complete` reports, as a `max_memory` failure does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_panicked_lua_nodes_queued_batches_are_counted_as_shutdown_drops() {
+        // The panic vector `a_lua_thread_panicking_after_ready_flips_failed_and_returns_runtime`
+        // uses: a zero interval panics in `advance_flush_deadline` before the first receive.
+        let run = run_lua_with_queued(
+            "function process(event) return event end",
+            Some(Duration::ZERO),
+            Vec::new(),
+            (0..3).map(|_| counter_batch_of(4)).collect(),
+        )
+        .await;
+
+        let message = run.report.expect_err("a panic fails the node");
+        assert!(message.contains("panicked"), "{message}");
+        assert_eq!(run.telemetry.sum("logit.component.events.received", &[]), 0.0);
+        assert_eq!(run.sent, 0);
+        let shutdown = [("reason", "shutdown")];
+        assert_eq!(run.telemetry.sum("logit.component.batches.dropped", &shutdown), 3.0);
+        assert_eq!(run.telemetry.sum("logit.component.events.dropped", &shutdown), 12.0);
+        assert_eq!(run.tally, 3, "the sweep reaches the drain complete tally");
+    }
+
+    /// A Lua thread that panics inside a `process()` call counts the batch those calls were
+    /// working through as a shutdown drop, beside the batches still queued behind it.
+    ///
+    /// The panic vector is `lua_slot_of`'s `debug_assert`: the VM knows a target the node has
+    /// no edge for, which the runtime never builds, so only a debug build panics on it.
+    #[cfg(debug_assertions)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lua_node_panicking_mid_batch_counts_the_batch_in_hand_as_a_shutdown_drop() {
+        let run = run_lua_with_queued(
+            r#"function process(event) return event:to("t") end"#,
+            None,
+            vec!["t".to_string()],
+            (0..3).map(|_| counter_batch_of(4)).collect(),
+        )
+        .await;
+
+        let message = run.report.expect_err("a panic fails the node");
+        assert!(message.contains("target slot"), "the slot assertion panicked: {message}");
+        assert_eq!(run.telemetry.sum("logit.component.batches.received", &[]), 1.0);
+        assert_eq!(run.telemetry.sum("logit.component.events.received", &[]), 4.0);
+        assert_eq!(run.sent, 0);
+        let shutdown = [("reason", "shutdown")];
+        assert_eq!(
+            run.telemetry.sum("logit.component.batches.dropped", &shutdown),
+            3.0,
+            "the batch in hand and the two queued behind it"
+        );
+        assert_eq!(run.telemetry.sum("logit.component.events.dropped", &shutdown), 12.0);
+        assert_eq!(run.tally, 3);
+    }
+
     /// A Lua thread panicking after `Ready` fails the run like a task: `Runtime`, others drained.
     #[tokio::test]
     async fn a_lua_thread_panicking_after_ready_flips_failed_and_returns_runtime() {
@@ -11598,6 +12024,59 @@ mod tests {
             "the batch sent through the pre-reserved permit is counted"
         );
         assert!(rig.inbox_tx.is_closed());
+    }
+
+    /// A revoked node's undeliverable events log one `closed_consumer` line per edge of each slot
+    /// that lost any, naming the node and the consumer, beside the count.
+    #[test]
+    fn a_revoked_lua_node_warns_per_edge_it_drops_on_naming_both_ends() {
+        let (lines, _guard) = crate::test_util::capture_lines();
+        let edge = |id| Edge::new(mpsc::channel(1).0).with_consumer(id);
+        let own = Fanout::from_edges(vec![edge("windowed"), edge("archive")]);
+        let targets =
+            [Fanout::from_edges(vec![edge("quiet")]), Fanout::from_edges(vec![edge("audit")])];
+        let slot_consumers: Vec<Vec<String>> =
+            std::iter::once(&own).chain(&targets).map(Fanout::consumer_names).collect();
+        let mut dests = vec![
+            vec![counter_event("a", 1.0), counter_event("b", 1.0)],
+            Vec::new(),
+            vec![counter_event("c", 1.0)],
+        ];
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("enrich", "lua", "transform");
+
+        count_revoked(
+            &mut dests,
+            &slot_consumers,
+            logit_core::interner::intern("enrich"),
+            &telemetry,
+        );
+
+        assert!(dests.iter().all(Vec::is_empty));
+        let totals = Totals::of(registry.drain(0));
+        assert_eq!(
+            totals.sum(
+                "logit.component.events.dropped",
+                &[("component", "enrich"), ("reason", "closed_consumer")]
+            ),
+            3.0
+        );
+        assert_eq!(lines.components_with_key("closed_consumer"), ["enrich", "enrich", "enrich"]);
+        let line = |n: usize, consumer: &str| {
+            (
+                tracing::Level::WARN,
+                format!(
+                    "dropped {n} event(s) bound for {consumer}: this node's channels were revoked \
+                     after it overran its shutdown grace; counted in \
+                     logit.component.events.dropped{{reason=\"closed_consumer\"}}"
+                ),
+            )
+        };
+        assert_eq!(
+            lines.with_key("closed_consumer"),
+            vec![line(2, "windowed"), line(2, "archive"), line(1, "audit")],
+            "the slot that lost nothing names no edge"
+        );
     }
 
     #[tokio::test(start_paused = true)]

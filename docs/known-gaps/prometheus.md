@@ -41,8 +41,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
   `logit.output.metrics.normalized{reason="name_sanitized"}`. Within one batch, two names that
   land on one wire name keep one family and count the other's records
   `metrics.dropped{reason="name_collision"}` (`crates/logit-proto/src/prometheus/mod.rs`'s encode
-  table). Across batches nothing compares them: the exposition registry keys a family by its wire
-  name, and a remote-write receiver keys a series by its labels.
+  table). Across batches nothing compares their model names: the exposition registry keys a
+  family by its wire name, and a remote-write receiver keys a series by its labels.
   - **Consequence:** `http.requests` in one batch and `http_requests` in the next are one series,
     each batch's sample replacing the other's, with no `name_collision` for either. Label names
     merge the same way across batches.

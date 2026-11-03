@@ -122,7 +122,7 @@ impl DatadogDecoder {
         ))
     }
 
-    fn skip_check(&self, outcome: MetricIn) {
+    fn skip_check(&mut self, outcome: MetricIn) {
         self.metric_not_decoded(outcome, 1);
     }
 }
@@ -132,7 +132,7 @@ impl DatadogEncoder {
     /// `Gauge` as one `/api/v1/check_run` JSON array, every key present on every item; `None` when
     /// no event qualifies. Any other event is skipped silently (it belongs to another route); a
     /// check with no valid status is skipped and counted.
-    pub fn encode_service_checks(&self, batch: &EventBatch) -> Option<Bytes> {
+    pub fn encode_service_checks(&mut self, batch: &EventBatch) -> Option<Bytes> {
         let keys = &*KEYS;
         let mut out = Vec::new();
         out.push(b'[');
@@ -293,8 +293,8 @@ mod tests {
     /// `host.name`, the check's own over the resource's, then the default host.
     #[test]
     fn encode_fills_a_missing_host_with_host_name_then_the_default_host() {
-        let encoder = DatadogEncoder::new().with_default_host(Some(Arc::from("relay")));
-        let encode_with = |batch: &EventBatch| {
+        let mut encoder = DatadogEncoder::new().with_default_host(Some(Arc::from("relay")));
+        let mut encode_with = |batch: &EventBatch| {
             String::from_utf8(encoder.encode_service_checks(batch).unwrap().to_vec()).unwrap()
         };
         let hostless = decode(r#"[{"check":"app.ok","timestamp":1700000000,"status":1}]"#);
@@ -331,7 +331,7 @@ mod tests {
     /// default host.
     #[test]
     fn a_collectd_host_is_an_ordinary_tag() {
-        let encoder = DatadogEncoder::new().with_default_host(Some(Arc::from("relay")));
+        let mut encoder = DatadogEncoder::new().with_default_host(Some(Arc::from("relay")));
         let body =
             r#"[{"check":"c","timestamp":1700000000,"status":0,"tags":["collectd.host:web1"]}]"#;
         let out = encoder.encode_service_checks(&decode(body)).unwrap();
@@ -352,7 +352,7 @@ mod tests {
             "datadog_in",
             "listener",
         ));
-        let encoder = DatadogEncoder::new().with_default_host(Some(Arc::from("relay")));
+        let mut encoder = DatadogEncoder::new().with_default_host(Some(Arc::from("relay")));
         let mut round_trip = |body: &str| {
             let batch = decoder.decode_service_checks(body.as_bytes(), RECEIVED_AT).unwrap();
             String::from_utf8(encoder.encode_service_checks(&batch).unwrap().to_vec()).unwrap()
@@ -407,7 +407,7 @@ mod tests {
         );
         let batch = new_batch(Resource::default(), vec![bad, plain]);
         let registry = Registry::new();
-        let encoder = DatadogEncoder::new().with_telemetry(registry.telemetry_for(
+        let mut encoder = DatadogEncoder::new().with_telemetry(registry.telemetry_for(
             "datadog_out",
             "datadog_out",
             "sink",

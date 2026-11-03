@@ -163,7 +163,7 @@
 //! | `record/same_instant_equal` | normalized | `next_nanosecond` | A point sharing a series and a timestamp with one already in the batch takes the next free nanosecond, so both are kept. |
 //! | `record/same_millisecond` | exact | -- | Each point is its own line at its own nanosecond. |
 //! | `record/same_millisecond_equal` | exact | -- | Each point is its own line at its own nanosecond. |
-//! | `record/non_finite` | dropped | `logit.output.metrics.dropped{reason=unencodable_value}` | Line protocol has no non-finite float, so the record is dropped. |
+//! | `record/non_finite` | dropped | `logit.output.metrics.dropped{reason=unencodable_value}` | Line protocol has no non-finite float, so the record is dropped, with a throttled `unencodable_value` warning. |
 //! | `log/dogstatsd_event` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A log has no line-protocol form and isn't written. |
 //! | `log/plain` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A log has no line-protocol form and isn't written. |
 //! | `span/alone` | skipped | `logit.output.events.skipped{reason=no_metrics}` | A span has no line-protocol form and isn't written. |
@@ -227,9 +227,9 @@
 //! | a non-finite `sum`, `min`, `max`, quantile, quantile value, or bound other than `+Inf`, in one of those kinds | left off the line, which is still written | `metrics.degraded{reason="non_finite_component"}`, once per record |
 //! | `unit`, `description`, `start_timestamp`, exemplars; `EventBatch::scope`; `Resource::schema_url` | dropped | -- |
 //! | a measurement starting `#` | dropped: influxd reads the line as a comment | `metrics.dropped{reason="comment_measurement"}`, diagnostic `encode_error` |
-//! | a measurement or carrier field key with no spelling (encode.rs's "Escaping"), such as a measurement starting with a tab or NUL, or a line whose every field key does | dropped, once per field | `metrics.dropped{reason="unencodable_key"}` |
-//! | carrier field key `time` | dropped: influxd answers `422` | `metrics.dropped{reason="reserved_key"}` |
-//! | carrier string field over 1 MiB | dropped: influxd answers `422` | `metrics.dropped{reason="oversize_value"}` |
+//! | a measurement or carrier field key with no spelling (encode.rs's "Escaping"), such as a measurement starting with a tab or NUL, or a line whose every field key does | dropped, once per field | `metrics.dropped{reason="unencodable_key"}`; `influxdb_out` adds diag `unencodable_key` with the batch's count |
+//! | carrier field key `time` | dropped: influxd answers `422` | `metrics.dropped{reason="reserved_key"}`; `influxdb_out` adds diag `reserved_key` with the batch's count |
+//! | carrier string field over 1 MiB | dropped: influxd answers `422` | `metrics.dropped{reason="oversize_value"}`; `influxdb_out` adds diag `oversize_value` with the batch's count |
 //! | `event.timestamp` | the line's timestamp in nanoseconds; a same-series point already in the batch takes the next free nanosecond (normalization 9) | `metrics.dropped{reason="timestamp_overflow"}` when none is free below `i64::MAX` |
 //!
 //! Tags are the resource's attributes merged with the event's, the event's value winning:

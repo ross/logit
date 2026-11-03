@@ -32,7 +32,8 @@
 //! **A request no consumer takes is refused, not acknowledged.** When every consumer of the
 //! listener has closed, the request is answered `503` with `Retry-After: 1` (gRPC `UNAVAILABLE`,
 //! status 14) and its undelivered batches are counted
-//! `logit.input.batches.dropped{reason="closed_consumer"}`. Never a `partial_success`, which tells
+//! `logit.input.batches.dropped{reason="closed_consumer"}`, beside a throttled
+//! `closed_consumer` line. Never a `partial_success`, which tells
 //! the exporter the rejected items are permanently bad and must not be retried.
 //!
 //! **TLS is optional, per listener.** `tls:` in config ([`TlsServerSettings`]) turns it on for
@@ -159,11 +160,12 @@
 //! the signal closes the listening socket and waits for them. When `run_input`'s grace backstop
 //! drops that future instead, the set aborts every task still running. The abort costs a client
 //! its response, which it answers by resending, and never a batch: no handler awaits
-//! `Fanout::send` on its connection task (`crate::http`'s module doc). h2 stream tasks and
-//! detached deliveries outlive the abort, bounded by the downstream draining or closing
-//! (`docs/design/pipeline-graph.md`'s "Cancellation points"). ADR `idle-connection-timeout`'s
-//! "Amendment: shutdown is the second trigger of the close sequence (2026-10-07)" records the
-//! decision.
+//! `Fanout::send` on its connection task (`crate::http`'s module doc). The abort doesn't reach an
+//! h2 stream's task, but the dropped connection closes the stream, so its handler is polled once
+//! more and then dropped. Detached deliveries outlive the abort, bounded by the downstream
+//! draining or closing (`docs/design/pipeline-graph.md`'s "Cancellation points"). ADR
+//! `idle-connection-timeout`'s "Amendment: shutdown is the second trigger of the close sequence
+//! (2026-10-07)" records the decision.
 //!
 //! *Why not hyper's `http1().header_read_timeout(..)`.* In the pinned hyper 1.11.1
 //! (`src/proto/h1/conn.rs`) that timer is armed at the *top* of `poll_read_head`, before a header
@@ -515,7 +517,7 @@ impl Input for OtlpInput {
                 continue;
             };
 
-            let sink = sink.clone();
+            let sink = sink.for_connection();
             let transport = self.transport;
             let mut diag = self.diag.clone();
             let telemetry = self.telemetry.clone();
@@ -823,7 +825,7 @@ async fn handle_http(
     match result {
         Ok(mut batches) => {
             request_peer.stamp_batches(&mut batches);
-            let settle = count_undelivered(&telemetry);
+            let settle = count_undelivered(&telemetry, &gate.diag, peer);
             if crate::http::deliver_detached(&sink, batches, settle).await.is_err() {
                 let mut response =
                     text_response(StatusCode::SERVICE_UNAVAILABLE, NO_CONSUMER_TOOK_THE_BATCH);
@@ -1042,7 +1044,7 @@ async fn handle_grpc(
     match decoder.decode_signal(signal, payload) {
         Ok(mut batches) => {
             request_peer.stamp_batches(&mut batches);
-            let settle = count_undelivered(&telemetry);
+            let settle = count_undelivered(&telemetry, &gate.diag, peer);
             match crate::http::deliver_detached(&sink, batches, settle).await {
                 Ok(()) => Ok(grpc_response(0, "", Some(export_response(0, "")))),
                 Err(_) => Ok(grpc_response(14, NO_CONSUMER_TOOK_THE_BATCH, None)),
@@ -1063,14 +1065,23 @@ struct Gate {
 const NO_CONSUMER_TOOK_THE_BATCH: &str = "no consumer took the batch";
 
 /// The delivery task's count of a request's batches that no consumer took, the refused one
-/// included: on that task, so a client that closed mid-wait doesn't leave the drop uncounted.
+/// included, and its `closed_consumer` line: on that task, so a client that closed mid-wait
+/// doesn't leave the drop uncounted.
 fn count_undelivered(
     telemetry: &Telemetry,
+    diag: &Diagnostics,
+    peer: &ConnectionPeer,
 ) -> impl FnOnce(Result<(), crate::http::Undelivered>) + Send + 'static {
-    let telemetry = telemetry.clone();
+    let (telemetry, mut diag, peer) = (telemetry.clone(), diag.clone(), peer.clone());
     move |outcome| {
         if let Err(undelivered) = outcome {
             undelivered.record(&telemetry);
+            diag.warn_throttled(
+                "closed_consumer",
+                format_args!(
+                    "otlp_in: refused a request from {peer}: {NO_CONSUMER_TOOK_THE_BATCH}"
+                ),
+            );
         }
     }
 }
@@ -1839,7 +1850,8 @@ mod tests {
         let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
         let telemetry = probe.telemetry("otlp_in", "otlp_in", "listener");
         let (addr, input) = bound_input(OtlpTransport::Http).await;
-        let mut input = input.with_telemetry(telemetry);
+        let diag = Diagnostics::new("otlp_in").with_telemetry(telemetry.clone());
+        let mut input = input.with_diagnostics(diag).with_telemetry(telemetry);
         let (sink, rx) = fanout_into_channel();
         drop(rx);
         tokio::spawn(async move { input.run(sink).await });
@@ -1854,6 +1866,8 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 503"), "got: {response}");
         assert!(response.to_ascii_lowercase().contains("retry-after: 1"), "got: {response}");
         assert_eq!(probe.sum("logit.input.batches.dropped", &[("reason", "closed_consumer")]), 1.0);
+        let closed = [("key", "closed_consumer")];
+        assert_eq!(probe.sum("logit.component.diagnostics", &closed), 1.0, "its line");
     }
 
     #[tokio::test]
@@ -1861,7 +1875,8 @@ mod tests {
         let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
         let telemetry = probe.telemetry("otlp_in", "otlp_in", "listener");
         let (addr, input) = bound_input(OtlpTransport::Grpc).await;
-        let mut input = input.with_telemetry(telemetry);
+        let diag = Diagnostics::new("otlp_in").with_telemetry(telemetry.clone());
+        let mut input = input.with_diagnostics(diag).with_telemetry(telemetry);
         let (sink, rx) = fanout_into_channel();
         drop(rx);
         tokio::spawn(async move { input.run(sink).await });
@@ -1869,6 +1884,8 @@ mod tests {
         let trailers = grpc_export(&addr, grpc_message(false, &one_span_payload()), None).await;
         assert_eq!(trailers.get("grpc-status").unwrap().to_str().unwrap(), "14");
         assert_eq!(probe.sum("logit.input.batches.dropped", &[("reason", "closed_consumer")]), 1.0);
+        let closed = [("key", "closed_consumer")];
+        assert_eq!(probe.sum("logit.component.diagnostics", &closed), 1.0, "its line");
     }
 
     // ---- gRPC: garbage-frame status test ----

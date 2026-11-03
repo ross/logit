@@ -844,8 +844,9 @@ impl<D: Decoder + Clone + Send + 'static> ConnectionSpawner<D> {
     {
         // Every connection task holds a `Fanout` clone, so the shutdown cascade
         // (`docs/adr/service-lifecycle-and-output-retry.md`) completes only once every one has
-        // dropped, which `serve_connection`'s shutdown race guarantees.
-        let sink = self.sink.clone();
+        // dropped, which `serve_connection`'s shutdown race guarantees. The task is detached:
+        // `run_until_shutdown` returns at the signal without it, so the backstop never cuts it.
+        let sink = self.sink.detached();
         let mut diag = self.diag.clone();
         let telemetry = self.telemetry.clone();
         let tls_acceptor = self.tls_acceptor.clone();

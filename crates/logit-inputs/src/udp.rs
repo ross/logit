@@ -858,9 +858,9 @@ fn report_receive_buffer(
 /// `logit.input.reads`, one `logit.input.datagrams` of however many it read, one
 /// `logit.input.datagram.bytes` of their total, and, only when nonzero, one
 /// `logit.component.datagrams.dropped`/`bytes.dropped{reason="truncated"}` pair for the datagrams
-/// it read truncated and never queued. `datagrams / reads` is the mean fill of the syscall batch: a
-/// fill pinned at `read_batch` says the knob is the limit; a fill near 1 says the traffic never
-/// batches and the knob is irrelevant. Per batch because each count takes `ComponentBuffer`'s
+/// it read truncated and never queued, with one throttled `truncated` line. `datagrams / reads` is
+/// the mean fill of the syscall batch: a fill pinned at `read_batch` says the knob is the limit; a
+/// fill near 1 says the traffic never batches and the knob is irrelevant. Per batch because each count takes `ComponentBuffer`'s
 /// mutex, which `decode_loop` contends for from the other side of the same component.
 ///
 /// [`ReadHalf`] closes `queue` on every exit, dropped future included: the only signal
@@ -878,6 +878,8 @@ async fn read_loop<S: DatagramSocket>(
     peer: bool,
 ) -> anyhow::Result<()> {
     let mut reader = BatchReader::new(read_batch, peer);
+    // Its own handle for the truncation line: `half` borrows `diag` for the loop's lifetime.
+    let mut loss_diag = diag.clone();
     // `batch` is reused and cleared each iteration: `push_many` drains it, so its capacity
     // survives and the steady state allocates only the one right-sized copy per datagram.
     let mut half = ReadHalf {
@@ -911,6 +913,13 @@ async fn read_loop<S: DatagramSocket>(
             let tags = [("reason", TRUNCATED)];
             telemetry.count(RECEIVE_QUEUE_METRICS.items_dropped, truncated as f64, &tags);
             telemetry.count(RECEIVE_QUEUE_METRICS.units_dropped, truncated_bytes as f64, &tags);
+            loss_diag.warn_throttled(
+                TRUNCATED,
+                format_args!(
+                    "dropped {truncated} datagram(s) longer than {MAX_DATAGRAM_BYTES} bytes, \
+                     which the kernel cut to fit: a cut datagram is never decoded"
+                ),
+            );
         }
         // Unbiased: `half.batch` may still be full on return (see [`ReadHalf`]).
         tokio::select! {
@@ -1815,7 +1824,8 @@ impl ReceiveBufferSampler {
     /// One `getsockopt`, and the four metrics it feeds.
     ///
     /// `logit.input.kernel.dropped{reason="socket"}` is reported only when the delta is nonzero,
-    /// like every other loss counter here; the gauges alongside it show the sampler is alive.
+    /// like every other loss counter here, with a throttled `socket` line beside it; the gauges
+    /// alongside it show the sampler is alive.
     ///
     /// `logit.input.receive_buffer.bytes` is re-emitted every sample though it never changes after
     /// bind: `ComponentBuffer::drain` (`logit_core::telemetry`) `mem::take`s its point map, so a
@@ -1862,6 +1872,16 @@ impl ReceiveBufferSampler {
         let dropped = self.drops.delta(info.drops);
         if dropped > 0 {
             self.telemetry.count(KERNEL_DROPPED, dropped as f64, &[("reason", "socket")]);
+            // One occurrence per sample that saw new drops, so a sustained overflow logs on the
+            // throttle's schedule rather than once a second.
+            self.diag.warn_throttled(
+                "socket",
+                format_args!(
+                    "the kernel discarded {dropped} datagram(s) since the last sample before this \
+                     listener read them; logit.input.receive_buffer.utilization shows how full \
+                     its socket buffer runs"
+                ),
+            );
         }
         self.telemetry.gauge("logit.input.receive_buffer.bytes", f64::from(info.rcvbuf), &[]);
         self.telemetry.gauge(
@@ -2104,6 +2124,47 @@ pub(crate) fn now_nanos() -> i64 {
 mod tests {
     use super::*;
     use logit_core::{AttrMap, Resource};
+
+    /// A dropped [`Undecoded`] counts what it never yielded and logs its own line, never the
+    /// `shutdown_push_cut` a cancelled push logs: its datagrams were popped off the queue.
+    #[test]
+    fn a_dropped_undecoded_batch_logs_no_push_cut() {
+        let (lines, _guard) = logit_pipeline::test_util::capture_lines();
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("in", "statsd_in", "listener");
+        let diag = Diagnostics::new("in");
+        let mut popped: Vec<Datagram> = (0..3)
+            .map(|i| Datagram { bytes: Bytes::from(format!("m{i}")), received_at: i, peer: None })
+            .collect();
+        {
+            let mut undecoded = Undecoded {
+                drain: CountedDrain::new(
+                    &mut popped,
+                    &telemetry,
+                    &RECEIVE_QUEUE_METRICS,
+                    "shutdown",
+                ),
+                left: 3,
+                diag: &diag,
+            };
+            undecoded.next().expect("one is decoded");
+        }
+        let dropped: f64 = registry
+            .drain(0)
+            .iter()
+            .filter(|e| e.attributes.get("reason").and_then(|v| v.as_str()) == Some("shutdown"))
+            .flat_map(|e| e.metrics.iter())
+            .filter(|m| {
+                logit_core::interner::resolve(m.name) == RECEIVE_QUEUE_METRICS.items_dropped
+            })
+            .map(|m| match &m.kind {
+                logit_core::MetricKind::Sum(sum) => sum.value.as_f64(),
+                _ => 0.0,
+            })
+            .sum();
+        assert_eq!(dropped, 2.0, "the two never yielded are counted");
+        assert!(lines.with_key("shutdown_push_cut").is_empty(), "no push was cut");
+    }
     use logit_pipeline::unwrap_batch;
     use logit_proto::CodecError;
     use tokio::net::UdpSocket;
@@ -3008,21 +3069,8 @@ mod tests {
         blast(addr, OVERRUN_DATAGRAMS).await;
 
         let fd = logit_pipeline::sockstat::fd_of(&socket).expect("a unix socket has a descriptor");
-        let drops_now = || {
-            logit_pipeline::sockstat::meminfo(fd)
-                .expect("SO_MEMINFO on a socket this process just opened")
-                .drops
-        };
-        let mut last = (drops_now(), std::time::Instant::now());
-        logit_pipeline::test_util::wait_until("sk_drops to hold still for 20ms", || {
-            let drops = drops_now();
-            if drops != last.0 {
-                last = (drops, std::time::Instant::now());
-            }
-            last.1.elapsed() >= Duration::from_millis(20)
-        })
-        .await;
-        let settled = u64::from(last.0);
+        let drops_now = || drops_at(fd);
+        let settled = u64::from(settle_drops(fd).await);
 
         let Some(procfs_drops) = proc_net_udp_drops(&socket) else {
             println!("skipping: /proc/net/udp is not readable in this environment");
@@ -3053,6 +3101,65 @@ mod tests {
             "and so must a direct SO_MEMINFO read, which is what rules out the counter's \
              first-sample arithmetic hiding an index mistake"
         );
+    }
+
+    /// `sk_drops` for the socket behind `fd`, read straight off it.
+    #[cfg(target_os = "linux")]
+    fn drops_at(fd: logit_pipeline::sockstat::RawFd) -> u32 {
+        logit_pipeline::sockstat::meminfo(fd)
+            .expect("SO_MEMINFO on a socket this process just opened")
+            .drops
+    }
+
+    /// Waits for `sk_drops` on `fd` to hold still for 20ms and returns it: loopback delivery runs
+    /// in softirq, so a blast can still be raising it after the blaster returns.
+    #[cfg(target_os = "linux")]
+    async fn settle_drops(fd: logit_pipeline::sockstat::RawFd) -> u32 {
+        let mut last = (drops_at(fd), std::time::Instant::now());
+        logit_pipeline::test_util::wait_until("sk_drops to hold still for 20ms", || {
+            let drops = drops_at(fd);
+            if drops != last.0 {
+                last = (drops, std::time::Instant::now());
+            }
+            last.1.elapsed() >= Duration::from_millis(20)
+        })
+        .await;
+        last.0
+    }
+
+    /// A sample that sees new kernel drops logs one throttled `socket` line with the count, and a
+    /// sample that sees none logs nothing.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_sample_with_new_kernel_drops_logs_one_line() {
+        let telemetry = Telemetry::default();
+        let mut diag = Diagnostics::default();
+        let (socket, _group) = bind_socket(
+            "127.0.0.1:0",
+            BindOptions::default(),
+            Some(TINY_RECEIVE_BUFFER),
+            &telemetry,
+            &mut diag,
+        )
+        .await
+        .expect("binding an ephemeral port should succeed");
+        let addr = socket.local_addr().expect("a bound socket has an address");
+        blast(addr, OVERRUN_DATAGRAMS).await;
+        let fd = logit_pipeline::sockstat::fd_of(&socket).expect("a unix socket has a descriptor");
+        let settled = settle_drops(fd).await;
+        assert!(settled > 0, "the flood must have overrun a {TINY_RECEIVE_BUFFER}-byte buffer");
+
+        let (lines, _guard) = logit_pipeline::test_util::capture_lines();
+        let mut sampler = ReceiveBufferSampler::new(&socket, telemetry, Diagnostics::new("udp"));
+        sampler.sample_once();
+        assert!(sampler.enabled, "SO_MEMINFO is available on this kernel -- test premise");
+        sampler.sample_once();
+
+        let found = lines.with_key("socket");
+        assert_eq!(found.len(), 1, "one line for the one sample with new drops: {found:?}");
+        assert_eq!(found[0].0, logit_pipeline::test_util::Level::WARN);
+        let expected = format!("the kernel discarded {settled} datagram(s)");
+        assert!(found[0].1.contains(&expected), "{}", found[0].1);
     }
 
     /// This socket's `drops` column in `/proc/net/udp[6]`, found by inode. `None` if procfs is
@@ -4282,8 +4389,14 @@ mod tests {
 
         let registry = logit_core::Registry::new();
         let telemetry = registry.telemetry_for("statsd_in", "statsd_in", "listener");
+        let (lines, guard) = logit_pipeline::test_util::capture_lines();
         let datagram = read_one(&socket, telemetry).await;
+        drop(guard);
         assert_truncated_dropped(&datagram, &registry.drain(0));
+        let found = lines.with_key(TRUNCATED);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].0, logit_pipeline::test_util::Level::WARN);
+        assert!(found[0].1.contains("dropped 1 datagram(s) longer than"), "{}", found[0].1);
     }
 
     /// Runs [`read_loop`] over `socket` until the queue yields one datagram, then stops it.
@@ -5139,8 +5252,8 @@ mod tests {
     }
 
     /// A batch whose fan-out is cut off mid-`Fanout::deliver` reaches a prefix of the consumers,
-    /// and is counted `sent` and `receive.flushed` but never dropped. This pins the gap
-    /// `docs/known-gaps/intake.md` records for the grace backstop.
+    /// and the listener counts it `sent` and `receive.flushed` but never dropped. Under
+    /// `run_input`, the grace backstop counts it dropped from the listener's sends in flight.
     #[tokio::test(start_paused = true)]
     async fn a_batch_cut_off_mid_fan_out_reaches_a_prefix_of_consumers() {
         let registry = logit_core::Registry::new();

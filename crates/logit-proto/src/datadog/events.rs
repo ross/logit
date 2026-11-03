@@ -160,6 +160,10 @@ impl DatadogDecoder {
         let text = str_of(obj, "msg_text").or_else(|| str_of(obj, "text"));
         if title.is_none() && text.is_none() {
             self.drop_event("no_title");
+            self.diagnostics.warn_throttled(
+                "no_title",
+                "dropped an event item with neither a title nor a text",
+            );
             return None;
         }
         let timestamp = obj.get("timestamp").or_else(|| obj.get("date_happened")).and_then(seconds);
@@ -495,11 +499,10 @@ mod tests {
     #[test]
     fn events_without_title_or_text_are_dropped_and_counted() {
         let registry = Registry::new();
-        let mut decoder = DatadogDecoder::new().with_telemetry(registry.telemetry_for(
-            "datadog_in",
-            "datadog_in",
-            "listener",
-        ));
+        let diagnostics = logit_core::Diagnostics::new("datadog_in");
+        let mut decoder = DatadogDecoder::new()
+            .with_diagnostics(diagnostics.clone())
+            .with_telemetry(registry.telemetry_for("datadog_in", "datadog_in", "listener"));
         let batch = decoder
             .decode_events(
                 br#"{"events":{"api":[{"host":"h"},{"msg_text":"only text"}]},"internalHostname":""}"#,
@@ -511,6 +514,7 @@ mod tests {
         assert_eq!(attr(&batch.events[0], "_logit.statsd.event.title"), Some(""));
         assert_eq!(batch.events[0].timestamp, RECEIVED_AT);
         assert_eq!(counted(&registry, "logit.input.events.dropped", ("reason", "no_title")), 1.0);
+        assert_eq!(diagnostics.occurrences("no_title"), 1);
     }
 
     #[test]

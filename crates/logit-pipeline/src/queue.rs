@@ -172,14 +172,24 @@ impl From<SinkQueueConfig> for QueueConfig {
 /// `reason` is `"shutdown"` at every call site: the shutdown race and the grace backstop are the
 /// only production cancellers of a future that holds one.
 ///
-/// The drop calls only `Telemetry::count`, never the queue lock. `Telemetry::count` takes its own
-/// buffer's lock, which is never held across an await or while a `CountedDrain` drops
-/// (`docs/adr/shutdown-accounting-and-cancellation-safety.md`, "Alternatives considered").
+/// Built by [`BoundedQueue::push_many`] ([`CountedDrain::push_cut`]), a drop that counts
+/// anything also logs one `shutdown_push_cut` warn line naming the queue's component, the counts,
+/// and the counter. The remainder isn't in `drain complete`'s `batches_dropped`: that tally sums
+/// batches, and `push_many`'s one production caller, a UDP listener's receive queue, holds
+/// datagrams. One built by [`CountedDrain::new`] only counts, since what it holds may never have
+/// been a push (a UDP listener's popped, undecoded batch logs its own line).
+///
+/// The drop calls only `Telemetry::count` and the log, never the queue lock. `Telemetry::count`
+/// takes its own buffer's lock, which is never held across an await or while a `CountedDrain`
+/// drops (`docs/adr/shutdown-accounting-and-cancellation-safety.md`, "Alternatives considered"),
+/// and so does the log's capture into `internal`.
 pub struct CountedDrain<'a, T: Queued> {
     drain: Peekable<vec::Drain<'a, T>>,
     telemetry: &'a Telemetry,
     metrics: &'static QueueMetrics,
     reason: &'static str,
+    /// Whether a counting drop logs `shutdown_push_cut`: set only by [`Self::push_cut`].
+    push_cut: bool,
 }
 
 impl<'a, T: Queued> CountedDrain<'a, T> {
@@ -190,7 +200,19 @@ impl<'a, T: Queued> CountedDrain<'a, T> {
         metrics: &'static QueueMetrics,
         reason: &'static str,
     ) -> Self {
-        Self { drain: items.drain(..).peekable(), telemetry, metrics, reason }
+        Self { drain: items.drain(..).peekable(), telemetry, metrics, reason, push_cut: false }
+    }
+
+    /// [`Self::new`] for a push into the queue: a counting drop also logs `shutdown_push_cut`.
+    fn push_cut(
+        items: &'a mut Vec<T>,
+        telemetry: &'a Telemetry,
+        metrics: &'static QueueMetrics,
+        reason: &'static str,
+    ) -> Self {
+        let mut drain = Self::new(items, telemetry, metrics, reason);
+        drain.push_cut = true;
+        drain
     }
 
     /// The next item without yielding it. A peeked item that is never yielded is counted.
@@ -221,6 +243,19 @@ impl<T: Queued> Drop for CountedDrain<'_, T> {
             let tags = [("reason", self.reason)];
             self.telemetry.count(self.metrics.items_dropped, items as f64, &tags);
             self.telemetry.count(self.metrics.units_dropped, units as f64, &tags);
+            if !self.push_cut {
+                return;
+            }
+            let component = self.telemetry.component().map_or("<unnamed>", |(id, _)| id);
+            tracing::warn!(
+                target: "logit",
+                component = %component,
+                key = "shutdown_push_cut",
+                "dropped {items} item(s) ({units} unit(s)) a cancelled push never reached the \
+                 queue; counted in {}{{reason=\"{}\"}}",
+                self.metrics.items_dropped,
+                self.reason,
+            );
         }
     }
 }
@@ -309,7 +344,8 @@ impl<T: Queued> BoundedQueue<T> {
     }
 
     /// Ends a full-buffer episode still open once nothing will push again, writing
-    /// `buffer_full_at_shutdown` if the episode was announced. A no-op with no episode open.
+    /// `buffer_full_at_shutdown` if the episode was announced, else `buffer_shed_unannounced` if
+    /// an episode no line announced shed anything (`buffer_full`'s module doc).
     pub fn finish_full_episode(&self) {
         self.watch.finish();
     }
@@ -450,7 +486,8 @@ impl<T: Queued> BoundedQueue<T> {
         // wait and keep evicted datagrams alive for it.
         let mut dropped: Vec<(&'static str, T, Bound)> = Vec::new();
         let (len, total_weight) = {
-            let mut drain = CountedDrain::new(items, &self.telemetry, self.metrics, "shutdown");
+            let mut drain =
+                CountedDrain::push_cut(items, &self.telemetry, self.metrics, "shutdown");
             // The head item's weight, computed once however many times the wait loop re-examines
             // it.
             let mut head_weight: Option<u64> = None;
@@ -1954,6 +1991,7 @@ mod tests {
     /// exact.
     #[tokio::test(start_paused = true)]
     async fn a_cancelled_push_many_keeps_its_prefix_and_counts_its_remainder_as_shutdown_drops() {
+        let (lines, _guard) = crate::test_util::capture_lines();
         let (registry, q) = recording_queue(2, u64::MAX, OverflowPolicy::Block);
         let mut items = batch_of(&[(1, 1), (1, 2), (1, 3), (1, 4)]);
 
@@ -1980,6 +2018,16 @@ mod tests {
             metric_sum(&events, TEST_METRICS.items_dropped, None),
             2.0,
             "nothing else is counted: the prefix was admitted, not dropped"
+        );
+        assert_eq!(lines.components_with_key("shutdown_push_cut"), ["test"]);
+        assert_eq!(
+            lines.with_key("shutdown_push_cut"),
+            [(
+                tracing::Level::WARN,
+                "dropped 2 item(s) (7 unit(s)) a cancelled push never reached the queue; counted \
+                 in test.queue.items.dropped{reason=\"shutdown\"}"
+                    .to_string()
+            )]
         );
 
         // Exact accounting: once drained, the queue takes a full batch without evicting.
@@ -2850,9 +2898,9 @@ mod tests {
 #[cfg(test)]
 mod full_buffer_tests {
     use super::*;
-    use crate::buffer_full::test_support::{capture, Lines};
     use crate::buffer_full::{fmt_bytes, REPEAT_INTERVAL};
     use crate::fanout::TraceContext;
+    use crate::test_util::{capture_lines as capture, Lines};
     use crate::test_util::{wait_until, TelemetryProbe, RECV_TIMEOUT};
     use logit_core::{AttrMap, Event, Resource};
     use std::time::Duration;
@@ -2919,7 +2967,7 @@ mod full_buffer_tests {
         q.commit().expect("2 of 4 left");
         let recovered = lines.with_key("buffer_recovered");
         assert_eq!(recovered.len(), 1);
-        assert_eq!(recovered[0].0, tracing::Level::INFO);
+        assert_eq!(recovered[0].0, tracing::Level::WARN);
         assert_eq!(
             recovered[0].1,
             "buffer below 75% of its bounds after 1m0s; overflow block held intake for 1m0s"

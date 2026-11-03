@@ -134,6 +134,8 @@ impl DatadogDecoder {
         let message = match obj.get("message") {
             None | Some(Json::Null) => {
                 self.drop_log("no_message");
+                self.diagnostics
+                    .warn_throttled("no_message", "dropped a log item with no `message` field");
                 return None;
             }
             Some(Json::String(s)) => Value::str(s.as_str()),
@@ -791,11 +793,10 @@ pub(super) mod tests {
     #[test]
     fn rfc3339_timestamps_and_missing_messages() {
         let registry = Registry::new();
-        let mut decoder = DatadogDecoder::new().with_telemetry(registry.telemetry_for(
-            "datadog_in",
-            "datadog_in",
-            "listener",
-        ));
+        let diagnostics = logit_core::Diagnostics::new("datadog_in");
+        let mut decoder = DatadogDecoder::new()
+            .with_diagnostics(diagnostics.clone())
+            .with_telemetry(registry.telemetry_for("datadog_in", "datadog_in", "listener"));
         let batch = decoder
             .decode_logs(
                 br#"[{"message":"a","timestamp":"2023-11-14T22:13:20.5Z"},{"status":"info"},{"message":null},{"message":"b","timestamp":"yesterday"}]"#,
@@ -806,6 +807,7 @@ pub(super) mod tests {
         assert_eq!(batch.events[0].timestamp, 1_700_000_000_500_000_000);
         assert_eq!(batch.events[1].timestamp, RECEIVED_AT);
         assert_eq!(counted(&registry, "logit.input.logs.dropped", ("reason", "no_message")), 2.0);
+        assert_eq!(diagnostics.occurrences("no_message"), 2);
     }
 
     /// A fractional millisecond `timestamp` keeps every digit of its text, in an array, a bare

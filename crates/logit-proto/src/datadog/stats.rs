@@ -696,7 +696,16 @@ impl DatadogDecoder {
                 Ok(sketch) => {
                     records.push(MetricRecord::new(intern(name), MetricKind::Distribution(sketch)))
                 }
-                Err(SketchError::Interpolation) => self.stats_not_decoded(StatsIn::Interpolation),
+                Err(SketchError::Interpolation) => {
+                    self.stats_not_decoded(StatsIn::Interpolation);
+                    self.diagnostics.warn_throttled(
+                        StatsIn::Interpolation.reason(),
+                        format_args!(
+                            "datadog stats: {name} dropped: its sketch's interpolation isn't \
+                             NONE, which this decoder doesn't read"
+                        ),
+                    );
+                }
                 Err(SketchError::Malformed(why)) => {
                     self.stats_not_decoded(StatsIn::BadSketch);
                     self.diagnostics.warn_throttled(
@@ -721,8 +730,10 @@ fn str_array(v: &[String]) -> Value {
 // ---------------------------------------------------------------------------------------------
 
 impl DatadogEncoder {
-    fn stats_out_dropped(&self, reason: &'static str) {
+    /// Counts a stats record dropped for `reason`, with a throttled diagnostic keyed on it.
+    fn stats_out_dropped(&mut self, reason: &'static str, why: impl std::fmt::Display) {
         self.telemetry.count("logit.output.stats.dropped", 1.0, &[("reason", reason)]);
+        self.diagnostics.warn_throttled(reason, format_args!("datadog stats: {why}"));
     }
 
     fn stats_out_degraded(&self, reason: &'static str) {
@@ -852,7 +863,7 @@ impl DatadogEncoder {
     /// fields read from the event, falling back to the resource, except `Service`: the resource's
     /// `service.name` is the payload's `Service`, so a group's is the event's alone, and a group
     /// that left it empty relays empty.
-    fn group(&self, resource: &Resource, event: &Event) -> (ClientGroupedStats, u64, i64) {
+    fn group(&mut self, resource: &Resource, event: &Event) -> (ClientGroupedStats, u64, i64) {
         let mut g = ClientGroupedStats::default();
         for key in GROUP_STRINGS {
             let value = if key == ATTR_SERVICE_NAME {
@@ -931,7 +942,14 @@ impl DatadogEncoder {
                 (METRIC_ERROR_SUMMARY, MetricKind::Distribution(d)) => {
                     g.error_summary = self.summary(d)
                 }
-                _ => self.stats_out_dropped("unrecognized_record"),
+                _ => self.stats_out_dropped(
+                    "unrecognized_record",
+                    format_args!(
+                        "a stats record dropped: {name} as a {} isn't one of the APM stats \
+                         group's records",
+                        record.kind.name()
+                    ),
+                ),
             }
         }
         (g, duration, shift)
@@ -1557,7 +1575,9 @@ mod tests {
 
     #[test]
     fn a_bad_or_interpolated_summary_drops_only_that_record() {
-        let (mut d, registry) = decoder();
+        let (d, registry) = decoder();
+        let diagnostics = logit_core::Diagnostics::new("datadog_in");
+        let mut d = d.with_diagnostics(diagnostics.clone());
         let linear = pb_sketch(Interpolation::Linear, sparse(&[(1, 1.0)]), Store::default(), 0.0);
         let g = ClientGroupedStats {
             name: "n".into(),
@@ -1579,6 +1599,7 @@ mod tests {
         assert_eq!(count(dropped, "bad_sketch"), 1);
         assert_eq!(count(dropped, "interpolation"), 1);
         assert_eq!(count(skipped, "bad_sketch") + count(skipped, "interpolation"), 0);
+        assert_eq!(diagnostics.occurrences("interpolation"), 1);
     }
 
     /// A hand-written v0.6 body: keys out of order, an unknown key, `nil`s for zero values, a

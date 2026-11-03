@@ -79,6 +79,27 @@ impl MetricIn {
             | MetricIn::InvalidStatus => INPUT_METRICS_DROPPED,
         }
     }
+
+    /// What [`super::DatadogDecoder::metric_not_decoded`]'s line says was dropped, or `None`: a
+    /// skip logs nothing, and `bad_series`, `bad_sketch`, and a service check's `malformed` log
+    /// their own line, naming the fault, at their call sites.
+    pub(super) fn diagnostic(self) -> Option<&'static str> {
+        match self {
+            MetricIn::BadPoint => Some("point(s) that aren't a timestamp and a value"),
+            MetricIn::NonFiniteValue => Some("point(s) whose value isn't a finite number"),
+            MetricIn::LegacyDistribution => {
+                Some("legacy `distributions` sketch entries, which this decoder doesn't read")
+            }
+            MetricIn::NoName => Some("service check(s) with no `check` name"),
+            MetricIn::InvalidStatus => Some("service check(s) whose `status` isn't 0 to 3"),
+            MetricIn::BadSeries
+            | MetricIn::BadSketch
+            | MetricIn::Malformed
+            | MetricIn::NullValue
+            | MetricIn::EmptyDistribution
+            | MetricIn::EmptySketch => None,
+        }
+    }
 }
 
 /// An element of an APM stats payload the decoder didn't turn into a stats event.
@@ -169,6 +190,44 @@ impl MetricOut {
         MetricOut::EqualDuplicateTimestamp,
     ];
 
+    /// The throttled diagnostic `metric_not_sent` raises beside a drop, as `(key, message)`, so
+    /// every counted loss leaves a line. `None` for an outcome that isn't a loss, and for one
+    /// whose call site raises its own diagnostic with what only it knows.
+    pub(super) fn diagnostic(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            MetricOut::GaugeDelta => Some((
+                "gauge_delta_unresolved",
+                "a relative gauge adjustment reached a sink unresolved -- add an `aggregate` \
+                 component between the statsd input and this output",
+            )),
+            MetricOut::NonFiniteValue => Some((
+                "non_finite_value",
+                "datadog: a NaN or infinite metric value dropped: Datadog has no form for one",
+            )),
+            MetricOut::NonMonotonicBounds => Some((
+                "non_monotonic_bounds",
+                "datadog: a histogram dropped: a bucket's upper bound keys below its lower bound, \
+                 so it can't be sketched",
+            )),
+            MetricOut::SketchRange => Some((
+                "sketch_range",
+                "datadog: an exponential histogram dropped: its buckets fall outside the Agent \
+                 sketch's key range",
+            )),
+            MetricOut::InvalidStatus => Some((
+                "invalid_status",
+                "datadog: a service check dropped: its status isn't an integer from 0 to 3",
+            )),
+            MetricOut::Kind(_)
+            | MetricOut::NoRecordedValue
+            | MetricOut::EmptySketch
+            | MetricOut::EqualDuplicateTimestamp
+            | MetricOut::OversizedSketch
+            | MetricOut::UnresolvedCumulative
+            | MetricOut::DuplicateTimestamp => None,
+        }
+    }
+
     /// The counter and its one tag.
     pub(super) fn counter(self) -> (&'static str, (&'static str, &'static str)) {
         match self {
@@ -242,6 +301,50 @@ mod tests {
         for outcome in MetricOut::ALL {
             let (metric, (key, _)) = outcome.counter();
             assert!(!(metric == OUTPUT_METRICS_DROPPED && key == "metric_kind"), "{outcome:?}");
+        }
+    }
+
+    /// Every `dropped` outcome leaves a line: `metric_not_sent` raises this one, or its call site
+    /// raises its own (`oversized_sketch`, `unresolved_cumulative`, `duplicate_timestamp`).
+    #[test]
+    fn every_dropped_outcome_has_a_diagnostic() {
+        let own = [
+            MetricOut::OversizedSketch,
+            MetricOut::UnresolvedCumulative,
+            MetricOut::DuplicateTimestamp,
+        ];
+        for outcome in MetricOut::ALL {
+            let dropped = outcome.counter().0 == OUTPUT_METRICS_DROPPED;
+            let raised = outcome.diagnostic().is_some() || own.contains(&outcome);
+            assert_eq!(dropped, raised, "{outcome:?}");
+        }
+    }
+
+    /// The decode side's twin: every dropped input outcome logs a line, from
+    /// `metric_not_decoded` or, for the three that name their fault, at the call site, and a skip
+    /// logs none.
+    #[test]
+    fn every_dropped_input_outcome_has_a_diagnostic() {
+        let own = [MetricIn::BadSeries, MetricIn::BadSketch, MetricIn::Malformed];
+        for outcome in MetricIn::ALL {
+            let dropped = outcome.metric() == INPUT_METRICS_DROPPED;
+            let raised = outcome.diagnostic().is_some() || own.contains(&outcome);
+            assert_eq!(dropped, raised, "{outcome:?}");
+        }
+    }
+
+    /// `metric_not_decoded` raises an outcome's line once per call that counts it, keyed on its
+    /// reason, and nothing for a count of zero.
+    #[test]
+    fn metric_not_decoded_raises_the_outcomes_diagnostic() {
+        for outcome in MetricIn::ALL {
+            let diagnostics = logit_core::Diagnostics::new("datadog_in");
+            let mut decoder =
+                super::super::DatadogDecoder::new().with_diagnostics(diagnostics.clone());
+            decoder.metric_not_decoded(outcome, 0);
+            decoder.metric_not_decoded(outcome, 2);
+            let expected = u64::from(outcome.diagnostic().is_some());
+            assert_eq!(diagnostics.occurrences(outcome.reason()), expected, "{outcome:?}");
         }
     }
 

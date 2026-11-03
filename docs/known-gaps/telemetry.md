@@ -77,14 +77,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
   the throttle (a lifecycle event, an unthrottled `Diagnostics::error`). It isn't built because
   nothing shipped needs it, and the throttle already covers the hot path (a malformed line, a
   parse failure).
-- **A self-telemetry batch `internal` has drained is lost uncounted if the grace backstop drops it
-  mid-send.** Each `tick` drains the registry, then awaits `Fanout::send`. A tick parked on a full
-  downstream when shutdown fires keeps the `select!` from seeing the signal until the send
-  completes. If the downstream stays full for the 5 s grace, `run_input` drops the task with the
-  drained points, spans, and logs in the send. The registry no longer holds them, and nothing
-  counts them. This is the general dropped-send loss under
-  [Pipeline runtime and graph](runtime.md#pipeline-runtime-and-graph), for the one listener
-  whose data is `logit`'s own.
 - **A drop a kernel or a destination decided counts again on a retried batch.** Encode-side
   counters count once per batch, but these repeat on every attempt that gets the same answer:
   Splunk's code 6 (`records.dropped{reason="invalid_event"}`) and Splunk Cloud's oversize answer,

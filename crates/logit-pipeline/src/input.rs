@@ -28,6 +28,15 @@ pub trait Input {
         Ok(())
     }
 
+    /// Whether the next process reads again a batch this listener was sending when shutdown
+    /// stopped it: its source keeps what the listener hasn't confirmed, as a tail checkpoint or an
+    /// uncommitted Kafka offset does. When `run_input`'s grace backstop cuts a send, a `true`
+    /// listener's batch counts `logit.input.batches.deferred` and a `false` one's counts
+    /// `batches.dropped`/`events.dropped{reason="shutdown"}`. The default is `false`.
+    fn rereads_after_restart(&self) -> bool {
+        false
+    }
+
     /// The socket address this listener holds after [`Input::bind`], `None` before it or for an
     /// input with no network socket. A test binds `127.0.0.1:0` and reads the OS-assigned port
     /// here, through a boxed `dyn Input`, instead of choosing a port first and racing other
@@ -51,11 +60,15 @@ pub trait Input {
     ///
     /// An override should return within its configured grace
     /// ([`InputRuntimeConfig::shutdown_grace`]): `run_input` (`crate::runtime`) races this against
-    /// that deadline as a backstop and cancels a listener still running by drop, losing (and not
-    /// counting) whatever it was still draining. An override may rely on the backstop to end a
-    /// wait it doesn't bound itself, provided the drop loses nothing it can't afford: an HTTP
-    /// listener that waits out a request in flight with no ceiling relies on it, and the drop
-    /// aborts its connection tasks, costing a client its response but never a batch.
+    /// that deadline as a backstop and cancels a listener still running by drop. The backstop
+    /// counts a batch the listener was parked sending, but whatever else it held undrained, such
+    /// as a UDP listener's accumulated events, is lost uncounted. An override may rely on the
+    /// backstop to end a wait it doesn't bound itself, provided the drop loses nothing it can't
+    /// afford: an HTTP listener that waits out a request in flight with no ceiling relies on it,
+    /// and the drop aborts its connection tasks, costing a client its response and any batch a
+    /// handler was still sending, which the backstop counts. ADR
+    /// `shutdown-accounting-and-cancellation-safety`'s 2026-11-02 amendment records the counts
+    /// and the races in them.
     async fn run_until_shutdown(
         &mut self,
         sink: Fanout,

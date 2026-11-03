@@ -1519,7 +1519,19 @@ WIRES = {
 # against `Ledger.kafka_band`. A batch the listener deferred at a revoke or shutdown is in W
 # and never sent, and is read again: Q, `logit.input.batches.deferred`, bounds its records at
 # `batch_max_events` each, since the wire's records carry one event each.
-KAFKA_DEFERRED = "logit.input.batches.deferred"
+#
+# A tailer with a `checkpoint_path` keeps a batch the runtime's shutdown backstop cut out of
+# its send the same way: its checkpoint never passed the batch, so the next life reads it again,
+# and the backstop counts it in the same Q
+# (docs/adr/shutdown-accounting-and-cancellation-safety.md, decision 19). Unlike a Kafka batch, its send had counted it in E, so a file wire's
+# Q is in W and E and in neither A nor X, and only a Kafka wire's Q excuses W − D past E + B
+# (`DEFERRED_UNSENT_WIRES`).
+DEFERRED = "logit.input.batches.deferred"
+# The wires whose listener reads a deferred batch again, so Q is read on them.
+DEFERRED_WIRES = (KAFKA_WIRE, FILE_WIRE, CRI_WIRE)
+# The wires whose deferred batch never counted E: `kafka_in`'s `send_resumable` counts a send
+# only once every consumer's slot is held.
+DEFERRED_UNSENT_WIRES = (KAFKA_WIRE,)
 KAFKA_REBALANCES = "logit.input.rebalances"
 # `kafka_in`'s `commit_interval` and `fetch.max_partition_bytes` when the config names none
 # (crates/logit-config, `KafkaIn` and `KafkaFetch`).
@@ -1586,6 +1598,16 @@ class HttpListener:
 # `route` tag, decodes it to one batch, and never answers busy: backpressure delays its `204`
 # (crates/logit-inputs/src/prometheus.rs, "What a decoded request becomes"). It counts a write
 # on the delivery's task, so one whose sender timed out waiting is still `ok` ("Counters").
+#
+# The runtime's shutdown backstop can cut a request out of its deadline send: the send counts
+# `batches.sent` only once every consumer's slot is held, and the handler that counts the class
+# is dropped with it, so the request counts neither and the identities hold. It counts
+# `events.dropped{reason="shutdown"}`, which X leaves out on an HTTP wire: the events were never
+# in E, and the client, which saw no answer, resends them. In the narrow race where an HTTP/2
+# stream's send completes after the backstop counted it, it counts sent and its class as well,
+# and is in V, so leaving it out of X is right there too
+# (docs/adr/shutdown-accounting-and-cancellation-safety.md, "Amendment: the listener backstop
+# logs and counts a cut send").
 HTTP_LISTENERS = {
     "influxdb_in": HttpListener("logit.input.requests", "write", "logit.input.batches.deferred"),
     "otlp_in": HttpListener(None, None, None),
@@ -2067,17 +2089,25 @@ class Ledger:
                 one["B"] = _summed({"B": one["B"], **{
                     name: sut.counter_by_life(name, component=listener)
                     for name in wire.b_counters}})
-            # On a Kafka wire, Q: the batches the listener deferred, which it reads again; and
-            # the memberships it lost, each of which replays what it read after its last commit.
+            # On a Kafka or file wire, Q: the batches the listener deferred, which it reads
+            # again (`DEFERRED_WIRES`); and on a Kafka wire the memberships it lost, each of
+            # which replays what it read after its last commit.
             kafka = wire is WIRES[KAFKA_WIRE]
-            one["Q"] = (sut.counter_by_life(KAFKA_DEFERRED, component=listener) if kafka
-                        else {})
+            one["Q"] = (sut.counter_by_life(DEFERRED, component=listener)
+                        if any(wire is WIRES[name] for name in DEFERRED_WIRES) else {})
             one["lost"] = (sut.counter_by_life(KAFKA_REBALANCES, component=listener,
                                                reason="membership_lost") if kafka else {})
             one["E"] = sut.counter_by_life("logit.component.events.sent", component=listener)
             # Events the listener counted as sent and then dropped, every reason: a batch sent
-            # into the inbox of a node that has failed is `closed_consumer`.
+            # into the inbox of a node that has failed is `closed_consumer`, and one the
+            # shutdown backstop cut out of its send is `shutdown`. An HTTP listener's cut request
+            # was never counted sent (`HTTP_LISTENERS`), so on an HTTP wire X leaves out its
+            # `shutdown` drops.
             one["X"] = sut.counter_by_life("logit.component.events.dropped", component=listener)
+            if wire is WIRES[HTTP_WIRE]:
+                cut = sut.counter_by_life("logit.component.events.dropped", component=listener,
+                                          reason="shutdown")
+                one["X"] = {life: value - cut.get(life, 0) for life, value in one["X"].items()}
             # On a scrape wire, Y: the synthetic samples E counts beside W, three per scrape.
             one["Y"] = ({life: SCRAPE_SYNTHETIC_SAMPLES * value for life, value in
                          sut.counter_by_life("logit.input.scrapes", component=listener).items()}
@@ -2103,8 +2133,9 @@ class Ledger:
         sut = self.sut
         if self.hop is not None:
             self._read_hop(data)
-        # Batches any data node dropped for shutdown, the sink's and a Lua node's alike, which
-        # `drain complete`'s `batches_dropped` cross-checks.
+        # Batches any data node dropped for shutdown, the sink's, a Lua node's, and a send the
+        # backstop cut at a listener that doesn't read it again alike, which `drain complete`'s
+        # `batches_dropped` cross-checks: both count each of them. With a hop this SUT's own.
         self.shutdown_batches = sut.counter_by_life("logit.component.batches.dropped",
                                                     reason="shutdown")
         # `{life: {(component, reason): batches}}` under every reason, which `drop_credit` reads.
@@ -2831,7 +2862,12 @@ class Ledger:
         stop, restart, or `exit` ended emits each file's unterminated line at shutdown and the
         rest of it after the restart, one line more per file it had open
         (`logit.input.files.open` at its last drain), above (docs/known-gaps/tailing.md's
-        split-line entry). The final life adds nothing.
+        split-line entry). A life whose shutdown backstop cut a tailer's send counts that batch in
+        Q, and the cut also keeps the tailer from writing its shutdown checkpoint, so the next
+        life reads again the batch and everything read since the last periodic checkpoint: Q at
+        `batch_max_events` (`deferred`) plus a killed life's allowance above, its rate taken
+        from the life's peak drain interval, since a tailer parked on a full inbox reads nothing
+        in its last ones. The final life adds nothing.
 
         A `cri_in` listener keeps one checkpoint position per file, pinned at a held `P` run's
         first record while it waits for its `F` or for `partial_timeout`, and the other
@@ -2929,6 +2965,40 @@ class Ledger:
                 high += files
                 lines.append(f"life {life} (stopped): [0, +{files}]: one split line per file "
                              f"open at its last drain")
+            deferred = self.deferred(life, listeners)
+            if deferred and life in inn.killed:
+                high += deferred
+                lines.append(f"life {life}: [0, +{_n(deferred)}]: "
+                             f"{self.deferred_text(life, listeners, 'lines')}, a send the "
+                             "shutdown backstop cut that the checkpoint never passed")
+            elif deferred:
+                # The backstop drops the tailer before its shutdown checkpoint, so the next life
+                # also reads again what this one read since its last periodic checkpoint, as
+                # after a kill. A parked tailer reads nothing, so the rate is the life's peak
+                # drain interval's, from before the stall.
+                checkpoint = max((component_duration(text, listener, "checkpoint_interval")
+                                  or DEFAULT_TAIL_CHECKPOINT_INTERVAL_S)
+                                 for listener in listeners)
+                read = {}
+                for listener in listeners:
+                    for ts, v, point_life in self.ingress.counter_points(
+                            self.wires[listener].w, component=listener):
+                        if point_life == life:
+                            read[ts] = read.get(ts, 0) + v
+                peak = max((read.get(b, 0) / (b - a) for a, b in zip(drains, drains[1:])
+                            if b > a), default=0.0)
+                reread = round(peak * checkpoint) if gaps else last
+                chunks = chunk_lines * TAIL_REPLAY_FILES * len(listeners)
+                above = deferred + reread + chunks
+                high += above
+                lines.append(f"life {life}: [0, +{_n(above)}]: "
+                             f"{self.deferred_text(life, listeners, 'lines')}, a send the "
+                             "shutdown backstop cut that the checkpoint never passed, and the "
+                             "reads since the last checkpoint, which the cut kept from being "
+                             f"written: {_n(reread)} lines, {peak:,.0f} lines/s at the life's "
+                             f"peak drain interval x a {checkpoint:g}s checkpoint_interval, plus "
+                             f"{TAIL_REPLAY_FILES} file(s) x one 64 KiB read of "
+                             f"{_n(chunk_lines)} lines")
         if cri and dangles is None:
             lines.append(f"no dangle log ({SHARED_DIR}/{criwriter.DANGLE_LOG}), so every "
                          "stopped and killed life takes the pin's cap")
@@ -2953,22 +3023,32 @@ class Ledger:
                        longest("checkpoint_interval", DEFAULT_TAIL_CHECKPOINT_INTERVAL_S))
 
     def deferred(self, life, listeners=None):
-        """The most records the batches the Kafka wire's listeners (or `listeners`) deferred in
-        `life` hold, Q at each listener's `batch_max_events`. Each is in W and never sent, and
-        the listener reads it again."""
+        """The most records or lines the batches the listeners (or `listeners`) deferred in
+        `life` hold, Q at each listener's `batch_max_events`, on the wires that read Q
+        (`DEFERRED_WIRES`). Each is in W, never reaches `aggregate`, and the listener reads it
+        again."""
         return sum(self.per[listener]["Q"].get(life, 0)
                    * self.batch_max.get(listener, DEFAULT_BATCH_MAX_EVENTS)
                    for listener in (self.listeners if listeners is None else listeners)
                    if listener in self.per)
 
-    def deferred_text(self, life):
-        """Q in `life` and the records it can hold, as text, or "" when nothing was deferred."""
-        batches = sum(self.per[listener]["Q"].get(life, 0) for listener in self.listeners
+    def unsent_deferred(self, life, listeners=None):
+        """`deferred` over the listeners (or `listeners`) on a wire whose deferred batch never
+        counted E (`DEFERRED_UNSENT_WIRES`): the most W − D may exceed E + B by in `life`."""
+        return self.deferred(life, [
+            listener for listener in (self.listeners if listeners is None else listeners)
+            if any(self.wires.get(listener) is WIRES[name] for name in DEFERRED_UNSENT_WIRES)])
+
+    def deferred_text(self, life, listeners=None, unit="records"):
+        """Q in `life` and the `unit`s it can hold, over the listeners (or `listeners`), as
+        text, or "" when nothing was deferred."""
+        listeners = self.listeners if listeners is None else listeners
+        batches = sum(self.per[listener]["Q"].get(life, 0) for listener in listeners
                       if listener in self.per)
         if not batches:
             return ""
-        return (f"Q {_n(batches)} deferred batch(es), up to {_n(self.deferred(life))} records "
-                "read again")
+        return (f"Q {_n(batches)} deferred batch(es), up to "
+                f"{_n(self.deferred(life, listeners))} {unit} read again")
 
     def kafka_band(self, listeners):
         """`(low, high, lines)`: the range a Kafka wire's W − G may take over the run, summed
@@ -3036,7 +3116,7 @@ class Ledger:
             deferred = self.deferred(life, listeners)
             if deferred:
                 above += deferred
-                why.append(f"{self.deferred_text(life)}, above")
+                why.append(f"{self.deferred_text(life, listeners)}, above")
             if why:
                 lines.append(f"life {life}: [{_n(-below)}, +{_n(above)}]: " + "; ".join(why))
             low -= below
@@ -3228,8 +3308,17 @@ class Ledger:
         `aggregate`) or at this sink can; under `route`, and with one sink, the group holds
         every sink and the count is the life's whole. Under `target` another sink's branch
         (its transforms and `aggregate`) is left out with it, since its drop loses nothing this
-        sink's target sent."""
+        sink's target sent.
+
+        With one SUT the listeners' drops are left out too: X takes their events out of the
+        residual, so none can explain the gap, and a send the shutdown backstop cut would
+        otherwise excuse a stopped life's uncounted loss. With a hop the far `logit_in`'s are
+        left out: a frame its backstop cut stays unacknowledged, and `logit_out` resends it."""
         others = self._others(sinks)
+        if self.hop is None:
+            others |= set(self.listeners)
+        elif self.hop.get("listener"):
+            others.add(self.hop["listener"])
         return self._drops(life, lambda component: component not in others)
 
     def cued_rejections(self, life, sinks):
@@ -3616,9 +3705,14 @@ def _wire_buckets(data, led, source, combined=None, anchors_out=None):
         if wire_name == HTTP_WIRE:
             # A batch the listener sent and answered `503` for, every consumer having closed,
             # is in W and its events in X, and the client still holds it, so G never counts it.
+            # A request the shutdown backstop cut was never in W, and its client resends it, so
+            # its `shutdown` drops stay out, as they do from X (`HTTP_LISTENERS`).
             for ts, value, _ in sut.counter_points("logit.component.events.dropped",
                                                    component=listener):
                 counts[ts] = counts.get(ts, 0) - value
+            for ts, value, _ in sut.counter_points("logit.component.events.dropped",
+                                                   component=listener, reason="shutdown"):
+                counts[ts] = counts.get(ts, 0) + value
         drains = sorted(set(sut.drains) | set(counts))
         sut_starts = led.inn.life_starts
         previous = sut_starts[0] if sut_starts else (drains[0] if drains else 0)
@@ -4459,8 +4553,10 @@ def _http_intake(led, listener, life):
     """`[(problem, text)]`: an HTTP listener's own identities in `life` (`HTTP_LISTENERS`), each
     a problem when it doesn't hold. One request is one batch, so its `ok` and `closed_consumer`
     requests sum to its `batches.sent`, and a busy `503` sends nothing, so its `busy` requests
-    equal its `batches.deferred`. A listener with no request counter has neither, and one whose
-    kind the SUT config doesn't give is reported; either note's `problem` is None."""
+    equal its `batches.deferred`. A request the shutdown backstop cut counts neither its class
+    nor `batches.sent` (`HTTP_LISTENERS`), so it leaves both identities whole. A listener with
+    no request counter has neither, and one whose kind the SUT config doesn't give is reported;
+    either note's `problem` is None."""
     if listener not in led.http_kinds:
         return ([(None, "an http listener whose kind the SUT config doesn't give: no request "
                          "identities")]
@@ -4523,8 +4619,9 @@ def check_ledger_intake(data):
         name = f" {listener}" if len(led.listeners) > 1 else ""
         w_text = "W + Y − D" if led.wires[listener] is WIRES[SCRAPE_WIRE] else "W − D"
         part = f"final life {life}{name}: {w_text} {_n(lhs)} vs E + B {_n(rhs)}"
-        # The same slack, under the same guard, as `ledger.summary`'s: none across a hop.
-        deferred = led.deferred(life, [listener]) if led.hop is None else 0
+        # The same slack, under the same guard, as `ledger.summary`'s: none across a hop, and
+        # none on a file wire, whose deferred batch E counted.
+        deferred = led.unsent_deferred(life, [listener]) if led.hop is None else 0
         if 0 < lhs - rhs <= deferred:
             parts.append(part + f", the {_n(lhs - rhs)} between them within the deferred "
                                 f"batches' {_n(deferred)} records, read again")
@@ -4562,17 +4659,19 @@ def check_ledger_intake(data):
     for label, earlier_lives, residual_of, text, bound, name in judged:
         for earlier in earlier_lives:
             residual = residual_of(earlier)
+            deferred = led.deferred(earlier) if led.hop is None else 0
             if led.targeted and earlier not in led.inn.killed:
                 # The router's side starts each sink's own egress, so nothing else judges what
                 # a stopped life read short of the router. Its final drain runs after every
-                # data node has exited, so it counts the whole life: the residual is 0.
-                ok = residual == 0
+                # data node has exited, so it counts the whole life: the residual is 0, or up
+                # to Q's records, which the listener reads again.
+                ok = 0 <= residual <= deferred
                 parts.append(f"life {earlier} (stopped): {text} {_n(residual)}"
-                             + ("" if ok else ", uncounted, not 0"))
+                             + ("" if ok else ", uncounted, not 0")
+                             + (f" (Q's {_n(deferred)} records allowed)" if deferred else ""))
                 if not ok:
                     status = FAIL
                 continue
-            deferred = led.deferred(earlier) if led.hop is None else 0
             ok = 0 <= residual <= bound + deferred
             parts.append(f"{label}life {earlier}: {text} {_n(residual)} "
                          f"{'within' if ok else 'outside'} [0, {name}"
@@ -5193,7 +5292,7 @@ def check_ledger_summary(data):
     # A batch the Kafka listener deferred is in W and in neither E nor B, so the final life's
     # intake term may hold up to Q's records, as `ledger.intake` allows.
     excused = 0
-    deferred = led.deferred(first) if led.hop is None else 0
+    deferred = led.unsent_deferred(first) if led.hop is None else 0
     if 0 < terms[0][1] <= deferred:
         excused = terms[0][1]
         shown[0] += f" within the deferred batches' {_n(deferred)} records"
@@ -7717,12 +7816,13 @@ STANDIN_JUDGED_DROPS = {
 }
 
 
-def _balanced_drop(led, service, name, component, reason, batch_drops):
+def _balanced_drop(led, service, name, component, reason, batch_drops, event_drops=frozenset()):
     """Whether a row that runs already judges this `*.dropped` term of SUT `service`'s
     `component`, so `drops` leaves it out. Each term is judged only in the SUT it belongs to:
     the listener terms in the listeners' SUT, the rest of the ledger's in the sinks' SUT, and
     across a hop the hop sink's drops by `ledger.hop`, and `logit_in`'s X_B in the far SUT's
-    `fed`. With one SUT both are the same."""
+    `fed`. With one SUT both are the same. `batch_drops` and `event_drops` are the service's
+    `(component, reason)` pairs with a nonzero `batches.dropped` and `events.dropped`."""
     sinks_side = service == led.service
     hop_sink = led.hop is not None and service == led.inn.service and component == led.hop.get(
         "sink")
@@ -7736,13 +7836,19 @@ def _balanced_drop(led, service, name, component, reason, batch_drops):
     if name == "logit.component.batches.dropped":
         if hop_sink:
             return True
+        # A listener's batch drop beside its `events.dropped` of the same reason is X's loss,
+        # which the ledger judges in the listeners' SUT: a send the shutdown backstop cut
+        # counts both.
+        if (service == led.inn.service and component in led.listeners
+                and (component, reason) in event_drops):
+            return True
         return sinks_side and not (led.data.external and reason in FAULT_DROP_REASONS
                                    and component not in led.sinks)
     if name == "logit.component.bytes.dropped":
         return True
     if (name == "logit.component.events.dropped" and (component, reason) in batch_drops
             and _balanced_drop(led, service, "logit.component.batches.dropped", component,
-                               reason, batch_drops)):
+                               reason, batch_drops, event_drops)):
         return True
     if hop_sink and name == "logit.component.events.dropped":
         return True  # `ledger.hop`'s counted hop drops
@@ -7780,7 +7886,9 @@ def check_drops(data):
     the name alone (ADR `telemetry-loss-vocabulary`). A `FAULT_DROP_REASONS` reason FAILs, any
     other WARNs. Terms the ledger and the sink rows balance stay with them. On a `cri` source,
     `bytes.dropped{reason="gone"}` within what the writer's rotations explain is excused and
-    listed (`_excuse_cri_gone`). With several SUT services each line names its service."""
+    listed (`_excuse_cri_gone`), and so is a count the scenario's own `[[expect]]` requires
+    inside its window (`_excuse_expected`). With several SUT services each line names its
+    service."""
     if _overlapped(data):
         return _per_instance(data, check_drops)
     led = _ledger(data)
@@ -7790,9 +7898,11 @@ def check_drops(data):
     totals = {}
     for service, view in led.views.items():
         tel = view.tel
-        batch_drops = {(point.attributes.get("component"), point.attributes.get("reason"))
-                       for point in tel.matching("logit.component.batches.dropped")
-                       if isinstance(point.value, (int, float)) and point.value}
+        batch_drops, event_drops = ({
+            (point.attributes.get("component"), point.attributes.get("reason"))
+            for point in tel.matching(name)
+            if isinstance(point.value, (int, float)) and point.value}
+            for name in ("logit.component.batches.dropped", "logit.component.events.dropped"))
         names = sorted({point.name for point in tel.points
                         if point.name.startswith("logit.") and point.name.endswith(".dropped")})
         for name in names:
@@ -7801,11 +7911,12 @@ def check_drops(data):
                     continue
                 component = point.attributes.get("component", "?")
                 reason = point.attributes.get("reason", "?")
-                if _balanced_drop(led, service, name, component, reason, batch_drops):
+                if _balanced_drop(led, service, name, component, reason, batch_drops,
+                                  event_drops):
                     continue
                 key = (name, service, component, reason)
                 totals[key] = totals.get(key, 0) + point.value
-    excused = _excuse_cri_gone(led, totals)
+    excused = _excuse_cri_gone(led, totals) + _excuse_expected(data, totals)
     if not totals:
         return Result("drops", PASS, "no *.dropped count outside the ledger and the sink rows"
                       + (f"; {excused[0]}" if excused else ""), excused)
@@ -7818,6 +7929,38 @@ def check_drops(data):
         lines.append(f"{label}{component}: {name}{{reason=\"{reason}\"}} {_n(value)}")
     return Result("drops", status, f"{len(lines)} *.dropped count(s) outside the ledger: "
                   + "; ".join(lines + excused[:1]), lines + excused)
+
+
+def _excuse_expected(data, totals):
+    """Removes from `totals` each count that an `[[expect]]` matches on all of (its service,
+    metric, `component`, and `reason`, and no other attribute) with `reduce = "delta"` and a
+    `min` of 1 at least, when the count's whole run total falls inside that expectation's
+    windows, and returns a line per count saying so. The expectation requires the drop and
+    `expect.<name>` judges it, so it's loss the scenario's fault causes, not loss the run
+    didn't plan; a count past the windows stays in `totals` whole. `min` says only that the
+    drop happened, so the excuse leaves its size unbounded by design: a `max` on the same
+    expectation bounds it."""
+    lines = []
+    for exp in data.resolved.get("expect") or []:
+        attrs = dict(exp.get("attrs") or {})
+        if (exp.get("reduce") != "delta" or (exp.get("min") or 0) < 1
+                or exp.get("window") == RUN_WINDOW or set(attrs) != {"component", "reason"}):
+            continue
+        key = (exp.get("metric"), exp.get("service"), attrs["component"], attrs["reason"])
+        tel = data.telemetry.get(exp.get("service"))
+        if key not in totals or tel is None:
+            continue
+        _, faults = _expect_occurrences(data, exp)
+        inside = 0
+        for fault in faults:
+            start, end = expect_window(data, fault, exp.get("window"))
+            value, _ = reduce_counter(tel, exp.get("metric"), attrs, start, end, "delta")
+            inside += value or 0
+        if inside >= totals[key]:
+            lines.append(f"excused: {attrs['component']}: {exp.get('metric')}"
+                         f"{{reason=\"{attrs['reason']}\"}} {_n(totals.pop(key))}, required "
+                         f"by expect.{exp.get('name')}")
+    return lines
 
 
 def _excuse_cri_gone(led, totals):

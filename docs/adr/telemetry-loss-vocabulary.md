@@ -1,6 +1,6 @@
 ---
 created: 2026-10-13
-updated: 2026-10-30
+updated: 2026-11-02
 ---
 
 # Telemetry loss vocabulary: any nonzero `*.dropped` is loss, and intended outcomes use other words
@@ -199,6 +199,7 @@ same date has the bounds of the count and how it enters the sink identity.
 - **`output.metrics.type_conflict` keeps its name** (a row in the Outputs table). It counts a
   family `prometheus_out`'s registry replaced because a later batch re-typed it: the new type
   wins and the old type's series are evicted, because exposition allows one type per family.
+  The 2026-11-02 amendment below renames it to `output.metrics.dropped{reason="type_conflict"}`.
 - **The soak harness reads every `*.dropped` as loss.** Its `drops` row surfaces every
   `logit.*.dropped` counter the system under test emits that no ledger row balances
   ([ADR `soak-harness`](soak-harness.md), `tools/soak/README.md`).
@@ -210,7 +211,8 @@ same date has the bounds of the count and how it enters the sink identity.
 ## Amendment (2026-10-13): counters for `kafka_out`'s text format and `docker_in`'s decoder
 
 The last two entries leave [Loss with no counter](#loss-with-no-counter), which is now empty
-(`influxdb_out` counts under [ADR `influxdb-line-protocol-relay`](influxdb-line-protocol-relay.md)):
+(`influxdb_out` counts under [ADR `influxdb-line-protocol-relay`](influxdb-line-protocol-relay.md))
+[it holds one entry again since the 2026-11-02 amendment's Lua panic case]:
 
 | Loss | Counter |
 |---|---|
@@ -412,6 +414,131 @@ same reason a `503` is, so the name stays outside `*.dropped`.
 [internal-telemetry.md](../design/internal-telemetry.md#loss-vocabulary)'s "Loss vocabulary" row
 for `input.batches.deferred` carries the wider meaning.
 
+## Amendment (2026-11-02): every counted loss leaves a warn line
+
+A loss that showed only in a counter was invisible to an operator reading stderr, or `internal`'s
+`logs: warn` stream, until something drained and graphed the counter. So the vocabulary's rule
+that a loss reported only by a diagnostic gets a `*.dropped` counter beside it now runs both ways:
+**every counted loss in a listener, its decoder, a sink, its codec, its disk spool,
+`prometheus_out`'s registry, the pipeline runtime, or `internal` also logs a `warn` line**, save
+the one exception at the end of this amendment. The counter stays the record of how much; the line
+says that it happened and why, and names the component. A loss that recurs per batch or per record
+is throttled, and one that repeats for one lasting cause logs once for that cause, so the line
+never becomes a flood.
+
+### Sinks, their codecs, and the disk spool
+
+Every `*.dropped` a sink, its codec, or its `buffer.disk:` spool counts has a throttled `warn`
+line beside it. Each line added here is keyed on its counter's `reason`, except
+`gauge_delta_unresolved` for `reason="unresolved_gauge_delta"`, the key every other sink already
+uses; an older line may carry a broader key (`disk_io_error` for `disk_full`, `encode_error` for
+`comment_measurement`). The line gives the count or an example.
+
+- **Throttled, never per event.** The line goes through `Diagnostics::warn_throttled`, which
+  reports a key's 1st, 2nd, 4th, 8th, ... occurrence. Where a sink tallies a reason per batch
+  (`datadog_out`'s plan, `influxdb_out`'s encode stats), the line is one per batch and carries the
+  batch's count; where a codec decides per record, it's one occurrence per record.
+- **Gated like its counter.** An encode-side line goes through the `Diagnostics::gated` handle,
+  or with the counter on the batch's first encode, so a retry or a bisection re-encode doesn't
+  repeat it ([ADR `sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md),
+  decision 1). A drop the destination's verdict decides logs on the ungated handle, once per
+  attempt that decides it.
+- **A line already in the path covers its drop.** A batch `write_loop` drops after a final fault
+  logs `send_failed` and `degraded`, so a sink's `ambiguous_at_most_once` count for that batch's
+  records needs no line of its own. `kafka_out`'s does, since a refused partition beside the
+  ambiguous one holds the batch and `write_loop` drops nothing. A shutdown drop sums into the
+  `drain complete` line.
+
+The line was added to `datadog_out` (`stale`, `needs_agent_processing`, `not_datadog_origin`,
+`non_finite_value`, `non_monotonic_bounds`, `sketch_range`, `invalid_status`,
+`unresolved_gauge_delta`, and the stats route's `unrecognized_record`), `splunk_hec_out`
+(`duplicate_name`, `unresolved_gauge_delta`), `influxdb_out` (`unencodable_value`,
+`unencodable_key`, `reserved_key`, `oversize_value`), `prometheus_out`'s codec (`type_conflict` and
+`name_collision` within one batch's encode, and remote-write's `no_timestamp` and
+`invalid_labels`), `kafka_out` (`ambiguous_at_most_once` beside a refused batch), and the disk spool
+(`disk_torn` and `disk_corrupt` at open, `disk_corrupt` on a live read, `frame_too_large`). Every
+other sink-side `*.dropped` already had one.
+
+### The registry, the pipeline, and `internal`
+
+An audit of the losses outside the sinks' encode paths found one counter outside the vocabulary
+and six counted losses that wrote no line:
+
+| Loss | Counter | Line |
+|---|---|---|
+| A `prometheus_out` registry family re-typed across batches, its old series dropped | `output.metrics.type_conflict` (untagged, one per family) is renamed `output.metrics.dropped{reason="type_conflict"}`, one per series dropped | `family_retyped`, throttled |
+| Two `prometheus_out` registry families writing one `# TYPE` name | `output.metrics.dropped{reason="name_collision"}`, counted once per batch when the family is stored, where it was counted again on every scrape | `family_name_collision`, throttled |
+| A `Fanout` send into a closed consumer | `component.events.dropped{reason="closed_consumer"}`, unchanged | `closed_consumer`, once per producer and consumer pair, naming both |
+| Events a wedged `lua` node produced after its channels were revoked | `component.events.dropped{reason="closed_consumer"}` under the node, unchanged | `closed_consumer`, one per edge the events were bound for, naming the node and the consumer; a revoked node exits, so this is once per edge |
+| A buffer or receive queue that shed data in a full episode the throttle never announced, then finished | the overflow `*.dropped` counters, unchanged | `buffer_shed_unannounced` at shutdown ([ADR `buffer-full-diagnostics`](buffer-full-diagnostics.md)'s "Amendment: shutdown reports what no line announced (2026-11-02)") |
+| A point or span `internal`'s per-component buffer couldn't hold | `internal.points.dropped{reason="cardinality"}`, `internal.spans.dropped{reason="buffer_full"}`, unchanged | `telemetry_points_capped`, `telemetry_spans_capped`, once per component per cap |
+| The items a cancelled `push_many` never reached, its `CountedDrain` dropped at shutdown | the queue's `items_dropped`/`units_dropped{reason="shutdown"}` (for a UDP listener's receive queue, `component.datagrams.dropped`/`bytes.dropped`), unchanged | `shutdown_push_cut`, naming the queue's component and the counts; a cancelled push happens once per queue at shutdown. A UDP decode loop's popped, undecoded batch, which the same type counts, logs its own line instead |
+
+The two registry lines are throttled as the sinks' are. The other five log once per lasting
+cause: a closed edge stays closed, a revoked node exits, a queue finishes once, a component over
+its cap stays over it, and a push is cut once, at shutdown.
+
+`CountedDrain`'s remainder stays out of `drain complete`'s `batches_dropped`. That field sums
+`batches.dropped{reason="shutdown"}`, and the one production caller of `push_many` is a UDP
+listener's receive queue, whose items are datagrams, not batches.
+
+A wedged, failed, or panicked Lua node's inbox sweep (`revoke_lua_io`, on a wedge past the
+shutdown grace, a `max_memory` failure, a panic on the node's thread, or another error that fails
+the node) counts `batches.dropped{reason="shutdown"}` through the same path a sink's abandoned
+inbox does, so `drain complete` logs it, as the sink section's "A line already in the path covers
+its drop" allows. A panic between a batch's receive and its `process()` pass's counts also counts
+that batch there, since nothing is sent in that span; a panic in a send or a `flush()` loses
+what the thread held uncounted, a gap [`docs/known-gaps/transforms.md`](../known-gaps/transforms.md) keeps open. The
+`thread_panicked` error line says the node failed and leaves the count to `drain complete`.
+
+The type-conflict rename reverses the 2026-10-13 close-out's "`output.metrics.type_conflict` keeps
+its name": that series was live data the registry removed, which is loss, and the codec already
+counts a record a type conflict drops within a batch under the same reason and unit. There's no
+alias.
+
+### Listeners and their decoders
+
+Every `input.*.dropped` a listener or its decoder counts, and a UDP listener's truncated
+`component.datagrams.dropped`/`bytes.dropped` pair, has a throttled `warn` line beside it. Each
+line added here is keyed on its counter's `reason`; an older line keeps its own key, often the
+fault's name rather than the reason.
+
+- **Nothing to pay when nothing drops.** A decoder logs inside the branch that counts, so a clean
+  body costs no format and no call. Where a decoder tallies a reason across a body (statsd's
+  unread `|c:` items), the line is one per body and carries the count.
+- **A decoder logs on the handle it already holds.** Every `logit_proto` decoder that counts a
+  loss carries a `Diagnostics` its listener sets, through `with_diagnostics` or the scrape seam's
+  `set_diagnostics`, as a sink's codec gets one. None needed a channel back to its listener.
+- **The kernel's count logs per sample.** `input.kernel.dropped{reason="socket"}` is read once a
+  second. Each sample that shows new drops is one occurrence, so a sustained overflow logs on the
+  throttle's schedule rather than every second.
+- **A closed consumer logs at the listener too.** `Fanout`'s `closed_consumer` line names the edge
+  once. A listener that refuses a request or a frame because no consumer took its batch also logs
+  its own line naming the peer, as the other HTTP listeners already did, since the refusal is per
+  request and the peer is what an operator looks for.
+- **A line already in the path covers its drop.** `cri_in`'s and `docker_in`'s decoder counts a
+  truncated file's held fragment as the tail driver logs its `truncated` line for that file.
+
+The line was added to the UDP driver (`truncated`, and `socket` for the kernel's count),
+`logit_in` and `otlp_in` (`closed_consumer`), `nginx_stub_status_in` (`out_of_range`),
+`apache_status_in` (`truncated`), the statsd decoder (`fields.dropped{reason="malformed"}`), the
+Prometheus decoder on both scrape and remote-write (every reason but `non_monotonic_buckets`), the
+Splunk decoder (`no_event`, `blank_event`, `bad_name`, `bad_value`, `duplicate_name`,
+`incomplete_single_metric`), and the Datadog decoder (`bad_point`, `non_finite_value`,
+`legacy_distribution`, `no_name`, `invalid_status`, `no_message`, `no_title`, `idx_payload`, and the
+stats route's `interpolation`). Every other listener and decoder count already had one: collectd,
+graphite, syslog, the stream framer's `framing_error`, the tail driver and its decoders, `replay_in`,
+`kafka_in`, and the other HTTP listeners' closed consumer. The InfluxDB decoder counts no drop.
+
+### The exception
+
+**`internal.logs.dropped{reason="buffer_full"}`** has no line. The line would be a `logit` log that
+`TelemetryLayer` captures back into the same full buffer, where it would be dropped in turn, and
+the log that was dropped has already been written to stderr under the operator's `--log-level`:
+only its copy in the pipeline is lost.
+[internal-telemetry.md](../design/internal-telemetry.md)'s "Logs" section carries the same
+statement.
+
 ## Migration record
 The classification of every `*.dropped`, `*.skipped`, `*.degraded`, `*.truncated`, and loss-related
 `*.rejected` name and reason that existed on 2026-10-13, verified against the emit sites in
@@ -528,5 +655,13 @@ series route, `prometheus_out`'s exposition dialects, and `splunk_hec_out`'s
 | `internal` | `internal.span.links.dropped` (`cardinality`) | `internal.span.links.omitted` (`cardinality`) |
 
 ### Loss with no counter
-None remain. Each entry this list held now counts under the vocabulary; the amendments above
+One remains. Each other entry this list held now counts under the vocabulary; the amendments above
 record where each one went.
+
+- **What a `lua` node's thread held in a send or a `flush()` when it panicked.** A panic there is a
+  bug in `logit`, not a script's fault. It's reported by `thread_panicked` at `error` and a failed
+  run (exit `2`), not by a counter: part of a batch in a send may already be counted or delivered,
+  and a `flush()`'s events come from no input batch, so no count is both whole and never doubled.
+  A panic anywhere else on the thread counts what it held
+  ([ADR `lua-runaway-script-bounds`](lua-runaway-script-bounds.md)'s 2026-11-02 amendment).
+  [`docs/known-gaps/transforms.md`](../known-gaps/transforms.md) keeps it open.
