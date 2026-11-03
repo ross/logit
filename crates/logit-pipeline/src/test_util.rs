@@ -1,7 +1,8 @@
 //! Shared test helpers for every crate's tests: a named wait, an accumulating telemetry reader, a
 //! channel receive under one timeout, socket close checks, a bind-first input spawn, the runtime's
-//! own sink write loop over a queue of batches ([`drive_write_loop`]), and a unique scratch
-//! directory. The rules they encode are in `docs/adr/test-timing-and-observables.md`.
+//! own sink write loop over a queue of batches ([`drive_write_loop`]), a capture of self-log lines
+//! ([`capture_lines`]), and a unique scratch directory. The rules they encode are in
+//! `docs/adr/test-timing-and-observables.md`.
 //!
 //! Compiled for this crate's own tests and, elsewhere, only through the dev-only `test-util`
 //! feature; `script/lint` fails if `logit-cli`'s release graph enables it.
@@ -426,6 +427,76 @@ pub fn scratch_dir(label: &str) -> PathBuf {
     }
     std::fs::create_dir_all(&dir).expect("create scratch dir");
     dir
+}
+
+/// A captured line's level, for a crate whose tests have no `tracing` dependency.
+pub use tracing::Level;
+
+/// One captured line: its level, `key`, `component`, and message.
+type Captured = (tracing::Level, String, String, String);
+
+/// Self-log lines [`capture_lines`] recorded.
+#[derive(Clone, Default)]
+pub struct Lines(Arc<std::sync::Mutex<Vec<Captured>>>);
+
+impl Lines {
+    /// Every captured `(level, message)` whose `key` field is `key`.
+    pub fn with_key(&self, key: &str) -> Vec<(tracing::Level, String)> {
+        let lines = self.0.lock().unwrap();
+        lines.iter().filter(|(_, k, _, _)| k == key).map(|(l, _, _, m)| (*l, m.clone())).collect()
+    }
+
+    /// The `component` field of every captured line whose `key` field is `key`.
+    pub fn components_with_key(&self, key: &str) -> Vec<String> {
+        let lines = self.0.lock().unwrap();
+        lines.iter().filter(|(_, k, _, _)| k == key).map(|(_, _, c, _)| c.clone()).collect()
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Lines {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        #[derive(Default)]
+        struct Visitor {
+            key: String,
+            component: String,
+            message: String,
+        }
+        impl tracing::field::Visit for Visitor {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.record_str(field, &format!("{value:?}"));
+            }
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                match field.name() {
+                    "key" => self.key = value.trim_matches('"').to_string(),
+                    "component" => self.component = value.trim_matches('"').to_string(),
+                    "message" => self.message = value.to_string(),
+                    _ => {}
+                }
+            }
+        }
+        let mut visitor = Visitor::default();
+        event.record(&mut visitor);
+        self.0.lock().unwrap().push((
+            *event.metadata().level(),
+            visitor.key,
+            visitor.component,
+            visitor.message,
+        ));
+    }
+}
+
+/// Captures every self-log line written on this thread until the guard drops: a test on a
+/// `current_thread` runtime sees its components' lines, and a line written on another OS thread
+/// isn't captured.
+pub fn capture_lines() -> (Lines, tracing::subscriber::DefaultGuard) {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let lines = Lines::default();
+    let subscriber = tracing_subscriber::registry().with(lines.clone());
+    (lines.clone(), tracing::subscriber::set_default(subscriber))
 }
 
 #[cfg(test)]

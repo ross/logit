@@ -34,6 +34,8 @@ webpki-roots.workspace = true
 jiff.workspace = true
 # `host::resolve`'s kernel hostname lookup.
 rustix.workspace = true
+# `test_util::capture_lines`, under the dev-only `test-util` feature.
+tracing-subscriber = { workspace = true, optional = true }
 
 [features]
 # Arms the fault-injection seam (`src/fault.rs`) outside this crate's own tests. Only ever a
@@ -41,7 +43,7 @@ rustix.workspace = true
 fault-injection = []
 # Compiles `src/test_util.rs`, the shared test helpers, outside this crate's own tests. Only ever a
 # dev-dependency feature: `script/lint` fails if `logit-cli`'s normal dependency graph enables it.
-test-util = []
+test-util = ["dep:tracing-subscriber"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # `sockstat`'s `getsockopt(SO_MEMINFO)` / `getsockopt(TCP_INFO)` reads: Linux-only socket

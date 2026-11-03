@@ -241,8 +241,8 @@ async fn at_most_once_drops_an_ambiguous_batch_and_the_next_bumps_the_epoch() {
 }
 
 /// Under `at_most_once`, an `Ambiguous` partition in an attempt another partition answers
-/// `Refused` is dropped and counted, not resent with the `Refused` one: without idempotence the
-/// resend would append its records twice.
+/// `Refused` is dropped, counted, and logged once, not resent with the `Refused` one: without
+/// idempotence the resend would append its records twice.
 #[tokio::test]
 async fn at_most_once_drops_an_ambiguous_partition_when_another_is_refused() {
     let cluster = FakeCluster::start(2).await;
@@ -261,7 +261,12 @@ async fn at_most_once_drops_an_ambiguous_partition_when_another_is_refused() {
     cluster.script(Step::produce(Some(1), Action::Error(fault::code::TOPIC_AUTHORIZATION_FAILED)));
     let mut events = keyed_for("a", 0, 2, 3);
     events.extend(keyed_for("b", 1, 2, 2));
+    let (lines, _guard) = logit_pipeline::test_util::capture_lines();
     let sums = run(&mut out, &mut probe, vec![batch(events)], at_most_once()).await;
+    let warned = lines.with_key("ambiguous_at_most_once");
+    assert_eq!(warned.len(), 1, "one line for the dropped partition batch: {warned:?}");
+    assert_eq!(warned[0].0, logit_pipeline::test_util::Level::WARN);
+    assert!(warned[0].1.contains("dropped 3 record(s)"), "{}", warned[0].1);
 
     let partitions: Vec<i32> = received(&cluster).iter().map(|r| r.partition).collect();
     assert_eq!(partitions.iter().filter(|&&p| p == 0).count(), 1, "{partitions:?}");

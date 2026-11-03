@@ -774,7 +774,7 @@ rows:
         counter: logit.output.metrics.dropped{reason=unresolved_gauge_delta}
         text: >-
           Nothing upstream resolved the relative gauge to an absolute one, so the series encoders
-          drop it.
+          drop it, with a throttled `gauge_delta_unresolved` warning.
       graphite_out:
         class: dropped
         counter: logit.output.metrics.dropped{reason=unresolved_gauge_delta}
@@ -826,7 +826,7 @@ rows:
         counter: logit.output.metrics.dropped{reason=unresolved_gauge_delta}
         text: >-
           Nothing upstream resolved the relative gauge to an absolute one, so the series encoders
-          drop it.
+          drop it, with a throttled `gauge_delta_unresolved` warning.
       graphite_out:
         class: dropped
         counter: logit.output.metrics.dropped{reason=unresolved_gauge_delta}
@@ -872,7 +872,7 @@ rows:
         counter: logit.output.metrics.dropped{reason=unresolved_gauge_delta}
         text: >-
           Nothing upstream resolved the relative gauge to an absolute one, so the series encoders
-          drop it.
+          drop it, with a throttled `gauge_delta_unresolved` warning.
       graphite_out:
         class: dropped
         counter: logit.output.metrics.dropped{reason=unresolved_gauge_delta}
@@ -919,7 +919,7 @@ rows:
         counter: logit.output.metrics.dropped{reason=unresolved_gauge_delta}
         text: >-
           Nothing upstream resolved the relative gauge to an absolute one, so the series encoders
-          drop it.
+          drop it, with a throttled `gauge_delta_unresolved` warning.
       graphite_out:
         class: dropped
         counter: logit.output.metrics.dropped{reason=unresolved_gauge_delta}
@@ -1415,8 +1415,9 @@ rows:
           text: >-
             Datadog's exporter keys a `NaN` bound at the Agent's key 1 on amd64, so a `NaN` above
             a bound that keys higher makes a bucket whose upper key is below its lower one, and
-            the point is dropped, as the exporter drops it. A `NaN` below every bound that keys
-            above 1 would instead be sketched with its count at key 1.
+            the point is dropped, as the exporter drops it, with a throttled `non_monotonic_bounds`
+            warning. A `NaN` below every bound that keys above 1 would instead be sketched with its
+            count at key 1.
       graphite_out:
         - when: {multi_value: expand}
           class: degraded
@@ -2285,7 +2286,8 @@ rows:
           A name is forced into `[a-zA-Z_:][a-zA-Z0-9_:]*`, each other character `_`, so the record
           reads back under the sanitized name, counted once per record it renames. Two names that
           sanitize onto one in a batch keep one family, the other counted
-          `logit.output.metrics.dropped{reason=name_collision}`; across batches they merge into one
+          `logit.output.metrics.dropped{reason=name_collision}` with a throttled `name_collision`
+          warning; across batches they merge into one
           series, uncounted.
       graphite_out:
         class: normalized
@@ -2644,7 +2646,9 @@ rows:
       influxdb_out:
         class: dropped
         counter: logit.output.metrics.dropped{reason=unencodable_value}
-        text: Line protocol has no non-finite float, so the record is dropped.
+        text: >-
+          Line protocol has no non-finite float, so the record is dropped, with a throttled
+          `unencodable_value` warning.
       otlp_out:
         class: exact
         text: The non-finite `as_double`.
@@ -2652,7 +2656,8 @@ rows:
         class: dropped
         counter: logit.output.metrics.dropped{reason=non_finite_value}
         text: >-
-          JSON has no `NaN` or infinity, so the point isn't written.
+          JSON has no `NaN` or infinity, so the point isn't written, with a throttled
+          `non_finite_value` warning.
       graphite_out:
         class: dropped
         counter: logit.output.metrics.dropped{reason=unencodable_value}
@@ -6791,7 +6796,7 @@ rows:
         text: >-
           A trace chunk whose root carries no Datadog span attribute, an OTel or `logit`-made span
           whose path to Datadog is `otlp_out`, isn't sent: every span of it is dropped and counted,
-          beside its event's other signals or not.
+          beside its event's other signals or not, with a throttled `not_datadog_origin` warning.
       datadog_trace_out:
         class: exact
         text: >-
@@ -6846,7 +6851,8 @@ rows:
         text: >-
           A trace chunk whose root carries Datadog span attributes but not the Agent's `_top_level`
           mark, raw tracer output an Agent hasn't normalized or computed stats for, isn't sent:
-          every span of it is dropped and counted, beside its event's other signals or not.
+          every span of it is dropped and counted, beside its event's other signals or not, with a
+          throttled `needs_agent_processing` warning.
       datadog_trace_out:
         class: exact
         text: >-

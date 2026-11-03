@@ -136,12 +136,12 @@
 //!
 //! | Situation | Result |
 //! |---|---|
-//! | [`Series::timestamp`] is `None` | the series is **dropped**, `logit.output.metrics.dropped{reason="no_timestamp"}`. The wire has no way to omit a timestamp, so a caller on this path runs the encoder with [`super::PrometheusEncoder::with_timestamps_always`]`(true)` and never produces one |
+//! | [`Series::timestamp`] is `None` | the series is **dropped**, `logit.output.metrics.dropped{reason="no_timestamp"}` + diag `no_timestamp`. The wire has no way to omit a timestamp, so a caller on this path runs the encoder with [`super::PrometheusEncoder::with_timestamps_always`]`(true)` and never produces one |
 //! | a label with an empty value, or named `__name__`/`le`/`quantile` where the codec generates that name itself | the label is omitted, `logit.output.labels.omitted{reason="empty_value"\|"reserved"}` -- both specs forbid an empty value, and a repeated name is an invalid label set rather than a confusing one |
 //! | an exemplar on a family with no `_total`/`_bucket` series (a gauge, an `info`, a `stateset`, a summary), or one whose value is `NaN` and so falls in no bucket | dropped, `logit.output.metrics.degraded{reason="exemplar_omitted"}` -- the same rule and the same counter the OpenMetrics writer uses |
 //! | an exemplar whose labels are over OpenMetrics' 128-code-point budget, names (as sanitized) and values together | dropped, `logit.output.metrics.degraded{reason="exemplar_omitted"}`, the OpenMetrics writer's rule through [`text::exemplar_fits`]. Prometheus's receiver drops one over that budget without failing the request (`tsdb/exemplar.go`'s `validateExemplar`), so sending it would lose it uncounted |
 //! | two exemplar attribute keys sanitizing onto one label name, or one onto `trace_id`/`span_id` beside the exemplar's trace | the one whose original key sorts first is written, the rest omitted, `logit.output.labels.omitted{reason="collision"\|"reserved"}` -- the OpenMetrics writer's rule, since both build the pairs in [`text::exemplar_labels`]. Counted only for an exemplar that is written |
-//! | a family with an empty name | **dropped**, `logit.output.metrics.dropped{reason="invalid_labels"}`; `__name__` may not be empty |
+//! | a family with an empty name | **dropped**, `logit.output.metrics.dropped{reason="invalid_labels"}` + diag `invalid_labels`; `__name__` may not be empty |
 //! | two readings of one series whose nanosecond timestamps truncate to the same millisecond | the **later** reading wins whole and the earlier is **dropped** before either is flattened into samples (keyed by family name, type, label set, and millisecond), `logit.output.metrics.dropped{reason="duplicate_timestamp"}` once per dropped reading (not per wire sample: a histogram reading is one), with a throttled `duplicate_timestamp` diagnostic naming the remedy, a `dedup_timestamps` upstream. A dropped reading that's a state equal to the one sent ([`super::same_reading`]: neither marked [`Series::increment`], and the same point, each `f64` by its bits, the created timestamp, and the exemplars) loses nothing and counts `logit.output.metrics.normalized{reason="duplicate_timestamp"}` instead; each is compared with the reading sent, not the one that displaced it. Under [`encode_pending`], the dropped reading's held-back counts (a degrade, an omitted label) are discarded with it. One label set holds one sample per millisecond. Given two in one request, Prometheus and Mimir answer `2xx`, keep the first, and drop the second silently, so the sink collapses them itself to send the later reading and count the loss. Two readings with the same nanosecond never reach here: [`super::events_to_families`] replaces the earlier and counts it under the same reason |
 //! | a counter's family name in 1.0's `MetricMetadata` | its value sample's name, `_total` included, whatever the model name: decode gives a counter that name either way, so this keeps a re-encode a fixed point |
 //! | [`Series::created`], **version 1.0 only** | dropped, uncounted. 1.0 has no field for it at all; this is the operator's choice of wire version, listed with the permitted normalizations below the way text 0.0.4's `_created` drop is |
@@ -1188,6 +1188,14 @@ fn encode_flat(
                 reading = reading.wrapping_add(1);
                 let Some(timestamp) = series.timestamp else {
                     encoder.not_encoded(NotEncoded::NoTimestamp);
+                    encoder.diagnostics.warn_throttled(
+                        "no_timestamp",
+                        format_args!(
+                            "dropped a reading of '{}' with no timestamp: remote-write needs \
+                             one on every sample",
+                            family.name
+                        ),
+                    );
                     continue;
                 };
                 flat.clear();
@@ -1497,6 +1505,10 @@ fn label_set(
 ) -> Option<Vec<(String, String)>> {
     if name.is_empty() {
         encoder.not_encoded(NotEncoded::InvalidLabels);
+        encoder.diagnostics.warn_throttled(
+            "invalid_labels",
+            "dropped a sample with an empty metric name, which remote-write can't carry",
+        );
         return None;
     }
     let mut out: Vec<(String, String)> = Vec::with_capacity(labels.len() + 2);

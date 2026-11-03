@@ -83,6 +83,8 @@
 //! | service checks | older than 10 min |
 //! | traces, stats | never: neither route has a documented window |
 //!
+//! A batch with stale records logs a throttled `stale` warning per route, with the count.
+//!
 //! A `buffer.disk:` replaying after a long outage therefore sends only what is still inside these
 //! windows. Anything older is counted `stale` and dropped at replay time, not delivered late.
 //!
@@ -107,9 +109,10 @@
 //! them. [`trace_readiness`] decides per trace chunk from its root span: a root with the Agent's
 //! `_top_level` mark goes out; a Datadog span without it is counted
 //! `records.dropped{reason="needs_agent_processing"}`, and a span with no Datadog attribute at all
-//! `records.dropped{reason="not_datadog_origin"}`, one per span. So `datadog_trace_in` must not
-//! feed this sink directly: its spans are raw tracer output. Route them to `datadog_trace_out` and
-//! a real Agent, and OTel spans to `otlp_out`.
+//! `records.dropped{reason="not_datadog_origin"}`, one per span, each reason with a throttled
+//! warning of its name per batch. So `datadog_trace_in` must not feed this sink directly: its spans
+//! are raw tracer output. Route them to `datadog_trace_out` and a real Agent, and OTel spans to
+//! `otlp_out`.
 //!
 //! **A metric over Datadog's tag limit.** A series, distribution point, or sketch whose `tags`
 //! list holds more than 100 strings is dropped by the intake, so this sink drops it first and
@@ -685,6 +688,32 @@ impl Gated {
             self.needs_agent_processing,
         );
         count_dropped(telemetry, Route::Traces, "not_datadog_origin", self.not_datadog_origin);
+    }
+
+    /// Raises a throttled diagnostic for each reason the gate held spans back for.
+    fn diagnose(&self, diag: &mut Diagnostics) {
+        if self.needs_agent_processing > 0 {
+            diag.warn_throttled(
+                "needs_agent_processing",
+                format_args!(
+                    "dropped {} span(s) on the traces route: a Datadog trace whose root carries no \
+                     `_top_level` mark hasn't been through an Agent -- send tracer spans to \
+                     `datadog_trace_out` and a real Agent instead",
+                    self.needs_agent_processing
+                ),
+            );
+        }
+        if self.not_datadog_origin > 0 {
+            diag.warn_throttled(
+                "not_datadog_origin",
+                format_args!(
+                    "dropped {} span(s) on the traces route: a span with no Datadog attribute \
+                     isn't a Datadog trace -- send OTel spans, `internal`'s own included, to \
+                     `otlp_out` instead",
+                    self.not_datadog_origin
+                ),
+            );
+        }
     }
 }
 
@@ -1312,7 +1341,18 @@ impl Encoding<'_> {
     fn count_plan_drops(&mut self, plan: &Plan) {
         self.encoder.events_without_payload(plan.unrouted);
         for route in ROUTES {
-            self.dropped(route, "stale", plan.stale[route as usize]);
+            let stale = plan.stale[route as usize];
+            self.dropped(route, "stale", stale);
+            if stale > 0 {
+                self.diag.warn_throttled(
+                    "stale",
+                    format_args!(
+                        "dropped {stale} record(s) on the {} route outside Datadog's timestamp \
+                         window for it, measured from the batch's send time",
+                        route.name()
+                    ),
+                );
+            }
             let n = plan.too_many_tags[route as usize];
             self.dropped(route, "too_many_tags", n);
             if let Some((name, tags)) = plan.too_many_tags_first[route as usize] {
@@ -1328,6 +1368,7 @@ impl Encoding<'_> {
             }
         }
         plan.gated.count(self.telemetry);
+        plan.gated.diagnose(self.diag);
         self.encoder.count_duplicates(plan.duplicates.differing(), plan.duplicates.equal());
     }
 
@@ -2369,6 +2410,64 @@ mod tests {
         assert_eq!(dropped("not_datadog_origin"), 1.0);
     }
 
+    // ---- loss diagnostics --------------------------------------------------------------------
+
+    /// Every loss the plan or the encoder counts leaves one warn line keyed on its reason, and a
+    /// retried batch doesn't repeat it: the plan's lines go out on its first encode only, and the
+    /// encoder's through the gated handle.
+    #[tokio::test]
+    async fn each_counted_loss_logs_one_line_across_a_retry() {
+        let raw = [(ATTR_RESOURCE_NAME, Value::str("GET /"))];
+        let otel = [("http.route", Value::str("/"))];
+        let mut bad_check = service_check(NOW);
+        bad_check.attributes.insert(ATTR_SERVICE_CHECK_STATUS, Value::U64(7));
+        bad_check.metrics[0] = MetricRecord::new(intern("app.ok"), MetricKind::gauge(7.0));
+        let mut bad_stats = stats(NOW);
+        bad_stats.metrics.push(MetricRecord::new(intern("unknown"), MetricKind::gauge(1.0)));
+        let non_monotonic = metric(
+            NOW,
+            MetricKind::Histogram(logit_core::Histogram {
+                buckets: vec![(10.0, 2), (1.0, 5), (f64::INFINITY, 1)],
+                temporality: Temporality::Delta,
+                sum: Some(30.0),
+                min: None,
+                max: None,
+            }),
+        );
+        let b = batch(vec![
+            gauge(NOW - 2 * HOUR),
+            gauge(NOW - 3 * HOUR),
+            span(2, 3, None, &raw),
+            span(3, 5, None, &otel),
+            span(4, 6, None, &otel),
+            metric(NOW, MetricKind::gauge(f64::NAN)),
+            metric(NOW, MetricKind::GaugeDelta(logit_core::MetricValue::F64(1.0))),
+            non_monotonic,
+            bad_check,
+            bad_stats,
+        ]);
+        let (lines, _guard) = logit_pipeline::test_util::capture_lines();
+        let (sums, log) = run_dd(busy_once, vec![b], at_least_once(), instrumented).await;
+        assert!(log.len() > 1, "the batch is retried");
+        let reasons = [
+            ("stale", "dropped 2 record(s) on the series route"),
+            ("needs_agent_processing", "dropped 1 span(s)"),
+            ("not_datadog_origin", "dropped 2 span(s)"),
+            ("non_finite_value", "NaN or infinite"),
+            ("gauge_delta_unresolved", "relative gauge adjustment"),
+            ("non_monotonic_bounds", "upper bound keys below"),
+            ("invalid_status", "service check dropped"),
+            ("unrecognized_record", "unknown as a gauge"),
+        ];
+        for (key, text) in reasons {
+            let found = lines.with_key(key);
+            assert_eq!(found.len(), 1, "{key}: {found:?}");
+            assert_eq!(found[0].0, logit_pipeline::test_util::Level::WARN, "{key}");
+            assert!(found[0].1.contains(text), "{key}: {}", found[0].1);
+            assert_eq!(sum_of(&sums, "logit.component.diagnostics", &[("key", key)]), 1.0, "{key}");
+        }
+    }
+
     // ---- the splitter ------------------------------------------------------------------------
 
     /// 1,001 logs are two requests on the logs route's 1,000-entry cap.
@@ -2950,8 +3049,10 @@ mod tests {
         Event::metric(NOW, attrs, MetricRecord::new(intern("flags"), MetricKind::gauge(1.0)))
     }
 
-    const ENCODE_SIDE: [SumSeries<'static>; 10] = [
+    const ENCODE_SIDE: [SumSeries<'static>; 12] = [
         (RECORDS_DROPPED, &[("route", "series"), ("reason", "stale")]),
+        ("logit.component.diagnostics", &[("key", "stale")]),
+        ("logit.component.diagnostics", &[("key", "not_datadog_origin")]),
         (RECORDS_DROPPED, &[("route", "series"), ("reason", "too_many_tags")]),
         ("logit.component.diagnostics", &[("key", "too_many_tags")]),
         (RECORDS_DROPPED, &[("route", "traces"), ("reason", "not_datadog_origin")]),

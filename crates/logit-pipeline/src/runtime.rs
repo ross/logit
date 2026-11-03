@@ -318,7 +318,7 @@ pub async fn run_with_options(
         // Captured here, before the spawn loop's `telemetry.remove`, so a producer sorted after
         // its consumer still finds the consumer's handle.
         let consumer = telemetry.get(id).cloned().unwrap_or_default();
-        edges.insert(id.clone(), Edge::new(tx).with_telemetry(consumer));
+        edges.insert(id.clone(), Edge::new(tx).with_telemetry(consumer).with_consumer(id));
         inboxes.insert(id.clone(), rx);
     }
 
@@ -3009,6 +3009,11 @@ fn run_lua_loop(
     // target count, which revocation never changes.
     let mut scratch =
         RouterScratch::new(lock_io(&io).as_ref().map_or(0, |io| io.target_fanouts.len()));
+    // Each slot's consumers, read while the channels are still here, so a drop after revocation
+    // can name the edges it would have used.
+    let slot_consumers: Vec<Vec<String>> = lock_io(&io).as_ref().map_or_else(Vec::new, |io| {
+        std::iter::once(&io.fanout).chain(&io.target_fanouts).map(Fanout::consumer_names).collect()
+    });
 
     // Mints its own root and records the `flush` span, as `run_flush` does: a Lua `flush()` has
     // no single parent batch (`docs/adr/lua-flush-root-context.md`). The script's batch-scoped
@@ -3071,7 +3076,7 @@ fn run_lua_loop(
                 let guard = lock_io(&io);
                 let Some(io) = guard.as_ref() else {
                     drop(guard);
-                    count_revoked(&mut scratch.dests, &telemetry);
+                    count_revoked(&mut scratch.dests, &slot_consumers, me, &telemetry);
                     return FlushOutcome::Revoked;
                 };
                 let sent = send_lua_partitions(
@@ -3273,7 +3278,7 @@ fn run_lua_loop(
         let guard = lock_io(&io);
         let Some(io) = guard.as_ref() else {
             drop(guard);
-            count_revoked(&mut scratch.dests, &telemetry);
+            count_revoked(&mut scratch.dests, &slot_consumers, me, &telemetry);
             return Ok(());
         };
         let sent = send_lua_partitions(
@@ -3297,8 +3302,35 @@ fn run_lua_loop(
 /// Counts what a revoked node produced but can no longer send as
 /// `events.dropped{reason="closed_consumer"}`: its consumers are gone, as they would be for a
 /// `Fanout` sending into closed inboxes.
-fn count_revoked(dests: &mut [Vec<Event>], telemetry: &Telemetry) {
-    let lost: usize = dests.iter_mut().map(|d| std::mem::take(d).len()).sum();
+///
+/// Each slot that lost events also logs one `closed_consumer` warn line per edge it would have
+/// sent on, naming `producer` and the consumer from `slot_consumers` (indexed as `dests`), as
+/// `Fanout` does for the first drop on an edge. A revoked node finds its channels gone and exits,
+/// so this runs at most once per node and needs no flag to warn once per edge.
+fn count_revoked(
+    dests: &mut [Vec<Event>],
+    slot_consumers: &[Vec<String>],
+    producer: logit_core::Symbol,
+    telemetry: &Telemetry,
+) {
+    let mut lost: usize = 0;
+    for (slot, dest) in dests.iter_mut().enumerate() {
+        let n = std::mem::take(dest).len();
+        if n == 0 {
+            continue;
+        }
+        lost += n;
+        for consumer in slot_consumers.get(slot).into_iter().flatten() {
+            tracing::warn!(
+                target: "logit",
+                component = %logit_core::interner::resolve(producer),
+                key = "closed_consumer",
+                "dropped {n} event(s) bound for {consumer}: this node's channels were revoked \
+                 after it overran its shutdown grace; counted in \
+                 logit.component.events.dropped{{reason=\"closed_consumer\"}}",
+            );
+        }
+    }
     if lost > 0 {
         telemetry.count(
             "logit.component.events.dropped",
@@ -4542,7 +4574,7 @@ mod tests {
     }
 
     async fn backstop_report(input: Box<dyn Input + Send>) -> Backstop {
-        let (lines, _guard) = crate::buffer_full::test_support::capture();
+        let (lines, _guard) = crate::test_util::capture_lines();
         let (tx, _rx) = mpsc::channel(1);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut probe = TelemetryProbe::new();
@@ -8387,7 +8419,7 @@ mod tests {
             }
         }
 
-        let (lines, _guard) = crate::buffer_full::test_support::capture();
+        let (lines, _guard) = crate::test_util::capture_lines();
         let started = Arc::new(AtomicU64::new(0));
         let release = Arc::new(tokio::sync::Notify::new());
         let mut output = Slow { started: Arc::clone(&started), release: Arc::clone(&release) };
@@ -11831,6 +11863,59 @@ mod tests {
             "the batch sent through the pre-reserved permit is counted"
         );
         assert!(rig.inbox_tx.is_closed());
+    }
+
+    /// A revoked node's undeliverable events log one `closed_consumer` line per edge of each slot
+    /// that lost any, naming the node and the consumer, beside the count.
+    #[test]
+    fn a_revoked_lua_node_warns_per_edge_it_drops_on_naming_both_ends() {
+        let (lines, _guard) = crate::test_util::capture_lines();
+        let edge = |id| Edge::new(mpsc::channel(1).0).with_consumer(id);
+        let own = Fanout::from_edges(vec![edge("windowed"), edge("archive")]);
+        let targets =
+            [Fanout::from_edges(vec![edge("quiet")]), Fanout::from_edges(vec![edge("audit")])];
+        let slot_consumers: Vec<Vec<String>> =
+            std::iter::once(&own).chain(&targets).map(Fanout::consumer_names).collect();
+        let mut dests = vec![
+            vec![counter_event("a", 1.0), counter_event("b", 1.0)],
+            Vec::new(),
+            vec![counter_event("c", 1.0)],
+        ];
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("enrich", "lua", "transform");
+
+        count_revoked(
+            &mut dests,
+            &slot_consumers,
+            logit_core::interner::intern("enrich"),
+            &telemetry,
+        );
+
+        assert!(dests.iter().all(Vec::is_empty));
+        let totals = Totals::of(registry.drain(0));
+        assert_eq!(
+            totals.sum(
+                "logit.component.events.dropped",
+                &[("component", "enrich"), ("reason", "closed_consumer")]
+            ),
+            3.0
+        );
+        assert_eq!(lines.components_with_key("closed_consumer"), ["enrich", "enrich", "enrich"]);
+        let line = |n: usize, consumer: &str| {
+            (
+                tracing::Level::WARN,
+                format!(
+                    "dropped {n} event(s) bound for {consumer}: this node's channels were revoked \
+                     after it overran its shutdown grace; counted in \
+                     logit.component.events.dropped{{reason=\"closed_consumer\"}}"
+                ),
+            )
+        };
+        assert_eq!(
+            lines.with_key("closed_consumer"),
+            vec![line(2, "windowed"), line(2, "archive"), line(1, "audit")],
+            "the slot that lost nothing names no edge"
+        );
     }
 
     #[tokio::test(start_paused = true)]

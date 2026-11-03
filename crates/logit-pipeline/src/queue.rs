@@ -309,7 +309,8 @@ impl<T: Queued> BoundedQueue<T> {
     }
 
     /// Ends a full-buffer episode still open once nothing will push again, writing
-    /// `buffer_full_at_shutdown` if the episode was announced. A no-op with no episode open.
+    /// `buffer_full_at_shutdown` if the episode was announced, else `buffer_shed_unannounced` if
+    /// an episode no line announced shed anything (`buffer_full`'s module doc).
     pub fn finish_full_episode(&self) {
         self.watch.finish();
     }
@@ -2850,9 +2851,9 @@ mod tests {
 #[cfg(test)]
 mod full_buffer_tests {
     use super::*;
-    use crate::buffer_full::test_support::{capture, Lines};
     use crate::buffer_full::{fmt_bytes, REPEAT_INTERVAL};
     use crate::fanout::TraceContext;
+    use crate::test_util::{capture_lines as capture, Lines};
     use crate::test_util::{wait_until, TelemetryProbe, RECV_TIMEOUT};
     use logit_core::{AttrMap, Event, Resource};
     use std::time::Duration;

@@ -92,9 +92,23 @@
 //!
 //! **Type conflicts.** The exposition grammar allows one `# TYPE` per family name, so a `gauge`
 //! arriving for a name registered as a `counter` can't sit beside it. The new type wins: the
-//! family's type is replaced, every series stored under the old type is evicted, and
-//! `logit.output.metrics.type_conflict` is counted. Keeping the old type would drop live data in
-//! favour of data that may already have expired.
+//! family's type is replaced, and every series stored under the old type is dropped, counted
+//! `logit.output.metrics.dropped{reason="type_conflict"}` once per series, with a throttled
+//! `family_retyped` warning naming the family. Keeping the old type would drop live data in favour
+//! of data that may already have expired.
+//!
+//! **Name collisions.** Two families with different model names can write one `# TYPE` name: a
+//! text 0.0.4 counter `foo` and a gauge `foo_total` both write `# TYPE foo_total`, and an
+//! OpenMetrics counter `foo_total` and a gauge `foo` both write `# TYPE foo`. A second `# TYPE`
+//! line for a name fails the whole scrape, so the registry settles the pair when a family is
+//! stored (new to the registry, or re-typed), by a render's rule: the family whose model name
+//! sorts first stays. An arriving loser's series are never stored, and a held loser is removed
+//! with its series; either way each series counts
+//! `logit.output.metrics.dropped{reason="name_collision"}`, with a throttled
+//! `family_name_collision` warning naming both families. A collision in either dialect counts,
+//! since one registry serves both, so a pair that only OpenMetrics can't write is settled for a
+//! text 0.0.4 scraper too. A render then never meets a collision, and counts none per scrape. An
+//! arriving loser counts on every batch that carries it, as an in-batch drop does.
 //!
 //! ## The wire (sender mode)
 //!
@@ -262,7 +276,7 @@
 //! | `logit.output.scrape.bytes` | response body bytes as rendered -- post-gzip when the client asked for it, so it measures transfer cost rather than exposition size. Counted when the body is built, same caveat as `ok` above |
 //! | `logit.output.series` (gauge) | series held after each `send` |
 //! | `logit.output.series.evicted{reason="expired"\|"cardinality"}` | see above |
-//! | `logit.output.metrics.type_conflict` | see above |
+//! | `logit.output.metrics.dropped{reason="type_conflict"\|"name_collision"}` | series the registry dropped across batches: see "Type conflicts" and "Name collisions" above. The codec counts the same reasons for records within one batch |
 //!
 //! Sender mode:
 //!
@@ -414,7 +428,9 @@ const SCRAPES: &str = "logit.output.scrapes";
 const SCRAPE_BYTES: &str = "logit.output.scrape.bytes";
 const SERIES: &str = "logit.output.series";
 const SERIES_EVICTED: &str = "logit.output.series.evicted";
-const TYPE_CONFLICT: &str = "logit.output.metrics.type_conflict";
+/// The codec counts its own drops under this name; the registry adds a type conflict and a name
+/// collision it settles across batches.
+const METRICS_DROPPED: &str = "logit.output.metrics.dropped";
 
 // Sender mode's; the module doc's "Telemetry" has why `requests` has no `signal` tag.
 const REQUESTS: &str = "logit.output.requests";
@@ -464,21 +480,48 @@ impl Registry {
         self.families.values().map(|f| f.series.len()).sum()
     }
 
-    /// Upserts one family's series, latest wins. A type change drops every series stored under
-    /// the old type (module doc's "Type conflicts").
-    fn upsert(&mut self, family: MetricFamily, now: Instant, telemetry: &Telemetry) {
+    /// Upserts one family's series, latest wins. A family new to the registry, or re-typed, first
+    /// settles a `# TYPE` name collision with the families held (module doc's "Name
+    /// collisions"); then a type change drops every series stored under the old type (module
+    /// doc's "Type conflicts"). Both losses count and warn here, once per batch that causes them,
+    /// never per scrape.
+    fn upsert(
+        &mut self,
+        family: MetricFamily,
+        now: Instant,
+        telemetry: &Telemetry,
+        diag: &mut Diagnostics,
+    ) {
         let MetricFamily { name, kind, help, unit, series } = family;
+        let held = self.families.get(&name).map(|stored| stored.kind);
+        if held != Some(kind) && !self.settle_collisions(&name, kind, series.len(), telemetry, diag)
+        {
+            return;
+        }
+        if let Some(stored) = self.families.get_mut(&name).filter(|stored| stored.kind != kind) {
+            let previous = stored.kind;
+            let evicted = stored.series.len();
+            stored.kind = kind;
+            stored.series.clear();
+            if evicted > 0 {
+                telemetry.count(METRICS_DROPPED, evicted as f64, &[("reason", "type_conflict")]);
+                diag.warn_throttled(
+                    "family_retyped",
+                    format_args!(
+                        "metric family {name} arrived as a {} and dropped the {evicted} series \
+                         held as a {}: a family name carries one type, and the newest wins",
+                        kind.as_str(),
+                        previous.as_str(),
+                    ),
+                );
+            }
+        }
         let entry = self.families.entry(name).or_insert_with(|| StoredFamily {
             kind,
             help: None,
             unit: None,
             series: BTreeMap::new(),
         });
-        if entry.kind != kind {
-            entry.kind = kind;
-            entry.series.clear();
-            telemetry.count(TYPE_CONFLICT, 1.0, &[]);
-        }
         // Latest wins for `# HELP`/`# UNIT` too: a scrape shows what the producer last said.
         entry.help = help;
         entry.unit = unit;
@@ -488,6 +531,64 @@ impl Registry {
                 .series
                 .insert(labels, Stored { point, timestamp, created, exemplars, updated_at: now });
         }
+    }
+
+    /// Settles the `# TYPE` name collisions `name` as a `kind` would have with the families held,
+    /// by the rule a render applies ([`text::write_with`]): the family whose model name sorts
+    /// first stays. Returns whether `name` may be stored. When it may, every held family it
+    /// collides with is removed and its series counted; when it may not, its `arriving` series
+    /// are. Either way the loss counts `metrics.dropped{reason="name_collision"}` and warns,
+    /// throttled.
+    ///
+    /// A collision in either dialect counts, since one registry serves both: a text 0.0.4 counter
+    /// `foo` and a gauge `foo_total` collide (`# TYPE foo_total`), as do an OpenMetrics counter
+    /// `foo_total` and a gauge `foo` (`# TYPE foo`).
+    fn settle_collisions(
+        &mut self,
+        name: &str,
+        kind: FamilyType,
+        arriving: usize,
+        telemetry: &Telemetry,
+        diag: &mut Diagnostics,
+    ) -> bool {
+        let colliders: Vec<String> = text::collision_candidates(name, kind)
+            .into_iter()
+            .filter(|other| {
+                self.families.get(other).is_some_and(|stored| {
+                    text::type_names_collide((name, kind), (other.as_str(), stored.kind))
+                })
+            })
+            .collect();
+        if let Some(kept) = colliders.iter().find(|other| other.as_str() < name) {
+            if arriving > 0 {
+                telemetry.count(METRICS_DROPPED, arriving as f64, &[("reason", "name_collision")]);
+                diag.warn_throttled(
+                    "family_name_collision",
+                    format_args!(
+                        "metric family {name} would write the same # TYPE name as the family \
+                         {kept} held, so its {arriving} series were dropped; the name that \
+                         sorts first is kept"
+                    ),
+                );
+            }
+            return false;
+        }
+        for other in colliders {
+            let Some(removed) = self.families.remove(&other) else { continue };
+            let dropped = removed.series.len();
+            if dropped > 0 {
+                telemetry.count(METRICS_DROPPED, dropped as f64, &[("reason", "name_collision")]);
+                diag.warn_throttled(
+                    "family_name_collision",
+                    format_args!(
+                        "metric family {name} would write the same # TYPE name as the family \
+                         {other} held, so {other}'s {dropped} series were dropped; the name that \
+                         sorts first is kept"
+                    ),
+                );
+            }
+        }
+        true
     }
 
     /// Drops every series last updated more than `expire_after` ago (zero disables expiry), and
@@ -584,11 +685,10 @@ impl Registry {
     }
 
     /// Renders through [`text::write_with`], not [`text::write`], so the writer's drops
-    /// (`degraded{reason="exemplar_omitted"|"unit_not_suffix"}`,
-    /// `labels.omitted{reason="collision"|"reserved"}` for an exemplar's keys, and
-    /// `dropped{reason="name_collision"}` for two families with one `# TYPE` name) count on the
-    /// encoder `send` uses. Post-sanitization family-name collisions are that encoder's to drop and
-    /// count too.
+    /// (`degraded{reason="exemplar_omitted"|"unit_not_suffix"}` and
+    /// `labels.omitted{reason="collision"|"reserved"}` for an exemplar's keys) count on the
+    /// encoder `send` uses. The writer's `name_collision` never fires here: [`Registry::upsert`]
+    /// never holds two families with one `# TYPE` name.
     fn render(&self, dialect: Dialect, encoder: &mut PrometheusEncoder) -> Vec<u8> {
         let mut out = Vec::new();
         text::write_with(&self.families(), dialect, &mut out, encoder);
@@ -945,7 +1045,7 @@ impl Output for ExposeOutput {
         let held = {
             let mut registry = lock(&self.registry);
             for family in families {
-                registry.upsert(family, now, &self.telemetry);
+                registry.upsert(family, now, &self.telemetry, &mut self.diag);
             }
             registry.sweep(self.expire_after, now, &self.telemetry);
             registry.enforce_cap(self.max_series, &self.telemetry);
@@ -1458,6 +1558,8 @@ pub fn render_batches(
     telemetry: &Telemetry,
 ) -> Vec<u8> {
     let mut registry = Registry::default();
+    // The registry's throttled warnings have no component to name here.
+    let mut diag = Diagnostics::default();
     let start = Instant::now();
     for (i, batch) in batches.iter().enumerate() {
         // A later batch is newer, as each `send` reads the clock again, so the cap evicts by age
@@ -1467,7 +1569,7 @@ pub fn render_batches(
         for family in
             events_to_families(batch.events.iter().map(|event| (resource, event)), encoder)
         {
-            registry.upsert(family, now, telemetry);
+            registry.upsert(family, now, telemetry, &mut diag);
         }
         registry.enforce_cap(max_series, telemetry);
     }
@@ -2284,29 +2386,85 @@ mod tests {
         }
     }
 
-    /// A gauge arriving for a counter's name replaces the family and its old series.
+    /// A gauge arriving for a counter's name replaces the family, and its old series are dropped:
+    /// counted once per series under `metrics.dropped{reason="type_conflict"}` and warned.
     #[tokio::test]
-    async fn a_type_conflict_replaces_the_family_and_evicts_its_old_series() {
-        let registry = logit_core::Registry::new();
+    async fn a_type_conflict_replaces_the_family_and_drops_its_old_series_counted() {
+        let mut probe = TelemetryProbe::new();
+        let telemetry = probe.telemetry("out", "prometheus_out", "sink");
+        let diag = Diagnostics::new("out");
         let mut sink = ExposeOutput::new("127.0.0.1:0")
             .with_expire_after(Duration::ZERO)
-            .with_telemetry(registry.telemetry_for("out", "prometheus_out", "sink"));
-        sink.send(&batch(vec![metric_event(
-            "x",
-            cumulative_counter(1.0),
-            &[("id", Value::str("old"))],
-        )]))
+            .with_diagnostics(diag.clone())
+            .with_telemetry(telemetry);
+        sink.send(&batch(vec![
+            metric_event("x", cumulative_counter(1.0), &[("id", Value::str("a"))]),
+            metric_event("x", cumulative_counter(1.0), &[("id", Value::str("b"))]),
+        ]))
         .await
         .unwrap();
         sink.send(&batch(vec![metric_event("x", MetricKind::gauge(2.0), &[])])).await.unwrap();
 
         let (_sink, url) = bound(sink).await;
-        assert_eq!(
-            get(&format!("{url}/metrics"), &[]).await.text().await.unwrap(),
-            "# TYPE x gauge\nx 2\n",
-            "the counter family, and every series under it, is replaced"
-        );
-        assert_eq!(counter(&registry, TYPE_CONFLICT, "component", "out"), 1.0);
+        for _ in 0..2 {
+            assert_eq!(
+                get(&format!("{url}/metrics"), &[]).await.text().await.unwrap(),
+                "# TYPE x gauge\nx 2\n",
+                "the counter family, and every series under it, is replaced"
+            );
+        }
+        let dropped = [("reason", "type_conflict")];
+        assert_eq!(probe.sum("logit.output.metrics.dropped", &dropped), 2.0, "one per series");
+        assert_eq!(diag.occurrences("family_retyped"), 1);
+    }
+
+    /// Two families that write one `# TYPE` name are settled when the second is stored: the one
+    /// whose model name sorts first stays, whichever arrived first, and the other's series count
+    /// `metrics.dropped{reason="name_collision"}` once, not once per scrape.
+    #[tokio::test]
+    async fn a_name_collision_is_settled_and_counted_when_stored_not_per_scrape() {
+        // `foo` (a counter, `# TYPE foo_total` in text 0.0.4) sorts before `foo_total`.
+        for (first, second, body) in [
+            (
+                metric_event("foo_total", MetricKind::gauge(7.0), &[("id", Value::str("a"))]),
+                metric_event("foo", cumulative_counter(1.0), &[]),
+                "# TYPE foo_total counter\nfoo_total 1\n",
+            ),
+            (
+                metric_event("foo", cumulative_counter(1.0), &[]),
+                metric_event("foo_total", MetricKind::gauge(7.0), &[("id", Value::str("a"))]),
+                "# TYPE foo_total counter\nfoo_total 1\n",
+            ),
+            // An OpenMetrics-only collision, `# TYPE foo` for both, is settled for every scraper:
+            // `foo` sorts first.
+            (
+                metric_event("foo", MetricKind::gauge(7.0), &[("id", Value::str("a"))]),
+                metric_event("foo_total", cumulative_counter(1.0), &[]),
+                "# TYPE foo gauge\nfoo{id=\"a\"} 7\n",
+            ),
+        ] {
+            let mut probe = TelemetryProbe::new();
+            let telemetry = probe.telemetry("out", "prometheus_out", "sink");
+            let diag = Diagnostics::new("out");
+            let mut sink = ExposeOutput::new("127.0.0.1:0")
+                .with_expire_after(Duration::ZERO)
+                .with_diagnostics(diag.clone())
+                .with_telemetry(telemetry);
+            sink.send(&batch(vec![first])).await.unwrap();
+            sink.send(&batch(vec![second])).await.unwrap();
+
+            let (_sink, url) = bound(sink).await;
+            for accept in ["", "application/openmetrics-text", ""] {
+                let response = get(&format!("{url}/metrics"), &[("accept", accept)]).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                if accept.is_empty() {
+                    assert_eq!(response.text().await.unwrap(), body);
+                }
+            }
+            let collision = [("reason", "name_collision")];
+            assert_eq!(probe.sum("logit.output.metrics.dropped", &collision), 1.0, "{body}");
+            assert_eq!(diag.occurrences("family_name_collision"), 1, "{body}");
+        }
     }
 
     /// The sink's encoder is wired to the component's `Telemetry`, so codec drops are counted.
@@ -3826,7 +3984,15 @@ mod tests {
             metric_event("free.mem", MetricKind::gauge(1.0), &both),
             metric_event("free.mem", MetricKind::gauge(2.0), &both),
         ]);
+        let (lines, guard) = logit_pipeline::test_util::capture_lines();
         sink.send(&b).await.unwrap();
+        drop(guard);
+        let collision = lines.with_key("name_collision");
+        assert_eq!(collision.len(), 1, "{collision:?}");
+        assert!(collision[0].1.contains("dropped 1 series of 'a_b'"), "{}", collision[0].1);
+        let conflict = lines.with_key("type_conflict");
+        assert_eq!(conflict.len(), 1, "{conflict:?}");
+        assert!(conflict[0].1.contains("reading of 'hits'"), "{}", conflict[0].1);
         let renamed = probe.sum("logit.output.metrics.normalized", &[("reason", "name_sanitized")]);
         assert_eq!(renamed, 2.0, "`a.b` and the later `free.mem`");
         let dropped = probe.sum("logit.output.metrics.dropped", &[("reason", "name_collision")]);
@@ -3903,6 +4069,49 @@ mod tests {
         assert_eq!(one[0], bodies[1]);
         assert_eq!(sum_of(&retried, "logit.component.diagnostics", &[REJECTED]), 1.0);
         assert_counted_once_per_batch(&single, &retried, &ENCODE_SIDE, &PER_ATTEMPT);
+    }
+
+    /// A name collision and a type conflict in a remote-write batch each log one warn line, and
+    /// a retry doesn't repeat them: the codec raises them through the gated handle.
+    #[tokio::test]
+    async fn a_remote_write_retry_logs_each_collision_once() {
+        let b = batch(vec![
+            metric_event("a_b", MetricKind::gauge(1.0), &[]),
+            metric_event("a.b", MetricKind::gauge(2.0), &[]),
+            metric_event("hits", MetricKind::gauge(1.0), &[]),
+            metric_event("hits", cumulative_counter(1.0), &[]),
+            // `.` sorts before `_`, so `a.b` displaces the earlier `a_b` and the later `x_y` loses
+            // to `x.y`: one drop on each arm.
+            metric_event("x.y", MetricKind::gauge(1.0), &[]),
+            metric_event("x_y", MetricKind::gauge(2.0), &[]),
+        ]);
+        let (url, log) = scripted_receiver(&[503, 200]).await;
+        let mut probe = TelemetryProbe::new();
+        let mut output = instrumented_sender(&url, &probe);
+        let (lines, _guard) = logit_pipeline::test_util::capture_lines();
+        let sums = sums_through_write_loop(
+            &mut output,
+            &mut probe,
+            "prometheus_out",
+            vec![b],
+            fast_retry(),
+        )
+        .await;
+        assert_eq!(log.lock().unwrap().len(), 2, "the batch is retried");
+        for (key, losers) in [
+            ("name_collision", &["dropped 1 series of 'a_b'", "dropped 1 series of 'x_y'"][..]),
+            ("type_conflict", &["reading of 'hits'"][..]),
+        ] {
+            let found = lines.with_key(key);
+            assert_eq!(found.len(), losers.len(), "{key}: {found:?}");
+            for (line, loser) in found.iter().zip(losers) {
+                assert_eq!(line.0, logit_pipeline::test_util::Level::WARN, "{key}");
+                assert!(line.1.contains(loser), "{key}: {}", line.1);
+            }
+            let dropped = [("reason", key)];
+            let n = losers.len() as f64;
+            assert_eq!(sum_of(&sums, "logit.output.metrics.dropped", &dropped), n, "{key}");
+        }
     }
 
     /// A rejection answered on a retry is the receiver's verdict on that attempt, counted and

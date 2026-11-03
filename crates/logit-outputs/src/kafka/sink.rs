@@ -44,10 +44,11 @@
 //! `oversize`, `records.unkeyed`, `events.skipped`, `attributes.normalized`, `metrics.omitted`, `spans.omitted`, and the
 //! OTLP mapping's counters are encode-side, counted once per batch; `requests` and `reconnects`
 //! count per attempt; the others follow the broker's answer, which a retry never meets twice for
-//! one partition batch. Each drop but `ambiguous_at_most_once` raises a
-//! throttled diagnostic of the same name: `oversize` names the record count and the
-//! `max_request_bytes` cap, and `rejected`, `invalid_timestamp`, and `invalid_record` carry the
-//! broker's error code and message.
+//! one partition batch. Each drop raises a throttled diagnostic of the same name: `oversize` names
+//! the record count and the `max_request_bytes` cap; `rejected`, `invalid_timestamp`, and
+//! `invalid_record` carry the broker's error code and message; and `ambiguous_at_most_once`
+//! beside a `Refused` partition batch names the records dropped and the refusal. A batch
+//! `write_loop` drops after a final `Ambiguous` fault is logged there, as `send_failed`.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -476,6 +477,14 @@ impl KafkaOutput {
                             RECORDS_DROPPED,
                             lost as f64,
                             &[("reason", "ambiguous_at_most_once")],
+                        );
+                        self.diag.warn_throttled(
+                            "ambiguous_at_most_once",
+                            format_args!(
+                                "dropped {lost} record(s) whose produce request failed \
+                                 ambiguously, under `at_most_once`; the rest of the batch is \
+                                 held and retried, since a broker refused it: {err:#}"
+                            ),
                         );
                     }
                 }
