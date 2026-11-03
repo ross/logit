@@ -4510,7 +4510,7 @@ def _tail_run(tmp, name, kill=True, unflushed=6.0, short=0, pickle=False, **kwar
 
 
 def _tail_ledger():
-    """`ledger.tail`: per SUT life, the sink's counted lines M against the export's distinct
+    """`ledger.tail`: per SUT life, the sink's counted datapoints M against the export's distinct
     samples S, 0 exact, a backend kill's loss up to its bound, and every other gap FAILs; and
     `ledger.windows` excuses a gap across the kill's span."""
     with tempfile.TemporaryDirectory() as tmp:
