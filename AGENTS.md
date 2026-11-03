@@ -856,7 +856,9 @@ the operator-facing account of all of this.
   scenario's `[[expect]]` tables assert its own telemetry around a step, as the four sink-outage
   and UDP-flood scenarios do for queue fill, counted drops, kernel drops, and drain.
   `spool-kill-replay` kills the SUT with SIGKILL during a sink outage and checks that its
-  `buffer.disk:` spool is replayed by the next process. `lua-path`, `lua-stall`, and `lua-memory`
+  `buffer.disk:` spool is replayed by the next process. `sink-outage-stop` stops the SUT inside
+  a sink outage that has backed the chain up to its listener, so the shutdown backstop cuts the
+  listener's parked send. `lua-path`, `lua-stall`, and `lua-memory`
   put a `lua` stage in the path (`[ledger] sut_script`): a rewrite with script drops and errors,
   a busy loop that `/readyz` reads as `stalled` inside a `mark` step, and a `max_memory` exit 2
   inside an `exit` step that restarts the SUT. `lua-path-jit`, `lua-stall-jit`, and

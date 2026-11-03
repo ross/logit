@@ -15084,6 +15084,67 @@ def _backstop_ledger():
         expect(hop["drops"].lines == [
                    "collector window: logit.component.events.dropped{reason=\"stale\"} 1"],
                f"drops leaves an ingress listener's cut batch to X, got {hop['drops'].lines}")
+        # `collector`'s stopped life 0 stores one window short; a batch its `logit_in`'s
+        # backstop cut is resent by `logit_out`, so it can't call that gap counted.
+        far = {r.id: r for r in checks.run_all(_two_sut_run(
+            tmp, "backstop-hop-far", kill_on=None, collector_restart=True, drops=(
+                ("collector", "logit.component.batches.dropped", "hop_in", "shutdown"),)))}
+        # `drops` leaves a count to the `[[expect]]` that requires it inside its window, as
+        # sink-outage-stop's does `aggregate`'s `closed_consumer` drop into the stopped sink.
+        def expected_drop(name, offset, rows=True, points=(), edit=None, attrs=None):
+            """`drops` with 300 `closed_consumer` events at `offset` and `points`'
+            `(offset, events)` more, under one `[[expect]]` that `edit` changes, its keys set to
+            None removed; `attrs` adds attributes to every drop point."""
+            closed = [_line(_stamp(T0 + at), "logit.component.events.dropped", "sum", n,
+                            component="window",
+                            attrs={"reason": "closed_consumer", **(attrs or {})})
+                      for at, n in [(offset, 300), *points]]
+            row = {"name": "closed", "service": "logit",
+                   "metric": "logit.component.events.dropped",
+                   "attrs": {"component": "window", "reason": "closed_consumer"},
+                   "step": "c0s1", "window": "during", "reduce": "delta", "min": 1}
+            row = {k: v for k, v in {**row, **(edit or {})}.items() if v is not None}
+            return {r.id: r for r in checks.run_all(_ledger_run(
+                tmp, name, sut_extra=closed, steps=[{"id": "c0s1"}],
+                expect=[row] if rows else []))}
+
+        held = expected_drop("backstop-expected", 105)
+        expect(held["drops"].status == checks.PASS
+               and held["expect.closed"].status == checks.PASS
+               and "excused: window: logit.component.events.dropped"
+               "{reason=\"closed_consumer\"} 300, required by expect.closed"
+               in held["drops"].detail,
+               f"drops leaves an expected drop to its expectation, got {held['drops']}")
+        outside = expected_drop("backstop-expected-outside", 250)["drops"]
+        expect(outside.status == checks.WARN and "window" in outside.detail,
+               f"a drop outside its expectation's window stays in drops, got {outside}")
+        bare = expected_drop("backstop-expected-none", 105, rows=False)["drops"]
+        expect(bare.status == checks.WARN,
+               f"a drop no expectation requires stays in drops, got {bare}")
+        # The excuse takes the whole count or none of it: one event past the window keeps all
+        # 301 in the row.
+        partial = expected_drop("backstop-expected-partial", 105, points=[(250, 1)])["drops"]
+        expect(partial.status == checks.WARN and "{reason=\"closed_consumer\"} 301"
+               in partial.detail,
+               f"a count partly outside its expectation's window stays whole, got {partial}")
+        # Only an expectation that requires the drop, as a delta over its component and reason
+        # and no other attribute, excuses it.
+        for case, edit, attrs in (
+                ("min-0", {"min": 0}, None),
+                ("max-only", {"min": None, "max": 1_000}, None),
+                ("reduce-max", {"reduce": "max"}, None),
+                ("extra-attr", {"attrs": {"component": "window", "reason": "closed_consumer",
+                                          "edge": "sink"}}, {"edge": "sink"})):
+            kept = expected_drop(f"backstop-expected-{case}", 105, edit=edit,
+                                 attrs=attrs)["drops"]
+            expect(kept.status == checks.WARN and "closed_consumer" in kept.detail,
+                   f"an expectation with {case} doesn't excuse the drop, got {kept}")
+
+        expect(far["ledger.egress"].status == checks.FAIL
+               and "life 0: E_B − X_B − V 1,000 = residual 0 + Ab − V 1,000, uncounted "
+               "(batches dropped: 0)" in far["ledger.egress"].detail,
+               f"the far logit_in's shutdown drop doesn't excuse a sink's gap, got "
+               f"{far['ledger.egress']}")
 
 
 def run(root, quiet=False):

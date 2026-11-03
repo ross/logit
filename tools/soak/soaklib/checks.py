@@ -7886,7 +7886,9 @@ def check_drops(data):
     the name alone (ADR `telemetry-loss-vocabulary`). A `FAULT_DROP_REASONS` reason FAILs, any
     other WARNs. Terms the ledger and the sink rows balance stay with them. On a `cri` source,
     `bytes.dropped{reason="gone"}` within what the writer's rotations explain is excused and
-    listed (`_excuse_cri_gone`). With several SUT services each line names its service."""
+    listed (`_excuse_cri_gone`), and so is a count the scenario's own `[[expect]]` requires
+    inside its window (`_excuse_expected`). With several SUT services each line names its
+    service."""
     if _overlapped(data):
         return _per_instance(data, check_drops)
     led = _ledger(data)
@@ -7914,7 +7916,7 @@ def check_drops(data):
                     continue
                 key = (name, service, component, reason)
                 totals[key] = totals.get(key, 0) + point.value
-    excused = _excuse_cri_gone(led, totals)
+    excused = _excuse_cri_gone(led, totals) + _excuse_expected(data, totals)
     if not totals:
         return Result("drops", PASS, "no *.dropped count outside the ledger and the sink rows"
                       + (f"; {excused[0]}" if excused else ""), excused)
@@ -7927,6 +7929,38 @@ def check_drops(data):
         lines.append(f"{label}{component}: {name}{{reason=\"{reason}\"}} {_n(value)}")
     return Result("drops", status, f"{len(lines)} *.dropped count(s) outside the ledger: "
                   + "; ".join(lines + excused[:1]), lines + excused)
+
+
+def _excuse_expected(data, totals):
+    """Removes from `totals` each count that an `[[expect]]` matches on all of (its service,
+    metric, `component`, and `reason`, and no other attribute) with `reduce = "delta"` and a
+    `min` of 1 at least, when the count's whole run total falls inside that expectation's
+    windows, and returns a line per count saying so. The expectation requires the drop and
+    `expect.<name>` judges it, so it's loss the scenario's fault causes, not loss the run
+    didn't plan; a count past the windows stays in `totals` whole. `min` says only that the
+    drop happened, so the excuse leaves its size unbounded by design: a `max` on the same
+    expectation bounds it."""
+    lines = []
+    for exp in data.resolved.get("expect") or []:
+        attrs = dict(exp.get("attrs") or {})
+        if (exp.get("reduce") != "delta" or (exp.get("min") or 0) < 1
+                or exp.get("window") == RUN_WINDOW or set(attrs) != {"component", "reason"}):
+            continue
+        key = (exp.get("metric"), exp.get("service"), attrs["component"], attrs["reason"])
+        tel = data.telemetry.get(exp.get("service"))
+        if key not in totals or tel is None:
+            continue
+        _, faults = _expect_occurrences(data, exp)
+        inside = 0
+        for fault in faults:
+            start, end = expect_window(data, fault, exp.get("window"))
+            value, _ = reduce_counter(tel, exp.get("metric"), attrs, start, end, "delta")
+            inside += value or 0
+        if inside >= totals[key]:
+            lines.append(f"excused: {attrs['component']}: {exp.get('metric')}"
+                         f"{{reason=\"{attrs['reason']}\"}} {_n(totals.pop(key))}, required "
+                         f"by expect.{exp.get('name')}")
+    return lines
 
 
 def _excuse_cri_gone(led, totals):
