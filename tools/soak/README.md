@@ -200,7 +200,7 @@ value rather than add one, so V reads each series' last value per life:
 | `otlp-egress` | 16 minutes | `otlp_out` over HTTP to VictoriaMetrics' `/opentelemetry` route, which stores an OTLP sum under its own name, with no `_total`. `graphite-egress`'s faults plus a kill of the SUT, with `vm_every_window`. Its expectations assert that the sink holds its queue through the stop and drops no batch |
 | `otlp-grpc-egress` | 17 minutes | `otlp_out` over gRPC to a second `logit`, `collector`, whose `otlp_in` passes it on through `prometheus_out` to VictoriaMetrics, whose OTLP route is HTTP only. `collector` is the sink's relay (see [Several SUT services](#several-sut-services)). A netem delay and 30% loss on the gRPC link, a partition, a stop, a pause, and a kill of `collector`, a stop of VictoriaMetrics, and a kill of `logit`. Its expectations assert that the sink holds its queue through `collector`'s stop and drops no batch. It has no `vm_every_window`, because a kill of `collector` loses the windows in its sink's queue, and the next window's totals cover them |
 
-Four scenarios of 6 to 8 minutes each run one fault of the sink's delivery path and assert its
+Eight scenarios of 5 to 8 minutes each run one fault of the sink's delivery path and assert its
 effect with `[[expect]]` tables:
 
 | Scenario | Length | What it drives |
@@ -210,6 +210,9 @@ effect with `[[expect]]` tables:
 | `slow-destination` | 7 minutes 45 seconds | the sink's `timeout` is 2 s. A 3 s netem delay on VictoriaMetrics makes it apply each write whose response arrives late, then a 2 kbit rate limit on the SUT's egress makes a request unable to finish. Each counts `network_error` and a retry, and nothing drops |
 | `fanout-stop-outage` | 6 minutes 15 seconds | `fanout-copy`'s two sinks, with the second's queue at 4 batches under `drop_oldest`. VictoriaMetrics B is stopped 150 s and the SUT is stopped for 30 s, 60 s in, so the second sink's queued batches drop at shutdown and are counted while the first sink drops nothing |
 | `sink-outage-stop` | 5 minutes 40 seconds | `sink-outage-block`'s blocking 2-batch sink queue and 500 ms window. VictoriaMetrics is stopped 100 s, and the SUT is stopped for 20 s, 60 s in, with the chain backed up to the listener. The shutdown backstop cuts `statsd_in`'s parked send, counting its batch and events dropped `shutdown`; the sink drops its queue at shutdown; and `aggregate`'s send into the closed sink is dropped `closed_consumer`, which its expectation requires and `drops` therefore leaves out. The second life drops nothing |
+| `tail-outage-stop` | 6 minutes 10 seconds | `sink-outage-stop`'s faults on `tail-rotate`'s writer and checkpointed `tail_in`, with VictoriaMetrics stopped 130 s and the SUT 90 s in, since the chain to the tailer holds four more inboxes. The backstop counts the tailer's cut batch `logit.input.batches.deferred`, and the next life reads it again inside `ledger.wire`'s band |
+| `kafka-outage-stop` | 5 minutes 40 seconds | `sink-outage-stop`'s faults on `kafka-consume-broker-restart`'s topic. `kafka_in` defers its parked batch inside its own grace, before the backstop could cut it, and the next life reads it again from the commit |
+| `http-outage-stop` | 5 minutes 40 seconds | `sink-outage-stop`'s faults on `http-ingress`'s `influxdb_out` into `influxdb_in`. The parked request's 5 s busy deadline passes before the listener's 5 s grace, so it's answered `503` and resent, and the backstop cuts nothing |
 
 The stall and the memory cap depend on the host's speed: the `lua-stall` scenarios' loop count
 and the `lua-memory` scenarios' event count are calibrated on the development host, and the
