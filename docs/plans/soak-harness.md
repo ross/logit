@@ -6817,8 +6817,8 @@ What the runs showed:
   line. One batch was deferred, and `ledger.wire` read W − G 100 against the band's 1,000. Its
   sink keeps the default grace, since no backstop races it.
 - **No HTTP variant, because no HTTP listener's send is cuttable.** `influxdb_in`, `datadog_in`,
-  and `datadog_trace_in` answer a parked request busy at a 5 s `BUSY_AFTER` from the start of its
-  send, no later than the 5 s grace, and `otlp_in`, `prometheus_in`'s receiver, and
+  and `datadog_trace_in` answer a parked request busy at a `BUSY_AFTER` of 5 s (2 s on
+  `datadog_trace_in`) from the start of its send, no later than the 5 s grace, and `otlp_in`, `prometheus_in`'s receiver, and
   `splunk_hec_in`'s later batches send from a detached task the backstop never reads;
   `http-ingress` already covers the busy `503` path.
 - In each scenario the sink dropped its 67 queued batches `shutdown` and `aggregate`'s send into
@@ -6826,5 +6826,5 @@ What the runs showed:
   `drops` excuses.
 - **Self-test**: `_backstop_ledger` gained a Kafka-wire case: a stopped life's deferred batches
   widen the band and are read again, and a final life's excuse W − D past E + B. Taking
-  `KAFKA_WIRE` out of `DEFERRED_WIRES` fails four of its expectations, and out of
+  `KAFKA_WIRE` out of `DEFERRED_WIRES` fails six of its expectations, and out of
   `DEFERRED_UNSENT_WIRES` two; 2,742 expectations pass.
