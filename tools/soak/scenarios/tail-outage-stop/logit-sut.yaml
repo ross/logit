@@ -45,6 +45,10 @@ components:
     endpoint: http://victoria-metrics:8428/api/v1/write
     version: 1
     compression: zstd
-    buffer: { max_batches: 2 }      # overflow: block, the default
+    # overflow: block, the default. Its grace outlasts the listener's 5 s, so the chain stays
+    # blocked until the backstop has cut the tailer's parked send: a sink that dropped its queue
+    # first would unblock the send, and the tailer would return with nothing to cut. 10 s keeps
+    # the whole shutdown inside the harness's 30 s `docker stop` timeout.
+    buffer: { max_batches: 2, shutdown_grace: 10s }
   self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
   telemetry: { type: stdio_out, sources: [self], format: json }

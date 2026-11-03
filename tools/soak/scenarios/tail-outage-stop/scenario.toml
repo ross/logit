@@ -4,7 +4,8 @@
 # `checkpoint_path` it counts that batch `logit.input.batches.deferred`, never dropped: its
 # checkpoint never passed the batch, so the next life reads it again, inside `ledger.wire`'s
 # replay band for a cut tailer (docs/adr/shutdown-accounting-and-cancellation-safety.md, decision
-# 19). The sink drops its queue and `aggregate`'s send into the closed sink is dropped
+# 19). The sink's 10 s `shutdown_grace` outlasts the tailer's 5 s, so the backstop always cuts
+# first; the sink then drops its queue and `aggregate`'s send into the closed sink is dropped
 # `closed_consumer`, as in sink-outage-stop. The schema is docs/plans/soak-harness.md's "The
 # scenario schema".
 
