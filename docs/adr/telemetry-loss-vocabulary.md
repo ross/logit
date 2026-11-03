@@ -1,6 +1,6 @@
 ---
 created: 2026-10-13
-updated: 2026-10-30
+updated: 2026-11-02
 ---
 
 # Telemetry loss vocabulary: any nonzero `*.dropped` is loss, and intended outcomes use other words
@@ -411,6 +411,46 @@ same reason a `503` is, so the name stays outside `*.dropped`.
 
 [internal-telemetry.md](../design/internal-telemetry.md#loss-vocabulary)'s "Loss vocabulary" row
 for `input.batches.deferred` carries the wider meaning.
+
+## Amendment (2026-11-02): a counted loss also leaves a warn line
+
+A loss that showed only in a counter was invisible to an operator reading stderr, or `internal`'s
+`logs: warn` stream, until something drained and graphed the counter. So the vocabulary's rule
+that a loss reported only by a diagnostic gets a `*.dropped` counter beside it now runs both ways:
+**every `*.dropped` a sink, its codec, or its `buffer.disk:` spool counts has a throttled `warn`
+line beside it**. Each line this amendment adds is keyed on its counter's `reason`, except
+`gauge_delta_unresolved` for `reason="unresolved_gauge_delta"`, the key every other sink already
+uses; an older line may carry a broader key (`disk_io_error` for `disk_full`, `encode_error` for
+`comment_measurement`). The line names the component and gives the count or an example.
+
+- **Throttled, never per event.** The line goes through `Diagnostics::warn_throttled`, which
+  reports a key's 1st, 2nd, 4th, 8th, ... occurrence. Where a sink tallies a reason per batch
+  (`datadog_out`'s plan, `influxdb_out`'s encode stats), the line is one per batch and carries the
+  batch's count; where a codec decides per record, it's one occurrence per record.
+- **Gated like its counter.** An encode-side line goes through the `Diagnostics::gated` handle,
+  or with the counter on the batch's first encode, so a retry or a bisection re-encode doesn't
+  repeat it ([ADR `sink-send-path-and-attempt-accounting`](sink-send-path-and-attempt-accounting.md),
+  decision 1). A drop the destination's verdict decides logs on the ungated handle, once per
+  attempt that decides it.
+- **A line already in the path covers its drop.** A batch `write_loop` drops after a final fault
+  logs `send_failed` and `degraded`, so a sink's `ambiguous_at_most_once` count for that batch's
+  records needs no line of its own. `kafka_out`'s does, since a refused partition beside the
+  ambiguous one holds the batch and `write_loop` drops nothing. A shutdown drop sums into the
+  `drain complete` line.
+
+This branch added the line to `datadog_out` (`stale`, `needs_agent_processing`,
+`not_datadog_origin`, `non_finite_value`, `non_monotonic_bounds`, `sketch_range`,
+`invalid_status`, `unresolved_gauge_delta`, and the stats route's `unrecognized_record`),
+`splunk_hec_out` (`duplicate_name`, `unresolved_gauge_delta`), `influxdb_out`
+(`unencodable_value`, `unencodable_key`, `reserved_key`, `oversize_value`), `prometheus_out`'s
+codec (`type_conflict` and `name_collision` within one batch's encode, and remote-write's
+`no_timestamp` and `invalid_labels`), `kafka_out` (`ambiguous_at_most_once` beside a refused
+batch), and the disk spool (`disk_torn` and `disk_corrupt` at open, `disk_corrupt` on a live
+read, `frame_too_large`). Every other sink-side `*.dropped` already had one.
+
+Two pipeline counts still have no line of their own: `revoke_lua_io`'s `shutdown` sweep of a
+wedged Lua node's inbox, which sums into `drain complete` beside the node's own failure, and
+`CountedDrain`'s `shutdown` count of a cancelled `push_many`'s remainder.
 
 ## Migration record
 The classification of every `*.dropped`, `*.skipped`, `*.degraded`, `*.truncated`, and loss-related

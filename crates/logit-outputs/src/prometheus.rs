@@ -3927,9 +3927,14 @@ mod tests {
         let mut probe = TelemetryProbe::new();
         let mut output = instrumented_sender(&url, &probe);
         let (lines, _guard) = logit_pipeline::test_util::capture_lines();
-        let sums =
-            sums_through_write_loop(&mut output, &mut probe, "prometheus_out", vec![b], fast_retry())
-                .await;
+        let sums = sums_through_write_loop(
+            &mut output,
+            &mut probe,
+            "prometheus_out",
+            vec![b],
+            fast_retry(),
+        )
+        .await;
         assert_eq!(log.lock().unwrap().len(), 2, "the batch is retried");
         for key in ["name_collision", "type_conflict"] {
             let found = lines.with_key(key);

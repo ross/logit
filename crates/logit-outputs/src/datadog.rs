@@ -83,6 +83,8 @@
 //! | service checks | older than 10 min |
 //! | traces, stats | never: neither route has a documented window |
 //!
+//! A batch with stale records logs a throttled `stale` warning per route, with the count.
+//!
 //! A `buffer.disk:` replaying after a long outage therefore sends only what is still inside these
 //! windows. Anything older is counted `stale` and dropped at replay time, not delivered late.
 //!
@@ -107,9 +109,10 @@
 //! them. [`trace_readiness`] decides per trace chunk from its root span: a root with the Agent's
 //! `_top_level` mark goes out; a Datadog span without it is counted
 //! `records.dropped{reason="needs_agent_processing"}`, and a span with no Datadog attribute at all
-//! `records.dropped{reason="not_datadog_origin"}`, one per span. So `datadog_trace_in` must not
-//! feed this sink directly: its spans are raw tracer output. Route them to `datadog_trace_out` and
-//! a real Agent, and OTel spans to `otlp_out`.
+//! `records.dropped{reason="not_datadog_origin"}`, one per span, each reason with a throttled
+//! warning of its name per batch. So `datadog_trace_in` must not feed this sink directly: its spans
+//! are raw tracer output. Route them to `datadog_trace_out` and a real Agent, and OTel spans to
+//! `otlp_out`.
 //!
 //! **A metric over Datadog's tag limit.** A series, distribution point, or sketch whose `tags`
 //! list holds more than 100 strings is dropped by the intake, so this sink drops it first and

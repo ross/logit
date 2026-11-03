@@ -561,8 +561,8 @@ fn fmt_duration(d: Duration) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::test_util::capture_lines as capture;
     use super::*;
+    use crate::test_util::capture_lines as capture;
 
     static LABELS: FullLabels = FullLabels {
         what: "buffer",

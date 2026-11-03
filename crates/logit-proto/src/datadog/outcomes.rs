@@ -287,8 +287,11 @@ mod tests {
     /// raises its own (`oversized_sketch`, `unresolved_cumulative`, `duplicate_timestamp`).
     #[test]
     fn every_dropped_outcome_has_a_diagnostic() {
-        let own =
-            [MetricOut::OversizedSketch, MetricOut::UnresolvedCumulative, MetricOut::DuplicateTimestamp];
+        let own = [
+            MetricOut::OversizedSketch,
+            MetricOut::UnresolvedCumulative,
+            MetricOut::DuplicateTimestamp,
+        ];
         for outcome in MetricOut::ALL {
             let dropped = outcome.counter().0 == OUTPUT_METRICS_DROPPED;
             let raised = outcome.diagnostic().is_some() || own.contains(&outcome);

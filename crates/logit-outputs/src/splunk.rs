@@ -2350,10 +2350,16 @@ mod tests {
         let delta = Event::metric(
             TS,
             AttrMap::new(),
-            MetricRecord::new(intern("level"), MetricKind::GaugeDelta(logit_core::MetricValue::F64(1.0))),
+            MetricRecord::new(
+                intern("level"),
+                MetricKind::GaugeDelta(logit_core::MetricValue::F64(1.0)),
+            ),
         );
-        let mut twice =
-            Event::metric(TS, AttrMap::new(), MetricRecord::new(intern("cpu"), MetricKind::gauge(1.0)));
+        let mut twice = Event::metric(
+            TS,
+            AttrMap::new(),
+            MetricRecord::new(intern("cpu"), MetricKind::gauge(1.0)),
+        );
         twice.metrics.push(MetricRecord::new(intern("cpu"), MetricKind::gauge(2.0)));
         let b = batch(vec![delta, twice, log_event("kept")]);
         let (lines, _guard) = logit_pipeline::test_util::capture_lines();

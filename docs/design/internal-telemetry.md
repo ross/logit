@@ -543,6 +543,13 @@ reason says why (`rejected`, `truncated`), and the name says what happened. Diag
 (`gauge_delta_unresolved`, say) name a self-log line, not a count, and don't follow this
 vocabulary.
 
+A `*.dropped` a sink, its codec, or its disk spool counts also leaves a throttled `warn` self-log
+line, usually keyed on its `reason`, so the loss shows on stderr and in `internal`'s `logs: warn`
+stream before anything graphs the counter. An encode-side line is gated as its counter is, so a retry
+doesn't repeat it. A batch `write_loop` drops after a final fault is covered by its `send_failed`
+and `degraded` lines, and a shutdown drop by `drain complete`
+([ADR `telemetry-loss-vocabulary`](../adr/telemetry-loss-vocabulary.md)'s 2026-11-02 amendment).
+
 Every point also carries its component's identity as `component`, `kind`, and `role` attributes.
 Those three tag keys are reserved; see [Metrics from Lua scripts](#metrics-from-lua-scripts).
 

@@ -830,6 +830,14 @@ impl DiskQueue {
             // One batch: a partial record holds no readable event count, so `events.dropped` isn't
             // counted. Records lost whole with the page cache leave no bytes and aren't counted.
             telemetry.count(SINK_QUEUE_METRICS.items_dropped, 1.0, &[("reason", "disk_torn")]);
+            diag.warn_throttled(
+                "disk_torn",
+                format_args!(
+                    "dropped 1 batch from the disk buffer at {}: its last record was cut off \
+                     mid-write, as a crash leaves it",
+                    config.dir.display()
+                ),
+            );
         }
         if corrupt_skipped_total > 0 {
             telemetry.count(
@@ -841,6 +849,14 @@ impl DiskQueue {
                 SINK_QUEUE_METRICS.units_dropped,
                 corrupt_skipped_total as f64,
                 &[("reason", "disk_corrupt")],
+            );
+            diag.warn_throttled(
+                "disk_corrupt",
+                format_args!(
+                    "found {corrupt_skipped_total} corrupt record(s) in the disk buffer at {} \
+                     on open; they're skipped and dropped",
+                    config.dir.display()
+                ),
             );
         }
         if replayed > 0 {
@@ -970,6 +986,13 @@ impl DiskQueue {
         self.telemetry.count(SINK_QUEUE_METRICS.units_dropped, units as f64, &[("reason", reason)]);
     }
 
+    /// Raises the throttled diagnostic beside a [`DiskQueue::count_dropped`]. Takes the state
+    /// lock, so never call it while holding one.
+    fn diagnose(&self, key: &'static str, message: fmt::Arguments<'_>) {
+        let mut state = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        state.diag.warn_throttled(key, message);
+    }
+
     /// Counts and diagnoses a failed non-cursor filesystem operation. Takes the state lock, so
     /// never call it while holding one.
     fn count_fs_error(&self, op: &'static str, what: fmt::Arguments<'_>, err: &io::Error) {
@@ -1029,6 +1052,14 @@ impl DiskQueue {
             Ok(framed) => framed,
             Err(_) => {
                 self.count_dropped("frame_too_large", batch.events.len() as u64);
+                self.diagnose(
+                    "frame_too_large",
+                    format_args!(
+                        "dropped a batch of {} event(s): it encodes past the native frame's \
+                         size limit, so the disk buffer can't hold it",
+                        batch.events.len()
+                    ),
+                );
                 return;
             }
         };
@@ -1485,7 +1516,15 @@ impl DiskQueue {
         });
         match found {
             Some((ctx, batch, seq, delta)) => {
-                self.count_dropped("disk_corrupt", outcome.corrupt_skipped.max(1));
+                let skipped = outcome.corrupt_skipped.max(1);
+                self.count_dropped("disk_corrupt", skipped);
+                self.diagnose(
+                    "disk_corrupt",
+                    format_args!(
+                        "skipped {skipped} corrupt record(s) reading the disk buffer; they're \
+                         dropped"
+                    ),
+                );
                 ReadOutcome::Record(ctx, batch, seq, delta)
             }
             None => ReadOutcome::Skip(remaining as u64),
@@ -1511,6 +1550,12 @@ impl DiskQueue {
             state.read_offset += delta;
         }
         self.count_dropped("disk_corrupt", 0);
+        self.diagnose(
+            "disk_corrupt",
+            format_args!(
+                "skipped {delta} corrupt byte(s) reading the disk buffer; they're dropped"
+            ),
+        );
         self.after_cursor_advance();
         let utilization = self.after_change();
         self.watch.utilization(utilization);
@@ -2412,7 +2457,7 @@ mod tests {
     }
 
     /// Writes `segments` as segment files 0, 1, ..., persists `cursor`, opens the spool, and
-    /// returns its `batches.dropped{reason="disk_torn"}` count.
+    /// returns its `batches.dropped{reason="disk_torn"}` count, checking a warn line went with it.
     fn disk_torn_at_open(name: &str, segments: &[Vec<u8>], cursor: (u64, u64)) -> f64 {
         let dir = scratch_dir(name);
         std::fs::create_dir_all(&dir).unwrap();
@@ -2422,11 +2467,17 @@ mod tests {
         persist_cursor(&dir, cursor.0, cursor.1).unwrap();
         let registry = Registry::new();
         let telemetry = registry.telemetry_for("test", "output", "sink");
+        let (lines, guard) = crate::test_util::capture_lines();
         let q = DiskQueue::open(config(dir.clone()), telemetry, Diagnostics::new("test")).unwrap();
         let events = registry.drain(0);
         drop(q);
         std::fs::remove_dir_all(&dir).ok();
-        metric_sum(&events, SINK_QUEUE_METRICS.items_dropped, Some(("reason", "disk_torn")))
+        drop(guard);
+        let dropped =
+            metric_sum(&events, SINK_QUEUE_METRICS.items_dropped, Some(("reason", "disk_torn")));
+        let warned = lines.with_key("disk_torn");
+        assert_eq!(warned.len() as f64, dropped, "one warn line per counted drop: {warned:?}");
+        dropped
     }
 
     #[test]
@@ -2665,8 +2716,13 @@ mod tests {
             scope: None,
             events: vec![Event::empty(0, attrs)],
         });
+        let (lines, guard) = crate::test_util::capture_lines();
         q.push((huge, ctx())).await;
         q.push((batch("after"), ctx())).await;
+        drop(guard);
+        let warned = lines.with_key("frame_too_large");
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert!(warned[0].1.contains("dropped a batch of 1 event(s)"), "{}", warned[0].1);
 
         let (next, _, seq) = q.peek().await.expect("the batch after should be queued");
         assert_eq!(marker_of(&next), "after", "the oversized batch should never have been written");
@@ -3072,6 +3128,7 @@ mod tests {
 
         let registry = Registry::new();
         let telemetry = registry.telemetry_for("test", "output", "sink");
+        let (lines, _guard) = crate::test_util::capture_lines();
         let q = DiskQueue::open(config(dir.clone()), telemetry, Diagnostics::new("test")).unwrap();
         // Discard `open`'s own recovery count so the drain below reflects only the live path.
         registry.drain(0);
@@ -3106,6 +3163,11 @@ mod tests {
             1.0,
             "exactly one live corruption event should have been counted by the live read path"
         );
+        let warned: Vec<String> =
+            lines.with_key("disk_corrupt").into_iter().map(|(_, m)| m).collect();
+        assert_eq!(warned.len(), 2, "one line at open, one on the live read: {warned:?}");
+        assert!(warned[0].contains("on open"), "{}", warned[0]);
+        assert!(warned[1].contains("reading the disk buffer"), "{}", warned[1]);
         std::fs::remove_dir_all(&dir).ok();
     }
 

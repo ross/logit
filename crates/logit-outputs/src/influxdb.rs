@@ -30,7 +30,9 @@
 //! batch, and [`InfluxDbOutput::send`] makes one attempt and classifies the outcome as a
 //! [`logit_pipeline::Fault`]; retry timing belongs to `logit-pipeline`'s writer
 //! (`docs/adr/buffered-sink-delivery.md`). The sink emits the encoder's [`EncodeStats`] as
-//! telemetry once per batch ([`emit_encode_stats`]).
+//! telemetry once per batch ([`emit_encode_stats`]), with one throttled warning per
+//! `metrics.dropped` reason the encoder doesn't diagnose itself (`unencodable_value`,
+//! `unencodable_key`, `reserved_key`, `oversize_value`), carrying the batch's count.
 //!
 //! The client, the status bucket, and the transport classifier are [`crate::http`]'s, so
 //! redirects are off ([`crate::http::build_client`] says why) and a `3xx` is the misconfigured
@@ -647,7 +649,11 @@ fn diagnose_encode_drops(diag: &mut Diagnostics, stats: &EncodeStats) {
             "unencodable_key",
             "field(s) whose measurement or field key has no line-protocol spelling",
         ),
-        (stats.dropped_reserved_key, "reserved_key", "string field(s) named `time`, which influxd refuses"),
+        (
+            stats.dropped_reserved_key,
+            "reserved_key",
+            "string field(s) named `time`, which influxd refuses",
+        ),
         (
             stats.dropped_oversize_value,
             "oversize_value",
@@ -1342,9 +1348,10 @@ mod tests {
         let mut carrier = Event::empty(0, AttrMap::new());
         carrier.attributes.insert(logit_proto::influxdb::ATTR_MEASUREMENT, "cpu");
         for field in ["cpu.time", "cpu.idle"] {
-            carrier
-                .metrics
-                .push(MetricRecord::new(logit_core::interner::intern(field), MetricKind::gauge(1.0)));
+            carrier.metrics.push(MetricRecord::new(
+                logit_core::interner::intern(field),
+                MetricKind::gauge(1.0),
+            ));
         }
         let big = "a".repeat(1024 * 1024 + 1);
         carrier.attributes.insert("_logit.field.big", big.as_str());
@@ -1362,9 +1369,14 @@ mod tests {
             .with_diagnostics(Diagnostics::new("out").with_telemetry(telemetry.clone()))
             .with_telemetry(telemetry);
         let (lines, _guard) = capture_lines();
-        let sums =
-            sums_through_write_loop(&mut output, &mut probe, "influxdb_out", vec![batch], fast_retry())
-                .await;
+        let sums = sums_through_write_loop(
+            &mut output,
+            &mut probe,
+            "influxdb_out",
+            vec![batch],
+            fast_retry(),
+        )
+        .await;
         assert_eq!(sum_of(&sums, "logit.output.requests", &[("class", "5xx")]), 1.0);
         for (key, text, n) in [
             ("unencodable_value", "dropped 2 field(s) with a NaN or infinite value", 2.0),

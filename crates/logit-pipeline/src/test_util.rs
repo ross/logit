@@ -445,7 +445,11 @@ impl Lines {
 }
 
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Lines {
-    fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
         #[derive(Default)]
         struct Visitor {
             key: String,
