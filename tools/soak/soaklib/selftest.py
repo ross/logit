@@ -13085,15 +13085,16 @@ def _reset_actions():
     ctx = faults.Context(docker=fake, ids={"generator": "gen"}, netem_image="netem")
     step = scenario.Step("c0s7", 6, 0, "reset", "generator", "", 675.0, 690.0, port=6514)
     result = faults.ACTIONS["reset"].apply(ctx, step)
-    expect(fake.calls[-1] == ["--network", "container:gen", "--cap-add", "NET_ADMIN", "netem",
-                              "reset", "6514"]
+    expect(fake.calls[-1] == ["--network", "container:gen", "--cap-add", "NET_ADMIN",
+                              "--security-opt", "label=disable", "netem", "reset", "6514"]
            and result["rc"] == 0 and result["killed"] == 1
            and result["closed"] == ["10.0.0.3:41000 10.0.0.2:6514"],
            f"a reset closes the port's connections in the target's namespace, got "
            f"{fake.calls[-1]} {result}")
     result = faults.ACTIONS["reset"].apply(ctx, step)
     expect(result["rc"] == 1 and "closed no established TCP connection on port 6514" in
-           result["stderr"] and "CONFIG_INET_DIAG_DESTROY" in result["stderr"],
+           result["stderr"] and "CONFIG_INET_DIAG_DESTROY" in result["stderr"]
+           and "SELinux" in result["stderr"],
            f"a reset that closed nothing fails the step, got {result}")
     result = faults.ACTIONS["reset"].apply(ctx, step)
     expect(result["rc"] == 1 and "printed no count" in result["stderr"],
