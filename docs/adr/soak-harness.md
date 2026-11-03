@@ -835,12 +835,14 @@ the sink's events received, and those its events delivered plus its counted drop
   listener are two processes whose lives don't pair, and an ambiguous resend reaches the relay
   twice, so the row can't equate them. It holds the listener's ΣE_r at or above what the sink
   counted delivered, less the records the sink's encoder counted dropped or skipped and less
-  one drain interval of E_r per relay life a kill or an `exit` ended or the end sequence didn't
-  stop. The listener counts an event sent before it answers and the sink counts it delivered
-  after, so a request the relay answered and then lost before counting it FAILs here, which V
-  can't show mid-life under cumulative temporality. The two count one unit when each delivered
-  event carries one record: `otlp_out` writes one data point per record and `otlp_in` decodes
-  one event per data point, and `aggregate` emits one record per event.
+  the most E_r one drain interval held among the last few it moved in, per relay life a kill or an
+  `exit` ended or the end sequence didn't stop. The sender flushes on its own period, which can
+  span several relay drains, so the last interval alone is often empty while a flush the relay
+  answered after it went uncounted. The listener counts an event sent before it answers and the
+  sink counts it delivered after, so a request the relay answered and then lost before counting it
+  FAILs here, which V can't show mid-life under cumulative temporality. The two count one unit when
+  each delivered event carries one record: `otlp_out` writes one data point per record and
+  `otlp_in` decodes one event per data point, and `aggregate` emits one record per event.
 
 ## Amendment: a `reset` step closes TCP connections, reported on a TCP wire (2026-11-03)
 

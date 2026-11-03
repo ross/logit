@@ -8596,12 +8596,16 @@ RELAY_CONFIG = ("components:\n"
 RELAY_PER_DRAIN = 100
 
 
-def _relay_run(tmp, name, action="kill", extra=(), stopped=True, keys=True, sut_extra=()):
+def _relay_run(tmp, name, action="kill", extra=(), stopped=True, keys=True, sut_extra=(),
+               bursty=False):
     """`_ledger_run`'s two-life run with its sink's writes carried on by a relay, `collector`,
     whose `action` (a `kill` or a `stop`) over `RELAY_KILL` gives it two lives. Each 5 s drain
     the relay's `otlp` sends `RELAY_PER_DRAIN` events on to `victoria_metrics`, which receives
     and delivers them, plus `extra` lines; with `stopped` the end sequence stopped it, and with
-    `keys` its sink names `relay_listener` and `relay_sink`. `sut_extra` lines go to `logit`."""
+    `keys` its sink names `relay_listener` and `relay_sink`. `sut_extra` lines go to `logit`.
+    Under `bursty` the relay moves `2 × RELAY_PER_DRAIN` at every other drain (+5, +15, ...)
+    and exports no point at the rest, as a 10 s sender into a 5 s drain does, so its killed
+    life's last drain, +200, is empty."""
     kill = RELAY_KILL
     relay_timeline = [_action("apply", "c0s2", action, "collector", kill[0]),
                       _action("revert", "c0s2", action, "collector", kill[1] - 1, kill[1]),
@@ -8628,11 +8632,15 @@ def _relay_run(tmp, name, action="kill", extra=(), stopped=True, keys=True, sut_
         start = kill[1] if offset >= kill[1] else -1
         stamp = _stamp(T0 + offset)
         relay.append(_line(stamp, "logit.process.uptime", "gauge", float(offset - start)))
-        relay.append(_line(stamp, "logit.component.events.sent", "sum", RELAY_PER_DRAIN,
+        moved = RELAY_PER_DRAIN
+        if bursty:
+            if offset % 10 == 0:
+                continue
+            moved = 2 * RELAY_PER_DRAIN
+        relay.append(_line(stamp, "logit.component.events.sent", "sum", moved,
                            component="otlp"))
         for metric in ("logit.component.events.received", "logit.component.events.delivered"):
-            relay.append(_line(stamp, metric, "sum", RELAY_PER_DRAIN,
-                               component="victoria_metrics"))
+            relay.append(_line(stamp, metric, "sum", moved, component="victoria_metrics"))
     (run_dir / "logs" / "collector.stdout").write_text("\n".join(relay + list(extra)) + "\n")
     return run_dir
 
@@ -8745,8 +8753,9 @@ def _relay_ledger():
 
         across = row("relay-delivered", sut_extra=delivered(6200))
         expect(across is not None and across.status == checks.PASS
-               and "sink to collector over the run: ΣE_r 6,200 against Del 6,200 − 100 (a "
-                   "drain interval per relay life whose last counts are unseen) = 6,100, ok"
+               and "sink to collector over the run: ΣE_r 6,200 against Del 6,200 − 100 (the "
+                   "busiest recent drain interval per relay life whose last counts are unseen) "
+                   "= 6,100, ok"
                in across.detail,
                f"the relay's listener sent on what logit's sink delivered, less its killed "
                f"life's last drain interval, got {across}")
@@ -8763,6 +8772,12 @@ def _relay_ledger():
                and "ΣE_r 6,200 against Del 6,250 = 6,250, 50 delivered" in stopped.detail,
                f"with every relay life seen to its last drain no interval is allowed, got "
                f"{stopped}")
+        burst = row("relay-delivered-bursty", bursty=True, sut_extra=delivered(6400))
+        expect(burst is not None and burst.status == checks.PASS
+               and "ΣE_r 6,200 against Del 6,400 − 200 (the busiest recent drain interval" in
+               burst.detail and "= 6,200, ok" in burst.detail,
+               f"a flush the killed relay answered after its last drain, an empty one, is "
+               f"allowed by the busiest of its recent drain intervals, got {burst}")
         unwritten = row("relay-delivered-unwritten", sut_extra=delivered(
             6400, at(100, "logit.output.metrics.skipped", 200, component="sink",
                      metric_kind="gauge_histogram")))
@@ -12033,8 +12048,8 @@ IDP_MODES = {"logit": "service:sut-net", "idp": "service:sut-net"}
 def _idp_rules(root):
     """An `idp`'s namespace: the role map's rules (a holder only beside an idp, an idp only
     beside one holder, never with `[overlap]` or a further SUT), `logit` and the idp in the
-    holder's namespace, netem and partition on the holder only, no lifecycle fault on it, and
-    the fault predicates, under which an idp's lifecycle faults affect egress alone."""
+    holder's namespace, netem, partition, and reset on the holder only, no lifecycle fault on
+    it, and the fault predicates, under which an idp's lifecycle faults affect egress alone."""
     path = root / "scenarios" / "kafka-oauth-reauth" / "scenario.toml"
     raw = tomllib.loads(path.read_text())
     loaded = scenario.load(path)

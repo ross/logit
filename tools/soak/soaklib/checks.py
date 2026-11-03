@@ -5973,13 +5973,13 @@ def check_ledger_relay(data):
     lives are the relay's own, which no other row reads, and `drops` leaves these terms to this
     row. Across the two processes, on run totals, the relay listener's ΣE_r is at least what
     `logit`'s sink counted delivered, less the records its encoder counted dropped or skipped
-    and less one drain interval of E_r per relay life a kill or an `exit` ended or the end
-    sequence didn't stop (`_last_interval`): the listener counts an event sent before it
-    answers, and the sink counts it delivered after the answer, so a request the relay took and
-    lost before E_r shows here; a resend only raises E_r. The two count one unit when each
-    delivered event carries one record, as `aggregate`'s output does, since `otlp_out` writes
-    one data point per record and `otlp_in` decodes one event per data point. V judges what the
-    relay stored. A run with no relay has no row."""
+    and less, per relay life a kill or an `exit` ended or the end sequence didn't stop, the most
+    E_r one drain interval held among the last ones it moved in (`_relay_tail`): the listener
+    counts an event sent before it answers, and the sink counts it delivered after the answer, so a
+    request the relay took and lost before E_r shows here; a resend only raises E_r. The two count
+    one unit when each delivered event carries one record, as `aggregate`'s output does, since
+    `otlp_out` writes one data point per record and `otlp_in` decodes one event per data point. V
+    judges what the relay stored. A run with no relay has no row."""
     relayed = [sink for sink in data.ledger.get("sink") or [] if sink.get("relay")]
     if not relayed:
         return []
@@ -6065,22 +6065,33 @@ RELAY_UNWRITTEN = ("logit.output.metrics.dropped", "logit.output.metrics.skipped
                    "logit.output.records.dropped")
 
 
+def _relay_tail(tel, listener, life):
+    """What a relay life's unseen end can hold of E_r: the highest rate `_commit_rate` reads
+    over the drain intervals the listener last moved in, times the life's median drain
+    interval. The sender's flushes can be sparser than the relay's drains, so the last
+    interval is often empty while a flush the relay answered after it went uncounted."""
+    gaps = [b - a for a, b in zip(tel.life_drains(life), tel.life_drains(life)[1:])]
+    if not gaps:
+        return 0
+    rate, _ = _commit_rate(tel, "logit.component.events.sent", listener, life)
+    return round(rate * statistics.median(gaps))
+
+
 def _relay_cross(led, sink, relay, listener, tel, sent, unseen):
     """`(status, text)`: `ledger.relay`'s run-total check across the two processes, ΣE_r against
-    what `logit`'s `sink` counted delivered less its unwritten records and less a drain interval
-    of E_r per life in `unseen`."""
+    what `logit`'s `sink` counted delivered less its unwritten records and less each life in
+    `unseen`'s `_relay_tail`."""
     delivered = sum(led.sut.counter_by_life("logit.component.events.delivered",
                                             component=sink).values())
     unwritten = sum(sum(led.sut.counter_by_life(name, component=sink).values())
                     for name in RELAY_UNWRITTEN)
-    tail = sum(_last_interval(tel, "logit.component.events.sent", listener, life)[0]
-               for life in unseen)
+    tail = sum(_relay_tail(tel, listener, life) for life in unseen)
     total = sum(sent.values())
     floor = max(0, delivered - unwritten - tail)
     text = (f"{sink} to {relay} over the run: ΣE_r {_n(total)} against Del {_n(delivered)}"
             + (f" − unwritten {_n(unwritten)}" if unwritten else "")
-            + (f" − {_n(tail)} (a drain interval per relay life whose last counts are unseen)"
-               if tail else "") + f" = {_n(floor)}")
+            + (f" − {_n(tail)} (the busiest recent drain interval per relay life whose last "
+               "counts are unseen)" if tail else "") + f" = {_n(floor)}")
     if total >= floor:
         return PASS, f"{text}, ok"
     return FAIL, (f"{text}, {_n(floor - total)} delivered to the relay and never counted "

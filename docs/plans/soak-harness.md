@@ -815,7 +815,7 @@ but never recreated. From W4 the driver appends it in chunks during the run (§5
 ### 4. Netem scope (W1a)
 
 Each netem change is a one-shot
-`docker run --rm --network container:<id> --cap-add NET_ADMIN logit-soak-netem set|clear|show`.
+`docker run --rm --network container:<id> --cap-add NET_ADMIN logit-soak-netem set|clear|show|reset`.
 The qdisc outlives the `tc` process, and nothing long-lived joins the target's namespace, so netem
 stays out of `compose up --wait`. The driver appends `limit 100000` unless the spec sets a
 `limit`, as headroom so netem's own queue never drops a packet: a delay on the generator at
@@ -1632,8 +1632,9 @@ The rows:
   `exit` ended, or a final life the end sequence didn't stop, is reported. A `rejected` or
   `disk_corrupt` batch drop at the relay sink FAILs, and `drops` leaves these terms to the row.
   On run totals, ΣE_r must be at least the `logit` sink's events delivered, less the records
-  its encoder counted dropped or skipped and a drain interval of E_r per relay life a kill or an
-  `exit` ended or the end sequence didn't stop, which catches a request the relay answered and
+  its encoder counted dropped or skipped and, per relay life a kill or an `exit` ended or the
+  end sequence didn't stop, the most E_r one drain interval held among the last
+  `COMMIT_RATE_INTERVALS` it moved in, which catches a request the relay answered and
   lost before counting it. V still judges what the relay stored.
 - `ledger.overlap` (W12b), under `[overlap]` only, else no row: the run's G − Σ(W + K + F)
   against what the instances' socket closes could discard. Under `[overlap]` the per-life rows
