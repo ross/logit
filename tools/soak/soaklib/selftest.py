@@ -14946,7 +14946,9 @@ def _backstop_ledger():
     """The ledger on a send the runtime's shutdown backstop cut at life 0's stop
     (docs/adr/shutdown-accounting-and-cancellation-safety.md, decisions 17 to 20): a tailer's
     batch its checkpoint never passed, deferred and read again by life 1, widens the file and
-    `cri` replay bands and excuses its residual in `ledger.egress`; an HTTP listener's cut
+    `cri` replay bands and excuses its residual in `ledger.egress`; `kafka_in`'s deferred
+    batch, read and never sent, widens the Kafka band and, in the final life, excuses W − D
+    past E + B by its records; an HTTP listener's cut
     request, counted dropped and never sent, stays out of X; a listener's drop never excuses a
     sink's gap; and across a hop the ingress listener's cut batch is X's, not `drops`'s."""
     last0 = 100  # life 0's last drain, which carries its shutdown counts
@@ -15034,6 +15036,43 @@ def _backstop_ledger():
         over = target_run("backstop-target-over", 1_200, q)["ledger.intake"]
         expect(over.status == checks.FAIL,
                f"a residual past Q's lines at the router FAILs, got {over}")
+
+        # `kafka_in`: life 0's stop deferred its parked send and the batch behind it, read and
+        # never sent, so they're in W and not E, and life 1 reads them again from the commit.
+        def kafka_run(name, n=2):
+            run_dir = _ledger_run(tmp, name, shutdown_drops=0, life0_extra=0, v0_extra=0)
+            return {r.id: r for r in checks.run_all(_as_kafka_wire(
+                run_dir, w_minus_g=cut, deferred={last0: n} if n else None,
+                unsent={last0: cut}))}
+
+        kafka = kafka_run("backstop-kafka")
+        for row in ("ledger.wire", "ledger.intake", "ledger.egress", "ledger.summary", "drops"):
+            expect(kafka[row].status == checks.PASS,
+                   f"{row} PASSes kafka_in's deferred cut read again, got {kafka[row]}")
+        expect("[0, 2,000]" in kafka["ledger.wire"].detail
+               and any(line.startswith("life 0: [0, +2,000]: Q 2 deferred batch(es), up to "
+                                       "2,000 records read again") for line in
+                       kafka["ledger.wire"].lines),
+               f"a deferred cut widens the Kafka band by Q's records, got {kafka['ledger.wire']} "
+               f"{kafka['ledger.wire'].lines}")
+        expect("Q's 2,000 records" in kafka["ledger.intake"].detail,
+               f"a stopped life's unsent residual is held to Q's records, got "
+               f"{kafka['ledger.intake']}")
+        bare = kafka_run("backstop-kafka-uncounted", n=0)
+        expect(bare["ledger.wire"].status == checks.FAIL,
+               f"the same replay with no deferred batch FAILs, got {bare['ledger.wire']}")
+        # One deferred batch holds at most `batch_max_events`' 1,000 of the 1,500 records.
+        short = kafka_run("backstop-kafka-short", n=1)["ledger.wire"]
+        expect(short.status == checks.FAIL,
+               f"a replay past its deferred batches' records FAILs, got {short}")
+        # The end sequence's stop deferring the final life's parked send: no life reads it
+        # again, so W − D exceeds E + B by its records, which only a Kafka wire's Q excuses.
+        final = {r.id: r for r in checks.run_all(_as_kafka_wire(
+            _ledger_run(tmp, "backstop-kafka-final"), w_minus_g=cut,
+            deferred={320: 2}, unsent={320: cut}))}
+        for row in ("ledger.intake", "ledger.summary"):
+            expect(final[row].status == checks.PASS,
+                   f"{row} PASSes a final life's deferred cut, got {final[row]}")
 
         # `influxdb_in`: a request cut out of its deadline send counts 300 events dropped and
         # none sent; the client resends it, so it isn't X and life 0's residual stays 0.

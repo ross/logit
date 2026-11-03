@@ -3,7 +3,9 @@
 # drops the sink's queue, `aggregate`'s send into the closed sink is dropped `closed_consumer`,
 # and the runtime's shutdown backstop cuts `statsd_in`'s send parked on `aggregate`'s full inbox,
 # counting the batch and its events dropped `shutdown`
-# (docs/adr/shutdown-accounting-and-cancellation-safety.md). The schema is
+# (docs/adr/shutdown-accounting-and-cancellation-safety.md). The sink's 10 s `shutdown_grace`
+# outlasts the listener's 5 s, so the backstop always cuts before the sink's drop could unblock
+# the send. The schema is
 # docs/plans/soak-harness.md's "The scenario schema".
 
 name = "sink-outage-stop"

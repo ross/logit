@@ -1,0 +1,45 @@
+# The system under test in `script/soak`'s kafka-outage-stop scenario: `kafka_in` consumes the
+# generator's topic as the one member of its group, each record one `soak_records` increment in a
+# 500 ms cumulative aggregate, sent as remote-write 1.0 (zstd) to VictoriaMetrics behind a
+# two-batch queue under the default `overflow: block`. With VictoriaMetrics down, the queue and
+# every inbox back to the consumer fill, and its send parks on a full inbox. Stopped then, it
+# defers the parked batch and every batch behind it, counted `logit.input.batches.deferred`, and
+# commits only what every downstream inbox took, so the next life reads them again. Its
+# `internal` telemetry goes to stdout as NDJSON for the harness to read; `script/soak` runs it
+# with `--log-format json`.
+admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
+components:
+  consume:
+    type: kafka_in
+    brokers: ["kafka:9092"]
+    topics: [soak-in]
+    group: soak
+    format: json
+    # The group has no commit at its first join, and the generator may have produced by then:
+    # `earliest` reads those records rather than skipping them.
+    start: earliest
+    # A clean stop leaves the group, so the second life joins at once; the heartbeat runs on
+    # its own task, so a parked send never costs the membership.
+    session_timeout: 10s
+    heartbeat_interval: 2s
+    commit_interval: 5s
+  # Drops the `_logit.kafka.*` carriers, offset included, which would otherwise make every
+  # record its own series. No record carries `id`: no labels.
+  labels: { type: keep, sources: [consume], fields: [id] }
+  window:
+    type: aggregate
+    sources: [labels]
+    # One batch a window: 60 s of outage fills the sink's 64-batch inbox and then every inbox
+    # back to the consumer.
+    interval: 500ms
+    temporality: cumulative
+    series_retention: 7200          # an hour of windows: a fault must never evict a series
+  victoria_metrics:
+    type: prometheus_out
+    sources: [window]
+    endpoint: http://victoria-metrics:8428/api/v1/write
+    version: 1
+    compression: zstd
+    buffer: { max_batches: 2 }      # overflow: block, the default
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }

@@ -1,0 +1,10 @@
+# Runs the broker's health probe as a topic creation: the SUT starts once the broker is healthy,
+# and `kafka_in` never creates a topic and looks for a missing one only every 5 minutes, so the
+# topic must exist before the SUT joins. Two partitions, so the end sequence's wait and the lag
+# expectations read more than one. `--if-not-exists` makes every later probe a plain check.
+services:
+  kafka:
+    healthcheck:
+      test: ["CMD", "/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "localhost:9092",
+             "--create", "--if-not-exists", "--topic", "soak-in", "--partitions", "2",
+             "--replication-factor", "1"]

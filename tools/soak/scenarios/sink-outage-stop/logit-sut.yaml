@@ -1,9 +1,9 @@
 # The system under test in `script/soak`'s sink-outage-stop scenario: statsd over UDP, a 500 ms
 # cumulative aggregate, and a remote-write sink with a two-batch queue under the default
 # `overflow: block`. With VictoriaMetrics down, the queue, the sink's inbox, and `aggregate`'s
-# inbox fill, and `statsd_in`'s send parks on a full inbox. Stopped then, the sink drops its
-# queue, `aggregate`'s send into the closed sink is dropped `closed_consumer`, and the shutdown
-# backstop cuts the listener's parked send. Its `internal` telemetry goes to stdout as NDJSON for
+# inbox fill, and `statsd_in`'s send parks on a full inbox. Stopped then, the shutdown backstop
+# cuts the listener's parked send at 5 s, and at 10 s the sink drops its queue and `aggregate`'s
+# send into the closed sink is dropped `closed_consumer`. Its `internal` telemetry goes to stdout as NDJSON for
 # the harness to read.
 admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
 components:
@@ -21,6 +21,10 @@ components:
     endpoint: http://victoria-metrics:8428/api/v1/write
     version: 1
     compression: zstd
-    buffer: { max_batches: 2 }      # overflow: block, the default
+    # overflow: block, the default. Its grace outlasts the listener's 5 s, so the chain stays
+    # blocked until the backstop has cut the listener's parked send: a sink that dropped its queue
+    # first would unblock the send, and the listener would return with nothing to cut. 10 s keeps
+    # the whole shutdown inside the harness's 30 s `docker stop` timeout.
+    buffer: { max_batches: 2, shutdown_grace: 10s }
   self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
   telemetry: { type: stdio_out, sources: [self], format: json }
