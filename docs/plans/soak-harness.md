@@ -1612,7 +1612,9 @@ The rows:
   `reduce = "delta"` and `min` of 1 or more) is excused and listed when the run's whole count
   falls inside that expectation's windows: the scenario requires the drop, and
   `expect.<name>` judges it. `sink-outage-stop` excuses `aggregate`'s `closed_consumer` drop
-  into the sink its stop closed this way.
+  into the sink its stop closed this way. A `min` of 1 says only that the drop happened, not
+  how large it was: the excuse leaves its size unbounded by design, and a `max` on the same
+  expectation bounds it.
 - `ledger.overlap` (W12b), under `[overlap]` only, else no row: the run's G − Σ(W + K + F)
   against what the instances' socket closes could discard. Under `[overlap]` the per-life rows
   judge each instance on its own lives and the wire, `progress`, and `recovery` judge them

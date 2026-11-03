@@ -7937,7 +7937,9 @@ def _excuse_expected(data, totals):
     `min` of 1 at least, when the count's whole run total falls inside that expectation's
     windows, and returns a line per count saying so. The expectation requires the drop and
     `expect.<name>` judges it, so it's loss the scenario's fault causes, not loss the run
-    didn't plan; a count past the windows stays in `totals` whole."""
+    didn't plan; a count past the windows stays in `totals` whole. `min` says only that the
+    drop happened, so the excuse leaves its size unbounded by design: a `max` on the same
+    expectation bounds it."""
     lines = []
     for exp in data.resolved.get("expect") or []:
         attrs = dict(exp.get("attrs") or {})
