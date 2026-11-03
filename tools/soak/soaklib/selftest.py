@@ -11588,7 +11588,7 @@ def _overlap_rules(root):
     refused(step(at="4m", action="partition", on="logit-b"),
             "so put partition on sut-net", "a partition of an instance")
     refused(step(at="4m", action="stop", on="sut-net"),
-            "the holder takes netem and partition only", "a stop of the holder")
+            "the holder takes netem, partition, and reset only", "a stop of the holder")
     refused(step(at="20s", action="pause", on="logit-b"),
             "stop on logit and pause on logit-b overlap; with every instance held",
             "lifecycle faults on two instances overlapping")
@@ -12005,7 +12005,7 @@ def _idp_rules(root):
             "idp shares sut-net's network namespace, so put partition on sut-net",
             "a partition of the idp")
     refused(step(at="12m40s", action="stop", on="sut-net"),
-            "the holder takes netem and partition only; any other fault on it takes logit, "
+            "the holder takes netem, partition, and reset only; any other fault on it takes logit, "
             "idp's network away", "a stop of the holder")
     refused(lambda r: None, "an idp shares logit's network namespace through a netns holder, "
             "and the stack has none", "an idp with no holder",
@@ -12511,7 +12511,7 @@ def _tls_rules(root):
         (step(1, cert="statsd"), "`cert` is for rotate and probe only", "cert on a signal"),
         (step(1, days=31), "`days` is for rotate only", "days on a signal"),
         (step(4, broken=True), "`broken` is for rotate only", "broken on a restart"),
-        (step(0, port=8125), "`port` is for probe only", "port on a rotate"),
+        (step(0, port=8125), "`port` is for probe and reset only", "port on a rotate"),
         (step(2, port=None), "probe needs `port`", "a probe with no port"),
         (step(2, port=0), "`port` must be a port number", "port 0"),
         (step(2, port=70000), "`port` must be a port number", "a port past 65535"),
@@ -12611,6 +12611,125 @@ def _tls_rules(root):
                                        "for": {"min": "10s", "max": "20s"}})
         _refused(random_path, raw, f"{action} opens no fault window",
                  f"a {action} in a [random] schedule")
+
+
+class _NetemDocker:
+    """Records each `run_oneshot` call and answers with the next of `answers`."""
+
+    def __init__(self, answers):
+        self.calls = []
+        self.answers = list(answers)
+
+    def run_oneshot(self, args, timeout=None):
+        self.calls.append(list(args))
+        return self.answers.pop(0)
+
+    def __getattr__(self, name):
+        raise AssertionError(f"_NetemDocker.{name} called")
+
+
+def _reset_actions():
+    """A `reset` runs netem.sh's `reset` in the target's namespace with NET_ADMIN, passing its
+    `port` when it has one, and records how many connections `ss -K` closed; one that closed
+    none, printed no count, or failed fails the step; its revert makes no call; and on TCP its
+    window is reported, while on HTTP it's judged."""
+    closed = "10.0.0.3:41000 10.0.0.2:6514\n"
+    fake = _NetemDocker([docker.Result(0, closed + '{"killed": 1}\n', ""),
+                         docker.Result(0, '{"killed": 0}\n', ""),
+                         docker.Result(0, "", ""),
+                         docker.Result(2, "", "usage: netem.sh set ..."),
+                         docker.Result(0, '{"killed": 3}\n', "")])
+    ctx = faults.Context(docker=fake, ids={"generator": "gen"}, netem_image="netem")
+    step = scenario.Step("c0s7", 6, 0, "reset", "generator", "", 675.0, 690.0, port=6514)
+    result = faults.ACTIONS["reset"].apply(ctx, step)
+    expect(fake.calls[-1] == ["--network", "container:gen", "--cap-add", "NET_ADMIN", "netem",
+                              "reset", "6514"]
+           and result["rc"] == 0 and result["killed"] == 1
+           and result["closed"] == ["10.0.0.3:41000 10.0.0.2:6514"],
+           f"a reset closes the port's connections in the target's namespace, got "
+           f"{fake.calls[-1]} {result}")
+    result = faults.ACTIONS["reset"].apply(ctx, step)
+    expect(result["rc"] == 1 and "closed no established TCP connection on port 6514" in
+           result["stderr"] and "CONFIG_INET_DIAG_DESTROY" in result["stderr"],
+           f"a reset that closed nothing fails the step, got {result}")
+    result = faults.ACTIONS["reset"].apply(ctx, step)
+    expect(result["rc"] == 1 and "printed no count" in result["stderr"],
+           f"a reset with no count fails the step, got {result}")
+    result = faults.ACTIONS["reset"].apply(ctx, step)
+    expect(result["rc"] == 2 and "usage" in result["stderr"],
+           f"a failed reset keeps its rc and stderr, got {result}")
+    every = scenario.Step("c0s8", 7, 0, "reset", "generator", "", 700.0, 710.0)
+    result = faults.ACTIONS["reset"].apply(ctx, every)
+    expect(fake.calls[-1][-1] == "reset" and result["rc"] == 0 and result["killed"] == 3,
+           f"a reset with no port closes every established connection, got {fake.calls[-1]} "
+           f"{result}")
+    calls = len(fake.calls)
+    expect(faults.ACTIONS["reset"].revert(ctx, step) == {"rc": 0, "stderr": ""}
+           and len(fake.calls) == calls, "a reset's revert makes no Docker call")
+    roles = {"logit": "sut", "generator": "generator", "victoria-metrics": "backend"}
+    action = faults.ACTIONS["reset"]
+    on_gen = scenario.Step("x", 0, 0, "reset", "generator", "", 0.0, 1.0)
+    on_vm = scenario.Step("x", 0, 0, "reset", "victoria-metrics", "", 0.0, 1.0)
+    expect(action.affects("tcp", on_gen, roles) and action.affects("http", on_gen, roles)
+           and not action.affects("udp", on_gen, roles)
+           and not action.affects("file", on_gen, roles)
+           and action.affects_egress(on_vm, roles) and not action.affects("tcp", on_vm, roles),
+           "a reset affects TCP and HTTP ingress from a generator, never UDP or a file, and "
+           "egress at a backend")
+    fault = checks.Fault(step="c0s7", action="reset", on="generator", start=0.0, end=1.0,
+                         affects_udp_ingress=False, affects_egress=False)
+    expect(checks.wire_judgment(fault, "tcp") == "fault"
+           and checks.wire_judgment(fault, "http") == "judged",
+           "a reset's window is reported on TCP and judged on HTTP")
+
+
+def _reset_rules(root):
+    """`load()`'s rules for a `reset` step's `port`, a reset under `[overlap]` held to the
+    holder, and the shipped syslog-tcp-ingress scenario's reset with its positive expectation."""
+    path, raw = _base(root)
+
+    def with_step(**fields):
+        changed = copy.deepcopy(raw)
+        changed["step"] = [{"at": "0s", "action": "reset", "on": "logit", "for": "10s",
+                            **fields}]
+        return changed
+
+    for fields in ({}, {"port": 8125}):
+        try:
+            loaded = scenario.from_dict(with_step(**fields), path)
+            scenario.validate(loaded)
+            expect(loaded.steps[0].port == fields.get("port"), "")
+        except scenario.ScenarioError as err:
+            expect(False, f"a reset with {fields or 'no port'} loads, got {err.problems}")
+    for port in (0, 70000, "6514", True):
+        _refused(path, with_step(port=port), "`port` must be a port number, 1 to 65535",
+                 f"a reset's port {port!r}")
+    changed = copy.deepcopy(raw)
+    changed["step"][0]["port"] = 8125
+    _refused(path, changed, "`port` is for probe and reset only",
+             f"port on a {raw['step'][0]['action']}")
+    over_path = root / "scenarios" / "rolling-overlap" / "scenario.toml"
+    over = tomllib.loads(over_path.read_text())
+    holder = over["overlap"]["holder"]
+    member = over["overlap"]["instances"][0]
+    over["step"] = [{"at": "0s", "action": "reset", "on": member, "for": "10s"}]
+    _refused(over_path, over, f"put reset on {holder}", "a reset on an overlap instance",
+             roles=OVERLAP_ROLES)
+
+    shipped = scenario.load(root / "scenarios" / "syslog-tcp-ingress" / "scenario.toml")
+    resets = [one for one in scenario.expand(shipped) if one.action == "reset"]
+    rows = {exp.name: exp.to_json() for exp in shipped.expectations}
+    expect(len(resets) == 1 and resets[0].on == "generator" and resets[0].port == 6514,
+           f"syslog-tcp-ingress resets the generator's connection to the listener's port, got "
+           f"{resets}")
+    counted = rows.get("reset-counted", {})
+    expect(resets and counted.get("step") == resets[0].id and counted.get("min") == 1
+           and counted.get("metric") == "logit.input.connections.closed"
+           and counted.get("attrs") == {"component": "syslog", "reason": "reset"}
+           and not any(exp.get("window") == "run" and exp.get("attrs", {}).get("reason")
+                       == "reset" for exp in rows.values()),
+           f"its reset-counted expectation reads at least one reset in the reset's window, and "
+           f"no run-wide row holds resets at 0, got {counted}")
 
 
 class _CertsDocker:
@@ -15423,6 +15542,7 @@ def run(root, quiet=False):
                      _overlap_driver, _overlap_checks, _idp_rules, _refresh_checks,
                      _signal_rules, _signal_actions, _sighup_driver,
                      _reopen_checks, _tls_rules, _tls_actions, _tls_driver, _tls_checks,
+                     _reset_actions, _reset_rules,
                      _fan_out_ledger, _idle_writer, _boundary_skew, _fan_out_rules,
                      _sampling_vectors, _absent_rules, _absent_checks, _merge_ledger,
                      _merge_rules, _delta_ledger, _delta_rules, _scrape_ledger,
@@ -15446,7 +15566,7 @@ def run(root, quiet=False):
                               _splunk_server, _new_shape_rules,
                               _overlap_rules, _overlap_driver, _idp_rules, _signal_rules,
                               _sighup_driver,
-                              _tls_rules, _tls_driver, _fan_out_rules, _sampling_vectors,
+                              _tls_rules, _tls_driver, _reset_rules, _fan_out_rules, _sampling_vectors,
                               _absent_rules, _merge_rules, _delta_rules, _scrape_rules)
                 part(root) if part in takes_root else part()
             except Exception as err:  # report the part that broke, then keep going

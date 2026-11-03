@@ -835,6 +835,26 @@ the sink's events received, and those its events delivered plus its counted drop
   processes whose lives don't pair, and an ambiguous resend reaches the relay twice, so the row
   doesn't compare them.
 
+## Amendment: a `reset` step closes TCP connections, reported on a TCP wire (2026-11-03)
+
+No fault reset a TCP connection: a stop, kill, or partition ends one with a FIN or on the
+SUT's own side, so `logit.input.connections.closed{reason="reset"}` could be held at 0 and never
+seen above it. A `reset` step runs `ss -K` in a one-shot netem container joined to the target's
+network namespace, closing its established TCP connections, or those on the step's `port`. The
+kernel sends each peer a reset: the side the step is `on` reads `ECONNABORTED`, and the peer
+`ECONNRESET`, so to make a listener count a reset the step goes on its client.
+
+- **Reported on TCP, judged on HTTP.** A reset can lose what sat in either side's socket
+  buffers, as a stop or a kill can, so `ledger.wire` reports its window on a TCP wire. On an
+  HTTP wire G counts only what the listener answered, so the window is judged with the
+  ambiguous-attempt allowance, as a partition's is.
+- **A reset that closed nothing fails.** `ss -K` needs CAP_NET_ADMIN and a kernel built with
+  `CONFIG_INET_DIAG_DESTROY`, and without the second it closes nothing and reports no error.
+  The step records how many sockets it closed and is `rc` 1 when that is 0, so `timeline` FAILs
+  a step that did nothing and it gets no window.
+- **A namespace fault.** Under `[overlap]` or beside an `idp` it goes on the holder, as `netem`
+  and `partition` do, since a member shares the holder's namespace.
+
 ## Amendment: OTLP and HEC stand-ins overwrite under cumulative temporality, and name loss by position (2026-10-29)
 
 A stand-in target can play OTLP/HTTP's metrics route (`[target] shape = "otlp"`) and Splunk's

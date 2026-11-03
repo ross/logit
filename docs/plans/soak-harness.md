@@ -222,7 +222,11 @@ settle window would leave a life no fit. `fanin` and `tcp-ingress` set `60s`, an
   wire's generator too, which sends nothing. W7a adds `mark` and `exit`
   (below). W9a adds `respond`, on a stand-in only (below). W12c adds `signal` and `rename`, on
   a service that runs `logit` (below), W12d `rotate` and `probe` (below), and `tailid/soak-claim`
-  `copytruncate`, `gzip`, and `replace`, on a file source's writer (below).
+  `copytruncate`, `gzip`, and `replace`, on a file source's writer (below). The round-3
+  follow-ups add `reset`, on any service: a one-shot netem container in its namespace closes
+  its established TCP connections with `ss -K`, or those on the step's optional `port`, 1 to
+  65535, and fails the step when it closed none. Under `[overlap]` or beside an `idp` it goes
+  on the holder, as `netem` and `partition` do.
 - `[ledger] vm_every_window`, optional, is `true` or `false`; `[ledger] sut_script`, optional,
   is a component id.
 - `[[ledger.source]]` (W8b) has the rules under "Sources" below.
@@ -1264,12 +1268,12 @@ The rows:
   line per source; the worst status wins.
 
   On a TCP wire (W11a) a fault is TCP-affecting when it's a lifecycle fault (`pause`, `stop`,
-  `kill`, `restart`) or a `partition` of the ingress SUT or of a generator, a `mark` or an
+  `kill`, `restart`), a `partition`, or a `reset` of the ingress SUT or of a generator, a `mark` or an
   `exit` on the ingress SUT, or netem on the ingress SUT, whose egress carries the ACKs. Netem on
   the generator isn't: TCP retransmits what it delays or drops, so its window is judged as steady
   state. Of the TCP-affecting windows only those that can reset the connection with lines in its
-  socket buffers are reported and not judged: a `stop`, `kill`, `restart`, or `exit`, and a
-  `partition` whose record shows the container's address changed or doesn't show the address
+  socket buffers are reported and not judged: a `stop`, `kill`, `restart`, `exit`, or `reset`,
+  and a `partition` whose record shows the container's address changed or doesn't show the address
   after it (`checks.wire_judgment`). Every other TCP-affecting window is **judged**: its loss
   counts with steady state's, against the same limit and edge tolerance, and its surplus, W + F
   above G, may not exceed one generator batch per ambiguous attempt the generator's stream sink
@@ -3312,9 +3316,11 @@ that items 3, 7, and 11 need.
   response-class invariant extended to both sinks.
 
 - **Round-3 follow-ups** (`soak/round3-followups`, off `main`): a self-test case for W25's
-  X / 3 cap on a scrape's dropped batches, and the `ledger.relay` row with its
-  `relay_listener` and `relay_sink` keys, an amendment to ADR `soak-harness`, and self-test
-  fixtures for each rule. W28's finding that a relay had no row of its own is the second.
+  X / 3 cap on a scrape's dropped batches; the `ledger.relay` row with its `relay_listener` and
+  `relay_sink` keys, for W28's finding that a relay had no row of its own; and the `reset`
+  action, for W27's finding that no fault reset a connection, with `syslog-tcp-ingress`'s
+  reset step and its `reset-counted` expectation. Each has an amendment to ADR `soak-harness`
+  and self-test fixtures for its rules. The reset step hasn't run yet.
 
 §10's follow-ups to items 11 and 12, and its list deferred to a later round, have no workstream
 yet.

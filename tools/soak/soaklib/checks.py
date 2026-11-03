@@ -1803,9 +1803,9 @@ DEFAULT_FILE_OUT_MAX_FILES = 5
 FILE_RETENTION_ACTIONS = ("pause", "stop", "kill", "restart", "exit")
 _SIZE_UNITS = {"B": 1, "KB": 1000, "MB": 1000 ** 2, "GB": 1000 ** 3,
                "KiB": 1024, "MiB": 1024 ** 2, "GiB": 1024 ** 3}
-# On a TCP wire the actions that end a SUT or generator process, or a partition that moved an
-# address, can lose lines the generator counted as sent: what sat in either side's socket buffers
-# when the connection reset. Their windows are reported, not judged. Every other TCP-affecting
+# On a TCP wire the actions that end a SUT or generator process, a `reset` of a connection, or a
+# partition that moved an address, can lose lines the generator counted as sent: what sat in
+# either side's socket buffers when the connection reset. Their windows are reported, not judged. Every other TCP-affecting
 # window is judged as steady state is, with a surplus allowed of one generator batch per
 # attempt its stream sink counted `logit.output.requests{class="ambiguous"}` in it: a write that
 # failed partway, or a TLS first write that failed, left whole lines the SUT read and the
@@ -1813,7 +1813,7 @@ _SIZE_UNITS = {"B": 1, "KB": 1000, "MB": 1000 ** 2, "GB": 1000 ** 3,
 # `at_most_once` it drops the batch `ambiguous_at_most_once`, one drop per such attempt; either
 # way the attempt leaves at most one batch of surplus (crates/logit-outputs/src/stream.rs's module
 # table).
-TCP_REPORTED_ACTIONS = ("stop", "kill", "restart", "exit")
+TCP_REPORTED_ACTIONS = ("stop", "kill", "restart", "exit", "reset")
 TCP_AMBIGUOUS_CLASS = "ambiguous"
 # On an HTTP wire G counts only points the listener answered with a success, which it does once
 # their batch is in every inbox, after W counted it, so no window can lose a point G counted. A

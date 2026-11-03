@@ -1,14 +1,30 @@
 #!/bin/bash
-# Usage: netem.sh set <netem args...> | clear | show
+# Usage: netem.sh set <netem args...> | clear | show | reset [port]
 #
 # Runs inside the target container's network namespace. A root qdisc on the default-route
 # interface shapes that container's egress only.
 #
-#   set <args>  replace the root qdisc with `netem <args>`, then print it
-#   clear       delete the root qdisc, then print what's left; clearing an absent one succeeds
-#   show        print the root qdisc
+#   set <args>    replace the root qdisc with `netem <args>`, then print it
+#   clear         delete the root qdisc, then print what's left; clearing an absent one succeeds
+#   show          print the root qdisc
+#   reset [port]  close every established TCP connection in the namespace, or each whose local
+#                 or remote port is `port`, with `ss -K`, which sends the peer a reset; print
+#                 each socket it closed, then `{"killed": N}`. `ss -K` needs CAP_NET_ADMIN and a
+#                 kernel built with CONFIG_INET_DIAG_DESTROY; without it, it closes and prints
+#                 nothing, and N is 0.
 
 set -euo pipefail
+
+if [ "${1:-}" = "reset" ]; then
+    filter=()
+    if [ -n "${2:-}" ]; then
+        filter=("(" sport = ":${2}" or dport = ":${2}" ")")
+    fi
+    closed="$(ss -K -H -t -n state established "${filter[@]}")"
+    printf '%s\n' "${closed}"
+    printf '{"killed": %d}\n' "$(printf '%s' "${closed}" | grep -c . || true)"
+    exit 0
+fi
 
 dev="$(ip route show default | awk '{for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit }}')"
 if [ -z "${dev}" ]; then
@@ -30,7 +46,7 @@ case "${1:-}" in
     show)
         ;;
     *)
-        echo "usage: netem.sh set <netem args...> | clear | show" >&2
+        echo "usage: netem.sh set <netem args...> | clear | show | reset [port]" >&2
         exit 2
         ;;
 esac

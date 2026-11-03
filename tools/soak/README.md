@@ -329,6 +329,15 @@ then never reaches the generator. Its expectations assert the generator's overfl
 ambiguous drops around the SUT's pause, an idle close around the generator's, and none under
 the netem delay.
 
+`syslog-tcp-ingress` (15 minutes 15 seconds) sends RFC 5424 lines from `syslog_out` at its
+default `at_least_once`, octet-counted, into `syslog_in` over TCP, on the `tcp` wire. Its
+12.25-minute cycle drops 30% of the SUT's segments, pauses, stops, kills, and partitions the
+SUT, stops the generator, and ends with a `reset` of the generator's connection to the
+listener's port. Its expectations assert the generator's overflow and ambiguous attempts around
+the SUT's pause, no ambiguous drop over the run,
+`logit.input.connections.closed{reason="reset"}` at 0 around every other fault, and at 1 or
+more around the reset.
+
 `http-ingress` (18 minutes) sends 2,000 InfluxDB points a second with `influxdb_out`, 100 to a
 request, into `influxdb_in`, its source declared `wire = "http"`. Each point carries only a
 string field, so the SUT decodes no gauge, and a `kv_metrics` counts one per point ahead of a
@@ -672,7 +681,7 @@ source names, a `shutdown.delay` that with the drain fits `docker stop -t 30`, a
 `LOGIT_ADMIN`), and a `set` stamping `label` that each source's `sut_transforms` lists. The
 generators send to the holder's name, over UDP only. A generator needs several flows to spread:
 `generator_input` and `generator_sink` may both list components, as many of each, each input
-feeding the sink at its position, one sink per flow; their counts sum. Only `netem` and `partition` go on the holder, neither on an instance, and two
+feeding the sink at its position, one sink per flow; their counts sum. Only `netem`, `partition`, and `reset` go on the holder, none on an instance, and two
 instances may not be held (paused, stopped, killed, restarted, or exited) at once. At the end the
 driver waits once on the backends' totals, then stops each instance.
 
@@ -708,9 +717,9 @@ services:
 The SUT reaches the `idp` at `127.0.0.1`, and every other service reaches either at the holder's
 name: the generator sends to `sut-net:8125`, and the broker fetches the JWKS from `sut-net`.
 With no `[overlap]`, a `netns` service needs an `idp` and an `idp` needs one, the stack runs no
-SUT but `logit`, and `logit`'s and the `idp`'s `network_mode` must name the holder. Put `netem`
-and `partition` on the holder, which then shape or cut the SUT's network, and neither on
-`logit` or the `idp`; the holder takes no other fault. A `pause`, `stop`, or `restart` of the
+SUT but `logit`, and `logit`'s and the `idp`'s `network_mode` must name the holder. Put `netem`,
+`partition`, and `reset` on the holder, which then shape, cut, or reset the SUT's network, and
+none on `logit` or the `idp`; the holder takes no other fault. A `pause`, `stop`, or `restart` of the
 `idp` affects egress only. `self_log` counts a `token_refresh_failed` warning inside a fault
 window on an `idp` and WARNs one outside every such window. The plan's "A token endpoint in the
 SUT's namespace (W19)" has the rules.
@@ -787,6 +796,7 @@ requires one completes the handshake and logs no `connection_error`.
 | `stop` | `docker stop -t 30` | `docker start` |
 | `kill` | `docker kill -s KILL`, on a SUT service, or a scrape wire's generator, only: no shutdown signal, so no final telemetry drain, no shutdown drops, and exit code 137. A killed generator's last sends would reach the SUT with no count behind them; a scrape target sends nothing | `docker start` |
 | `restart` | `docker restart -t 30` | none |
+| `reset` | a one-shot `logit-soak-netem:local` container in the target's network namespace closes each established TCP connection there, or each whose local or remote port is the step's optional `port`, with `ss -K`, so the kernel sends its peer a reset; records how many it closed (`killed`), and fails the step when it closed none. `ss -K` needs CAP_NET_ADMIN, which the container gets, and a host kernel built with `CONFIG_INET_DIAG_DESTROY`, without which it closes nothing. The side the step is `on` reads `ECONNABORTED`, and its peer `ECONNRESET`, so a reset a listener counts goes on the client. On a TCP wire its window is reported, since the lines in either side's buffers can be lost. A netem image older than the action answers with its usage line, so a run with `SOAK_SKIP_IMAGE` set needs one built from this tree | none: the client dials again |
 | `partition` | `docker network disconnect` from every network, recording the container's address on each (`ips`) | `docker network connect`, passing back each alias recorded before the disconnect, and recording the address after it (`ips_after`), which can differ |
 | `mark` | nothing: it marks a window for an event the SUT's own config causes, such as a stalled script. An optional `ready` names a readiness word the SUT must report inside it | nothing |
 | `exit` | nothing: on a SUT service only, it names an exit the SUT makes on its own inside the window, with the `code` it leaves and the `key` of the ERROR line that explains it | `docker start` if the container has exited |

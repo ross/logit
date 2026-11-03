@@ -92,9 +92,12 @@ STANDIN_ROLES = {"standin": STANDIN_ROLE}
 
 # Every action the scenario schema accepts. faults.py implements them; the names must match its
 # ACTIONS.
-ACTION_NAMES = ("netem", "pause", "stop", "kill", "restart", "partition", "mark", "exit",
-                "respond", "signal", "rename", "rotate", "probe", "copytruncate", "gzip",
+ACTION_NAMES = ("netem", "pause", "stop", "kill", "restart", "partition", "reset", "mark",
+                "exit", "respond", "signal", "rename", "rotate", "probe", "copytruncate", "gzip",
                 "replace")
+# The actions that take `port`: a `probe`, which needs the listener's, and a `reset`, which
+# closes only the connections whose local or remote port it is, and every one without it.
+PORT_ACTIONS = ("probe", "reset")
 # Actions allowed on a SUT service only, each with the reason. A `kill` exists to end a `logit`
 # process with no shutdown; on the generator, the lines it sent after its last telemetry drain
 # reach the SUT with no G behind them, and `ledger.wire` would net them against real loss. An
@@ -330,9 +333,9 @@ OVERLAP_KEYS = {"holder", "instances", "label"}
 _LABEL_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # The actions allowed on a namespace holder, and refused on a service in its namespace (an
 # overlap's instance, or `logit` or an `idp` beside one): a member shares the holder's
-# namespace, so a netem or a partition of it is one of the holder, and a lifecycle fault of the
-# holder would take every member's network away at once.
-HOLDER_ACTIONS = ("netem", "partition")
+# namespace, so a netem, a partition, or a reset of it is one of the holder, and a lifecycle
+# fault of the holder would take every member's network away at once.
+HOLDER_ACTIONS = ("netem", "partition", "reset")
 # The actions that hold an instance's port or process, which may not overlap across instances:
 # with every instance held at once nothing reads the port.
 INSTANCE_HOLD_ACTIONS = ("pause", "stop", "kill", "restart", "exit")
@@ -2353,7 +2356,7 @@ def _overlap_step_problems(scenario):
                     for t in scenario.random.faults]
     for where, action, on in entries:
         if on == holder and action not in HOLDER_ACTIONS:
-            problems.append(f"{where}: the holder takes {' and '.join(HOLDER_ACTIONS)} only; "
+            problems.append(f"{where}: the holder takes {_listed(HOLDER_ACTIONS)} only; "
                             "any other fault on it takes every instance's network away")
         elif on in instances and action in HOLDER_ACTIONS:
             problems.append(f"{where}: an instance shares {holder}'s network namespace, so put "
@@ -2398,7 +2401,7 @@ def _idp_namespace_problems(scenario, roles, modes=None):
                     for t in scenario.random.faults]
     for where, action, on in entries:
         if on == holder and action not in HOLDER_ACTIONS:
-            problems.append(f"{where}: the holder takes {' and '.join(HOLDER_ACTIONS)} only; "
+            problems.append(f"{where}: the holder takes {_listed(HOLDER_ACTIONS)} only; "
                             f"any other fault on it takes {', '.join(members)}'s network away")
         elif on in members and action in HOLDER_ACTIONS:
             problems.append(f"{where}: {on} shares {holder}'s network namespace, so put "
@@ -3106,11 +3109,20 @@ def _file_action_problems(scenario, duration):
     return problems
 
 
+def _listed(words):
+    """`a`, `a and b`, or `a, b, and c`."""
+    words = list(words)
+    if len(words) < 3:
+        return " and ".join(words)
+    return ", ".join(words[:-1]) + ", and " + words[-1]
+
+
 def _tls_step_problems(spec, where, tls):
     """What a step breaks of the `rotate` and `probe` keys: `cert`, a `[tls.cert]` name,
     required on both and refused elsewhere; `days`, a whole number above `TLS_INITIAL_DAYS`,
     required on a `rotate`, and `broken`, true or false, allowed on one only; `port`, 1 to
-    65535, required on a `probe` only, whose `cert` is a `server` one. `_rotate_problems()`
+    65535, required on a `probe`, whose `cert` is a `server` one, optional on a `reset`, and
+    refused elsewhere. `_rotate_problems()`
     checks the steps against each other and the configs."""
     problems = []
     certs = tls or {}
@@ -3141,16 +3153,16 @@ def _tls_step_problems(spec, where, tls):
         for name in ("days", "broken"):
             if getattr(spec, name) is not None:
                 problems.append(f"{where}: `{name}` is for rotate only")
-    if spec.action == "probe":
-        if spec.port is None:
-            problems.append(f"{where}: probe needs `port`, the listener's port in its service's "
-                            "network namespace")
-        elif (not isinstance(spec.port, int) or isinstance(spec.port, bool)
-              or not 1 <= spec.port <= 65535):
+    if spec.action == "probe" and spec.port is None:
+        problems.append(f"{where}: probe needs `port`, the listener's port in its service's "
+                        "network namespace")
+    elif spec.action in PORT_ACTIONS and spec.port is not None:
+        if (not isinstance(spec.port, int) or isinstance(spec.port, bool)
+                or not 1 <= spec.port <= 65535):
             problems.append(f"{where}: `port` must be a port number, 1 to 65535, got "
                             f"{spec.port!r}")
     elif spec.port is not None:
-        problems.append(f"{where}: `port` is for probe only")
+        problems.append(f"{where}: `port` is for {' and '.join(PORT_ACTIONS)} only")
     return problems
 
 
