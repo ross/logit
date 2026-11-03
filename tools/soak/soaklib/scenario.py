@@ -363,8 +363,8 @@ ROUTER_KINDS = ("route", "route_signals")
 # and that `aggregate`, in order. A local sink may add `vm_absent_selector`, a selector its
 # backend must hold no series for at the end (checks.py's `check_ledger_absent`). A sink whose
 # writes a further SUT service carries on names it in `relay`, with `relay_listener`, the relay's
-# listener the sink writes to, and `relay_sink`, the relay's sink that listener alone feeds,
-# which `ledger.relay` balances per relay life (checks.py's `check_ledger_relay`).
+# listener the sink writes to, and `relay_sink`, the relay's sink that listener alone feeds
+# and whose only source it is, which `ledger.relay` balances per relay life (checks.py's `check_ledger_relay`).
 SINK_KEYS = {"id", "backend", "vm_selector", "target", "aggregate", "transforms",
              "vm_absent_selector", "relay", "relay_listener", "relay_sink"}
 RELAY_SINK_KEYS = ("relay_listener", "relay_sink")
@@ -2149,8 +2149,9 @@ def _relay_problems(ledger, extra_suts, kind):
 def _relay_config_problems(ledger, configs, directory):
     """What a `[[ledger.sink]]`'s `relay_listener` and `relay_sink` break: each is a component
     id, set together and only beside `relay`; no two sinks share a `relay_listener`; and, in the
-    relay's config, the listener is an `_in` kind whose events the named sink alone takes, from
-    the listener directly, so `ledger.relay`'s balance has no node or copy between the two."""
+    relay's config, the listener is an `_in` kind whose events the named `_out` sink alone
+    takes, from the listener directly, and that sink reads no other source, so `ledger.relay`'s
+    balance has no node, copy, or other input between the two."""
     sinks = ledger.get("sink") if isinstance(ledger.get("sink"), list) else []
     problems = []
     listeners = []
@@ -2190,12 +2191,21 @@ def _relay_config_problems(ledger, configs, directory):
             problems.append(f"{where}: `relay_listener` {listener} must be a listener in "
                             f"{name}" + (f", and it's a {kind}" if kind else ", which has no "
                                          "such component"))
-        if listener_wire(text, relay_sink)[1] is None:
+        sink_kind = listener_wire(text, relay_sink)[1]
+        if sink_kind is None:
             problems.append(f"{where}: `relay_sink` {relay_sink} isn't a component in {name}")
             continue
-        if listener not in config_sources(text, relay_sink):
+        if not sink_kind.endswith("_out"):
+            problems.append(f"{where}: `relay_sink` {relay_sink} must be a sink in {name}, "
+                            f"and its kind is {sink_kind}")
+        sources = config_sources(text, relay_sink)
+        if listener not in sources:
             problems.append(f"{where}: `relay_sink` {relay_sink} must take `relay_listener` "
                             f"{listener}'s events directly, in its `sources:`")
+        elif sources != [listener]:
+            others = ", ".join(one for one in sources if one != listener)
+            problems.append(f"{where}: `relay_sink` {relay_sink} reads {others} too; its only "
+                            f"source must be `relay_listener` {listener}")
         ids_in_file = re.findall(r"^  ([A-Za-z0-9_][A-Za-z0-9_.-]*)\s*:", text, re.M)
         others = [one for one in ids_in_file
                   if one != relay_sink and listener in config_sources(text, one)]
@@ -2340,8 +2350,8 @@ def _overlap_problems(overlap, ledger, configs, extra_suts, directory):
 
 
 def _overlap_step_problems(scenario):
-    """What the steps break of `[overlap]`'s rules: on the holder only `netem` and `partition`,
-    on an instance neither, and no two `INSTANCE_HOLD_ACTIONS` steps on different instances
+    """What the steps break of `[overlap]`'s rules: on the holder only `netem`, `partition`, and
+    `reset`, on an instance none of them, and no two `INSTANCE_HOLD_ACTIONS` steps on different instances
     overlapping, since with every instance held nothing reads the port. A `[random]` fault on
     the holder or an instance is held to the first two; its draws never overlap."""
     overlap = scenario.overlap
@@ -2376,9 +2386,9 @@ def _overlap_step_problems(scenario):
 
 def _idp_namespace_problems(scenario, roles, modes=None):
     """What an `idp`'s namespace breaks, with no `[overlap]`: with `modes`, `logit` and each
-    `idp` in the holder's namespace; on the holder only `netem` and `partition`, and on a member
-    neither. A member shares the holder's namespace, so a netem or a partition of it is one of
-    the holder, and a lifecycle fault of the holder takes every member's network away. A
+    `idp` in the holder's namespace; on the holder only `netem`, `partition`, and `reset`, and
+    on a member none of them. A member shares the holder's namespace, so a netem, a partition,
+    or a reset of it is one of the holder, and a lifecycle fault of the holder takes every member's network away. A
     `[random]` fault is held to the same."""
     netns = [n for n, r in roles.items() if r == NETNS_ROLE]
     idps = sorted(n for n, r in roles.items() if r == IDP_ROLE)

@@ -8494,6 +8494,9 @@ def _relay_rules(root):
         (lambda sink: sink.update(relay_sink="telemetry"),
          "`relay_sink` telemetry must take `relay_listener` otlp's events directly",
          "a relay_sink the listener doesn't feed"),
+        (lambda sink: sink.update(relay_sink="self"),
+         "`relay_sink` self must be a sink in logit-collector.yaml, and its kind is internal",
+         "a relay_sink that isn't a sink"),
         (lambda sink: (sink.pop("relay"), sink.pop("relay_sink")),
          "`relay_listener` names a relay's component, and the sink names no `relay`",
          "relay_listener with no relay"),
@@ -8513,6 +8516,11 @@ def _relay_rules(root):
         _refused(copied / "scenario.toml", copy.deepcopy(raw),
                  "`relay_listener` otlp feeds archive too; `relay_sink` victoria_metrics must "
                  "take its events alone", "a relay listener feeding a second component")
+        relay_file.write_text((path.parent / "logit-collector.yaml").read_text().replace(
+            "sources: [otlp]", "sources: [otlp, self]", 1))
+        _refused(copied / "scenario.toml", copy.deepcopy(raw),
+                 "`relay_sink` victoria_metrics reads self too; its only source must be "
+                 "`relay_listener` otlp", "a relay_sink reading a second source")
     expect(scenario.config_sources("  a:\n    sources: [x, 'y']\n", "a") == ["x", "y"]
            and scenario.config_sources("  a:\n    sources:\n      - x  # one\n      - y\n"
                                        "  b: {}\n", "a") == ["x", "y"]
@@ -8588,19 +8596,19 @@ RELAY_CONFIG = ("components:\n"
 RELAY_PER_DRAIN = 100
 
 
-def _relay_run(tmp, name, action="kill", extra=(), stopped=True, keys=True):
+def _relay_run(tmp, name, action="kill", extra=(), stopped=True, keys=True, sut_extra=()):
     """`_ledger_run`'s two-life run with its sink's writes carried on by a relay, `collector`,
     whose `action` (a `kill` or a `stop`) over `RELAY_KILL` gives it two lives. Each 5 s drain
     the relay's `otlp` sends `RELAY_PER_DRAIN` events on to `victoria_metrics`, which receives
     and delivers them, plus `extra` lines; with `stopped` the end sequence stopped it, and with
-    `keys` its sink names `relay_listener` and `relay_sink`."""
+    `keys` its sink names `relay_listener` and `relay_sink`. `sut_extra` lines go to `logit`."""
     kill = RELAY_KILL
     relay_timeline = [_action("apply", "c0s2", action, "collector", kill[0]),
                       _action("revert", "c0s2", action, "collector", kill[1] - 1, kill[1]),
                       _ready("c0s2", "collector", kill[1] + 1)]
     if stopped:
         relay_timeline.append(_phase("sut_stopped", 325, service="collector"))
-    run_dir = _ledger_run(tmp, name, timeline_extra=relay_timeline)
+    run_dir = _ledger_run(tmp, name, timeline_extra=relay_timeline, sut_extra=sut_extra)
     resolved_path = run_dir / "scenario.resolved.json"
     resolved = json.loads(resolved_path.read_text())
     resolved["suts"] = ["logit", "collector"]
@@ -8653,17 +8661,25 @@ def _relay_ledger():
     """`ledger.relay` over `_relay_run`: per relay life, the listener's sends less its drops
     against the relay sink's receipts, and those against its deliveries and drops; a stopped
     life and a final life the end sequence stopped judged at 0, a killed one reported, a counted
-    drop at either end balancing, a listener's `shutdown` drop left out of X_r, and a rejected
-    batch FAILing."""
+    drop at either end balancing and left out of `drops`, a listener's `shutdown` drop left out
+    of X_r, and a rejected batch FAILing; and, over the run, the listener's sends against what
+    `logit`'s sink counted delivered."""
     def at(offset, metric, value, component="victoria_metrics", **attrs):
         return _line(_stamp(T0 + offset), metric, "sum", value, component=component,
                      attrs=attrs or None)
 
     with tempfile.TemporaryDirectory() as tmp:
+        seen = {}
+
         def row(name, **kwargs):
-            found = [r for r in checks.run_all(_relay_run(tmp, name, **kwargs))
-                     if r.id == "ledger.relay"]
+            results = checks.run_all(_relay_run(tmp, name, **kwargs))
+            seen[name] = {r.id: r for r in results}
+            found = [r for r in results if r.id == "ledger.relay"]
             return found[0] if len(found) == 1 else None
+
+        def drops_pass(name):
+            got = seen[name].get("drops")
+            return got is not None and got.status == checks.PASS, got
 
         clean = row("relay-clean")
         expect(clean is not None and clean.status == checks.PASS
@@ -8688,11 +8704,15 @@ def _relay_ledger():
                f"a relay sink receiving more than its listener sent FAILs, got {surplus}")
 
         counted = row("relay-counted", extra=lost + [
-            at(250, "logit.component.events.dropped", 10, reason="overflow_newest")])
+            at(250, "logit.component.events.dropped", 10, reason="overflow_newest"),
+            at(250, "logit.component.batches.dropped", 1, reason="overflow_newest")])
         expect(counted is not None and counted.status == checks.PASS
                and "Del_r − Drop_r 2,200 − 2,190 − 10 = 0 (Drop_r: overflow_newest 10), "
                    "balanced, the drops counted" in counted.detail,
                f"a relay sink's counted drop balances, got {counted}")
+        ok, got = drops_pass("relay-counted")
+        expect(ok, f"drops leaves a relay sink's events and batches dropped to ledger.relay, "
+                   f"got {got}")
         closed = row("relay-closed-consumer", extra=[
             at(250, "logit.component.events.dropped", 10, component="otlp",
                reason="closed_consumer"),
@@ -8701,6 +8721,8 @@ def _relay_ledger():
         expect(closed is not None and closed.status == checks.PASS
                and "E_r − X_r 2,200 − 10 − S_r 2,190 = 0" in closed.detail,
                f"a relay listener's counted drop balances, got {closed}")
+        ok, got = drops_pass("relay-closed-consumer")
+        expect(ok, f"drops leaves a relay listener's events dropped to ledger.relay, got {got}")
         cut = row("relay-listener-shutdown", extra=[
             at(320, "logit.component.events.dropped", 10, component="otlp", reason="shutdown")])
         expect(cut is not None and cut.status == checks.PASS
@@ -8714,6 +8736,39 @@ def _relay_ledger():
                and "FAIL: collector victoria_metrics: 1 batch(es) rejected by the destination"
                in rejected.detail,
                f"a batch the relay's destination rejected FAILs, though counted, got {rejected}")
+        ok, got = drops_pass("relay-rejected")
+        expect(ok, f"a relay sink's rejected batch FAILs in ledger.relay alone, got {got}")
+
+        def delivered(value, *more):
+            return [at(100, "logit.component.events.delivered", value, component="sink"),
+                    *more]
+
+        across = row("relay-delivered", sut_extra=delivered(6200))
+        expect(across is not None and across.status == checks.PASS
+               and "sink to collector over the run: ΣE_r 6,200 against Del 6,200 − 100 (a "
+                   "drain interval per relay life whose last counts are unseen) = 6,100, ok"
+               in across.detail,
+               f"the relay's listener sent on what logit's sink delivered, less its killed "
+               f"life's last drain interval, got {across}")
+        short = row("relay-delivered-over", sut_extra=delivered(6400))
+        expect(short is not None and short.status == checks.FAIL
+               and short.detail.startswith(
+                   "sink to collector over the run: ΣE_r 6,200 against Del 6,400 − 100")
+               and "= 6,300, 100 delivered to the relay and never counted sent by its "
+                   "listener" in short.detail,
+               f"a write logit's sink saw answered that the relay never counted FAILs, got "
+               f"{short}")
+        stopped = row("relay-delivered-stopped", action="stop", sut_extra=delivered(6250))
+        expect(stopped is not None and stopped.status == checks.FAIL
+               and "ΣE_r 6,200 against Del 6,250 = 6,250, 50 delivered" in stopped.detail,
+               f"with every relay life seen to its last drain no interval is allowed, got "
+               f"{stopped}")
+        unwritten = row("relay-delivered-unwritten", sut_extra=delivered(
+            6400, at(100, "logit.output.metrics.skipped", 200, component="sink",
+                     metric_kind="gauge_histogram")))
+        expect(unwritten is not None and unwritten.status == checks.PASS
+               and "Del 6,400 − unwritten 200 − 100" in unwritten.detail,
+               f"records the sink's encoder skipped never reach the relay, got {unwritten}")
 
         early = row("relay-stopped-short", action="stop",
                     extra=[at(100, "logit.component.events.delivered", -10)])
@@ -12726,10 +12781,15 @@ def _reset_rules(root):
     expect(resets and counted.get("step") == resets[0].id and counted.get("min") == 1
            and counted.get("metric") == "logit.input.connections.closed"
            and counted.get("attrs") == {"component": "syslog", "reason": "reset"}
-           and not any(exp.get("window") == "run" and exp.get("attrs", {}).get("reason")
-                       == "reset" for exp in rows.values()),
+           and all(exp.get("max") == 1 for exp in rows.values()
+                   if exp.get("window") == "run"
+                   and exp.get("attrs", {}).get("reason") == "reset"),
            f"its reset-counted expectation reads at least one reset in the reset's window, and "
-           f"no run-wide row holds resets at 0, got {counted}")
+           f"no run-wide row holds resets below the one the step sends, got {counted}")
+    whole = rows.get("resets-run", {})
+    expect(whole.get("window") == "run" and whole.get("max") == 1
+           and whole.get("attrs") == {"component": "syslog", "reason": "reset"},
+           f"a run-wide row holds the run to the one reset the step sends, got {whole}")
 
 
 class _CertsDocker:

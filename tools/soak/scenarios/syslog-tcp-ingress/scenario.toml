@@ -141,7 +141,18 @@ max = 0
 # the generator never holds unread bytes, whose close would be a reset: a stalled write's
 # dropped connection, the end of a partition, and the generator's stop each close with a
 # FIN, and a stop or kill of the SUT ends the connection on its own side. Only the reset step
-# sends one.
+# sends one, to the generator's one connection, so the run counts at most 1, and the
+# pause, partition, both stops, and the kill each 0.
+[[expect]]
+name = "resets-run"
+service = "logit"
+metric = "logit.input.connections.closed"
+component = "syslog"
+attrs = { reason = "reset" }
+window = "run"
+reduce = "delta"
+max = 1
+
 [[expect]]
 name = "no-reset-pause"
 service = "logit"

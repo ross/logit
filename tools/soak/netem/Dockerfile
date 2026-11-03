@@ -1,5 +1,5 @@
 # The one-shot fault image `script/soak` runs as
-# `docker run --rm --network container:<id> --cap-add NET_ADMIN logit-soak-netem:local set|clear|show`.
+# `docker run --rm --network container:<id> --cap-add NET_ADMIN logit-soak-netem:local set|clear|show|reset`.
 # It joins the target container's network namespace, changes or prints the root qdisc on that
 # namespace's default-route interface, and exits; the qdisc outlives it. `reset` closes the
 # namespace's established TCP connections with iproute2's `ss -K` instead.

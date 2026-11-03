@@ -893,14 +893,15 @@ the operator-facing account of all of this.
   `tcp-ingress` sends statsd over TCP, its source declared `wire = "tcp"` and checked at load
   against the listener's `transport:`: W is `input.frames`, the framer's drops are counted wire
   loss, and the generator's netem is judged at 0 because TCP retransmits. A process-ending
-  fault, or a partition that moved or didn't record the SUT's address, is reported; every other
+  fault, a `reset`, or a partition that moved or didn't record the SUT's address, is reported; every other
   TCP window is judged with a surplus allowance (the plan's `ledger.wire` row) of one batch per
   ambiguous attempt the generator's sink counted, under either posture.
   `syslog-tcp-ingress` and `syslog-tls-ingress` send RFC 5424 from `syslog_out` at its default
   `at_least_once`, octet-counted, into `syslog_in` over TCP and over TLS from the run's private
   CA, through a certificate rotation in the second, with `[[expect]]` rows on the listener's
-  `logit.input.connections.closed{reason="reset"}`: 0 around each fault, and in the first, at 1
-  or more around a `reset` step, which closes the generator's connection with `ss -K` from a
+  `logit.input.connections.closed{reason="reset"}`: in the second 0 over the run, and in the
+  first at most 1 over the run, 0 around the SUT's pause, stop, kill, and partition and the
+  generator's stop, and at least 1 around a `reset` step, which closes the generator's connection with `ss -K` from a
   one-shot container in its network namespace (a kernel with `CONFIG_INET_DIAG_DESTROY`).
   `http-ingress` sends InfluxDB points from `influxdb_out` into `influxdb_in`, its source
   declared `wire = "http"`: G is the points the listener answered `204` for and W its

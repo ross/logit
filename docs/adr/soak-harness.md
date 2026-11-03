@@ -817,8 +817,8 @@ The relay amendment above judged a relay's losses only through V, so a loss insi
 only when it held a `logit` life's last value. A relay now gets a row of its own,
 `ledger.relay`, read on its own lives, which no other row reads. Each `[[ledger.sink]]` that
 names a `relay` also names the relay's listener it writes to, `relay_listener`, and the relay's
-sink that listener alone feeds, directly, `relay_sink`; `load()` checks both against the
-relay's config. Per relay life, the listener's events sent less its counted drops must equal
+sink that listener alone feeds, directly, `relay_sink`, an `_out` kind with no other
+source; `load()` checks both against the relay's config. Per relay life, the listener's events sent less its counted drops must equal
 the sink's events received, and those its events delivered plus its counted drops.
 
 - **Exact, where the life ended cleanly.** A life a stop or a restart ended, and the final life
@@ -830,10 +830,17 @@ the sink's events received, and those its events delivered plus its counted drop
   of the listener's drops, as it does on an HTTP wire.
 - **A counted drop balances; a fault drop FAILs.** A drop at either end leaves no gap, and a
   `rejected` or `disk_corrupt` batch drop at the relay sink FAILs, as at a SUT sink. `drops`
-  still lists the relay's drops beside the row.
-- **The hop into the relay stays V's.** `logit`'s sink and the relay's listener are two
-  processes whose lives don't pair, and an ambiguous resend reaches the relay twice, so the row
-  doesn't compare them.
+  leaves these terms to the row, as it leaves a hop sink's to `ledger.hop`.
+- **The hop into the relay is one-sided, on run totals.** `logit`'s sink and the relay's
+  listener are two processes whose lives don't pair, and an ambiguous resend reaches the relay
+  twice, so the row can't equate them. It holds the listener's ΣE_r at or above what the sink
+  counted delivered, less the records the sink's encoder counted dropped or skipped and less
+  one drain interval of E_r per relay life a kill or an `exit` ended or the end sequence didn't
+  stop. The listener counts an event sent before it answers and the sink counts it delivered
+  after, so a request the relay answered and then lost before counting it FAILs here, which V
+  can't show mid-life under cumulative temporality. The two count one unit when each delivered
+  event carries one record: `otlp_out` writes one data point per record and `otlp_in` decodes
+  one event per data point, and `aggregate` emits one record per event.
 
 ## Amendment: a `reset` step closes TCP connections, reported on a TCP wire (2026-11-03)
 

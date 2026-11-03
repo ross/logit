@@ -1630,8 +1630,11 @@ The rows:
   stop or a restart ended, and the final life once the end sequence stopped the relay, ends
   with a drain after every data node has exited, so both gaps must be 0; a life a kill or an
   `exit` ended, or a final life the end sequence didn't stop, is reported. A `rejected` or
-  `disk_corrupt` batch drop at the relay sink FAILs. V still judges what the relay stored, and
-  `drops` still lists the relay's drops.
+  `disk_corrupt` batch drop at the relay sink FAILs, and `drops` leaves these terms to the row.
+  On run totals, ΣE_r must be at least the `logit` sink's events delivered, less the records
+  its encoder counted dropped or skipped and a drain interval of E_r per relay life a kill or an
+  `exit` ended or the end sequence didn't stop, which catches a request the relay answered and
+  lost before counting it. V still judges what the relay stored.
 - `ledger.overlap` (W12b), under `[overlap]` only, else no row: the run's G − Σ(W + K + F)
   against what the instances' socket closes could discard. Under `[overlap]` the per-life rows
   judge each instance on its own lives and the wire, `progress`, and `recovery` judge them
@@ -2351,8 +2354,8 @@ instance's config `reuse_port: true` on every source's listener, a `shutdown.del
 with a 10 s drain (the listeners' 5 s `shutdown_grace` and `internal`'s 5 s second stage) is
 under `docker stop -t 30`, `admin.socket` with no `admin.bind`, and a `set` stamping `label`
 that every source's `sut_transforms` lists. Two instance configs may differ only in the lines
-that set `label`. With the steps: only `netem` and `partition` on the holder, neither on an
-instance, and no two of `pause`, `stop`, `kill`, `restart`, or `exit` on different instances
+that set `label`. With the steps: only `netem`, `partition`, and `reset` on the holder, none of
+them on an instance, and no two of `pause`, `stop`, `kill`, `restart`, or `exit` on different instances
 overlapping. With the role map: the holder is the stack's one `netns` service, a `netns` service
 needs an `[overlap]` or, from W19, an `idp` ("A token endpoint in the SUT's namespace"), and
 each instance's `network_mode` names the holder (read from `docker compose config` beside the
