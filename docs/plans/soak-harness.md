@@ -711,7 +711,8 @@ hold what it ingested unsaved. VictoriaMetrics buffers ingested rows for up to a
 holds them as in-memory parts for `-inmemoryDataFlushInterval`, so it's 1 s plus that flag. It
 needs `vm_every_window`, and a `kill` of a backend needs it on a sink delivering there: a
 backend kill loses what it hadn't saved, and `ledger.tail` (§6) is the row that sees it. Only a
-`graphite_out` writes one line per stored sample, which the row's comparison needs.
+`graphite_out` writes one datapoint per stored sample and counts each in
+`logit.output.datapoints`, under plaintext and pickle alike, which the row's comparison needs.
 
 The expected rate is never configured. It is measured from the generator's own `events.sent`
 over the warmup.
@@ -1579,13 +1580,14 @@ The rows:
   batches and drains counted. A gap that overlaps a backend kill's span on a sink with
   `kill_unflushed` (`ledger.tail`'s) is excused and listed as a tail gap: that row judges it.
 - `ledger.tail`, only for a sink with `kill_unflushed`, else SKIP: per SUT life, M − S, M the
-  lines the sink counted written (`logit.output.messages`) and S the distinct
+  datapoints the sink counted written (`logit.output.datapoints`, one per sample whether a frame
+  carries one or, under pickle, many) and S the distinct
   `(series, timestamp)` samples its export holds in that life. A resend rewrites the same sample,
   so M − S is what the sink counted written and the backend never stored: the bytes a stream
   sink can't count (`docs/known-gaps/sinks.md`), with what the backend held unsaved when
   killed. Under a cumulative `aggregate` V and `ledger.egress` can't see it, since the next
   window's total covers a lost one, and `ledger.windows` sees a gap but not its size. 0 passes;
-  a life with a kill of the backend passes up to its bound, the lines the sink counted in the
+  a life with a kill of the backend passes up to its bound, the datapoints the sink counted in the
   drains from `kill_unflushed` plus one aggregate interval before each kill (a sample is stamped
   with its window's time) to two SUT drain periods after it (writes the sink counted before it
   saw the close). A surplus, a gap past the bound, and any gap in a life with no backend kill
@@ -6907,7 +6909,7 @@ acknowledged"). Neither has run; the numbers are owed.
 
 - **`graphite-egress`'s backend kills.** Its cycle adds two SIGKILLs of VictoriaMetrics, at
   11m15s and 13m20s, half a 10 s window apart in phase, under `-inmemoryDataFlushInterval=5s` and
-  `kill_unflushed = "6s"`. `ledger.tail` will show, per SUT life, the lines `graphite_out`
+  `kill_unflushed = "6s"`. `ledger.tail` will show, per SUT life, the datapoints `graphite_out`
   counted written against the samples stored, each kill's loss against its bound, and
   `ledger.windows` the gaps it leaves to that row; `reconnects-after-kill` and
   `reconnects-after-second-kill` show the sink redialed. Owed: each kill's M − S, its bound,

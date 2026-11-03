@@ -4486,16 +4486,19 @@ def _kill_run(tmp, name, kill_gap=1500, stray_drop=False, replayed=3, queued=Non
     return run_dir
 
 
-def _tail_run(tmp, name, kill=True, unflushed=6.0, short=0, **kwargs):
+def _tail_run(tmp, name, kill=True, unflushed=6.0, short=0, pickle=False, **kwargs):
     """`_kill_run`'s three-life run with a `graphite_out`-style sink: the SUT counts
-    `logit.output.messages` for `sink`, two lines per aggregate flush (one per series), and
-    the sink names `kill_unflushed` (`unflushed`, None for none). With `kill`, a `kill` of
-    victoria-metrics runs over +240..+270 in life 2. `short` lines go uncounted in the drain at
-    +250. Its span is (+240 − 6 − 10, +240 + 2 x 5] = (+224, +250], which holds the flushes at
+    `logit.output.datapoints` for `sink`, two per aggregate flush (one per series), and
+    `logit.output.messages` as many under plaintext, or one frame per flush under `pickle`; the
+    sink names `kill_unflushed` (`unflushed`, None for none). With `kill`, a `kill` of
+    victoria-metrics runs over +240..+270 in life 2. `short` datapoints go uncounted in the drain
+    at +250. Its span is (+240 − 6 − 10, +240 + 2 x 5] = (+224, +250], which holds the flushes at
     +230, +240, and +250: a bound of 6."""
     flushes = (*range(10, 101, 10), *range(140, 201, 10), *range(220, 321, 10))
-    messages = [_line(_stamp(T0 + s), "logit.output.messages", "sum",
-                      2 - (short if s == 250 else 0), component="sink") for s in flushes]
+    messages = [_line(_stamp(T0 + s), name_, "sum", value, component="sink")
+                for s in flushes
+                for name_, value in (("logit.output.datapoints", 2 - (short if s == 250 else 0)),
+                                     ("logit.output.messages", 1 if pickle else 2))]
     run_dir = _kill_run(tmp, name, sut_extra=messages,
                         silence=("victoria-metrics", "kill") if kill else None, **kwargs)
     resolved = json.loads((run_dir / "scenario.resolved.json").read_text())
@@ -4522,9 +4525,14 @@ def _tail_ledger():
                and "life 0: M 20 − S 20 = 0, exact" in detail
                and "life 1: M 14 − S 14 = 0, reported: a killed SUT life" in detail
                and "life 2 (final): M 22 − S 22 = 0, exact (c0s3 kill of victoria-metrics at "
-               "+240s: 6 line(s) counted from +224s to +250s)" in detail,
+               "+240s: 6 datapoint(s) counted from +224s to +250s)" in detail,
                f"tail PASSes a kill that lost nothing and states its bound, got "
                f"{exact['ledger.tail']}")
+        pickled = tail("tail-pickle", pickle=True)
+        expect(pickled["ledger.tail"].status == checks.PASS
+               and "life 2 (final): M 22 − S 22 = 0, exact" in pickled["ledger.tail"].detail,
+               f"tail counts a pickle sink's datapoints, not its frames, got "
+               f"{pickled['ledger.tail']}")
         within = tail("tail-within", drop=(230, 240, 250))
         expect(within["ledger.tail"].status == checks.PASS
                and "life 2 (final): M 22 − S 16 = 6, tail loss within the bound 6, uncounted by "

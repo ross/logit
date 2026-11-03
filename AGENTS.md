@@ -953,7 +953,7 @@ the operator-facing account of all of this.
   `otlp-egress` send a cumulative `aggregate` through `graphite_out` and `otlp_out` over HTTP
   into VictoriaMetrics' own Graphite and OTLP listeners, under `vm_every_window`;
   `graphite-egress` also SIGKILLs VictoriaMetrics twice, and `ledger.tail` (a sink's
-  `kill_unflushed`) holds the lines `graphite_out` counted written to the samples stored, the
+  `kill_unflushed`) holds the datapoints `graphite_out` counted written to the samples stored, the
   tail a stream sink can't count, bounded by what the backend held unsaved;
   `otlp-grpc-egress` sends it over gRPC to a second `logit`, `collector`, which passes it on
   through `prometheus_out`. `collector` is the sink's `relay`, so `logit` keeps `aggregate`

@@ -40,7 +40,8 @@ backend = "victoria-metrics"
 vm_selector = '{__name__=~"soak_requests_[0-9]+"}'
 # What a SIGKILL of VictoriaMetrics can lose of what it ingested: up to a second in memory, then
 # the override's -inmemoryDataFlushInterval 5s before it's on disk. ledger.tail bounds each
-# kill's loss by the lines the sink counted from this long before the kill.
+# kill's loss by the datapoints the sink counted from this long plus one aggregate interval
+# before the kill.
 kill_unflushed = "6s"
 
 [thresholds]
@@ -86,7 +87,7 @@ for = "45s"
 # the kernel closes its connection, so the sink's next send probes it closed and redials, and
 # each redial fails until the revert starts VictoriaMetrics again. What it ingested and hadn't
 # saved, and anything still in its socket, is gone with nothing counting it; ledger.tail holds
-# the sink's written lines to the stored samples, and ledger.windows leaves the gap to it.
+# the sink's written datapoints to the stored samples, and ledger.windows leaves the gap to it.
 [[step]]
 at = "11m15s"
 action = "kill"

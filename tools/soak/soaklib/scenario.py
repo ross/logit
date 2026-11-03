@@ -378,8 +378,9 @@ ROUTER_KINDS = ("route", "route_signals")
 # loss by (checks.py's `check_ledger_tail`).
 SINK_KEYS = {"id", "backend", "vm_selector", "target", "aggregate", "transforms",
              "vm_absent_selector", "relay", "relay_listener", "relay_sink", "kill_unflushed"}
-# The sink kinds `kill_unflushed` may name: a stream sink of one line per stored sample, so its
-# `logit.output.messages` counts the samples it wrote and the export's distinct samples count
+# The sink kinds `kill_unflushed` may name: a stream sink that writes one datapoint per stored
+# sample and counts each in `logit.output.datapoints`, whether a frame holds one (plaintext) or
+# many (pickle), so that counter is the samples it wrote and the export's distinct samples count
 # what was stored.
 TAIL_SINK_KINDS = ("graphite_out",)
 # The actions that may name a backend: a `kill`, when a `[[ledger.sink]]` on that backend
@@ -1718,8 +1719,8 @@ def _tail_problems(ledger, sut_text):
                 else None)
         if kind not in TAIL_SINK_KINDS:
             problems.append(f"ledger.sink {index + 1}: `kill_unflushed` is for a "
-                            f"{' or '.join(TAIL_SINK_KINDS)}, one line per stored sample, and "
-                            f"{sink.get('id')!r} is "
+                            f"{' or '.join(TAIL_SINK_KINDS)}, one datapoint per stored "
+                            f"sample, and {sink.get('id')!r} is "
                             + (f"a {kind}" if kind else "no component of the SUT config"))
     return problems
 

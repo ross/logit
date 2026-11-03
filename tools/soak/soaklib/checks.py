@@ -6455,19 +6455,20 @@ def tail_spans(data, sink, interval, period):
 
 
 def check_ledger_tail(data):
-    """Under a `[[ledger.sink]]`'s `kill_unflushed`, per SUT life: M, the lines the sink counted
-    written (`logit.output.messages`), against S, the distinct `(series, timestamp)` samples its
-    export holds in that life (`stored_samples_by_life`). The sink writes one line per sample
-    (scenario.py's `TAIL_SINK_KINDS`) and a resend rewrites the same sample, so M − S is what
-    it counted written and the backend never stored: the frames a stream sink can't count
-    (docs/known-gaps/sinks.md), with what the backend held in memory when killed. Under a
-    cumulative `aggregate` V and `ledger.egress` can't see it, since the next window's total
-    covers a lost one. 0 passes; a life holding a kill of the sink's backend passes up to its
-    bound, the lines the sink counted in the drains from `kill_unflushed` before each kill to
-    two drain periods after it: what the backend had ingested and not yet saved, or never read
-    from its socket, and the writes the sink counted before it saw the connection close. A gap
-    past the bound, any gap in a life with no such kill, and a sample the sink never counted
-    FAIL. A killed SUT life is reported, since its last drain doesn't hold all of M."""
+    """Under a `[[ledger.sink]]`'s `kill_unflushed`, per SUT life: M, the datapoints the sink
+    counted written (`logit.output.datapoints`, one per sample whether a frame holds one or many),
+    against S, the distinct `(series, timestamp)` samples its export holds in that life
+    (`stored_samples_by_life`). The sink writes one datapoint per sample (scenario.py's
+    `TAIL_SINK_KINDS`) and a resend rewrites the same sample, so M − S is what it counted written
+    and the backend never stored: the frames a stream sink can't count (docs/known-gaps/sinks.md),
+    with what the backend held in memory when killed. Under a cumulative `aggregate` V and
+    `ledger.egress` can't see it, since the next window's total covers a lost one. 0 passes; a life
+    holding a kill of the sink's backend passes up to its bound, the datapoints the sink counted in
+    the drains from `kill_unflushed` plus one aggregate interval before each kill to two drain
+    periods after it: what the backend had ingested and not yet saved, or never read from its
+    socket, and the writes the sink counted before it saw the connection close. A gap past the
+    bound, any gap in a life with no such kill, and a sample the sink never counted FAIL. A killed
+    SUT life is reported, since its last drain doesn't hold all of M."""
     tailed = [one for one in data.ledger.get("sink") or [] if "kill_unflushed" in one]
     if not tailed:
         return Result("ledger.tail", SKIP, "no [[ledger.sink]] names kill_unflushed")
@@ -6485,8 +6486,8 @@ def check_ledger_tail(data):
             status = FAIL
             groups.append(f"{sink}: no series in vm-export/{sink}.jsonl")
             continue
-        written = led.sut.counter_points("logit.output.messages", component=sink)
-        counted = led.sut.counter_by_life("logit.output.messages", component=sink)
+        written = led.sut.counter_points("logit.output.datapoints", component=sink)
+        counted = led.sut.counter_by_life("logit.output.datapoints", component=sink)
         stored = stored_samples_by_life(led.series[sink], led.life_starts)
         spans = tail_spans(data, sink, led.interval, period)
         parts = []
@@ -6499,8 +6500,8 @@ def check_ledger_tail(data):
                         if any(a < ts <= b for a, b, _ in kills))
             each = "; ".join(
                 f"{kill.step} kill of {kill.on} at {data.offset(kill.start)}: "
-                f"{_n(sum(value for ts, value, _ in written if a < ts <= b))} line(s) counted "
-                f"from {data.offset(a)} to {data.offset(b)}" for a, b, kill in kills)
+                f"{_n(sum(value for ts, value, _ in written if a < ts <= b))} datapoint(s) "
+                f"counted from {data.offset(a)} to {data.offset(b)}" for a, b, kill in kills)
             if life in led.killed and life != led.final:
                 verdict = "reported: a killed SUT life's last drain doesn't hold all of M"
             elif lost < 0:
@@ -6524,7 +6525,7 @@ def check_ledger_tail(data):
             lines.append(f"{sink}: {part}")
         groups.append(f"{sink}: " + "; ".join(parts))
     return Result("ledger.tail", status,
-                  " | ".join(groups) + " (M the sink's output.messages, S the distinct stored "
+                  " | ".join(groups) + " (M the sink's output.datapoints, S the distinct stored "
                   "samples)", lines)
 
 

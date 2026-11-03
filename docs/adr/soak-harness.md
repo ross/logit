@@ -871,18 +871,21 @@ holding, and a graceful stop of VictoriaMetrics drains what its kernel took, so 
 showed that loss. Killing the backend does, but under a cumulative `aggregate` V doesn't move:
 the next window's total covers a lost one, and `ledger.windows` sees the gap but not its size.
 
-- **What shows the loss.** `graphite_out` writes one carbon line per stored sample, and a resend
-  rewrites the same `(series, timestamp)`. So per SUT life, M − S, the lines the sink counted in
-  `logit.output.messages` less the distinct samples the export holds, is what it counted written
-  and the backend never stored. `ledger.tail` judges it; the key is limited to `graphite_out`
-  until another sink's lines map one to one onto stored samples.
+- **What shows the loss.** `graphite_out` writes one carbon datapoint per stored sample, and a
+  resend rewrites the same `(series, timestamp)`. So per SUT life, M − S, the datapoints the sink
+  counted in `logit.output.datapoints` less the distinct samples the export holds, is what it
+  counted written and the backend never stored. M is datapoints, not `logit.output.messages`,
+  which counts frames: one per datapoint under plaintext, one per many under pickle.
+  `ledger.tail` judges it; the key is limited to `graphite_out` until another sink's counts map
+  one to one onto stored samples.
 - **The bound includes the backend's own memory.** VictoriaMetrics buffers ingested rows for
   up to a second and holds them as in-memory parts until `-inmemoryDataFlushInterval`, so a
   SIGKILL also loses rows it read. The sink's `kill_unflushed` names that span (1 s plus the
-  flag), and the bound is the lines the sink counted in the drains from that span plus one
+  flag), and the bound is the datapoints the sink counted in the drains from that span plus one
   aggregate interval before each kill to two SUT drain periods after it. Past the bound, in a
   life with no backend kill, or below 0, the row FAILs. The row can't split socket loss from
-  memory loss; the scenario shortens the flush interval to 5 s to keep the memory part small.
+  memory loss; the scenario pins the flag at its 5 s default, so `kill_unflushed` (1 s plus
+  the flag) names a known value.
 - **The rules that hold it.** A `kill` of a backend needs `kill_unflushed` on a sink
   delivering there, and the key needs `vm_every_window` and a local target. `ledger.windows`
   excuses a gap overlapping a kill's span on such a sink and lists it, leaving its size to
