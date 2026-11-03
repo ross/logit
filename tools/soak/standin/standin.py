@@ -96,6 +96,18 @@ def emit(record):
         sys.stdout.flush()
 
 
+class Server(http.server.ThreadingHTTPServer):
+    """A `ThreadingHTTPServer` that prints no traceback when a client closes or resets its
+    connection under a handler: a sink drops pooled connections, and the stand-in's own reset
+    answer can race a client's next write. Any other handler error prints as
+    `socketserver` prints it."""
+
+    def handle_error(self, request, client_address):
+        if isinstance(sys.exc_info()[1], ConnectionError):
+            return
+        super().handle_error(request, client_address)
+
+
 class State:
     def __init__(self, shape, path):
         self.shape = shape
@@ -538,10 +550,8 @@ def main(argv=None):
                         help="seconds a keep-alive connection may sit idle")
     args = parser.parse_args(argv)
     state = State(args.shape, args.path or DEFAULT_PATH[args.shape])
-    data = http.server.ThreadingHTTPServer(("0.0.0.0", args.data_port),
-                                           data_handler(state, args.idle_timeout))
-    control = http.server.ThreadingHTTPServer(("0.0.0.0", args.control_port),
-                                              control_handler(state))
+    data = Server(("0.0.0.0", args.data_port), data_handler(state, args.idle_timeout))
+    control = Server(("0.0.0.0", args.control_port), control_handler(state))
     # Joined on close, so a SIGTERM waits for each request in flight.
     data.daemon_threads = False
     data.block_on_close = True

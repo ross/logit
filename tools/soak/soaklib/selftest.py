@@ -130,7 +130,8 @@ For a stand-in target, it covers the Snappy decoder against blocks `snap::raw` w
 (`standin/snap-vectors.json`) and the malformed blocks it refuses, the `WriteRequest` walker,
 V rebuilt from a record (a later write replacing an earlier one, a same-value resend counted, a
 changed value and an undecodable body named), the stand-in's own handlers on loopback ports (its
-cue rules, each answer, a reset, a wrong path, and the record line each prints), `post_cue`,
+cue rules, each answer, a reset, a wrong path, and the record line each prints), its server's
+silence on a client's reset, `post_cue`,
 every `respond`, `class`, and `[target] kind = "standin"` rule, the stand-in's compose service,
 the driver re-reading its control port and sending a step's cue and an empty one, and the checks
 over a stand-in two-life run: V judged as an export, the black-hole control FAILing as uncounted
@@ -9149,7 +9150,6 @@ def _standin_server(root):
     cued status with its body, `apply`, a reset, a write to the wrong path, and the record line
     each prints; and `faults.post_cue` against its control port."""
     import http.client
-    import http.server
     import io
     import threading
     server = _load_standin_server(root)
@@ -9170,8 +9170,8 @@ def _standin_server(root):
            "an empty cue and a full one are accepted")
 
     state = server.State("remote_write", "/api/v1/write")
-    data = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.data_handler(state))
-    control = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.control_handler(state))
+    data = server.Server(("127.0.0.1", 0), server.data_handler(state))
+    control = server.Server(("127.0.0.1", 0), server.control_handler(state))
     threads = [threading.Thread(target=one.serve_forever, daemon=True) for one in (data, control)]
     for thread in threads:
         thread.start()
@@ -9423,7 +9423,6 @@ def _standin_count(root):
     the step's cue and timeline carrying it, and `ledger.standin` FAILing a counted step whose
     cue answered fewer writes than its count."""
     import http.client
-    import http.server
     import io
     import threading
     server = _load_standin_server(root)
@@ -9437,8 +9436,8 @@ def _standin_count(root):
            "a counted reset is accepted")
 
     state = server.State("remote_write", "/api/v1/write")
-    data = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.data_handler(state))
-    control = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.control_handler(state))
+    data = server.Server(("127.0.0.1", 0), server.data_handler(state))
+    control = server.Server(("127.0.0.1", 0), server.control_handler(state))
     for one in (data, control):
         threading.Thread(target=one.serve_forever, daemon=True).start()
     printed = io.StringIO()
@@ -9513,16 +9512,41 @@ def _standin_count(root):
 
 
 
+def _standin_quiet_errors(root):
+    """The stand-in's `Server` prints nothing when a client closes or resets its connection
+    under a handler, and prints any other handler error's traceback."""
+    server = _load_standin_server(root)
+    one = server.Server(("127.0.0.1", 0), server.data_handler(
+        server.State("remote_write", "/api/v1/write")))
+    printed = {}
+    real_stderr = sys.stderr
+    try:
+        for error in (ConnectionResetError(104, "Connection reset by peer"),
+                      BrokenPipeError(32, "Broken pipe"), ValueError("a handler bug")):
+            sys.stderr = io.StringIO()
+            try:
+                raise error
+            except Exception:
+                one.handle_error(None, ("127.0.0.1", 1))
+            printed[type(error).__name__] = sys.stderr.getvalue()
+    finally:
+        sys.stderr = real_stderr
+        one.server_close()
+    expect(printed["ConnectionResetError"] == "" and printed["BrokenPipeError"] == "",
+           f"a client's reset or close prints nothing, got {printed}")
+    expect("ValueError: a handler bug" in printed["ValueError"],
+           f"any other handler error prints its traceback, got {printed['ValueError']!r}")
+
+
 def _standin_idle_timeout(root):
     """`data_handler`'s `idle_timeout`: the stand-in closes a keep-alive connection that stays
     idle past it, which `--idle-timeout` sets."""
-    import http.server
     import io
     import socket
     import threading
     server = _load_standin_server(root)
     state = server.State("remote_write", "/api/v1/write")
-    data = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.data_handler(state, 0.5))
+    data = server.Server(("127.0.0.1", 0), server.data_handler(state, 0.5))
     threading.Thread(target=data.serve_forever, daemon=True).start()
     real_stdout = server.sys.stdout
     server.sys.stdout = io.StringIO()
@@ -9899,7 +9923,6 @@ def _datadog_server(root):
     default `202` on `/api/v2/series`, and a `series_errors` answer whose body `datadog_out`'s
     `series_errors` reads as N entries, recorded with the count."""
     import http.client
-    import http.server
     import io
     import threading
     server = _load_standin_server(root)
@@ -9931,8 +9954,8 @@ def _datadog_server(root):
         return found
 
     state = server.State("datadog", "/api/v2/series")
-    data = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.data_handler(state))
-    control = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.control_handler(state))
+    data = server.Server(("127.0.0.1", 0), server.data_handler(state))
+    control = server.Server(("127.0.0.1", 0), server.control_handler(state))
     for one in (data, control):
         threading.Thread(target=one.serve_forever, daemon=True).start()
     printed = io.StringIO()
@@ -9988,7 +10011,6 @@ def _written_counts(root):
     scenario step, and `ledger.standin` holding a short count to the sink's
     `samples.dropped{reason="not_written"}`."""
     import http.client
-    import http.server
     import io
     import threading
     server = _load_standin_server(root)
@@ -10006,8 +10028,8 @@ def _written_counts(root):
            "a 2xx cue with empty headers is accepted")
 
     state = server.State("remote_write", "/api/v1/write")
-    data = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.data_handler(state))
-    control = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.control_handler(state))
+    data = server.Server(("127.0.0.1", 0), server.data_handler(state))
+    control = server.Server(("127.0.0.1", 0), server.control_handler(state))
     for one in (data, control):
         threading.Thread(target=one.serve_forever, daemon=True).start()
     printed = io.StringIO()
@@ -10547,13 +10569,12 @@ def _influx_server(root):
     `Content-Length` and no body on `/api/v2/write`, a second request on the same connection,
     the query split off the path and recorded, a cued status, and `404` off the path."""
     import http.client
-    import http.server
     import io
     import threading
     server = _load_standin_server(root)
     state = server.State("influxdb", "/api/v2/write")
-    data = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.data_handler(state))
-    control = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.control_handler(state))
+    data = server.Server(("127.0.0.1", 0), server.data_handler(state))
+    control = server.Server(("127.0.0.1", 0), server.control_handler(state))
     for one in (data, control):
         threading.Thread(target=one.serve_forever, daemon=True).start()
     printed = io.StringIO()
@@ -10884,13 +10905,12 @@ def _standin_on_loopback(root, shape, path, exchange):
     where `request(method, path, body, headers)` returns `(status, headers, body)` and
     `cue(obj)` posts a cue; returns the record lines it printed."""
     import http.client
-    import http.server
     import io
     import threading
     server = _load_standin_server(root)
     state = server.State(shape, path)
-    data = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.data_handler(state))
-    control = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server.control_handler(state))
+    data = server.Server(("127.0.0.1", 0), server.data_handler(state))
+    control = server.Server(("127.0.0.1", 0), server.control_handler(state))
     for one in (data, control):
         threading.Thread(target=one.serve_forever, daemon=True).start()
     printed = io.StringIO()
@@ -15215,7 +15235,7 @@ def run(root, quiet=False):
                      _rss_settle_rules, _rss_settle_checks, _rss_life_warmup,
                      _expected_rules, _slope_reducer, _standin_codec, _standin_record_parts,
                      _standin_server, _respond_rules, _standin_count, _standin_idle_timeout,
-                     _standin_driver,
+                     _standin_quiet_errors, _standin_driver,
                      _standin_checks, _class_signatures, _written_counts, _datadog_codec,
                      _datadog_counts, _datadog_server,
                      _datadog_rules, _datadog_checks, _influx_codec, _influx_points,
@@ -15241,7 +15261,7 @@ def run(root, quiet=False):
                               _two_sut_driver, _file_action_rules, _relay_rules, _relay_driver,
                               _rss_settle_rules, _expected_rules, _standin_codec, _standin_server,
                               _respond_rules, _standin_count, _standin_idle_timeout,
-                              _standin_driver, _written_counts, _datadog_codec,
+                              _standin_quiet_errors, _standin_driver, _written_counts, _datadog_codec,
                               _datadog_server,
                               _datadog_rules, _influx_codec, _influx_server, _influx_rules,
                               _otlp_standin_codec, _splunk_codec, _otlp_standin_server,
