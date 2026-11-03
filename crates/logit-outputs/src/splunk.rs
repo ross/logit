@@ -2343,6 +2343,36 @@ mod tests {
         assert_counted_once_per_batch(&single, &retried, &ENCODE_SIDE, &PER_ATTEMPT);
     }
 
+    /// An unresolved gauge delta and a repeated metric name each log one warn line, keyed on
+    /// its reason, across a retried batch: the codec raises them through the gated handle.
+    #[tokio::test]
+    async fn each_encode_side_metric_loss_logs_one_line_across_a_retry() {
+        let delta = Event::metric(
+            TS,
+            AttrMap::new(),
+            MetricRecord::new(intern("level"), MetricKind::GaugeDelta(logit_core::MetricValue::F64(1.0))),
+        );
+        let mut twice =
+            Event::metric(TS, AttrMap::new(), MetricRecord::new(intern("cpu"), MetricKind::gauge(1.0)));
+        twice.metrics.push(MetricRecord::new(intern("cpu"), MetricKind::gauge(2.0)));
+        let b = batch(vec![delta, twice, log_event("kept")]);
+        let (lines, _guard) = logit_pipeline::test_util::capture_lines();
+        let (sums, bodies) = run_hec(&[Hec::Busy, Hec::Accept], b, instrumented_hec).await;
+        assert_eq!(bodies.len(), 2, "the batch is retried");
+        for (key, reason, text) in [
+            ("gauge_delta_unresolved", "unresolved_gauge_delta", "relative gauge adjustment"),
+            ("duplicate_name", "duplicate_name", "dropped 1 metric(s)"),
+        ] {
+            let found = lines.with_key(key);
+            assert_eq!(found.len(), 1, "{key}: {found:?}");
+            assert_eq!(found[0].0, logit_pipeline::test_util::Level::WARN, "{key}");
+            assert!(found[0].1.contains(text), "{key}: {}", found[0].1);
+            let dropped = [("reason", reason)];
+            assert_eq!(sum_of(&sums, "logit.output.metrics.dropped", &dropped), 1.0, "{key}");
+        }
+        assert!(lines.with_key("duplicate_name")[0].1.contains("such as cpu"));
+    }
+
     /// A code 6 answered on a retry is Splunk's verdict on that attempt: counted, diagnosed, and
     /// resent without the named object, through the sink's ungated handles.
     #[tokio::test]

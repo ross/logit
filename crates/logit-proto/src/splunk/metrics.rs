@@ -222,6 +222,8 @@ struct MetricObject {
 struct Objects {
     objects: Vec<MetricObject>,
     duplicates: usize,
+    /// The first duplicated name, for the diagnostic.
+    first_duplicate: Option<String>,
 }
 
 impl Objects {
@@ -246,6 +248,7 @@ impl Objects {
         let values = &mut self.objects[at].values;
         if values.iter().any(|(n, _)| *n == name) {
             self.duplicates += 1;
+            self.first_duplicate.get_or_insert(name);
         } else {
             values.push((name, value));
         }
@@ -317,7 +320,14 @@ impl SplunkEncoder {
                     self.count_bool(sum.value);
                     objects.scalar(&sum_type, name, sum.value);
                 }
-                MetricKind::GaugeDelta(_) => self.unencoded(Unencoded::UnresolvedGaugeDelta, 1),
+                MetricKind::GaugeDelta(_) => {
+                    self.unencoded(Unencoded::UnresolvedGaugeDelta, 1);
+                    self.diagnostics.warn_throttled(
+                        "gauge_delta_unresolved",
+                        "a relative gauge adjustment reached a sink unresolved -- add an \
+                         `aggregate` component between the statsd input and this output",
+                    );
+                }
                 MetricKind::ExponentialHistogram(_) => {
                     self.unencoded(Unencoded::Kind("exponential_histogram"), 1);
                 }
@@ -344,6 +354,15 @@ impl SplunkEncoder {
         }
         if objects.duplicates > 0 {
             self.unencoded(Unencoded::DuplicateName, objects.duplicates);
+            let name = objects.first_duplicate.as_deref().unwrap_or_default();
+            self.diagnostics.warn_throttled(
+                "duplicate_name",
+                format_args!(
+                    "dropped {} metric(s) whose name another record of the same event already \
+                     wrote, such as {name}: one HEC object holds one value per name",
+                    objects.duplicates
+                ),
+            );
         }
 
         for object in &objects.objects {

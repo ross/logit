@@ -1188,6 +1188,14 @@ fn encode_flat(
                 reading = reading.wrapping_add(1);
                 let Some(timestamp) = series.timestamp else {
                     encoder.not_encoded(NotEncoded::NoTimestamp);
+                    encoder.diagnostics.warn_throttled(
+                        "no_timestamp",
+                        format_args!(
+                            "dropped a reading of '{}' with no timestamp: remote-write needs \
+                             one on every sample",
+                            family.name
+                        ),
+                    );
                     continue;
                 };
                 flat.clear();
@@ -1497,6 +1505,10 @@ fn label_set(
 ) -> Option<Vec<(String, String)>> {
     if name.is_empty() {
         encoder.not_encoded(NotEncoded::InvalidLabels);
+        encoder.diagnostics.warn_throttled(
+            "invalid_labels",
+            "dropped a sample with an empty metric name, which remote-write can't carry",
+        );
         return None;
     }
     let mut out: Vec<(String, String)> = Vec::with_capacity(labels.len() + 2);

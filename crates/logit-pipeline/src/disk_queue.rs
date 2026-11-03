@@ -4783,7 +4783,7 @@ mod full_buffer_tests {
     use super::test_support::{batch, config, ctx, raw_record, scratch_dir};
     use super::*;
     use crate::buffer_full::fmt_bytes;
-    use crate::buffer_full::test_support::{capture, Lines};
+    use crate::test_util::{capture_lines as capture, Lines};
     use crate::test_util::{TelemetryProbe, RECV_TIMEOUT};
 
     const BLOCKED: &str = "logit.component.buffer.push.blocked";

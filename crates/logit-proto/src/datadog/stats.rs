@@ -721,8 +721,10 @@ fn str_array(v: &[String]) -> Value {
 // ---------------------------------------------------------------------------------------------
 
 impl DatadogEncoder {
-    fn stats_out_dropped(&self, reason: &'static str) {
+    /// Counts a stats record dropped for `reason`, with a throttled diagnostic keyed on it.
+    fn stats_out_dropped(&mut self, reason: &'static str, why: impl std::fmt::Display) {
         self.telemetry.count("logit.output.stats.dropped", 1.0, &[("reason", reason)]);
+        self.diagnostics.warn_throttled(reason, format_args!("datadog stats: {why}"));
     }
 
     fn stats_out_degraded(&self, reason: &'static str) {
@@ -852,7 +854,7 @@ impl DatadogEncoder {
     /// fields read from the event, falling back to the resource, except `Service`: the resource's
     /// `service.name` is the payload's `Service`, so a group's is the event's alone, and a group
     /// that left it empty relays empty.
-    fn group(&self, resource: &Resource, event: &Event) -> (ClientGroupedStats, u64, i64) {
+    fn group(&mut self, resource: &Resource, event: &Event) -> (ClientGroupedStats, u64, i64) {
         let mut g = ClientGroupedStats::default();
         for key in GROUP_STRINGS {
             let value = if key == ATTR_SERVICE_NAME {
@@ -931,7 +933,14 @@ impl DatadogEncoder {
                 (METRIC_ERROR_SUMMARY, MetricKind::Distribution(d)) => {
                     g.error_summary = self.summary(d)
                 }
-                _ => self.stats_out_dropped("unrecognized_record"),
+                _ => self.stats_out_dropped(
+                    "unrecognized_record",
+                    format_args!(
+                        "a stats record dropped: {name} as a {} isn't one of the APM stats \
+                         group's records",
+                        record.kind.name()
+                    ),
+                ),
             }
         }
         (g, duration, shift)

@@ -4542,7 +4542,7 @@ mod tests {
     }
 
     async fn backstop_report(input: Box<dyn Input + Send>) -> Backstop {
-        let (lines, _guard) = crate::buffer_full::test_support::capture();
+        let (lines, _guard) = crate::test_util::capture_lines();
         let (tx, _rx) = mpsc::channel(1);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut probe = TelemetryProbe::new();
@@ -8387,7 +8387,7 @@ mod tests {
             }
         }
 
-        let (lines, _guard) = crate::buffer_full::test_support::capture();
+        let (lines, _guard) = crate::test_util::capture_lines();
         let started = Arc::new(AtomicU64::new(0));
         let release = Arc::new(tokio::sync::Notify::new());
         let mut output = Slow { started: Arc::clone(&started), release: Arc::clone(&release) };

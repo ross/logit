@@ -1171,6 +1171,7 @@ pub fn events_to_families_pending<'a>(
                         // is its whole fate, so its held-back counts go with it.
                         drop(counts);
                         encoder.not_encoded(NotEncoded::TypeConflict);
+                        warn_type_conflict(encoder, key.as_ref());
                     } else {
                         if !counts.0.is_empty() {
                             existing.pending.push((existing.family.series.len(), counts));
@@ -1187,7 +1188,10 @@ pub fn events_to_families_pending<'a>(
                     existing.pending.clear();
                     start_family = true;
                 }
-                Some(_) => encoder.not_encoded(NotEncoded::NameCollision),
+                Some(existing) => {
+                    encoder.not_encoded(NotEncoded::NameCollision);
+                    warn_name_collision(encoder, key.as_ref(), name, existing.origin, 1);
+                }
                 None => start_family = true,
             }
             if !start_family {
@@ -1196,6 +1200,12 @@ pub fn events_to_families_pending<'a>(
             let series = series.take().expect("only the matching-family arm consumes it");
             for _ in 0..displaced {
                 encoder.not_encoded(NotEncoded::NameCollision);
+            }
+            if displaced > 0 {
+                let loser = families.get(key.as_ref()).map(|e| e.origin);
+                if let Some(loser) = loser {
+                    warn_name_collision(encoder, key.as_ref(), loser, name, displaced);
+                }
             }
             let key = key.into_owned();
             families.insert(
@@ -1375,6 +1385,35 @@ fn warn_duplicate_timestamp(encoder: &mut PrometheusEncoder, n: usize) {
              different one, which remote-write can't carry -- add a `dedup_timestamps` \
              component with `precision: 1ms` before this output, or an `aggregate` for a live \
              delta flow"
+        ),
+    );
+}
+
+/// The diagnostic beside a `type_conflict` drop.
+fn warn_type_conflict(encoder: &mut PrometheusEncoder, wire: &str) {
+    encoder.diagnostics.warn_throttled(
+        "type_conflict",
+        format_args!(
+            "dropped a reading of '{wire}' whose type differs from an earlier record of that name \
+             in the batch: Prometheus has one `# TYPE` per name"
+        ),
+    );
+}
+
+/// The diagnostic beside a `name_collision` drop: `n` series of the model name `dropped` lost
+/// the wire name `wire` to the model name `kept`.
+fn warn_name_collision(
+    encoder: &mut PrometheusEncoder,
+    wire: &str,
+    dropped: &str,
+    kept: &str,
+    n: usize,
+) {
+    encoder.diagnostics.warn_throttled(
+        "name_collision",
+        format_args!(
+            "dropped {n} series of '{dropped}': it sanitizes to '{wire}', which '{kept}' also \
+             does, and the name that sorts first is written"
         ),
     );
 }
@@ -1844,6 +1883,32 @@ mod tests {
             PrometheusEncoder::new().with_telemetry(telemetry).with_diagnostics(diagnostics);
         let families = events_to_families(std::iter::once((resource, event)), &mut encoder);
         (families, registry, diag_registry)
+    }
+
+    /// A remote-write family with no timestamp, and one with an empty name, each drop counted with
+    /// a throttled diagnostic keyed on its reason.
+    #[test]
+    fn a_remote_write_encode_drop_raises_its_diagnostic() {
+        let (registry, telemetry) = telemetry();
+        let diagnostics = Diagnostics::new("prometheus_out");
+        let mut encoder =
+            PrometheusEncoder::new().with_telemetry(telemetry).with_diagnostics(diagnostics.clone());
+        let mut stamped = Series::new(labels(&[]), Point::Gauge(1.0));
+        stamped.timestamp = Some(RECEIVED_AT);
+        let groups = vec![vec![
+            family("untimed", FamilyType::Gauge, vec![Series::new(labels(&[]), Point::Gauge(1.0))]),
+            family("", FamilyType::Gauge, vec![stamped]),
+        ]];
+        remote_write::encode(&groups, remote_write::Version::V1, &mut encoder);
+        let points = registry.drain(0);
+        for reason in ["no_timestamp", "invalid_labels"] {
+            assert!(
+                points.iter().any(|e| e.attributes.get("reason").and_then(|v| v.as_str())
+                    == Some(reason)),
+                "{reason} counted"
+            );
+            assert_eq!(diagnostics.occurrences(reason), 1, "{reason} diagnosed");
+        }
     }
 
     fn encode_kind(kind: MetricKind) -> Vec<MetricFamily> {

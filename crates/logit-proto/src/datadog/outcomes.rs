@@ -169,6 +169,44 @@ impl MetricOut {
         MetricOut::EqualDuplicateTimestamp,
     ];
 
+    /// The throttled diagnostic `metric_not_sent` raises beside a drop, as `(key, message)`, so
+    /// every counted loss leaves a line. `None` for an outcome that isn't a loss, and for one
+    /// whose call site raises its own diagnostic with what only it knows.
+    pub(super) fn diagnostic(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            MetricOut::GaugeDelta => Some((
+                "gauge_delta_unresolved",
+                "a relative gauge adjustment reached a sink unresolved -- add an `aggregate` \
+                 component between the statsd input and this output",
+            )),
+            MetricOut::NonFiniteValue => Some((
+                "non_finite_value",
+                "datadog: a NaN or infinite metric value dropped: Datadog has no form for one",
+            )),
+            MetricOut::NonMonotonicBounds => Some((
+                "non_monotonic_bounds",
+                "datadog: a histogram dropped: a bucket's upper bound keys below its lower bound, \
+                 so it can't be sketched",
+            )),
+            MetricOut::SketchRange => Some((
+                "sketch_range",
+                "datadog: an exponential histogram dropped: its buckets fall outside the Agent \
+                 sketch's key range",
+            )),
+            MetricOut::InvalidStatus => Some((
+                "invalid_status",
+                "datadog: a service check dropped: its status isn't an integer from 0 to 3",
+            )),
+            MetricOut::Kind(_)
+            | MetricOut::NoRecordedValue
+            | MetricOut::EmptySketch
+            | MetricOut::EqualDuplicateTimestamp
+            | MetricOut::OversizedSketch
+            | MetricOut::UnresolvedCumulative
+            | MetricOut::DuplicateTimestamp => None,
+        }
+    }
+
     /// The counter and its one tag.
     pub(super) fn counter(self) -> (&'static str, (&'static str, &'static str)) {
         match self {
@@ -242,6 +280,19 @@ mod tests {
         for outcome in MetricOut::ALL {
             let (metric, (key, _)) = outcome.counter();
             assert!(!(metric == OUTPUT_METRICS_DROPPED && key == "metric_kind"), "{outcome:?}");
+        }
+    }
+
+    /// Every `dropped` outcome leaves a line: `metric_not_sent` raises this one, or its call site
+    /// raises its own (`oversized_sketch`, `unresolved_cumulative`, `duplicate_timestamp`).
+    #[test]
+    fn every_dropped_outcome_has_a_diagnostic() {
+        let own =
+            [MetricOut::OversizedSketch, MetricOut::UnresolvedCumulative, MetricOut::DuplicateTimestamp];
+        for outcome in MetricOut::ALL {
+            let dropped = outcome.counter().0 == OUTPUT_METRICS_DROPPED;
+            let raised = outcome.diagnostic().is_some() || own.contains(&outcome);
+            assert_eq!(dropped, raised, "{outcome:?}");
         }
     }
 

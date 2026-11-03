@@ -2850,7 +2850,7 @@ mod tests {
 #[cfg(test)]
 mod full_buffer_tests {
     use super::*;
-    use crate::buffer_full::test_support::{capture, Lines};
+    use crate::test_util::{capture_lines as capture, Lines};
     use crate::buffer_full::{fmt_bytes, REPEAT_INTERVAL};
     use crate::fanout::TraceContext;
     use crate::test_util::{wait_until, TelemetryProbe, RECV_TIMEOUT};
