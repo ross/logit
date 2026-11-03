@@ -13626,7 +13626,8 @@ def _scrape_ledger():
     its end band, a killed life's band reaching below 0 and a stopped life's not, a loss or a
     surplus past the band FAILing, a failed scrape losing nothing, V split at the generator's
     lives, the synthetic samples in E as Y, the samples judged from the listener to the stored
-    export, and recovery judged by a sample scraped."""
+    export, the batches the listener dropped capped at X / 3 when a scrape never reached the
+    sink, and recovery judged by a sample scraped."""
     with tempfile.TemporaryDirectory() as tmp:
         def rows(name, **kwargs):
             return {r.id: r for r in checks.run_all(_scrape_run(tmp, name, **kwargs))}
@@ -13723,6 +13724,16 @@ def _scrape_ledger():
                and "W − X 120 − V_n 118 = 2, counted: within the sink's 2 samples dropped"
                in refused["ledger.egress"].detail,
                f"a sink's dropped batch counts its samples, got {refused['ledger.egress']}")
+        # A scrape whose batch the sink's telemetry never counted received, though the sink
+        # stored it, and that no listener drop explains: X is 0, so the batches it dropped are
+        # capped at 0, and the scrape's synthetic samples stay out of W − X.
+        uncounted_batch = [_line(_stamp(T0 + 320), "logit.component.batches.received", "sum",
+                                 -1, component="sink")]
+        unreached = rows("scrape-batch-unreached", sut_extra=uncounted_batch)
+        expect(unreached["ledger.egress"].status == checks.PASS
+               and "W − X 120 − V_n 120 = 0, exact" in unreached["ledger.egress"].detail,
+               f"a scrape that never reached the sink, with no listener drop, adds no "
+               f"synthetic samples to W − X, got {unreached['ledger.egress']}")
         missing = [_line(_stamp(T0 + 100), "logit.input.samples", "sum", 2, component="scrape")]
         past = rows("scrape-sink-dropped-past", sink_dropped=(99,), sut_extra=missing)
         expect(past["ledger.egress"].status == checks.FAIL
