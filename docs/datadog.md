@@ -294,8 +294,18 @@ Distribution points aren't collapsed, because Datadog keeps both. A relay that
 keeps source timestamps from a source stamping several readings of one series in a second (an
 Agent's unaggregated `|T` gauges, `statsd_in` gauges, `internal`) shows a nonzero dropped count.
 Put a `dedup_timestamps` with `precision: 1s` last before the sink: it keeps the latest gauge and
-sums deltas and `rate`s of one interval. Two points of one series in one second that arrive in two batches are both sent, and
-Datadog keeps the later, uncounted (`docs/known-gaps/datadog.md`).
+sums deltas and `rate`s of one interval.
+
+Across batches, `datadog_out` remembers the latest second it sent each series in, once Datadog
+accepted the request. A later batch's point of that series and second is left off and counted by
+the same rule, with a throttled `duplicate_timestamp_sent` diagnostic: Datadog would let the later
+write replace the earlier, so one of the two is lost either way, and the sink keeps the one already
+stored. An `aggregate`'s shutdown flush is the usual cause: its partial last window can share a
+whole second with the full window before it. The memory lives only as long as the process and
+doesn't see a batch still in flight above `concurrency: 1`, so a pair split across a restart of
+the sink's process, or between two batches in flight together, is still both sent, and Datadog
+keeps the later, uncounted ([known gaps](known-gaps/datadog.md);
+[ADR `datadog-out-sent-second-memory`](adr/datadog-out-sent-second-memory.md)).
 
 The series route also names what it dropped from an accepted request in its `202` body, such as
 a point more than 10 minutes in the future when the sender's clock runs ahead. `datadog_out`

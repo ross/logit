@@ -14182,6 +14182,23 @@ def _delta_ledger():
                and "100 in points never stored outside a cue" in uncued["ledger.value"].detail,
                f"a delta never stored outside a cue is in the gap, got {uncued['ledger.value']}")
 
+        # The sink left one series' point off as a duplicate of a second it had sent, counted:
+        # a delta lost short of the stand-in, inside the band its count allows.
+        def left_off(requests):
+            request = requests[10]
+            series = [("x_1", [(int(T0) + 54, DELTA_PER_DRAIN / DELTA_SERIES)])]
+            requests[10] = _datadog_request(request["seq"], request["t"] - T0, series)
+            return requests
+
+        duplicate = [_line(_stamp(T0 + 55), "logit.output.metrics.dropped", "sum", 1,
+                           component="sink", attrs={"reason": "duplicate_timestamp"})]
+        dup = rows("delta-sent-duplicate", edit=left_off, sut_extra=duplicate)
+        expect(dup["ledger.value"].status == checks.PASS
+               and "= 50, reported: within the 50 " in dup["ledger.value"].detail
+               and "1 delta(s) the sink dropped short of the stand-in" in dup["ledger.value"].detail,
+               f"a point dropped duplicate_timestamp is a delta lost short of the stand-in, got "
+               f"{dup['ledger.value']}")
+
         def named(requests):
             requests[10]["series_errors"] = 1
             return requests

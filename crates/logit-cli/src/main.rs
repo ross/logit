@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 mod admin;
 mod config;
 mod dot;
+mod fdlimit;
 mod pipeline;
 mod signals;
 #[cfg(test)]

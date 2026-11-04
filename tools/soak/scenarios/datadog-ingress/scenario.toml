@@ -124,7 +124,7 @@ window = "through"
 reduce = "delta"
 min = 1
 
-# Every point is a distinct series and second in its batch, so the generator collapses none.
+# No two points share a series and second, so the generator leaves none off.
 [[expect]]
 name = "generator-collapses-none"
 service = "generator"

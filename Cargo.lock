@@ -1087,6 +1087,7 @@ dependencies = [
  "logit-transforms",
  "prost",
  "reqwest",
+ "rustix",
  "rustls",
  "rustls-pki-types",
  "ruzstd",

@@ -743,9 +743,13 @@ counts here: that sink's `batches.dropped{reason="shutdown"}` and a UDP listener
 
 Outside the lifecycle events, `logit run` can log startup `warn` lines before `ready`:
 
-- The listeners' summed `max_connections` reaches the process's open-files limit (Linux only). See
-  ["`max_connections` on a stream listener"](#max_connections-on-a-stream-listener) for its text and
-  the fix.
+- The listeners' summed `max_connections` reaches the process's open-files limit (Linux only).
+  `logit run` has already tried to raise the soft limit to the hard limit, so it means the hard
+  limit is too low, or that the raise failed (the next bullet). See
+  ["`max_connections` on a stream listener"](#max_connections-on-a-stream-listener) for its text
+  and the fix.
+- The soft open-files limit couldn't be raised to the hard limit (Linux only); the line gives the
+  reason. See ["`max_connections` on a stream listener"](#max_connections-on-a-stream-listener).
 - A listener reaches two or more sinks that use `overflow: block` with no `buffer.disk`. See
   [A slow or unreachable sink](#a-slow-or-unreachable-sink).
 - `internal` shares a node with a data path. See
@@ -1521,7 +1525,8 @@ backpressure), but its accept queue has the same shape of problem:
   connection); fix it at the sender before raising `net.core.somaxconn`.
 - `logit.input.accept.errors{reason}` (count): an `accept()` that failed. A burst of file
   descriptor exhaustion shows here as `reason="resource"` while the listener backs off 100 ms and
-  keeps accepting, not as a dead listener; raise the process's `nofile` limit if it recurs.
+  keeps accepting, not as a dead listener; raise the process's hard `nofile` limit if it recurs
+  (`logit run` raises the soft limit to it).
   `reason="fatal"` means the listening socket itself failed, and ends the listener.
 
 ### `handshake_timeout` on a TCP listener
@@ -1742,18 +1747,30 @@ connection, sink socket, tailed file, and disk spool draws from one open-files l
 listeners' caps add up to more than that limit, the process runs out of descriptors before any
 cap is reached: `accept()` fails, counted `logit.input.accept.errors{reason="resource"}`, and a
 sink can fail to connect. A single listener at the default already reaches a soft limit of 1024,
-the stock limit for a systemd service. At `logit run` (not `logit validate`, because the limit belongs to the process rather than
-the config), `logit` sums `max_connections` over every stream listener in the graph and, if the
+the stock limit for a systemd service.
+
+So `logit run` first raises the soft limit to the hard limit, as the Go runtime does for every Go
+program. With the stock Docker and containerd limits (soft 1024, hard 524288) that is 524288, and a
+listener at its default never meets the soft limit. Linux caps the hard limit at `fs.nr_open`, so
+it is never unlimited. A raise logs one `info` line with the old and
+new soft limits; a failed raise logs one `warn` line and startup continues. The raise has no
+setting, and `logit validate` doesn't make it, because the limit belongs to the process rather than
+the config.
+
+After the raise, `logit` sums `max_connections` over every stream listener in the graph and, if the
 total is at or above the soft limit, logs a warning like this one, once:
 
 ```text
-listeners' max_connections total 2048 is at or above the process's open-files limit 1024: the caps can't bind before file descriptors run out; raise the limit (ulimit -n, LimitNOFILE) or lower the caps
+listeners' max_connections total 2048 is at or above the process's open-files limit 1024: the caps can't bind before file descriptors run out; the soft limit is already at the hard limit, so raise the hard limit (systemd's LimitNOFILE=, docker run --ulimit nofile=) or lower the caps
 ```
 
-Raise the limit (`ulimit -n`, systemd's `LimitNOFILE=`, or `docker run --ulimit nofile=`), or
-lower the caps on listeners that don't need them. The check reads `/proc/self/limits`, so it runs
-on Linux only. It's an ordinary `warn`-level self-log, so `internal`'s default `logs: warn`
-carries it into the pipeline too.
+That text means the soft limit is at the hard limit, so the hard limit is too low. Raise it with
+systemd's `LimitNOFILE=` or `docker run --ulimit nofile=`, or lower the caps on listeners that
+don't need them. If the soft limit is below the hard limit, the text says the raise failed instead,
+and the `warn` line above it gives the reason (a seccomp filter that denies `setrlimit`, for
+example). The check reads
+`/proc/self/limits`, so it runs on Linux only. It's an ordinary `warn`-level self-log, so
+`internal`'s default `logs: warn` carries it into the pipeline too.
 
 **Choosing a value.** The default suits most deployments. Lowering it rejects producers that work
 today: a thousand hosts forwarding syslog over TCP, or a thousand OTLP agents each holding one
@@ -3211,15 +3228,17 @@ single observation to attach one to. To keep exemplars, route those records arou
 
 Remote-write holds one sample per series per millisecond, and Datadog's series intake one point
 per series per second. So `prometheus_out`'s remote-write and `datadog_out` each send only the
-latest of a series' readings in one bucket, and count every other one:
+latest of a series' readings in one bucket, and count every other one. `datadog_out` also leaves
+off a point whose series and second an earlier request already sent (see
+below):
 
 | Removed reading | Counter |
 |---|---|
 | a state equal to the reading sent | `logit.output.metrics.normalized{reason="duplicate_timestamp"}` |
 | any other | `logit.output.metrics.dropped{reason="duplicate_timestamp"}`, with a throttled `duplicate_timestamp` diagnostic |
 
-The sink keeps the later reading because Prometheus and Mimir would keep the first of two in one
-request, and Datadog the higher, and neither adds two deltas. A state is a reading a later one
+Within a batch, the sink keeps the later reading because Prometheus and Mimir would keep the first
+of two in one request, and Datadog the higher, and neither adds two deltas. A state is a reading a later one
 fully replaces: a gauge, or a cumulative sum, histogram, or summary.
 An equal state loses nothing: the destination stores the same sample either way, so a relay or a
 retry resending identical points raises no loss alarm. Equal means the whole reading as the sink
@@ -3229,8 +3248,8 @@ increment or a set of observations (a delta count, a rate such as a Datadog `rat
 `samples`, a distribution, a set) counts `dropped` even when equal: two equal ones are two sets of events, and
 only one is sent. Two sets `{alice}` and `{bob}` both write a size of 1, and their union is 2.
 
-A nonzero dropped count means the flow needs a `dedup_timestamps` component, placed last before
-the sink.
+A nonzero dropped count with the `duplicate_timestamp` diagnostic means the flow needs a
+`dedup_timestamps` component, placed last before the sink.
 You meet it on a flow that keeps source timestamps from a source that can stamp two readings of
 one series inside one bucket: `statsd_in` gauges, which share their datagram's arrival time,
 `internal`, and any relay with no `aggregate` in the path. Set `precision:` to the sink's
@@ -3252,7 +3271,16 @@ before_remote_write:
 `rate`s, where the sink
 can only keep one reading. A record it can't merge passes through, and the sink then drops it,
 counted. It works within one batch, so a later batch repeating a series and instant still reaches
-the destination twice (`docs/known-gaps/prometheus.md` and `docs/known-gaps/datadog.md`).
+the destination twice on remote-write (`docs/known-gaps/prometheus.md`), and on `datadog_out`
+across a restart of its own process or between batches in flight together
+(`docs/known-gaps/datadog.md`).
+
+**Across batches**, `datadog_out` remembers the latest second it sent each series in, while its
+process runs. A later batch's point of a series and second an earlier accepted request already sent is left off, and the
+earlier point stays the one Datadog holds. It's counted by the table's rule, with a throttled
+`duplicate_timestamp_sent` diagnostic in place of `duplicate_timestamp`. `dedup_timestamps` doesn't
+remedy it, since it works within one batch. Keep one series' readings of one second in one batch,
+or merge them upstream with an `aggregate` window.
 
 `aggregate` also leaves one point per series, but it's the wrong stage for a timestamp-faithful
 relay. It stamps every point with the flush's wall-clock time, adds up to a window of latency, and
@@ -3694,7 +3722,10 @@ sketch whose `tags` list holds more than 100 strings, so `datadog_out` drops it 
 points in one request, so of each batch's pair `datadog_out` sends the later and counts the other
 `metrics.dropped{reason="duplicate_timestamp"}`, or
 `metrics.normalized{reason="duplicate_timestamp"}` for a gauge equal to the one sent;
-distribution points are kept, as Datadog keeps them. A `dedup_timestamps` with
+distribution points are kept, as Datadog keeps them. Across requests Datadog keeps the later
+write, so a later batch's point of a series and second the sink already sent is left off and
+counted the same way, with a `duplicate_timestamp_sent` warning. The sink remembers what it sent
+only while its process runs, and not for a batch still in flight above `concurrency: 1`. A `dedup_timestamps` with
 `precision: 1s` ahead of the sink merges deltas instead (see
 [Duplicate timestamps](#duplicate-timestamps)).
 
