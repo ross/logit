@@ -13227,6 +13227,72 @@ def _tls_base(root):
     return path, tomllib.loads(path.read_text())
 
 
+def _trust_rules(root):
+    """Every `trust` rule and a rotate's `ca`, on tls-ca-rotation: `cas` required, a list of
+    CA generations ascending with none repeated, and refused elsewhere; `ca` a whole number
+    from 1 on a rotate only; a trust on a service whose config reads the bundle, with a SIGHUP
+    there on a service that doesn't poll; new CAs made in turn; a rotate's CA in the bundle in
+    force; no bundle dropping the CA of a certificate in force; and once per run."""
+    path = root / "scenarios" / "tls-ca-rotation" / "scenario.toml"
+    base = tomllib.loads(path.read_text())
+    loaded = scenario.load(path)
+    expect(scenario.service_problems(loaded, _override_roles(loaded)) == [],
+           f"tls-ca-rotation passes its service rules, got "
+           f"{scenario.service_problems(loaded, _override_roles(loaded))}")
+    steps = scenario.expand(loaded)
+    expect([(s.action, s.cas, s.ca) for s in steps if s.action in ("trust", "rotate")]
+           == [("trust", [1, 2], None), ("rotate", None, 2), ("rotate", None, 2),
+               ("trust", [2], None), ("rotate", None, 2)]
+           and steps[0].expected() == {"cas": [1, 2]},
+           f"each trust's CAs and each rotate's CA reach its step and timeline fields, got "
+           f"{steps}")
+
+    def step(index, **fields):
+        def edit(raw):
+            raw["step"][index].update(fields)
+            for key in [k for k, v in fields.items() if v is None]:
+                del raw["step"][index][key]
+        return edit
+
+    cases = [
+        (step(0, cas=None), "trust needs `cas`", "a trust with no cas"),
+        (step(0, cas=[]), "`cas` must list CA generations", "an empty cas"),
+        (step(0, cas=[2, 1]), "`cas` must list CA generations", "cas out of order"),
+        (step(0, cas=[1, 1, 2]), "`cas` must list CA generations", "a repeated CA"),
+        (step(0, cas=[0, 2]), "`cas` must list CA generations", "CA 0"),
+        (step(0, cas="2"), "`cas` must list CA generations", "cas as a string"),
+        (step(1, cas=[1]), "`cas` is for trust only", "cas on a signal"),
+        (step(2, ca=0), "`ca` must be a CA generation", "CA 0 on a rotate"),
+        (step(2, ca=True), "`ca` must be a CA generation", "ca as a boolean"),
+        (step(4, ca=2), "`ca` is for rotate only", "ca on a probe"),
+        (step(0, cas=[1, 3]), "the next CA generation is 2", "a CA made out of turn"),
+        (step(0, cas=[1]), "`ca` 2 isn't in the trust bundle in force, [1]",
+         "a rotate to a CA no bundle holds"),
+        (step(8, cas=[1]), "drops CA 2, which signs statsd's generation in force",
+         "a bundle dropping the CA of a certificate in force"),
+        (step(0, cas=[2]), "drops CA 1, which signs statsd's generation in force",
+         "a bundle dropping CA 1 before any rotation"),
+        (lambda raw: (step(9, at="7m50s")(raw), step(13, action="pause")(raw)),
+         "nothing loads this bundle",
+         "a trust with no SIGHUP or later start on a service that doesn't poll"),
+        (step(0, on="victoria-metrics"), "victoria-metrics's config reads nothing under "
+         "/tls/trust/live/", "a trust on a service whose config doesn't read the bundle"),
+    ]
+    for edit, needle, what in cases:
+        raw = copy.deepcopy(base)
+        edit(raw)
+        _refused(path, raw, needle, what, roles=_override_roles(loaded))
+    raw = copy.deepcopy(base)
+    raw.pop("max_duration")
+    _refused(path, raw, "a second cycle's bundle would repeat its CA generations",
+             "a trust repeated in a second cycle", duration=2 * 12.5 * 60 + 180,
+             roles=_override_roles(loaded))
+    raw = copy.deepcopy(base)
+    raw.pop("tls")
+    _refused(path, raw, "trust needs a [tls] table", "a trust with no [tls]",
+             roles=_override_roles(loaded))
+
+
 def _tls_rules(root):
     """Every `[tls]`, `rotate`, and `probe` rule: the table's keys, names, DNS names, and
     usages; the keys each step takes and refuses; a rotate's certificate read by its service's
@@ -15115,7 +15181,8 @@ def _tls_stderr_line(offset, key):
 
 
 def _tls_run(tmp, name, served="B2", verified=True, issued=True, first_broken=False,
-             failed_probe=False, reload_failed_at=None, failed_on="logit", lines=()):
+             failed_probe=False, reload_failed_at=None, failed_on="logit", lines=(),
+             issuer=None):
     """A run directory for `tls.served`, `self_log`, and `rise`: statsd first issued as A1
     (notAfter 100), rotated at c0s1 [+100, +140] to gen 2, B2 (notAfter 200), with a SIGHUP
     c0s2 [+110, +120] and a probe c0s3 [+125, +130]; the generator's certificate rotated at
@@ -15124,8 +15191,8 @@ def _tls_run(tmp, name, served="B2", verified=True, issued=True, first_broken=Fa
     `tls_reload_interval: 0s` and the generator's `10s`. `first_broken` makes c0s1 the broken
     one, `issued` False leaves out the `tls_issued` phase, `failed_probe` fails c0s8's apply,
     `reload_failed_at` puts a `tls_reload_failed` line on `failed_on`'s stderr at that offset,
-    and `lines` adds `(service, offset, key)` lines. The SUT's not_after gauge reads 100 until
-    +115 and 200 after it."""
+    and `lines` adds `(service, offset, key)` lines. With `issuer`, c0s1's B2 is CA 2's and c0s3
+    reads `issuer` served. The SUT's not_after gauge reads 100 until +115 and 200 after it."""
     timeline = [_phase("start", 0, t0=T0)]
     if issued:
         timeline.append(_phase("tls_issued", -5, certs={"statsd": {
@@ -15134,12 +15201,15 @@ def _tls_run(tmp, name, served="B2", verified=True, issued=True, first_broken=Fa
     for step_id, action, start, end, fields in (
             ("c0s1", "rotate", 100, 140, {"cert": "statsd", "days": 31, "gen": 2,
                                           "serial": "B2", "not_after": 200,
-                                          **({"broken": True} if first_broken else {})}),
+                                          **({"broken": True} if first_broken else {}),
+                                          **({"ca": 2, "issuer": "logit soak CA 2"}
+                                             if issuer else {})}),
             ("c0s2", "signal", 110, 120, {"signal": "HUP"}),
             ("c0s3", "probe", 125, 130, {"cert": "statsd", "port": 8125,
                                          "serial": "A1" if first_broken else "B2",
                                          "not_after": 100 if first_broken else 200,
-                                         "verified": True}),
+                                         "verified": True,
+                                         **({"issuer": issuer} if issuer else {})}),
             ("c0s4", "rotate", 150, 190, {"cert": "generator", "days": 31, "gen": 2,
                                           "serial": "G2", "not_after": 250}),
             ("c0s6", "rotate", 200, 240, {"cert": "statsd", "days": 32, "gen": 3,
@@ -15221,6 +15291,16 @@ def _tls_checks():
                and "serial differs; notAfter differs" in bad["tls.served.c0s8"].detail
                and bad["tls.served.c0s3"].status == checks.PASS,
                f"a broken rotation's certificate served FAILs, got {bad}")
+        signed = {r.id: r for r in checks.check_tls_served(checks.RunData(
+            _tls_run(tmp, "signed", issuer="logit soak CA 2")))}
+        expect(signed["tls.served.c0s3"].status == checks.PASS
+               and "issuer 'logit soak CA 2'" in signed["tls.served.c0s3"].detail,
+               f"a leaf served by the CA its rotation names PASSes, got {signed}")
+        other = {r.id: r for r in checks.check_tls_served(checks.RunData(
+            _tls_run(tmp, "other-ca", issuer="logit soak CA")))}
+        expect(other["tls.served.c0s3"].status == checks.FAIL
+               and other["tls.served.c0s3"].detail.endswith(": issuer differs"),
+               f"a leaf served by another CA than its rotation's FAILs, got {other}")
         unverified = {r.id: r for r in checks.check_tls_served(checks.RunData(
             _tls_run(tmp, "unverified", verified=False)))}
         expect(unverified["tls.served.c0s8"].status == checks.FAIL
@@ -18246,7 +18326,7 @@ def run(root, quiet=False):
                      _otlp_standin_checks, _splunk_checks, _overlap_rules,
                      _overlap_driver, _overlap_checks, _idp_rules, _refresh_checks,
                      _signal_rules, _signal_actions, _sighup_driver,
-                     _reopen_checks, _tls_rules, _tls_actions, _tls_driver, _tls_checks,
+                     _reopen_checks, _tls_rules, _trust_rules, _tls_actions, _tls_driver, _tls_checks,
                      _reset_actions, _reset_rules, _prlimit_actions, _prlimit_rules,
                      _cgroup_actions, _cgroup_rules, _cgroup_io_device, _cgroup_io_actions,
                      _cgroup_io_rules, _slowclient_client,
@@ -18277,7 +18357,7 @@ def run(root, quiet=False):
                               _splunk_server, _new_shape_rules,
                               _overlap_rules, _overlap_driver, _idp_rules, _signal_rules,
                               _sighup_driver,
-                              _tls_rules, _tls_driver, _reset_rules, _prlimit_rules,
+                              _tls_rules, _trust_rules, _tls_driver, _reset_rules, _prlimit_rules,
                               _cgroup_rules, _cgroup_io_rules, _slowclient_rules,
                               _fan_out_rules, _sampling_vectors,
                               _absent_rules, _merge_rules, _delta_rules, _scrape_rules,
