@@ -3501,7 +3501,11 @@ that items 3, 7, and 11 need.
 - **W32**: item 28: the `cgroup` action, its rules, its window's excuses, self-test fixtures
   for each, the `cpu-quota`, `memory-high`, and `memory-high-pressure` scenarios, an amendment
   to ADR `soak-harness`, and the eight runs of the three recorded under "Findings".
-- **W33** to **W37**: items 29, 31, 32, 33, and 34 in turn, each with its action or
+- **W34**: item 31: the `slowclient` action and its client, `soaklib/slowclient.py`, their
+  rules, self-test fixtures for each, the `slowloris-tcp` and `slowloris-http` scenarios, the
+  killed-life allowance in `ledger.standin` for requests answered after the life's last drain,
+  an amendment to ADR `soak-harness` for each, and both runs recorded under "Findings".
+- **W33**, and **W35** to **W37**: items 29, 32, 33, and 34 in turn, each with its action or
   wire, self-test fixtures for each rule, an amendment to ADR `soak-harness` where it adds a
   ledger rule or an action, and each scenario's run recorded under "Findings". Item 30 has no
   workstream.
@@ -6845,6 +6849,56 @@ What the runs showed about `logit` and the harness:
   the stopped stand-in, which never reach the record, as in W9a.
 - **Self-test**: 2,375 expectations after the merges. Each new rule was reverted in turn and
   failed at least one expectation; the PR lists them.
+
+### W34: slowloris and half-open peers on a TCP and an HTTP listener (2026-11-04)
+
+W34 adds the `slowclient` action and the `slowloris-tcp` and `slowloris-http` scenarios, and
+the killed-life allowance in `ledger.standin`. Both scenarios ran at their default duration on
+the development host (Docker 29.9, SELinux enforcing), one after the other, against
+`logit:soak-w34` built from `soak/w34` (W34 changes no Rust). The client ran in the
+`python:3.13.16-alpine3.24` image the file actions already pull, on the SUT's compose network,
+and was gone after each revert.
+
+| Run | Scenario | Verdict | Highlights |
+|---|---|---|---|
+| `20261104T165809Z` | `slowloris-tcp` | PASS | `silent-closed` 80 first-byte timeouts from 8 silent connections in 60 s; `slots-full` 801 limit refusals and `slots-held` 16 under the trickle; `trickle-holds` 0 closes; `half-open-idle` 8; `fds-released` 17 at most; G = W = Ab = V = 1,271,300, loss judged 36 against 500 |
+| `20261104T171030Z` | `slowloris-http` | PASS | `head-idle` 24 idle closes from 8 trickled heads in 60 s; `slots-full` 810 and `slots-held` 16 under the dribbled bodies; `body-holds` 0 closes; `half-open-idle` 8; `fds-released` 17 at most; G = W = Ab = V = 1,271,300, loss judged 46 against 500 |
+
+A copy of `delta-datadog`'s run `20261104T045821Z`, rescored with the `ledger.standin` change,
+reads PASS where it had WARNed, with "life 1: the stand-in answered 1 request(s) 2xx datadog
+never counted, reported".
+
+What the runs showed about `logit` and the harness:
+
+- **The TCP driver bounds a silent connection and nothing past its first byte.** Each silent
+  connection was closed at `handshake_timeout:` (5 s) and counted, and the client redialed it,
+  80 closes in the window. Under the trickle, 15 connections and the generator's held all 16
+  slots for the whole 90 s window with no close: an LF a second re-arms `idle_timeout:` (20 s)
+  on every read, and the LF framer counts no frame for it, so W gained nothing. The other nine
+  were each accepted and closed at once, 801 `rejected{reason="limit"}` over the client's 825
+  dials, the generator's connection unaffected.
+- **An HTTP head is bounded by `idle_timeout:`, a body is not.** A head trickled a byte a
+  second was closed at the 10 s `idle_timeout:` from accept, since the clock re-arms only on a
+  finished request, 24 closes for 8 connections in 60 s. A body dribbled under a 1 MiB
+  `Content-Length` met the per-frame stall bound with each byte and held its slot until the
+  revert, when the listener counted 15 `logit.input.requests.rejected{reason="body_read"}`, each
+  with its throttled warning. A slot taken that way is released by the client or the size cap,
+  which at a byte a second is about 12 days: the limit ADR `deployment-threat-model` records.
+- **A half-open peer is closed by `idle_timeout:` on both listeners.** Each of the 8
+  connections sent its first byte, saw it acknowledged (`TIOCOUTQ` 0), and lost its network, so
+  no FIN or RST reached the SUT; each was closed `idle` within the window. The SUT's FIN went
+  unanswered, and its descriptor count returned to 17 by the `mark`, the warmup's median.
+- **No warning line accompanies a limit refusal or a timeout close.** Neither run logged a WARN
+  for the 801 and 810 refusals or the 80 and 24 timeout closes; each is counted, and none is a
+  `*.dropped`, so the loss vocabulary asks for no line. Not a finding.
+- **Self-test**: 3,035 expectations. Each new rule was reverted in turn and failed at least one
+  expectation, 36 in all: the client's modes, sends, head, endless head, trickle, redial, the
+  half-open first byte and acknowledgment wait, its usage rule; the apply's network inspect, the
+  start, the `ready` wait and each failure it reads, the disconnect and its cleanup, the
+  revert's stop, `done` read, and failed-apply path; `timeline`'s report; the scenario rules for
+  each key, its range and form, `send` against `silent`, the keys off another action, the
+  SUT-only and `[random]` refusals, and the keys reaching the expanded step. Reverting the
+  `ledger.standin` allowance fails its new killed-life case.
 
 ### W32: a CPU quota and memory pressure on the SUT's cgroup (2026-11-03)
 

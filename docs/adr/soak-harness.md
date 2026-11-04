@@ -1,6 +1,6 @@
 ---
 created: 2026-10-08
-updated: 2026-11-03
+updated: 2026-11-04
 ---
 
 # A soak harness: real containers over ordinary config, one-shot netem, and a reset-aware ledger as the loss oracle
@@ -937,6 +937,56 @@ fails on a read-back that differs; the revert writes what it found back.
   a reason to want one.
 - **On a SUT only, and never in a `[random]` schedule**, which can't set `cpu` or
   `memory_high`.
+
+## Amendment: a `slowclient` step holds a listener's connection slots (2026-11-04)
+
+No fault reached what a listener does with a client that connects and then delivers nothing:
+its connection cap, its first-byte and idle timeouts, and a peer that vanishes with no FIN or
+RST. A `slowclient` step runs a stdlib client of the harness's own (`soaklib/slowclient.py`) in
+a detached container of the `python` image the stand-in and the file actions already pull, on
+the first network of the SUT service it's `on`, against the step's `address`. It opens
+`connections` connections and, by `mode`, sends nothing (`silent`), sends each one byte every
+`interval` (`trickle`), or sends each its first byte and then loses its network (`half_open`).
+What it sends (`send`) is LF bytes, which a stream listener's framer skips with no frame
+counted, an HTTP request head that never ends, or a whole head to `influxdb_in`'s write route
+and then its body's LF bytes, short of the `Content-Length` it declared. It dials again each
+connection the listener closes, as a client sent away comes back. The revert stops it with
+SIGTERM, records the counts it prints, and removes it.
+
+- **A client container of its own, not the generator's namespace.** A `--network
+  container:<generator>` one-shot would share the generator's interfaces, so cutting the
+  client's network would cut the generator's. A container of its own on the compose network
+  reaches the SUT by its service name as the generator does, and its network can go alone.
+- **Half-open by the `partition` mechanism.** Once the peer has acknowledged every byte the
+  client sent (`TIOCOUTQ` reads 0 on each socket), the apply runs `docker network disconnect`
+  on the client: its sockets stay established with no interface under them, so the listener's
+  end sees a peer that sends nothing and answers nothing, and no FIN or RST leaves. That reuses
+  what a `partition` does with no new image or capability; an `iptables` drop in the client's
+  namespace would need both. A connection that sent nothing would meet the first-byte bound
+  instead, so each half-open connection sends its first byte before the cut.
+- **It loses nothing on any leg.** The clients send nothing a listener frames or decodes, so W
+  is the generator's alone, and every wire judges the window. A generator's connection opened
+  before the slots fill goes on as before; a redial inside the window would be refused, and a
+  scenario keeps its generator's connection open from the start.
+- **A step that didn't happen fails.** A client that prints no `ready` line within 30 s, opens
+  no connection, leaves a byte unacknowledged before a half-open cut, or isn't running at the
+  revert, or a disconnect that fails, is `rc` 1, and `timeline` FAILs it. The record carries
+  the client's counts, which `timeline` reports.
+- **Labeled into the compose project**, so `compose down --remove-orphans` removes a client a
+  crashed run left behind.
+- **On a SUT only, and never in a `[random]` schedule**, which can't set `address`, `mode`, or
+  `connections`.
+
+## Amendment: a killed life's requests answered after its last drain are reported (2026-11-04)
+
+`ledger.standin` holds the record's requests per status class to the sink's
+`logit.output.requests` in each SUT life, and WARNed any mismatch in a killed life. A SIGKILL
+takes the sink's last telemetry interval with it, so a request the stand-in answered between
+the life's last drain and the kill is one the sink counted in a drain that never ran: a
+`delta-datadog` run WARNed "the stand-in answered 30 request(s) 2xx, datadog counted 29" for a
+life with one such request. A killed life's shortfall of a class is now reported when it's no
+more than the requests of that class the stand-in recorded from the life's last drain to the
+kill, and resets the same way; a shortfall past it, or a surplus, still WARNs.
 
 ## Amendment: a backend kill is allowed on a tailed sink, and `ledger.tail` measures it (2026-11-03)
 
