@@ -7147,8 +7147,10 @@ def check_ledger_standin(data):
     every answer other than the default carries the cue of a `respond` step and falls inside
     its span, and every write went to the stand-in's path; each step with a `count` answered
     that many writes to the path under its cue; and each step with a `class` shows
-    that class's effect at the sink (`_class_signature`). A killed life's mismatch WARNs, since
-    a kill loses that life's last telemetry interval. Every other target SKIPs.
+    that class's effect at the sink (`_class_signature`). A kill loses that life's last
+    telemetry interval, so a killed life's shortfall of no more requests of a class than the
+    stand-in recorded from the life's last drain to the kill is reported, and any other
+    mismatch in it WARNs. Every other target SKIPs.
 
     Under the `remote_write` shape (`_standin_not_written`), also: per SUT life, the samples the
     stand-in's short `X-Prometheus-Remote-Write-Samples-Written` answers said weren't written
@@ -7256,11 +7258,21 @@ def check_ledger_standin(data):
     sinks = led.sinks
     sink = sinks[0] if sinks else None
     by_life = {}
+    # `{life: {class: n}}`: a killed life's requests the stand-in recorded after the life's
+    # last drain, up to the kill, whose count the killed process never drained.
+    undrained = {}
     for request in requests:
-        life = vm.life_at(led.life_starts, request.get("t") or 0)
+        t = request.get("t") or 0
+        life = vm.life_at(led.life_starts, t)
         cls = standin.status_class(request)
         by_life.setdefault(life, {})
         by_life[life][cls] = by_life[life].get(cls, 0) + 1
+        if life in led.killed and life != led.final:
+            drains = led.sut.life_drains(life)
+            kill = led.out.killed_done.get(life) or led.killed_at[life]
+            if drains and drains[-1] < t <= kill:
+                undrained.setdefault(life, {})
+                undrained[life][cls] = undrained[life].get(cls, 0) + 1
     for life in led.lives:
         recorded = by_life.get(life, {})
         counted = {}
@@ -7269,13 +7281,25 @@ def check_ledger_standin(data):
                 cls = point.attributes.get("class", "?")
                 counted[cls] = counted.get(cls, 0) + point.value
         verdict = WARN if life in led.killed and life != led.final else FAIL
+        late = undrained.get(life, {})
         unrecorded = {"network_error", HTTP_CONNECT_CLASS}
         for cls in sorted((set(recorded) | set(counted)) - unrecorded):
-            if recorded.get(cls, 0) != counted.get(cls, 0):
-                flag(verdict, f"life {life}: the stand-in answered {_n(recorded.get(cls, 0))} "
-                              f"request(s) {cls}, {sink} counted {_n(counted.get(cls, 0))}")
+            short = recorded.get(cls, 0) - counted.get(cls, 0)
+            if short == 0:
+                continue
+            if 0 < short <= late.get(cls, 0):
+                lines.append(f"life {life}: the stand-in answered {_n(short)} request(s) {cls} "
+                             f"{sink} never counted, reported: the stand-in recorded "
+                             f"{_n(late[cls])} {cls} after the killed life's last drain")
+                continue
+            flag(verdict, f"life {life}: the stand-in answered {_n(recorded.get(cls, 0))} "
+                          f"request(s) {cls}, {sink} counted {_n(counted.get(cls, 0))}")
         resets, errors = recorded.get("network_error", 0), counted.get("network_error", 0)
-        if resets > errors:
+        if 0 < resets - errors <= late.get("network_error", 0):
+            lines.append(f"life {life}: the stand-in reset {_n(resets - errors)} request(s) "
+                         f"{sink} never counted, reported: the stand-in reset "
+                         f"{_n(late['network_error'])} after the killed life's last drain")
+        elif resets > errors:
             flag(verdict, f"life {life}: the stand-in reset {_n(resets)} request(s), {sink} "
                           f"counted {_n(errors)} network_error")
         lines.append(f"life {life}: recorded " + (", ".join(

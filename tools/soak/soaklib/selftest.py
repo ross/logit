@@ -14631,7 +14631,7 @@ DELTA_GENERATOR = ("components:\n  load: { type: generate_in }\n"
 
 
 def _delta_run(tmp, name, restart=False, evict_at=None, edit=None, timeline_extra=(),
-               sut_extra=(), gen_extra=(), action="stop"):
+               sut_extra=(), gen_extra=(), action="stop", counted=None):
     """A `sut_delta` run directory that balances in points and in value. The generator sends
     from +5 to +300; each SUT drain receives one window's points and sends their deltas, each
     stored by a `202` request a second before the drain. With `restart`, the SUT is stopped
@@ -14639,7 +14639,8 @@ def _delta_run(tmp, name, restart=False, evict_at=None, edit=None, timeline_extr
     first drain, where the transform skips each series' first point, losing one window's
     increments, and the stand-in stores the rest by one request, their timestamps in life 0. `evict_at` makes the drain at
     that offset an idle eviction: each series evicted and its point skipped, a window's
-    increments lost. `edit(requests)` returns the record's request lines, edited."""
+    increments lost. `edit(requests)` returns the record's request lines, edited, and the sink
+    counts each request `counted(request)` accepts, by default every one."""
     per_point = DELTA_PER_DRAIN / DELTA_SERIES
     gen = []
     for offset in range(5, 301, 5):
@@ -14712,7 +14713,8 @@ def _delta_run(tmp, name, restart=False, evict_at=None, edit=None, timeline_extr
     requests = edit(requests) if edit else requests
     _write_standin(run_dir, requests, shape=standin.DATADOG)
     with open(run_dir / "logs" / "logit.stdout", "a") as out:
-        out.write("\n".join(_standin_telemetry(requests)) + "\n")
+        out.write("\n".join(_standin_telemetry(
+            [r for r in requests if counted is None or counted(r)])) + "\n")
     _write_export(run_dir, "sink", [])
     return run_dir
 
@@ -14863,6 +14865,24 @@ def _delta_ledger():
                and "killed life 0's Ab − V 4 x 50" in " ".join(killed["ledger.value"].lines),
                f"a kill's window holds the points the killed life lost, got "
                f"{killed['ledger.value']}")
+        # A 2xx the stand-in answered after the killed life's last drain at +100 and before
+        # the kill at +101: the sink counted it in a drain the kill took. One before that drain
+        # the life should have counted.
+        def answered_at(offset):
+            def edit(requests):
+                return requests + [_datadog_request(len(requests) + 1, offset, [])]
+            return edit
+
+        for offset, status in ((100.5, checks.PASS), (98.5, checks.WARN)):
+            tail = rows(f"delta-kill-tail-{offset}", restart=True, action="kill",
+                        edit=answered_at(offset),
+                        counted=lambda r, at=T0 + offset: r["t"] != at)["ledger.standin"]
+            reported = ("life 0: the stand-in answered 1 request(s) 2xx sink never counted, "
+                        "reported: the stand-in recorded 1 2xx after the killed life's last "
+                        "drain" in tail.lines)
+            expect(tail.status == status and reported == (status == checks.PASS),
+                   f"a 2xx at +{offset} the killed life never counted "
+                   f"{'is reported' if status == checks.PASS else 'WARNs'}, got {tail}")
         dropped = [_line(_stamp(T0 + 110), "logit.component.batches.dropped", "sum", 1,
                          component="out", attrs={"reason": "overflow_oldest"})]
         overflowed = rows("delta-drop-queue", restart=True, edit=lost_queue, gen_extra=dropped)
