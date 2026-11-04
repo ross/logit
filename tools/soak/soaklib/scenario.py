@@ -92,9 +92,9 @@ STANDIN_ROLES = {"standin": STANDIN_ROLE}
 
 # Every action the scenario schema accepts. faults.py implements them; the names must match its
 # ACTIONS.
-ACTION_NAMES = ("netem", "pause", "stop", "kill", "restart", "partition", "reset", "mark",
-                "exit", "respond", "signal", "rename", "rotate", "probe", "copytruncate", "gzip",
-                "replace")
+ACTION_NAMES = ("netem", "pause", "stop", "kill", "restart", "partition", "reset", "prlimit",
+                "mark", "exit", "respond", "signal", "rename", "rotate", "probe", "copytruncate",
+                "gzip", "replace")
 # The actions that take `port`: a `probe`, which needs the listener's, and a `reset`, which
 # closes only the connections whose local or remote port it is, and every one without it.
 PORT_ACTIONS = ("probe", "reset")
@@ -106,7 +106,15 @@ SUT_ONLY_ACTIONS = {
     "kill": ("on the generator, the lines it sent after its last telemetry drain reach the SUT "
              "with no G behind them, so ledger.wire would net them against real loss"),
     "exit": "an expected exit is one the SUT's own config causes",
+    "prlimit": ("the checks score its window on the SUT's own listeners, files, and sinks, and "
+                "a generator's failed dials have no rule"),
 }
+# A `prlimit` step's `nofile`: the open-files limit, soft and hard, it sets on the SUT's process
+# for its window. Below `PRLIMIT_MIN_NOFILE` the process can't open the stdio and runtime
+# descriptors it starts with; above `PRLIMIT_MAX_NOFILE`, Linux's default `fs.nr_open`, the
+# kernel refuses the hard limit.
+PRLIMIT_MIN_NOFILE = 8
+PRLIMIT_MAX_NOFILE = 1048576
 # The `SUT_ONLY_ACTIONS` allowed on a scrape wire's generator: it sends nothing, so a kill
 # loses only the increments after the SUT's last scrape, which `ledger.wire` bounds per life.
 SCRAPED_GENERATOR_ACTIONS = ("kill",)
@@ -222,7 +230,7 @@ _TARGET_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 PRIVATE_ENV_PREFIX = "soak-env-"
 STEP_KEYS = {"at", "action", "on", "args", "for", "ready", "code", "key", "class", "signal",
-             "path", "to", "cert", "days", "broken", "port", *RESPOND_KEYS}
+             "path", "to", "cert", "days", "broken", "port", "nofile", *RESPOND_KEYS}
 RANDOM_KEYS = {"seed", "gap", "fault"}
 RANDOM_FAULT_KEYS = {"weight", "action", "on", "args", "for"}
 RANGE_KEYS = {"min", "max"}
@@ -543,6 +551,8 @@ class StepSpec:
     days: object = None
     broken: object = None
     port: object = None
+    # A `prlimit`'s open-files limit.
+    nofile: object = None
 
 
 # The `Step` fields `expected()` writes into its JSON and its timeline records, each under its
@@ -554,7 +564,7 @@ STEP_FIELDS = (("ready", "ready"), ("code", "code"), ("key", "key"), ("status", 
                ("invalid_event", "invalid_event"), ("withhold_acks", "withhold_acks"),
                ("fault_class", "class"),
                ("signal", "signal"), ("path", "path"), ("to", "to"), ("cert", "cert"),
-               ("days", "days"), ("broken", "broken"), ("port", "port"))
+               ("days", "days"), ("broken", "broken"), ("port", "port"), ("nofile", "nofile"))
 
 
 @dataclass
@@ -625,6 +635,7 @@ class Step:
     days: object = None
     broken: object = None
     port: object = None
+    nofile: object = None
 
     def expected(self):
         """The fields this step sets (`STEP_FIELDS`), for its JSON and its timeline records."""
@@ -1063,7 +1074,7 @@ def from_dict(raw, path):
             withhold_acks=raw_step.get("withhold_acks"),
             signal=raw_step.get("signal"), path=raw_step.get("path"), to=raw_step.get("to"),
             cert=raw_step.get("cert"), days=raw_step.get("days"), broken=raw_step.get("broken"),
-            port=raw_step.get("port"),
+            port=raw_step.get("port"), nofile=raw_step.get("nofile"),
         ))
         if "for" not in raw_step:
             problems.append(f"{where}: every fault needs `for`, so its revert is scheduled with it")
@@ -2910,6 +2921,7 @@ def validate(scenario, duration=None, seed=None):
         problems += _respond_problems(spec, where, scenario.target.get("shape"))
         problems += _signal_problems(spec, where)
         problems += _tls_step_problems(spec, where, scenario.tls)
+        problems += _prlimit_problems(spec, where)
         if spec.for_ <= 0:
             problems.append(f"{where}: `for` must be longer than 0s")
         if spec.action == "netem":
@@ -3008,6 +3020,21 @@ def validate(scenario, duration=None, seed=None):
                 problems += _schedule_problems(scenario, steps, length)
     if problems:
         raise ScenarioError(problems)
+
+
+def _prlimit_problems(spec, where):
+    """What a step breaks of the `prlimit` rule: `nofile`, a whole number from
+    `PRLIMIT_MIN_NOFILE` to `PRLIMIT_MAX_NOFILE`, required on a `prlimit` and refused
+    elsewhere."""
+    if spec.action != "prlimit":
+        return [f"{where}: `nofile` is for prlimit only"] if spec.nofile is not None else []
+    if spec.nofile is None:
+        return [f"{where}: prlimit needs `nofile`, the open-files limit it sets"]
+    if (not isinstance(spec.nofile, int) or isinstance(spec.nofile, bool)
+            or not PRLIMIT_MIN_NOFILE <= spec.nofile <= PRLIMIT_MAX_NOFILE):
+        return [f"{where}: `nofile` must be a whole number from {PRLIMIT_MIN_NOFILE} to "
+                f"{PRLIMIT_MAX_NOFILE}, got {spec.nofile!r}"]
+    return []
 
 
 def _expected_event_problems(spec, where):
@@ -3487,6 +3514,9 @@ def _random_problems(scenario, duration):
         if template.action == "respond":
             problems.append(f"{where}: respond takes a status or an answer, which a [random] "
                             "fault can't set; write it as a [[step]]")
+        if template.action == "prlimit":
+            problems.append(f"{where}: prlimit takes `nofile`, which a [random] fault can't "
+                            "set; write it as a [[step]]")
         if template.action in NO_WINDOW_ACTIONS:
             problems.append(f"{where}: {template.action} opens no fault window and takes keys a "
                             "[random] fault can't set; write it as a [[step]]")
@@ -3849,7 +3879,7 @@ def expand(scenario, duration=None, seed=None):
                     after=spec.after, partial_success=spec.partial_success,
                     invalid_event=spec.invalid_event, withhold_acks=spec.withhold_acks,
                     signal=spec.signal, path=spec.path, to=spec.to, cert=spec.cert,
-                    days=spec.days, broken=spec.broken, port=spec.port,
+                    days=spec.days, broken=spec.broken, port=spec.port, nofile=spec.nofile,
                 ))
         cycle += 1
     steps.sort(key=lambda s: (s.start, s.spec_index))

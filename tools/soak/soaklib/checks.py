@@ -599,7 +599,8 @@ def stalled(results):
 def check_timeline(data):
     """FAILs when the schedule didn't run as written: an apply or revert that returned nonzero,
     a fail-fast stop, or a start or unpause of a `logit` service with no `ready` record. An
-    early revert in the end sequence isn't probed, so it needs none."""
+    early revert in the end sequence isn't probed, so it needs none. A `prlimit` whose process
+    started again inside its window is reported: its limit went with the old process."""
     if data.t0 is None:
         return Result("timeline", SKIP, "no timeline start")
     lines = []
@@ -628,10 +629,15 @@ def check_timeline(data):
             lines.append(f"{record['on']} {'unpaused' if action == 'pause' else 'started'} at "
                          f"{data.offset(record.get('finished_at'))} ({record.get('step')}) "
                          "with no readiness probe recorded")
+    gone = [f"{record.get('step')} (prlimit on {record.get('on')}): the process started again "
+            "inside the window, so its limit ended there and nothing was restored"
+            for record in actions
+            if record["event"] == "revert" and record.get("started_in_window")]
     if lines:
-        return Result("timeline", FAIL, lines[0], lines)
+        return Result("timeline", FAIL, lines[0], lines + gone)
     return Result("timeline", PASS, f"{len(actions)} apply/revert action(s) returned 0; "
-                  f"{starts} start(s) or unpause(s) each probed; no fail fast")
+                  f"{starts} start(s) or unpause(s) each probed; no fail fast"
+                  + "".join(f"; {line}" for line in gone), gone)
 
 
 def check_exit(data):
@@ -1800,8 +1806,13 @@ TAIL_REPLAY_FILES = 2
 # `RotateConfig`). It counts the active file.
 DEFAULT_FILE_OUT_MAX_FILES = 5
 # The SUT actions during which a file wire's tailer reads nothing while its writer keeps
-# rotating (`_file_retention_problems`).
-FILE_RETENTION_ACTIONS = ("pause", "stop", "kill", "restart", "exit")
+# rotating.
+FILE_DOWN_ACTIONS = ("pause", "stop", "kill", "restart", "exit")
+# Those and a `prlimit`, during which the tailer can open no file the writer creates, which
+# `_file_retention_problems` and `_cri_writer_problems` bound. A pause and a prlimit keep the
+# files the tailer has open (`FILE_HELD_ACTIONS`), and a prlimit's tailer goes on reading them.
+FILE_RETENTION_ACTIONS = FILE_DOWN_ACTIONS + ("prlimit",)
+FILE_HELD_ACTIONS = ("pause", "prlimit")
 _SIZE_UNITS = {"B": 1, "KB": 1000, "MB": 1000 ** 2, "GB": 1000 ** 3,
                "KiB": 1024, "MiB": 1024 ** 2, "GiB": 1024 ** 3}
 # On a TCP wire the actions that end a SUT or generator process, a `reset` of a connection, or a
@@ -3168,7 +3179,7 @@ class Ledger:
         low = high = 0
         lines = []
         down = [fault for fault in self.data.faults
-                if fault.on == self.inn.service and fault.action in FILE_RETENTION_ACTIONS]
+                if fault.on == self.inn.service and fault.action in FILE_DOWN_ACTIONS]
         for source in self.sources:
             if source.get("sut_listener") not in listeners or source_wire(source) != FILE_WIRE:
                 continue
@@ -4369,6 +4380,11 @@ def _file_writers(data, led, source):
             for sink in source_ids(source, "generator_sink")]
 
 
+def _held(fault):
+    """How a `FILE_RETENTION_ACTIONS` fault held the tailer, for a retention guard's line."""
+    return "was down" if fault.action in FILE_DOWN_ACTIONS else "was at its open-files limit"
+
+
 def _file_retention_problems(data, led, source):
     """One problem per window of the ingress SUT's `FILE_RETENTION_ACTIONS` in which a file
     source's writer rotated often enough to delete a file the tailer hadn't read. `file_out`
@@ -4381,7 +4397,8 @@ def _file_retention_problems(data, led, source):
     - A pause keeps the tailer's descriptors, so a file it had open stays readable after a
       deletion. Only a file the writer created after the pause began is lost: created at the
       pause's first rotation, it's deleted at its `max_files + 1`th, so the limit is
-      `max_files`.
+      `max_files`. A `prlimit` keeps them too, and its tailer can't open a file created in its
+      window, so it takes the pause's limit.
 
     A restarted tailer never finds a deleted file, and the loss is counted only as far as the
     last checkpoint knew (docs/known-gaps/tailing.md), so the ledger can't see all of it any
@@ -4397,12 +4414,12 @@ def _file_retention_problems(data, led, source):
         for fault in data.faults:
             if fault.on != service or fault.action not in FILE_RETENTION_ACTIONS:
                 continue
-            limit = max_files if fault.action == "pause" else max(1, max_files - 2)
+            limit = max_files if fault.action in FILE_HELD_ACTIONS else max(1, max_files - 2)
             rotated = gen.counter_in("logit.output.file.rotations", fault.start - pad,
                                      fault.end + pad, component=sink)
             if rotated >= limit:
                 problems.append(
-                    f"the writer rotated {_n(rotated)} time(s) while the SUT was down "
+                    f"the writer rotated {_n(rotated)} time(s) while the SUT {_held(fault)} "
                     f"({fault.action} [{data.offset(fault.start)}, {data.offset(fault.end)}]), "
                     f"enough to delete a file it hadn't read: {sink} keeps {max_files} files, "
                     f"so {limit} rotation(s) in a {fault.action} trip the guard")
@@ -4597,8 +4614,8 @@ CRI_SPLIT = "soak.writer.lines.split"
 # The rotations a SUT down window may hold before a `cri` writer compresses a file the tailer
 # hadn't finished, which `cri_in` never reads: a rotation compresses every uncompressed rotated
 # file, so a stop, kill, restart, or `exit` loses the live file's unread tail at its second
-# rotation, and a pause, whose tailer keeps reading what it holds open, the file created at
-# its first rotation at its third.
+# rotation, and a pause or a `prlimit`, whose tailer keeps what it holds open, the file
+# created at its first rotation at its third.
 CRI_DOWN_ROTATIONS = 2
 CRI_PAUSE_ROTATIONS = 3
 
@@ -4632,12 +4649,13 @@ def _cri_writer_problems(data, led, source, G, S):
     for fault in data.faults:
         if fault.on != led.inn.service or fault.action not in FILE_RETENTION_ACTIONS:
             continue
-        limit = CRI_PAUSE_ROTATIONS if fault.action == "pause" else CRI_DOWN_ROTATIONS
+        limit = (CRI_PAUSE_ROTATIONS if fault.action in FILE_HELD_ACTIONS
+                 else CRI_DOWN_ROTATIONS)
         rotated = sum(gen.counter_in(CRI_ROTATIONS, fault.start - pad, fault.end + pad,
                                      component=sink) for sink in sinks)
         if rotated >= limit:
             problems.append(
-                f"the writer rotated {_n(rotated)} time(s) while the SUT was down "
+                f"the writer rotated {_n(rotated)} time(s) while the SUT {_held(fault)} "
                 f"({fault.action} [{data.offset(fault.start)}, {data.offset(fault.end)}]), "
                 f"enough to compress a file it hadn't read: {limit} rotation(s) in a "
                 f"{fault.action} trip the guard")

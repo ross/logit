@@ -7989,6 +7989,30 @@ def _file_ledger():
         expect(short_pause["ledger.wire"].status == checks.PASS,
                f"seven rotations in a pause pass, got {short_pause['ledger.wire']}")
 
+        # A prlimit keeps the tailer's open files too and fails its opens of new ones, so it
+        # takes the pause's limit: eight rotations in its window trip the guard, seven don't.
+        limited = [_action("apply", "c0s2", "prlimit", "logit", 200, 201, nofile=24,
+                           found=[1024, 524288], affects_file_ingress=True),
+                   _action("revert", "c0s2", "prlimit", "logit", 260, 260, restored=True)]
+
+        def limit(name, rotations, **kwargs):
+            run_dir = _ledger_run(tmp, name, shutdown_drops=0, life0_extra=30,
+                                  timeline_extra=limited)
+            return {r.id: r for r in checks.run_all(_as_file_wire(
+                run_dir, rotations={o: 1 for o in range(205, 205 + 5 * rotations, 5)},
+                max_files=8, **kwargs))}
+
+        long_limit = limit("file-retention-prlimit", 8, counted=deleting(files=8))
+        expect(long_limit["ledger.wire"].status == checks.FAIL
+               and long_limit["ledger.wire"].detail.startswith(
+                   "the writer rotated 8 time(s) while the SUT was at its open-files limit "
+                   "(prlimit [+200s, +260s]), enough to delete a file it hadn't read: out keeps 8 files, so 8 "
+                   "rotation(s) in a prlimit trip the guard"),
+               f"a prlimit over max_files rotations FAILs, got {long_limit['ledger.wire']}")
+        short_limit = limit("file-retention-prlimit-under", 7)
+        expect(short_limit["ledger.wire"].status == checks.PASS,
+               f"seven rotations in a prlimit pass, got {short_limit['ledger.wire']}")
+
         # A killed life at 200 lines/s, 5 s drains, and a 5 s checkpoint_interval: below, 1,000
         # lost counts; above, 1,000 lines plus two files x 690 lines a 64 KiB read holds at 95
         # bytes a line; the stopped life adds one split.
@@ -13156,6 +13180,168 @@ def _reset_actions():
            "a reset's window is reported on TCP and judged on HTTP")
 
 
+class _PrlimitDocker:
+    """Records each `run_oneshot` call and answers with the next of `answers`; `inspect` answers
+    with `state`, which a test changes between calls."""
+
+    def __init__(self, answers, state):
+        self.calls = []
+        self.answers = list(answers)
+        self.state = state
+
+    def run_oneshot(self, args, timeout=None):
+        self.calls.append(list(args))
+        return self.answers.pop(0)
+
+    def inspect(self, container, timeout=None):
+        return {"State": dict(self.state)}
+
+    def __getattr__(self, name):
+        raise AssertionError(f"_PrlimitDocker.{name} called")
+
+
+def _prlimit_actions():
+    """A `prlimit` reads PID 1's open-files limit in the target's PID namespace with
+    SYS_RESOURCE, then sets the step's `nofile` as both limits; its revert sets what it found
+    back, or, when the process started again inside the window, sets nothing and says so; a read
+    that printed no limit fails the step and leaves nothing to restore; it affects TCP, HTTP,
+    file, and Kafka ingress on the ingress SUT, and egress, never UDP; and `timeline` reports a
+    start inside its window."""
+    running = {"Status": "running", "StartedAt": "2026-10-08T12:00:00Z"}
+    ok = docker.Result(0, "", "")
+    fake = _PrlimitDocker([docker.Result(0, "1024 524288\n", ""), ok, ok], running)
+    ctx = faults.Context(docker=fake, ids={"logit": "sut"}, netem_image="netem")
+    step = scenario.Step("c0s2", 1, 0, "prlimit", "logit", "", 130.0, 210.0, nofile=24)
+    head = ["--pid", "container:sut", "--cap-add", "SYS_RESOURCE", "--entrypoint",
+            "/usr/bin/prlimit", "netem", "--pid", "1"]
+    result = faults.ACTIONS["prlimit"].apply(ctx, step)
+    expect(fake.calls == [head + ["--nofile", "--raw", "--noheadings", "--output", "SOFT,HARD"],
+                          head + ["--nofile=24:24"]]
+           and result["rc"] == 0 and result["found"] == [1024, 524288]
+           and result["nofile"] == 24 and "--security-opt" not in fake.calls[0],
+           f"a prlimit reads PID 1's limit, then sets nofile soft and hard, got {fake.calls} "
+           f"{result}")
+    result = faults.ACTIONS["prlimit"].revert(ctx, step)
+    expect(fake.calls[-1] == head + ["--nofile=1024:524288"] and result["rc"] == 0
+           and result["restored"] is True and step.id not in ctx.state,
+           f"a prlimit's revert sets the limit it found back, got {fake.calls[-1]} {result}")
+
+    fake = _PrlimitDocker([docker.Result(0, "1024 unlimited\n", ""), ok], running)
+    ctx = faults.Context(docker=fake, ids={"logit": "sut"}, netem_image="netem")
+    faults.ACTIONS["prlimit"].apply(ctx, step)
+    fake.state = {"Status": "running", "StartedAt": "2026-10-08T12:03:00Z"}
+    calls = len(fake.calls)
+    result = faults.ACTIONS["prlimit"].revert(ctx, step)
+    expect(len(fake.calls) == calls and result["rc"] == 0 and result["restored"] is False
+           and result["started_in_window"] is True,
+           f"a process started inside the window has its own limit, so the revert sets "
+           f"nothing, got {result}")
+    fake.state = running
+    ctx.state[step.id] = {"found": [1024, "unlimited"], "started_at": running["StartedAt"]}
+    fake.answers.append(ok)
+    faults.ACTIONS["prlimit"].revert(ctx, step)
+    expect(fake.calls[-1][-1] == "--nofile=1024:unlimited",
+           f"an unlimited hard limit is set back as found, got {fake.calls[-1]}")
+
+    for printed, rc in (("", 0), ("1024\n", 0), ("soft hard\n", 0), ("", 1)):
+        fake = _PrlimitDocker([docker.Result(rc, printed, "")], running)
+        ctx = faults.Context(docker=fake, ids={"logit": "sut"}, netem_image="netem")
+        result = faults.ACTIONS["prlimit"].apply(ctx, step)
+        expect(result["rc"] != 0 and len(fake.calls) == 1 and step.id not in ctx.state
+               and faults.ACTIONS["prlimit"].revert(ctx, step)
+               == {"rc": 0, "stderr": "", "restored": False},
+               f"a read that printed {printed!r} with rc {rc} fails the step, sets nothing, "
+               f"and leaves nothing to restore, got {result}")
+
+    roles = {"logit": "sut", "generator": "generator", "victoria-metrics": "backend"}
+    action = faults.ACTIONS["prlimit"]
+    on_sut = scenario.Step("x", 0, 0, "prlimit", "logit", "", 0.0, 1.0, nofile=24)
+    expect(all(action.affects(wire, on_sut, roles) for wire in ("tcp", "http", "file", "kafka"))
+           and not action.affects("udp", on_sut, roles) and action.affects_egress(on_sut, roles),
+           "a prlimit on the SUT affects TCP, HTTP, file, and Kafka ingress and egress, never "
+           "UDP")
+    fault = checks.Fault(step="c0s2", action="prlimit", on="logit", start=0.0, end=1.0,
+                         affects_udp_ingress=False, affects_egress=True)
+    expect(checks.wire_judgment(fault, "tcp") == "judged"
+           and checks.wire_judgment(fault, "http") == "judged",
+           "a prlimit's window is judged on TCP and HTTP")
+    with tempfile.TemporaryDirectory() as tmp:
+        timeline = [_phase("start", 0, t0=T0),
+                    _action("apply", "c0s2", "prlimit", "logit", 130, nofile=24,
+                            found=[1024, 524288]),
+                    _action("revert", "c0s2", "prlimit", "logit", 210, restored=False,
+                            started_in_window=True)]
+        result = _status(_run_dir(tmp, "prlimit-restarted", timeline), checks.check_timeline)
+        expect(result.status == checks.PASS
+               and "c0s2 (prlimit on logit): the process started again inside the window"
+               in result.detail,
+               f"timeline reports a prlimit whose process started inside it, got {result}")
+
+
+def _prlimit_rules(root):
+    """`load()`'s rules for a `prlimit` step: `nofile` required, a whole number in range, and
+    refused on any other action; a prlimit on the SUT only, and never in a [random] schedule;
+    and the shipped fd-limit scenarios' limits and expectations."""
+    path, raw = _base(root)
+
+    def with_step(**fields):
+        changed = copy.deepcopy(raw)
+        changed["step"] = [{"at": "0s", "action": "prlimit", "on": "logit", "for": "10s",
+                            **fields}]
+        return changed
+
+    try:
+        loaded = scenario.from_dict(with_step(nofile=64), path)
+        scenario.validate(loaded)
+        expanded = scenario.expand(loaded)
+        expect(loaded.steps[0].nofile == 64 and expanded[0].nofile == 64
+               and expanded[0].expected() == {"nofile": 64},
+               f"a prlimit's nofile reaches its step and its records, got {expanded[0]}")
+    except scenario.ScenarioError as err:
+        expect(False, f"a prlimit with nofile 64 loads, got {err.problems}")
+    _refused(path, with_step(), "prlimit needs `nofile`", "a prlimit with no nofile")
+    for nofile in (0, 7, 1048577, "64", 64.0, True):
+        _refused(path, with_step(nofile=nofile), "`nofile` must be a whole number from 8 to "
+                 "1048576", f"a prlimit's nofile {nofile!r}")
+    changed = copy.deepcopy(raw)
+    changed["step"][0]["nofile"] = 64
+    _refused(path, changed, "`nofile` is for prlimit only",
+             f"nofile on a {raw['step'][0]['action']}")
+    _refused(path, with_step(nofile=64, args="64"), "`args` is for netem only",
+             "args on a prlimit")
+    gen = with_step(nofile=64)
+    gen["step"][0]["on"] = "generator"
+    _refused(path, gen, "prlimit is for logit only", "a prlimit on the generator")
+    rand = copy.deepcopy(raw)
+    for key in ("cycle", "step", "expect"):
+        rand.pop(key, None)
+    rand["random"] = {"seed": 1, "gap": {"min": "60s", "max": "90s"},
+                      "fault": [{"weight": 1, "action": "prlimit", "on": "logit",
+                                 "for": {"min": "10s", "max": "20s"}}]}
+    _refused(path, rand, "prlimit takes `nofile`, which a [random] fault can't set",
+             "a prlimit in a [random] schedule")
+
+    for name, metric in (("fd-limit-tcp", "logit.input.accept.errors"),
+                         ("fd-limit-tail", "logit.input.scan.errors")):
+        shipped = scenario.load(root / "scenarios" / name / "scenario.toml")
+        limits = [one for one in scenario.expand(shipped) if one.action == "prlimit"]
+        rows = {exp.name: exp.to_json() for exp in shipped.expectations}
+        landed = rows.get("limit-landed", {})
+        expect(len(limits) == 1 and limits[0].on == "logit"
+               and landed.get("step") == limits[0].id and landed.get("window") == "during"
+               and landed.get("reduce") == "min"
+               and landed.get("min") == landed.get("max") == limits[0].nofile
+               and landed.get("metric") == "logit.process.fds.limit",
+               f"{name} limits the SUT once and expects logit.process.fds.limit to read the "
+               f"limit inside the window, got {limits} {landed}")
+        failed = [exp for exp in rows.values() if exp.get("metric") == metric
+                  and limits and exp.get("step") == limits[0].id]
+        expect({(exp.get("window"), exp.get("min"), exp.get("max")) for exp in failed}
+               == {("during", 1, None), ("after", None, 0)},
+               f"{name} expects {metric} above 0 inside the window and 0 after it, got "
+               f"{failed}")
+
+
 def _reset_rules(root):
     """`load()`'s rules for a `reset` step's `port`, a reset under `[overlap]` held to the
     holder, and the shipped syslog-tcp-ingress scenario's reset with its positive expectation."""
@@ -16024,7 +16210,7 @@ def run(root, quiet=False):
                      _overlap_driver, _overlap_checks, _idp_rules, _refresh_checks,
                      _signal_rules, _signal_actions, _sighup_driver,
                      _reopen_checks, _tls_rules, _tls_actions, _tls_driver, _tls_checks,
-                     _reset_actions, _reset_rules,
+                     _reset_actions, _reset_rules, _prlimit_actions, _prlimit_rules,
                      _fan_out_ledger, _idle_writer, _boundary_skew, _fan_out_rules,
                      _sampling_vectors, _absent_rules, _absent_checks, _merge_ledger,
                      _merge_rules, _delta_ledger, _delta_rules, _scrape_ledger,
@@ -16050,7 +16236,8 @@ def run(root, quiet=False):
                               _splunk_server, _new_shape_rules,
                               _overlap_rules, _overlap_driver, _idp_rules, _signal_rules,
                               _sighup_driver,
-                              _tls_rules, _tls_driver, _reset_rules, _fan_out_rules, _sampling_vectors,
+                              _tls_rules, _tls_driver, _reset_rules, _prlimit_rules,
+                              _fan_out_rules, _sampling_vectors,
                               _absent_rules, _merge_rules, _delta_rules, _scrape_rules)
                 part(root) if part in takes_root else part()
             except Exception as err:  # report the part that broke, then keep going

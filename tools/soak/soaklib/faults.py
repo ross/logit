@@ -26,6 +26,14 @@ Facts a maintainer needs here (docs/plans/soak-harness.md, "Netem scope"):
   unconfined container (`--security-opt label=disable`, which a `reset` run passes). A reset that closed no
   connection is `rc` 1, so `timeline` FAILs it and it gets no window. Its revert does nothing:
   the client dials again on its own.
+- A `prlimit` is a one-shot netem container in the target's PID namespace
+  (`--pid container:<id>`) with CAP_SYS_RESOURCE, running util-linux's `prlimit` against PID 1,
+  which is `logit`: compose.yaml's entrypoint runs it with no init. The apply reads the soft and
+  hard `RLIMIT_NOFILE` (`found`), then sets both to the step's `nofile`; the revert sets
+  `found` back. Neither needs `label=disable`, and `docker update` can't change a running
+  container's ulimits. Lowering the limit closes nothing already open. A process started
+  inside the window starts with the container's own limit, so the fault is gone: the revert
+  then sets nothing and records `started_in_window`, as a pause's revert records `unpaused`.
 - A `kill` is `docker kill -s KILL`: the process gets no shutdown signal, so it writes no final
   `internal` drain, no shutdown drops, and no `exiting` or `drain complete` line, and the container
   exits with `KILL_EXIT_CODE`. Its revert is a `docker start`, as a `stop`'s is. The container is
@@ -103,6 +111,9 @@ FILEOPS_IMAGE = "python:3.13.16-alpine3.24"
 FILEOPS_SOURCE = Path(fileops.__file__).read_text()
 FILEOPS_TIMEOUT_S = 60
 FILEOPS_PULL_TIMEOUT_S = 600
+# util-linux's `prlimit` in the netem image, and the PID it acts on in the target's namespace.
+PRLIMIT_ENTRYPOINT = "/usr/bin/prlimit"
+PRLIMIT_PID = "1"
 
 
 @dataclass
@@ -207,6 +218,60 @@ def reset_apply(ctx, step):
                                     "nothing on a kernel without CONFIG_INET_DIAG_DESTROY or "
                                     "under an LSM (SELinux) denial of the sock_diag socket"))
     return record
+
+
+def prlimit_argv(ctx, step, *args):
+    """`docker run --rm` arguments for one `prlimit` call on PID 1 in the target's PID
+    namespace."""
+    return ["--pid", f"container:{ctx.ids[step.on]}", "--cap-add", "SYS_RESOURCE",
+            "--entrypoint", PRLIMIT_ENTRYPOINT, ctx.netem_image, "--pid", PRLIMIT_PID, *args]
+
+
+def nofile_limits(result):
+    """`[soft, hard]` from `prlimit --nofile --raw --noheadings --output SOFT,HARD`, each an int
+    or `"unlimited"`, or None when the output isn't two such words."""
+    words = result.stdout.split()
+    if len(words) != 2:
+        return None
+    try:
+        return [word if word == "unlimited" else int(word) for word in words]
+    except ValueError:
+        return None
+
+
+def prlimit_apply(ctx, step):
+    """Reads the target's open-files limit (`found`), sets it to `step.nofile`, soft and hard,
+    and leaves `found` and the process's start time for the revert. A read that printed no
+    limit is `rc` 1 and sets nothing."""
+    started = _started_at(ctx, step.on)
+    read = ctx.docker.run_oneshot(prlimit_argv(
+        ctx, step, "--nofile", "--raw", "--noheadings", "--output", "SOFT,HARD"))
+    found = nofile_limits(read)
+    if read.rc != 0 or found is None:
+        record = _record(read)
+        record.update(rc=read.rc or 1, stderr=record["stderr"] or
+                      f"prlimit printed no limit: {read.stdout.strip()[-200:]!r}")
+        return record
+    ctx.state[step.id] = {"found": found, "started_at": started}
+    limit = f"--nofile={step.nofile}:{step.nofile}"
+    result = ctx.docker.run_oneshot(prlimit_argv(ctx, step, limit))
+    return _record(result, found=found, nofile=step.nofile)
+
+
+def prlimit_revert(ctx, step):
+    """Sets the limit the apply found back, unless the process started again inside the window,
+    whose new process has the container's own limit: the record then says so
+    (`started_in_window`) and sets nothing. An apply that failed left nothing to restore."""
+    saved = ctx.state.pop(step.id, None)
+    if saved is None:
+        return {"rc": 0, "stderr": "", "restored": False}
+    state = (ctx.docker.inspect(ctx.ids[step.on]) or {}).get("State") or {}
+    if state.get("Status") != "running" or state.get("StartedAt") != saved["started_at"]:
+        return {"rc": 0, "stderr": "", "restored": False, "started_in_window": True,
+                "status": state.get("Status")}
+    soft, hard = saved["found"]
+    result = ctx.docker.run_oneshot(prlimit_argv(ctx, step, f"--nofile={soft}:{hard}"))
+    return _record(result, restored=result.rc == 0, nofile=saved["found"])
 
 
 def _started_at(ctx, service):
@@ -577,6 +642,20 @@ ACTIONS = {
         affects_file_ingress=_never,
         affects_http_ingress=_on_ingress_sut_or_generator,
         affects_kafka_ingress=_on_kafka_path,
+    ),
+    # A limit on the SUT fails its accepts, opens, and dials once its descriptors reach it: a
+    # TCP or HTTP sender's connection waits in the accept queue, a tailer's new file waits for
+    # the next scan, and a sink's redial is retried. It loses nothing on any of them, so no wire
+    # reports its window; it never touches a bound UDP socket.
+    "prlimit": Action(
+        apply=prlimit_apply,
+        revert=prlimit_revert,
+        affects_udp_ingress=_never,
+        affects_egress=_on_sut_or_destination,
+        affects_tcp_ingress=_on_ingress_sut,
+        affects_file_ingress=_on_ingress_sut,
+        affects_http_ingress=_on_ingress_sut,
+        affects_kafka_ingress=_on_ingress_sut,
     ),
     # A mark on the SUT holds what it marks, such as a stalled script backing up into the UDP
     # receive queue.
