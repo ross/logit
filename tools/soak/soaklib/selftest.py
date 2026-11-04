@@ -14136,11 +14136,11 @@ def _cgroup_rules(root):
            and scenario.memory_bytes("512K") == 512 * 1024
            and scenario.memory_bytes("256") is None and scenario.memory_bytes(256) is None,
            "memory_bytes reads K, M, and G as powers of 1024 and nothing else")
-    _refused(path, with_step(), "cgroup needs one of `cpu` or `memory_high`, got neither",
-             "a cgroup with neither key")
+    _refused(path, with_step(), "cgroup needs one of `cpu`, `memory_high`, or `io_wbps` and "
+             "`io_wiops`, got none", "a cgroup with no key")
     _refused(path, with_step(cpu=0.5, memory_high="256M"),
-             "cgroup needs one of `cpu` or `memory_high`, got `cpu`, `memory_high`",
-             "a cgroup with both keys")
+             "cgroup needs one of `cpu`, `memory_high`, or `io_wbps` and `io_wiops`, got `cpu`, "
+             "`memory_high`", "a cgroup with both keys")
     for cpu in (0, 0.009, 1025, "0.5", True, -1):
         _refused(path, with_step(cpu=cpu), "`cpu` must be a number of CPUs from 0.01 to 1024",
                  f"a cgroup's cpu {cpu!r}")
@@ -14158,13 +14158,13 @@ def _cgroup_rules(root):
     except scenario.ScenarioError as err:
         expect(False, f"a memory_high of 16388K with engaged loads, got {err.problems}")
     _refused(path, with_step(cpu=0.5, engaged=True), "`engaged` is for a cgroup step with "
-             "`memory_high` only", "engaged on a cpu step")
+             "`memory_high`, `io_wbps`, or `io_wiops` only", "engaged on a cpu step")
     _refused(path, with_step(memory_high="64M", engaged="yes"), "`engaged` must be true or "
              "false", "an engaged that isn't a bool")
     for key, value in (("cpu", 0.5), ("memory_high", "256M"), ("engaged", True)):
         changed = copy.deepcopy(raw)
         changed["step"][0][key] = value
-        _refused(path, changed, "`engaged` is for a cgroup step with `memory_high` only"
+        _refused(path, changed, "`engaged` is for a cgroup step with `memory_high`, `io_wbps`, or `io_wiops` only"
                  if key == "engaged" else f"`{key}` is for cgroup only",
                  f"{key} on a {raw['step'][0]['action']}")
     _refused(path, with_step(cpu=0.5, args="50"), "`args` is for netem only", "args on a cgroup")
@@ -14177,8 +14177,8 @@ def _cgroup_rules(root):
     rand["random"] = {"seed": 1, "gap": {"min": "60s", "max": "90s"},
                       "fault": [{"weight": 1, "action": "cgroup", "on": "logit",
                                  "for": {"min": "10s", "max": "20s"}}]}
-    _refused(path, rand, "cgroup takes `cpu` or `memory_high`, which a [random] fault can't "
-             "set", "a cgroup in a [random] schedule")
+    _refused(path, rand, "cgroup takes `cpu`, `memory_high`, or an io limit, which a [random] "
+             "fault can't set", "a cgroup in a [random] schedule")
 
     shipped = scenario.load(root / "scenarios" / "cpu-quota" / "scenario.toml")
     limits = [one for one in scenario.expand(shipped) if one.action == "cgroup"]
@@ -14211,6 +14211,399 @@ def _cgroup_rules(root):
            and limits[0].engaged is True,
            f"memory-high-pressure throttles the SUT between its steady memory and its outage "
            f"peak, around the outage, got {limits} {stops}")
+
+
+def _io_tree(tmp, container, host):
+    """A fake `/proc` and `/sys` under `tmp`: process 4242's `mountinfo` (`container`) and
+    `cgroup`, the host's `/proc/1/mountinfo` (`host`), and `/sys/dev/block` links for the disk
+    8:0 with its partition 8:1 and for the unpartitioned 253:0."""
+    root = Path(tmp)
+    shutil.rmtree(root / "proc", ignore_errors=True)
+    shutil.rmtree(root / "sys", ignore_errors=True)
+    proc = root / "proc"
+    (proc / "4242").mkdir(parents=True)
+    (proc / "1").mkdir(parents=True)
+    (proc / "4242" / "cgroup").write_text(f"0::/system.slice/docker-{'f' * 64}.scope\n")
+    (proc / "4242" / "mountinfo").write_text(container)
+    (proc / "1" / "mountinfo").write_text(host)
+    sda = root / "sys" / "devices" / "pci0" / "sda"
+    (sda / "sda1").mkdir(parents=True)
+    (sda / "dev").write_text("8:0\n")
+    (sda / "sda1" / "dev").write_text("8:1\n")
+    (sda / "sda1" / "partition").write_text("1\n")
+    dm = root / "sys" / "devices" / "virtual" / "dm-0"
+    dm.mkdir(parents=True)
+    (dm / "dev").write_text("253:0\n")
+    block = root / "sys" / "dev" / "block"
+    block.mkdir(parents=True)
+    (block / "8:0").symlink_to("../../devices/pci0/sda")
+    (block / "8:1").symlink_to("../../devices/pci0/sda/sda1")
+    (block / "253:0").symlink_to("../../devices/virtual/dm-0")
+    return str(proc), str(root / "sys")
+
+
+_IO_OVERLAY = ("1798 1644 0:104 / / rw,relatime - overlay overlay rw,lowerdir=/l1:/l2,"
+               "upperdir=/var/lib/docker/snap/41201/fs,workdir=/var/lib/docker/snap/41201/work\n"
+               "1799 1798 0:135 / /proc rw - proc proc rw\n"
+               "1800 1798 8:1 /var/lib/docker/volumes/v/_data /spool rw - ext4 /dev/sda1 rw\n"
+               "1801 1798 253:0 /x /data\\040dir rw - ext4 /dev/dm-0 rw\n"
+               "1802 1798 0:150 / /tmp/ram rw - tmpfs tmpfs rw\n")
+_IO_HOST_EXT4 = ("22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n"
+                 "23 22 0:21 / /proc rw shared:2 - proc proc rw\n")
+_IO_HOST_BTRFS = ("48 1 0:38 /root / rw,relatime shared:1 - btrfs /dev/dm-1 rw,subvol=/root\n"
+                  "49 48 0:38 /docker /var/lib/docker rw shared:9 - btrfs /dev/dm-1 rw\n")
+
+
+def _cgroup_io_device():
+    """`io_device` finds the disk behind a path in the SUT: the mount holding it by whole
+    components, an overlay's upperdir through the host's mounts, octal escapes decoded, a
+    partition's whole disk through `/sys/dev/block`, an unpartitioned device as it is; and
+    fails with no block device behind an anonymous device, a missing `/sys` entry, an overlay
+    with no upperdir, or a mountinfo it can't read."""
+    with tempfile.TemporaryDirectory() as tmp:
+        proc, sys_root = _io_tree(tmp, _IO_OVERLAY, _IO_HOST_EXT4)
+        ctx = faults.Context(docker=None, ids={}, netem_image="netem", proc_root=proc,
+                             sys_root=sys_root)
+        device, detail, why = faults.io_device(ctx, 4242, "/tmp/soak-spool")
+        expect(device == "8:0" and why is None and detail.get("partition") == "8:1"
+               and detail.get("fstype") == "overlay" and detail.get("upper_mount") == "/"
+               and detail.get("upper") == "/var/lib/docker/snap/41201/fs",
+               f"an overlay root's spool resolves through its upperdir's host mount, a "
+               f"partition, to the whole disk 8:0, got {device} {detail} {why}")
+        device, detail, why = faults.io_device(ctx, 4242, "/spool/segments")
+        expect(device == "8:0" and detail.get("mount") == "/spool"
+               and detail.get("partition") == "8:1" and "upper" not in detail,
+               f"a volume's own device resolves with no overlay step, got {device} {detail}")
+        device, detail, why = faults.io_device(ctx, 4242, "/spoolx/a")
+        expect(device == "8:0" and detail.get("mount") == "/",
+               f"a mount point matches whole components only, got {device} {detail}")
+        device, detail, why = faults.io_device(ctx, 4242, "/data dir/spool")
+        expect(device == "253:0" and "partition" not in detail and why is None,
+               f"an escaped mount point is decoded and an unpartitioned device is kept, got "
+               f"{device} {detail} {why}")
+        device, detail, why = faults.io_device(ctx, 4242, "/tmp/ram/spool")
+        expect(device is None and "no block device backs /tmp/ram/spool" in why
+               and "tmpfs" in why and "0:150" in why,
+               f"a tmpfs has no block device, got {device} {why}")
+        proc, sys_root = _io_tree(tmp, _IO_OVERLAY, _IO_HOST_BTRFS)
+        ctx = faults.Context(docker=None, ids={}, netem_image="netem", proc_root=proc,
+                             sys_root=sys_root)
+        device, detail, why = faults.io_device(ctx, 4242, "/tmp/soak-spool")
+        expect(device is None and "no block device backs /tmp/soak-spool" in why
+               and "btrfs" in why and "0:38" in why
+               and detail.get("upper_mount") == "/var/lib/docker",
+               f"an overlay over btrfs has only an anonymous device, got {device} {detail} "
+               f"{why}")
+        proc, sys_root = _io_tree(tmp, _IO_OVERLAY.replace("8:1 /var", "8:7 /var"),
+                                  _IO_HOST_EXT4)
+        ctx = faults.Context(docker=None, ids={}, netem_image="netem", proc_root=proc,
+                             sys_root=sys_root)
+        device, detail, why = faults.io_device(ctx, 4242, "/spool")
+        expect(device is None and "no block device backs /spool" in why and "8:7" in why,
+               f"a device with no /sys/dev/block entry fails, got {device} {why}")
+        proc, sys_root = _io_tree(tmp, _IO_OVERLAY.replace("upperdir=", "upper="),
+                                  _IO_HOST_EXT4)
+        ctx = faults.Context(docker=None, ids={}, netem_image="netem", proc_root=proc,
+                             sys_root=sys_root)
+        device, detail, why = faults.io_device(ctx, 4242, "/tmp/soak-spool")
+        expect(device is None and "overlay has no upperdir" in why,
+               f"an overlay with no upperdir fails, got {device} {why}")
+        device, detail, why = faults.io_device(ctx, 9999, "/tmp")
+        expect(device is None and "can't read" in why and "9999/mountinfo" in why,
+               f"an unreadable mountinfo fails, got {device} {why}")
+    expect(faults.io_max_values("8:0 rbps=max wbps=1048576 riops=max wiops=40\n"
+                                "253:0 rbps=max wbps=max riops=7 wiops=max\n", "8:0")
+           == {"rbps": "max", "wbps": "1048576", "riops": "max", "wiops": "40"}
+           and faults.io_max_values("253:0 riops=7\n", "8:0")["wbps"] == "max"
+           and faults.io_max_values("", "8:0")["wiops"] == "max",
+           "io_max_values reads the device's line, and every key at max with none")
+    expect(faults.io_max_line("8:0", {"wbps": "4096", "wiops": "10"}) == "8:0 wbps=4096 wiops=10"
+           and faults.io_max_line("8:0", {"wiops": "max"}) == "8:0 wiops=max",
+           "io_max_line puts the keys it sets on the device, in io.max's order")
+
+
+def _cgroup_io_actions():
+    """An io `cgroup` step resolves the device, reads `io.max`'s line for it (`found`, `max`
+    with none), `io.stat`'s `wbytes` and `wios` (0 with no line) and `io.pressure`'s `some`
+    total, then writes the limit on that device and compares the read-back's keys; its revert
+    reads the counts again, records the window's differences and length, and writes each
+    limited key's found value back. A device it can't resolve, a failed or unparsable count, or
+    a read-back that differs fails the step; a revert that can't read the counts still
+    restores; one after a start inside the window reads nothing."""
+    full = "f" * 64
+    scope = f"system.slice/docker-{full}.scope"
+    running = {"Status": "running", "StartedAt": "2026-10-08T12:00:00Z", "Pid": 4242}
+    ok = docker.Result
+
+    def argv(path, *value):
+        return ["-v", "/sys/fs/cgroup:/cg:rw", "--security-opt", "label=disable",
+                "--entrypoint", "/bin/sh", "netem", "-c", faults.CGROUP_SCRIPT, "sh",
+                f"/cg/{scope}/{path}", *value]
+
+    def stat(wbytes, wios, device="8:0"):
+        return ok(0, f"253:0 rbytes=9 wbytes=9 rios=9 wios=9 dbytes=0 dios=0\n{device} "
+                     f"rbytes=1 wbytes={wbytes} rios=1 wios={wios} dbytes=0 dios=0\n", "")
+
+    def pressure(total):
+        return ok(0, f"some avg10=0.00 avg60=0.00 avg300=0.00 total={total}\n"
+                     "full avg10=0.00 avg60=0.00 avg300=0.00 total=7\n", "")
+
+    class Clock:
+        def __init__(self):
+            self.now = 1000.0
+
+        def __call__(self):
+            return self.now
+
+    wbps = scenario.Step("c0s1", 0, 0, "cgroup", "logit", "", 60.0, 180.0, io_wbps="1M",
+                         io_path="/tmp/soak-spool")
+    both = scenario.Step("c0s2", 1, 0, "cgroup", "logit", "", 60.0, 180.0, io_wbps=4096,
+                         io_wiops=100, io_path="/tmp/soak-spool")
+    action = faults.ACTIONS["cgroup"]
+    with tempfile.TemporaryDirectory() as tmp:
+        def context(answers, host=_IO_HOST_EXT4, state=running):
+            proc, sys_root = _io_tree(tmp, _IO_OVERLAY, host)
+            fake = _CgroupDocker(answers, state)
+            clock = Clock()
+            return fake, clock, faults.Context(docker=fake, ids={"logit": "sut"},
+                                               netem_image="netem", proc_root=proc,
+                                               sys_root=sys_root, clock=clock)
+
+        written = ok(0, "8:0 rbps=max wbps=1048576 riops=max wiops=max\n", "")
+        fake, clock, ctx = context([ok(0, "", ""), stat(100, 10), pressure(500), written,
+                                    stat(5000100, 1010), pressure(6000500), ok(0, "", "")])
+        result = action.apply(ctx, wbps)
+        expect(fake.calls == [argv("io.max"), argv("io.stat"), argv("io.pressure"),
+                              argv("io.max", "8:0 wbps=1048576")]
+               and result["rc"] == 0 and result["found"] == "max" and result["device"] == "8:0"
+               and result["value"] == "8:0 wbps=1048576" and result["file"] == "io.max"
+               and result["io_before"] == {"wbytes": 100, "wios": 10, "stall_us": 500}
+               and result["io_device"].get("partition") == "8:1",
+               f"an io_wbps of 1M reads io.max, io.stat, and io.pressure, then writes "
+               f"'8:0 wbps=1048576' on the spool's disk, got {fake.calls} {result}")
+        clock.now += 120.5
+        result = action.revert(ctx, wbps)
+        expect(fake.calls[-3:] == [argv("io.stat"), argv("io.pressure"),
+                                   argv("io.max", "8:0 wbps=max")]
+               and result["rc"] == 0 and result["restored"] is True
+               and result["io_wbytes"] == 5000000 and result["io_wios"] == 1000
+               and result["io_stall_us"] == 6000000 and result["io_window_s"] == 120.5
+               and result["device"] == "8:0" and wbps.id not in ctx.state,
+               f"the revert records the window's writes, stall, and length, then writes "
+               f"wbps=max, which the kernel reads back as no line, got {fake.calls[-3:]} "
+               f"{result}")
+        limited = ok(0, "8:0 rbps=max wbps=2097152 riops=max wiops=500\n", "")
+        fake, clock, ctx = context([limited, ok(0, "", ""), pressure(0),
+                                    ok(0, "8:0 rbps=max wbps=4096 riops=max wiops=100\n", ""),
+                                    stat(8192, 2), pressure(10), limited])
+        result = action.apply(ctx, both)
+        expect(result["rc"] == 0 and fake.calls[-1] == argv("io.max", "8:0 wbps=4096 wiops=100")
+               and result["found"] == "8:0 rbps=max wbps=2097152 riops=max wiops=500"
+               and result["io_before"] == {"wbytes": 0, "wios": 0, "stall_us": 0},
+               f"io_wbps and io_wiops go on one line, io.stat with no line for the device reads "
+               f"0, and found is the device's line, got {fake.calls[-1]} {result}")
+        result = action.revert(ctx, both)
+        expect(fake.calls[-1] == argv("io.max", "8:0 wbps=2097152 wiops=500")
+               and result["rc"] == 0 and result["io_wbytes"] == 8192 and result["io_wios"] == 2,
+               f"the revert writes each limited key's found value back, got {fake.calls[-1]} "
+               f"{result}")
+        ignored = ok(0, "8:0 rbps=max wbps=max riops=max wiops=max\n", "")
+        fake, clock, ctx = context([ok(0, "", ""), stat(0, 0), pressure(0), ignored,
+                                    ok(0, "", "")])
+        result = action.apply(ctx, wbps)
+        expect(result["rc"] == 1 and "read back" in result["stderr"]
+               and fake.calls[-1] == argv("io.max", "8:0 wbps=max") and wbps.id not in ctx.state,
+               f"a read-back without the limit fails the step and writes found back, got "
+               f"{fake.calls[-1]} {result}")
+        for answers, why in (([ok(0, "", ""), ok(1, "", "No such file")], "io.stat: rc 1"),
+                             ([ok(0, "", ""), stat(0, 0), ok(0, "full total=3\n", "")],
+                              "printed no some total"),
+                             ([ok(0, "", ""), stat(0, 0), ok(1, "", "denied")],
+                              "io.pressure: rc 1"),
+                             ([ok(0, "", ""), ok(0, "8:0 wbytes=x wios=1\n", "")],
+                              "printed wbytes='x'")):
+            fake, clock, ctx = context(answers)
+            result = action.apply(ctx, wbps)
+            expect(result["rc"] == 1 and why in result["stderr"]
+                   and not any(len(call) > len(argv("io.max")) for call in fake.calls)
+                   and wbps.id not in ctx.state,
+                   f"an apply that can't read the counts ({why}) writes nothing, got {result}")
+        fake, clock, ctx = context([], host=_IO_HOST_BTRFS)
+        result = action.apply(ctx, wbps)
+        expect(result["rc"] == 1 and "no block device backs /tmp/soak-spool" in result["stderr"]
+               and not fake.calls and wbps.id not in ctx.state
+               and result["io_device"].get("upper_mount") == "/var/lib/docker",
+               f"a spool on btrfs fails the step with no one-shot, got {result}")
+        fake, clock, ctx = context([ok(0, "", ""), stat(0, 0), pressure(0), written,
+                                    ok(1, "", "gone"), ok(0, "", "")])
+        action.apply(ctx, wbps)
+        result = action.revert(ctx, wbps)
+        expect(result["rc"] == 0 and result["restored"] is True and "io_stall_us" not in result
+               and "io.stat: rc 1" in result.get("io_error", "")
+               and fake.calls[-1] == argv("io.max", "8:0 wbps=max"),
+               f"a revert that can't read the counts still restores and says why, got {result}")
+        fake, clock, ctx = context([ok(0, "", ""), stat(0, 0), pressure(0), written])
+        action.apply(ctx, wbps)
+        fake.state = dict(running, StartedAt="2026-10-08T12:03:00Z")
+        calls = len(fake.calls)
+        result = action.revert(ctx, wbps)
+        expect(len(fake.calls) == calls and result.get("started_in_window") is True
+               and "io_error" not in result,
+               f"a start inside the window reads and writes nothing at the revert, got {result}")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        timeline = [_phase("start", 0, t0=T0),
+                    _action("apply", "c0s1", "cgroup", "logit", 60, io_wbps="1M"),
+                    _action("revert", "c0s1", "cgroup", "logit", 180, restored=True,
+                            io_wbps="1M", device="8:0", io_wbytes=5000000, io_wios=1000,
+                            io_stall_us=6000000, io_window_s=120.0),
+                    _phase("end_begin", 400), _phase("end_end", 450)]
+        result = _status(_run_dir(tmp, "io-reported", timeline), checks.check_timeline)
+        expect(result.status == checks.PASS
+               and "c0s1 (cgroup on logit): io.max on 8:0 over 120.0s: 5,000,000 byte(s) in "
+                   "1,000 write(s), 41,667 B/s and 8.3 writes/s against a limit of 1,048,576 "
+                   "B/s; io.pressure stalled 6.0s (5.0% of the window)" in result.detail,
+               f"timeline reports an io step's writes, rate, limit, and stall, got {result}")
+        unread = timeline[:2] + [_action("revert", "c0s1", "cgroup", "logit", 180,
+                                         restored=True, io_error="io.stat: rc 1")] + timeline[3:]
+        result = _status(_run_dir(tmp, "io-unread", unread), checks.check_timeline)
+        expect(result.status == checks.FAIL
+               and "can't read io.max's writes and stalls: io.stat: rc 1" in result.detail,
+               f"timeline FAILs an io revert that couldn't read its counts, got {result}")
+        for want, stall_us, status in ((True, 1190000, checks.FAIL),
+                                       (True, 1200000, checks.PASS),
+                                       (False, 1200000, checks.FAIL),
+                                       (False, 1190000, checks.PASS)):
+            judged = timeline[:2] + [_action("revert", "c0s1", "cgroup", "logit", 180,
+                                             restored=True, io_wiops=50, device="8:0",
+                                             io_wbytes=0, io_wios=0, io_stall_us=stall_us,
+                                             io_window_s=120.0, engaged=want)] + timeline[3:]
+            result = _status(_run_dir(tmp, f"io-engaged-{want}-{stall_us}", judged),
+                             checks.check_timeline)
+            expect(result.status == status
+                   and any("against a limit of 50 writes/s" in line for line in result.lines)
+                   and (status == checks.PASS or "and the step expects the limit" in result.detail),
+                   f"timeline judges engaged = {want} against {stall_us} us stalled in 120 s as "
+                   f"{status}, got {result}")
+        zero = timeline[:2] + [_action("revert", "c0s1", "cgroup", "logit", 180, restored=True,
+                                       io_wbps="1M", device="8:0", io_wbytes=0, io_wios=0,
+                                       io_stall_us=0, io_window_s=0, engaged=True)
+                               ] + timeline[3:]
+        result = _status(_run_dir(tmp, "io-zero-window", zero), checks.check_timeline)
+        expect(result.status == checks.FAIL,
+               f"a window of no length never reads as engaged, got {result}")
+
+
+def _cgroup_io_rules(root):
+    """`load()`'s rules for an io `cgroup` step: `io_wbps`, `io_wiops`, or both as one limit,
+    each in range, with an absolute `io_path`; neither with another limit nor on another action,
+    nor `io_path` without them; `engaged` allowed; a stop or kill of the SUT may start inside a
+    cgroup step, after its start, and nothing else may; and the shipped slow-spool scenario."""
+    path, raw = _base(root)
+
+    def with_step(**fields):
+        changed = copy.deepcopy(raw)
+        changed["step"] = [{"at": "0s", "action": "cgroup", "on": "logit", "for": "10s",
+                            **fields}]
+        return changed
+
+    spool = {"io_path": "/tmp/soak-spool"}
+    for fields in ({"io_wbps": "1M"}, {"io_wbps": 4096}, {"io_wbps": "4K"},
+                   {"io_wbps": "1024G"}, {"io_wiops": 1}, {"io_wiops": 1000000},
+                   {"io_wbps": "256K", "io_wiops": 50}, {"io_wbps": "1M", "engaged": False}):
+        try:
+            loaded = scenario.from_dict(with_step(**fields, **spool), path)
+            scenario.validate(loaded)
+            expect(scenario.expand(loaded)[0].expected() == {**fields, **spool},
+                   f"an io cgroup's {fields} reaches its step and its records")
+        except scenario.ScenarioError as err:
+            expect(False, f"an io cgroup with {fields} loads, got {err.problems}")
+    expect(scenario.io_bytes("1M") == 1024 ** 2 and scenario.io_bytes("4K") == 4096
+           and scenario.io_bytes("2G") == 2 * 1024 ** 3 and scenario.io_bytes("512") == 512
+           and scenario.io_bytes(4096) == 4096
+           and all(scenario.io_bytes(bad) is None
+                   for bad in ("1m", "1MB", "0", "01K", "1.5M", "", 0, -1, True, 1.5)),
+           "io_bytes reads a whole number, bare or with K, M, or G as powers of 1024")
+    for wbps in ("2K", 4095, "1025G", "1MB", True, -1, "0", 1.5):
+        _refused(path, with_step(io_wbps=wbps, **spool), "`io_wbps` must be a whole number of "
+                 "bytes a second", f"an io_wbps {wbps!r}")
+    for wiops in (0, 1000001, 1.5, True, "100"):
+        _refused(path, with_step(io_wiops=wiops, **spool), "`io_wiops` must be a whole number "
+                 "of writes a second from 1 to 1,000,000", f"an io_wiops {wiops!r}")
+    _refused(path, with_step(io_wbps="1M"), "an io limit needs `io_path`", "an io_wbps with no "
+             "io_path")
+    for where in ("tmp/soak-spool", "/tmp/../etc", "/tmp/soak spool", 5, "/tmp/\tx"):
+        _refused(path, with_step(io_wbps="1M", io_path=where), "`io_path` must be an absolute "
+                 "path", f"an io_path {where!r}")
+    _refused(path, with_step(cpu=0.5, **spool), "`io_path` is for a cgroup step with `io_wbps` "
+             "or `io_wiops` only", "an io_path on a cpu step")
+    _refused(path, with_step(cpu=0.5, io_wbps="1M", **spool), "cgroup needs one of `cpu`, "
+             "`memory_high`, or `io_wbps` and `io_wiops`, got `cpu`, `io_wbps`",
+             "a cpu and an io_wbps")
+    _refused(path, with_step(memory_high="64M", io_wiops=5, **spool), "cgroup needs one of",
+             "a memory_high and an io_wiops")
+    for key, value in (("io_wbps", "1M"), ("io_wiops", 5), ("io_path", "/tmp")):
+        changed = copy.deepcopy(raw)
+        changed["step"][0][key] = value
+        _refused(path, changed, f"`{key}` is for cgroup only" if key != "io_path" else
+                 "`io_path` is for a cgroup step with `io_wbps` or `io_wiops` only",
+                 f"{key} on a {raw['step'][0]['action']}")
+
+    def overlap(first, second):
+        changed = copy.deepcopy(raw)
+        changed["step"] = [{"on": "logit", **first}, {"on": "logit", **second}]
+        return changed
+
+    throttle = {"at": "0s", "action": "cgroup", "cpu": 0.5, "for": "60s"}
+    for action in ("stop", "kill"):
+        try:
+            loaded = scenario.from_dict(overlap(throttle, {"at": "20s", "action": action,
+                                                           "for": "60s"}), path)
+            scenario.validate(loaded)
+            expect(True, "")
+        except scenario.ScenarioError as err:
+            expect(False, f"a {action} starting inside a cgroup loads, got {err.problems}")
+    engaged = {"at": "0s", "action": "cgroup", "memory_high": "64M", "engaged": True,
+               "for": "60s"}
+    for action in ("stop", "kill"):
+        _refused(path, overlap(engaged, {"at": "20s", "action": action, "for": "60s"}),
+                 "`engaged` can't be judged on a cgroup step a stop or kill ends",
+                 f"an engaged cgroup a {action} starts inside")
+    for second, what in (({"at": "0s", "action": "stop", "for": "20s"}, "a stop at its start"),
+                         ({"at": "20s", "action": "pause", "for": "20s"}, "a pause inside it"),
+                         ({"at": "20s", "action": "restart", "for": "20s"},
+                          "a restart inside it")):
+        _refused(path, overlap(throttle, second), "two faults overlap on logit",
+                 f"{what} of a cgroup")
+    _refused(path, overlap({"at": "0s", "action": "stop", "for": "60s"},
+                           {**throttle, "at": "20s"}), "two faults overlap on logit",
+             "a cgroup inside a stop")
+
+    name = "slow-spool"
+    shipped = scenario.load(root / "scenarios" / name / "scenario.toml")
+    steps = scenario.expand(shipped)
+    throttles = [one for one in steps if one.action == "cgroup"]
+    sut_stops = [one for one in steps if one.action == "stop" and one.on == "logit"]
+    outages = [one for one in steps if one.action == "stop" and one.on == "victoria-metrics"]
+    sut = (root / "scenarios" / name / "logit-sut.yaml").read_text()
+    expect(len(throttles) == 2 and len(sut_stops) == 1 and len(outages) == 1
+           and all(one.on == "logit" and one.io_wbps is not None
+                   and one.io_path == "/tmp/soak-spool" for one in throttles)
+           and f"path: {throttles[0].io_path}" in sut
+           and throttles[0].start < sut_stops[0].start < throttles[0].end < sut_stops[0].end
+           and sut_stops[0].end < throttles[1].start < outages[0].end < throttles[1].end
+           and outages[0].start < throttles[0].start
+           and throttles[1].engaged is True and throttles[0].engaged is None,
+           f"slow-spool limits the spool's writes through the outage's backlog, stops the SUT "
+           f"inside that limit, and limits the new process through the replay, got {steps}")
+    rows = {exp.name: exp.to_json() for exp in shipped.expectations}
+    expect(rows.get("spool-replayed-at-restart", {}).get("step") == sut_stops[0].id
+           and rows.get("no-torn-tail", {}).get("max") == 0
+           and rows.get("sink-never-drops", {}).get("max") == 0
+           and rows.get("no-spool-errors", {}).get("metric")
+           == "logit.component.buffer.disk.errors",
+           f"slow-spool expects a replay after the stop, no torn tail, no drop, and no spool "
+           f"error, got {rows}")
 
 
 def _reset_rules(root):
@@ -17140,7 +17533,8 @@ def run(root, quiet=False):
                      _signal_rules, _signal_actions, _sighup_driver,
                      _reopen_checks, _tls_rules, _tls_actions, _tls_driver, _tls_checks,
                      _reset_actions, _reset_rules, _prlimit_actions, _prlimit_rules,
-                     _cgroup_actions, _cgroup_rules, _slowclient_client,
+                     _cgroup_actions, _cgroup_rules, _cgroup_io_device, _cgroup_io_actions,
+                     _cgroup_io_rules, _slowclient_client,
                      _slowclient_actions, _stray_removal, _slowclient_rules,
                      _fan_out_ledger, _idle_writer, _boundary_skew, _fan_out_rules,
                      _sampling_vectors, _absent_rules, _absent_checks, _merge_ledger,
@@ -17168,7 +17562,7 @@ def run(root, quiet=False):
                               _overlap_rules, _overlap_driver, _idp_rules, _signal_rules,
                               _sighup_driver,
                               _tls_rules, _tls_driver, _reset_rules, _prlimit_rules,
-                              _cgroup_rules, _slowclient_rules,
+                              _cgroup_rules, _cgroup_io_rules, _slowclient_rules,
                               _fan_out_rules, _sampling_vectors,
                               _absent_rules, _merge_rules, _delta_rules, _scrape_rules)
                 part(root) if part in takes_root else part()
