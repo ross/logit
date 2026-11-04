@@ -3212,11 +3212,13 @@ Docker 29.9, SELinux enforcing) checked each fault's mechanism before it was pla
     fixing session's `connections.closed{reason="handshake_timeout"}` has landed. Rows: `connections.rejected{reason="limit"}`
     above 0 while the slow clients hold every slot; `connections.closed{reason="idle"}` for
     a trickled HTTP request head and for the half-open peers on both listeners, since they send
-    nothing; a trickled HTTP body and a TCP trickle each holding its slot with no close, pinned
-    as the
-    limit [ADR `deployment-threat-model`](../adr/deployment-threat-model.md) documents ("A
-    stalled or dribbled body holds its connection permit"), not a new finding; the generator's wire loss at 0 with its connection opened before the slots fill (a
-    redial in that phase is refused, and allowed for); and no descriptor growth after.
+    nothing; a trickled HTTP body holding its slot with no close, the limit
+    [ADR `deployment-threat-model`](../adr/deployment-threat-model.md) documents ("A stalled or
+    dribbled body holds its connection permit"); a TCP trickle holding its slot the same way,
+    which no document lists yet, since the TCP driver has no body read and re-arms on every
+    byte, so the fixing session adds it beside that entry before W34 pins it; the generator's
+    wire loss at 0 with its connection opened before the slots fill (a redial in that phase is
+    refused, and allowed for); and no descriptor growth after.
 32. **Native-hop variants (W35).** `native-hop` over TLS from the run's private CA, through a
     certificate rotation; under a netem delay on the hop long enough that the send window, not
     the link, bounds throughput, with an `[[expect]]` row on frames in flight; and with more
