@@ -3195,30 +3195,30 @@ Docker 29.9, SELinux enforcing) checked each fault's mechanism before it was pla
     would misplace drains against the fault windows; placing drains by the time the driver read
     them comes first. `tail-rotate-stale` already reaches the stale paths from the producer's
     side.
-31. **Connection adversity (W34).** A stdlib one-shot client, cued by a step, against a TCP and
-    an HTTP listener: slowloris connections that trickle one byte at a time under
-    `handshake_timeout:` and `idle_timeout:`, enough of them to fill `max_connections:`, and
-    half-open peers, connections whose packets a partition drops with no FIN or RST. What each
-    cause reaches: a full listener refuses a new connection before any TLS accept and counts
-    `logit.input.connections.rejected{reason="limit"}`, on the TCP driver and the HTTP
-    listeners alike; a trickling client is past its first byte, so `handshake_timeout:` no
-    longer bounds it, and `idle_timeout:`, when the scenario sets it, bounds it only in an HTTP
-    request's head, where the clock re-arms only when a request finishes, counted
-    `connections.closed{reason="idle"}`; an HTTP body is read under a per-frame stall bound and
-    the TCP driver re-arms its clock on every read that returns bytes, so in either a byte sent
-    faster than `idle_timeout:` holds the slot until the client leaves or, for a body, the size
-    cap; and a first-byte timeout under `handshake_timeout:` shows only as the
-    `connection_error` diagnostic, with no counter yet, so W34 judges it from stderr unless the
-    fixing session's `connections.closed{reason="handshake_timeout"}` has landed. Rows: `connections.rejected{reason="limit"}`
-    above 0 while the slow clients hold every slot; `connections.closed{reason="idle"}` for
-    a trickled HTTP request head and for the half-open peers on both listeners, since they send
-    nothing; a trickled HTTP body holding its slot with no close, the limit
-    [ADR `deployment-threat-model`](../adr/deployment-threat-model.md) documents ("A stalled or
-    dribbled body holds its connection permit"); a TCP trickle holding its slot the same way,
-    which no document lists yet, since the TCP driver has no body read and re-arms on every
-    byte, so the fixing session adds it beside that entry before W34 pins it; the generator's
-    wire loss at 0 with its connection opened before the slots fill (a redial in that phase is
-    refused, and allowed for); and no descriptor growth after.
+31. **Connection adversity (W34).** A stdlib one-shot client, cued by a step, against a TCP and an
+    HTTP listener: slowloris connections that trickle one byte at a time under `handshake_timeout:`
+    and `idle_timeout:`, enough of them to fill `max_connections:`, and half-open peers, connections
+    whose packets a partition drops with no FIN or RST. What each cause reaches: a full listener
+    refuses a new connection before any TLS accept and counts
+    `logit.input.connections.rejected{reason="limit"}`, on the TCP driver and the HTTP listeners
+    alike; a trickling client is past its first byte, so `handshake_timeout:` no longer bounds it,
+    and `idle_timeout:`, when the scenario sets it, bounds it only in an HTTP request's head, where
+    the clock re-arms only when a request finishes, counted `connections.closed{reason="idle"}`; an
+    HTTP body is read under a per-frame stall bound and the TCP driver re-arms its clock on every
+    read that returns bytes, so in either a byte sent faster than `idle_timeout:` holds the slot
+    until the client leaves or, for a body, the size cap; and a first-byte timeout under
+    `handshake_timeout:` shows only as the `connection_error` diagnostic, with no counter yet, so
+    W34 judges it from stderr unless the fixing session's
+    `connections.closed{reason="handshake_timeout"}` has landed. Rows:
+    `connections.rejected{reason="limit"}` above 0 while the slow clients hold every slot;
+    `connections.closed{reason="idle"}` for a trickled HTTP request head and for the half-open peers
+    on both listeners, since they send nothing; a trickled HTTP body holding its slot with no close,
+    the limit [ADR `deployment-threat-model`](../adr/deployment-threat-model.md) documents ("A
+    stalled or dribbled body holds its connection permit"); a TCP trickle holding its slot the same
+    way, which no document lists yet, since the TCP driver has no body read and re-arms on every
+    byte, so the fixing session adds it beside that entry before W34 pins it; the generator's wire
+    loss at 0 with its connection opened before the slots fill (a redial in that phase is refused,
+    and allowed for); and no descriptor growth after.
 32. **Native-hop variants (W35).** `native-hop` over TLS from the run's private CA, through a
     certificate rotation; under a netem delay on the hop long enough that the send window, not
     the link, bounds throughput, with an `[[expect]]` row on frames in flight; and with more
