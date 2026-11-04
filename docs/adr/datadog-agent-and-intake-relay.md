@@ -962,16 +962,20 @@ too".
 
 Decision 5 bounded each batch of a multi-batch request (traces, stats) under the one deadline, so
 a `503` could follow a prefix of the request already delivered, and the Agent's retry delivered
-that prefix again. The decision accepted the duplicate because a resent request duplicates at
-Datadog's intake too. **Changed:** every batch of a request now waits under the one 5 s deadline,
-all or none, through the mechanism
+that prefix again. The decision took that prefix behavior to match Datadog's intake, but that was
+never verified: nothing in this record shows how the intake treats a request it can take only part
+of, only how it treats a resent one. **Changed:** every batch of a request now waits under the
+one 5 s deadline, all or none, through the mechanism
 [ADR `otlp-in-busy-answer`](otlp-in-busy-answer.md)'s amendment "A request is delivered all or
 none" gives `otlp_in` and `splunk_hec_in`: room for every batch is reserved on every consumer
-before any is sent. A `503` now always means nothing of the request was taken.
+before any is sent. The 5 s bound is unchanged. A `503` now always means nothing of the request was taken.
 
-The Agent retries a `503` whether or not part of the request got in, so delivering a prefix
-first bought no delivery the retry doesn't make, and cost a duplicate of it. All or none removes
-the duplicate at no cost to delivery.
+The Agent retries a `503` whole: its forwarder's `HTTPTransaction.internalProcess`
+(`comp/forwarder/defaultforwarder/transaction/transaction.go` in `datadog-agent`) drops a
+transaction only on a `400` or `413`, or on a `403` its secret refresh can't fix, reschedules it
+on any other status above `400`, and resends the same payload. So delivering a prefix first
+bought no delivery the retry doesn't make, and cost a duplicate of it. All or none loses nothing
+and removes the prefix duplicate.
 
 A request with more batches than an inbox holds (64) sends its first 64 under the deadline and
 the rest without one, and is counted `logit.input.requests{class="unbounded"}` in place of `ok`.

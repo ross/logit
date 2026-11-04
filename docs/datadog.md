@@ -476,7 +476,10 @@ When the pipeline doesn't take a request's batches in time, both listeners answe
 `Retry-After: 1` rather than holding the connection, and count
 `logit.input.batches.deferred`. A `503` means nothing of the request was taken: every batch of a
 multi-batch traces or stats request reaches every consumer or none does, so the retry is the one
-copy. What that costs depends on the sender:
+copy. `datadog_in` used to deliver a prefix of such a request before answering `503`, on the
+belief that Datadog's intake does the same, which was never verified. The Agent resends a `503`'d
+request whole either way, so all or none loses nothing and removes that duplicate. What that
+costs depends on the sender:
 
 - **`datadog_in`** waits 5 seconds. An Agent's forwarder keeps the payload in its retry queue and
   retries for minutes, so a `503` defers delivery until that queue fills.

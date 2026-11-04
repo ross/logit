@@ -3,7 +3,7 @@ created: 2026-11-03
 updated: 2026-11-04
 ---
 
-# `otlp_in` answers busy: a request's first batch waits at most 2 seconds, then `503` or `UNAVAILABLE`
+# `otlp_in` answers busy: a request waits at most 2 seconds, then `503` or `UNAVAILABLE`
 
 ## Status
 Accepted
