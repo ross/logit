@@ -137,8 +137,9 @@
 //!
 //! **Two points of one series in one second.** Datadog keeps one point per series per second:
 //! of two in one request, the higher, for a `count` as for a gauge (a trial org, 2026-10-21), and
-//! across requests the later write. So the plan finds, over the whole batch, the latest point of
-//! each series and second, the later in batch order on a tie
+//! across requests the later write, for a `count`, a gauge, and a `rate` alike (2026-11-04; ADR
+//! `datadog-out-sent-second-memory`'s "Verified destination behavior"). So the plan finds, over
+//! the whole batch, the latest point of each series and second, the later in batch order on a tie
 //! (`logit_proto::datadog::series::SeriesDuplicates`; `logit_proto::datadog`'s encode table has
 //! the series key), and the series encoder sends only that one. Each other point is counted once
 //! per batch with the plan's drops: `logit.output.metrics.normalized{reason="duplicate_timestamp"}`
@@ -147,13 +148,25 @@
 //! origin), since Datadog stores the same point, and otherwise
 //! `logit.output.metrics.dropped{reason="duplicate_timestamp"}`, with a throttled
 //! `duplicate_timestamp` diagnostic. Two equal delta counts or `rate`s (a `Gauge` flagged
-//! `_logit.metrics.type: rate`) are two increments, so the one left off counts `dropped`. Each point left off comes out of its event's weight, so no request cut
-//! or bisection splits a pair, and `logit.output.records` and
-//! an `at_most_once` drop count only the points sent. Distribution points aren't collapsed:
-//! Datadog keeps both. Two points of one series in one second in two batches are both sent, and
-//! Datadog keeps the later, uncounted (`docs/known-gaps/datadog.md`). A `dedup_timestamps` with
-//! `precision: 1s` as the last stage before this sink sums two counts or rates of one interval and
-//! keeps the later gauge first.
+//! `_logit.metrics.type: rate`) are two increments, so the one left off counts `dropped`. Each
+//! point left off comes out of its event's weight, so no request cut or bisection splits a pair,
+//! and `logit.output.records` and an `at_most_once` drop count only the points sent. Distribution
+//! points aren't collapsed: Datadog keeps both. A `dedup_timestamps` with `precision: 1s` as the
+//! last stage before this sink sums two counts or rates of one interval and keeps the later gauge
+//! first.
+//!
+//! Across batches, the sink remembers the latest second it sent each series in ([`SentSeconds`]),
+//! recorded once Datadog accepted the request carrying the point with a `2xx` whose body names no
+//! series dropped. A later batch's point of that series and second is left off too, after the
+//! batch's own collapse, and counted by the same rule against the point sent before: `normalized`
+//! for an equal state, else `dropped{reason="duplicate_timestamp"}`, with a throttled
+//! `duplicate_timestamp_sent` diagnostic. The earlier point stays the one Datadog holds; the sink
+//! doesn't merge the two. The batch's first plan reads the memory, and every later attempt at the
+//! batch reuses that plan's points left off ([`BatchState`]), so a retry doesn't read its own
+//! accepted points as earlier ones. The memory is in memory only and bounded, two generations of
+//! [`SENT_SERIES_PER_GENERATION`] series each, and misses a pair from two process lives, a pair in
+//! flight together above `concurrency: 1`, a series it forgot, a repeat of an older second
+//! than the latest sent, and a pair whose earlier request drew a `2xx` naming any series dropped (`docs/known-gaps/datadog.md`).
 //!
 //! ## Size limits
 //!
@@ -243,9 +256,11 @@
 //! oldest first. A fault on one batch resends or drops that batch alone, under the table below,
 //! and its resend skips the requests that batch already settled. Batches can land out of order: a
 //! series point is the last to arrive per `(series, second)`, and the other routes store what
-//! they receive as it arrives. Over TLS to a server that picks h2 through ALPN, the batches in
-//! flight share one connection as concurrent streams; otherwise they open up to `concurrency`
-//! connections. `logit.output.in_flight` reads the batches in flight, and
+//! they receive as it arrives. A batch's accepted series points join the sink's memory of seconds
+//! sent when `await_ack` applies its answer, so a batch planned while an earlier one is in flight
+//! doesn't leave off a point of that one's series and second. Over TLS to a server that picks h2
+//! through ALPN, the batches in flight share one connection as concurrent streams; otherwise they
+//! open up to `concurrency` connections. `logit.output.in_flight` reads the batches in flight, and
 //! `logit.component.send.duration` times each batch's requests from the first send to the last
 //! response.
 //!
@@ -337,7 +352,8 @@
 //!
 //! **Once per batch or per attempt** (ADR `sink-send-path-and-attempt-accounting`, decision 1).
 //! What the plan and the encoder decide counts once per batch: `stale`, `too_many_tags`,
-//! `needs_agent_processing`, `not_datadog_origin`, an event too large to send alone, an event no
+//! `needs_agent_processing`, `not_datadog_origin`, `duplicate_timestamp` (within the batch and
+//! against an earlier batch's), an event too large to send alone, an event no
 //! route carries (`events.skipped{reason="no_payload"}`), and the
 //! encoder's counters and diagnostics, through handles gated by the sink's `BatchAccounting`. The
 //! plan is unit 0 and each route its own unit, so a route an earlier attempt never reached counts
@@ -362,7 +378,8 @@ use logit_core::{redact, Diagnostics, Event, EventBatch, Resource, Symbol, Telem
 use logit_pipeline::{BatchContext, DeliveryPosture, Fault, Output, SeqId};
 use logit_proto::datadog::events::EventFormat;
 use logit_proto::datadog::series::{
-    metric_tag_count, record_routes, series_over_tag_limit, SeriesDuplicates, SeriesPlanned,
+    metric_tag_count, record_routes, series_over_tag_limit, SentPoint, SeriesDuplicates,
+    SeriesPlanned,
 };
 use logit_proto::datadog::{
     datadog_stats_name, is_datadog_event, is_datadog_stats, is_service_check, trace_readiness,
@@ -371,6 +388,7 @@ use logit_proto::datadog::{
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::Write;
+use std::num::NonZeroU64;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -398,6 +416,10 @@ const METRIC_MAX_AHEAD: i64 = 10 * MINUTE;
 const LOG_MAX_AGE: i64 = 18 * 60 * MINUTE;
 /// Service checks: 10 min.
 const CHECK_MAX_AGE: i64 = 10 * MINUTE;
+
+/// How many series [`SentSeconds`] remembers in each of its two generations, so at most twice
+/// this many in all: seven eighths of 65,536, the most a table of 65,536 buckets holds.
+const SENT_SERIES_PER_GENERATION: usize = 57_344;
 
 /// How much of a series `2xx` body to read for its `errors` (module doc's "Faults, retries, and
 /// duplicate safety"): one entry per dropped series, each about 100 bytes plus the metric name, for
@@ -624,6 +646,85 @@ fn now_nanos() -> i64 {
 /// Where the sink reads its send time: [`now_nanos`], or a test's scripted clock.
 type Clock = Box<dyn Fn() -> i64 + Send + Sync>;
 
+/// The latest second the sink sent each series in, in a request Datadog accepted, so a later
+/// batch's point of that series and second is left off (module doc's "Two points of one series
+/// in one second"). In memory only: a restart forgets it.
+///
+/// Two generations of at most [`SENT_SERIES_PER_GENERATION`] series each: a lookup reads the
+/// current, then the previous, and a record writes the current. The current becomes the previous,
+/// and the previous is forgotten, once the current is full or older than [`METRIC_MAX_AGE`] of
+/// send time, past which the stale filter drops any point of a second it could name. So a series
+/// is remembered for at least one generation's span after its last record.
+#[derive(Debug)]
+struct SentSeconds {
+    current: HashMap<u64, Sent>,
+    previous: HashMap<u64, Sent>,
+    /// The send time of the current generation's first record.
+    opened: Option<i64>,
+    /// [`SENT_SERIES_PER_GENERATION`], or a test's smaller bound.
+    per_generation: usize,
+}
+
+impl Default for SentSeconds {
+    fn default() -> Self {
+        Self {
+            current: HashMap::new(),
+            previous: HashMap::new(),
+            opened: None,
+            per_generation: SENT_SERIES_PER_GENERATION,
+        }
+    }
+}
+
+/// What [`SentSeconds`] holds per series: its latest second sent, and that point's
+/// [`SentPoint::state`]. 16 bytes, so a table entry with its key is 24.
+#[derive(Clone, Copy, Debug)]
+struct Sent {
+    second: i64,
+    state: Option<NonZeroU64>,
+}
+
+impl SentSeconds {
+    fn get(&self, series: u64) -> Option<Sent> {
+        self.current.get(&series).or_else(|| self.previous.get(&series)).copied()
+    }
+
+    /// The [`SentPoint::state`] of the point an accepted request carried for `point`'s series in
+    /// its second, or `None` when the latest second sent for the series is another.
+    fn earlier(&self, point: &SentPoint) -> Option<Option<NonZeroU64>> {
+        self.get(point.series).filter(|sent| sent.second == point.second).map(|sent| sent.state)
+    }
+
+    /// Records `points` as accepted at send time `now`. A series keeps its latest second; a point
+    /// of that second replaces the one held, since Datadog keeps the later write.
+    fn record(&mut self, points: &[SentPoint], now: i64) {
+        for point in points {
+            let opened = *self.opened.get_or_insert(now);
+            if self.current.len() >= self.per_generation
+                || now.saturating_sub(opened) >= METRIC_MAX_AGE
+            {
+                self.previous = std::mem::take(&mut self.current);
+                self.opened = Some(now);
+            }
+            let held = self.get(point.series);
+            let sent = match held {
+                Some(held) if held.second > point.second => held,
+                _ => Sent { second: point.second, state: point.state },
+            };
+            self.current.insert(point.series, sent);
+        }
+    }
+}
+
+/// What the sink fixes for one batch at its first attempt and reads on every later one: the send
+/// time, and the series duplicates its plan found ([`plan_duplicates`]), since a request a
+/// retried batch's own earlier attempt had accepted would otherwise read as an earlier one.
+#[derive(Debug, Default)]
+struct BatchState {
+    now: Option<i64>,
+    duplicates: Option<Arc<SeriesDuplicates>>,
+}
+
 /// [`plan`]'s result: each route's items, indexed by `Route as usize`, and what the stale filter,
 /// the tag limit, and the trace readiness gate dropped, which the sink counts once per batch.
 #[derive(Debug, Default)]
@@ -725,20 +826,43 @@ fn count_dropped(telemetry: &Telemetry, route: Route, reason: &'static str, n: u
 }
 
 /// Plans the series route's duplicates over the whole batch, after the stale filter and the tag
-/// limit, and takes each event's left-off points out of its weight, so the request cuts and the
-/// `records` count see only the points sent (module doc's "Two points of one series in one
-/// second").
-fn plan_duplicates(plan: &mut Plan, encoder: &DatadogEncoder, batch: &EventBatch) {
+/// limit: the points a later one of their series and second displaces within the batch, then
+/// those whose series and second an earlier batch's accepted request carried (`sent`). Takes each
+/// event's left-off points out of its weight, so the request cuts and the `records` count see
+/// only the points sent (module doc's "Two points of one series in one second").
+///
+/// `frozen` holds the result for the batch's later attempts once `armed`: `sent` grows as the
+/// batch's own requests are accepted, and a retry that read it again would leave off the points
+/// its first attempt delivered and cut different requests.
+fn plan_duplicates(
+    plan: &mut Plan,
+    encoder: &DatadogEncoder,
+    batch: &EventBatch,
+    sent: &SentSeconds,
+    frozen: &mut Option<Arc<SeriesDuplicates>>,
+    armed: bool,
+) {
     let series = &mut plan.routes[Route::Series as usize];
-    if series.len() < 2 && series.iter().all(|item| item.weight < 2) {
+    if series.is_empty() {
         return;
     }
-    let events: Vec<usize> = series.iter().map(|item| item.index).collect();
-    let duplicates = encoder.series_duplicates_in(batch, &events);
+    let duplicates = match frozen.as_ref().filter(|_| armed) {
+        Some(duplicates) => Arc::clone(duplicates),
+        None => {
+            let events: Vec<usize> = series.iter().map(|item| item.index).collect();
+            let mut duplicates = encoder.series_duplicates_in(batch, &events);
+            duplicates.leave_off_sent(|point| sent.earlier(point));
+            let duplicates = Arc::new(duplicates);
+            if armed {
+                *frozen = Some(Arc::clone(&duplicates));
+            }
+            duplicates
+        }
+    };
     for item in series.iter_mut() {
         item.weight = item.weight.saturating_sub(duplicates.of_event(item.index));
     }
-    plan.duplicates = Arc::new(duplicates);
+    plan.duplicates = duplicates;
 }
 
 /// [`partition`]'s result: each route's items, indexed by `Route as usize`, and how many events
@@ -979,11 +1103,13 @@ pub struct DatadogOutput {
     diag: Diagnostics,
     telemetry: Telemetry,
     accounting: BatchAccounting,
-    /// The send time of the batch `observe_batch` last armed, read by every attempt at it so each
-    /// reaches the same stale verdict; cleared by a final result
-    /// ([`BatchAccounting::is_final`]), replaced by the next `observe_batch`.
-    /// `None` reads the clock per `send`.
-    batch_now: Option<i64>,
+    /// The send time and series duplicates of the batch `observe_batch` last armed, read by
+    /// every attempt at it so each reaches the same stale verdict and cuts the same requests;
+    /// cleared by a final result ([`BatchAccounting::is_final`]), replaced by the next
+    /// `observe_batch`. No send time reads the clock per `send`.
+    batch: BatchState,
+    /// The latest second each series was sent in, in an accepted request.
+    sent: SentSeconds,
     /// [`now_nanos`], or a test's scripted clock.
     clock: Clock,
     /// Replaces every route's [`Route::caps`], so a test can bisect a small body.
@@ -991,7 +1117,7 @@ pub struct DatadogOutput {
     caps_override: Option<Caps>,
     /// The batches in flight above a concurrency of 1, each with its own accounting over
     /// `accounting`'s gate and its own send time (the module doc's "Concurrency").
-    slots: Slots<Attempted, Option<i64>>,
+    slots: Slots<Attempted, BatchState>,
 }
 
 impl DatadogOutput {
@@ -1029,7 +1155,8 @@ impl DatadogOutput {
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
             accounting,
-            batch_now: None,
+            batch: BatchState::default(),
+            sent: SentSeconds::default(),
             clock: Box::new(now_nanos),
             #[cfg(test)]
             caps_override: None,
@@ -1250,10 +1377,13 @@ impl DatadogOutput {
             encoder: &mut self.encoder,
             telemetry: &self.telemetry,
             diag: &mut self.diag,
+            sent: &self.sent,
         };
-        match prepare(poster, encoding, &mut self.accounting, batch, now) {
+        let frozen = &mut self.batch.duplicates;
+        match prepare(poster, encoding, &mut self.accounting, frozen, batch, now) {
             Some(attempt) => {
                 let attempted = run(attempt).await;
+                self.sent.record(&attempted.sent, attempted.now);
                 attempted.journal.replay(&mut self.diag, &mut self.accounting);
                 attempted.result
             }
@@ -1267,7 +1397,7 @@ impl DatadogOutput {
     async fn send_at(&mut self, batch: &EventBatch, now: i64) -> anyhow::Result<()> {
         let result = self.attempt(batch, now).await;
         if self.accounting.is_final(&result) {
-            self.batch_now = None;
+            self.batch = BatchState::default();
         }
         self.accounting.finish(result)
     }
@@ -1313,6 +1443,8 @@ struct Encoding<'a> {
     encoder: &'a mut DatadogEncoder,
     telemetry: &'a Telemetry,
     diag: &'a mut Diagnostics,
+    /// What earlier batches' accepted requests sent.
+    sent: &'a SentSeconds,
 }
 
 impl Encoding<'_> {
@@ -1321,13 +1453,21 @@ impl Encoding<'_> {
     }
 
     /// The batch's plan at send time `now`, unit 0 of `accounting`; what it dropped counts on the
-    /// batch's first encode of it only.
-    fn plan(&mut self, accounting: &mut BatchAccounting, batch: &EventBatch, now: i64) -> Plan {
+    /// batch's first encode of it only. `frozen` is the batch's series duplicates
+    /// ([`plan_duplicates`]).
+    fn plan(
+        &mut self,
+        accounting: &mut BatchAccounting,
+        frozen: &mut Option<Arc<SeriesDuplicates>>,
+        batch: &EventBatch,
+        now: i64,
+    ) -> Plan {
         let histograms = self.encoder.histograms();
-        let encoder = &*self.encoder;
+        let (encoder, sent) = (&*self.encoder, self.sent);
+        let armed = accounting.armed();
         let (first, plan) = accounting.encode(0, || {
             let mut plan = plan(batch, now, histograms);
-            plan_duplicates(&mut plan, encoder, batch);
+            plan_duplicates(&mut plan, encoder, batch, sent, frozen, armed);
             plan
         });
         if first {
@@ -1369,7 +1509,9 @@ impl Encoding<'_> {
         }
         plan.gated.count(self.telemetry);
         plan.gated.diagnose(self.diag);
-        self.encoder.count_duplicates(plan.duplicates.differing(), plan.duplicates.equal());
+        let duplicates = &plan.duplicates;
+        self.encoder.count_duplicates(duplicates.differing(), duplicates.equal());
+        self.encoder.count_sent_duplicates(duplicates.sent_differing(), duplicates.sent_equal());
     }
 
     /// `route`'s requests for `items`, unit `1 + route as u32` of `accounting`: the oversize drops
@@ -1426,7 +1568,12 @@ impl Encoding<'_> {
             let request = *next_request;
             *next_request += 1;
             if !accounting.settled(request) {
-                postings.push(Posting { request, route, entries: weight(&chunk), encoded });
+                let sent = if route == Route::Series {
+                    chunk.iter().flat_map(|item| duplicates.sent_by(item.index)).copied().collect()
+                } else {
+                    Vec::new()
+                };
+                postings.push(Posting { request, route, entries: weight(&chunk), encoded, sent });
             }
         }
         postings
@@ -1434,12 +1581,13 @@ impl Encoding<'_> {
 }
 
 /// One request of an attempt: its number in the batch's send order, its route, the entries it
-/// carries, and its body.
+/// carries, its body, and the series points it carries ([`SentSeconds`]).
 struct Posting {
     request: u32,
     route: Route,
     entries: usize,
     encoded: Encoded,
+    sent: Vec<SentPoint>,
 }
 
 /// Everything a batch's requests need, cloned from the sink: the client is a handle on the
@@ -1466,19 +1614,25 @@ struct Stopped {
 
 /// Sends `postings` in order, each verdict folded into `outcomes`: an accepted or rejected request
 /// is settled in `journal` and the next is sent; any other fault stops the run with the request's
-/// own class.
+/// own class. An accepted request whose answer names no series dropped adds its series points to
+/// `sent`: a point a `202` body may name was never stored, and leaving a later point of its
+/// series off would lose both.
 async fn post_all(
     poster: &Poster,
     postings: Vec<Posting>,
     outcomes: &mut Outcomes,
     journal: &mut Journal,
+    sent: &mut Vec<SentPoint>,
 ) -> Result<(), Stopped> {
     let mut postings = postings.into_iter();
-    while let Some(Posting { request, route, entries, encoded }) = postings.next() {
+    while let Some(Posting { request, route, entries, encoded, sent: points }) = postings.next() {
         // `post` counts and diagnoses a rejection itself.
         let result = poster.post(route, encoded, entries, journal).await;
         let accepted = result.is_ok();
-        if let Err(err) = outcomes.note(result, |_| {}) {
+        if matches!(result, Ok(0)) {
+            sent.extend(points);
+        }
+        if let Err(err) = outcomes.note(result.map(drop), |_| {}) {
             return Err(Stopped { err, route, entries, rest: postings.collect() });
         }
         journal.settle(request, accepted);
@@ -1493,13 +1647,18 @@ struct SlotAttempt {
     /// Whether an earlier attempt at the batch had a request accepted ([`Outcomes::new`]).
     accepted_before: bool,
     posture: DeliveryPosture,
+    /// The batch's send time.
+    now: i64,
 }
 
-/// What [`run`] did: the attempt's result and every count, warning, and settled request it
-/// recorded, for [`DatadogOutput::await_ack`] to apply on the loop task.
+/// What [`run`] did: the attempt's result, every count, warning, and settled request it
+/// recorded, and the series points its accepted requests carried at send time `now`, for
+/// [`DatadogOutput::await_ack`] to apply on the loop task.
 struct Attempted {
     journal: Journal,
     result: anyhow::Result<()>,
+    sent: Vec<SentPoint>,
+    now: i64,
 }
 
 /// The encode half of one attempt, on the loop task: the plan and every route's requests at send
@@ -1516,10 +1675,11 @@ fn prepare(
     poster: Poster,
     mut encoding: Encoding<'_>,
     accounting: &mut BatchAccounting,
+    frozen: &mut Option<Arc<SeriesDuplicates>>,
     batch: &EventBatch,
     now: i64,
 ) -> Option<SlotAttempt> {
-    let mut plan = encoding.plan(accounting, batch, now);
+    let mut plan = encoding.plan(accounting, frozen, batch, now);
     let duplicates = Arc::clone(&plan.duplicates);
     let mut postings = Vec::new();
     let mut next_request: u32 = 0;
@@ -1544,6 +1704,7 @@ fn prepare(
         postings,
         accepted_before: accounting.any_accepted(),
         posture: accounting.posture(),
+        now,
     })
 }
 
@@ -1552,11 +1713,12 @@ fn prepare(
 /// `records.dropped{reason="ambiguous_at_most_once"}`: every route was encoded before the first
 /// request, so each count is the entries its requests carry.
 async fn run(attempt: SlotAttempt) -> Attempted {
-    let SlotAttempt { poster, postings, accepted_before, posture } = attempt;
+    let SlotAttempt { poster, postings, accepted_before, posture, now } = attempt;
     let mut journal = Journal::new(poster.telemetry.clone());
     let mut outcomes = Outcomes::new(accepted_before);
-    match post_all(&poster, postings, &mut outcomes, &mut journal).await {
-        Ok(()) => Attempted { journal, result: outcomes.finish() },
+    let mut sent = Vec::new();
+    match post_all(&poster, postings, &mut outcomes, &mut journal, &mut sent).await {
+        Ok(()) => Attempted { journal, result: outcomes.finish(), sent, now },
         Err(stopped) => {
             if drops_ambiguous(posture, &stopped.err) {
                 let mut lost = [0usize; 8];
@@ -1568,7 +1730,7 @@ async fn run(attempt: SlotAttempt) -> Attempted {
                     dropped(&mut journal, later, "ambiguous_at_most_once", lost[later as usize]);
                 }
             }
-            Attempted { journal, result: Err(stopped.err) }
+            Attempted { journal, result: Err(stopped.err), sent, now }
         }
     }
 }
@@ -1606,7 +1768,7 @@ impl Poster {
         encoded: Encoded,
         entries: usize,
         journal: &mut Journal,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<usize> {
         let url = route_url(&self.site, &self.endpoints, route);
         let tags = [("route", route.name())];
         let wire_len = encoded.body.len();
@@ -1662,7 +1824,7 @@ impl Poster {
                 0
             };
             journal.count(RECORDS, (entries - rejected) as f64, &tags);
-            return Ok(());
+            return Ok(rejected);
         }
         let url = redact::url(&url);
         // Bounded, and scrubbed of the key before it reaches a diagnostic or the error
@@ -1758,10 +1920,10 @@ impl Output for DatadogOutput {
     fn observe_batch(&mut self, _ctx: BatchContext, seq: SeqId) {
         let now = (self.clock)();
         if self.slots.window() > 1 {
-            *self.slots.observe(seq) = Some(now);
+            self.slots.observe(seq).now = Some(now);
         } else {
             self.accounting.observe();
-            self.batch_now = Some(now);
+            self.batch = BatchState { now: Some(now), duplicates: None };
         }
     }
 
@@ -1779,7 +1941,7 @@ impl Output for DatadogOutput {
     /// (module doc's "Faults, retries, and duplicate safety"). The send time is the one the last
     /// `observe_batch` fixed until a final result clears it, else the clock's.
     async fn send(&mut self, batch: &EventBatch) -> anyhow::Result<()> {
-        let now = self.batch_now.unwrap_or_else(|| (self.clock)());
+        let now = self.batch.now.unwrap_or_else(|| (self.clock)());
         self.send_at(batch, now).await
     }
 
@@ -1811,18 +1973,20 @@ impl Output for DatadogOutput {
             encoder: &mut self.encoder,
             telemetry: &self.telemetry,
             diag: &mut self.diag,
+            sent: &self.sent,
         };
-        self.slots.submit_with(seq, |accounting, batch_now| {
-            let now = *batch_now.get_or_insert_with(clock);
-            Ok(prepare(poster, encoding, accounting, batch, now).map(run))
+        self.slots.submit_with(seq, |accounting, state| {
+            let now = *state.now.get_or_insert_with(clock);
+            Ok(prepare(poster, encoding, accounting, &mut state.duplicates, batch, now).map(run))
         })
     }
 
     /// The oldest batch's answer, counted and classified as `send` does.
     async fn await_ack(&mut self) -> anyhow::Result<()> {
-        let diag = &mut self.diag;
+        let (diag, sent) = (&mut self.diag, &mut self.sent);
         self.slots
             .ack_with(|attempted, accounting| {
+                sent.record(&attempted.sent, attempted.now);
                 attempted.journal.replay(diag, accounting);
                 attempted.result
             })
@@ -3042,6 +3206,15 @@ mod tests {
         ])
     }
 
+    /// `b` with every event a second later, so no series point repeats a series and second an
+    /// earlier batch sent.
+    fn one_second_later(mut b: EventBatch) -> EventBatch {
+        for event in &mut b.events {
+            event.timestamp += 1_000_000_000;
+        }
+        b
+    }
+
     /// A gauge with a map-valued attribute, which has no Datadog tag form.
     fn map_valued_gauge() -> Event {
         let mut attrs = AttrMap::new();
@@ -3445,7 +3618,7 @@ mod tests {
     /// The gate re-arms per batch: a second batch counts as the first did.
     #[tokio::test]
     async fn a_second_datadog_batch_counts_its_encode_side_counters() {
-        let batches = vec![encode_side_batch(), encode_side_batch()];
+        let batches = vec![encode_side_batch(), one_second_later(encode_side_batch())];
         let (sums, _) = run_dd(|p, _| accepted(p), batches, fast_retry(), instrumented).await;
         for (name, tags) in ENCODE_SIDE {
             assert_eq!(sum_of(&sums, name, tags), 2.0, "{name} {tags:?}");
@@ -3463,7 +3636,7 @@ mod tests {
                 accepted(p)
             }
         };
-        let batches = vec![encode_side_batch(), encode_side_batch()];
+        let batches = vec![encode_side_batch(), one_second_later(encode_side_batch())];
         let (sums, log) = run_dd(script, batches, at_most_once(), instrumented).await;
         assert_eq!(sum_of(&sums, "logit.component.batches.dropped", &[]), 1.0);
         assert_eq!(sum_of(&sums, "logit.component.batches.delivered", &[]), 1.0);
@@ -3480,12 +3653,22 @@ mod tests {
         let (addr, log) = per_path_recorder(|p, _| accepted(p)).await;
         let mut probe = TelemetryProbe::new();
         let mut output = instrumented(addr, &probe);
+        // Each send a second later than the last, so none repeats a series and second sent.
+        let sends = AtomicUsize::new(0);
+        let next = || {
+            let mut b = encode_side_batch();
+            let n = sends.fetch_add(1, Ordering::SeqCst) as i64;
+            for event in &mut b.events {
+                event.timestamp += n * 1_000_000_000;
+            }
+            b
+        };
         assert_direct_sends_count_after_an_empty_batch(
             &mut output,
             &mut probe,
             "datadog_out",
             batch(vec![gauge(NOW - 2 * HOUR)]),
-            encode_side_batch,
+            next,
             &ENCODE_SIDE,
         )
         .await;
@@ -3713,7 +3896,8 @@ mod tests {
     async fn a_new_batch_resends_every_request() {
         let script = |p: &str, k| if p == LOGS { busy_once(p, k) } else { accepted(p) };
         let b = || batch(vec![gauge(NOW), log_event(NOW, "after")]);
-        let (_, log) = run_dd(script, vec![b(), b()], at_least_once(), instrumented).await;
+        let batches = vec![b(), one_second_later(b())];
+        let (_, log) = run_dd(script, batches, at_least_once(), instrumented).await;
         assert_eq!(recorded_paths(&log), [SERIES, LOGS, LOGS, SERIES, LOGS]);
     }
 
@@ -3727,7 +3911,8 @@ mod tests {
         let b = batch(vec![gauge(NOW), log_event(NOW, "after")]);
         let err = out.send(&b).await.unwrap_err();
         assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous);
-        out.send(&b).await.unwrap();
+        // A second later: the point the first send's accepted request carried would be left off.
+        out.send(&one_second_later(b)).await.unwrap();
         assert_eq!(recorded_paths(&log.lock().unwrap()), [SERIES, LOGS, SERIES, LOGS]);
     }
 
@@ -3964,6 +4149,160 @@ mod tests {
         assert_eq!(sum_of(&sums, RECORDS_DROPPED, &ambiguous), 3.0);
         let duplicate = [("reason", "duplicate_timestamp")];
         assert_eq!(sum_of(&sums, "logit.output.metrics.dropped", &duplicate), 1.0);
+    }
+
+    // ---- a series and second an earlier request sent ----------------------------------------
+
+    /// What an `instrumented` sink counted for `duplicate_timestamp`: dropped, normalized, and
+    /// the cross-request diagnostic.
+    fn sent_duplicates(sums: &Sums) -> (f64, f64, f64) {
+        let duplicate = [("reason", "duplicate_timestamp")];
+        (
+            sum_of(sums, "logit.output.metrics.dropped", &duplicate),
+            sum_of(sums, "logit.output.metrics.normalized", &duplicate),
+            sum_of(sums, "logit.component.diagnostics", &[("key", "duplicate_timestamp_sent")]),
+        )
+    }
+
+    /// A gauge of the series and second an earlier batch's accepted request sent, with another
+    /// value, is left off and counted dropped once, though its batch took two attempts, beside a
+    /// point of another series that is sent. The earlier point stays the one Datadog holds.
+    #[tokio::test]
+    async fn a_point_whose_series_and_second_an_earlier_batch_sent_is_dropped_and_counted() {
+        let first = batch(vec![named("m", NOW, 9.0)]);
+        let second = batch(vec![named("m", NOW + 500_000_000, 2.0), named("n", NOW, 1.0)]);
+        let script = |p: &str, k| if p == SERIES && k == 1 { busy_once(p, 0) } else { accepted(p) };
+        let (sums, log) = run_dd(script, vec![first, second], at_least_once(), instrumented).await;
+        assert_eq!(bodies(&log, SERIES).len(), 3, "the second batch's request is retried");
+        let sent = sent_series(&log);
+        assert_eq!(
+            sent,
+            [("m".to_string(), 9.0), ("n".to_string(), 1.0), ("n".to_string(), 1.0)],
+            "the later batch's point of m is left off on both attempts"
+        );
+        assert_eq!(sent_duplicates(&sums), (1.0, 0.0, 1.0));
+        assert_eq!(sum_of(&sums, RECORDS, &[("route", "series")]), 2.0);
+    }
+
+    /// An equal gauge of a series and second an earlier batch sent, as a relay or an upstream
+    /// resend writes it, is left off and counted `normalized`, with no diagnostic: Datadog holds
+    /// the same point.
+    #[tokio::test]
+    async fn an_equal_gauge_an_earlier_batch_sent_is_counted_normalized() {
+        let batches = vec![batch(vec![named("m", NOW, 2.0)]), batch(vec![named("m", NOW, 2.0)])];
+        let (sums, log) = run_dd(|p, _| accepted(p), batches, at_least_once(), instrumented).await;
+        assert_eq!(sent_series(&log), [("m".to_string(), 2.0)]);
+        assert_eq!(sent_duplicates(&sums), (0.0, 1.0, 0.0));
+    }
+
+    /// An equal delta count of a series and second an earlier batch sent is a second increment:
+    /// left off and counted dropped, as within one batch.
+    #[tokio::test]
+    async fn an_equal_count_an_earlier_batch_sent_is_counted_dropped() {
+        let batches = vec![
+            batch(vec![metric(NOW, MetricKind::counter(1.0))]),
+            batch(vec![metric(NOW, MetricKind::counter(1.0))]),
+        ];
+        let (sums, log) = run_dd(|p, _| accepted(p), batches, at_least_once(), instrumented).await;
+        assert_eq!(bodies(&log, SERIES).len(), 1, "the second batch sends nothing");
+        assert_eq!(sent_duplicates(&sums), (1.0, 0.0, 1.0));
+        assert_eq!(sum_of(&sums, RECORDS, &[("route", "series")]), 1.0);
+    }
+
+    /// A series request Datadog rejected stored nothing, so a later batch's point of its series
+    /// and second is sent, uncounted as a duplicate; so is one after a `202` whose body names a
+    /// series dropped, since the sink can't tell which of its request's points it was.
+    #[tokio::test]
+    async fn a_point_after_a_rejected_or_partly_dropped_request_is_sent() {
+        for first in
+            [Reply::Answer(400, Vec::new()), Reply::Answer(202, SERIES_202_TWO_ERRORS.to_vec())]
+        {
+            let reply = Mutex::new(Some(first));
+            let script = move |p: &str, k| match (p, k) {
+                (SERIES, 0) => reply.lock().unwrap().take().unwrap(),
+                _ => accepted(p),
+            };
+            let batches =
+                vec![batch(vec![named("m", NOW, 9.0)]), batch(vec![named("m", NOW, 2.0)])];
+            let (sums, log) = run_dd(script, batches, at_least_once(), instrumented).await;
+            assert_eq!(sent_series(&log), [("m".to_string(), 9.0), ("m".to_string(), 2.0)]);
+            assert_eq!(sent_duplicates(&sums), (0.0, 0.0, 0.0));
+        }
+    }
+
+    /// A batch whose series request was accepted and whose logs request failed retries the logs
+    /// alone, and doesn't read its own accepted point as an earlier batch's: no duplicate is
+    /// counted, and the logs request is resent.
+    #[tokio::test]
+    async fn a_retry_does_not_read_its_own_accepted_series_as_sent_earlier() {
+        let b = batch(vec![named("m", NOW, 9.0), log_event(NOW, "after")]);
+        let script = |p: &str, k| if p == LOGS { busy_once(p, k) } else { accepted(p) };
+        let (sums, log) = run_dd(script, vec![b], at_least_once(), instrumented).await;
+        assert_eq!(recorded_paths(&log), [SERIES, LOGS, LOGS]);
+        assert_eq!(sent_duplicates(&sums), (0.0, 0.0, 0.0));
+        assert_eq!(sum_of(&sums, RECORDS, &[("route", "logs")]), 1.0);
+    }
+
+    /// Above a concurrency of 1, a batch's accepted series points are recorded when its answer is
+    /// acknowledged, so a batch submitted after that leaves off its point of the same series and
+    /// second.
+    #[tokio::test]
+    async fn a_slot_records_its_accepted_points_when_acknowledged() {
+        let (addr, log) = per_path_recorder(|p, _| accepted(p)).await;
+        let mut probe = TelemetryProbe::new();
+        let mut out = instrumented(addr, &probe).with_concurrency(2);
+        for (seq, value) in [(1, 9.0), (2, 2.0)] {
+            let id = SeqId { id: [0; 16], seq };
+            let b = batch(vec![named("m", NOW, value)]);
+            out.observe_batch(BatchContext::default(), id);
+            out.submit(&b, BatchContext::default(), id).await.unwrap();
+            out.await_ack().await.unwrap();
+        }
+        let log = log.lock().unwrap().clone();
+        assert_eq!(sent_series(&log), [("m".to_string(), 9.0)]);
+        let sums: Sums = probe
+            .poll()
+            .sums()
+            .map(|(name, tags, v)| ((name.to_string(), tags.to_vec()), v))
+            .collect();
+        assert_eq!(sent_duplicates(&sums), (1.0, 0.0, 1.0));
+    }
+
+    /// The memory keeps each series' latest second, the later write of that second, and forgets a
+    /// generation once the next fills or ages past the series window.
+    #[test]
+    fn sent_seconds_keep_the_latest_second_and_rotate_by_size_and_age() {
+        let point = |series, second, state: Option<u64>| SentPoint {
+            series,
+            second,
+            state: state.and_then(NonZeroU64::new),
+        };
+        let state = |n| NonZeroU64::new(n);
+        let mut sent = SentSeconds { per_generation: 2, ..SentSeconds::default() };
+        sent.record(&[point(1, 10, Some(7))], 0);
+        sent.record(&[point(1, 9, Some(8))], 0);
+        assert_eq!(
+            sent.earlier(&point(1, 10, None)),
+            Some(state(7)),
+            "an older second is no update"
+        );
+        assert_eq!(sent.earlier(&point(1, 9, None)), None, "only the latest second is held");
+        sent.record(&[point(1, 10, None)], 0);
+        assert_eq!(sent.earlier(&point(1, 10, None)), Some(None), "the later write of a second");
+
+        sent.record(&[point(2, 1, None)], 0);
+        sent.record(&[point(3, 1, None)], 0);
+        assert!(sent.earlier(&point(1, 10, None)).is_some(), "the previous generation is read");
+        sent.record(&[point(4, 1, None), point(5, 1, None)], 0);
+        assert_eq!(sent.earlier(&point(1, 10, None)), None, "two rotations forget series 1");
+
+        let mut aged = SentSeconds::default();
+        aged.record(&[point(1, 1, None)], 0);
+        aged.record(&[point(2, 1, None)], METRIC_MAX_AGE);
+        assert!(aged.earlier(&point(1, 1, None)).is_some());
+        aged.record(&[point(3, 1, None)], 2 * METRIC_MAX_AGE);
+        assert_eq!(aged.earlier(&point(1, 1, None)), None, "aged out after two generations");
+        assert_eq!(std::mem::size_of::<(u64, Sent)>(), 24, "the entry the memory bound assumes");
     }
 }
 

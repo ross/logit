@@ -166,7 +166,7 @@ which scenario to read it against; §1 has each measured one's committed `count`
 | `otlp-relay-grpc` | `otlp-relay-http` over OTLP/gRPC | The same round trip over the gRPC transport, read against `otlp-relay-http` |
 | `influxdb-relay` | `generate_in` (gauge, `host: h{seq%1000}`) → `influxdb_out` → `influxdb_in` → `null_out`, in one process | Line-protocol encode, one write request per batch, and the whole-body parse |
 | `prometheus-remote-write-relay` | `influxdb-relay`'s `generate_in` → `prometheus_out` (remote-write 1.0, Snappy) → `prometheus_in` (receiver) → `null_out`, in one process | Remote-write encode, Snappy, one request per batch, and decode |
-| `datadog-relay` | `influxdb-relay`'s `generate_in` → `datadog_out` (series v2, gzip) → `datadog_in` → `null_out`, in one process | Datadog series encode, gzip, one intake request per batch, and decode |
+| `datadog-relay` | a `generate_in` of one gauge per series → `datadog_out` (series v2, gzip) → `datadog_in` → `null_out`, in one process | Datadog series encode, the memory of seconds sent, gzip, one intake request per batch, and decode |
 | `splunk-hec-relay` | `otlp-relay-http`'s `generate_in` → `splunk_hec_out` (`/event`, gzip) → `splunk_hec_in` → `null_out`, in one process | HEC event-object encode, gzip, one request per batch, and decode |
 
 Rules a new or retuned scenario follows:
@@ -335,7 +335,11 @@ repeats per row. `lua-edit-jit` is `lua-edit.yaml` with `jit: true` on its `lua`
 temporary copy that isn't committed. The Count column is what ran: five relays have been resized
 since, to land inside §0's 5–10 s wall target (`datadog-relay` and `splunk-hec-relay` 2M,
 `influxdb-relay` 5M, `prometheus-remote-write-relay` 3M, `otlp-relay-grpc` 4M), so their
-committed counts differ from the rows below.
+committed counts differ from the rows below. `datadog-relay`'s event has changed since too: each
+gauge is its own series (`host: h{seq}`, where the row below ran `h{seq%1000}`), because
+`datadog_out` leaves off a point whose series and second it already sent
+([ADR `datadog-out-sent-second-memory`](../adr/datadog-out-sent-second-memory.md)). Its row
+isn't comparable with a run of the committed scenario.
 
 | Scenario | Count | events/s | events/s (min–max) | CPU µs/event | Peak RSS | Wall |
 |---|---:|---:|---:|---:|---:|---:|

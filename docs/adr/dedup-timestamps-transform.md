@@ -1,6 +1,6 @@
 ---
 created: 2026-10-21
-updated: 2026-10-23
+updated: 2026-11-04
 ---
 
 # `dedup_timestamps`: collapse readings of one series that share a timestamp, within a batch, before a sink that can't hold both
@@ -562,3 +562,16 @@ above read "rate" for that reason.
   flagged `rate` is still a state.
 - Neither reader imports anything from `logit_proto::datadog`; both call
   `logit_core::attrs::is_rate` and `logit_core::attrs::interval`.
+
+## Amendment: `datadog_out` remembers the seconds it sent (2026-11-04)
+
+"The sink-side counter" says two points of one Datadog series in one second in two batches aren't
+collapsed. `datadog_out` now remembers the latest second it sent each series in, once Datadog
+accepted the request, and leaves a later batch's point of that series and second off, counted by
+the table above: `normalized` for an equal state, else `dropped{reason="duplicate_timestamp"}`,
+with a `duplicate_timestamp_sent` diagnostic. It keeps the earlier point, which Datadog already
+holds, and merges nothing. A probe on 2026-11-04 verified "Across separate requests, the later
+write wins" for a `count`, a gauge, and a `rate`, whichever value is higher. The memory, its
+bounds, and the pairs it misses are
+[ADR `datadog-out-sent-second-memory`](datadog-out-sent-second-memory.md). This transform still
+holds no state between batches.
