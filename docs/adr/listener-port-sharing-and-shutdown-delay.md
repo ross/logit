@@ -1,6 +1,6 @@
 ---
 created: 2026-10-07
-updated: 2026-10-13
+updated: 2026-11-04
 ---
 
 # Listener port sharing with `SO_REUSEPORT`, a SIGTERM drain delay, and an admin Unix socket
@@ -275,3 +275,22 @@ not defended.
 
 Under [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md), the kernel's per-socket counter this record cites as `logit.input.kernel.drops` is
 `logit.input.kernel.dropped{reason="socket"}`.
+
+## Amendment (2026-11-04): a close resets in-flight handshakes without `tcp_migrate_req`
+
+Decision 2 says only the connections that complete their handshake "between the last accept and
+the close" are exposed. That undersells it. With `net.ipv4.tcp_migrate_req=0`, the kernel's
+default, closing a listener resets every connection in its accept queue and every handshake in
+flight to it, including one whose final ACK hasn't arrived. The count is about the dial rate times
+the round-trip time, on the closing listener's share of the port, so it grows with the clients'
+distance. Keeping the queue near empty by accepting through the delay doesn't remove it.
+
+With `tcp_migrate_req=1` the kernel migrates both to the other listener. The soak saw 7 and 7
+resets at two closes of 23,920 churn dials at 0 (an earlier control read 9 and 14), and none
+across four closes of 44,817 dials at 1. The recommendation changes from "closes a narrow window"
+to: an operator who overlaps TCP listeners sets `net.ipv4.tcp_migrate_req=1` in the network
+namespace the listeners share. The sysctl is per namespace, and Docker sets it with `--sysctl` or
+Compose `sysctls:` and no added capability. UDP is unchanged: the sysctl is TCP only.
+[docs/deploying.md](../deploying.md#tcp-listeners-and-tcp_migrate_req) states the corrected
+exposure. The numbers are in the "W37" Findings of
+[docs/plans/soak-harness.md](../plans/soak-harness.md).
