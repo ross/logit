@@ -1,10 +1,10 @@
 # Generated remote-write 2.0 samples from `prometheus_out` into `logit`'s `prometheus_in` on
 # `bind:` and out to VictoriaMetrics, under network and lifecycle faults on both ends and a
 # backend stop. G counts only the samples the SUT answered `204` for, after they were in its
-# pipeline, so every window but a kill's is judged. The receiver never answers busy: a backend
-# stop holds its `204` past the generator's 10 s timeout, and the generator resends a batch the
-# SUT still delivers, a surplus allowed one batch per transport-error attempt. The schema is
-# docs/plans/soak-harness.md's "The scenario schema".
+# pipeline, so every window but a kill's is judged. A backend stop reaches the receiver as busy
+# `503`s: a write whose batch finds no room within 2 s is answered with nothing taken, counted
+# deferred, and the generator retries it. A transport-error resend is a surplus allowed one batch
+# per attempt. The schema is docs/plans/soak-harness.md's "The scenario schema".
 
 name = "rw-ingress"
 description = "generator prometheus_out RW2 -> prometheus_in bind (HTTP) -> kv_metrics -> aggregate 500ms cumulative -> prometheus_out RW1 zstd -> VictoriaMetrics"
@@ -66,8 +66,8 @@ args = "loss 10%"
 for = "60s"
 
 # The sink's two-batch queue and every inbox back to the listener fill, and the listener then
-# holds each request until its batch is taken: past the generator's 10 s timeout, which
-# resends the batch while the held one still delivers once the backend is back.
+# answers each write whose batch finds no room within 2 s `503`, counted deferred, which the
+# generator retries with nothing taken, well inside its 10 s timeout.
 [[step]]
 at = "7m"
 action = "stop"
@@ -94,17 +94,52 @@ action = "kill"
 on = "logit"
 for = "30s"
 
-# Held `204`s time out at the generator, which resends.
+# The full pipeline reaches the receiver as busy answers, not as writes held past the
+# generator's timeout.
 [[expect]]
-name = "backend-stop-resends"
+name = "listener-answers-busy"
+service = "logit"
+metric = "logit.input.batches.deferred"
+component = "remote_write"
+step = "c0s4"
+window = "through"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "listener-writes-busy"
+service = "logit"
+metric = "logit.input.writes"
+component = "remote_write"
+attrs = { class = "busy" }
+step = "c0s4"
+window = "through"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "generator-reads-busy"
+service = "generator"
+metric = "logit.output.requests"
+component = "remote_write"
+attrs = { class = "5xx" }
+step = "c0s4"
+window = "through"
+reduce = "delta"
+min = 1
+
+# A busy answer arrives at 2 s, inside the generator's 10 s timeout, so the stop times nothing
+# out.
+[[expect]]
+name = "backend-stop-times-nothing-out"
 service = "generator"
 metric = "logit.output.requests"
 component = "remote_write"
 attrs = { class = "network_error" }
 step = "c0s4"
-window = "through"
+window = "during"
 reduce = "delta"
-min = 1
+max = 0
 
 [[expect]]
 name = "generator-resends"
@@ -137,7 +172,8 @@ window = "run"
 reduce = "delta"
 min = 1
 
-# A write the receiver refuses whole, any class but `ok`, would be a batch neither side counts.
+# A write the receiver refuses as malformed would be a batch neither side counts; a busy write is
+# a retry, asserted above.
 [[expect]]
 name = "listener-refuses-none"
 service = "logit"
