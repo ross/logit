@@ -15371,6 +15371,17 @@ def _copytruncate_ledger():
                and reread.detail.startswith("W + F − G 4,000 is surplus, outside the replay "
                                             "band [0, 1]"),
                f"a copy made while the SUT was down read from 0 FAILs, got {reread}")
+        # A prlimit leaves the tailer running, so a copy made inside one is a running step's: it
+        # may read its copy again after bytes were appended, and the band is not the down band.
+        limited = [_action("apply", "c0s2", "prlimit", "logit", 200, 201, nofile=24,
+                           found=[1024, 524288], affects_file_ingress=True),
+                   _action("revert", "c0s2", "prlimit", "logit", 260, 260, restored=True)]
+        inside = limited + ops_of((210, 5_000, 30, 2_850))
+        limit = run("ct-prlimit", 5_001, short=30, ops=inside)["ledger.wire"]
+        expect(limit.status == checks.PASS
+               and "copytruncate at +210s, a tailer running: [-30, +5,001]" in "\n".join(limit.lines),
+               f"a copytruncate inside a prlimit window is a running tailer's, got {limit} "
+               f"{limit.lines}")
         # A shortfall past the records means a write landed unrecorded: every running step may
         # then have read past its copy.
         short = run("ct-shortfall", 8_003, short=150)["ledger.wire"]
