@@ -49,6 +49,8 @@
 //! - TCP: `crate::stream`'s module doc lists the fault rules. A connect failure or timeout is
 //!   `Clean`. A first write that accepted nothing is retried once on a fresh connection. A
 //!   failure after a byte left, or of the flush, is `Ambiguous` and never retried by this sink.
+//!   A receiver that stops reading keeps its connection, and a connection that ends with bytes
+//!   unacknowledged counts them as `logit.output.bytes.dropped{reason="unacknowledged"}`.
 //!
 //! ## Telemetry
 //!
@@ -57,7 +59,8 @@
 //! `logit.output.requests{class="ok"|"clean"|"ambiguous"|"rejected"|"refused"}`, `logit.output.messages`
 //! (entries sent), `logit.output.datapoints` (Σ sent entries' meta; equals `messages` for
 //! plaintext), `logit.output.datagrams` (UDP only), `logit.output.reconnects` (TCP, every connect
-//! after the first), and the `oversize_datagram` drop above. On UDP the sent counts include what
+//! after the first), `logit.output.bytes.dropped{reason="unacknowledged"}` (TCP), and the
+//! `oversize_datagram` drop above. On UDP the sent counts include what
 //! reached the kernel before a failure; on TCP they count only a delivered frame.
 //!
 //! ## Delivery posture
@@ -255,7 +258,8 @@ impl GraphiteOutput {
                     sink: "graphite_out",
                     nodelay: false,
                 };
-                let result = pool.send(&dial, &self.packet_buf, &self.telemetry).await;
+                let result =
+                    pool.send(&dial, &self.packet_buf, &self.telemetry, &mut self.diag).await;
                 if result.is_ok() {
                     self.telemetry.count("logit.output.messages", self.buf.len() as f64, &[]);
                     self.telemetry.count("logit.output.datapoints", datapoints as f64, &[]);
@@ -289,8 +293,8 @@ impl Output for GraphiteOutput {
 
     /// `send` pools a connection only after flushing it; this is the shutdown backstop.
     async fn flush(&mut self) -> anyhow::Result<()> {
-        if let Conn::Tcp { pool, .. } = &mut self.conn {
-            pool.flush().await.context("flushing graphite_out TCP stream")?;
+        if let Conn::Tcp { pool, connect_timeout } = &mut self.conn {
+            pool.flush(*connect_timeout).await.context("flushing graphite_out TCP stream")?;
         }
         Ok(())
     }

@@ -78,7 +78,7 @@ have to open six files. Most also appear in the producer's own header or its `pr
   `logit.shape.attributes` is a flat `0` there by construction. `graphite_in`'s 5 s
   `handshake_timeout` closes Telegraf's **first** graphite connection once, because Telegraf
   connects before it has anything to write. It reconnects and the capture is unaffected; the
-  resulting `logit.log` line is expected, not a fault.
+  resulting `connections.closed{reason="handshake_timeout"}` count is expected, not a fault.
 - **`demo`: the weakest evidence in the harness and its best exercise.** See
   [Representativeness is structural](#representativeness-is-structural), and `source-labels.json`
   for which tiers' formats this repository authored.

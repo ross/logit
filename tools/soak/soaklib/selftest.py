@@ -4486,19 +4486,27 @@ def _kill_run(tmp, name, kill_gap=1500, stray_drop=False, replayed=3, queued=Non
     return run_dir
 
 
-def _tail_run(tmp, name, kill=True, unflushed=6.0, short=0, pickle=False, **kwargs):
+def _tail_run(tmp, name, kill=True, unflushed=6.0, short=0, pickle=False, unacked=0,
+              **kwargs):
     """`_kill_run`'s three-life run with a `graphite_out`-style sink: the SUT counts
-    `logit.output.datapoints` for `sink`, two per aggregate flush (one per series), and
-    `logit.output.messages` as many under plaintext, or one frame per flush under `pickle`; the
-    sink names `kill_unflushed` (`unflushed`, None for none). With `kill`, a `kill` of
-    victoria-metrics runs over +240..+270 in life 2. `short` datapoints go uncounted in the drain
-    at +250. Its span is (+240 − 6 − 10, +240 + 2 x 5] = (+224, +250], which holds the flushes at
-    +230, +240, and +250: a bound of 6."""
+    `logit.output.datapoints` for `sink`, two per aggregate flush (one per series), 30
+    `logit.output.batch.bytes` per datapoint, and `logit.output.messages` as many under
+    plaintext, or one frame per flush under `pickle`; the sink names `kill_unflushed`
+    (`unflushed`, None for none). With `kill`, a `kill` of victoria-metrics runs over +240..+270
+    in life 2. `short` datapoints go uncounted in the drain at +250, and `unacked` bytes are
+    counted `logit.output.bytes.dropped{reason="unacknowledged"}` there. Its span is
+    (+240 − 6 − 10, +240 + 2 x 5] = (+224, +250], which holds the flushes at +230, +240, and
+    +250: a bound of 6."""
     flushes = (*range(10, 101, 10), *range(140, 201, 10), *range(220, 321, 10))
     messages = [_line(_stamp(T0 + s), name_, "sum", value, component="sink")
                 for s in flushes
                 for name_, value in (("logit.output.datapoints", 2 - (short if s == 250 else 0)),
+                                     ("logit.output.batch.bytes",
+                                      30 * (2 - (short if s == 250 else 0))),
                                      ("logit.output.messages", 1 if pickle else 2))]
+    if unacked:
+        messages.append(_line(_stamp(T0 + 250), "logit.output.bytes.dropped", "sum", unacked,
+                              component="sink", attrs={"reason": "unacknowledged"}))
     run_dir = _kill_run(tmp, name, sut_extra=messages,
                         silence=("victoria-metrics", "kill") if kill else None, **kwargs)
     resolved = json.loads((run_dir / "scenario.resolved.json").read_text())
@@ -4510,8 +4518,9 @@ def _tail_run(tmp, name, kill=True, unflushed=6.0, short=0, pickle=False, **kwar
 
 
 def _tail_ledger():
-    """`ledger.tail`: per SUT life, the sink's counted datapoints M against the export's distinct
-    samples S, 0 exact, a backend kill's loss up to its bound, and every other gap FAILs; and
+    """`ledger.tail`: per SUT life, the sink's counted datapoints M less its unacknowledged
+    count U against the export's distinct samples S, 0 exact, a backend kill's loss up to its
+    bound, and every other gap FAILs, a U past the loss included; `drops` leaves U to it; and
     `ledger.windows` excuses a gap across the kill's span."""
     with tempfile.TemporaryDirectory() as tmp:
         def tail(name, **kwargs):
@@ -4535,8 +4544,8 @@ def _tail_ledger():
                f"{pickled['ledger.tail']}")
         within = tail("tail-within", drop=(230, 240, 250))
         expect(within["ledger.tail"].status == checks.PASS
-               and "life 2 (final): M 22 − S 16 = 6, tail loss within the bound 6, uncounted by "
-               "design" in within["ledger.tail"].detail,
+               and "life 2 (final): M 22 − S 16 = 6, tail loss within the bound 6, uncounted: "
+               "what the backend acknowledged and never stored" in within["ledger.tail"].detail,
                f"tail PASSes a backend kill's loss up to its bound, got {within['ledger.tail']}")
         expect(within["ledger.windows"].status == checks.PASS
                and "tail gap excused: sink c0s3, 2 gap(s), widest 40s, across the kill's span; "
@@ -4558,6 +4567,25 @@ def _tail_ledger():
                and "M 21 − S 22 = -1, a surplus: 1 stored sample(s) the sink never counted"
                in surplus["ledger.tail"].detail,
                f"tail FAILs a stored sample the sink never counted, got {surplus['ledger.tail']}")
+        part = tail("tail-k-part", drop=(230, 240, 250), unacked=90)
+        expect(part["ledger.tail"].status == checks.PASS
+               and "life 2 (final): M 22 − S 16 − U 3 = 3, U 90 unacknowledged byte(s) counted, "
+               "3 datapoint(s) at 30.0 bytes each, tail loss within the bound 6"
+               in part["ledger.tail"].detail,
+               f"tail takes the sink's unacknowledged count out of the loss, got "
+               f"{part['ledger.tail']}")
+        drops = checks.check_drops(checks.RunData(Path(tmp) / "tail-k-part"))
+        expect(drops.status == checks.PASS and "unacknowledged" not in drops.detail,
+               f"drops leaves a kill_unflushed sink's unacknowledged count to tail, got {drops}")
+        counted = tail("tail-k-all", kill=False, drop=(240,), unacked=60)
+        expect(counted["ledger.tail"].status == checks.PASS
+               and "M 22 − S 20 − U 2 = 0, U 60 unacknowledged byte(s) counted, 2 datapoint(s) "
+               "at 30.0 bytes each, every lost datapoint counted" in counted["ledger.tail"].detail,
+               f"tail PASSes a loss the sink counted whole, got {counted['ledger.tail']}")
+        overcounted = tail("tail-k-over", drop=(240,), unacked=150)
+        expect(overcounted["ledger.tail"].status == checks.FAIL
+               and "U exceeds the 2 lost by 3, past 5% of U" in overcounted["ledger.tail"].detail,
+               f"tail FAILs a count past the loss, got {overcounted['ledger.tail']}")
         unset = tail("tail-unset", unflushed=None, drop=(240,))
         expect(unset["ledger.tail"].status == checks.SKIP
                and unset["ledger.windows"].status == checks.FAIL,
@@ -6514,13 +6542,16 @@ STALL_PAUSE = (86, 131)
 STALL_KILL = (101, 131)
 
 
-def _stall_run(tmp, name, redials=0, buffers=(150_000, 150_000), per_line=100, sized=True):
+def _stall_run(tmp, name, redials=0, buffers=(150_000, 150_000), per_line=100, sized=True,
+               unacked=750_000):
     """`_tcp_run`'s two-life run with its stop replaced by a stalled kill: a pause of the SUT
     over `STALL_PAUSE` and a kill inside it over `STALL_KILL`, both TCP-affecting, the pause's
     revert finding nothing to unpause. The SUT writes no drain while paused, so its last before
     the pause is at +85. The generator's sink counts `per_line` bytes per line
-    (`logit.output.batch.bytes`) when `sized`, and `redials` reconnects at +105; the source
-    names `buffers` as its `socket_buffers` (`(receive, send)`, None for none)."""
+    (`logit.output.batch.bytes`) when `sized`, `redials` reconnects at +100, inside the pause
+    before the kill, and `unacked` bytes `logit.output.bytes.dropped{reason="unacknowledged"}`
+    at +110, after the kill; the source names `buffers` as its `socket_buffers`
+    (`(receive, send)`, None for none)."""
     pause_ts = (T0 + STALL_PAUSE[0], T0 + STALL_KILL[0])
 
     def sut_edit(record):
@@ -6534,9 +6565,13 @@ def _stall_run(tmp, name, redials=0, buffers=(150_000, 150_000), per_line=100, s
         if sized:
             extra.append(json.loads(_line(record["timestamp"], "logit.output.batch.bytes",
                                           "sum", PER_DRAIN * per_line, component="out")))
-        if redials and record["timestamp"] == _stamp(T0 + 105):
+        if redials and record["timestamp"] == _stamp(T0 + 100):
             extra.append(json.loads(_line(record["timestamp"], "logit.output.reconnects",
                                           "sum", redials, component="out")))
+        if unacked and record["timestamp"] == _stamp(T0 + 110):
+            extra.append(json.loads(_line(record["timestamp"], "logit.output.bytes.dropped",
+                                          "sum", unacked, component="out",
+                                          attrs={"reason": "unacknowledged"})))
         return [record, *extra]
 
     run_dir = _tcp_run(tmp, name, sut_edit=sut_edit, gen_edit=gen_edit)
@@ -6570,39 +6605,55 @@ def _stall_run(tmp, name, redials=0, buffers=(150_000, 150_000), per_line=100, s
 
 
 def _stall_ledger():
-    """`ledger.wire` on a stalled kill: the fault run holding it reports its loss and holds it
-    to G from the SUT's last drain to the pause, plus each connection's two `socket_buffers`
-    in lines, plus a batch per edge; a loss past that FAILs, and without `socket_buffers` or
-    the generator's bytes per line the loss is reported unbounded."""
+    """`ledger.wire` on a stalled kill: the fault run holding it reports its loss and the
+    generator's unacknowledged count U in lines, and holds the rest to G from the SUT's last
+    drain to the pause, plus the receive `socket_buffers` in lines, plus a batch per edge. A rest
+    past that FAILs, and so do no U at a stalled kill and a U past the loss; without
+    `socket_buffers` or the generator's bytes per line the loss is reported unbounded."""
     with tempfile.TemporaryDirectory() as tmp:
         def wire(name, **kwargs):
             return checks.check_ledger_wire(checks.RunData(_stall_run(tmp, name, **kwargs)))
 
-        within = wire("stall-within", redials=2)
+        within = wire("stall-within")
         expect(within.status == checks.PASS
-               and "stalled kill [+85s, +180s]: lost 9,000, within its bound 9,400, uncounted "
-               "by design; c0s2 inside c0s1: G 200 from the SUT's last drain at +85s to the "
-               "pause" in within.detail
-               and "bound 9,400 = 200 + 3 connection(s) (2 redial(s)) x (150,000 + 150,000) "
-               "bytes at 100.0 bytes per line (9,000) + 2 edge(s) x one 100-line batch"
+               and "stalled kill [+85s, +180s]: lost 9,000, U 7,500 counted, 1,500 uncounted "
+               "within its bound 1,900: U counted, R (the receiver's share) uncounted; c0s2 "
+               "inside c0s1: G 200 from the SUT's last drain at +85s to the pause"
+               in within.detail
+               and "0 redial(s) in it; U 750,000 unacknowledged byte(s) counted, 7,500 line(s) "
+               "at 100.0 bytes per line; R (the receiver's share) uncounted, bound 1,900 = 200 "
+               "+ R at most 150,000 bytes (1,500) + 2 edge(s) x one 100-line batch"
                in within.detail,
-               f"wire holds a stalled kill's loss to its connections' buffers, got {within}")
-        over = wire("stall-over")
+               f"wire holds a stalled kill's uncounted loss to its receive buffer, got {within}")
+        redialed = wire("stall-redialed", redials=2)
+        expect(redialed.status == checks.PASS and "2 redial(s) in it" in redialed.detail,
+               f"wire shows a stall's redials, got {redialed}")
+        over = wire("stall-over", unacked=100_000)
         expect(over.status == checks.FAIL
-               and over.detail.startswith("stalled kill [+85s, +180s]: lost 9,000, over its "
-                                          "bound 3,400")
-               and over.detail.count("over its bound") == 1
-               and "1 connection(s) (0 redial(s))" in over.detail,
-               f"wire FAILs a stalled kill's loss past one connection's buffers, got {over}")
-        smaller = wire("stall-small-buffers", redials=2, buffers=(100_000, 100_000))
-        expect(smaller.status == checks.FAIL and "over its bound 6,400" in smaller.detail,
-               f"the bound follows socket_buffers, got {smaller}")
+               and over.detail.startswith("stalled kill [+85s, +180s]: lost 9,000, U 1,000 "
+                                          "counted, 8,000 uncounted, over its bound 1,900")
+               and over.detail.count("over its bound") == 1,
+               f"wire FAILs a stalled kill's uncounted loss past its receive buffer, got {over}")
+        uncounted = wire("stall-uncounted", unacked=0)
+        expect(uncounted.status == checks.FAIL
+               and uncounted.detail.startswith(
+                   "stalled kill [+85s, +180s]: lost 9,000, U 0 counted, but the generator "
+                   "counted no unacknowledged bytes after c0s2"),
+               f"wire FAILs a stalled kill with no unacknowledged count, got {uncounted}")
+        overcounted = wire("stall-overcounted", unacked=950_000)
+        expect(overcounted.status == checks.FAIL
+               and "U 9,500 counted, more than the 9,000 lost plus 2 edge batches"
+               in overcounted.detail,
+               f"wire FAILs a count past a stalled kill's loss, got {overcounted}")
+        smaller = wire("stall-small-buffers", buffers=(10_000, 150_000))
+        expect(smaller.status == checks.FAIL and "over its bound 500" in smaller.detail,
+               f"the bound follows socket_buffers' receive bytes, got {smaller}")
         unnamed = wire("stall-no-buffers", buffers=None)
         expect(unnamed.status == checks.PASS
-               and "stalled kill [+85s, +180s]: lost 9,000; c0s2 inside c0s1: not bounded: the "
-               "source names no socket_buffers" in unnamed.detail,
+               and "stalled kill [+85s, +180s]: lost 9,000, U 0 counted; c0s2 inside c0s1: not "
+               "bounded: the source names no socket_buffers" in unnamed.detail,
                f"wire reports a stalled kill unbounded without socket_buffers, got {unnamed}")
-        unsized = wire("stall-no-bytes", redials=2, sized=False)
+        unsized = wire("stall-no-bytes", sized=False)
         expect(unsized.status == checks.PASS
                and "not bounded: the generator's sink counted no logit.output.batch.bytes"
                in unsized.detail,
@@ -7197,6 +7248,7 @@ HTTP_REQUESTS = {
     "influxdb_in": ("logit.input.requests", {"route": "write"}),
     "splunk_hec_in": ("logit.input.requests", {"route": "event"}),
     "datadog_in": ("logit.input.requests", {"route": "series_v2"}),
+    "otlp_in": ("logit.input.requests", {"route": "metrics"}),
     "prometheus_in": ("logit.input.writes", {}),
 }
 
@@ -7591,11 +7643,13 @@ def _http_ledger():
                f"no request read in flight widens no edge, got {masked['ledger.wire']}")
 
         # `splunk_hec_in` and `datadog_in` hold their write route's requests to batches as
-        # `influxdb_in` does, each on its own route; `prometheus_in`'s receiver counts
-        # `logit.input.writes{class}` with no route tag, and never answers busy.
+        # `influxdb_in` does, each on its own route, and `otlp_in` on its three routes summed;
+        # `prometheus_in`'s receiver counts `logit.input.writes{class}` with no route tag, and
+        # never answers busy.
         for kind, route_text in (
                 ("splunk_hec_in", "logit.input.requests{route=event}"),
                 ("datadog_in", "logit.input.requests{route=series_v2}"),
+                ("otlp_in", "logit.input.requests"),
                 ("prometheus_in", "logit.input.writes")):
             got = results(f"http-{kind}", kind=kind)
             intake = got["ledger.intake"].detail
@@ -7628,15 +7682,7 @@ def _http_ledger():
                    f"{kind}: a closed_consumer request is one batch sent, got "
                    f"{refused['ledger.intake']}")
 
-        # `otlp_in` counts no requests: its intake has no identity of its own, and its wire
-        # still FAILs uncounted loss.
-        otlp = results("http-otlp", kind="otlp_in")
-        expect(otlp["ledger.wire"].status == checks.PASS
-               and otlp["ledger.intake"].status == checks.PASS
-               and "otlp_in counts no requests: W − D == E + B alone"
-               in otlp["ledger.intake"].detail,
-               f"otlp_in's rows PASS its balanced fixture, got {otlp['ledger.wire']}, "
-               f"{otlp['ledger.intake']}")
+        # `otlp_in`'s wire still FAILs uncounted loss.
         otlp_lost = results("http-otlp-lost", kind="otlp_in", gen_edit=_at_offset(
             "logit.component.events.delivered", 60, 1000, "out", add=True))
         expect(otlp_lost["ledger.wire"].status == checks.FAIL

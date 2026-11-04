@@ -65,6 +65,13 @@
 //! The bound covers only the *first* byte (until [`Framer::first_byte_seen`] is true), the phase
 //! with no legitimate reason to be slow. The opt-in idle timeout bounds the gaps after it.
 //!
+//! *Counted, not diagnosed.* Expiry of the TLS accept or of the first-byte wait closes the
+//! connection with `Ok(())`, counted `logit.input.connections.closed{reason="handshake_timeout"}`
+//! and never reaching `connection_error`, as an idle close does. No bytes were framed, so it
+//! isn't a loss (`*.dropped`). A PROXY header that times out stays
+//! `connections.rejected{reason="proxy_header"}`, and a TLS accept that fails (rather than times
+//! out) stays a `connection_error`.
+//!
 //! The predicate is `first_byte_seen`, not "has the framer latched a
 //! [`Framing`](logit_proto::framing::Framing)": only [`FramingMode::Rfc6587Auto`] has anything to
 //! latch, so under either explicit mode a latch-shaped predicate would read "already framed" on a
@@ -899,9 +906,16 @@ impl<D: Decoder + Clone + Send + 'static> ConnectionSpawner<D> {
                             .await
                         }
                         Ok(Err(err)) => Err(anyhow::anyhow!("TLS handshake failed: {err}")),
-                        Err(_elapsed) => Err(anyhow::anyhow!(
-                            "TLS handshake did not complete within {handshake_timeout:?}"
-                        )),
+                        // Policy, not a fault, as for the first-byte bound: counted, not
+                        // diagnosed.
+                        Err(_elapsed) => {
+                            telemetry.count(
+                                "logit.input.connections.closed",
+                                1.0,
+                                &[("reason", "handshake_timeout")],
+                            );
+                            Ok(())
+                        }
                     }
                 }
                 // No TLS to bound, but `serve_connection`'s first-byte deadline still applies
@@ -926,9 +940,9 @@ impl<D: Decoder + Clone + Send + 'static> ConnectionSpawner<D> {
 
             drop(live);
 
-            // One connection's error (a peer vanishing mid-frame, a TLS accept that failed or
-            // timed out) is never fatal to the listener or its siblings; only an accept failing
-            // in the accept loop is.
+            // One connection's error (a peer vanishing mid-frame, a TLS accept that failed) is
+            // never fatal to the listener or its siblings; only an accept failing in the accept
+            // loop is.
             if let Err(err) = result {
                 diag.warn_throttled("connection_error", err);
             }
@@ -1090,12 +1104,15 @@ where
                 // Checked against the clock rather than inferred from which deadline was smaller,
                 // so a flush tick landing on the same instant can't mask it.
                 if tokio::time::Instant::now() >= next_byte_deadline {
-                    // No first byte: a fault, returned as `Err` so it reaches the accept loop's
-                    // `connection_error` diagnostic.
+                    // No first byte: policy, not a fault, like the idle close below. Nothing was
+                    // framed, so there is no partial frame to report.
                     if awaiting_first_byte {
-                        return Err(anyhow::anyhow!(
-                            "the peer sent no bytes within {handshake_timeout:?}"
-                        ));
+                        telemetry.count(
+                            "logit.input.connections.closed",
+                            1.0,
+                            &[("reason", "handshake_timeout")],
+                        );
+                        return Ok(());
                     }
                     // Idle: policy, not a fault, so `Ok(())` and no `connection_error` (this
                     // module's "Idle timeout" doc section). A buffered partial frame is counted
@@ -2007,6 +2024,39 @@ mod tests {
         handle.abort();
     }
 
+    /// A plaintext connection that sends nothing is counted `handshake_timeout`, not diagnosed.
+    #[tokio::test]
+    async fn a_first_byte_timeout_is_counted_and_not_diagnosed() {
+        let mut probe = TelemetryProbe::new();
+        let (addr, listener) = bound_listener(one_per_frame()).await;
+        let diag = Diagnostics::new("syslog_in");
+        let listener_diag = diag.clone();
+        let mut listener = listener
+            .with_telemetry(probe.telemetry("syslog_in", "syslog_in", "listener"))
+            .with_diagnostics(diag)
+            .with_handshake_timeout(Duration::from_millis(50));
+        let (sink, _rx) = fanout_into_channel(16);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle =
+            tokio::spawn(async move { listener.run_until_shutdown(sink, shutdown_rx).await });
+
+        let mut silent = connect(&addr).await;
+        expect_closed(&mut silent, "a connection that sent no bytes").await;
+        wait_until("the handshake_timeout close count", || {
+            probe.sum("logit.input.connections.closed", &[("reason", "handshake_timeout")]) == 1.0
+        })
+        .await;
+        assert_eq!(
+            probe.sum("logit.input.connections.closed", &[("reason", "idle")]),
+            0.0,
+            "counted as a handshake timeout, never as idle"
+        );
+        assert_eq!(listener_diag.occurrences("connection_error"), 0);
+
+        drop(silent);
+        handle.abort();
+    }
+
     /// With no `idle_timeout`, a gap past the first-byte budget after the first frame is fine.
     #[tokio::test]
     async fn the_first_byte_deadline_does_not_apply_once_the_framing_has_latched() {
@@ -2080,11 +2130,17 @@ mod tests {
         }
     }
 
-    /// A TLS connection that never sends a ClientHello releases its permit at the timeout.
+    /// A TLS connection that never sends a ClientHello releases its permit at the timeout, counted
+    /// `handshake_timeout` and not diagnosed.
     #[tokio::test]
     async fn a_silent_connection_releases_its_permit_after_the_handshake_timeout() {
+        let mut probe = TelemetryProbe::new();
         let (addr, listener) = bound_listener(one_per_frame()).await;
+        let diag = Diagnostics::new("syslog_in");
+        let listener_diag = diag.clone();
         let mut listener = listener
+            .with_telemetry(probe.telemetry("syslog_in", "syslog_in", "listener"))
+            .with_diagnostics(diag)
             .with_tls(
                 &test_tls_settings(None),
                 &testdata_dir(),
@@ -2103,6 +2159,11 @@ mod tests {
         // this current-thread runtime the close means the permit is back.
         let mut silent = connect(&addr).await;
         expect_closed(&mut silent, "a TLS connection that sent no ClientHello").await;
+        wait_until("the handshake_timeout close count", || {
+            probe.sum("logit.input.connections.closed", &[("reason", "handshake_timeout")]) == 1.0
+        })
+        .await;
+        assert_eq!(listener_diag.occurrences("connection_error"), 0);
 
         let connector = tls_connector("ca.pem", None).await;
         let mut client = tls_connect(&connector, &addr).await;

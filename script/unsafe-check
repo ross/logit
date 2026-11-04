@@ -13,11 +13,12 @@
 #        script/unsafe-check --help
 #
 # Verifies, with nightly-only tools in a throwaway image, the three raw-`libc` `unsafe` call sites
-# (udp.rs `recvmmsg`, sockstat.rs `getsockopt`, tail/watch.rs inotify), the safe-Rust accept loops
-# (the `accept4` inject scenarios), and the decoders of untrusted bytes (the fuzz targets); see
-# docs/adr/out-of-ci-unsafe-verification.md and docs/adr/out-of-ci-fuzzing.md. `miri` runs the
-# pure helpers and the sketch and HyperLogLog codec tests, `careful` runs the real tests under a
-# debug-assertion std, and `inject`/`inject-all` force errno paths with `strace -e inject=`.
+# (udp.rs `recvmmsg`, sockstat.rs `getsockopt` and `ioctl(SIOCOUTQ)`, tail/watch.rs inotify), the
+# safe-Rust accept loops (the `accept4` inject scenarios), and the decoders of untrusted bytes (the
+# fuzz targets); see docs/adr/out-of-ci-unsafe-verification.md and docs/adr/out-of-ci-fuzzing.md.
+# `miri` runs the pure helpers and the sketch and HyperLogLog codec tests, `careful` runs the real
+# tests under a debug-assertion std, and `inject`/`inject-all` force errno paths with `strace -e
+# inject=`.
 # `all` runs `miri` then `careful`.
 #
 # The same image fuzzes the decoders that read a peer's or the disk spool's bytes (`fuzz/`,
@@ -57,7 +58,7 @@ IMAGE=logit-unsafe-check:local
 #   parse_events            the `inotify_event` parser in tail/watch.rs
 #   batch_reader_helpers    udp.rs's `mmsghdr`/`iovec`/`msg_name` construction, post-call harvest,
 #                           and the source-address parser `peer:` reads `msg_name` with
-#   reply_parsing           sockstat.rs's two `getsockopt` reply parsers, which take an
+#   reply_parsing           sockstat.rs's three `getsockopt` reply parsers, which take an
 #                           already-filled buffer, including a `mem::zeroed::<libc::tcp_info>()`
 #   hyperloglog, hll_       metric.rs's `HyperLogLog` codec; Stacked Borrows off, permissive provenance
 #   sketch::tests           sketch.rs's `DdSketch`; deterministic floats
@@ -666,11 +667,12 @@ Usage: script/unsafe-check miri [cargo-miri-test args]
        script/unsafe-check --help
 
 Verifies, with nightly-only tools in a throwaway image, the three raw-`libc` `unsafe` call sites
-(udp.rs `recvmmsg`, sockstat.rs `getsockopt`, tail/watch.rs inotify), the safe-Rust accept loops
-(the `accept4` inject scenarios), and the decoders of untrusted bytes (the fuzz targets); see
-docs/adr/out-of-ci-unsafe-verification.md and docs/adr/out-of-ci-fuzzing.md. `miri` runs the
-pure helpers and the sketch and HyperLogLog codec tests, `careful` runs the real tests under a
-debug-assertion std, and `inject`/`inject-all` force errno paths with `strace -e inject=`.
+(udp.rs `recvmmsg`, sockstat.rs `getsockopt` and `ioctl(SIOCOUTQ)`, tail/watch.rs inotify), the
+safe-Rust accept loops (the `accept4` inject scenarios), and the decoders of untrusted bytes (the
+fuzz targets); see docs/adr/out-of-ci-unsafe-verification.md and docs/adr/out-of-ci-fuzzing.md.
+`miri` runs the pure helpers and the sketch and HyperLogLog codec tests, `careful` runs the real
+tests under a debug-assertion std, and `inject`/`inject-all` force errno paths with `strace -e
+inject=`.
 `all` runs `miri` then `careful`.
 
 The same image fuzzes the decoders that read a peer's or the disk spool's bytes (`fuzz/`,

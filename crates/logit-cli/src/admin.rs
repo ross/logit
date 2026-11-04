@@ -12,6 +12,7 @@ use http::{Method, StatusCode};
 use http_body_util::Full;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
+use logit_core::Diagnostics;
 use logit_pipeline::readiness::{NodeState, Phase, PipelineState};
 use std::io::ErrorKind;
 use std::sync::Arc;
@@ -44,6 +45,7 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 /// Each listener gets its own task, so each has its own connection limit.
 pub async fn serve_on(listener: AdminListener, readiness: watch::Receiver<PipelineState>) {
     let connection_limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+    let mut diag = Diagnostics::new("admin");
     loop {
         let accepted = match &listener {
             AdminListener::Tcp(tcp) => match tcp.accept().await {
@@ -68,7 +70,7 @@ pub async fn serve_on(listener: AdminListener, readiness: watch::Receiver<Pipeli
             // `ConnectionReset`/`Interrupted` are one client's accident and retry at once;
             // anything else (fd exhaustion, realistically) is process-wide and gets
             // `ACCEPT_ERROR_BACKOFF` first, or a readable-but-failing listener spins hot.
-            tracing::warn!(target: "logit", error = %err, "admin: accept failed");
+            report_accept_error(&mut diag, &err);
             if !matches!(
                 err.kind(),
                 ErrorKind::ConnectionAborted | ErrorKind::ConnectionReset | ErrorKind::Interrupted
@@ -77,6 +79,12 @@ pub async fn serve_on(listener: AdminListener, readiness: watch::Receiver<Pipeli
             }
         }
     }
+}
+
+/// Reports a failed `accept()` under the throttled key `accept_error`, as the network listeners do,
+/// because a process-wide failure repeats every `ACCEPT_ERROR_BACKOFF`. Returns whether it logged.
+fn report_accept_error(diag: &mut Diagnostics, err: &std::io::Error) -> bool {
+    diag.warn_throttled("accept_error", format_args!("admin: accept failed: {err}"))
 }
 
 /// A bound admin listener: `admin.bind`'s TCP socket or `admin.socket`'s Unix socket. An enum
@@ -295,6 +303,15 @@ mod tests {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
         (code, head, body)
+    }
+
+    #[test]
+    fn a_repeating_accept_failure_logs_on_powers_of_two_only() {
+        let mut diag = Diagnostics::new("admin");
+        let emfile = std::io::Error::from_raw_os_error(24);
+        let logged = (0..100).filter(|_| report_accept_error(&mut diag, &emfile)).count();
+        assert_eq!(logged, 7, "occurrences 1, 2, 4, 8, 16, 32, and 64");
+        assert_eq!(diag.occurrences("accept_error"), 100);
     }
 
     struct Server {
