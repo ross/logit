@@ -9346,7 +9346,7 @@ TWO_SUT_COLLECTOR_CONFIG = ("components:\n"
 def _two_sut_run(tmp, name, kill_on="collector", collector_lives=2, extra=0, short=0,
                  hop_dropped=0, drops=(), pause=False, logit_lives=None, replayed=3,
                  stalled=False, partial=False, collector_restart=False, evicted=(),
-                 checkpoint=None, burst=0):
+                 checkpoint=None, burst=0, segment_bytes="512MiB"):
     """A two-SUT run across a native hop: the generator and `logit` move `PER_DRAIN` lines per
     5 s drain into `logit`'s one life, whose hop sink `hop` takes each drain's lines in 10
     frames; `collector`'s `logit_in` `hop_in` forwards them into `window`, which delivers one
@@ -9488,7 +9488,9 @@ def _two_sut_run(tmp, name, kill_on="collector", collector_lives=2, extra=0, sho
     (run_dir / "configs" / "logit-sut.yaml").write_text(
         KILL_SUT_CONFIG.split("  window:")[0] + (TWO_SUT_HOP_CONFIG if checkpoint is None else
         TWO_SUT_HOP_CONFIG.replace(" }\n", ", buffer: { disk: { path: /s, checkpoint_interval: "
-                                   f"{checkpoint}s }} }} }}\n")))
+                                   f"{checkpoint}s"
+                                   + (f", segment_bytes: {segment_bytes}" if segment_bytes else "")
+                                   + " } } }\n")))
     (run_dir / "configs" / "logit-collector.yaml").write_text(TWO_SUT_COLLECTOR_CONFIG)
     (run_dir / "logs" / "collector.stdout").write_text("\n".join(egress) + "\n")
     (run_dir / "logs" / "generator.stdout").write_text("\n".join(gen) + "\n")
@@ -9854,6 +9856,14 @@ def _two_sut_checks():
                "its 300s checkpoint, with no persist" in loop["ledger.replay"].detail,
                f"a life killed inside its first checkpoint replays all it committed, got "
                f"{loop['ledger.replay']}")
+        unrolled = hop_row("two-logit-no-segment", kill_on="logit", collector_lives=1,
+                           replayed=403 + 1000, checkpoint=300, burst=1000, segment_bytes=None)
+        expect(unrolled["ledger.replay"].status == checks.FAIL
+               and "no segment_bytes set: a roll may have persisted"
+               in unrolled["ledger.replay"].detail
+               and "all 1,400 batches" not in unrolled["ledger.replay"].detail,
+               f"a spool with no declared segment_bytes gets the one-interval band, got "
+               f"{unrolled['ledger.replay']}")
         persisted = hop_row("two-logit-persisted", kill_on="logit", collector_lives=1,
                             replayed=403 + 1000, checkpoint=100, burst=1000)
         expect(persisted["ledger.replay"].status == checks.FAIL

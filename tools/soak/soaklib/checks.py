@@ -1526,6 +1526,18 @@ def component_duration(text, component, key):
     return None
 
 
+def component_bytes(text, component, key):
+    """A byte-size field of one component in a YAML text (`512MiB`, `64KiB`, `1GiB`, or a bare
+    count), in bytes, or None."""
+    units = {"": 1, "B": 1, "KiB": 1024, "MiB": MIB, "GiB": 1024 * MIB, "KB": 1000,
+             "MB": 1000 ** 2, "GB": 1000 ** 3}
+    for block in component_blocks(text, component):
+        found = re.search(rf"\b{key}\s*:\s*[\"']?([0-9.]+)\s*([A-Za-z]*)", block)
+        if found and found.group(2) in units:
+            return float(found.group(1)) * units[found.group(2)]
+    return None
+
+
 # The aggregate window assumed when the SUT config names none.
 DEFAULT_AGGREGATE_INTERVAL_S = 10.0
 
@@ -2605,6 +2617,7 @@ class Ledger:
         self.window = component_int(text, sink, "concurrency") or DEFAULT_HOP_WINDOW
         self.hop_checkpoint = (component_duration(text, sink, "checkpoint_interval")
                                or DEFAULT_CHECKPOINT_INTERVAL_S)
+        self.hop_segment_bytes = component_bytes(text, sink, "segment_bytes")
 
     def fed(self, life):
         """What reached `aggregate`'s side of the sinks' SUT in `life`: W − D − B − X, or across
@@ -6215,7 +6228,10 @@ def _evicted_replays(led):
     that window is a replayed identity the table no longer held, taken back by a forward of a
     frame it had acknowledged before (docs/plans/soak-harness.md's "The native hop (W10b)").
     The life's replayed frames bound those forwards. A collector restart's forgotten marks are
-    allowed apart, and evict nothing."""
+    allowed apart, and evict nothing. The count > 1 trigger assumes one ingress sender: with
+    several sharing `collector`'s table, another sender's churn can supply the second eviction,
+    and a multi-sender hop scenario would need a per-life capacity test (ingress lives since
+    collector's last start > max_connections + max_connections / 4)."""
     if led.hop is None:
         return []
     sink, listener = led.hop.get("sink"), led.hop.get("listener")
@@ -6943,8 +6959,10 @@ def check_ledger_replay(data):
     drain at its delivered rate: in a crash loop each life's replay carries the one before.
     That holds only while the spool rolled no segment: `DiskQueue::roll_read_cursor` persists
     the cursor at every segment boundary whatever the interval, and the harness can't see a
-    roll (`buffer.disk.segments` is a gauge sampled at drains). A scenario using this band sets
-    `segment_bytes` large enough that no roll happens."""
+    roll (`buffer.disk.segments` is a gauge sampled at drains). The band therefore requires the
+    sink to declare `segment_bytes`, which the scenario sets large enough that no roll happens;
+    the declaration is the scenario's assertion, and the harness doesn't check its size. A sink
+    that doesn't declare one gets the one-interval band, and the row says so."""
     if _overlapped(data):
         return _per_instance(data, check_ledger_replay)
     led = _ledger(data)
@@ -6978,7 +6996,8 @@ def check_ledger_replay(data):
             after = max(0.0, done - drains[-1]) if drains else 0.0
             low = -math.ceil(sent * after) - 1
             start = led.inn.life_starts[life] if life < len(led.inn.life_starts) else None
-            if start is not None and done - start < led.hop_checkpoint:
+            if (start is not None and done - start < led.hop_checkpoint
+                    and led.hop_segment_bytes):
                 # The spool persists its cursor only once the interval has passed since it
                 # opened, so a life killed sooner never persisted: every frame it committed,
                 # its own replay's included, replays again. A segment roll persists the cursor
@@ -6998,6 +7017,10 @@ def check_ledger_replay(data):
                         f"{sent:,.1f} delivered over its last drain interval, {after:.1f}s "
                         f"from its last drain to the kill, and a {led.hop_checkpoint:g}s "
                         f"checkpoint of its last delivering {last:,.1f}/s")
+                if (start is not None and done - start < led.hop_checkpoint
+                        and not led.hop_segment_bytes):
+                    band += (", no segment_bytes set: a roll may have persisted, so one "
+                             "interval's band")
         ok = low <= replayed - queued <= high
         status = worst([status, PASS if ok else FAIL])
         where = f"{service} " if service is not None else ""
