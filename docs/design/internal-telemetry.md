@@ -460,9 +460,11 @@ Without that handle, nothing is sampled.
 | `logit.process.uptime` | gauge | Seconds since `internal` started. |
 
 **The procfs points are Linux-only**, and each of their four sources (`status`, `stat`, `fd`,
-`limits`) latches off on its own first failed read, with one diagnostic: `debug` on a non-Linux
-build, `warn` for a failed read on Linux. A sandbox that hides one file silences only the points
-that file feeds. The allocator gauge doesn't depend on procfs.
+`limits`) latches off on its own first permanent failure, with one diagnostic: `debug` on a
+non-Linux build, `warn` for a missing, forbidden, or unparseable file on Linux. A sandbox that
+hides one file silences only the points that file feeds. A transient failure, such as `EMFILE` at
+the descriptor limit, skips that tick's points and retries on the next, with a throttled `warn`
+under the `procfs_status`, `procfs_stat`, `procfs_fd`, or `procfs_limits` key. The allocator gauge doesn't depend on procfs.
 
 **CPU is a delta, like every other `internal` counter.** The first tick's delta is CPU time since
 process start, so a cumulative total downstream equals the kernel's own counter. Every tick emits
@@ -540,7 +542,7 @@ config asked for never uses the word:
 
 | Name | Meaning | Tags |
 |---|---|---|
-| `*.dropped` | Loss: data that should have left `logit` and didn't, such as queue overflow, a destination's rejection, shutdown, a disk fault, an oversize item, malformed input, a closed consumer, a relative gauge or delta nothing upstream resolved, or a gap in `logit`'s own implementation. | Always `reason`, never `metric_kind`; `signal` or `route` where the counter needs one. |
+| `*.dropped` | Loss: data that should have left `logit` and didn't, such as queue overflow, a destination's rejection, bytes a stream sink's receiver never acknowledged, shutdown, a disk fault, an oversize item, malformed input, a closed consumer, a relative gauge or delta nothing upstream resolved, or a gap in `logit`'s own implementation. | Always `reason`, never `metric_kind`; `signal` or `route` where the counter needs one. |
 | `logit.component.events.discarded` | A filter, `sample`, `aggregate`, `cumulative_to_delta`, `dedup_timestamps`, `route_signals`, or Lua script removed an event because the config asked it to. A record `aggregate` or `cumulative_to_delta` dropped is counted under its own `*.dropped` as well. | None. |
 | `logit.component.events.copied` | A router delivered an event to more than one destination, or `route_signals` split one into a part per target; counts the deliveries past each event's first. Nothing is lost. | None. |
 | `*.omitted` | A piece (a tag, label, attribute, field, structured-data element, link, sample value, or a metric record or span beside a log body) removed from a record that's still delivered. | `reason` where more than one cause exists. |
@@ -2188,7 +2190,7 @@ decision 1). For `statsd_out`, `syslog_out`, `graphite_out`, `collectd_out`, `in
 |---|---|---|
 | Encode-side | once per batch, however many attempts the runtime makes | `batch.bytes`; `messages.dropped` for a reason the encoder decided; `tags.omitted`, `tags.normalized`, `messages.skipped`, `messages.normalized`, `messages.truncated`, `fields.omitted`, `events.skipped`, `events.dropped`, `structured_data.omitted`; the codec counters of `statsd_out`, `graphite_out`, `collectd_out`, `otlp_out`, `prometheus_out`, `splunk_hec_out`, `datadog_out`, and `datadog_trace_out` (`metrics.dropped`, `metrics.skipped`, `metrics.degraded`, `metrics.normalized`, `attributes.normalized`, `identity.sanitized`, `labels.omitted`, `labels.normalized`, `spans.degraded`, `stats.dropped`, `stats.degraded`); `splunk_hec_out`'s `records.dropped{reason="oversize"}` for an object over `max_body_bytes`; `datadog_out`'s `records.dropped{reason="stale"\|"too_many_tags"\|"needs_agent_processing"\|"not_datadog_origin"}` and its `too_many_tags` diagnostic; both Datadog sinks' `records.dropped{reason="oversize"}` for an event too large to send alone; `influxdb_out`'s `metrics.dropped{reason="no_bucket"}` and its `no_bucket` diagnostic, for a batch it never sends; `kafka_out`'s `records.dropped{reason="oversize"}`, `records.unkeyed`, `events.skipped{reason="no_log"}`, `metrics.omitted{reason="format"}`, `spans.omitted{reason="format"}`, its `oversize` diagnostic, and under `format: otlp_proto` or `otlp_json` `events.skipped{reason="no_payload"}`, `attributes.normalized{reason="u64_as_double"}`, and the OTLP codec's `metrics.skipped`, `metrics.dropped`, and `metrics.degraded`; `file.rotations` and `file.reopens`; and every `logit.component.diagnostics` count an encoder emits, `datadog_trace_out`'s `bad_header` included |
 | Transport | once per attempt | `requests`, `request.duration`, `request.bytes`, `reconnects`, and what the attempt sent or had accepted: `messages`, `datagrams`, `datapoints`, `samples`, `records` |
-| Kernel or destination verdict, and packer backstop | once per attempt that meets it | `messages.dropped{reason="oversize_datagram"}`, from `EMSGSIZE` or from the packer's skip of an entry over the cap; `splunk_hec_out`'s `records.dropped{reason="invalid_event"}`, its `records.dropped{reason="oversize"}` from Splunk Cloud's oversize answer, `requests.rejected`, and `acks`; `datadog_out`'s `records.dropped{route="series", reason="rejected"}` from a series `202`'s body; `prometheus_out`'s `samples.dropped{reason="not_written"}` from a 2.0 receiver's written count; the Datadog sinks' `records.dropped{reason="oversize"}` for a request answered `413`; `otlp_out`'s `records.dropped{signal, reason="rejected"\|"ambiguous_at_most_once"}`, from a `partial_success` (`rejected` only) or a verdict that names a signal, and the Datadog sinks' `records.dropped{route, reason="rejected"\|"ambiguous_at_most_once"}` for a request answered with a verdict that names it (counted even when the send ends `Ok`); `kafka_out`'s `records.dropped{reason="rejected"\|"invalid_timestamp"\|"invalid_record"\|"ambiguous_at_most_once"}` for a partition batch; and the diagnostics a verdict raises (`remote_write_rejected`, `remote_write_version_unsupported`, `remote_write_samples_not_written`, `remote_write_samples_written_unreadable`, `otlp_partial_success`, `signal_rejected`, `invalid_event`, `token_rejected`, `request_refused`, `request_rejected`, `api_key_rejected`, `series_rejected`, `ack_unsupported`, `ack_timeout`, `oversize` for Splunk Cloud's answer, and `kafka_out`'s `rejected`, `invalid_timestamp`, and `invalid_record`). `otlp_out`, `datadog_out`, `datadog_trace_out`, and `kafka_out` meet each of their verdicts at most once per batch, because a retry never resends a signal, request, or partition batch the destination settled; only `splunk_hec_out` and the datagram sinks meet one again on a retry |
+| Kernel or destination verdict, and packer backstop | once per attempt that meets it | `messages.dropped{reason="oversize_datagram"}`, from `EMSGSIZE` or from the packer's skip of an entry over the cap; `splunk_hec_out`'s `records.dropped{reason="invalid_event"}`, its `records.dropped{reason="oversize"}` from Splunk Cloud's oversize answer, `requests.rejected`, and `acks`; `datadog_out`'s `records.dropped{route="series", reason="rejected"}` from a series `202`'s body; `prometheus_out`'s `samples.dropped{reason="not_written"}` from a 2.0 receiver's written count; the Datadog sinks' `records.dropped{reason="oversize"}` for a request answered `413`; `otlp_out`'s `records.dropped{signal, reason="rejected"\|"ambiguous_at_most_once"}`, from a `partial_success` (`rejected` only) or a verdict that names a signal, and the Datadog sinks' `records.dropped{route, reason="rejected"\|"ambiguous_at_most_once"}` for a request answered with a verdict that names it (counted even when the send ends `Ok`); `kafka_out`'s `records.dropped{reason="rejected"\|"invalid_timestamp"\|"invalid_record"\|"ambiguous_at_most_once"}` for a partition batch; the stream driver's `bytes.dropped{reason="unacknowledged"}` and its `unacknowledged` diagnostic, once per TCP connection that ends with earlier batches' bytes unacknowledged; and the diagnostics a verdict raises (`remote_write_rejected`, `remote_write_version_unsupported`, `remote_write_samples_not_written`, `remote_write_samples_written_unreadable`, `otlp_partial_success`, `signal_rejected`, `invalid_event`, `token_rejected`, `request_refused`, `request_rejected`, `api_key_rejected`, `series_rejected`, `ack_unsupported`, `ack_timeout`, `oversize` for Splunk Cloud's answer, and `kafka_out`'s `rejected`, `invalid_timestamp`, and `invalid_record`). `otlp_out`, `datadog_out`, `datadog_trace_out`, and `kafka_out` meet each of their verdicts at most once per batch, because a retry never resends a signal, request, or partition batch the destination settled; only `splunk_hec_out` and the datagram sinks meet one again on a retry |
 
 The sinks with encoders count the first class through a gate `Output::observe_batch` arms
 (`crates/logit-outputs/src/accounting.rs`); `stdio_out` and `file_out` count after the write that
@@ -2345,10 +2347,19 @@ itself. The sink emits each once per batch, however many attempts the runtime ma
   steady state means the peer or the network, not this sink, is unstable. Counted on plaintext and
   TLS (RFC 5425) connections alike, because both go through the pooled-stream driver
   `statsd_out` and `graphite_out` share (`crates/logit-outputs/src/stream.rs`). A failed connect
-  doesn't count. UDP is connectionless and never reports it.
+  doesn't count. A receiver that stops reading doesn't raise it: the driver keeps the stalled
+  connection while the peer still answers. UDP is connectionless and never reports it.
+- `logit.output.bytes.dropped{reason="unacknowledged"}` (count, TCP only): when a pooled
+  connection ends with its data destroyed (the receiver's reset or close, unsolicited bytes, a TLS
+  alert, or a failed write), the bytes of earlier batches its send queue still held that the
+  receiver never acknowledged, read with `SIOCOUTQ` before the close, with a throttled
+  `unacknowledged` warning. Bytes on the wire: under TLS, ciphertext. The attempt that met the
+  close counts its own batch through `requests` and its posture, so its bytes are left out. What
+  the receiver had acknowledged into its own buffer, a stall's closed connection, and shutdown are
+  never counted (`docs/known-gaps/sinks.md`). Linux only.
 
-`Diagnostics` keys: `invalid_structured_data`, `message_truncated`, `oversize_datagram`, and
-`oversize_header`, mirroring the counters above.
+`Diagnostics` keys: `invalid_structured_data`, `message_truncated`, `oversize_datagram`,
+`oversize_header`, and `unacknowledged`, mirroring the counters above.
 
 ##### `statsd_out`
 
@@ -2411,6 +2422,8 @@ itself. The sink emits each once per batch, however many attempts the runtime ma
   Under `unix` it counts each reconnect of the connected datagram socket after a timeout or a gone
   receiver ([ADR `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md),
   decision 12). UDP is connectionless and never reports it.
+- `logit.output.bytes.dropped{reason="unacknowledged"}` (count, `tcp` only): as for `syslog_out`.
+  A `unix_stream` receiver's close frees the queue the count reads, so nothing is counted there.
 
 A `MetricKind::GaugeDelta` reaching this encoder with `relative_gauges: false` reports under
 `logit.component.diagnostics{key="gauge_delta_unresolved"}`, the same key `influxdb_out` uses, so
@@ -2479,6 +2492,7 @@ under one component id, as for `collectd_out`. The sink adds only what a socket 
   both transports.
 - `logit.output.reconnects` (count, TCP only): every connect *after* the first, including the
   redial after the probe finds a pooled connection closed, as for `syslog_out`.
+- `logit.output.bytes.dropped{reason="unacknowledged"}` (count, TCP only): as for `syslog_out`.
 - `logit.output.messages`: entries actually sent (one plaintext line, or one
   already-length-prefixed pickle frame).
 - `logit.output.datapoints`: Σ each sent entry's own datapoint count (`MessageBuf<usize>`'s `meta`).

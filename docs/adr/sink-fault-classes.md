@@ -1,6 +1,6 @@
 ---
 created: 2026-10-04
-updated: 2026-10-30
+updated: 2026-11-03
 ---
 
 # Sink fault classes: a rejected batch drops, a refused destination holds, and the process never exits for a sink
@@ -558,3 +558,13 @@ attribute; the s3 ADR states what that costs.
 holds the sink's queue, announced by `logit.component.retrying`, where the default would have
 dropped a batch per attempt; the operator fixes `region:`, `endpoint:`, `part_size`, or the
 bucket, and the held objects go through.
+
+## Amendment: a stream sink's stalled write keeps its connection (2026-11-03)
+
+"A sink's own timeout is the only bound on an attempt (2026-10-25)" still holds for the stream
+sinks: `connect_timeout` bounds each write's progress. A write it ends no longer drops the
+connection. A first write that accepted nothing is `Clean`, plaintext or TLS, and a stall after
+part of the frame left is `Ambiguous`; either way the connection is kept, with the frame's
+unwritten tail finished before the next frame, unless its TCP peer has stopped answering
+([ADR `stream-sink-stalled-connection`](stream-sink-stalled-connection.md)). The stream driver's
+module doc is the response-class table.
