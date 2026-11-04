@@ -119,20 +119,34 @@ SUT_ONLY_ACTIONS = {
 # kernel refuses the hard limit.
 PRLIMIT_MIN_NOFILE = 8
 PRLIMIT_MAX_NOFILE = 1048576
-# A `cgroup` step's keys, one per step: `cpu`, the CPUs `cpu.max` allows per period, and
+# A `cgroup` step's keys, one limit per step: `cpu`, the CPUs `cpu.max` allows per period;
 # `memory_high`, the `memory.high` throttle as a whole number with a `K`, `M`, or `G` suffix
-# (powers of 1024, as the kernel reads them). `CGROUP_MIN_CPU` is the kernel's least quota,
+# (powers of 1024, as the kernel reads them); or an `io.max` write limit, `io_wbps` (bytes a
+# second, a whole number with an optional suffix) and `io_wiops` (writes a second), either or
+# both, on the disk behind the SUT's `io_path`. `CGROUP_MIN_CPU` is the kernel's least quota,
 # 1 ms per 100 ms period. Below `CGROUP_MIN_MEMORY_HIGH` the process can't hold its own
-# binary and runtime, so it does nothing but reclaim.
-CGROUP_KEYS = ("cpu", "memory_high")
-# A `memory_high` step's optional `engaged`: whether the kernel must throttle the cgroup in the
-# window (`true`) or must not (`false`), which `timeline` judges from the revert's count.
+# binary and runtime, so it does nothing but reclaim. Below `CGROUP_MIN_IO_WBPS` a page takes
+# longer than a second to write.
+CGROUP_KEYS = ("cpu", "memory_high", "io_wbps", "io_wiops")
+# The steps that may start inside a `cgroup` step on its container, after its start: each ends
+# the process, and its cgroup with it, so the cgroup's revert finds the process exited or
+# started again and writes nothing, as `timeline` reports.
+CGROUP_ENDING_ACTIONS = ("stop", "kill")
+CGROUP_IO_KEYS = ("io_wbps", "io_wiops")
+# A `memory_high` or io step's optional `engaged`: whether the kernel must throttle the cgroup
+# in the window (`true`) or must not (`false`), which `timeline` judges from the revert's count
+# of `memory.events`' `high` or `io.pressure`'s stalled time.
 CGROUP_MIN_CPU = 0.01
 CGROUP_MAX_CPU = 1024
 CGROUP_MIN_MEMORY_HIGH = 16 * 1024 ** 2
 CGROUP_MAX_MEMORY_HIGH = 1024 ** 4
 CGROUP_PAGE_BYTES = 4096
 _MEMORY_HIGH = re.compile(r"^([1-9][0-9]*)([KMG])$")
+_IO_BYTES = re.compile(r"^([1-9][0-9]*)([KMG]?)$")
+CGROUP_MIN_IO_WBPS = 4096
+CGROUP_MAX_IO_WBPS = 1024 ** 4
+CGROUP_MIN_IO_WIOPS = 1
+CGROUP_MAX_IO_WIOPS = 1000000
 _MEMORY_UNITS = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}
 # A `slowclient` step's keys (slowclient.py): `address`, the `host:port` it dials; `mode`, one of
 # `SLOWCLIENT_MODES`; `connections`, how many it holds, up to `SLOWCLIENT_MAX_CONNECTIONS`;
@@ -266,8 +280,8 @@ _TARGET_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 PRIVATE_ENV_PREFIX = "soak-env-"
 STEP_KEYS = {"at", "action", "on", "args", "for", "ready", "code", "key", "class", "signal",
-             "path", "to", "cert", "days", "broken", "port", "nofile", "engaged", *CGROUP_KEYS,
-             *SLOWCLIENT_KEYS, *RESPOND_KEYS}
+             "path", "to", "cert", "days", "broken", "port", "nofile", "engaged", "io_path",
+             *CGROUP_KEYS, *SLOWCLIENT_KEYS, *RESPOND_KEYS}
 RANDOM_KEYS = {"seed", "gap", "fault"}
 RANDOM_FAULT_KEYS = {"weight", "action", "on", "args", "for"}
 RANGE_KEYS = {"min", "max"}
@@ -594,9 +608,13 @@ class StepSpec:
     port: object = None
     # A `prlimit`'s open-files limit.
     nofile: object = None
-    # A `cgroup`'s CPU quota or memory throttle, and whether a throttle must engage.
+    # A `cgroup`'s CPU quota, memory throttle, or write limit and the SUT path whose disk it
+    # limits, and whether a throttle must engage.
     cpu: object = None
     memory_high: object = None
+    io_wbps: object = None
+    io_wiops: object = None
+    io_path: object = None
     engaged: object = None
     # A `slowclient`'s address, mode, connections, interval (seconds), and what it sends.
     address: object = None
@@ -616,7 +634,8 @@ STEP_FIELDS = (("ready", "ready"), ("code", "code"), ("key", "key"), ("status", 
                ("fault_class", "class"),
                ("signal", "signal"), ("path", "path"), ("to", "to"), ("cert", "cert"),
                ("days", "days"), ("broken", "broken"), ("port", "port"), ("nofile", "nofile"),
-               ("cpu", "cpu"), ("memory_high", "memory_high"), ("engaged", "engaged"),
+               ("cpu", "cpu"), ("memory_high", "memory_high"), ("io_wbps", "io_wbps"),
+               ("io_wiops", "io_wiops"), ("io_path", "io_path"), ("engaged", "engaged"),
                ("address", "address"), ("mode", "mode"), ("connections", "connections"),
                ("interval", "interval"), ("send", "send"))
 
@@ -692,6 +711,9 @@ class Step:
     nofile: object = None
     cpu: object = None
     memory_high: object = None
+    io_wbps: object = None
+    io_wiops: object = None
+    io_path: object = None
     engaged: object = None
     address: object = None
     mode: object = None
@@ -1138,7 +1160,9 @@ def from_dict(raw, path):
             cert=raw_step.get("cert"), days=raw_step.get("days"), broken=raw_step.get("broken"),
             port=raw_step.get("port"), nofile=raw_step.get("nofile"),
             cpu=raw_step.get("cpu"), memory_high=raw_step.get("memory_high"),
-            engaged=raw_step.get("engaged"), address=raw_step.get("address"),
+            io_wbps=raw_step.get("io_wbps"), io_wiops=raw_step.get("io_wiops"),
+            io_path=raw_step.get("io_path"), engaged=raw_step.get("engaged"),
+            address=raw_step.get("address"),
             mode=raw_step.get("mode"), connections=raw_step.get("connections"),
             interval=dur(raw_step, "interval", where) if "interval" in raw_step else None,
             send=raw_step.get("send"),
@@ -3011,7 +3035,9 @@ def validate(scenario, duration=None, seed=None):
     # Two faults on one container may not overlap. A netem overlapping a stop, kill, pause,
     # restart, or partition of its container gets its own message: the qdisc is lost with the
     # namespace, and a one-shot netem container needs a running target. A kill may start inside
-    # a pause of its container and end with it: a stalled kill (`stalled_kills()`).
+    # a pause of its container and end with it: a stalled kill (`stalled_kills()`). A stop or
+    # kill may start inside a `cgroup` step of its container, after the cgroup's start
+    # (`CGROUP_ENDING_ACTIONS`).
     stalled = {(pause.index, kill.index) for pause, kill in stalled_kills(scenario.steps)}
     by_service = {}
     for spec in scenario.steps:
@@ -3025,6 +3051,16 @@ def validate(scenario, duration=None, seed=None):
                     if first.action in HOLDING_ACTIONS and second.action in HELD_ACTIONS:
                         continue
                     if (first.index, second.index) in stalled:
+                        continue
+                    if (first.action == "cgroup" and second.action in CGROUP_ENDING_ACTIONS
+                            and second.at > first.at):
+                        if first.engaged is not None:
+                            problems.append(
+                                f"steps {first.index + 1} and {second.index + 1}: `engaged` "
+                                "can't be judged on a cgroup step a stop or kill ends: the "
+                                "process's counts go with its scope; drop `engaged`, or end the "
+                                "step before the stop or kill"
+                            )
                         continue
                     if pair == {"pause", "kill"}:
                         problems.append(
@@ -3163,25 +3199,51 @@ def memory_bytes(text):
     return int(match.group(1)) * _MEMORY_UNITS[match.group(2)] if match else None
 
 
+def io_bytes(value):
+    """The bytes a second an `io_wbps` value names, or None when it isn't a whole number, bare
+    or as a string with an optional `K`, `M`, or `G` suffix."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value if value > 0 else None
+    match = _IO_BYTES.match(value) if isinstance(value, str) else None
+    if not match:
+        return None
+    return int(match.group(1)) * (_MEMORY_UNITS[match.group(2)] if match.group(2) else 1)
+
+
 def _cgroup_problems(spec, where):
-    """What a step breaks of the `cgroup` rule: one of `CGROUP_KEYS` on a `cgroup`, never on
-    another action; `cpu` a number from `CGROUP_MIN_CPU` to `CGROUP_MAX_CPU`; `memory_high` a
-    size from `CGROUP_MIN_MEMORY_HIGH` to `CGROUP_MAX_MEMORY_HIGH`."""
+    """What a step breaks of the `cgroup` rule: one limit of `CGROUP_KEYS` on a `cgroup`, never
+    on another action, where `io_wbps` and `io_wiops` together are one limit; `cpu` a number
+    from `CGROUP_MIN_CPU` to `CGROUP_MAX_CPU`; `memory_high` a size from
+    `CGROUP_MIN_MEMORY_HIGH` to `CGROUP_MAX_MEMORY_HIGH`; `io_wbps` and `io_wiops` in their
+    ranges, with an absolute `io_path`, which no other step takes."""
     given = [key for key in CGROUP_KEYS if getattr(spec, key) is not None]
-    if spec.engaged is not None and (spec.action != "cgroup" or spec.memory_high is None):
-        return [f"{where}: `engaged` is for a cgroup step with `memory_high` only"]
+    io = [key for key in given if key in CGROUP_IO_KEYS]
+    if spec.engaged is not None and (spec.action != "cgroup"
+                                     or (spec.memory_high is None and not io)):
+        return [f"{where}: `engaged` is for a cgroup step with `memory_high`, `io_wbps`, or "
+                "`io_wiops` only"]
     if spec.engaged is not None and not isinstance(spec.engaged, bool):
         return [f"{where}: `engaged` must be true or false, got {spec.engaged!r}"]
     if spec.action != "cgroup":
-        return [f"{where}: `{key}` is for cgroup only" for key in given]
-    if len(given) != 1:
-        return [f"{where}: cgroup needs one of `cpu` or `memory_high`, got "
-                f"{', '.join(f'`{key}`' for key in given) or 'neither'}"]
+        problems = [f"{where}: `{key}` is for cgroup only" for key in given]
+        if spec.io_path is not None:
+            problems.append(f"{where}: `io_path` is for a cgroup step with `io_wbps` or "
+                            "`io_wiops` only")
+        return problems
+    limits = [key for key in given if key not in CGROUP_IO_KEYS] + (["io"] if io else [])
+    if len(limits) != 1:
+        return [f"{where}: cgroup needs one of `cpu`, `memory_high`, or `io_wbps` and "
+                f"`io_wiops`, got {', '.join(f'`{key}`' for key in given) or 'none'}"]
     if spec.cpu is not None:
         if (not isinstance(spec.cpu, (int, float)) or isinstance(spec.cpu, bool)
                 or not CGROUP_MIN_CPU <= spec.cpu <= CGROUP_MAX_CPU):
             return [f"{where}: `cpu` must be a number of CPUs from {CGROUP_MIN_CPU} to "
                     f"{CGROUP_MAX_CPU}, got {spec.cpu!r}"]
+    if spec.io_path is not None and not io:
+        return [f"{where}: `io_path` is for a cgroup step with `io_wbps` or `io_wiops` only"]
+    if io:
+        return _cgroup_io_problems(spec, where)
+    if spec.memory_high is None:
         return []
     size = memory_bytes(spec.memory_high)
     if size is None or not CGROUP_MIN_MEMORY_HIGH <= size <= CGROUP_MAX_MEMORY_HIGH:
@@ -3192,6 +3254,35 @@ def _cgroup_problems(spec, where):
                 f"rounds it down to one and the read-back would differ, got "
                 f"{spec.memory_high!r}"]
     return []
+
+
+def _cgroup_io_problems(spec, where):
+    """What an io step breaks: `io_wbps` from `CGROUP_MIN_IO_WBPS` to `CGROUP_MAX_IO_WBPS`,
+    `io_wiops` a whole number from `CGROUP_MIN_IO_WIOPS` to `CGROUP_MAX_IO_WIOPS`, and
+    `io_path` an absolute path in the SUT with no `..` and no whitespace, which `mountinfo`
+    would escape."""
+    problems = []
+    if spec.io_wbps is not None:
+        rate = io_bytes(spec.io_wbps)
+        if rate is None or not CGROUP_MIN_IO_WBPS <= rate <= CGROUP_MAX_IO_WBPS:
+            problems.append(f"{where}: `io_wbps` must be a whole number of bytes a second, bare "
+                            f"or with a K, M, or G suffix, from 4K to 1024G, got "
+                            f"{spec.io_wbps!r}")
+    if spec.io_wiops is not None and (
+            not isinstance(spec.io_wiops, int) or isinstance(spec.io_wiops, bool)
+            or not CGROUP_MIN_IO_WIOPS <= spec.io_wiops <= CGROUP_MAX_IO_WIOPS):
+        problems.append(f"{where}: `io_wiops` must be a whole number of writes a second from "
+                        f"{CGROUP_MIN_IO_WIOPS} to {CGROUP_MAX_IO_WIOPS:,}, got "
+                        f"{spec.io_wiops!r}")
+    path = spec.io_path
+    if path is None:
+        problems.append(f"{where}: an io limit needs `io_path`, the path in the SUT whose disk "
+                        "it limits")
+    elif (not isinstance(path, str) or not path.startswith("/") or ".." in path.split("/")
+          or any(char.isspace() for char in path)):
+        problems.append(f"{where}: `io_path` must be an absolute path with no `..` and no "
+                        f"whitespace, got {path!r}")
+    return problems
 
 
 def _expected_event_problems(spec, where):
@@ -3675,8 +3766,8 @@ def _random_problems(scenario, duration):
             problems.append(f"{where}: prlimit takes `nofile`, which a [random] fault can't "
                             "set; write it as a [[step]]")
         if template.action == "cgroup":
-            problems.append(f"{where}: cgroup takes `cpu` or `memory_high`, which a [random] "
-                            "fault can't set; write it as a [[step]]")
+            problems.append(f"{where}: cgroup takes `cpu`, `memory_high`, or an io limit, which "
+                            "a [random] fault can't set; write it as a [[step]]")
         if template.action == "slowclient":
             problems.append(f"{where}: slowclient takes `address`, `mode`, and `connections`, "
                             "which a [random] fault can't set; write it as a [[step]]")
@@ -4043,7 +4134,8 @@ def expand(scenario, duration=None, seed=None):
                     invalid_event=spec.invalid_event, withhold_acks=spec.withhold_acks,
                     signal=spec.signal, path=spec.path, to=spec.to, cert=spec.cert,
                     days=spec.days, broken=spec.broken, port=spec.port, nofile=spec.nofile,
-                    cpu=spec.cpu, memory_high=spec.memory_high, engaged=spec.engaged,
+                    cpu=spec.cpu, memory_high=spec.memory_high, io_wbps=spec.io_wbps,
+                    io_wiops=spec.io_wiops, io_path=spec.io_path, engaged=spec.engaged,
                     address=spec.address, mode=spec.mode, connections=spec.connections,
                     interval=spec.interval, send=spec.send,
                 ))

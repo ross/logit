@@ -119,7 +119,7 @@ from .scenario import (CRI_WIRE, DEFAULT_RSS_SETTLE_S, DEFAULT_WIRE, EXPECT_REDU
                        HTTP_WIRE, KAFKA_TARGET, KAFKA_WIRE, SCRAPE_WIRE, LOCAL_TARGET, LOGIT_ROLES, NO_WINDOW_ACTIONS,
                        IDP_ROLE, RUN_WINDOW, SHARED_DIR, SHARED_MOUNT, STANDIN_ROLE, STANDIN_TARGET,
                        SUT_CONFIG_ENV, SUT_CONFIG_KEY, SUT_SERVICE, TARGET_SPLIT,
-                       component_blocks, config_env,
+                       component_blocks, config_env, io_bytes,
                        listener_wire, parse_duration, source_ids, source_pairs,
                        stdio_shared_targets, tls_reload_polls)
 
@@ -161,6 +161,12 @@ FRESHNESS_MAX_AGE_S = 30
 # whose quota or reclaim can hold its drain as a pause does.
 DRAIN_GAP_INTERVALS = 3
 DRAIN_HELD_ACTIONS = ("stop", "kill", "pause", "restart", "exit", "cgroup")
+# The share of an io step's window that `io.pressure`'s `some` total must reach for the limit to
+# count as engaged. An unthrottled spool's fsyncs on a local disk stall a small fraction of
+# that. A segment rotation syncs a whole record at once, so a write limit stalls a larger share
+# even above the spool's average pace; a spool whose segments don't rotate in the window can read
+# under it while throttled, since the flusher's writeback isn't the scope's stall.
+IO_ENGAGED_STALL_SHARE = 0.01
 SECONDS_PER_HOUR = 3600
 MIB = 1024 * 1024
 # An `[[expect]]` `slope` is fitted only over at least this many samples spanning this long.
@@ -606,8 +612,11 @@ def check_timeline(data):
     whose process started again or exited inside its window is reported: its limit went with
     the old process. A `memory.high` revert's throttle count is reported, and one that couldn't
     read `memory.events` FAILs, since nothing then says whether the throttle engaged; so does a
-    count that contradicts the step's `engaged`. A `slowclient` revert's counts are reported:
-    the most connections it held, its dials, and how many the listener closed."""
+    count that contradicts the step's `engaged`. An io revert's written bytes and writes, their
+    rate against the limit, and the stalled time are reported, and one that couldn't read them
+    FAILs; `engaged` there reads the stalled time against `IO_ENGAGED_STALL_SHARE` of the
+    window. A `slowclient` revert's counts are reported: the most connections it held, its
+    dials, and how many the listener closed."""
     if data.t0 is None:
         return Result("timeline", SKIP, "no timeline start")
     lines = []
@@ -658,6 +667,23 @@ def check_timeline(data):
              for record in actions if record["event"] == "revert"
              and isinstance(done := record.get("done"), dict)]
     for record in actions:
+        if record["event"] != "revert":
+            continue
+        if "io_error" in record:
+            lines.append(f"{record.get('step')} (cgroup on {record.get('on')}): can't read "
+                         f"io.max's writes and stalls: {record['io_error']}")
+        if "io_stall_us" not in record:
+            continue
+        line, stalled = _io_window(record)
+        gone.append(line)
+        want = record.get("engaged")
+        if (want is True and not stalled) or (want is False and stalled):
+            lines.append(f"{record.get('step')} (cgroup on {record.get('on')}): io.pressure "
+                         f"stalled {record['io_stall_us'] / 1e6:.2f}s, "
+                         f"{'under' if not stalled else 'at or above'} "
+                         f"{IO_ENGAGED_STALL_SHARE:.0%} of the window, and the step expects "
+                         f"the limit {'to engage' if want else 'never to engage'}")
+    for record in actions:
         if record["event"] != "revert" or "high_events" not in record:
             continue
         want, count = record.get("engaged"), record["high_events"]
@@ -670,6 +696,27 @@ def check_timeline(data):
     return Result("timeline", PASS, f"{len(actions)} apply/revert action(s) returned 0; "
                   f"{starts} start(s) or unpause(s) each probed; no fail fast"
                   + "".join(f"; {line}" for line in gone), gone)
+
+
+def _io_window(record):
+    """`(line, stalled)`: an io revert's report, and whether its stalled time reached
+    `IO_ENGAGED_STALL_SHARE` of its window, the engagement `engaged` judges."""
+    window = record.get("io_window_s") or 0
+    stall_s = record["io_stall_us"] / 1e6
+    share = stall_s / window if window > 0 else 0.0
+    rate = record["io_wbytes"] / window if window > 0 else 0.0
+    limits = []
+    if record.get("io_wbps") is not None:
+        limits.append(f"{_n(io_bytes(record['io_wbps']) or 0)} B/s")
+    if record.get("io_wiops") is not None:
+        limits.append(f"{_n(record['io_wiops'])} writes/s")
+    line = (f"{record.get('step')} (cgroup on {record.get('on')}): io.max on "
+            f"{record.get('device')} over {window:.1f}s: {_n(record['io_wbytes'])} byte(s) in "
+            f"{_n(record['io_wios'])} write(s), {_n(round(rate))} B/s and "
+            f"{record['io_wios'] / window if window > 0 else 0.0:,.1f} writes/s against a limit "
+            f"of {' and '.join(limits) or 'none'}; io.pressure stalled {stall_s:.1f}s "
+            f"({share:.1%} of the window)")
+    return line, window > 0 and share >= IO_ENGAGED_STALL_SHARE
 
 
 def check_exit(data):

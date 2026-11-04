@@ -208,8 +208,9 @@ settle window would leave a life no fit. `fanin` and `tcp-ingress` set `60s`, an
 
 - Every fault carries `for`, so its revert is scheduled with it. `netem clear` is a revert, never
   a step.
-- No two faults overlap on one container, except a `signal` inside a `rename` (W12c), and a
-  `signal` or a `probe` inside a `rotate` (W12d).
+- No two faults overlap on one container, except a `signal` inside a `rename` (W12c), a
+  `signal` or a `probe` inside a `rotate` (W12d), and a `stop` or `kill` starting inside a
+  `cgroup` after its start (W33).
 - No netem on a container during its `stop`, `kill`, `pause`, `partition`, or `exit`, because the qdisc
   is lost with the namespace and `docker run --network container:<id>` needs a running target.
 - No fault ends inside `cooldown`, and `cooldown` is at least `recovery_bound`.
@@ -237,7 +238,16 @@ settle window would leave a life no fit. `fanin` and `tcp-ingress` set `60s`, an
   it found, unless the process started again or exited inside the window; on a `memory_high`
   step it records the window's `memory.events` `high` count, which `timeline` reports, and an
   optional `engaged`, `true` or `false` and refused on any other step, FAILs a count of 0 or a
-  count above 0 respectively; `memory_high` must be a whole number of 4 KiB pages.
+  count above 0 respectively; `memory_high` must be a whole number of 4 KiB pages. W33 adds
+  `io.max` to it: `io_wbps`, a whole number bare or with a `K`, `M`, or `G` suffix from 4K to
+  1024G, and `io_wiops`, a whole number from 1 to 1,000,000, either or both as the step's one
+  limit, with `io_path`, an absolute path with no `..` and no whitespace, required with them
+  and refused elsewhere. The step writes them on the disk behind `io_path`, fails when no block
+  device backs it, and records the window's `io.stat` `wbytes` and `wios` and `io.pressure`
+  stalled time, which `timeline` reports; `engaged` is allowed on an io step, where it reads
+  the stalled time against 1% of the window. A `stop` or `kill` of the SUT may start inside a
+  `cgroup` step, after its start; such a step takes no `engaged`, since its counts go with the
+  process's scope.
 - `[ledger] vm_every_window`, optional, is `true` or `false`; `[ledger] sut_script`, optional,
   is a component id.
 - `[[ledger.source]]` (W8b) has the rules under "Sources" below.
@@ -3195,19 +3205,41 @@ Docker 29.9, SELinux enforcing) checked each fault's mechanism before it was pla
       (`max_memory` bounds one Lua VM), so this is the soak that shows a `buffer:` bound bounds
       memory. `memory.max` isn't planned: its outcome is an OOM kill, which `exit` FAILs, and an
       expected-OOM excuse waits for a reason to want one.
-29. **A slow disk (W33).** `io.max` doesn't throttle on this host: a 1 MiB/s write limit let
-    4 MiB through with `fsync` in 0.1 s, likely because overlayfs over btrfs over dm-crypt
-    loses the writeback's cgroup. W33 puts a `dm-delay` device over a loop file in the run
-    directory instead, made in a privileged one-shot (the netem image gains `dmsetup`,
-    `losetup`, and `mkfs.ext4`), mounted as an `ext4` Docker volume at the spool path by a
-    compose override, as `spool-enospc` mounts its tmpfs, with the delay changed by
-    `dmsetup suspend`, `reload`, and `resume`. Devices are named per compose project, removed
-    in the end sequence, and swept at the driver's start for a crashed run's leftovers. One
-    scenario, `slow-spool`, from `spool-kill-replay`, with a SUT stop inside the slow window,
-    reaches the spool's segment `sync_data`, its persist worker's cursor write, and the write a
-    cancelled push leaves running. A `dm-flakey` `error_writes` variant reaches
-    `buffer.disk.errors{op}` on real I/O errors. W33 lands last of the three and may be
-    dropped if the device setup proves fragile.
+29. **A slow disk (W33), on the perf VM.** `io.max` doesn't throttle on the development host: a
+    1 MiB/s write limit let 4 MiB through with `fsync` in 0.1 s, likely because overlayfs over
+    btrfs over dm-crypt loses the writeback's cgroup. W33 runs on the disposable perf VM
+    instead (ADR `disposable-azure-perf-vm`; decided with Ross, 2026-11-04), where privileged
+    host state is thrown away with the VM, and its root filesystem is ext4 on a managed disk,
+    where cgroup writeback is supported. Two mechanisms, tried in order:
+    - **`io.max` through the `cgroup` action.** W32's action gains `io_wbps` and `io_wiops`
+      keys, written as `<major>:<minor> wbps=<n>` or `wiops=<n>` in the SUT's `io.max`, the
+      device behind the mount that holds `io_path` in the SUT's mountinfo, followed through an
+      overlay's `upperdir` to the host mount, a partition replaced by its whole disk. It needs
+      no new image and no privilege beyond W32's `label=disable`, and reverts by writing back
+      each limited key's found value (`max` when the device had none). The VM's first step is
+      the probe the survey ran here: a throwaway container under a 1 MiB/s `wbps` writing 4
+      MiB with `fsync`, which must take about 4 s.
+    - **`dm-delay`, if the probe fails.** A `dm-delay` device over a loop file in the run
+      directory, made in a privileged one-shot (the netem image gains `dmsetup`, `losetup`,
+      and `mkfs.ext4`), mounted as an `ext4` Docker volume at the spool path by a compose
+      override, as `spool-enospc` mounts its tmpfs, with the delay changed by `dmsetup
+      suspend`, `reload`, and `resume`. Devices are named per compose project, removed in the
+      end sequence, and swept at the driver's start.
+
+    One scenario, `slow-spool`, from `spool-kill-replay`, slows the spool's writes for a window
+    through a sink outage and stops the SUT inside it. It reaches the spool's segment
+    `sync_data`, its persist worker's cursor write with two fsyncs, and the write a cancelled
+    push leaves running (`disk_queue.rs`'s `HeldWriteFile`). Expected: slow syncs with no loss, no
+    `*.dropped` unless the `buffer:` bound trips, the next life replaying the spool, and a
+    clean ledger. No internal metric times a spool write and `io.stat` has no throttle count.
+    `timeline` therefore reports `io.stat`'s `wbytes` and `wios` deltas and the cgroup's
+    `io.pressure` stall. `engaged` judges the stall against 1% of the window, so a window that
+    never slowed a write is visible, as `memory.events` is for W32 (ADR `soak-harness`'s
+    amendment "a `cgroup` step limits the writes to the disk behind a SUT path"). A `dm-flakey`
+    `error_writes` variant, reaching `buffer.disk.errors{op}` on real I/O errors, needs the
+    `dm-delay` path's device and stays out of W33 unless that path is the one taken. The
+    harness needs Python 3.11 or later and `sudo -n docker`: the VM's Debian 13 image ships
+    Python 3.13, which cloud-init itself runs on, and its cloud-init installs Docker CE.
 30. **Clock steps stay deferred.** `CLOCK_REALTIME` can't be namespaced, a time namespace
     offsets only the monotonic clocks and Docker can't make one, and stepping the host's clock
     would break the driver's own timeline. `libfaketime` in an image layer could step the SUT's
@@ -3309,7 +3341,7 @@ that items 3, 7, and 11 need.
 | W30 | `soak/w30` | `soak/w30: plan round 4, and three round-3 harness follow-ups` | S | — |
 | W31 | `soak/w31` | `soak/w31: file-descriptor-limit soaks, with a prlimit action` | M | W30 |
 | W32 | `soak/w32` | `soak/w32: CPU-quota and memory-pressure soaks, with a cgroup action` | M | W31 |
-| W33 | `soak/w33` | `soak/w33: a slow-disk spool soak on a dm-delay volume` | M | W32 |
+| W33 | `soak/w33` | `soak/w33: a slow-disk spool soak on the perf VM` | M | W32 |
 | W34 | `soak/w34` | `soak/w34: slowloris and half-open peer soaks` | M | W32 |
 | W35 | `soak/w35` | `soak/w35: native-hop soaks over TLS, under RTT, and past the identity table` | M | W34 |
 | W36 | `soak/w36` | `soak/w36: a datadog_trace pair soak, with a span unit` | M | W35 |
@@ -3507,6 +3539,13 @@ that items 3, 7, and 11 need.
 - **W32**: item 28: the `cgroup` action, its rules, its window's excuses, self-test fixtures
   for each, the `cpu-quota`, `memory-high`, and `memory-high-pressure` scenarios, an amendment
   to ADR `soak-harness`, and the eight runs of the three recorded under "Findings".
+- **W33**: item 29's `io.max` path: the `cgroup` action's `io_wbps`, `io_wiops`, and
+  `io_path` keys and their rules, the device resolution from the SUT's and the host's
+  mountinfo, the `io.stat` and `io.pressure` reads and `timeline`'s report and `engaged`
+  judgment, a `stop` or `kill` allowed inside a `cgroup` step, self-test fixtures for each, the
+  `slow-spool` scenario, `tools/soak/vm-io-probe.sh`, the README's "Running a scenario on the
+  perf VM", and an amendment to ADR `soak-harness`. The `dm-delay` fallback waits for the VM's
+  probe to fail, and the runs happen on the perf VM.
 - **W34**: item 31: the `slowclient` action and its client, `soaklib/slowclient.py`, their
   rules, self-test fixtures for each, the `slowloris-tcp` and `slowloris-http` scenarios, the
   killed-life allowance in `ledger.standin` for requests answered after the life's last drain,
@@ -3515,7 +3554,7 @@ that items 3, 7, and 11 need.
   scenarios, `ledger.hop`'s and `ledger.summary`'s allowance for a replay into a full sender
   table, self-test fixtures for it, an amendment to ADR `soak-harness`, and the runs recorded
   under "Findings".
-- **W33**, and **W36** and **W37**: items 29, 33, and 34 in turn, each with its action or
+- **W36** and **W37**: items 33 and 34 in turn, each with its action or
   wire, self-test fixtures for each rule, an amendment to ADR `soak-harness` where it adds a
   ledger rule or an action, and each scenario's run recorded under "Findings". Item 30 has no
   workstream.
@@ -6901,6 +6940,13 @@ What the runs showed about `logit` and the harness:
 - **No warning line accompanies a limit refusal or a timeout close.** Neither run logged a WARN
   for the 801 and 810 refusals or the 80 and 24 timeout closes; each is counted, and none is a
   `*.dropped`, so the loss vocabulary asks for no line. Not a finding.
+- **`max_open` in the two runs above is the old count.** The client sampled it right after
+  each `create_connection`, before a read saw the listener's close, so it read 24 of 24 with 15
+  slots free. It now samples at each tick after the read pass, so it means the connections the
+  listener let the client hold; the recorded runs' numbers have not been redone.
+- **A killed client no longer leaks.** `compose down --remove-orphans` doesn't remove a
+  container with no `config-hash` label (Compose 5.6.0), so teardown force-removes the
+  project's `<project>-slowclient-` containers first.
 - **Self-test**: 3,035 expectations. Each new rule was reverted in turn and failed at least one
   expectation, 36 in all: the client's modes, sends, head, endless head, trickle, redial, the
   half-open first byte and acknowledgment wait, its usage rule; the apply's network inspect, the
@@ -6909,6 +6955,73 @@ What the runs showed about `logit` and the harness:
   each key, its range and form, `send` against `silent`, the keys off another action, the
   SUT-only and `[random]` refusals, and the keys reaching the expanded step. Reverting the
   `ledger.standin` allowance fails its new killed-life case.
+
+### W33: a slow spool on the perf VM (2026-11-04)
+
+W33 adds the `cgroup` action's `io_wbps` and `io_wiops` keys, `tools/soak/vm-io-probe.sh`, and
+the `slow-spool` scenario. Both runs were on the disposable perf VM (`Standard_F8as_v6`, 8 cores
+of an AMD EPYC 9V74, 31 GiB, Debian 13 `debian-13:13-gen2`, kernel 6.12.115+deb13.1-cloud-amd64,
+Docker 29.9.3 with the containerd image store, Python 3.13.5), one after the other, at the
+scenario's default duration, with the driver running docker with no `sudo` (`DOCKER=docker`).
+The root filesystem is ext4 on `/dev/nvme0n1p1`, a 128 GiB Premium_LRS managed disk; a
+container's root is overlayfs whose upperdir, under
+`/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/`, sits on that ext4
+partition (259:7), and `io_device` resolved its whole disk, 259:0, in the probe and in every
+apply.
+
+The probe PASSed on the first try: under `259:0 wbps=1048576`, 4 MiB with `fsync` took 4.05 s,
+and `io.stat` counted 4,194,304 bytes in 17 writes. With no limit the same `dd` took 0.06 s, its
+cgroup's `io.pressure` `some` total gaining 71 µs and 2,059 µs in two tries, and six 40 KiB
+writes with `fsync` 3 s apart stalled 641 µs in all (about 0.004% of their 18 s); under
+`wbps=32768` those six stalled 7.5 s.
+
+| Run | Scenario | Verdict | Highlights |
+|---|---|---|---|
+| `20261104T160417Z` | `slow-spool`, first cut (the default 64MiB `segment_bytes`) | FAIL | `timeline`: `c0s4` wrote 425,984 bytes in 11 writes over 123.8 s, 3,441 B/s against the 32,768 limit, and stalled 0.40 s (0.3%), under `engaged`'s 1%; below. Every other row PASS; the SUT's stop inside `c0s2` took 18.7 s (`drain complete` 18.5 s), exit 0 |
+| `20261104T161635Z` | `slow-spool`, `segment_bytes: 64KiB` | PASS | `timeline`: both applies rc 0 on 259:0; `c0s4` wrote 1,503,232 bytes in 30 writes over 123.5 s, 12,169 B/s against 32,768, and stalled 6.4 s (5.2%). The stop inside `c0s2` took 9.8 s (`drain complete` 9.56 s), exit 0, against 14 ms unthrottled at the end. 5 records replayed at the restart, none truncated, no second replay, no `buffer.disk.errors`, no drop; G 760,700, W 741,400, Ab = V = 530,800, uncounted 0; `ledger.windows`' widest gap 10.0 s |
+
+Both runs used `logit:soak` built on the VM from the branch (`sha256:91d57082f118` at
+`1dfa6a27`, `sha256:a6784b790215` at `2aef5edd`).
+
+What the runs showed about `logit` and the harness:
+
+- **A spool push doesn't wait on the disk.** The first cut's limit throttled the writeback and
+  nothing in the SUT waited on it: a push writes its record with no `fsync`, and a segment is
+  synced only when it rotates and at close ([ADR `disk-backed-sink-buffer`](../adr/disk-backed-sink-buffer.md)),
+  so under the default 64MiB the segment never rotated, the flusher wrote 3.4 KB/s of the
+  spool's 12.8 KiB/s back under the limit, and the stall the run saw was the cursor persists'
+  `fsync`s. The scenario's premise, a `sync_data` per window, held only with a segment smaller
+  than one record: `segment_bytes: 64KiB` rotates at every push (each window's record is
+  130,978 bytes, from `logit.component.buffer.bytes`), and the rotation syncs the previous
+  record under the limit. That stalled 5.2% of the window, five times the threshold and more
+  than a thousand times the unthrottled share. It stalled less than the bytes over the limit
+  would predict (1.5 MB at 32K is 46 s); `io.pressure` counts only the time a task waited, and
+  the run doesn't show how much writeback the flusher did between rotations. The 1% threshold
+  stays: it sits between 0.004% and 5.2%.
+- **A shutdown under a slow disk syncs the unsynced segment.** The first cut's stop drained in
+  18.5 s, against 15 ms unthrottled at the end of the same run, because `finish` syncs the
+  active segment, which held every record since the last writeback; at one record per segment
+  it took 9.6 s. Both are under the driver's 30 s `docker stop -t`, but past Docker's default
+  10 s, which would SIGKILL a spool mid-sync on a slow disk; the next open recovers it, so it's
+  replay, not loss. An operator note, not a defect.
+- **Records sit in the page cache between rotations.** Under the default segment size and a
+  slow disk the dirty backlog grows with the outage; a power loss loses what the flusher hadn't
+  written. That is the ADR's documented durability, with per-push `fsync` left to a later knob.
+- **`rss_slope` WARNed on `logit` in the first cut** with no life of enough samples outside the
+  fault windows and PASSed in the second (-444.5 MiB/h over 60 s, limit 334): the scenario's
+  windows cover most of each life, so the row is thin either way.
+- **Self-test**: 3,049 expectations, unchanged by the scenario fix.
+- **Open: the 6.4 s stall against the ~46 s the bytes predict.** `c0s4`'s 1,503,232 B in 30
+  bios is about 11.5 records, so a stall of about 0.53 s per rotation, about 14% of the
+  bytes-over-limit time. The first run's 425,984 B stalled only 0.40 s. In the first run most
+  bytes were kworker writeback, which the scope's PSI doesn't see; in the second, the flusher
+  likely wrote back most of each record before the rotation's `fdatasync`. The next VM run
+  should record `sysctl vm.dirty_*`, sample `io.stat`, `io.pressure`, and `/proc/vmstat`'s
+  `nr_dirty` and `nr_writeback` each second, and time each `fdatasync`
+  (`strace -f -T -e fdatasync`).
+- **Open, not built: the default segment under throttle.** The first run's 18.5 s shutdown at
+  the default segment size exceeds Docker's 10 s default stop timeout and nothing asserts it.
+  A default-segment variant, or an `[[expect]]` on shutdown drain time, would assert it.
 
 ### W32: a CPU quota and memory pressure on the SUT's cgroup (2026-11-03)
 
