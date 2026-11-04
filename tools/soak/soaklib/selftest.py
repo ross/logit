@@ -14156,6 +14156,12 @@ def _cgroup_io_rules(root):
             expect(True, "")
         except scenario.ScenarioError as err:
             expect(False, f"a {action} starting inside a cgroup loads, got {err.problems}")
+    engaged = {"at": "0s", "action": "cgroup", "memory_high": "64M", "engaged": True,
+               "for": "60s"}
+    for action in ("stop", "kill"):
+        _refused(path, overlap(engaged, {"at": "20s", "action": action, "for": "60s"}),
+                 "`engaged` can't be judged on a cgroup step a stop or kill ends",
+                 f"an engaged cgroup a {action} starts inside")
     for second, what in (({"at": "0s", "action": "stop", "for": "20s"}, "a stop at its start"),
                          ({"at": "20s", "action": "pause", "for": "20s"}, "a pause inside it"),
                          ({"at": "20s", "action": "restart", "for": "20s"},

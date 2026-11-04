@@ -3016,6 +3016,12 @@ def validate(scenario, duration=None, seed=None):
                         continue
                     if (first.action == "cgroup" and second.action in CGROUP_ENDING_ACTIONS
                             and second.at > first.at):
+                        if first.engaged is not None:
+                            problems.append(
+                                f"steps {first.index + 1} and {second.index + 1}: `engaged` "
+                                "can't be judged on a cgroup step a stop or kill ends: the "
+                                "process's counts go with its scope"
+                            )
                         continue
                     if pair == {"pause", "kill"}:
                         problems.append(
