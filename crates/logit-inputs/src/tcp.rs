@@ -940,9 +940,9 @@ impl<D: Decoder + Clone + Send + 'static> ConnectionSpawner<D> {
 
             drop(live);
 
-            // One connection's error (a peer vanishing mid-frame, a TLS accept that failed or
-            // timed out) is never fatal to the listener or its siblings; only an accept failing
-            // in the accept loop is.
+            // One connection's error (a peer vanishing mid-frame, a TLS accept that failed) is
+            // never fatal to the listener or its siblings; only an accept failing in the accept
+            // loop is.
             if let Err(err) = result {
                 diag.warn_throttled("connection_error", err);
             }
@@ -2130,11 +2130,17 @@ mod tests {
         }
     }
 
-    /// A TLS connection that never sends a ClientHello releases its permit at the timeout.
+    /// A TLS connection that never sends a ClientHello releases its permit at the timeout, counted
+    /// `handshake_timeout` and not diagnosed.
     #[tokio::test]
     async fn a_silent_connection_releases_its_permit_after_the_handshake_timeout() {
+        let mut probe = TelemetryProbe::new();
         let (addr, listener) = bound_listener(one_per_frame()).await;
+        let diag = Diagnostics::new("syslog_in");
+        let listener_diag = diag.clone();
         let mut listener = listener
+            .with_telemetry(probe.telemetry("syslog_in", "syslog_in", "listener"))
+            .with_diagnostics(diag)
             .with_tls(
                 &test_tls_settings(None),
                 &testdata_dir(),
@@ -2153,6 +2159,11 @@ mod tests {
         // this current-thread runtime the close means the permit is back.
         let mut silent = connect(&addr).await;
         expect_closed(&mut silent, "a TLS connection that sent no ClientHello").await;
+        wait_until("the handshake_timeout close count", || {
+            probe.sum("logit.input.connections.closed", &[("reason", "handshake_timeout")]) == 1.0
+        })
+        .await;
+        assert_eq!(listener_diag.occurrences("connection_error"), 0);
 
         let connector = tls_connector("ca.pem", None).await;
         let mut client = tls_connect(&connector, &addr).await;
