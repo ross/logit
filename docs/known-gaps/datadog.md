@@ -124,28 +124,37 @@ Entry format and the other areas: [the known-gaps index](README.md).
     overwrite. `buffer: {delivery: at_most_once}` drops that request's batch instead.
   - **Revisit trigger:** a measurement showing another route dedupes a resend, or an operator who
     needs the replay to be duplicate-free.
-- **`datadog_out` collapses a series' points in one second only within one batch.** Of the
-  points of one series in one second in a batch, the sink sends the latest and leaves the rest
-  off, counted `metrics.dropped{reason="duplicate_timestamp"}`, or
-  `metrics.normalized{reason="duplicate_timestamp"}` for a gauge (not a `rate`) or cumulative
-  point equal to the one sent, because
-  Datadog keeps only the higher of two in one request (verified 2026-10-21;
-  [ADR `dedup-timestamps-transform`](../adr/dedup-timestamps-transform.md)'s "Verified destination
-  behavior"). It plans that over the whole batch before cutting requests, so no cut splits a pair,
-  but it holds no state between batches.
-  - **Consequence:** two such points in two batches are both sent, and Datadog keeps the one that
-    arrives later, so the other is lost, uncounted; for a `count`, that's an increment. Above
-    `concurrency: 1`, the one that arrives later can be the older batch's. `dedup_timestamps`
-    holds no state between batches either.
-  - **Workaround:** keep one series' readings of one second in one batch: an `aggregate` upstream
-    leaves one point per series per window. That fails at the `aggregate`'s own shutdown or
-    restart flush: it emits a partial window, which can fall in the same whole second as the
-    last full one and leaves in a separate request, so Datadog keeps one of the two, uncounted.
-    The soak scenario `delta-datadog` hit it on a generator restart: all 20 series sent a full
-    5 s window (250) stamped +794.5 s from the run's start and a 0.5 s partial window (25) at
-    +795.0 s, both truncating to one epoch second, 1793297098, in two requests (`tools/soak/README.md`'s "A delta transform's value"; its `ledger.standin` row
-    WARNs on such a pair). No configuration avoids it, since the flush's offset into a second
-    depends on when the process stops.
+- **`datadog_out` remembers the seconds it sent only within one process life, and not for a
+  batch in flight.** Of the points of one series in one second in a batch, the sink sends the
+  latest and leaves the rest off; a later batch's point of a series and second an earlier
+  accepted request sent is left off too. Each is counted
+  `metrics.dropped{reason="duplicate_timestamp"}`, or
+  `metrics.normalized{reason="duplicate_timestamp"}` for a state equal to the point sent,
+  because Datadog keeps one point per series per second: the higher of two in one request, and
+  the later across requests (verified 2026-10-21 and 2026-11-04;
+  [ADR `datadog-out-sent-second-memory`](../adr/datadog-out-sent-second-memory.md)). The memory
+  of seconds sent is in memory, bounded to two generations of 57,344 series, each forgotten after
+  two rotations or two hours of send time, and holds each series' latest second only.
+  - **Consequence:** two points of one series in one second are both sent, and Datadog keeps the
+    later, losing the other uncounted (for a `count`, an increment), when the two leave from two
+    lives of the `datadog_out` process (an SUT restart, not a generator restart); when the
+    earlier batch was still in flight above `concurrency: 1`, so either can land last; when the
+    series fell out of the memory; when the repeated second is older than the latest one sent
+    for the series; or when the earlier point's request drew a `2xx` whose `errors` name any
+    series dropped, which records none of that request's points. A point left off after an earlier one is a loss of the later point: Datadog
+    holds the earlier, which for a gauge is the older reading.
+  - **Workaround:** keep one series' readings of one second in one batch and one process: an
+    `aggregate` upstream leaves one point per series per window, and a `dedup_timestamps` with
+    `precision: 1s` merges a batch's readings. Neither covers an `aggregate`'s shutdown or
+    restart flush: it emits a partial window, which can fall in the same whole second as the last
+    full one and leaves in a separate request. Through one `datadog_out` process life, the sink
+    counts that pair. The soak scenario `delta-datadog` hit it on a generator restart: all 20
+    series sent a full 5 s window (250) stamped +794.5 s from the run's start and a 0.5 s
+    partial window (25) at +795.0 s, both truncating to one epoch second, 1793297098, in two
+    requests (`tools/soak/README.md`'s "A delta transform's value"). No configuration avoids it,
+    since the flush's offset into a second depends on when the process stops.
+  - **Revisit trigger:** a pair counted often enough across sink restarts or in-flight batches to
+    justify a persisted or in-flight-aware memory.
 - **`datadog_out` sends a container id unresolved.** `container.id` leaves as a bare
   `container_id` tag (a `ddtags` entry on a log, the payload field on a trace or stats payload).
   An Agent resolves a container id through its tagger into the container's image, name, and

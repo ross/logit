@@ -50,6 +50,8 @@ hyper.workspace = true
 hyper-util.workspace = true
 http.workspace = true
 http-body-util.workspace = true
+# `fdlimit.rs` raises the soft open-files limit through `getrlimit`/`setrlimit`.
+rustix.workspace = true
 
 [dev-dependencies]
 # The transit spec's `#[cfg(test)]` readers of `spec/transit/mapping.yaml` and each case's

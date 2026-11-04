@@ -38,8 +38,9 @@ logit-bench = { path = "crates/logit-bench" }
 bytes = "1"
 # The process hostname (`logit_pipeline::host`): `uname(2)`'s nodename through a safe wrapper, so
 # the lookup adds no raw-`libc` `unsafe` site (docs/adr/out-of-ci-unsafe-verification.md). Already
-# in the graph transitively.
-rustix = { version = "1", default-features = false, features = ["std", "system"] }
+# in the graph transitively. `process` is `logit run`'s `RLIMIT_NOFILE` raise
+# (`crates/logit-cli/src/fdlimit.rs`), which needs `getrlimit`/`setrlimit`.
+rustix = { version = "1", default-features = false, features = ["std", "system", "process"] }
 # OTLP codec only (crates/logit-proto/src/otlp) -- messages generated once, offline, and committed
 # (docs/adr/committed-pregenerated-otlp-protobuf.md); no `prost-build`/`protoc` at build time.
 prost = "0.14"
