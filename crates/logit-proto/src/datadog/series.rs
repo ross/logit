@@ -36,6 +36,7 @@ use prost::Message;
 use serde_json::{json, Map, Value as JsonValue};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU64;
 use std::sync::{Arc, LazyLock};
 
 type JsonMap = Map<String, JsonValue>;
@@ -49,7 +50,7 @@ const RESOURCE_HOST: &str = "host";
 const RESOURCE_DEVICE: &str = "device";
 
 /// A Datadog metric type, as every series route spells it one way or another.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum WireType {
     Unspecified,
     Count,
@@ -133,7 +134,7 @@ pub(super) struct WireSeries<'a> {
 
 /// `_logit.datadog.origin.*`: the protobuf `Origin`'s three codes plus the JSON API's
 /// `metric_type`. A zero code is absent, the protobuf default.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(super) struct OriginCodes {
     pub product: u64,
     pub category: u64,
@@ -1089,7 +1090,12 @@ impl DatadogEncoder {
         let mut out = SeriesDuplicates::default();
         let points = records.iter().flat_map(|r| (0..r.points.len()).map(move |k| (r, k)));
         for ((r, k), fate) in points.zip(fates) {
-            if fate != Fate::Sent {
+            if fate == Fate::Sent {
+                let (c, _) = carriers[r.index].as_ref().expect("read for every written event");
+                let second = nanos_to_seconds(batch.events[r.index].timestamp);
+                let point = SentPoint::new(r.record, &r.points[k], c, second);
+                out.sent.push(((r.index, r.record_index, k), point));
+            } else {
                 out.dropped.insert((r.index, r.record_index, k));
                 *out.per_event.entry(r.index).or_default() += 1;
                 out.equal += usize::from(fate == Fate::Equal);
@@ -1189,6 +1195,32 @@ impl DatadogEncoder {
                  later, different one, since Datadog keeps only the higher of the two -- add a \
                  `dedup_timestamps` component with `precision: 1s` before this output, or an \
                  `aggregate` for a live delta flow"
+            ),
+        );
+    }
+
+    /// Counts the series points left off because an earlier request already carried a point of
+    /// their series and second ([`SeriesDuplicates::leave_off_sent`]), as
+    /// [`DatadogEncoder::count_duplicates`] does, with a diagnostic of its own: no batch-local
+    /// remedy reaches a pair split across requests.
+    pub fn count_sent_duplicates(&mut self, differing: usize, equal: usize) {
+        for _ in 0..equal {
+            self.metric_not_sent(MetricOut::EqualDuplicateTimestamp);
+        }
+        if differing == 0 {
+            return;
+        }
+        for _ in 0..differing {
+            self.metric_not_sent(MetricOut::DuplicateTimestamp);
+        }
+        self.diagnostics.warn_throttled(
+            "duplicate_timestamp_sent",
+            format_args!(
+                "datadog: dropped {differing} series point(s) whose series and second an earlier \
+                 request already sent with a different point, since Datadog keeps one point per \
+                 series per second and a later write replaces the earlier -- keep one point per \
+                 series per second upstream, with an `aggregate` window or a \
+                 `dedup_timestamps` (`precision: 1s`) over batches that hold the whole second"
             ),
         );
     }
@@ -1380,7 +1412,8 @@ struct SeriesRecord<'a> {
 }
 
 /// The series points a batch leaves off as duplicates
-/// ([`DatadogEncoder::series_duplicates_in`]), by `(event, record, point)` index in the batch.
+/// ([`DatadogEncoder::series_duplicates_in`]), by `(event, record, point)` index in the batch,
+/// and the points it sends, each with what a sink remembers of it ([`SentPoint`]).
 #[derive(Clone, Debug, Default)]
 pub struct SeriesDuplicates {
     /// Every point left off, equal to the point sent or not.
@@ -1388,6 +1421,11 @@ pub struct SeriesDuplicates {
     per_event: HashMap<usize, usize>,
     /// How many of `dropped` equal the point sent for their series and second ([`same_point`]).
     equal: usize,
+    /// How many of `dropped`, and of `equal`, [`SeriesDuplicates::leave_off_sent`] left off.
+    sent_dropped: usize,
+    sent_equal: usize,
+    /// The points sent, in batch order, so in ascending event index.
+    sent: Vec<((usize, usize, usize), SentPoint)>,
 }
 
 impl SeriesDuplicates {
@@ -1396,19 +1434,102 @@ impl SeriesDuplicates {
         self.dropped.len()
     }
 
-    /// The points left off that equal the point sent for their series and second.
+    /// The points left off within the batch that equal the point sent for their series and
+    /// second.
     pub fn equal(&self) -> usize {
-        self.equal
+        self.equal - self.sent_equal
     }
 
-    /// The points left off that differ from the point sent for their series and second.
+    /// The points left off within the batch that differ from the point sent for their series and
+    /// second.
     pub fn differing(&self) -> usize {
-        self.dropped.len() - self.equal
+        self.dropped.len() - self.sent_dropped - self.equal()
+    }
+
+    /// The points [`SeriesDuplicates::leave_off_sent`] left off that equal the point an earlier
+    /// request sent.
+    pub fn sent_equal(&self) -> usize {
+        self.sent_equal
+    }
+
+    /// The points [`SeriesDuplicates::leave_off_sent`] left off that differ from the point an
+    /// earlier request sent.
+    pub fn sent_differing(&self) -> usize {
+        self.sent_dropped - self.sent_equal
     }
 
     /// The points left off from the batch's event `index`.
     pub fn of_event(&self, index: usize) -> usize {
         self.per_event.get(&index).copied().unwrap_or(0)
+    }
+
+    /// Leaves off each point the batch would send whose series and second `earlier` says an
+    /// earlier request carried: `earlier` returns that point's [`SentPoint::state`], and `None`
+    /// when no earlier request carried the series in that second. A point left off counts as
+    /// equal when both states are `Some` and match.
+    pub fn leave_off_sent(
+        &mut self,
+        mut earlier: impl FnMut(&SentPoint) -> Option<Option<NonZeroU64>>,
+    ) {
+        let mut kept = Vec::with_capacity(self.sent.len());
+        for (at, point) in std::mem::take(&mut self.sent) {
+            match earlier(&point) {
+                None => kept.push((at, point)),
+                Some(state) => {
+                    let equal = state.is_some() && state == point.state;
+                    self.dropped.insert(at);
+                    *self.per_event.entry(at.0).or_default() += 1;
+                    self.sent_dropped += 1;
+                    self.equal += usize::from(equal);
+                    self.sent_equal += usize::from(equal);
+                }
+            }
+        }
+        self.sent = kept;
+    }
+
+    /// The points the batch sends from its events `index`, in batch order.
+    pub fn sent_by(&self, index: usize) -> impl Iterator<Item = &SentPoint> {
+        let start = self.sent.partition_point(|((event, _, _), _)| *event < index);
+        self.sent[start..]
+            .iter()
+            .take_while(move |((event, _, _), _)| *event == index)
+            .map(|(_, point)| point)
+    }
+}
+
+/// One series point a batch sends, as `datadog_out` remembers it once Datadog accepted the
+/// request carrying it: a hash of its series ([`SeriesKey`] without the second), the second, and a
+/// hash of what [`same_point`] compares, its low bit set so it's never zero, `None` for an
+/// increment, which no other point equals. Two distinct series that share a hash read as one,
+/// with a chance near `2^-64` per pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SentPoint {
+    pub series: u64,
+    pub second: i64,
+    pub state: Option<NonZeroU64>,
+}
+
+impl SentPoint {
+    fn new(record: &MetricRecord, p: &SeriesPoint, c: &Carriers, second: i64) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::hash::DefaultHasher::new();
+        SeriesKey::new(record, p, c, 0).hash(&mut hasher);
+        let series = hasher.finish();
+        let wire_type = p.wire_type(c);
+        let state = (crate::replaced_by_a_later_reading(&record.kind)
+            && wire_type != WireType::Rate)
+            .then(|| {
+                let mut hasher = std::hash::DefaultHasher::new();
+                p.value.to_bits().hash(&mut hasher);
+                wire_type.hash(&mut hasher);
+                p.unit(record, c).hash(&mut hasher);
+                c.interval.hash(&mut hasher);
+                c.source_type_name.hash(&mut hasher);
+                c.origin.hash(&mut hasher);
+                NonZeroU64::MIN | hasher.finish()
+            });
+        Self { series, second, state }
     }
 }
 

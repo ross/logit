@@ -1,8 +1,10 @@
 # Datadog intake round trip: one process, two disconnected chains sharing one loopback
 # connection, `gen -> relay_out` (datadog_out, series v2 under gzip, its `api` base pointed at
-# the listener over plain HTTP) and `relay_in -> drop` (datadog_in). The event is one gauge over
-# 1000 series (`host: h{seq%1000}`), so this measures the series encode, gzip, one HTTP request
-# per 100 points, and the decode back to events. Scenario table: docs/design/performance.md,
+# the listener over plain HTTP) and `relay_in -> drop` (datadog_in). The event is one gauge, each
+# of its own series (`host: h{seq}`): `datadog_out` leaves off a point whose series and second it
+# already sent, so series repeating within a second would measure the drop instead of the send.
+# This measures the series encode, the memory of seconds sent, gzip, one HTTP request per 100
+# points, and the decode back to events. Scenario table: docs/design/performance.md,
 # "Scenarios".
 #
 #   script/perf run --scenario datadog-relay
@@ -22,7 +24,7 @@ components:
     count: 2000000
     event:
       attributes:
-        host: "h{seq%1000}"
+        host: "h{seq}"
       metric:
         name: cpu.usage
         kind: gauge

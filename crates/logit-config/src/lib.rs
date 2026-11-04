@@ -1706,7 +1706,8 @@ pub enum ComponentKind {
         /// The most connections this listener serves at once. One arriving past it is closed at
         /// once and counted `logit.input.connections.rejected{reason="limit"}`, never queued.
         /// Defaults to `1024`; `0` is rejected. Each open connection holds a file descriptor, so
-        /// keep the total across listeners under the process's `nofile` limit.
+        /// keep the total across listeners under the process's hard `nofile` limit.
+        /// `logit run` raises the soft limit to it.
         ///
         /// Stream transports only (`tcp` and `unix_stream`); a datagram listener has no
         /// connections, so a non-default value under `transport: udp` or `unix` is rejected.
@@ -1841,7 +1842,8 @@ pub enum ComponentKind {
         /// The most connections this listener serves at once. A connection arriving past the cap
         /// is closed immediately and counted `logit.input.connections.rejected{reason="limit"}`,
         /// never queued. Defaults to `1024`; `0` is rejected. Each open connection holds a file
-        /// descriptor, so keep the total across listeners under the process's `nofile` limit.
+        /// descriptor, so keep the total across listeners under the process's hard `nofile` limit.
+        /// `logit run` raises the soft limit to it.
         ///
         /// `transport: tcp` or `unix_stream` only: a datagram listener has no connections, so a
         /// non-default value under `transport: udp` or `unix` is rejected.
@@ -2018,7 +2020,8 @@ pub enum ComponentKind {
         /// The most connections this listener serves at once. One arriving past it is closed at
         /// once and counted `logit.input.connections.rejected{reason="limit"}`, never queued.
         /// Defaults to `1024`; `0` is rejected. Each open connection holds a file descriptor, so
-        /// keep the total across listeners under the process's `nofile` limit.
+        /// keep the total across listeners under the process's hard `nofile` limit.
+        /// `logit run` raises the soft limit to it.
         ///
         /// Stream transports only (`tcp`); a datagram listener has no connections, so a
         /// non-default value under `transport: udp` is rejected.
@@ -2160,7 +2163,8 @@ pub enum ComponentKind {
         /// The most connections this listener serves at once. One arriving past it is closed at
         /// once and counted `logit.input.connections.rejected{reason="limit"}`, never queued.
         /// Defaults to `1024`; `0` is rejected. Each open connection holds a file descriptor, so
-        /// keep the total across listeners under the process's `nofile` limit.
+        /// keep the total across listeners under the process's hard `nofile` limit.
+        /// `logit run` raises the soft limit to it.
         ///
         /// Stream transports only (`tcp`); a datagram listener has no connections, so a
         /// non-default value under `transport: udp` is rejected.
@@ -2261,7 +2265,8 @@ pub enum ComponentKind {
         /// The most connections this listener serves at once. One arriving past it is closed at
         /// once and counted `logit.input.connections.rejected{reason="limit"}`, never queued.
         /// Defaults to `1024`; `0` is rejected. Each open connection holds a file descriptor, so
-        /// keep the total across listeners under the process's `nofile` limit.
+        /// keep the total across listeners under the process's hard `nofile` limit.
+        /// `logit run` raises the soft limit to it.
         #[serde(default = "default_max_connections")]
         max_connections: usize,
         /// Stamps each event with the address of the socket peer that sent it, as
@@ -2357,7 +2362,8 @@ pub enum ComponentKind {
         /// The most connections this listener serves at once. One arriving past it is closed at
         /// once and counted `logit.input.connections.rejected{reason="limit"}`, never queued.
         /// Defaults to `1024`; `0` is rejected. Each open connection holds a file descriptor, so
-        /// keep the total across listeners under the process's `nofile` limit.
+        /// keep the total across listeners under the process's hard `nofile` limit.
+        /// `logit run` raises the soft limit to it.
         #[serde(default = "default_max_connections")]
         max_connections: usize,
         /// Stamps each event with the address of the socket peer that sent it, as
@@ -2467,7 +2473,8 @@ pub enum ComponentKind {
         /// The most connections this listener serves at once. One arriving past it is closed at
         /// once and counted `logit.input.connections.rejected{reason="limit"}`, never queued.
         /// Defaults to `1024`; `0` is rejected. Each open connection holds a file descriptor, so
-        /// keep the total across listeners under the process's `nofile` limit.
+        /// keep the total across listeners under the process's hard `nofile` limit.
+        /// `logit run` raises the soft limit to it.
         ///
         /// Counts the TCP listener and the Unix socket together; `/info` reports it as
         /// `connection_limit`.
@@ -2602,7 +2609,8 @@ pub enum ComponentKind {
         /// The most connections this listener serves at once. One arriving past it is closed at
         /// once and counted `logit.input.connections.rejected{reason="limit"}`, never queued.
         /// Defaults to `1024`; `0` is rejected. Each open connection holds a file descriptor, so
-        /// keep the total across listeners under the process's `nofile` limit.
+        /// keep the total across listeners under the process's hard `nofile` limit.
+        /// `logit run` raises the soft limit to it.
         #[serde(default = "default_max_connections")]
         max_connections: usize,
         /// Stamps each event with the address of the socket peer that sent it, as
@@ -2711,7 +2719,8 @@ pub enum ComponentKind {
         /// The most connections this listener serves at once. One arriving past it is closed at
         /// once and counted `logit.input.connections.rejected{reason="limit"}`, never queued.
         /// Defaults to `1024`; `0` is rejected. Each open connection holds a file descriptor, so
-        /// keep the total across listeners under the process's `nofile` limit.
+        /// keep the total across listeners under the process's hard `nofile` limit.
+        /// `logit run` raises the soft limit to it.
         #[serde(default = "default_max_connections")]
         max_connections: usize,
         /// Stamps each event with the address of the socket peer that sent it, as
@@ -2917,7 +2926,8 @@ pub enum ComponentKind {
         /// The most connections this listener serves at once. One arriving past it is closed at
         /// once and counted `logit.input.connections.rejected{reason="limit"}`, never queued.
         /// Defaults to `1024`; `0` is rejected. Each open connection holds a file descriptor, so
-        /// keep the total across listeners under the process's `nofile` limit.
+        /// keep the total across listeners under the process's hard `nofile` limit.
+        /// `logit run` raises the soft limit to it.
         ///
         /// A `logit_out` past the cap is told `Reject{INTERNAL}` and retries on its own. The resend
         /// table is sized from this value (`max_connections + max_connections / 4` sender
@@ -4830,7 +4840,8 @@ pub enum ComponentKind {
         /// The most connections this listener serves at once. One arriving past it is closed at
         /// once and counted `logit.input.connections.rejected{reason="limit"}`, never queued.
         /// Defaults to `1024`; `0` is rejected. Each open connection holds a file descriptor, so
-        /// keep the total across listeners under the process's `nofile` limit.
+        /// keep the total across listeners under the process's hard `nofile` limit.
+        /// `logit run` raises the soft limit to it.
         ///
         /// Remote-write receiver only (`bind:`); a non-default value alongside `scrape_targets` is
         /// rejected.

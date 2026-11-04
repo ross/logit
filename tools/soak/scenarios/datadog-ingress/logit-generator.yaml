@@ -9,11 +9,12 @@ components:
     batch: 100
     event:
       # A delta sum of 1, a `count` on the wire, one series point per event. A batch shares one
-      # timestamp and holds each `series` tag once, so no two points in one body share a series
-      # and second, which datadog_out would collapse into one.
+      # timestamp, and 4,000 `series` values are two seconds of load, so no two points in one
+      # second share a series, which datadog_out would leave off as one point, within a batch
+      # or across batches.
       metric: { name: soak_requests, kind: sum, value: 1 }
       attributes:
-        series: "{seq%100}"
+        series: "{seq%4000}"
   datadog:
     type: datadog_out
     sources: [load]

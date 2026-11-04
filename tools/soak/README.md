@@ -395,8 +395,9 @@ around the stop and no sink drop. Neither runs over TLS, and over plaintext
   resends their batches, a surplus allowed one batch per timed-out id. Its expectations assert
   that, ids issued and none evicted, and the busy `503`s around the backend stop.
 - `datadog-ingress` sends 2,000 `count` points a second with `datadog_out` into `datadog_in`,
-  each a delta of 1 that `aggregate` sums with no `kv_metrics`. `datadog_out` reads a busy
-  `503` as ambiguous and resends.
+  each a delta of 1 that `aggregate` sums with no `kv_metrics`, over 4,000 series so that no
+  two points share a series and second, which `datadog_out` would leave off. `datadog_out`
+  reads a busy `503` as ambiguous and resends.
 - `rw-ingress` sends 2,000 remote-write 2.0 samples a second with `prometheus_out` into
   `prometheus_in` on `bind:`. The generator marks each sample a cumulative counter in a `lua`
   stage, so the SUT's `aggregate` passes it through and absorbs only its `kv_metrics` counter.
@@ -1140,7 +1141,8 @@ What changes for a stand-in target:
 - `ledger.standin` judges the record against the sink: every body decodes; every sample of a write
   answered `2xx` was stored; no resend stored a different value (under `datadog`, which
   re-encodes a resend unchanged, two values of one series in one second `WARN` instead: two
-  points in two requests, of which Datadog keeps the later, the gap
+  points in two requests, of which Datadog keeps the later, which the sink leaves off within one
+  of its process lives but not across two or between batches in flight together, the gap
   [docs/known-gaps/datadog.md](../../docs/known-gaps/datadog.md) lists); per SUT life the record's
   requests by status class equal the sink's `logit.output.requests`, and its resets are at most
   the sink's `network_error` (a failed dial, `connect_error`, never reaches the record); every answer but the default carries a `respond` step's cue inside
@@ -1213,8 +1215,9 @@ The loader refuses `sut_delta` beside `sut_aggregate`, `sut_script`, a hop, a `s
   which `ledger.egress` judges) times the largest stored delta. It widens to the increments
   over its whole span only when the generator's sink counted a drop in it, or it's a shutdown
   drop's. The gap is reported if it fits the sum of the windows' bounds plus each drop the
-  record can't see (stale points among them) times the largest stored delta, and FAILs past
-  that, so the windows excuse no loss outside them.
+  record can't see (stale points among them, and a point the sink dropped
+  `duplicate_timestamp` because it had sent that series' second before) times the largest stored
+  delta, and FAILs past that, so the windows excuse no loss outside them.
 
 ## A run
 
