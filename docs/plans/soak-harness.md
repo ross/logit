@@ -2047,7 +2047,7 @@ the pause, so `ledger.topic`'s no-duplicate verdict rests on resends, and `retry
 during the stop and 0 after it. `kafka-otlp-broker-restart` is the same run under `format:
 otlp_proto`, `topics: {metrics: soak}`, with the same expectations: one record per window.
 
-### 8c. Stand-in targets (W9a, W9b, W16, W29)
+### 8c. Stand-in targets (W9a, W9b, W16, W29, W36)
 
 A `[target]` table with `kind = "standin"` runs a scripted HTTP destination in place of
 VictoriaMetrics, so every row of a sink's response-class table
@@ -2278,6 +2278,27 @@ to it, as on an external target. Under `remote_write` and `influxdb`, `ledger.se
   reset, every ack withheld (`ambiguous`), and a `stop` of the stand-in. Not cued: Splunk Cloud's
   code 6 at object 0 of a body over 5 MiB, a connect failure after a body was accepted, the
   request timeout (the stand-in holds no answer), and the two `connect_timeout:` rows.
+- `standin-datadog-trace` (W36): `[target] shape = "datadog_trace"`, the stand-in for an
+  Agent's trace API. A generator's `generate_in`, a `lua` stage minting a span per event (one
+  per trace, by `random.trace_id()`), and `datadog_trace_out` writing v0.4 to the SUT's
+  `datadog_trace_in`, which relays every span through `datadog_trace_out` (v0.7, gzip,
+  `idle_timeout: 1s`) to `endpoint: http://standin:8080`, with no `aggregate`. Thirteen steps,
+  60 s apart: a kill of the SUT, so every cued row falls in the final life; eleven 10 s cues,
+  `400`, `404`, `401`, `408`, `413`, `415`, `429`, `501`, a `503` after storing (its resend a
+  copy), `302`, and a reset; and a `stop` of the stand-in. Not cued: a dial past `connect_timeout:` and the request timeout. The
+  stand-in takes `PUT` and `POST` on `/v0.4/traces`, `/v0.7/traces`, and `/v0.6/stats`, and
+  answers a trace request with `rate_by_service`. Each body is read by
+  `soaklib/msgpack.py`, a bounded stdlib reader, into one series per span keyed by trace and
+  span id. The ledger counts spans: G the writer's `events.delivered`, W `datadog_trace_in`'s
+  `events.sent`, and V the spans of the writes answered `2xx`, every copy. The scenario
+  rules allow one source on an `http` wire into a `datadog_trace_in`, one `datadog_trace_out`
+  sink, one SUT service, and nothing between them. `ledger.aggregate` SKIPs, `ledger.edge`
+  holds E − X to the sink's events received as on a scrape wire, `ledger.egress` holds a
+  final or stopped life's W − X − V to the sink's `records.dropped` under every reason plus
+  its `events.dropped` under any reason but `rejected` and `ambiguous_at_most_once`,
+  `ledger.summary` holds the distinct spans accepted to G, and `ledger.standin` holds
+  `records.dropped{reason="rejected"}` and `{reason="oversize"}` to the spans of the rejected
+  steps' requests.
 
 The black-hole control is a `2xx` the stand-in doesn't store (`status = 200`, `apply = false`).
 `ledger.standin` FAILs it wherever it falls. Under cumulative temporality the next stored totals
@@ -3561,10 +3582,14 @@ that items 3, 7, and 11 need.
   scenarios, `ledger.hop`'s and `ledger.summary`'s allowance for a replay into a full sender
   table, self-test fixtures for it, an amendment to ADR `soak-harness`, and the runs recorded
   under "Findings".
-- **W36** and **W37**: items 33 and 34 in turn, each with its action or
-  wire, self-test fixtures for each rule, an amendment to ADR `soak-harness` where it adds a
-  ledger rule or an action, and each scenario's run recorded under "Findings". Item 30 has no
-  workstream.
+- **W36**: item 33: the `datadog_trace` stand-in shape, `soaklib/msgpack.py`, the span
+  ledger's egress, summary, and stand-in rules and its scenario rules, self-test fixtures for
+  each, the `standin-datadog-trace` scenario, `datadog_trace_out`'s table among those the
+  `standin-*` scenarios restate, an amendment to ADR `soak-harness`, and the run recorded under
+  "Findings".
+- **W37**: item 34, with its action or wire, self-test fixtures for each rule, an amendment to
+  ADR `soak-harness` where it adds a ledger rule or an action, and each scenario's run recorded
+  under "Findings". Item 30 has no workstream.
 
 Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9a → W9b → W10a → W10b → W11a → W11b → W12a → W12b → W12c → W12d → W14 → W13b → W15, linear; W13a, W16, and W17 land off `main` beside W14, and W18, W19, and W20 off `main` after it. W21 → W22 → W23 → W24 → W25 → W26 → W27 → W28 → W29 land after them, a linear stack off `main`. W30 lands off `main`, then W31 → W32 → W33 and W34 → W35 → W36 → W37, two stacks off W32, the second needing none of W33. Each PR is based on and targets its
 parent's branch and is brought up to date with `git merge origin/main`, never a rebase.

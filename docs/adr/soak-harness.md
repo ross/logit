@@ -1023,6 +1023,37 @@ allowed no duplicate for it, and `native-hop-identities` reaches one.
   `native-hop-identities` run FAILed three lives of its crash loop on the old band, each replay
   about one life's commits over it.
 
+## Amendment: a `datadog_trace` stand-in counts spans, with no `aggregate` (2026-11-04)
+
+The `datadog_trace_in -> datadog_trace_out` pair relays spans, which no `aggregate` summarizes
+and no backend stores as samples, so a stand-in target can play a Datadog Agent's trace API
+(`[target] shape = "datadog_trace"`) and the ledger counts in spans from the listener to it. The
+stand-in takes `PUT` and `POST` on `/v0.4/traces`, `/v0.7/traces`, and `/v0.6/stats`, answers a
+trace request with an Agent's `rate_by_service` body, and decodes each body with a bounded
+stdlib MessagePack reader, `soaklib/msgpack.py`, into one series per span keyed by its trace and
+span ids. A tracer's payloads come from a generator's `datadog_trace_out` writing v0.4, fed by a
+`lua` stage that turns each generated event into a span, so G is the spans that writer saw
+accepted, W the spans `datadog_trace_in` sent, and V the spans of the writes the stand-in
+answered `2xx`, every copy. A recorded dd-trace tracer's body would have pinned one tracer's
+shape; the generator's sink is the writer the pair's lossless claim covers, and its bodies sit
+in `standin/datadog-trace-vectors.json` beside a dd-trace-py capture.
+
+The scenario rules hold such a run to the one shape the rows can judge: one source on an
+`http` wire into a `datadog_trace_in`, one sink that is a `datadog_trace_out`, one SUT
+service, and no `sut_transforms`, `fan_out`, `merge`, `sut_aggregate`, `sut_delta`,
+`sut_script`, `hop`, `split`, `vm_every_window`, or `[overlap]`. As on a scrape wire,
+`ledger.aggregate` SKIPs and the edge reads E − X against the sink's events received.
+`ledger.egress` holds each final or stopped life's W − X − V to the spans the sink counted
+lost: its `records.dropped` under every reason, and its `events.dropped` under any reason but
+`rejected` and `ambiguous_at_most_once`, whose spans `records.dropped` already counts; a killed
+life's gap is reported. `ledger.summary` requires the final life's uncounted spans to be 0 and
+the distinct spans accepted over the run to be at most G, since a span keeps its identity end
+to end and no resend at either hop can add one. `ledger.standin` holds the sink's
+`records.dropped{reason="rejected"}` to the spans of the requests answered under a step classed
+`rejected`, a `413`'s to `oversize`, and reports the accepted copies and the spans of writes
+stored under a non-`2xx` answer, which the sink resends. `datadog_trace_out`'s response-class
+table joins the tables the `standin-*` scenarios restate as cued steps.
+
 ## Amendment: a killed life's requests answered after its last drain are reported (2026-11-04)
 
 `ledger.standin` holds the record's requests per status class to the sink's

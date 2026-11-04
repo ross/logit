@@ -6,8 +6,9 @@
 # (crates/logit-outputs/src/datadog_trace.rs, "Response classes"). The cued rows: 400; 404;
 # 401, which stands for 403, 405, and 407; 408; 413, counted `oversize`; 415; 429; any 5xx,
 # as 501 and as a 503 answered after storing; any other 3xx or 4xx, as a redirect; and a reset
-# after the request left. A stop of the stand-in is the connect-refused row, and a kill of the
-# SUT ends a life with its queue. Not cued: a 2xx, which every other request is; a dial past
+# after the request left. A stop of the stand-in is the connect-refused row. A kill of the SUT
+# comes first, so the life it ends is reported and every cued row falls in the final life,
+# which the ledger judges exactly. Not cued: a 2xx, which every other request is; a dial past
 # `connect_timeout:`; and the request timeout, which a held answer would turn into a stall.
 # The unit is the span, each its own trace: G the spans the generator's writer saw accepted,
 # W the spans the SUT's listener sent, V the spans the stand-in stored under a 2xx answer.
@@ -18,11 +19,11 @@
 
 name = "standin-datadog-trace"
 description = "datadog_trace_out (v0.4) into datadog_trace_in -> datadog_trace_out (v0.7, gzip) against a stand-in answering each row of the sink's response-class table in turn"
-duration = "15m10s"       # warmup + one cycle + cooldown
+duration = "15m"          # warmup + one cycle + cooldown
 warmup = "60s"
 cooldown = "30s"          # >= recovery_bound
 recovery_bound = "20s"    # retry_max_delay 2s, the generator's 1s, and two telemetry drains
-cycle = "13m40s"          # the last step, its recovery, and two progress windows
+cycle = "13m30s"          # the last step, its recovery, and two progress windows
 
 [configs]
 sut = "logit-sut.yaml"
@@ -50,8 +51,14 @@ progress_window = "30s"
 rss_growth_mib_per_hour = 64
 fd_growth = 8
 
-[[step]]                  # c0s1: 400, bad data: dropped
+[[step]]                  # c0s1: a kill of the SUT: its queue lost, the life reported
 at = "0s"
+action = "kill"
+on = "logit"
+for = "20s"
+
+[[step]]                  # c0s2: 400, bad data: dropped
+at = "1m"
 action = "respond"
 on = "standin"
 status = 400
@@ -59,64 +66,64 @@ body = "unable to decode"
 class = "rejected"
 for = "10s"
 
-[[step]]                  # c0s2: 404, an Agent without this route: held
-at = "1m"
+[[step]]                  # c0s3: 404, an Agent without this route: held
+at = "2m"
 action = "respond"
 on = "standin"
 status = 404
 class = "refused"
 for = "10s"
 
-[[step]]                  # c0s3: 401, a proxy's credential, standing for 403, 405, and 407: held
-at = "2m"
+[[step]]                  # c0s4: 401, a proxy's credential, standing for 403, 405, and 407: held
+at = "3m"
 action = "respond"
 on = "standin"
 status = 401
 class = "refused"
 for = "10s"
 
-[[step]]                  # c0s4: 408, a proxy gave up on the request's arrival: retried
-at = "3m"
+[[step]]                  # c0s5: 408, a proxy gave up on the request's arrival: retried
+at = "4m"
 action = "respond"
 on = "standin"
 status = 408
 class = "ambiguous"
 for = "10s"
 
-[[step]]                  # c0s5: 413, a body over the Agent's limit: dropped, counted oversize
-at = "4m"
+[[step]]                  # c0s6: 413, a body over the Agent's limit: dropped, counted oversize
+at = "5m"
 action = "respond"
 on = "standin"
 status = 413
 class = "rejected"
 for = "10s"
 
-[[step]]                  # c0s6: 415, a media type the Agent doesn't read: held
-at = "5m"
+[[step]]                  # c0s7: 415, a media type the Agent doesn't read: held
+at = "6m"
 action = "respond"
 on = "standin"
 status = 415
 class = "refused"
 for = "10s"
 
-[[step]]                  # c0s7: 429, the Agent's rate limiter: held, never sent
-at = "6m"
+[[step]]                  # c0s8: 429, the Agent's rate limiter: held, never sent
+at = "7m"
 action = "respond"
 on = "standin"
 status = 429
 class = "clean"
 for = "10s"
 
-[[step]]                  # c0s8: 501, any 5xx: retried
-at = "7m"
+[[step]]                  # c0s9: 501, any 5xx: retried
+at = "8m"
 action = "respond"
 on = "standin"
 status = 501
 class = "ambiguous"
 for = "10s"
 
-[[step]]                  # c0s9: 503 after storing, any 5xx: the resend stores the same spans again
-at = "8m"
+[[step]]                  # c0s10: 503 after storing, any 5xx: the resend stores the same spans again
+at = "9m"
 action = "respond"
 on = "standin"
 status = 503
@@ -124,34 +131,28 @@ apply = true
 class = "ambiguous"
 for = "10s"
 
-[[step]]                  # c0s10: a redirect, any other 3xx or 4xx: dropped
-at = "9m"
+[[step]]                  # c0s11: a redirect, any other 3xx or 4xx: dropped
+at = "10m"
 action = "respond"
 on = "standin"
 status = 302
 class = "rejected"
 for = "10s"
 
-[[step]]                  # c0s11: a reset after the request left: retried
-at = "10m"
+[[step]]                  # c0s12: a reset after the request left: retried
+at = "11m"
 action = "respond"
 on = "standin"
 answer = "reset"
 class = "ambiguous"
 for = "10s"
 
-[[step]]                  # c0s12: a connect failure: held
-at = "11m"
+[[step]]                  # c0s13: a connect failure: held
+at = "12m"
 action = "stop"
 on = "standin"
 class = "clean"
 for = "10s"
-
-[[step]]                  # c0s13: a kill of the SUT: its queue is lost, uncounted, and reported
-at = "12m"
-action = "kill"
-on = "logit"
-for = "20s"
 
 # One expectation per class, beside ledger.standin's check of every step.
 [[expect]]
@@ -160,7 +161,7 @@ service = "logit"
 metric = "logit.output.records.dropped"
 component = "agent"
 attrs = { reason = "rejected" }
-step = "c0s1"
+step = "c0s2"
 window = "through"
 reduce = "delta"
 min = 1
@@ -170,7 +171,7 @@ name = "refused-holds"
 service = "logit"
 metric = "logit.component.retrying"
 component = "agent"
-step = "c0s2"
+step = "c0s3"
 window = "during"
 reduce = "max"
 min = 1
@@ -180,7 +181,7 @@ name = "refused-drops-nothing"
 service = "logit"
 metric = "logit.component.batches.dropped"
 component = "agent"
-step = "c0s2"
+step = "c0s3"
 window = "through"
 reduce = "delta"
 max = 0
@@ -190,7 +191,7 @@ name = "ambiguous-retries"
 service = "logit"
 metric = "logit.component.retries"
 component = "agent"
-step = "c0s4"
+step = "c0s5"
 window = "during"
 reduce = "delta"
 min = 1
@@ -201,7 +202,7 @@ service = "logit"
 metric = "logit.output.records.dropped"
 component = "agent"
 attrs = { reason = "oversize" }
-step = "c0s5"
+step = "c0s6"
 window = "through"
 reduce = "delta"
 min = 1
@@ -211,7 +212,7 @@ name = "clean-holds"
 service = "logit"
 metric = "logit.component.retrying"
 component = "agent"
-step = "c0s7"
+step = "c0s8"
 window = "during"
 reduce = "max"
 min = 1
@@ -221,7 +222,7 @@ name = "connect-failure-holds"
 service = "logit"
 metric = "logit.component.retrying"
 component = "agent"
-step = "c0s12"
+step = "c0s13"
 window = "during"
 reduce = "max"
 min = 1
@@ -231,7 +232,7 @@ name = "retrying-clears"
 service = "logit"
 metric = "logit.component.retrying"
 component = "agent"
-step = "c0s12"
+step = "c0s13"
 window = "after"
 reduce = "last"
 max = 0
