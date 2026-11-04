@@ -592,17 +592,13 @@ impl Input for OtlpInput {
                         // `acceptor.accept` already waits on the first bytes under the same
                         // budget.
                         Some(acceptor) => {
-                            match tokio::time::timeout(handshake_timeout, acceptor.accept(stream))
-                                .await
-                            {
-                                Ok(Ok(tls_stream)) => {
-                                    Prelude::Tls(Box::new(tls_stream), connection_peer)
-                                }
-                                Ok(Err(err)) => {
-                                    Prelude::Failed(format!("TLS handshake failed: {err}"))
-                                }
-                                Err(_elapsed) => Prelude::HandshakeTimeout,
-                            }
+                            crate::listener::accept_tls(
+                                acceptor,
+                                stream,
+                                handshake_timeout,
+                                connection_peer,
+                            )
+                            .await
                         }
                         // The plaintext arm's budget: a `peek` that consumes nothing (this
                         // module's "peek, not a read"). A read error reaches
@@ -614,22 +610,12 @@ impl Input for OtlpInput {
                             // Bound to a local, not matched directly: the scrutinee's
                             // temporaries (`peek`'s borrow of `stream`) would outlive the arms,
                             // and the success arm moves `stream` into `hyper`.
-                            let first_byte =
-                                tokio::time::timeout(handshake_timeout, stream.peek(&mut [0u8; 1]))
-                                    .await;
-                            match first_byte {
-                                Ok(Ok(0)) => Prelude::Probe,
-                                Ok(Err(err))
-                                    if err.kind() == std::io::ErrorKind::ConnectionReset =>
-                                {
-                                    Prelude::Probe
-                                }
-                                Ok(Ok(_)) => Prelude::Plain(stream, connection_peer),
-                                Ok(Err(err)) => Prelude::Failed(format!(
-                                    "waiting for a first byte failed: {err}"
-                                )),
-                                Err(_elapsed) => Prelude::HandshakeTimeout,
-                            }
+                            crate::listener::peek_first_byte(
+                                stream,
+                                handshake_timeout,
+                                connection_peer,
+                            )
+                            .await
                         }
                     }
                 };

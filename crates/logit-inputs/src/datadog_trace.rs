@@ -678,32 +678,17 @@ async fn accept_tcp(
                     ConnectionPeer::tcp(peer, context.record_peer, origin.as_ref());
                 match tls_acceptor {
                     Some(acceptor) => {
-                        match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await
-                        {
-                            Ok(Ok(tls_stream)) => {
-                                Prelude::Tls(Box::new(tls_stream), connection_peer)
-                            }
-                            Ok(Err(err)) => Prelude::Failed(format!("TLS handshake failed: {err}")),
-                            Err(_elapsed) => Prelude::HandshakeTimeout,
-                        }
+                        crate::listener::accept_tls(
+                            acceptor,
+                            stream,
+                            handshake_timeout,
+                            connection_peer,
+                        )
+                        .await
                     }
                     None => {
-                        let first_byte =
-                            tokio::time::timeout(handshake_timeout, stream.peek(&mut [0u8; 1]))
-                                .await;
-                        match first_byte {
-                            // A clean close or a reset before the first byte is a health-check
-                            // probe, not a fault (`crate::otlp`'s "not a fault").
-                            Ok(Ok(0)) => Prelude::Probe,
-                            Ok(Err(err)) if err.kind() == std::io::ErrorKind::ConnectionReset => {
-                                Prelude::Probe
-                            }
-                            Ok(Ok(_)) => Prelude::Plain(stream, connection_peer),
-                            Ok(Err(err)) => {
-                                Prelude::Failed(format!("waiting for a first byte failed: {err}"))
-                            }
-                            Err(_elapsed) => Prelude::HandshakeTimeout,
-                        }
+                        crate::listener::peek_first_byte(stream, handshake_timeout, connection_peer)
+                            .await
                     }
                 }
             };
@@ -2630,6 +2615,35 @@ mod tests {
         probe
             .wait_for("the connections gauge to read 0", |t| {
                 t.gauge("logit.input.connections", &[]) == Some(0.0)
+            })
+            .await;
+    }
+
+    /// A client that sends no ClientHello is closed at the handshake timeout and counted
+    /// `handshake_timeout`.
+    #[tokio::test]
+    async fn a_silent_tls_connection_is_counted_a_handshake_timeout() {
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let settings = TlsServerSettings {
+            cert_file: "server.pem".to_string(),
+            key_file: "server.key".to_string(),
+            client_ca_file: None,
+        };
+        let mut input = tcp()
+            .with_tls(&settings, &testdata_tls_dir(), &logit_pipeline::tls::TlsReloader::new())
+            .unwrap()
+            .with_telemetry(probe.telemetry("apm", "datadog_trace_in", "listener"))
+            .with_handshake_timeout(Duration::from_millis(100));
+        input.bind().await.unwrap();
+        let addr = input.local_addr().unwrap().to_string();
+        let (sink, _rx) = channel_sink();
+        let _running = logit_pipeline::test_util::spawn_input(input, sink).await;
+
+        let mut silent = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        logit_pipeline::test_util::expect_closed(&mut silent, "a silent TLS connection").await;
+        probe
+            .wait_for("the handshake_timeout close count", |t| {
+                t.sum("logit.input.connections.closed", &[("reason", "handshake_timeout")]) == 1.0
             })
             .await;
     }

@@ -1086,37 +1086,15 @@ impl Input for PrometheusReceiver {
                         // No first-byte peek on this arm: `acceptor.accept` already waits on this
                         // connection's first bytes under the same budget.
                         Some(acceptor) => {
-                            match tokio::time::timeout(handshake_timeout, acceptor.accept(stream))
+                            crate::listener::accept_tls(acceptor, stream, handshake_timeout, peer)
                                 .await
-                            {
-                                Ok(Ok(tls_stream)) => Prelude::Tls(Box::new(tls_stream), peer),
-                                Ok(Err(err)) => {
-                                    Prelude::Failed(format!("TLS handshake failed: {err}"))
-                                }
-                                Err(_elapsed) => Prelude::HandshakeTimeout,
-                            }
                         }
                         // The plaintext arm's budget. `peek` is `recv(..., MSG_PEEK)`: it
                         // consumes nothing, so the auto builder's `ReadVersion` sniff still sees a
                         // pristine stream. A clean close or a reset before the first byte is a TCP
                         // health check, not a fault, as in `otlp_in` and `crate::tcp`.
                         None => {
-                            let first_byte =
-                                tokio::time::timeout(handshake_timeout, stream.peek(&mut [0u8; 1]))
-                                    .await;
-                            match first_byte {
-                                Ok(Ok(0)) => Prelude::Probe,
-                                Ok(Err(err))
-                                    if err.kind() == std::io::ErrorKind::ConnectionReset =>
-                                {
-                                    Prelude::Probe
-                                }
-                                Ok(Ok(_)) => Prelude::Plain(stream, peer),
-                                Ok(Err(err)) => Prelude::Failed(format!(
-                                    "waiting for a first byte failed: {err}"
-                                )),
-                                Err(_elapsed) => Prelude::HandshakeTimeout,
-                            }
+                            crate::listener::peek_first_byte(stream, handshake_timeout, peer).await
                         }
                     }
                 };
@@ -3823,6 +3801,33 @@ mod tests {
         assert_eq!(probe.sum("logit.input.writes", &[("class", "ok")]), 1.0);
         assert_eq!(probe.sum("logit.input.writes", &[("class", "busy")]), 0.0);
         assert_eq!(probe.sum("logit.input.batches.deferred", &[]), 0.0);
+    }
+
+    /// A client that sends no ClientHello is closed at the handshake timeout and counted
+    /// `handshake_timeout`.
+    #[tokio::test]
+    async fn a_silent_tls_connection_is_counted_a_handshake_timeout() {
+        let receiver = PrometheusReceiver::new("127.0.0.1:0", "/api/v1/write")
+            .with_bind_tls(
+                &TlsServerSettings {
+                    cert_file: "server.pem".to_string(),
+                    key_file: "server.key".to_string(),
+                    client_ca_file: None,
+                },
+                &testdata_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
+            )
+            .expect("a well-formed bind_tls: block should build fine")
+            .with_handshake_timeout(Duration::from_millis(100));
+        let (addr, _running, _rx, mut probe) = shutdown_receiver(receiver).await;
+
+        let mut silent = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        logit_pipeline::test_util::expect_closed(&mut silent, "a silent TLS connection").await;
+        probe
+            .wait_for("the handshake_timeout close count", |t| {
+                t.sum("logit.input.connections.closed", &[("reason", "handshake_timeout")]) == 1.0
+            })
+            .await;
     }
 
     /// A connection still in its TLS accept when shutdown fires ends at once rather than at its
