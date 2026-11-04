@@ -18006,8 +18006,11 @@ def _span_run(tmp, name, requests_edit=None, sut_extra=(), gen_extra=(), timelin
     """A span relay's run directory that balances: from +5 to +300 each 5 s drain counts two
     requests of `SPAN_BATCH` spans from the generator's `tracer` into the SUT's `apm`, which
     sends them on, and two to the stand-in, which stores them, each span its own trace. With
-    `kill`, the SUT is killed over `SPAN_KILL`: its last drain before it goes unexported, and
-    `lost` of the spans it sent to its sink in that life never reach the stand-in.
+    `kill`, the SUT is killed over `SPAN_KILL`: its last drain before it goes unexported, which
+    leaves the stand-in holding that drain's spans beyond what the SUT counted. `lost` whole
+    requests (`SPAN_BATCH` spans each, the most recent ones the SUT counted) never reach the
+    stand-in, though the SUT counted them sent: the queue a kill discards. The unexported drain
+    is two requests, so `lost` must exceed two for a positive gap.
     `requests_edit(requests)` returns the stand-in record's request lines to write."""
     lives = [(0, 0, SPAN_KILL[0]), (1, SPAN_KILL[1], 300)] if kill else [(0, 0, 300)]
     gen, sut, requests = [], [], []
@@ -18029,9 +18032,8 @@ def _span_run(tmp, name, requests_edit=None, sut_extra=(), gen_extra=(), timelin
                    for i in range(SPAN_BATCH)]
             span += SPAN_BATCH
             requests.append(_trace_request(len(requests) + 1, offset - 3 + index, ids))
-        if kill and life[0] == 0 and offset == SPAN_KILL[0] and lost:
-            dropped = requests.pop()
-            del dropped
+        if kill and life[0] == 0 and offset == SPAN_KILL[0] - 5 and lost:
+            del requests[len(requests) - lost:]
         if unexported:
             continue
         sut += [_line(stamp, "logit.process.uptime", "gauge", float(offset - life[1]))]
@@ -18184,12 +18186,22 @@ def _span_ledger():
                    and "uncounted loss of 10 span(s)" in broken["ledger.egress"].detail,
                    f"{name} FAILs egress, got {broken['ledger.egress']}")
 
-        # A kill whose queue held a request's spans: life 0's gap reported, life 1 exact.
-        killed = rows("span-kill", kill=True, lost=1)
+        # A kill whose queue held three requests the SUT counted sent: life 0's positive gap is
+        # reported, not FAILed, and life 1 is exact.
+        killed = rows("span-kill", kill=True, lost=3)
         expect(killed["ledger.egress"].status == checks.PASS
-               and "reported: a kill discards the sink's queue" in killed["ledger.egress"].detail
+               and "= 10, sink drops 0 (none), reported: a kill discards the sink's queue"
+               in killed["ledger.egress"].detail
                and "life 1 (final): W − X 480 − V 480 = 0" in killed["ledger.egress"].detail,
                f"a killed life's gap is reported, got {killed['ledger.egress']}")
+        # The kill's own last drain goes unexported while its spans reach the stand-in: a
+        # surplus over the life's counts, reported the same way.
+        unexported = rows("span-kill-unexported", kill=True)
+        expect(unexported["ledger.egress"].status == checks.PASS
+               and "reported: a kill discards the sink's queue"
+               in unexported["ledger.egress"].detail,
+               f"a killed life's unexported last drain is reported, got "
+               f"{unexported['ledger.egress']}")
 
 
 def run(root, quiet=False):

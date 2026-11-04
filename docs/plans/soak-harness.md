@@ -2056,7 +2056,7 @@ VictoriaMetrics, so every row of a sink's response-class table
 ```toml
 [target]
 kind = "standin"          # name defaults to "standin"
-shape = "remote_write"    # or "datadog" (W9b), "influxdb" (W16), "otlp" or "splunk" (W29)
+shape = "remote_write"    # or "datadog" (W9b), "influxdb" (W16), "otlp" or "splunk" (W29), or "datadog_trace" (W36)
 
 [[ledger.sink]]           # one sink, with no backend or vm_selector
 id = "remote_write"

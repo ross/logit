@@ -281,7 +281,7 @@ Its expectations assert that no record is dropped, a rebalance after the kill an
 the pause, a fenced commit in the pause, and each partition's lag back at 0 after every
 step.
 
-Eleven scenarios run a sink against a scripted stand-in in place of VictoriaMetrics (see
+Twelve scenarios run a sink against a scripted stand-in in place of VictoriaMetrics (see
 [Stand-in targets](#stand-in-targets)):
 
 | Scenario | Length | What it drives |
@@ -909,7 +909,7 @@ can go in a `[random]` schedule, and neither can a `prlimit`, a `cgroup`, or a `
 whose `nofile`, `cpu`, `memory_high`, io keys, `address`, `mode`, and `connections` a template
 can't set. A `respond` or a `stop` of
 a stand-in may name the `class` the sink must read its answers as (`clean`, `ambiguous`,
-`rejected`, or `refused`), which `ledger.standin` judges. Under the `datadog`, `influxdb`,
+`rejected`, or `refused`), which `ledger.standin` judges. Under the `datadog`, `datadog_trace`, `influxdb`,
 `otlp`, and `splunk` shapes every `respond` other than a `2xx` must name one, because its class
 is the only statement of what the sink should do with the answer, and a `2xx` takes none. Two
 `splunk` answers take the opposite rule: an `invalid_event` takes no class, because the sink
