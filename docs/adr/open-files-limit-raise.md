@@ -27,17 +27,18 @@ every Go program since Go 1.19, for the same reason.
 
 - If the soft limit is already at the hard limit, or is unlimited, nothing changes and nothing is
   logged.
-- If the hard limit is `RLIM_INFINITY`, the target is the kernel's `/proc/sys/fs/nr_open`, because
-  `setrlimit` fails with `EPERM` for a soft limit above it. If that file can't be read, the soft
-  limit stays and the failure is logged.
+- Linux caps the hard limit at `fs.nr_open`, so a process never holds an unlimited hard limit and
+  the target is always finite. An unlimited one, which can't occur, gets no raise.
 - A raise logs one `info` line with the old and new soft limits. A failure logs one `warn` line and
   startup continues; the raise never fails the start.
 - There is no config field to turn it off.
 - `logit validate`, `graph`, and `schema` don't raise it: the limit belongs to the process, not to
   the config.
 - Linux only, like the startup warning, which reads `/proc/self/limits` after the raise. The
-  warning stays and now means the hard limit is too low; its text points at systemd's
-  `LimitNOFILE=` and `docker run --ulimit nofile=`.
+  warning stays. It reads the soft and hard limits after the raise: a soft limit at the hard limit
+  means the hard limit is too low, and its text points at systemd's `LimitNOFILE=` and `docker run
+  --ulimit nofile=`. A soft limit below the hard limit means the raise failed, and the text points
+  at the `warn` line that logged the failure.
 
 ## Alternatives considered
 - **Warn only, as before.** Rejected: the warning fired on every default deployment, so it carried

@@ -203,9 +203,11 @@ pub async fn run_pipelines(
             tracing::warn!(target: "logit", "could not raise the open-files soft limit: {reason}");
         }
     }
-    if let Some(warning) =
-        fd_limit_warning(listener_connection_budget(&graph), logit_inputs::open_files_limit())
-    {
+    if let Some(warning) = fd_limit_warning(
+        listener_connection_budget(&graph),
+        logit_inputs::open_files_limit(),
+        crate::fdlimit::hard_limit(),
+    ) {
         tracing::warn!(target: "logit", "{warning}");
     }
 
@@ -332,16 +334,33 @@ fn listener_connection_budget(graph: &graph::Graph) -> usize {
 
 /// The startup warning for a connection budget the process's soft open-files limit can't cover,
 /// or `None` when it can or the limit is unknown or unlimited. At the limit already warns: the
-/// process holds other descriptors besides connections. It runs after the soft limit was raised to
-/// the hard limit, so it fires only when the hard limit is the one that's too low.
-fn fd_limit_warning(budget: usize, soft_limit: Option<u64>) -> Option<String> {
+/// process holds other descriptors besides connections.
+///
+/// It runs after the raise to the hard limit, so it names the hard limit as the one to raise only
+/// when the soft limit is at it. A soft limit below the hard limit means the raise failed, and the
+/// text points at the failure logged above it. `hard_limit` is `None` when unlimited.
+fn fd_limit_warning(
+    budget: usize,
+    soft_limit: Option<u64>,
+    hard_limit: Option<u64>,
+) -> Option<String> {
     let limit = soft_limit?;
     (budget as u64 >= limit).then(|| {
+        let cause = if hard_limit == Some(limit) {
+            "the soft limit is already at the hard limit, so raise the hard limit (systemd's \
+             LimitNOFILE=, docker run --ulimit nofile=)"
+                .to_owned()
+        } else {
+            let hard = hard_limit.map_or_else(|| "unlimited".to_owned(), |hard| hard.to_string());
+            format!(
+                "the soft limit is below the hard limit {hard} because the raise failed (see the \
+                 warning above), so fix that"
+            )
+        };
         format!(
             "listeners' max_connections total {budget} is at or above the process's open-files \
-             limit {limit}: the caps can't bind before file descriptors run out; the soft limit is \
-             already at the hard limit, so raise the hard limit (systemd's LimitNOFILE=, docker \
-             run --ulimit nofile=) or lower the caps"
+             limit {limit}: the caps can't bind before file descriptors run out; {cause} or \
+             lower the caps"
         )
     })
 }
@@ -4994,9 +5013,9 @@ mod tests {
 
     #[test]
     fn fd_limit_warning_fires_at_and_above_the_limit_only() {
-        assert_eq!(fd_limit_warning(1023, Some(1024)), None);
-        assert_eq!(fd_limit_warning(4096, None), None, "unknown or unlimited never warns");
-        let at = fd_limit_warning(1024, Some(1024)).expect("at the limit warns");
+        assert_eq!(fd_limit_warning(1023, Some(1024), Some(1024)), None);
+        assert_eq!(fd_limit_warning(4096, None, None), None, "unknown or unlimited never warns");
+        let at = fd_limit_warning(1024, Some(1024), Some(1024)).expect("at the limit warns");
         assert_eq!(
             at,
             "listeners' max_connections total 1024 is at or above the process's open-files limit \
@@ -5004,7 +5023,22 @@ mod tests {
              at the hard limit, so raise the hard limit (systemd's LimitNOFILE=, docker run \
              --ulimit nofile=) or lower the caps"
         );
-        assert!(fd_limit_warning(2048, Some(1024)).is_some(), "above the limit warns");
+        assert!(fd_limit_warning(2048, Some(1024), Some(1024)).is_some(), "above the limit warns");
+    }
+
+    #[test]
+    fn fd_limit_warning_blames_the_failed_raise_below_the_hard_limit() {
+        let failed =
+            fd_limit_warning(2048, Some(1024), Some(524_288)).expect("below the hard limit warns");
+        assert_eq!(
+            failed,
+            "listeners' max_connections total 2048 is at or above the process's open-files limit \
+             1024: the caps can't bind before file descriptors run out; the soft limit is below \
+             the hard limit 524288 because the raise failed (see the warning above), so fix that \
+             or lower the caps"
+        );
+        let unlimited = fd_limit_warning(2048, Some(1024), None).expect("warns");
+        assert!(unlimited.contains("hard limit unlimited"), "{unlimited}");
     }
 
     // ---- `max_connections` reaches each kind of stream listener ---------------------------------

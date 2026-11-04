@@ -3,7 +3,7 @@
 //!
 //! Every stream listener defaults to `max_connections: 1024`, the same number as a stock systemd
 //! service's soft limit, so the cap would not bind before descriptors ran out. Linux only; the
-//! startup warning in `pipeline.rs` reads the same limit from `/proc/self/limits` after this runs.
+//! startup warning in `pipeline.rs` reads the limits after this runs.
 
 /// What the raise did, for the caller to log once its self-log layer is active.
 #[derive(Debug, PartialEq)]
@@ -18,12 +18,24 @@ pub enum Raise {
 
 /// The soft limit to set, or `None` to leave it. `None` in a limit is `RLIM_INFINITY`.
 ///
-/// An infinite hard limit is capped at `nr_open`, the kernel's per-process descriptor ceiling,
-/// because `setrlimit` fails with `EPERM` for a soft limit above it.
-fn target_soft(soft: Option<u64>, hard: Option<u64>, nr_open: Option<u64>) -> Option<u64> {
-    let current = soft?;
-    let target = hard.or(nr_open)?;
+/// Linux caps the hard `RLIMIT_NOFILE` at `fs.nr_open` (`setrlimit` and `prlimit` fail with `EPERM`
+/// for a larger hard limit), so the hard limit is always a finite target. An infinite one can't
+/// occur; it gets no raise.
+fn target_soft(soft: Option<u64>, hard: Option<u64>) -> Option<u64> {
+    let (current, target) = (soft?, hard?);
     (current < target).then_some(target)
+}
+
+/// The hard `RLIMIT_NOFILE`, or `None` when it is unlimited or the platform has no such limit.
+#[cfg(target_os = "linux")]
+pub fn hard_limit() -> Option<u64> {
+    rustix::process::getrlimit(rustix::process::Resource::Nofile).maximum
+}
+
+/// Non-Linux twin of [`hard_limit`].
+#[cfg(not(target_os = "linux"))]
+pub fn hard_limit() -> Option<u64> {
+    None
 }
 
 /// Raises the soft `RLIMIT_NOFILE` to the hard limit, never failing the caller.
@@ -32,17 +44,7 @@ pub fn raise_soft_limit() -> Raise {
     use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
 
     let Rlimit { current: soft, maximum: hard } = getrlimit(Resource::Nofile);
-    let nr_open = std::fs::read_to_string("/proc/sys/fs/nr_open")
-        .ok()
-        .and_then(|text| text.trim().parse::<u64>().ok());
-    if hard.is_none() && nr_open.is_none() {
-        return Raise::Failed(
-            "the hard open-files limit is unlimited and /proc/sys/fs/nr_open is unreadable, so \
-             there is no ceiling to raise the soft limit to"
-                .into(),
-        );
-    }
-    let (Some(from), Some(to)) = (soft, target_soft(soft, hard, nr_open)) else {
+    let (Some(from), Some(to)) = (soft, target_soft(soft, hard)) else {
         return Raise::Unchanged;
     };
     match setrlimit(Resource::Nofile, Rlimit { current: Some(to), maximum: hard }) {
@@ -63,29 +65,17 @@ mod tests {
 
     #[test]
     fn target_soft_raises_to_the_hard_limit() {
-        assert_eq!(target_soft(Some(1024), Some(524_288), Some(1_048_576)), Some(524_288));
-        assert_eq!(target_soft(Some(1024), Some(524_288), None), Some(524_288));
+        assert_eq!(target_soft(Some(1024), Some(524_288)), Some(524_288));
     }
 
     #[test]
     fn target_soft_leaves_a_soft_limit_already_at_the_hard_limit() {
-        assert_eq!(target_soft(Some(4096), Some(4096), Some(1_048_576)), None);
+        assert_eq!(target_soft(Some(4096), Some(4096)), None);
     }
 
     #[test]
-    fn target_soft_caps_an_unlimited_hard_limit_at_nr_open() {
-        assert_eq!(target_soft(Some(1024), None, Some(1_048_576)), Some(1_048_576));
-        assert_eq!(target_soft(Some(1_048_576), None, Some(1_048_576)), None);
-    }
-
-    #[test]
-    fn target_soft_leaves_the_limit_when_nr_open_is_unreadable() {
-        assert_eq!(target_soft(Some(1024), None, None), None);
-    }
-
-    #[test]
-    fn target_soft_leaves_an_unlimited_soft_limit() {
-        assert_eq!(target_soft(None, None, Some(1_048_576)), None);
+    fn target_soft_leaves_an_infinite_hard_limit() {
+        assert_eq!(target_soft(Some(1024), None), None);
     }
 
     /// Calls the real `setrlimit`. `RLIMIT_NOFILE` is process-wide and the test lowers it first, so

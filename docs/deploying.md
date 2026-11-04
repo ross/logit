@@ -744,9 +744,12 @@ counts here: that sink's `batches.dropped{reason="shutdown"}` and a UDP listener
 Outside the lifecycle events, `logit run` can log startup `warn` lines before `ready`:
 
 - The listeners' summed `max_connections` reaches the process's open-files limit (Linux only).
-  `logit run` has already raised the soft limit to the hard limit, so it means the hard limit is
-  too low. See ["`max_connections` on a stream listener"](#max_connections-on-a-stream-listener)
-  for its text and the fix.
+  `logit run` has already tried to raise the soft limit to the hard limit, so it means the hard
+  limit is too low, or that the raise failed (the next bullet). See
+  ["`max_connections` on a stream listener"](#max_connections-on-a-stream-listener) for its text
+  and the fix.
+- The soft open-files limit couldn't be raised to the hard limit (Linux only); the line gives the
+  reason. See ["`max_connections` on a stream listener"](#max_connections-on-a-stream-listener).
 - A listener reaches two or more sinks that use `overflow: block` with no `buffer.disk`. See
   [A slow or unreachable sink](#a-slow-or-unreachable-sink).
 - `internal` shares a node with a data path. See
@@ -1748,8 +1751,8 @@ the stock limit for a systemd service.
 
 So `logit run` first raises the soft limit to the hard limit, as the Go runtime does for every Go
 program. With the stock Docker and containerd limits (soft 1024, hard 524288) that is 524288, and a
-listener at its default never meets the soft limit. When the hard limit is unlimited, the soft limit
-goes to the kernel's `/proc/sys/fs/nr_open` instead. A raise logs one `info` line with the old and
+listener at its default never meets the soft limit. Linux caps the hard limit at `fs.nr_open`, so
+it is never unlimited. A raise logs one `info` line with the old and
 new soft limits; a failed raise logs one `warn` line and startup continues. The raise has no
 setting, and `logit validate` doesn't make it, because the limit belongs to the process rather than
 the config.
@@ -1761,8 +1764,11 @@ total is at or above the soft limit, logs a warning like this one, once:
 listeners' max_connections total 2048 is at or above the process's open-files limit 1024: the caps can't bind before file descriptors run out; the soft limit is already at the hard limit, so raise the hard limit (systemd's LimitNOFILE=, docker run --ulimit nofile=) or lower the caps
 ```
 
-The warning means the hard limit is too low. Raise it with systemd's `LimitNOFILE=` or
-`docker run --ulimit nofile=`, or lower the caps on listeners that don't need them. The check reads
+That text means the soft limit is at the hard limit, so the hard limit is too low. Raise it with
+systemd's `LimitNOFILE=` or `docker run --ulimit nofile=`, or lower the caps on listeners that
+don't need them. If the soft limit is below the hard limit, the text says the raise failed instead,
+and the `warn` line above it gives the reason (a seccomp filter that denies `setrlimit`, for
+example). The check reads
 `/proc/self/limits`, so it runs on Linux only. It's an ordinary `warn`-level self-log, so
 `internal`'s default `logs: warn` carries it into the pipeline too.
 
