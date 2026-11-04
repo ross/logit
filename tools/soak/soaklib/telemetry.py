@@ -11,6 +11,10 @@ A container stopped and started keeps one log, so its stdout spans several proce
 decreases, and each point belongs to the newest life that started at or before its timestamp.
 Counters are summed per life; gauges are series.
 
+A line with a `span` object is one of `internal`'s spans: its `timestamp` is the span's start,
+not a drain. `Telemetry.spans` keeps each one's ids and its component, for the rows that join
+spans across a native hop; its `life` is the newest life that started at or before it.
+
 An hours-long run holds hundreds of thousands of points, and the checks query them thousands of
 times, so `Telemetry` indexes points by name and caches each (name, attributes) selection in
 timestamp order; `counter_in` bisects it. Points sharing a line share one attributes dict, and
@@ -59,9 +63,21 @@ class Point:
     life: int = 0
 
 
+@dataclass(slots=True)
+class Span:
+    ts: float
+    component: str
+    name: str
+    trace_id: str
+    span_id: str
+    parent_span_id: object  # str, or None for a root
+    life: int = 0
+
+
 @dataclass
 class Telemetry:
     points: list = field(default_factory=list)
+    spans: list = field(default_factory=list)
     bad_lines: int = 0
     # Epoch seconds each process life started (its first uptime point's timestamp minus uptime).
     life_starts: list = field(default_factory=list)
@@ -169,6 +185,17 @@ def parse_ndjson(lines):
             attributes = interned.setdefault(tuple(sorted(attributes.items())), attributes)
         except TypeError:
             pass  # an unhashable value: keep this line's own dict
+        span = event.get("span")
+        if isinstance(span, dict) and span.get("span_id"):
+            telemetry.spans.append(Span(
+                ts=ts,
+                component=str(attributes.get("component", "")) if isinstance(attributes, dict)
+                else "",
+                name=str(span.get("name", "")),
+                trace_id=str(span.get("trace_id", "")),
+                span_id=str(span.get("span_id")),
+                parent_span_id=span.get("parent_span_id") or None,
+            ))
         for metric in event.get("metrics") or []:
             telemetry.points.append(Point(
                 ts=ts,
@@ -213,8 +240,8 @@ def assign_lives(telemetry):
     # `ts - uptime` by the uptime's rounding.
     shifted = [start - 1.0 for start in starts]
     ordered = all(a <= b for a, b in zip(shifted, shifted[1:]))
-    for point in telemetry.points:
-        if point.ts in life_of_drain:
+    for point in [*telemetry.points, *telemetry.spans]:
+        if isinstance(point, Point) and point.ts in life_of_drain:
             point.life = life_of_drain[point.ts]
         elif ordered:
             point.life = max(0, bisect.bisect_right(shifted, point.ts) - 1)

@@ -94,7 +94,7 @@ STANDIN_ROLES = {"standin": STANDIN_ROLE}
 # ACTIONS.
 ACTION_NAMES = ("netem", "pause", "stop", "kill", "restart", "partition", "reset", "prlimit",
                 "cgroup", "slowclient", "mark", "exit", "respond", "signal", "rename", "rotate",
-                "probe", "copytruncate", "gzip", "replace")
+                "trust", "probe", "copytruncate", "gzip", "replace")
 # The actions that take `port`: a `probe`, which needs the listener's, and a `reset`, which
 # closes only the connections whose local or remote port it is, and every one without it.
 PORT_ACTIONS = ("probe", "reset")
@@ -149,12 +149,15 @@ CGROUP_MIN_IO_WIOPS = 1
 CGROUP_MAX_IO_WIOPS = 1000000
 _MEMORY_UNITS = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}
 # A `slowclient` step's keys (slowclient.py): `address`, the `host:port` it dials; `mode`, one of
-# `SLOWCLIENT_MODES`; `connections`, how many it holds, up to `SLOWCLIENT_MAX_CONNECTIONS`;
-# `interval`, its tick, from `SLOWCLIENT_MIN_INTERVAL_S` to `SLOWCLIENT_MAX_INTERVAL_S`, by
-# default `SLOWCLIENT_INTERVAL_S`; and `send`, what it sends, one of `SLOWCLIENT_SENDS`, by
-# default `lf`. A `silent` client sends nothing, so it takes no `send`.
+# `SLOWCLIENT_MODES`; `connections`, how many it holds, up to `SLOWCLIENT_MAX_CONNECTIONS`, or
+# under `churn` how many it dials each tick; `interval`, its tick, from
+# `SLOWCLIENT_MIN_INTERVAL_S` to `SLOWCLIENT_MAX_INTERVAL_S`, by default
+# `SLOWCLIENT_INTERVAL_S`; and `send`, what it sends, one of `SLOWCLIENT_SENDS`, by default
+# `lf`.
 SLOWCLIENT_KEYS = ("address", "mode", "connections", "interval", "send")
-SLOWCLIENT_MODES = ("silent", "trickle", "half_open")
+SLOWCLIENT_MODES = ("silent", "trickle", "half_open", "churn")
+# The modes that send nothing, so take no `send`: a `churn` client sends only a FIN.
+SLOWCLIENT_QUIET_MODES = ("silent", "churn")
 SLOWCLIENT_SENDS = ("lf", "http_head", "http_body")
 SLOWCLIENT_DEFAULT_SEND = "lf"
 SLOWCLIENT_MAX_CONNECTIONS = 1024
@@ -179,13 +182,14 @@ EXPECTED_EVENT_ACTIONS = ("mark", "exit")
 FILE_ACTIONS = ("copytruncate", "gzip", "replace")
 # Actions that open no fault window: a `signal` sends a `logit` service a signal it handles
 # while it runs, a `rename` moves a file aside in the run's shared directory, a `rotate` issues
-# a certificate into the run's TLS directory, a `probe` handshakes with a listener, and a
-# `FILE_ACTIONS` step rotates a file wire's files, so none excuses anything a check judges
-# (checks.py's `RunData.events`); `ledger.wire` accounts for a `copytruncate`'s lines from its
-# record instead. A `signal` or a `probe` may start inside a `rename` or a `rotate` on its own
-# service (`HOLDING_ACTIONS`), and no other step may overlap one of these on its service.
-NO_WINDOW_ACTIONS = ("signal", "rename", "rotate", "probe") + FILE_ACTIONS
-HOLDING_ACTIONS = ("rename", "rotate")
+# a certificate into the run's TLS directory, a `trust` swaps the trust bundle there, a `probe`
+# handshakes with a listener, and a `FILE_ACTIONS` step rotates a file wire's files, so none
+# excuses anything a check judges (checks.py's `RunData.events`); `ledger.wire` accounts for a
+# `copytruncate`'s lines from its record instead. A `signal` or a `probe` may start inside a
+# `rename`, a `rotate`, or a `trust` on its own service (`HOLDING_ACTIONS`), and no other step
+# may overlap one of these on its service.
+NO_WINDOW_ACTIONS = ("signal", "rename", "rotate", "trust", "probe") + FILE_ACTIONS
+HOLDING_ACTIONS = ("rename", "rotate", "trust")
 HELD_ACTIONS = ("signal", "probe")
 # The signals a `signal` step may send: SIGHUP, which a `logit` process answers by reopening
 # its file targets and by reloading its TLS material (docs/adr/signal-handling.md).
@@ -198,6 +202,12 @@ SHARED_MOUNT = "/shared"
 # issued for. Its files are `<TLS_MOUNT>/<name>/live/cert.pem` and `key.pem`, and the CA is
 # `<TLS_MOUNT>/ca.pem`. The first issue is valid for `TLS_INITIAL_DAYS`, and each `rotate` of a
 # certificate names more days than the one before it, so its `notAfter` rises.
+#
+# The run's CAs are numbered from 1, the one the driver makes first, `<TLS_MOUNT>/ca.pem`. A
+# `trust` step's `cas` lists the CA generations its trust bundle holds, ascending, making each
+# new one in turn, and points `<TLS_MOUNT>/trust/live/ca.pem`, which starts as CA 1 alone, at
+# that bundle; a `rotate`'s `ca` names the CA that signs its certificate, 1 by default. A probe
+# presents a client certificate from the newest CA in the bundle in force.
 TLS_DIR = "tls"
 TLS_DIR_ENV = "SOAK_TLS_DIR"
 TLS_MOUNT = "/tls"
@@ -205,6 +215,7 @@ TLS_KEYS = {"cert"}
 TLS_CERT_KEYS = {"san", "usage"}
 TLS_USAGES = ("server", "client")
 TLS_INITIAL_DAYS = 30
+TLS_TRUST_LIVE = f"{TLS_MOUNT}/trust/live/"
 # A config's top-level `tls_reload_interval`, and a zero duration, which turns the poll off.
 _TLS_RELOAD_INTERVAL = re.compile(r"^tls_reload_interval\s*:\s*[\"']?([^\"'\s]+)", re.M)
 _ZERO_DURATION = re.compile(r"^0+(\.0+)?(ns|us|ms|s|m|h)?$")
@@ -288,7 +299,8 @@ _TARGET_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 PRIVATE_ENV_PREFIX = "soak-env-"
 STEP_KEYS = {"at", "action", "on", "args", "for", "ready", "code", "key", "class", "signal",
-             "path", "to", "cert", "days", "broken", "port", "nofile", "engaged", "io_path",
+             "path", "to", "cert", "days", "broken", "ca", "cas", "port", "nofile", "engaged",
+             "io_path",
              *CGROUP_KEYS, *SLOWCLIENT_KEYS, *RESPOND_KEYS}
 RANDOM_KEYS = {"seed", "gap", "fault"}
 RANDOM_FAULT_KEYS = {"weight", "action", "on", "args", "for"}
@@ -403,10 +415,17 @@ LISTENER_MODES = {
     "prometheus_in": (("bind", "http"), ("scrape_targets", "scrape")),
 }
 # `[overlap]`: two or more SUT services, `instances`, each running the whole pipeline on one
-# shared UDP port under `reuse_port`, in the network namespace of the `holder` service, each
-# stamping its own name as the attribute `label` on every event ahead of `aggregate`, so V splits
-# by instance (docs/plans/soak-harness.md's "Rolling overlap (W12b)").
+# shared UDP or TCP port under `reuse_port`, in the network namespace of the `holder` service,
+# each stamping its own name as the attribute `label` on every event ahead of `aggregate`, so V
+# splits by instance (docs/plans/soak-harness.md's "Rolling overlap (W12b)").
 OVERLAP_KEYS = {"holder", "instances", "label"}
+# The wires an overlap's sources may use, and the sysctl a `tcp` one's holder sets in the compose
+# override, `0` or `1`: whether the kernel moves the connections in a closing listener's accept
+# queue to another listener of the port, which `overlap.migrate` reads its churn client against
+# (docs/plans/soak-harness.md's "A TCP rolling overlap (W37)").
+OVERLAP_WIRES = (DEFAULT_WIRE, "tcp")
+MIGRATE_SYSCTL = "net.ipv4.tcp_migrate_req"
+MIGRATE_VALUES = ("0", "1")
 # A Prometheus label name, which the label becomes on the backend.
 _LABEL_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # The actions allowed on a namespace holder, and refused on a service in its namespace (an
@@ -609,11 +628,13 @@ class StepSpec:
     signal: object = None
     path: object = None
     to: object = None
-    # A `rotate`'s certificate, days, and whether it's issued broken; a `probe`'s certificate
-    # and port.
+    # A `rotate`'s certificate, days, whether it's issued broken, and the CA generation that
+    # signs it; a `trust`'s CA generations; a `probe`'s certificate and port.
     cert: object = None
     days: object = None
     broken: object = None
+    ca: object = None
+    cas: object = None
     port: object = None
     # A `prlimit`'s open-files limit.
     nofile: object = None
@@ -642,7 +663,8 @@ STEP_FIELDS = (("ready", "ready"), ("code", "code"), ("key", "key"), ("status", 
                ("invalid_event", "invalid_event"), ("withhold_acks", "withhold_acks"),
                ("fault_class", "class"),
                ("signal", "signal"), ("path", "path"), ("to", "to"), ("cert", "cert"),
-               ("days", "days"), ("broken", "broken"), ("port", "port"), ("nofile", "nofile"),
+               ("days", "days"), ("broken", "broken"), ("ca", "ca"), ("cas", "cas"),
+               ("port", "port"), ("nofile", "nofile"),
                ("cpu", "cpu"), ("memory_high", "memory_high"), ("io_wbps", "io_wbps"),
                ("io_wiops", "io_wiops"), ("io_path", "io_path"), ("engaged", "engaged"),
                ("address", "address"), ("mode", "mode"), ("connections", "connections"),
@@ -716,6 +738,8 @@ class Step:
     cert: object = None
     days: object = None
     broken: object = None
+    ca: object = None
+    cas: object = None
     port: object = None
     nofile: object = None
     cpu: object = None
@@ -1145,6 +1169,9 @@ def from_dict(raw, path):
             if isinstance(configs, dict):
                 problems += _overlap_problems(overlap, ledger, configs, extra_suts,
                                               path.parent)
+            problems += _migrate_problems(
+                overlap, ledger, override.read_text() if override is not None
+                and override.is_file() else None)
         if overlap is not None and ledger.get("split") == TARGET_SPLIT:
             problems.append("[overlap] can't be combined with split = \"target\"")
 
@@ -1170,6 +1197,7 @@ def from_dict(raw, path):
             withhold_acks=raw_step.get("withhold_acks"),
             signal=raw_step.get("signal"), path=raw_step.get("path"), to=raw_step.get("to"),
             cert=raw_step.get("cert"), days=raw_step.get("days"), broken=raw_step.get("broken"),
+            ca=raw_step.get("ca"), cas=raw_step.get("cas"),
             port=raw_step.get("port"), nofile=raw_step.get("nofile"),
             cpu=raw_step.get("cpu"), memory_high=raw_step.get("memory_high"),
             io_wbps=raw_step.get("io_wbps"), io_wiops=raw_step.get("io_wiops"),
@@ -2570,8 +2598,8 @@ def _uncommented(text):
 
 def _overlap_problems(overlap, ledger, configs, extra_suts, directory):
     """What `[overlap]` breaks against the ledger and the configs. No `[[ledger.hop]]`, since
-    every instance runs the whole pipeline; every source on a `udp` wire, the one the ledger
-    judges an overlap on; a `[configs]` key other than `sut` and the generators only for an
+    every instance runs the whole pipeline; every source on a `udp` or `tcp` wire, the ones the
+    ledger judges an overlap on; a `[configs]` key other than `sut` and the generators only for an
     instance, which then runs its own config, else `sut`'s. Each instance's config sets
     `reuse_port: true` on every source's listener, a `shutdown.delay` above 0 that with the drain
     fits `docker stop`'s timeout, and `admin.socket` with no `admin.bind`, whose port the
@@ -2594,9 +2622,10 @@ def _overlap_problems(overlap, ledger, configs, extra_suts, directory):
                             f"{service!r} isn't one of overlap.instances after {SUT_SERVICE}")
     sources = ledger.get("source") if isinstance(ledger.get("source"), list) else []
     for index, source in enumerate(sources):
-        if isinstance(source, dict) and source.get("wire", DEFAULT_WIRE) != DEFAULT_WIRE:
-            problems.append(f"ledger.source {index + 1}: under [overlap] a source's wire is udp, "
-                            "the one whose loss at an instance's close ledger.overlap bounds")
+        if isinstance(source, dict) and source.get("wire", DEFAULT_WIRE) not in OVERLAP_WIRES:
+            problems.append(f"ledger.source {index + 1}: under [overlap] a source's wire is udp "
+                            "or tcp, those whose loss at an instance's close ledger.overlap "
+                            "bounds")
     texts = {}
     for instance in instances:
         name = configs.get(instance if instance in extra_suts else SUT_CONFIG_KEY)
@@ -2650,6 +2679,29 @@ def _overlap_problems(overlap, ledger, configs, extra_suts, directory):
             problems.append(f"overlap: {name} and {first_name} differ in more than the lines "
                             f"setting {label!r}; overlap instances run the same config")
     return problems
+
+
+def _migrate_problems(overlap, ledger, override_text):
+    """Under `[overlap]` with a source on a `tcp` wire, the holder's `MIGRATE_SYSCTL` set in the
+    compose override to `0` or `1`, which `overlap` then carries as `migrate_req`: the
+    namespace's default is 0 whatever the host's, and the row that reads a churn client's
+    resets against it needs it written down. Under a `udp` wire alone, no such sysctl, which
+    nothing reads."""
+    sources = ledger.get("source") if isinstance(ledger.get("source"), list) else []
+    tcp = any(isinstance(source, dict) and source.get("wire") == "tcp" for source in sources)
+    holder = overlap.get("holder")
+    value = compose_sysctls(override_text or "").get(holder, {}).get(MIGRATE_SYSCTL)
+    if not tcp:
+        if value is not None:
+            return [f"overlap: {holder} sets {MIGRATE_SYSCTL}, which only a tcp source's "
+                    "accept queue reads"]
+        return []
+    if value not in MIGRATE_VALUES:
+        return [f"overlap: under a tcp source the compose override sets {MIGRATE_SYSCTL} on "
+                f"{holder} to 0 or 1 (`sysctls:`), so a run states whether a closing "
+                f"instance's accept queue moves; got {value!r}"]
+    overlap["migrate_req"] = int(value)
+    return []
 
 
 def _overlap_step_problems(scenario):
@@ -3197,9 +3249,9 @@ def validate(scenario, duration=None, seed=None):
 
 
 def slowclient_send(step):
-    """What a `slowclient` step's client sends: `none` under `silent`, else its `send` or
-    `SLOWCLIENT_DEFAULT_SEND`."""
-    if step.mode == "silent":
+    """What a `slowclient` step's client sends: `none` under `silent` and `churn`, else its
+    `send` or `SLOWCLIENT_DEFAULT_SEND`."""
+    if step.mode in SLOWCLIENT_QUIET_MODES:
         return "none"
     return step.send if step.send is not None else SLOWCLIENT_DEFAULT_SEND
 
@@ -3208,7 +3260,8 @@ def _slowclient_problems(spec, where):
     """What a step breaks of the `slowclient` rules: `address` a `host:port` with a port from 1
     to 65535, `mode` one of `SLOWCLIENT_MODES`, and `connections` a whole number from 1 to
     `SLOWCLIENT_MAX_CONNECTIONS`, each required; `interval` from `SLOWCLIENT_MIN_INTERVAL_S` to
-    `SLOWCLIENT_MAX_INTERVAL_S`; `send` one of `SLOWCLIENT_SENDS`, refused under `silent`; and
+    `SLOWCLIENT_MAX_INTERVAL_S`; `send` one of `SLOWCLIENT_SENDS`, refused under `silent` and
+    `churn`; and
     every key refused on another action."""
     given = [key for key in SLOWCLIENT_KEYS if getattr(spec, key) is not None]
     if spec.action != "slowclient":
@@ -3237,8 +3290,9 @@ def _slowclient_problems(spec, where):
                         f"{format_duration(SLOWCLIENT_MIN_INTERVAL_S)} to "
                         f"{format_duration(SLOWCLIENT_MAX_INTERVAL_S)}, got "
                         f"{format_duration(spec.interval)}")
-    if spec.send is not None and spec.mode == "silent":
-        problems.append(f"{where}: a silent slowclient sends nothing, so it takes no `send`")
+    if spec.send is not None and spec.mode in SLOWCLIENT_QUIET_MODES:
+        problems.append(f"{where}: a {spec.mode} slowclient sends nothing, so it takes no "
+                        "`send`")
     elif spec.send is not None and spec.send not in SLOWCLIENT_SENDS:
         problems.append(f"{where}: `send` must be one of {', '.join(SLOWCLIENT_SENDS)}, got "
                         f"{spec.send!r}")
@@ -3667,6 +3721,25 @@ def _tls_step_problems(spec, where, tls):
                             f"{certs[spec.cert]['usage']} one")
     elif spec.cert is not None:
         problems.append(f"{where}: `cert` is for rotate and probe only")
+    if spec.action == "trust":
+        if tls is None:
+            problems.append(f"{where}: trust needs a [tls] table, whose CA it adds to")
+        if spec.cas is None:
+            problems.append(f"{where}: trust needs `cas`, the CA generations its bundle holds")
+        elif (not isinstance(spec.cas, list) or not spec.cas
+              or not all(isinstance(ca, int) and not isinstance(ca, bool) and ca >= 1
+                         for ca in spec.cas)
+              or spec.cas != sorted(set(spec.cas))):
+            problems.append(f"{where}: `cas` must list CA generations, whole numbers from 1, "
+                            f"ascending with none repeated, got {spec.cas!r}")
+    elif spec.cas is not None:
+        problems.append(f"{where}: `cas` is for trust only")
+    if spec.action == "rotate" and spec.ca is not None:
+        if not isinstance(spec.ca, int) or isinstance(spec.ca, bool) or spec.ca < 1:
+            problems.append(f"{where}: `ca` must be a CA generation, a whole number from 1, got "
+                            f"{spec.ca!r}")
+    elif spec.ca is not None:
+        problems.append(f"{where}: `ca` is for rotate only")
     if spec.action == "rotate":
         if spec.days is None:
             problems.append(f"{where}: rotate needs `days`, the new certificate's validity")
@@ -3792,6 +3865,80 @@ def _rotate_problems(scenario, duration):
     if rotates:
         problems += _once_per_run(scenario, duration, "rotate",
                                   "a second cycle's rotation would name the same days")
+    return problems + _trust_problems(scenario, duration)
+
+
+def _valid_cas(spec):
+    return (isinstance(spec.cas, list) and spec.cas
+            and all(isinstance(ca, int) and not isinstance(ca, bool) for ca in spec.cas))
+
+
+def _trust_problems(scenario, duration):
+    """What the `trust` steps and a `rotate`'s `ca` break: each trust on a service whose config
+    reads `TLS_TRUST_LIVE`, holding a SIGHUP on that service inside its `for` or a start of it
+    before the next trust when the service doesn't poll its TLS files; its new CAs, those above
+    every earlier bundle's, the next generations in turn; each rotate's `ca` a CA of the bundle
+    in force at it, the latest trust before it, else CA 1 alone, so the certificate's peers
+    trust it; each trust holding the CA of every certificate's generation in force at it, the
+    latest rotate before it that wasn't broken, else the first issue, by CA 1, so dropping a CA
+    never strands a certificate its peers then refuse; and each trust once per run of
+    `duration`, since a second cycle's would repeat its CA generations."""
+    problems = []
+    trusts = sorted((s for s in scenario.steps if s.action == "trust"), key=lambda s: s.at)
+    rotates = sorted((s for s in scenario.steps if s.action == "rotate"), key=lambda s: s.at)
+    made = 1
+    for spec in trusts:
+        where = f"step {spec.index + 1} (trust on {spec.on or '?'})"
+        key = service_config_key(scenario, spec.on)
+        text = ""
+        if key is not None:
+            try:
+                text = _uncommented(scenario.config_path(key).read_text())
+            except OSError:
+                text = ""
+        if TLS_TRUST_LIVE not in text:
+            problems.append(f"{where}: {spec.on}'s config reads nothing under {TLS_TRUST_LIVE}, "
+                            "so the bundle reaches no process")
+        elif not tls_reload_polls(text):
+            following = [t.at for t in trusts if t.at > spec.at]
+            until = min(following) if following else scenario.cycle
+            hup = any(other.action == "signal" and other.on == spec.on and other.signal == "HUP"
+                      and spec.at < other.at < spec.at + spec.for_ for other in scenario.steps)
+            started = any(other.action in RESTART_ACTIONS and other.on == spec.on
+                          and spec.at < other.at < until for other in scenario.steps)
+            if not (hup or started):
+                problems.append(f"{where}: {spec.on} polls no TLS files (tls_reload_interval: "
+                                "0s), and nothing loads this bundle: add a signal = \"HUP\" "
+                                f"step on {spec.on} inside its `for`, or a restart of it before "
+                                "the next trust")
+        if not _valid_cas(spec):
+            continue
+        new = [ca for ca in spec.cas if ca > made]
+        if new != list(range(made + 1, made + 1 + len(new))):
+            problems.append(f"{where}: `cas` {spec.cas} makes CA {', '.join(map(str, new))}, "
+                            f"and the next CA generation is {made + 1}: make them in turn")
+        made = max(made, *spec.cas)
+        for cert in sorted(scenario.tls or {}):
+            live = [r for r in rotates if r.cert == cert and r.at < spec.at and not r.broken]
+            signer = live[-1].ca if live and isinstance(live[-1].ca, int) else 1
+            if signer not in spec.cas:
+                problems.append(f"{where}: `cas` {spec.cas} drops CA {signer}, which signs "
+                                f"{cert}'s generation in force; rotate {cert} to a CA the "
+                                "bundle keeps first")
+    for spec in rotates:
+        ca = 1 if spec.ca is None else spec.ca
+        if not isinstance(ca, int) or isinstance(ca, bool):
+            continue
+        before = [t for t in trusts if t.at < spec.at and _valid_cas(t)]
+        bundle = before[-1].cas if before else [1]
+        if ca not in bundle:
+            problems.append(f"step {spec.index + 1} (rotate on {spec.on or '?'}): `ca` "
+                            f"{ca} isn't in the trust bundle in force, {bundle}, so its "
+                            "peers would refuse the certificate; add it with a trust step "
+                            "first")
+    if trusts:
+        problems += _once_per_run(scenario, duration, "trust",
+                                  "a second cycle's bundle would repeat its CA generations")
     return problems
 
 
@@ -4201,7 +4348,8 @@ def expand(scenario, duration=None, seed=None):
                     after=spec.after, partial_success=spec.partial_success,
                     invalid_event=spec.invalid_event, withhold_acks=spec.withhold_acks,
                     signal=spec.signal, path=spec.path, to=spec.to, cert=spec.cert,
-                    days=spec.days, broken=spec.broken, port=spec.port, nofile=spec.nofile,
+                    days=spec.days, broken=spec.broken, ca=spec.ca, cas=spec.cas,
+                    port=spec.port, nofile=spec.nofile,
                     cpu=spec.cpu, memory_high=spec.memory_high, io_wbps=spec.io_wbps,
                     io_wiops=spec.io_wiops, io_path=spec.io_path, engaged=spec.engaged,
                     address=spec.address, mode=spec.mode, connections=spec.connections,

@@ -11,12 +11,18 @@ nothing from the harness for that reason.
 - `half_open` opens them, sends each its first byte, and waits until the peer has acknowledged
   every byte (`TIOCOUTQ` reads 0), then holds them. The apply then disconnects the container
   from its networks, so from then on no packet passes either way and no FIN or RST is sent.
+- `churn` dials `connections` new connections every `interval` without blocking, sends each
+  nothing but a FIN once its handshake completes, and reads it to the listener's close. One the
+  peer resets, or refuses, counts in `resets`: a TCP listener that closes with handshakes in
+  flight resets them unless the kernel moves them to another listener of the port
+  (`net.ipv4.tcp_migrate_req`), which is what `overlap.migrate` reads this count for. One with
+  no answer in `DIAL_TIMEOUT_S` counts in `timeouts`, and any other failure in `dial_errors`.
 
 `send` is what goes on the wire, a byte at a time (`SENDS`): `lf` is LF bytes, which a stream
 listener's LF framer skips with no frame counted; `http_head` is an HTTP/1.1 request head that
 never ends; `http_body` is a whole head declaring a `BODY_BYTES` body to `HTTP_TARGET`,
 `influxdb_in`'s write route, so the listener reads the body, sent at connect, then the body's
-LF bytes, which never reach its length. `silent` sends nothing and takes `none`.
+LF bytes, which never reach its length. `silent` and `churn` send nothing and take `none`.
 
 Under `silent` and `trickle` a connection the peer closes or that fails is counted and dialed
 again at the next tick, `interval` later, as a client sent away comes back: a listener at its
@@ -26,6 +32,7 @@ It prints `{"event": "ready", ...}` once its first round of dials is done, and
 `{"event": "done", ...}` at SIGTERM, each with the counts `counts()` names.
 """
 
+import errno
 import fcntl
 import json
 import selectors
@@ -36,7 +43,8 @@ import sys
 import termios
 import time
 
-MODES = ("silent", "trickle", "half_open")
+MODES = ("silent", "trickle", "half_open", "churn")
+QUIET = ("silent", "churn")
 SENDS = ("none", "lf", "http_head", "http_body")
 HTTP_TARGET = "/api/v2/write?org=soak&bucket=soak"
 BODY_BYTES = 1 << 20
@@ -81,6 +89,8 @@ class Client:
         self.dialed = self.dial_errors = self.peer_closed = 0
         self.sent_bytes = self.received_bytes = self.max_open = 0
         self.unacked = None
+        self.closed = self.resets = self.timeouts = 0
+        self.pending = {}
 
     def counts(self, event):
         record = {"event": event, "mode": self.mode, "open": len(self.open),
@@ -89,7 +99,74 @@ class Client:
                   "sent_bytes": self.sent_bytes, "received_bytes": self.received_bytes}
         if self.unacked is not None:
             record["unacked_bytes"] = self.unacked
+        if self.mode == "churn":
+            record.update(open=len(self.pending), closed=self.closed, resets=self.resets,
+                          timeouts=self.timeouts)
         return record
+
+    def churn(self):
+        """Dials `connections` connections without waiting on any, and times out the ones with
+        no answer in `DIAL_TIMEOUT_S`."""
+        now = time.monotonic()
+        for sock, since in list(self.pending.items()):
+            if now - since >= DIAL_TIMEOUT_S:
+                self.timeouts += 1
+                self.forget(sock)
+        for _ in range(self.connections):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setblocking(False)
+            try:
+                sock.connect_ex((self.host, self.port))
+            except OSError:
+                self.dial_errors += 1
+                sock.close()
+                continue
+            self.dialed += 1
+            self.pending[sock] = now
+            self.selector.register(sock, selectors.EVENT_WRITE, "dial")
+        self.max_open = max(self.max_open, len(self.pending))
+
+    def forget(self, sock):
+        self.pending.pop(sock, None)
+        self.selector.unregister(sock)
+        sock.close()
+
+    def churned(self, key):
+        """One churn connection's event: its handshake's outcome, then its close."""
+        sock = key.fileobj
+        if key.data == "dial":
+            error = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+            if error == 0:
+                try:
+                    sock.shutdown(socket.SHUT_WR)
+                except OSError:
+                    error = errno.ECONNRESET
+            if error:
+                if error in (errno.ECONNRESET, errno.ECONNREFUSED):
+                    self.resets += 1
+                else:
+                    self.dial_errors += 1
+                self.forget(sock)
+                return
+            self.selector.modify(sock, selectors.EVENT_READ, "read")
+            return
+        try:
+            data = sock.recv(4096)
+        except BlockingIOError:
+            return
+        except ConnectionResetError:
+            self.resets += 1
+            self.forget(sock)
+            return
+        except OSError:
+            self.dial_errors += 1
+            self.forget(sock)
+            return
+        if data:
+            self.received_bytes += len(data)
+            return
+        self.closed += 1
+        self.forget(sock)
 
     def dial(self):
         try:
@@ -143,6 +220,9 @@ class Client:
 
     def read(self, timeout):
         for key, _ in self.selector.select(timeout):
+            if self.mode == "churn":
+                self.churned(key)
+                continue
             sock = key.fileobj
             try:
                 sock.settimeout(0)
@@ -169,6 +249,15 @@ class Client:
             time.sleep(0.05)
 
     def run(self):
+        if self.mode == "churn":
+            self.churn()
+            print(json.dumps(self.counts("ready")), flush=True)
+            due = time.monotonic() + self.interval
+            while True:
+                self.read(max(0.0, due - time.monotonic()))
+                if time.monotonic() >= due:
+                    due += self.interval
+                    self.churn()
         self.fill()
         if self.mode == "half_open":
             self.wait_acked()
@@ -191,7 +280,7 @@ def main(argv):
     try:
         mode, host, port, connections, interval, send = argv
         port, connections, interval = int(port), int(connections), float(interval)
-        valid = (mode in MODES and send in SENDS and (send == "none") == (mode == "silent")
+        valid = (mode in MODES and send in SENDS and (send == "none") == (mode in QUIET)
                  and connections >= 1 and interval > 0)
     except ValueError:
         valid = False

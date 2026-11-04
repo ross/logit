@@ -287,9 +287,10 @@ class Fault:
     to: object = None
     # When the apply finished, which for a `signal` is when Docker had sent it.
     applied: object = None
-    # A `rotate`'s certificate, days, generation, and whether it was issued broken, with the
-    # serial and `notAfter` it issued; a `probe`'s certificate and port, with the serial and
-    # `notAfter` the listener served and whether they verified against the CA. None elsewhere.
+    # A `rotate`'s certificate, days, generation, signing CA, and whether it was issued broken,
+    # with the serial, `notAfter`, and issuer it issued; a `probe`'s certificate and port, with
+    # the serial, `notAfter`, and issuer the listener served and whether they verified against
+    # the trust bundle in force; a `trust`'s CAs. None elsewhere.
     cert: object = None
     days: object = None
     broken: object = None
@@ -298,6 +299,9 @@ class Fault:
     serial: object = None
     not_after: object = None
     verified: object = None
+    ca: object = None
+    issuer: object = None
+    cas: object = None
 
     def affects(self, wire):
         return bool(getattr(self, faults.INGRESS_KEYS[wire]))
@@ -481,6 +485,7 @@ class RunData:
             cert=apply.get("cert"), days=apply.get("days"), broken=apply.get("broken"),
             gen=apply.get("gen"), port=apply.get("port"), serial=apply.get("serial"),
             not_after=apply.get("not_after"), verified=apply.get("verified"),
+            ca=apply.get("ca"), issuer=apply.get("issuer"), cas=apply.get("cas"),
         )
 
     def offset(self, t):
@@ -622,7 +627,7 @@ def check_timeline(data):
     rate against the limit, and the stalled time are reported, and one that couldn't read them
     FAILs; `engaged` there reads the stalled time against `IO_ENGAGED_STALL_SHARE` of the
     window. A `slowclient` revert's counts are reported: the most connections it held, its
-    dials, and how many the listener closed."""
+    dials, and how many the listener closed, or under `churn` its dials and how each ended."""
     if data.t0 is None:
         return Result("timeline", SKIP, "no timeline start")
     lines = []
@@ -671,7 +676,14 @@ def check_timeline(data):
              f"connection(s), dialed {_n(done.get('dialed', 0))}, "
              f"{_n(done.get('peer_closed', 0))} closed by the listener"
              for record in actions if record["event"] == "revert"
-             and isinstance(done := record.get("done"), dict)]
+             and isinstance(done := record.get("done"), dict) and done.get("mode") != "churn"]
+    gone += [f"{record.get('step')} (slowclient on {record.get('on')}): churn dialed "
+             f"{_n(done.get('dialed', 0))} ({_n(record.get('connections', 0))} a tick), "
+             f"{_n(done.get('closed', 0))} closed by the listener, "
+             f"{_n(done.get('resets', 0))} reset, {_n(done.get('timeouts', 0))} timed out, "
+             f"{_n(done.get('dial_errors', 0))} failed"
+             for record in actions if record["event"] == "revert"
+             and isinstance(done := record.get("done"), dict) and done.get("mode") == "churn"]
     for record in actions:
         if record["event"] != "revert":
             continue
@@ -3528,7 +3540,7 @@ def _skip_without_sut(check_id, led):
 
 # ---- a rolling overlap ---------------------------------------------------------------------------
 #
-# Under `[overlap]` every instance runs the whole pipeline on one shared UDP port (the plan's
+# Under `[overlap]` every instance runs the whole pipeline on one shared UDP or TCP port (the plan's
 # "Rolling overlap (W12b)"). A row about a process life (`ledger.intake`, `ledger.edge`,
 # `ledger.script`, `ledger.aggregate`, `ledger.egress`, `ledger.windows`, `ledger.replay`,
 # `identity.sink`, and `drops`, and `ledger.summary`'s per-life terms) judges each instance on
@@ -3544,6 +3556,10 @@ OVERLAP_HOLD_ACTIONS = ("stop", "kill", "pause", "restart", "exit")
 # with no final sample or drain, after which `ledger.overlap` can't be judged.
 OVERLAP_CLOSES = ("stop", "restart")
 OVERLAP_UNJUDGED = ("kill", "exit")
+# On a TCP wire, what one instance's close can lose of each generator sink's connection to it,
+# in that sink's batches: a write the closing instance's kernel acknowledged and the process
+# never read, and one written before the sink saw the close.
+OVERLAP_TCP_CLOSE_BATCHES = 2
 # The smallest `skb->truesize` the kernel charges one small datagram, so a queue charged `used`
 # bytes holds at most `used / TRUESIZE_FLOOR_B` of them.
 TRUESIZE_FLOOR_B = 512
@@ -3671,7 +3687,7 @@ def check_ledger_overlap(data):
     instance, which closes with no final sample, or with another fault that can lose UDP on its
     way in, is reported and not judged. Each stop's own gap, read from the drain intervals that
     span it, is reported, never judged: interpolating the instances' out-of-phase drains errs by
-    about a generator batch at each edge."""
+    about a generator batch at each edge. A TCP wire's bound is `_tcp_overlap()`'s."""
     if not data.overlap:
         return []
     leds = _instance_ledgers(data)
@@ -3687,6 +3703,9 @@ def check_ledger_overlap(data):
                           for symbol in ("W", "K", "F"))
             for instance, led in leds.items()}
     gap = G - sum(read.values())
+    tcp = [source for source in first.sources if source_wire(source) == "tcp"]
+    if tcp:
+        return _tcp_overlap(data, first, tcp, G, read, gap)
     buckets = {source.get("sut_listener"): _wire_buckets(
         data, first, source, combined=_overlap_ingest(list(leds.values()), source))
         for source in first.sources}
@@ -3750,6 +3769,109 @@ def check_ledger_overlap(data):
                   f"{totals}, {verdict}: {closes} close(s) of an instance's socket, each at most "
                   f"ceil(used / {TRUESIZE_FLOOR_B}) + 1 datagrams, loose by up to a quarter of "
                   "its SO_RCVBUF; below, the generators' end allowance", lines)
+
+
+def check_overlap_migrate(data):
+    """Under `[overlap]` with a TCP source's `migrate_req`, one row over its `churn` slowclient
+    steps, else none: each churn's namespace read `net.ipv4.tcp_migrate_req` at the declared
+    value, or FAILs. With 1, a churn's resets FAIL: the kernel moves a closing instance's
+    handshakes to another listener of the port. With 0, a churn with an instance's stop,
+    restart, kill, or `exit` starting in its window PASSes on a reset and WARNs on none, since a
+    close with no handshake in flight resets nothing; a reset with no close FAILs, as it has no
+    cause the row knows."""
+    migrate = (data.overlap or {}).get("migrate_req")
+    if migrate is None:
+        return []
+    applies = {record.get("step"): record for record in data.timeline
+               if record.get("event") == "apply" and record.get("action") == "slowclient"}
+    churns = [(applies[record.get("step")], record, done) for record in data.timeline
+              if record.get("event") == "revert" and record.get("step") in applies
+              and isinstance(done := record.get("done"), dict) and done.get("mode") == "churn"]
+    if not churns:
+        return []
+    instances = set(data.instances)
+    lines, statuses = [], []
+    for apply, revert, done in churns:
+        start, end = apply.get("started_at"), revert.get("finished_at")
+        closes = [f"{fault.step} {fault.action} on {fault.on}" for fault in data.faults
+                  if fault.on in instances and fault.action in OVERLAP_CLOSES + OVERLAP_UNJUDGED
+                  and start is not None and end is not None and start <= fault.start <= end]
+        resets = done.get("resets", 0)
+        head = (f"{apply.get('step')} churn on {apply.get('on')} at "
+                f"{data.offset(start)}: {_n(done.get('dialed', 0))} dialed, {_n(resets)} reset, "
+                f"{_n(done.get('closed', 0))} closed, closes in its window: "
+                f"{', '.join(closes) or 'none'}")
+        live = apply.get("migrate_req")
+        if live != migrate:
+            statuses.append(FAIL)
+            lines.append(f"{head}; the namespace read tcp_migrate_req {live}, and the scenario "
+                         f"declares {migrate}")
+        elif migrate == 1 and resets:
+            statuses.append(FAIL)
+            lines.append(f"{head}; with tcp_migrate_req 1 a closing instance's handshakes "
+                         "move to the other listener, so none resets")
+        elif migrate == 0 and resets and not closes:
+            statuses.append(FAIL)
+            lines.append(f"{head}; a reset with no instance closing in the window")
+        elif migrate == 0 and closes and not resets:
+            statuses.append(WARN)
+            lines.append(f"{head}; no handshake was in flight at the close, so the control "
+                         "shows nothing")
+        else:
+            statuses.append(PASS)
+            lines.append(head)
+    resets = sum(done.get("resets", 0) for _, _, done in churns)
+    dialed = sum(done.get("dialed", 0) for _, _, done in churns)
+    return Result("overlap.migrate", worst(statuses),
+                  f"tcp_migrate_req {migrate}: {len(churns)} churn step(s), {_n(dialed)} "
+                  f"dialed, {_n(resets)} reset", lines)
+
+
+def _tcp_overlap(data, first, sources, G, read, gap):
+    """`ledger.overlap` on a TCP wire: the run's gap at most `OVERLAP_TCP_CLOSE_BATCHES` of each
+    generator sink's batches per stop or restart of an instance, a connection's write the
+    closing instance acknowledged and never read and one written before the sink saw the close;
+    and below 0 no more than the end allowance and a batch per ambiguous attempt the sinks
+    counted, each a write the instance may have read before the sink resent it. A kill, an
+    `exit`, a `reset`, or a partition that moved an address, the windows `ledger.wire` reports
+    on TCP, is reported and not judged; a netem or a pause is judged, since TCP retransmits."""
+    instances = set(data.instances)
+    batches = sum(sum(first.gen_stats[source.get("service")]["sink_batch"].get(sink, 0.0)
+                      for sink in source_ids(source, "generator_sink"))
+                  for source in sources)
+    lines, unjudged, allowance, closes = [], [], 0.0, 0
+    for fault in sorted(data.faults, key=lambda f: f.start):
+        if fault.on in instances and fault.action in OVERLAP_CLOSES:
+            closes += 1
+            bound = OVERLAP_TCP_CLOSE_BATCHES * batches
+            allowance += bound
+            lines.append(f"{fault.step} {fault.action} on {fault.on} at "
+                         f"{data.offset(fault.start)}: at most {_n(bound)}, "
+                         f"{OVERLAP_TCP_CLOSE_BATCHES} batch(es) of each generator sink")
+        elif fault.affects("tcp") and wire_judgment(fault, "tcp") == "fault":
+            unjudged.append(f"{fault.step} {fault.action} on {fault.on}")
+            lines.append(f"{fault.step} {fault.action} on {fault.on} at "
+                         f"{data.offset(fault.start)}: can lose a connection's unread writes "
+                         "with no close to bound them, so the run's gap isn't the closes' alone")
+    ambiguous = sum(sum(v for _, v in _ambiguous_drops(first, source))
+                    * first.gen_stats[source.get("service")]["batch"] for source in sources)
+    below = sum(_end_allowance(first, source) for source in sources) + ambiguous
+    split = ", ".join(f"{instance} {_n(value)}" for instance, value in read.items())
+    totals = f"G {_n(G)} − Σ(W + K + F) {_n(sum(read.values()))} ({split}) = {_n(gap)}"
+    if unjudged:
+        return Result("ledger.overlap", SKIP,
+                      f"{totals}, reported, not judged: {'; '.join(unjudged)}", lines)
+    if gap > allowance:
+        status, verdict = FAIL, f"uncounted, over the closes' {_n(allowance)}"
+    elif gap < -below:
+        status, verdict = FAIL, f"a surplus, past the end and resend allowance {_n(below)}"
+    else:
+        status, verdict = PASS, f"within [-{_n(below)}, {_n(allowance)}]"
+    return Result("ledger.overlap", status,
+                  f"{totals}, {verdict}: {closes} close(s) of an instance's connections, each "
+                  f"at most {OVERLAP_TCP_CLOSE_BATCHES} batch(es) of each generator sink; below, "
+                  f"the generators' end allowance and {_n(ambiguous)} for ambiguous attempts",
+                  lines)
 
 
 
@@ -6413,6 +6535,110 @@ def check_ledger_hop(data):
     return Result("ledger.hop", status, detail, lines)
 
 
+# How far before a killed sender life's last drain a dangling parent's child may start: the
+# parent is recorded after that drain, and its child starts once the frame reaches the far SUT,
+# so only clock rounding puts the child earlier.
+SPAN_JOIN_SLACK_S = 1.0
+
+
+def _dangling_windows(data, led, joined):
+    """`[(life, start, end, bound)]`: for each ingress life a scheduled `kill` ended, the window
+    in which a far span may continue a parent the life recorded after its last drain, which it
+    never exported (docs/known-gaps/telemetry.md's internal-spans entry, item 7): from that
+    drain, less `SPAN_JOIN_SLACK_S`, to the first drain of the next life whose hop sink's
+    `logit.component.buffer.batches` reads 0, when its spool's replay of the killed life's
+    frames is done, else the next life's last drain. `bound` is one drain interval's worth of
+    such parents: the most joined parents (`joined`, `{span_id: Span}`) that started in any one
+    drain interval of the killed life, plus one, since the life lost at most the interval after
+    its last drain."""
+    sink = led.hop.get("sink")
+    tel = led.ingress
+    windows = []
+    for life in led.inn.killed:
+        drains = tel.life_drains(life)
+        if not drains:
+            continue
+        start = drains[-1] - SPAN_JOIN_SLACK_S
+        following = tel.life_drains(life + 1)
+        empty = [ts for ts, value, point_life in tel.gauge_series(
+            "logit.component.buffer.batches", component=sink)
+                 if point_life == life + 1 and value == 0]
+        end = empty[0] if empty else (following[-1] if following else data.end)
+        parents = sorted(span.ts for span in joined.values() if span.life == life)
+        per = [bisect.bisect_left(parents, b) - bisect.bisect_left(parents, a)
+               for a, b in zip(drains, drains[1:])]
+        windows.append((life, start, end, max(per, default=0) + 1))
+    return windows
+
+
+def check_spans_join(data):
+    """Across a `[[ledger.hop]]` whose far SUT records spans, one row joining each span the far
+    SUT's `logit_in` recorded with a parent, its hop listener's, to a span with that trace id and
+    span id the ingress SUT exported: `logit_out` carries a batch's incoming context only for a
+    trace its own process sampled (docs/adr/native-hop-trace-context.md), so every such parent
+    is a sender span. A parent the sender recorded after its last drain is never exported
+    (docs/known-gaps/telemetry.md's internal-spans entry, item 7), so an unmatched span is
+    allowed inside a killed sender life's window (`_dangling_windows`), up to the window's bound,
+    and up to the sender's `logit.internal.spans.dropped` anywhere; every other unmatched span
+    FAILs. SKIP when the far SUT recorded no span with a parent on the hop listener."""
+    if not data.ledger.get("hop"):
+        return []
+    led = _ledger(data)
+    skipped = _skip_without_sut("spans.join", led)
+    if skipped:
+        return skipped
+    listener = led.hop.get("listener")
+    children = [span for span in led.sut.spans
+                if span.component == listener and span.parent_span_id]
+    if not children:
+        return Result("spans.join", SKIP, f"{led.out.service} recorded no {listener} span with "
+                                          "a parent")
+    roots = sum(1 for span in led.sut.spans
+                if span.component == listener and not span.parent_span_id)
+    sent = {(span.trace_id, span.span_id): span for span in led.ingress.spans}
+    joined, unmatched = {}, []
+    for child in children:
+        parent = sent.get((child.trace_id, child.parent_span_id))
+        if parent is None:
+            unmatched.append(child)
+        else:
+            joined[parent.span_id] = parent
+    windows = _dangling_windows(data, led, joined)
+    lines, over = [], []
+    outside = []
+    for child in unmatched:
+        if not any(start <= child.ts <= end for _, start, end, _ in windows):
+            outside.append(child)
+    for life, start, end, bound in windows:
+        inside = sum(1 for child in unmatched if start <= child.ts <= end)
+        text = (f"{led.inn.service} life {life} killed: {_n(inside)} unmatched from its last "
+                f"drain ({data.offset(start + SPAN_JOIN_SLACK_S)}) to its replay's end "
+                f"({data.offset(end)}), at most {_n(bound)} (the most joined parents in one of "
+                "its drain intervals, plus one)")
+        lines.append(text)
+        if inside > bound:
+            over.append(text)
+    dropped = sum(point.value for point in led.ingress.matching(
+        "logit.internal.spans.dropped") if isinstance(point.value, (int, float)))
+    for child in outside[:5]:
+        lines.append(f"unmatched {child.name} span {child.span_id} at "
+                     f"{data.offset(child.ts)}: parent {child.parent_span_id} in trace "
+                     f"{child.trace_id}, outside every killed life's window")
+    head = (f"{led.out.service}'s {listener} spans with a parent {_n(len(children))}: joined "
+            f"{_n(len(children) - len(unmatched))} to {led.inn.service}'s exported spans, "
+            f"unmatched {_n(len(unmatched))} ({_n(len(unmatched) - len(outside))} inside a killed "
+            f"life's window, {_n(len(outside))} outside); {_n(roots)} root(s) with no parent; "
+            f"{led.inn.service} counted {_n(dropped)} span(s) dropped")
+    if over:
+        return Result("spans.join", FAIL, f"{head}: a window over its bound", lines)
+    if len(outside) > dropped:
+        return Result("spans.join", FAIL,
+                      f"{head}: {_n(len(outside))} unmatched outside every killed life's "
+                      f"window, over the {_n(dropped)} spans the sender counted dropped", lines)
+    return Result("spans.join", PASS, f"{head}: each unmatched span a parent the sender "
+                                      "recorded after its last drain or counted dropped", lines)
+
+
 def _relay_reasons(tel, name, component, life):
     """`{reason: summed delta}` for a `sum` metric of one component in one life."""
     sums = {}
@@ -8446,9 +8672,10 @@ def check_tls_served(data):
     """One `tls.served.<step>` row per `probe` step, else one `tls.served` row that SKIPs. The
     probe pairs with the generation in force for its certificate: the latest rotation of it
     that started before the probe and wasn't broken, else the first issue (the driver's
-    `tls_issued` phase). The row FAILs when the probe didn't apply, the served serial or
-    `notAfter` isn't that generation's, the served chain didn't verify against the run's CA for
-    the certificate's name, or no first issue was recorded."""
+    `tls_issued` phase). The row FAILs when the probe didn't apply, the served serial,
+    `notAfter`, or issuing CA isn't that generation's, the served chain didn't verify against
+    the trust bundle in force for the certificate's name, or no first issue was recorded. A
+    record from before certs.sh reported an issuer compares none."""
     probes = sorted((f for f in data.events if f.action == "probe"), key=lambda f: f.start)
     failed = [r for r in data.timeline if r.get("event") == "apply"
               and r.get("action") == "probe" and r.get("rc")]
@@ -8464,7 +8691,8 @@ def check_tls_served(data):
         first = issued.get(probe.cert)
         want = None if first is None else {"what": "the first issue (gen 1)",
                                            "serial": first.get("serial"),
-                                           "not_after": first.get("not_after")}
+                                           "not_after": first.get("not_after"),
+                                           "issuer": first.get("issuer")}
         skipped = []
         for rotation in rotations:
             if rotation.cert != probe.cert or rotation.start > probe.start:
@@ -8473,9 +8701,10 @@ def check_tls_served(data):
                 skipped.append(rotation.step)
                 continue
             want = {"what": f"{rotation.step}'s gen {rotation.gen}", "serial": rotation.serial,
-                    "not_after": rotation.not_after}
+                    "not_after": rotation.not_after, "issuer": rotation.issuer}
         served = (f"{probe.on}:{probe.port} served {probe.cert} serial {probe.serial}, "
-                  f"notAfter {probe.not_after}")
+                  f"notAfter {probe.not_after}"
+                  + (f", issuer {probe.issuer!r}" if probe.issuer is not None else ""))
         if want is None:
             results.append(Result(f"tls.served.{probe.step}", FAIL,
                                   f"{served}; no first issue of {probe.cert} recorded "
@@ -8483,14 +8712,18 @@ def check_tls_served(data):
             continue
         line = (f"{served}; want {want['what']}, serial {want['serial']}, notAfter "
                 f"{want['not_after']}"
+                + (f", issuer {want['issuer']!r}" if want.get("issuer") is not None else "")
                 + (f", still in force after broken {', '.join(skipped)}" if skipped else ""))
         problems = []
         if probe.serial != want["serial"]:
             problems.append("serial differs")
         if probe.not_after != want["not_after"]:
             problems.append("notAfter differs")
+        if (probe.issuer is not None or want.get("issuer") is not None) \
+                and probe.issuer != want.get("issuer"):
+            problems.append("issuer differs")
         if probe.verified is not True:
-            problems.append("the served chain didn't verify against the run's CA")
+            problems.append("the served chain didn't verify against the trust bundle in force")
         status = FAIL if problems else PASS
         results.append(Result(f"tls.served.{probe.step}", status,
                               f"{line}" + (f": {'; '.join(problems)}" if problems else "")))
@@ -8952,7 +9185,9 @@ CHECKS = (
     check_run, check_timeline, check_exit, check_restarts, check_self_log, check_ready,
     check_progress, check_rss_slope, check_fd_slope, check_ledger_wire, check_cri_dangles,
     check_ledger_overlap,
-    check_ledger_intake, check_ledger_edge, check_ledger_hop, check_ledger_relay,
+    check_overlap_migrate,
+    check_ledger_intake, check_ledger_edge, check_ledger_hop, check_spans_join,
+    check_ledger_relay,
     check_ledger_script, check_ledger_aggregate,
     check_ledger_egress, check_ledger_windows, check_ledger_tail, check_ledger_absent,
     check_ledger_replay,

@@ -247,10 +247,12 @@ import os
 import re
 import shutil
 import signal
+import socket
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tomllib
 import zlib
@@ -9346,7 +9348,7 @@ TWO_SUT_COLLECTOR_CONFIG = ("components:\n"
 def _two_sut_run(tmp, name, kill_on="collector", collector_lives=2, extra=0, short=0,
                  hop_dropped=0, drops=(), pause=False, logit_lives=None, replayed=3,
                  stalled=False, partial=False, collector_restart=False, evicted=(),
-                 checkpoint=None, burst=0, segment_bytes="512MiB"):
+                 checkpoint=None, burst=0, segment_bytes="512MiB", kill_action="kill"):
     """A two-SUT run across a native hop: the generator and `logit` move `PER_DRAIN` lines per
     5 s drain into `logit`'s one life, whose hop sink `hop` takes each drain's lines in 10
     frames; `collector`'s `logit_in` `hop_in` forwards them into `window`, which delivers one
@@ -9363,7 +9365,8 @@ def _two_sut_run(tmp, name, kill_on="collector", collector_lives=2, extra=0, sho
     `stalled` its hop sink delivers nothing in its last two drains and leaves 23 queued; under
     `partial` it delivers 2 of its last drain's 10 and leaves 11 queued. `collector_restart`
     stops `collector` over the same span as that kill, a graceful restart. `evicted` lists
-    `(offset, count)` pairs of `logit.input.senders.evicted` at `hop_in`. `checkpoint` sets the
+    `(offset, count)` pairs of `logit.input.senders.evicted` at `hop_in`. `kill_action` names the
+    action the kill's timeline records carry, a `stop` for a graceful one. `checkpoint` sets the
     hop sink's spool `checkpoint_interval` in seconds, and `burst` adds that many batches to its
     `batches.delivered` at +50 s, as a replay delivered early in the life. `collector` counts one
     `events.dropped{reason="stale"}` at `window`. `drops` adds a count of 1 for each `(service,
@@ -9459,9 +9462,9 @@ def _two_sut_run(tmp, name, kill_on="collector", collector_lives=2, extra=0, sho
     timeline = [_phase("start", 0, t0=T0)]
     if kill_on is not None:
         timeline += [
-            _action("apply", "c0s1", "kill", kill_on, TWO_SUT_KILL[0], TWO_SUT_KILL[0] + 0.1,
+            _action("apply", "c0s1", kill_action, kill_on, TWO_SUT_KILL[0], TWO_SUT_KILL[0] + 0.1,
                     affects_udp_ingress=kill_on == "logit", affects_egress=True),
-            _action("revert", "c0s1", "kill", kill_on, TWO_SUT_KILL[1] - 1, TWO_SUT_KILL[1],
+            _action("revert", "c0s1", kill_action, kill_on, TWO_SUT_KILL[1] - 1, TWO_SUT_KILL[1],
                     affects_udp_ingress=kill_on == "logit", affects_egress=True),
             _ready("c0s1", kill_on, TWO_SUT_KILL[1] + 1)]
     if collector_restart:
@@ -9508,6 +9511,149 @@ def _two_sut_run(tmp, name, kill_on="collector", collector_lives=2, extra=0, sho
     _write_export(run_dir, "sink", [{"metric": {"__name__": "x_0_total"}, "values": values,
                                      "timestamps": timestamps}])
     return run_dir
+
+
+def _span_line(offset, component, trace, span, parent=None):
+    """One `internal` span event as `stdio_out`'s JSON writes it, started at `offset`."""
+    body = {"name": f"{component} send", "trace_id": trace, "span_id": span, "kind": "producer"}
+    if parent is not None:
+        body["parent_span_id"] = parent
+    return json.dumps({"timestamp": _stamp(T0 + offset), "span": body,
+                       "attributes": {"component": component, "kind": "x", "role": "x"}},
+                      separators=(",", ":"))
+
+
+def _join_run(tmp, name, unmatched=(), wrong_trace=False, dropped=0, children=True,
+              buffer_held=False, stop=False):
+    """`_two_sut_run`'s run with a kill on `logit` (+203 to +213), with spans: `logit`'s
+    listener `in` records two spans a drain interval in each life, and `collector`'s `hop_in`
+    one child of each, 0.2 s later. `unmatched` adds a `collector` child at each offset whose
+    parent `logit` never exported; `wrong_trace` gives one child its parent's span id under
+    another trace id; `dropped` adds that many `logit.internal.spans.dropped` at `logit`;
+    `children` false records only roots at `collector`; and `buffer_held` holds the hop sink's
+    queue in `logit`'s next life until +260. `stop` makes the kill a graceful stop over the same
+    span."""
+    run_dir = _two_sut_run(tmp, name, kill_on="logit", collector_lives=1,
+                           kill_action="stop" if stop else "kill")
+    ingress, egress = [], []
+    offsets = [o for o in range(5, 300, 5)
+               if not TWO_SUT_KILL[0] - 3 < o < TWO_SUT_KILL[1] + 3]
+    for index, offset in enumerate(offsets):
+        for one in range(2):
+            trace = f"{index:016x}{one:016x}"
+            span = f"{index:014x}a{one}"
+            ingress.append(_span_line(offset + one, "in", trace, span))
+            if children:
+                parent_trace = trace if not (wrong_trace and index == 3 and one == 0) \
+                    else "f" * 32
+                egress.append(_span_line(offset + one + 0.2, "hop_in", parent_trace,
+                                         f"{index:014x}b{one}", span))
+            else:
+                egress.append(_span_line(offset + one + 0.2, "hop_in", trace,
+                                         f"{index:014x}b{one}"))
+    for number, offset in enumerate(unmatched):
+        egress.append(_span_line(offset, "hop_in", "e" * 32, f"{number:014x}cc",
+                                 f"{number:014x}dd"))
+    if dropped:
+        ingress.append(_line(_stamp(T0 + 98), "logit.internal.spans.dropped", "sum", dropped,
+                             component="in", attrs={"reason": "buffer_full"}))
+    for service, extra in (("logit", ingress), ("collector", egress)):
+        path = run_dir / "logs" / f"{service}.stdout"
+        kept = path.read_text().splitlines()
+        if buffer_held and service == "logit":
+            # The base run's queue reads 0 at every drain of the next life; hold it at 4 there
+            # until +260.
+            held = [_stamp(T0 + offset) for offset in range(TWO_SUT_KILL[1], 260, 5)]
+            kept = [line.replace('"value":0}', '"value":4}')
+                    if '"logit.component.buffer.batches"' in line
+                    and any(stamp in line for stamp in held) else line for line in kept]
+        path.write_text("\n".join(kept + extra) + "\n")
+    return run_dir
+
+
+def _span_join():
+    """`spans.join` joins each `collector` hop span with a parent to a span `logit` exported:
+    every child joined PASSes; an unmatched child inside a killed life's window, from its last
+    drain to its next life's first drain whose hop queue reads 0, PASSes up to one drain
+    interval's worth of joined parents plus one, and past it FAILs; one outside every window
+    FAILs, unless `logit` counted that many spans dropped; a parent id under another trace id
+    doesn't join; a far side with no child SKIPs; and span lines parse with their component and
+    life."""
+    with tempfile.TemporaryDirectory() as tmp:
+        def row(name, **kwargs):
+            rows = {r.id: r for r in checks.run_all(_join_run(tmp, name, **kwargs))}
+            return rows["spans.join"]
+
+        tel = telemetry.parse_ndjson([
+            _line(_stamp(T0 + 5), "logit.process.uptime", "gauge", 5.0),
+            _line(_stamp(T0 + 50), "logit.process.uptime", "gauge", 2.0),
+            _span_line(20, "in", "a" * 32, "b" * 16),
+            _span_line(49.5, "hop_in", "a" * 32, "c" * 16, "b" * 16)])
+        expect([(s.component, s.span_id, s.parent_span_id, s.life) for s in tel.spans]
+               == [("in", "b" * 16, None, 0), ("hop_in", "c" * 16, "b" * 16, 1)]
+               and len(tel.points) == 2,
+               f"span lines parse beside the points, each in the life it started in, got "
+               f"{[(s.component, s.span_id, s.parent_span_id, s.life) for s in tel.spans]}")
+        joined = row("join-all")
+        expect(joined.status == checks.PASS
+               and "spans with a parent 112: joined 112" in joined.detail
+               and "unmatched 0" in joined.detail,
+               f"every child joined to a sender span PASSes, got {joined}")
+        inside = row("join-inside", unmatched=(199, 205, 212))
+        expect(inside.status == checks.PASS
+               and "unmatched 3 (3 inside a killed life's window, 0 outside)" in inside.detail
+               and any("logit life 0 killed: 3 unmatched" in line and "at most 3" in line
+                       for line in inside.lines),
+               f"unmatched children inside the killed life's window PASS up to its bound, got "
+               f"{inside} {inside.lines}")
+        over = row("join-over", unmatched=(199, 200, 205, 212))
+        expect(over.status == checks.FAIL and "a window over its bound" in over.detail,
+               f"more unmatched children than the window's bound FAIL, got {over}")
+        outside = row("join-outside", unmatched=(100,))
+        expect(outside.status == checks.FAIL
+               and "1 unmatched outside every killed life's window" in outside.detail
+               and any("outside every killed life's window" in line for line in outside.lines),
+               f"an unmatched child outside every window FAILs, got {outside}")
+        # `logit`'s life 0 drains last at +198, so its window opens at +197, one
+        # `SPAN_JOIN_SLACK_S` before.
+        slack = row("join-slack", unmatched=(197.5,))
+        expect(slack.status == checks.PASS
+               and "unmatched 1 (1 inside a killed life's window" in slack.detail,
+               f"an unmatched child within SPAN_JOIN_SLACK_S before the killed life's last "
+               f"drain is inside its window, got {slack}")
+        early = row("join-early", unmatched=(196.5,))
+        expect(early.status == checks.FAIL
+               and "1 unmatched outside every killed life's window" in early.detail,
+               f"an unmatched child before the window's lower edge FAILs, got {early}")
+        # A window at its bound of 3 and one span below its start that a counted drop
+        # explains: counting that span inside the window puts it over its bound.
+        edge = row("join-edge", unmatched=(196.5, 199, 205, 212), dropped=1)
+        expect(edge.status == checks.PASS
+               and "unmatched 4 (3 inside a killed life's window, 1 outside)" in edge.detail,
+               f"an unmatched child below a window's start counts outside it, not in its bound, "
+               f"got {edge} {edge.lines}")
+        stopped = row("join-stopped", unmatched=(199, 205), stop=True)
+        expect(stopped.status == checks.FAIL
+               and "2 unmatched outside every killed life's window" in stopped.detail,
+               f"a graceful stop exports its spans at its shutdown drain, so it opens no window "
+               f"and its unmatched children FAIL, got {stopped}")
+        late = row("join-late", unmatched=(240,))
+        expect(late.status == checks.FAIL,
+               f"an unmatched child after the next life's queue read 0 FAILs, got {late}")
+        held = row("join-held", unmatched=(240,), buffer_held=True)
+        expect(held.status == checks.PASS,
+               f"the window runs to the next life's first drain whose hop queue reads 0, got "
+               f"{held}")
+        counted = row("join-counted", unmatched=(100,), dropped=1)
+        expect(counted.status == checks.PASS and "counted 1 span(s) dropped" in counted.detail,
+               f"an unmatched child the sender's counted span drop explains PASSes, got "
+               f"{counted}")
+        wrong = row("join-trace", wrong_trace=True)
+        expect(wrong.status == checks.FAIL and "unmatched 1" in wrong.detail,
+               f"a parent span id under another trace id doesn't join, got {wrong}")
+        roots = row("join-roots", children=False)
+        expect(roots.status == checks.SKIP and "recorded no hop_in span with a parent"
+               in roots.detail, f"a far side with no child SKIPs, got {roots}")
 
 
 def _tcp_hop_run(tmp, name, extra, ambiguous_at=None):
@@ -12240,8 +12386,8 @@ def _overlap_rules(root):
             "[overlap] and [[ledger.hop]] can't be combined", "an overlap beside a hop")
     refused(lambda r: r["configs"].update(collector="logit-sut.yaml"),
             "configs.collector: under [overlap]", "a further SUT that isn't an instance")
-    refused(lambda r: r["ledger"]["source"][0].update(wire="tcp"),
-            "under [overlap] a source's wire is udp", "an overlap on a TCP wire")
+    refused(lambda r: r["ledger"]["source"][0].update(wire="file"),
+            "under [overlap] a source's wire is udp or tcp", "an overlap on a file wire")
     refused(lambda r: r["ledger"]["source"][0].update(sut_transforms=["other"]),
             "`sut_transforms` must list the set component stamping 'soak_instance' (instance)",
             "the label's set off the source's transforms")
@@ -12339,6 +12485,48 @@ def _overlap_rules(root):
            "with no holder a further SUT still affects no UDP ingress")
 
 
+def _overlap_tcp_rules(root):
+    """`[overlap]` over TCP: rolling-overlap-tcp and its control load, carrying the holder's
+    `net.ipv4.tcp_migrate_req` as `migrate_req`; a TCP overlap whose override doesn't set it on
+    the holder to 0 or 1 is refused, and so is a UDP overlap that sets it."""
+    for name, want in (("rolling-overlap-tcp", 1), ("rolling-overlap-tcp-nomigrate", 0)):
+        loaded = scenario.load(root / "scenarios" / name / "scenario.toml")
+        problems = scenario.service_problems(loaded, OVERLAP_ROLES, OVERLAP_MODES)
+        expect(loaded.to_json()["overlap"] == {**OVERLAP, "migrate_req": want} and not problems,
+               f"{name} loads with migrate_req {want}, got {loaded.to_json()['overlap']} "
+               f"{problems}")
+    sysctl = "      net.ipv4.tcp_migrate_req: 1\n"
+    with tempfile.TemporaryDirectory() as tmp:
+        for what, edit, needle in (
+                ("no sysctl", lambda text: text.replace(sysctl, "").replace(
+                    "    sysctls:\n", ""),
+                 "sets net.ipv4.tcp_migrate_req on sut-net to 0 or 1 (`sysctls:`), so a run "
+                 "states whether a closing instance's accept queue moves; got None"),
+                ("a value of 2", lambda text: text.replace(sysctl, sysctl.replace("1", "2")),
+                 "to 0 or 1 (`sysctls:`), so a run states whether a closing instance's accept "
+                 "queue moves; got '2'"),
+                ("the sysctl on an instance", lambda text: text.replace(sysctl, "").replace(
+                    "    sysctls:\n", "").replace(
+                    "  logit:\n", "  logit:\n    sysctls:\n" + sysctl),
+                 "to 0 or 1 (`sysctls:`)")):
+            directory = Path(tmp) / what.replace(" ", "-")
+            shutil.copytree(root / "scenarios" / "rolling-overlap-tcp", directory)
+            override = directory / "compose.override.yaml"
+            override.write_text(edit(override.read_text()))
+            path = directory / "scenario.toml"
+            _refused(path, tomllib.loads(path.read_text()), needle,
+                     f"a TCP overlap with {what}", roles=OVERLAP_ROLES)
+        directory = Path(tmp) / "udp"
+        shutil.copytree(root / "scenarios" / "rolling-overlap", directory)
+        override = directory / "compose.override.yaml"
+        override.write_text(override.read_text().replace(
+            '    restart: "no"\n', '    restart: "no"\n    sysctls:\n' + sysctl, 1))
+        path = directory / "scenario.toml"
+        _refused(path, tomllib.loads(path.read_text()), "overlap: sut-net sets "
+                 "net.ipv4.tcp_migrate_req, which only a tcp source's accept queue reads",
+                 "a UDP overlap that sets the sysctl", roles=OVERLAP_ROLES)
+
+
 def _overlap_driver(root):
     """The driver under `[overlap]`: `compose.env` has no variable for an instance sharing
     sut's config, the resolved scenario records the overlap, compose's network modes are read
@@ -12429,7 +12617,7 @@ OVERLAP_SUT_CONFIG = ("admin: { socket: /tmp/admin.sock }\n"
 
 
 def _overlap_run(tmp, name, loss=0, used=2048, action="stop", unlabeled=False, stall=False,
-                 end_extra=0):
+                 end_extra=0, tcp=False, migrate=None, churns=(), ambiguous=0, extra=()):
     """A two-instance run: the generator's two inputs and sinks send `PER_DRAIN` lines per 5 s
     drain from +5 to +300, `logit` reads 600 of them a drain and `logit-b` 400, until `logit`
     stops over `STOP` (or `action`, a kill), when `logit-b` reads all 1,000 a drain, `loss`
@@ -12437,13 +12625,19 @@ def _overlap_run(tmp, name, loss=0, used=2048, action="stop", unlabeled=False, s
     before the stop samples `used` bytes in its receive queue. Each instance stamps its series
     with its name; `unlabeled` adds a series with no label. Under `stall`, `logit-b` delivers
     nothing from +95 to +180 with a batch queued. `end_extra` lines reach `logit-b` at +310,
-    after the generator stops, a surplus over G at the end."""
+    after the generator stops, a surplus over G at the end.
+
+    Under `tcp`, the source's wire is TCP, W is `logit.input.frames`, and the generator's sinks
+    count `ambiguous` ambiguous attempts at +100. `migrate` is the overlap's `migrate_req`;
+    `churns` are `(step, on, start, end, done, migrate_req)` slowclient churn steps, `done` the
+    counts the revert records; `extra` more timeline records."""
     gen = []
     for offset in range(5, 301, 5):
         stamp = _stamp(T0 + offset)
         gen.append(_line(stamp, "logit.process.uptime", "gauge", float(offset)))
         for index in (0, 1):
-            for metric in ("logit.output.messages", "logit.output.datagrams"):
+            for metric in ("logit.output.messages",
+                           *(() if tcp else ("logit.output.datagrams",))):
                 gen.append(_line(stamp, metric, "sum", PER_DRAIN // 2, component=f"out_{index}"))
             gen.append(_line(stamp, "logit.component.events.sent", "sum", PER_DRAIN // 2,
                              component=f"load_{index}"))
@@ -12451,6 +12645,10 @@ def _overlap_run(tmp, name, loss=0, used=2048, action="stop", unlabeled=False, s
                              component=f"load_{index}"))
             gen.append(_line(stamp, "logit.component.buffer.batches", "gauge", 0,
                              component=f"out_{index}"))
+            if tcp and ambiguous and offset == 100:
+                gen.append(_line(stamp, "logit.output.requests", "sum", ambiguous,
+                                 component=f"out_{index}", attrs={"class": "ambiguous"}))
+    read_metric = "logit.input.frames" if tcp else "logit.input.datagrams"
 
     def instance(rows):
         """NDJSON for one instance from `[(offset, life, life_start, w, delivered, queued,
@@ -12459,7 +12657,7 @@ def _overlap_run(tmp, name, loss=0, used=2048, action="stop", unlabeled=False, s
         for offset, life, start, w, delivered, queued, sampled in rows:
             stamp = _stamp(T0 + offset)
             out.append(_line(stamp, "logit.process.uptime", "gauge", float(offset - start)))
-            for metric, value, comp in (("logit.input.datagrams", w, "statsd"),
+            for metric, value, comp in ((read_metric, w, "statsd"),
                                         ("logit.component.events.sent", w, "statsd"),
                                         ("logit.component.events.received", w, "instance"),
                                         ("logit.component.events.sent", w, "instance"),
@@ -12503,26 +12701,37 @@ def _overlap_run(tmp, name, loss=0, used=2048, action="stop", unlabeled=False, s
         b_rows.append((offset, 0, -1, w, 0 if stalled else 1, 1 if stalled else 0, 0))
         w_b += w
     a_stdout = instance(a_rows)
+    affects = {"affects_tcp_ingress" if tcp else "affects_udp_ingress": True,
+               "affects_egress": True}
+    churn_records = []
+    for step, on, start, end, done, live in churns:
+        churn_records += [
+            _action("apply", step, "slowclient", on, start, mode="churn", connections=20,
+                    migrate_req=live),
+            _action("revert", step, "slowclient", on, end - 1, end, mode="churn",
+                    connections=20, done={"mode": "churn", **done})]
     timeline = [_phase("start", 0, t0=T0),
-                _action("apply", "c0s1", action, "logit", STOP[0], affects_udp_ingress=True,
-                        affects_egress=True),
-                _action("revert", "c0s1", action, "logit", STOP[1] - 1, STOP[1],
-                        affects_udp_ingress=True, affects_egress=True),
-                _ready("c0s1", "logit", STOP[1] + 1),
+                _action("apply", "c0s1", action, "logit", STOP[0], **affects),
+                _action("revert", "c0s1", action, "logit", STOP[1] - 1, STOP[1], **affects),
+                _ready("c0s1", "logit", STOP[1] + 1), *churn_records, *extra,
                 _phase("end_begin", 300), _phase("quiet", 305, held=True),
                 _phase("sut_stopped", 325, service="logit"),
                 _phase("sut_stopped", 326, service="logit-b"), _phase("end_end", 330)]
     ledger = {**LEDGER, "source": [{"service": "generator",
                                     "generator_input": ["load_0", "load_1"],
                                     "generator_sink": ["out_0", "out_1"],
-                                    "sut_listener": "statsd", "sut_transforms": ["instance"]}],
+                                    "sut_listener": "statsd", "sut_transforms": ["instance"],
+                                    **({"wire": "tcp"} if tcp else {})}],
               "sink": [{"id": "sink", "backend": "victoria-metrics",
                         "vm_selector": "{__name__=~\"x_[0-9]+_total\"}"}]}
+    overlap = OVERLAP if migrate is None else {**OVERLAP, "migrate_req": migrate}
     run_dir = _run_dir(tmp, name, timeline, a_stdout, ledger=ledger, services=OVERLAP_ROLES,
-                       suts=["logit", "logit-b"], overlap=OVERLAP,
+                       suts=["logit", "logit-b"], overlap=overlap,
                        configs={"sut": "logit-sut.yaml"})
     (run_dir / "configs").mkdir()
-    (run_dir / "configs" / "logit-sut.yaml").write_text(OVERLAP_SUT_CONFIG)
+    (run_dir / "configs" / "logit-sut.yaml").write_text(
+        OVERLAP_SUT_CONFIG.replace("reuse_port: true", "transport: tcp, reuse_port: true")
+        if tcp else OVERLAP_SUT_CONFIG)
     (run_dir / "logs" / "logit-b.stdout").write_text("\n".join(instance(b_rows)) + "\n")
     (run_dir / "logs" / "generator.stdout").write_text("\n".join(gen) + "\n")
 
@@ -12543,6 +12752,98 @@ def _overlap_run(tmp, name, loss=0, used=2048, action="stop", unlabeled=False, s
         export.append(series(None, [(10, (50, 100))]))
     _write_export(run_dir, "sink", export)
     return run_dir
+
+
+def _overlap_tcp_checks():
+    """`ledger.overlap` on a TCP wire: two of each generator sink's batches per close, so a
+    loss at the close up to that passes and one past it FAILs; a kill is reported, not judged;
+    a surplus at the end is allowed a batch per ambiguous attempt beyond the end allowance.
+    A pause of an instance is judged. `overlap.migrate` reads each churn: with migrate 1 a reset
+    FAILs, with 0 a close (a stop, a kill, or an `exit`) with resets PASSes, one with none
+    WARNs, and resets with no close FAIL; a live value other than the declared one FAILs; and
+    with no churn, or no migrate_req, there's no row."""
+    with tempfile.TemporaryDirectory() as tmp:
+        def rows(name, **kwargs):
+            return {r.id: r for r in checks.run_all(_overlap_run(tmp, name, tcp=True, **kwargs))}
+
+        clean = rows("clean")
+        expect(clean["ledger.overlap"].status == checks.PASS
+               and clean["ledger.wire"].status == checks.PASS
+               and "= 0, within [-200, 400]: 1 close(s) of an instance's connections, each at "
+                   "most 2 batch(es) of each generator sink" in clean["ledger.overlap"].detail
+               and "overlap.migrate" not in clean,
+               f"a clean TCP swap passes with two of each sink's 100-line batches per close, "
+               f"got {clean['ledger.overlap']} {clean['ledger.wire']}")
+        within = rows("within", loss=400)
+        expect(within["ledger.overlap"].status == checks.PASS
+               and "= 400, within [-200, 400]" in within["ledger.overlap"].detail,
+               f"a TCP close's loss up to its bound passes, got {within['ledger.overlap']}")
+        over = rows("over", loss=401)
+        expect(over["ledger.overlap"].status == checks.FAIL
+               and "= 401, uncounted, over the closes' 400" in over["ledger.overlap"].detail,
+               f"a TCP close's loss past its bound FAILs, got {over['ledger.overlap']}")
+        killed = rows("killed", loss=50, action="kill")
+        expect(killed["ledger.overlap"].status == checks.SKIP
+               and "reported, not judged: c0s1 kill on logit" in killed["ledger.overlap"].detail,
+               f"a kill of a TCP instance is reported, not judged, got "
+               f"{killed['ledger.overlap']}")
+        resent = rows("resent", end_extra=300, ambiguous=1)
+        expect(resent["ledger.overlap"].status == checks.PASS
+               and "= -300, within [-600, 400]" in resent["ledger.overlap"].detail
+               and "400 for ambiguous attempts" in resent["ledger.overlap"].detail,
+               f"a TCP surplus within a batch per ambiguous attempt passes, got "
+               f"{resent['ledger.overlap']}")
+        surplus = rows("surplus", end_extra=300)
+        expect(surplus["ledger.overlap"].status == checks.FAIL
+               and "= -300, a surplus, past the end and resend allowance 200"
+               in surplus["ledger.overlap"].detail,
+               f"a TCP surplus with no ambiguous attempt FAILs, got {surplus['ledger.overlap']}")
+
+        across = ("c0s2", "logit-b", 95, 140)
+        quiet = ("c0s3", "logit-b", 200, 240)
+        for name, migrate, churns, status, needle in (
+                ("moved", 1, [(*across, {"dialed": 900, "closed": 900, "resets": 0}, 1)],
+                 checks.PASS, "tcp_migrate_req 1: 1 churn step(s), 900 dialed, 0 reset"),
+                ("reset-on", 1, [(*across, {"dialed": 900, "closed": 890, "resets": 10}, 1)],
+                 checks.FAIL, "with tcp_migrate_req 1 a closing instance's handshakes move"),
+                ("control", 0, [(*across, {"dialed": 900, "closed": 890, "resets": 10}, 0)],
+                 checks.PASS, "tcp_migrate_req 0: 1 churn step(s), 900 dialed, 10 reset"),
+                ("control-none", 0, [(*across, {"dialed": 900, "closed": 900, "resets": 0}, 0)],
+                 checks.WARN, "no handshake was in flight at the close"),
+                ("no-close", 0, [(*quiet, {"dialed": 900, "closed": 897, "resets": 3}, 0)],
+                 checks.FAIL, "a reset with no instance closing in the window"),
+                ("live-differs", 1, [(*across, {"dialed": 900, "closed": 900, "resets": 0}, 0)],
+                 checks.FAIL, "the namespace read tcp_migrate_req 0, and the scenario "
+                              "declares 1"),
+                ("unread", 1, [(*across, {"dialed": 900, "closed": 900, "resets": 0}, None)],
+                 checks.FAIL, "the namespace read tcp_migrate_req None")):
+            row = rows(name, migrate=migrate, churns=churns).get("overlap.migrate")
+            text = "" if row is None else f"{row.detail}\n" + "\n".join(row.lines)
+            expect(row is not None and row.status == status and needle in text,
+                   f"overlap.migrate: {name} reads {status} with {needle!r}, got {row}")
+        lines = rows("named", migrate=0, churns=[(*across, {"dialed": 900, "closed": 890,
+                                                             "resets": 10}, 0)])
+        expect("closes in its window: c0s1 stop on logit"
+               in "\n".join(lines["overlap.migrate"].lines),
+               f"overlap.migrate names the closes in a churn's window, got "
+               f"{lines['overlap.migrate'].lines}")
+        expect("overlap.migrate" not in rows("unmigrated", churns=[
+                   (*across, {"dialed": 900, "closed": 900, "resets": 0}, 1)]),
+               "with no migrate_req there's no overlap.migrate row")
+        for action, article in (("kill", "a"), ("exit", "an")):
+            row = rows(f"control-{action}", action=action, migrate=0, churns=[
+                (*across, {"dialed": 900, "closed": 890, "resets": 10}, 0)])["overlap.migrate"]
+            expect(row.status == checks.PASS
+                   and f"closes in its window: c0s1 {action} on logit" in "\n".join(row.lines),
+                   f"overlap.migrate counts {article} {action} of an instance in a churn's "
+                   f"window as a close, got {row} {row.lines}")
+        pause = [_action("apply", "c0s4", "pause", "logit-b", 240, affects_tcp_ingress=True,
+                         affects_egress=True),
+                 _action("revert", "c0s4", "pause", "logit-b", 249, 250,
+                         affects_tcp_ingress=True, affects_egress=True)]
+        paused = rows("paused", extra=pause)["ledger.overlap"]
+        expect(paused.status == checks.PASS and "= 0, within [-200, 400]" in paused.detail,
+               f"a pause of a TCP instance is judged, since TCP retransmits, got {paused}")
 
 
 def _overlap_checks():
@@ -13107,6 +13408,80 @@ def _reopen_checks():
 def _tls_base(root):
     path = root / "scenarios" / "tls-reload" / "scenario.toml"
     return path, tomllib.loads(path.read_text())
+
+
+def _trust_rules(root):
+    """Every `trust` rule and a rotate's `ca`, on tls-ca-rotation: `cas` required, a list of
+    CA generations ascending with none repeated, and refused elsewhere; `ca` a whole number
+    from 1 on a rotate only; a trust on a service whose config reads the bundle, with a SIGHUP
+    there on a service that doesn't poll; new CAs made in turn; a rotate's CA in the bundle in
+    force; no bundle dropping the CA of a certificate in force; and once per run."""
+    path = root / "scenarios" / "tls-ca-rotation" / "scenario.toml"
+    base = tomllib.loads(path.read_text())
+    loaded = scenario.load(path)
+    expect(scenario.service_problems(loaded, _override_roles(loaded)) == [],
+           f"tls-ca-rotation passes its service rules, got "
+           f"{scenario.service_problems(loaded, _override_roles(loaded))}")
+    steps = scenario.expand(loaded)
+    expect([(s.action, s.cas, s.ca) for s in steps if s.action in ("trust", "rotate")]
+           == [("trust", [1, 2], None), ("rotate", None, 2), ("rotate", None, 2),
+               ("trust", [2], None), ("rotate", None, 2)]
+           and steps[0].expected() == {"cas": [1, 2]},
+           f"each trust's CAs and each rotate's CA reach its step and timeline fields, got "
+           f"{steps}")
+
+    def step(index, **fields):
+        def edit(raw):
+            raw["step"][index].update(fields)
+            for key in [k for k, v in fields.items() if v is None]:
+                del raw["step"][index][key]
+        return edit
+
+    cases = [
+        (step(0, cas=None), "trust needs `cas`", "a trust with no cas"),
+        (step(0, cas=[]), "`cas` must list CA generations", "an empty cas"),
+        (step(0, cas=[2, 1]), "`cas` must list CA generations", "cas out of order"),
+        (step(0, cas=[1, 1, 2]), "`cas` must list CA generations", "a repeated CA"),
+        (step(0, cas=[0, 2]), "`cas` must list CA generations", "CA 0"),
+        (step(0, cas="2"), "`cas` must list CA generations", "cas as a string"),
+        (step(1, cas=[1]), "`cas` is for trust only", "cas on a signal"),
+        (step(2, ca=0), "`ca` must be a CA generation", "CA 0 on a rotate"),
+        (step(2, ca=True), "`ca` must be a CA generation", "ca as a boolean"),
+        (step(4, ca=2), "`ca` is for rotate only", "ca on a probe"),
+        (step(0, cas=[1, 3]), "the next CA generation is 2", "a CA made out of turn"),
+        (step(0, cas=[1]), "`ca` 2 isn't in the trust bundle in force, [1]",
+         "a rotate to a CA no bundle holds"),
+        (step(10, ca=None), "`ca` 1 isn't in the trust bundle in force, [2]",
+         "a rotate with no ca, read as CA 1, after the bundle drops CA 1"),
+        (step(8, cas=[1]), "drops CA 2, which signs statsd's generation in force",
+         "a bundle dropping the CA of a certificate in force"),
+        (step(2, broken=True), "drops CA 1, which signs statsd's generation in force",
+         "a bundle dropping CA 1 when the CA 2 rotate of statsd was issued broken"),
+        (lambda raw: (step(1, at="50s")(raw), step(5, action="pause")(raw),
+                      step(7, action="pause")(raw)),
+         "step 1 (trust on logit): logit polls no TLS files",
+         "a trust whose only later start of its service follows the next trust"),
+        (step(0, cas=[2]), "drops CA 1, which signs statsd's generation in force",
+         "a bundle dropping CA 1 before any rotation"),
+        (lambda raw: (step(9, at="7m50s")(raw), step(13, action="pause")(raw)),
+         "nothing loads this bundle",
+         "a trust with no SIGHUP or later start on a service that doesn't poll"),
+        (step(0, on="victoria-metrics"), "victoria-metrics's config reads nothing under "
+         "/tls/trust/live/", "a trust on a service whose config doesn't read the bundle"),
+    ]
+    for edit, needle, what in cases:
+        raw = copy.deepcopy(base)
+        edit(raw)
+        _refused(path, raw, needle, what, roles=_override_roles(loaded))
+    raw = copy.deepcopy(base)
+    raw.pop("max_duration")
+    _refused(path, raw, "a second cycle's bundle would repeat its CA generations",
+             "a trust repeated in a second cycle", duration=2 * 12.5 * 60 + 180,
+             roles=_override_roles(loaded))
+    raw = copy.deepcopy(base)
+    raw.pop("tls")
+    _refused(path, raw, "trust needs a [tls] table", "a trust with no [tls]",
+             roles=_override_roles(loaded))
 
 
 def _tls_rules(root):
@@ -13692,7 +14067,9 @@ def _slowclient_client():
                f"acknowledged, and dials no more, got rc {rc} {lines} {got} {err}")
     finally:
         listener.close()
+    _churn_client()
     for args in (["silent", "127.0.0.1", "1", "1", "1", "lf"],
+                 ["churn", "127.0.0.1", "1", "1", "1", "lf"],
                  ["trickle", "127.0.0.1", "1", "1", "1", "none"],
                  ["trickle", "127.0.0.1", "1", "0", "1", "lf"],
                  ["trickle", "127.0.0.1", "1", "1"]):
@@ -13700,6 +14077,126 @@ def _slowclient_client():
                               capture_output=True, text=True, timeout=10)
         expect(proc.returncode == 2 and "usage:" in proc.stderr,
                f"the client refuses {args}, got {proc.returncode} {proc.stderr!r}")
+
+
+def _churn_client():
+    """A `churn` client against a local listener: it dials its connections every tick, sends
+    each a FIN, and counts the ones the listener closes; against a listener that never accepts
+    and then closes, it counts what the close resets and the refusals after it."""
+    serving = socket.socket()
+    serving.bind(("127.0.0.1", 0))
+    serving.listen(512)
+    stop = threading.Event()
+
+    def serve():
+        serving.settimeout(0.05)
+        while not stop.is_set():
+            try:
+                conn, _ = serving.accept()
+            except (socket.timeout, OSError):
+                continue
+            conn.settimeout(1)
+            try:
+                conn.recv(16)
+            except OSError:
+                pass
+            conn.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        rc, lines, err = _run_client(["churn", "127.0.0.1", str(serving.getsockname()[1]), "5",
+                                      "0.1", "none"], 1.0)
+    finally:
+        stop.set()
+        thread.join()
+        serving.close()
+    ready = next((one for one in lines if one["event"] == "ready"), {})
+    done = lines[-1] if lines else {}
+    expect(rc == 0 and ready.get("dialed") == 5 and done.get("event") == "done"
+           and done.get("mode") == "churn" and done.get("dialed", 0) >= 30
+           and done.get("closed", 0) >= done.get("dialed", 0) - 10
+           and done.get("resets") == 0 and done.get("sent_bytes") == 0,
+           f"a churn client dials its connections each tick, sends nothing, and counts the "
+           f"ones the listener closes, got rc {rc} {lines} {err}")
+    deaf = socket.socket()
+    deaf.bind(("127.0.0.1", 0))
+    deaf.listen(512)
+    port = deaf.getsockname()[1]
+    proc = subprocess.Popen([sys.executable, "-I", "-u", "-c", faults.SLOWCLIENT_SOURCE, "churn",
+                             "127.0.0.1", str(port), "5", "0.1", "none"],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    time.sleep(0.5)
+    deaf.close()
+    time.sleep(0.5)
+    proc.send_signal(signal.SIGTERM)
+    out, err = proc.communicate(timeout=10)
+    done = (faults.client_lines(out) or [{}])[-1]
+    expect(proc.returncode == 0 and done.get("resets", 0) >= 10
+           and done.get("closed") == 0,
+           f"a churn client counts the connections a closing listener resets and the dials "
+           f"refused after it, got {proc.returncode} {done} {err}")
+    # A port nothing listens on: every dial is refused, a reset.
+    unbound = socket.socket()
+    unbound.bind(("127.0.0.1", 0))
+    port = unbound.getsockname()[1]
+    unbound.close()
+    rc, lines, err = _run_client(["churn", "127.0.0.1", str(port), "5", "0.1", "none"], 0.6)
+    done = lines[-1] if lines else {}
+    expect(rc == 0 and done.get("resets", 0) >= 10 and done.get("dial_errors") == 0
+           and done.get("closed") == 0,
+           f"a churn client counts each refused dial as a reset, got rc {rc} {lines} {err}")
+    # A listener that reads each connection's FIN and closes it with a reset (SO_LINGER 0):
+    # the client's handshake and FIN succeed, and its read fails.
+    resetting = socket.socket()
+    resetting.bind(("127.0.0.1", 0))
+    resetting.listen(512)
+    stop = threading.Event()
+
+    def reset_each():
+        resetting.settimeout(0.05)
+        while not stop.is_set():
+            try:
+                conn, _ = resetting.accept()
+            except (socket.timeout, OSError):
+                continue
+            conn.settimeout(1)
+            try:
+                conn.recv(16)
+            except OSError:
+                pass
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            conn.close()
+
+    thread = threading.Thread(target=reset_each, daemon=True)
+    thread.start()
+    try:
+        rc, lines, err = _run_client(["churn", "127.0.0.1", str(resetting.getsockname()[1]),
+                                      "5", "0.1", "none"], 0.6)
+    finally:
+        stop.set()
+        thread.join()
+        resetting.close()
+    done = lines[-1] if lines else {}
+    expect(rc == 0 and done.get("resets", 0) >= 10 and done.get("dial_errors") == 0
+           and done.get("closed") == 0,
+           f"a churn client counts a read the listener resets as a reset, got rc {rc} {lines} "
+           f"{err}")
+    # A listener that never accepts: no connection ends in `DIAL_TIMEOUT_S`. The wait is
+    # capped, so a timeout past 5 s fails the case instead of stalling the self-test.
+    stuck = socket.socket()
+    stuck.bind(("127.0.0.1", 0))
+    stuck.listen(0)
+    try:
+        rc, lines, err = _run_client(["churn", "127.0.0.1", str(stuck.getsockname()[1]), "2",
+                                      "0.5", "none"],
+                                     min(faults.slowclient.DIAL_TIMEOUT_S, 5.0) + 1.2)
+    finally:
+        stuck.close()
+    done = lines[-1] if lines else {}
+    expect(rc == 0 and done.get("timeouts", 0) >= 1 and done.get("resets") == 0,
+           f"a churn client counts each connection unanswered for DIAL_TIMEOUT_S as timed out, "
+           f"got rc {rc} {lines} {err}")
 
 
 class _SlowclientDocker:
@@ -13733,6 +14230,70 @@ class _SlowclientDocker:
 
     def __getattr__(self, name):
         raise AssertionError(f"_SlowclientDocker.{name} called")
+
+
+class _InstanceDocker(_SlowclientDocker):
+    """`_SlowclientDocker` for an `[overlap]` instance, `sut`, in the namespace of `holder`,
+    which is on `networks`; `exec` reads `migrate`, the holder's `tcp_migrate_req`."""
+
+    def __init__(self, logs, migrate=docker.Result(0, "1\n", "")):
+        super().__init__(logs)
+        self.migrate = migrate
+
+    def run(self, args, timeout=None):
+        if args[0] == "exec":
+            self.calls.append(list(args))
+            return self.migrate
+        return super().run(args, timeout)
+
+    def inspect(self, container, timeout=None):
+        if container == "sut":
+            return {"HostConfig": {"NetworkMode": "container:holder"}, "NetworkSettings": {}}
+        if container == "holder":
+            return super().inspect("sut")
+        return super().inspect(container)
+
+
+def _churn_apply(ready):
+    """A `churn` slowclient on an `[overlap]` instance joins its holder's network, sends
+    `none`, and records the holder's `tcp_migrate_req`, None when the read fails; on a service
+    with a network of its own it reads nothing; and `timeline` reports how a churn's
+    connections ended."""
+    step = scenario.Step("c0s2", 1, 0, "slowclient", "logit-b", "", 0.0, 60.0,
+                         address="sut-net:8125", mode="churn", connections=20, interval=0.1)
+    for migrate, want in ((docker.Result(0, "1\n", ""), 1), (docker.Result(1, "", "no"), None)):
+        fake = _InstanceDocker([ready], migrate=migrate)
+        ctx = faults.Context(docker=fake, ids={"logit-b": "sut"}, netem_image="netem")
+        result = faults.ACTIONS["slowclient"].apply(ctx, step)
+        run = next(call for call in fake.calls if call[0] == "run")
+        expect(result["rc"] == 0 and run[8:10] == ["--network", "soak-x_default"]
+               and run[-6:] == ["churn", "sut-net", "8125", "20", "0.1", "none"]
+               and ["exec", "holder", "cat", faults.MIGRATE_REQ_PATH] in fake.calls
+               and result["migrate_req"] == want,
+               f"a churn client on an overlap instance joins the holder's network and records "
+               f"its tcp_migrate_req ({want}), got {fake.calls} {result}")
+    fake = _SlowclientDocker([ready])
+    ctx = faults.Context(docker=fake, ids={"logit": "sut"}, netem_image="netem")
+    result = faults.ACTIONS["slowclient"].apply(ctx, scenario.Step(
+        "c0s2", 1, 0, "slowclient", "logit", "", 0.0, 60.0, address="logit:8125", mode="churn",
+        connections=20))
+    expect(result["rc"] == 0 and "migrate_req" not in result
+           and not any(call[0] == "exec" for call in fake.calls),
+           f"a churn client on a service with its own network reads no sysctl, got {result}")
+    with tempfile.TemporaryDirectory() as tmp:
+        timeline = [_phase("start", 0, t0=T0),
+                    _action("apply", "c0s2", "slowclient", "logit", 90, mode="churn",
+                            connections=20),
+                    _action("revert", "c0s2", "slowclient", "logit", 150, mode="churn",
+                            connections=20, done={"event": "done", "mode": "churn",
+                                                  "dialed": 12000, "closed": 11950,
+                                                  "resets": 40, "timeouts": 2,
+                                                  "dial_errors": 1})]
+        result = _status(_run_dir(tmp, "churn", timeline), checks.check_timeline)
+        expect(result.status == checks.PASS
+               and "c0s2 (slowclient on logit): churn dialed 12,000 (20 a tick), 11,950 closed "
+                   "by the listener, 40 reset, 2 timed out, 1 failed" in result.detail,
+               f"timeline reports how a churn's connections ended, got {result}")
 
 
 def _stray_removal():
@@ -13874,6 +14435,7 @@ def _slowclient_actions():
     finally:
         faults.SLOWCLIENT_POLL_S = saved
 
+    _churn_apply(ready)
     roles = {"logit": "sut", "generator": "generator", "victoria-metrics": "backend"}
     action = faults.ACTIONS["slowclient"]
     expect(not any(action.affects(wire, step, roles)
@@ -13916,7 +14478,7 @@ def _slowclient_rules(root):
                                           "connections": 16, "interval": 0.5,
                                           "send": "http_body"},
                f"a slowclient's keys reach its step and its records, got {expanded[0]}")
-        for mode in ("silent", "half_open"):
+        for mode in ("silent", "half_open", "churn"):
             scenario.validate(scenario.from_dict(with_step(**{**base, "mode": mode}), path))
     except scenario.ScenarioError as err:
         expect(False, f"a slowclient with its keys loads, got {err.problems}")
@@ -13929,7 +14491,7 @@ def _slowclient_rules(root):
         _refused(path, with_step(**{**base, "address": address}), "`address` must be a "
                  "host:port with a port from 1 to 65535", f"a slowclient's address {address!r}")
     _refused(path, with_step(**{**base, "mode": "slow"}), "`mode` must be one of silent, "
-             "trickle, half_open", "a slowclient's mode 'slow'")
+             "trickle, half_open, churn", "a slowclient's mode 'slow'")
     for connections in (0, 1025, "16", 16.0, True):
         _refused(path, with_step(**{**base, "connections": connections}), "`connections` must "
                  "be a whole number from 1 to 1024", f"a slowclient's connections {connections!r}")
@@ -13940,6 +14502,8 @@ def _slowclient_rules(root):
              "http_body", "a slowclient's send 'bytes'")
     _refused(path, with_step(**{**base, "mode": "silent"}, send="lf"), "a silent slowclient "
              "sends nothing, so it takes no `send`", "a silent slowclient with a send")
+    _refused(path, with_step(**{**base, "mode": "churn"}, send="lf"), "a churn slowclient "
+             "sends nothing, so it takes no `send`", "a churn slowclient with a send")
     for key, value in (*base.items(), ("interval", "1s"), ("send", "lf")):
         changed = copy.deepcopy(raw)
         changed["step"][0][key] = value
@@ -14831,9 +15395,44 @@ def _tls_actions():
                               "/run/tls:/tls:ro,z", "--entrypoint", "/certs.sh", "netem",
                               "probe", "8125", "logit"]
            and result == {"rc": 0, "stderr": "", "serial": "S1", "not_after": 1001,
-                          "verified": True},
+                          "verified": True, "client_ca": 1},
            f"a probe joins the target's namespace and reads the first DNS name, got "
            f"{fake.calls[-1]} {result}")
+    trust = scenario.Step("c0s9", 8, 0, "trust", "logit", "", 400.0, 440.0, cas=[1, 2])
+    fake.answers = [docker.Result(0, "x\n" + json.dumps(
+        {"bundle": 2, "cas": [1, 2], "subjects": ["logit soak CA", "logit soak CA 2"]}) + "\n",
+        "")]
+    result = faults.ACTIONS["trust"].apply(ctx, trust)
+    expect(fake.calls[-1] == ["--user", "1000:1001", "-v", "/run/tls:/tls:z", "--entrypoint",
+                              "/certs.sh", "netem", "trust", "2", "1", "2"]
+           and result == {"rc": 0, "stderr": "", "bundle": 2, "cas": [1, 2],
+                          "subjects": ["logit soak CA", "logit soak CA 2"]}
+           and ctx.state[faults.TLS_TRUST_KEY] == [1, 2]
+           and faults.ACTIONS["trust"].revert(ctx, trust) == {"rc": 0, "stderr": ""},
+           f"a trust writes the next bundle of its CAs and records them, got {fake.calls[-1]} "
+           f"{result}")
+    fake.answers = [docker.Result(0, json.dumps({"serial": "S9", "not_after": 1009,
+                                                 "issuer": "logit soak CA 2",
+                                                 "verified": True}) + "\n", "")]
+    result = faults.ACTIONS["probe"].apply(ctx, probe)
+    expect(fake.calls[-1][-4:] == ["probe", "8125", "logit", "2"]
+           and result["client_ca"] == 2 and result["issuer"] == "logit soak CA 2",
+           f"a probe presents the newest CA's client certificate in the bundle in force, got "
+           f"{fake.calls[-1]} {result}")
+    signed = scenario.Step("c0s10", 9, 0, "rotate", "logit", "", 500.0, 540.0, cert="generator",
+                           days=31, ca=2)
+    result = faults.ACTIONS["rotate"].apply(ctx, signed)
+    expect(fake.calls[-1][7:] == ["issue", "generator", "2", "31", "client", "generator",
+                                  "--ca", "2"],
+           f"a rotate passes its signing CA, got {fake.calls[-1]}")
+    fake.answers = [docker.Result(0, json.dumps({"bundle": 3, "cas": [1]}) + "\n", "")]
+    dropped = scenario.Step("c0s11", 10, 0, "trust", "logit", "", 600.0, 640.0, cas=[2])
+    result = faults.ACTIONS["trust"].apply(ctx, dropped)
+    expect(result["rc"] == 1 and ctx.state[faults.TLS_TRUST_KEY] == [1, 2]
+           and ctx.state[faults.TLS_TRUST_GEN_KEY] == 3,
+           f"a trust whose report names other CAs fails and leaves the bundle in force, its "
+           f"generation used up, got {result} {ctx.state}")
+    ctx.state.pop(faults.TLS_TRUST_KEY)
     fake.answers = [docker.Result(0, "no report\n", "")]
     result = faults.ACTIONS["probe"].apply(ctx, probe)
     expect(result["rc"] == 1 and "printed no report" in result["stderr"],
@@ -14936,10 +15535,13 @@ def _tls_driver(root):
            "the netem image carries openssl and certs.sh at the entrypoint faults.py names")
     script = (root / "netem" / "certs.sh").read_text()
     expect("ec_paramgen_curve:P-256" in script and "mv -T" in script
-           and 'ln -sfn "gen-${gen}"' in script and "chmod 0644" in script
-           and "-cert probe/cert.pem" in script,
-           "certs.sh makes P-256 keys, swaps a relative live link in one rename, makes its "
-           "files readable, and presents the probe's certificate")
+           and 'ln -sfn "$2" "$1/live.next"' in script and 'link "${name}" "gen-${gen}"' in script
+           and 'link trust "gen-${gen}"' in script and "chmod 0644" in script
+           and "client=probe\n" in script and '-cert "${client}/cert.pem"' in script
+           and "-CAfile trust/live/ca.pem" in script,
+           "certs.sh makes P-256 keys, swaps a relative live link in one rename for a "
+           "certificate and the trust bundle, makes its files readable, presents the probe's "
+           "certificate from CA 1 by default, and verifies against the bundle in force")
 
 
 def _tls_stderr_line(offset, key):
@@ -14959,7 +15561,8 @@ def _tls_stderr_line(offset, key):
 
 
 def _tls_run(tmp, name, served="B2", verified=True, issued=True, first_broken=False,
-             failed_probe=False, reload_failed_at=None, failed_on="logit", lines=()):
+             failed_probe=False, reload_failed_at=None, failed_on="logit", lines=(),
+             issuer=None):
     """A run directory for `tls.served`, `self_log`, and `rise`: statsd first issued as A1
     (notAfter 100), rotated at c0s1 [+100, +140] to gen 2, B2 (notAfter 200), with a SIGHUP
     c0s2 [+110, +120] and a probe c0s3 [+125, +130]; the generator's certificate rotated at
@@ -14968,8 +15571,8 @@ def _tls_run(tmp, name, served="B2", verified=True, issued=True, first_broken=Fa
     `tls_reload_interval: 0s` and the generator's `10s`. `first_broken` makes c0s1 the broken
     one, `issued` False leaves out the `tls_issued` phase, `failed_probe` fails c0s8's apply,
     `reload_failed_at` puts a `tls_reload_failed` line on `failed_on`'s stderr at that offset,
-    and `lines` adds `(service, offset, key)` lines. The SUT's not_after gauge reads 100 until
-    +115 and 200 after it."""
+    and `lines` adds `(service, offset, key)` lines. With `issuer`, c0s1's B2 is CA 2's and c0s3
+    reads `issuer` served. The SUT's not_after gauge reads 100 until +115 and 200 after it."""
     timeline = [_phase("start", 0, t0=T0)]
     if issued:
         timeline.append(_phase("tls_issued", -5, certs={"statsd": {
@@ -14978,12 +15581,15 @@ def _tls_run(tmp, name, served="B2", verified=True, issued=True, first_broken=Fa
     for step_id, action, start, end, fields in (
             ("c0s1", "rotate", 100, 140, {"cert": "statsd", "days": 31, "gen": 2,
                                           "serial": "B2", "not_after": 200,
-                                          **({"broken": True} if first_broken else {})}),
+                                          **({"broken": True} if first_broken else {}),
+                                          **({"ca": 2, "issuer": "logit soak CA 2"}
+                                             if issuer else {})}),
             ("c0s2", "signal", 110, 120, {"signal": "HUP"}),
             ("c0s3", "probe", 125, 130, {"cert": "statsd", "port": 8125,
                                          "serial": "A1" if first_broken else "B2",
                                          "not_after": 100 if first_broken else 200,
-                                         "verified": True}),
+                                         "verified": True,
+                                         **({"issuer": issuer} if issuer else {})}),
             ("c0s4", "rotate", 150, 190, {"cert": "generator", "days": 31, "gen": 2,
                                           "serial": "G2", "not_after": 250}),
             ("c0s6", "rotate", 200, 240, {"cert": "statsd", "days": 32, "gen": 3,
@@ -15065,6 +15671,16 @@ def _tls_checks():
                and "serial differs; notAfter differs" in bad["tls.served.c0s8"].detail
                and bad["tls.served.c0s3"].status == checks.PASS,
                f"a broken rotation's certificate served FAILs, got {bad}")
+        signed = {r.id: r for r in checks.check_tls_served(checks.RunData(
+            _tls_run(tmp, "signed", issuer="logit soak CA 2")))}
+        expect(signed["tls.served.c0s3"].status == checks.PASS
+               and "issuer 'logit soak CA 2'" in signed["tls.served.c0s3"].detail,
+               f"a leaf served by the CA its rotation names PASSes, got {signed}")
+        other = {r.id: r for r in checks.check_tls_served(checks.RunData(
+            _tls_run(tmp, "other-ca", issuer="logit soak CA")))}
+        expect(other["tls.served.c0s3"].status == checks.FAIL
+               and other["tls.served.c0s3"].detail.endswith(": issuer differs"),
+               f"a leaf served by another CA than its rotation's FAILs, got {other}")
         unverified = {r.id: r for r in checks.check_tls_served(checks.RunData(
             _tls_run(tmp, "unverified", verified=False)))}
         expect(unverified["tls.served.c0s8"].status == checks.FAIL
@@ -18088,9 +18704,10 @@ def run(root, quiet=False):
                      _influx_server, _influx_rules, _influx_checks, _otlp_standin_codec,
                      _splunk_codec, _otlp_standin_server, _splunk_server, _new_shape_rules,
                      _otlp_standin_checks, _splunk_checks, _overlap_rules,
-                     _overlap_driver, _overlap_checks, _idp_rules, _refresh_checks,
+                     _overlap_driver, _overlap_checks, _overlap_tcp_rules,
+                     _overlap_tcp_checks, _idp_rules, _refresh_checks,
                      _signal_rules, _signal_actions, _sighup_driver,
-                     _reopen_checks, _tls_rules, _tls_actions, _tls_driver, _tls_checks,
+                     _reopen_checks, _tls_rules, _trust_rules, _tls_actions, _tls_driver, _tls_checks,
                      _reset_actions, _reset_rules, _prlimit_actions, _prlimit_rules,
                      _cgroup_actions, _cgroup_rules, _cgroup_io_device, _cgroup_io_actions,
                      _cgroup_io_rules, _slowclient_client,
@@ -18099,7 +18716,7 @@ def run(root, quiet=False):
                      _sampling_vectors, _absent_rules, _absent_checks, _merge_ledger,
                      _merge_rules, _delta_ledger, _delta_rules, _scrape_ledger,
                      _scrape_rules, _msgpack_reader, _datadog_trace_codec,
-                     _datadog_trace_server, _span_rules, _span_ledger, _shipped):
+                     _datadog_trace_server, _span_rules, _span_ledger, _span_join, _shipped):
             try:
                 takes_root = (_rules, _expect_rules, _expand, _random, _signals, _hung_inspect,
                               _stalled, _stall_abort,
@@ -18119,9 +18736,10 @@ def run(root, quiet=False):
                               _datadog_rules, _influx_codec, _influx_server, _influx_rules,
                               _otlp_standin_codec, _splunk_codec, _otlp_standin_server,
                               _splunk_server, _new_shape_rules,
-                              _overlap_rules, _overlap_driver, _idp_rules, _signal_rules,
+                              _overlap_rules, _overlap_tcp_rules, _overlap_driver,
+                              _idp_rules, _signal_rules,
                               _sighup_driver,
-                              _tls_rules, _tls_driver, _reset_rules, _prlimit_rules,
+                              _tls_rules, _trust_rules, _tls_driver, _reset_rules, _prlimit_rules,
                               _cgroup_rules, _cgroup_io_rules, _slowclient_rules,
                               _fan_out_rules, _sampling_vectors,
                               _absent_rules, _merge_rules, _delta_rules, _scrape_rules,

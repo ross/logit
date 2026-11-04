@@ -1,0 +1,36 @@
+# rolling-overlap-tcp's stack, merged onto tools/soak/compose.yaml: rolling-overlap's namespace
+# holder, `sut-net`, and its two instances, `logit` and `logit-b`, which here bind 8125 over TCP
+# with `reuse_port`. The holder sets `net.ipv4.tcp_migrate_req` to 1, a per-namespace sysctl
+# whose default is 0 whatever the host's: when an instance's listener closes, the kernel moves
+# the connections in its accept queue and its handshakes in flight to the other instance's,
+# instead of resetting them. The scenario declares it here, and `overlap.migrate` reads the value
+# in force against its churn client's resets. `extends.file` resolves against the project
+# directory, the base file's.
+services:
+  sut-net:
+    image: logit-soak-netem:local
+    entrypoint: ["sleep", "infinity"]
+    labels: { soak.role: netns }
+    stop_signal: SIGKILL
+    restart: "no"
+    sysctls:
+      net.ipv4.tcp_migrate_req: 1
+  logit:
+    network_mode: "service:sut-net"
+    depends_on:
+      sut-net: { condition: service_started }
+    environment:
+      LOGIT_ADMIN: unix:/tmp/admin.sock
+      SOAK_INSTANCE: logit
+  logit-b:
+    extends: { file: compose.yaml, service: logit }
+    labels: { soak.role: sut }
+    network_mode: "service:sut-net"
+    depends_on:
+      sut-net: { condition: service_started }
+    environment:
+      LOGIT_ADMIN: unix:/tmp/admin.sock
+      SOAK_INSTANCE: logit-b
+  generator:
+    depends_on:
+      logit-b: { condition: service_healthy }

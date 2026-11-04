@@ -1,0 +1,9 @@
+# Mounts the run's TLS directory, `<run>/tls`, which the driver fills from a private CA and
+# names in SOAK_TLS_DIR, read-only at /tls in the SUT and the generator. A whole directory, not
+# single files, so a `rotate` step's repointed `live` symlink reaches both. `:z` relabels it for
+# SELinux.
+services:
+  logit:
+    volumes: ["${SOAK_TLS_DIR:?set by script/soak}:/tls:ro,z"]
+  generator:
+    volumes: ["${SOAK_TLS_DIR:?set by script/soak}:/tls:ro,z"]
