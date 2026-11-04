@@ -2382,8 +2382,9 @@ the other.
   sooner after its start the commit term is every batch it delivered, plus delivered × t: it
   never persisted, and in a crash loop each life's replay carries the one before (W35). That
   assumes the spool rolled no segment, since `DiskQueue::roll_read_cursor` persists the cursor
-  at every segment boundary; a scenario using the rule sets `segment_bytes` large enough that
-  no roll happens, as `native-hop-identities` does with 512MiB.
+  at every segment boundary; the rule requires the hop sink to declare `segment_bytes`, large
+  enough that no roll happens, as `native-hop-identities` does with 512MiB, and a sink that
+  doesn't gets the one-interval band.
   The first two `native-hop` runs found both terms: a kill inside `collector`'s stop replayed 55
   batches over the queue, 50 it received in the 5 s before the kill and 5 committed before the
   stop and never persisted.
@@ -6955,10 +6956,11 @@ What the runs showed about `logit` and the harness:
   spool rolled no segment, which would persist the cursor at the boundary; the scenario's
   512MiB `segment_bytes` rules a roll out, and the harness can't see one. A harness fix: every
   replay matched what the spool's persist rule predicts.
-- **Self-test**: 3,127 expectations. Reverting the eviction allowance fails its passing case
-  and the `ledger.summary` text case; reverting the replay band's crash-loop term fails its
-  case. The eviction rule's one-eviction and late-eviction cases, and the replay band's
-  outlived-checkpoint case, FAIL as they should with each rule in place.
+- **Self-test**: 3,130 expectations. Reverting the eviction allowance fails its passing case,
+  the `ledger.summary` text case, and the inside and past surplus cases; reverting the replay
+  band's crash-loop term fails its case, and reverting its `segment_bytes` fallback fails the
+  undeclared-`segment_bytes` case. The eviction rule's one-eviction and late-eviction cases,
+  and the replay band's outlived-checkpoint case, FAIL as they should with each rule in place.
 
 ### W34: slowloris and half-open peers on a TCP and an HTTP listener (2026-11-04)
 

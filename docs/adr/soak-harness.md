@@ -1007,6 +1007,10 @@ allowed no duplicate for it, and `native-hop-identities` reaches one.
   life allows its replayed frames, `logit.component.buffer.disk.replayed` × the largest frame,
   below 0 in `ledger.hop` and above `G − counted` end to end. A life with one eviction allows
   nothing.
+- **One ingress sender.** The trigger of more than one eviction holds for a single ingress
+  sender: with several sharing `collector`'s table, another sender's churn can supply the
+  second eviction, and a multi-sender hop scenario would need a per-life capacity test
+  (ingress lives since collector's last start > `max_connections + max_connections / 4`).
 - **An upper bound, not a count.** `logit_in` can't tell a forward of an identity it no longer
   holds from a new one, and exports nothing per frame, so the row can't count the duplicates;
   the replayed frames bound them, the never-delivered backlog among them included.
@@ -1017,9 +1021,10 @@ allowed no duplicate for it, and `native-hop-identities` reaches one.
   delivered, its own replay included, plus its delivered rate after its last drain. That holds
   only while the spool rolled no segment, because `DiskQueue::roll_read_cursor` persists the
   cursor at every segment boundary whatever the interval, and the harness can't see a roll
-  (`buffer.disk.segments` is a gauge sampled at drains). A scenario using the band sets
-  `segment_bytes` large enough that no roll happens, as `native-hop-identities` does with
-  512MiB. The first
+  (`buffer.disk.segments` is a gauge sampled at drains). The band therefore requires the hop
+  sink to declare `segment_bytes`, set large enough that no roll happens, as
+  `native-hop-identities` does with 512MiB; a sink that doesn't gets the one-interval band, and
+  the row says no `segment_bytes` is set. The first
   `native-hop-identities` run FAILed three lives of its crash loop on the old band, each replay
   about one life's commits over it.
 
