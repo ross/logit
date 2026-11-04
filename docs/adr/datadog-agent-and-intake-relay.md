@@ -84,7 +84,7 @@ Three facts from the survey drive the shape of the decision:
    workspace's rationale against the `zstd` crate stays for compressing; senders use gzip.
 
 5. **`datadog_in`'s backpressure is a bounded wait on delivery, then `503` with
-   `Retry-After: 1`**, not `otlp_in`'s blocked connection (`otlp_in` has since moved to a bounded first batch and a
+   `Retry-After: 1`**, not `otlp_in`'s blocked connection (`otlp_in` has since moved to a bounded wait and a
    busy answer too: [ADR `otlp-in-busy-answer`](otlp-in-busy-answer.md)). A Datadog Agent's forwarder times a
    request out at 20 seconds and retries it with backoff, so a connection held open until the
    pipeline drains costs the Agent a slot for 20 seconds and still ends in a retry: only an
@@ -93,7 +93,8 @@ Three facts from the survey drive the shape of the decision:
    is reserved before any consumer is sent the batch, so a `503` means no consumer holds the batch
    that timed out, and the Agent's retry is the only copy. Batches of a multi-batch request
    (traces, stats) fully delivered before the deadline are delivered again by that retry, which
-   is what Datadog's own intake does with a resent request.
+   is what Datadog's own intake does with a resent request. (Amended: a request is now delivered
+   all or none; see "`datadog_in` delivers a request all or none" below.)
 
 6. **msgpack is hand-rolled** in `logit_proto::msgpack` (`nil`, bool, int, float, str, bin, array,
    map), the pickle precedent; `agent-payload`'s protos are vendored at a pinned tag and generated
@@ -956,3 +957,24 @@ delivered each timed-out request twice. [ADR `otlp-in-busy-answer`](otlp-in-busy
 `splunk_hec_in`'s first-batch rule. `prometheus_in`'s remote-write receiver followed on
 2026-11-04, by that record's amendment "`prometheus_in`'s remote-write receiver answers busy
 too".
+
+## Amendment: `datadog_in` delivers a request all or none (2026-11-04)
+
+Decision 5 bounded each batch of a multi-batch request (traces, stats) under the one deadline, so
+a `503` could follow a prefix of the request already delivered, and the Agent's retry delivered
+that prefix again. The decision accepted the duplicate because a resent request duplicates at
+Datadog's intake too. **Changed:** every batch of a request now waits under the one 5 s deadline,
+all or none, through the mechanism
+[ADR `otlp-in-busy-answer`](otlp-in-busy-answer.md)'s amendment "A request is delivered all or
+none" gives `otlp_in` and `splunk_hec_in`: room for every batch is reserved on every consumer
+before any is sent. A `503` now always means nothing of the request was taken.
+
+The Agent retries a `503` whether or not part of the request got in, so delivering a prefix
+first bought no delivery the retry doesn't make, and cost a duplicate of it. All or none removes
+the duplicate at no cost to delivery.
+
+A request with more batches than an inbox holds (64) sends its first 64 under the deadline and
+the rest without one, and is counted `logit.input.requests{class="unbounded"}` in place of `ok`.
+A request no consumer takes is refused whole, every batch counted
+`logit.input.batches.dropped{reason="closed_consumer"}`. Decision 11's `datadog_trace_in` sends
+one batch per request and is unchanged.
