@@ -494,23 +494,25 @@ is near empty, but the handshakes in flight still reset: about the dial rate tim
 time, on the closing listener's share of the port. With `net.ipv4.tcp_migrate_req=1` (Linux 5.14
 and later), the kernel moves the queue and the in-flight handshakes to the surviving listener
 instead. With a 100 ms path delay, a soak run at `0` reset 7 connections at each of two closes, of
-23,920 dials, and a run at `1` reset none across four closes, of 44,817. Set it in the network
-namespace the listeners share. Every stream client `logit` serves reconnects after a reset, but a
+23,920 dials, and a run at `1` reset none across four closes, of 44,817. Every stream client `logit` serves reconnects after a reset, but a
 line it had sent into the reset connection is lost unless its protocol acknowledges.
 
 The setting applies to TCP listeners only. A UDP socket has no handshake or accept queue.
 
-It's a node-level setting. A `hostNetwork` pod shares the node's network namespace and can't set
-network sysctls, so set it in the node image, from a privileged init DaemonSet, or through your
-distribution's node tuning:
+The sysctl is per network namespace, and both overlap instances share one, so set it where that
+namespace is owned. A new container's own namespace starts at 0 whatever the host's value, so
+setting it on the host doesn't reach a container. Set it on the container that owns the namespace
+(for example, the holder, or the first container whose network the other joins), with no added
+capability:
 
 ```sh
-sysctl -w net.ipv4.tcp_migrate_req=1    # persist it in /etc/sysctl.d/
+docker run --sysctl net.ipv4.tcp_migrate_req=1 ...    # or `sysctls:` in a Compose service
+sysctl -w net.ipv4.tcp_migrate_req=1                  # on a host; persist it in /etc/sysctl.d/
 ```
 
-The setting is per network namespace. A container with its own namespace sets it without added
-capabilities, for example `docker run --sysctl net.ipv4.tcp_migrate_req=1 ...`, or `sysctls:` in a
-Compose service.
+A `hostNetwork` pod shares the node's namespace and can't set network sysctls, so set it at the
+node: in the node image, from a privileged init DaemonSet, or through your distribution's node
+tuning.
 
 ### systemd: two instance units
 

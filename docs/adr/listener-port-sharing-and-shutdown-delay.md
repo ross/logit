@@ -60,7 +60,9 @@ the record.
   `connect()` and got `ECONNRESET` after sending its line. With `=1` (Linux 5.14 and later) the
   kernel migrated the queue to the surviving listener: zero resets in all 12 runs. A listener that
   closed while still accepting had an empty queue and reset nothing at either rate under either
-  setting.
+  setting. [Amended 2026-11-04: this was measured over loopback, where the round trip is near zero,
+  so no handshake was in flight at the close. Over a real path they reset; see the amendment at
+  the end.]
 - **An accepted connection closed with unread data** gets a reset (`ECONNRESET`). Closed after
   reading, or with nothing sent, it gets a clean EOF.
 - **Kernel counters stay per socket.** `SO_MEMINFO` on a group member reports that member's own
@@ -138,7 +140,9 @@ The connections still exposed are the few that complete their handshake between 
 and the close. Operators close that with `net.ipv4.tcp_migrate_req=1`, which `logit` documents as
 a node-level sysctl. A pod can't set it: under `hostNetwork` the pod shares the node's network
 namespace, and a `hostNetwork` pod can't set network sysctls. Without it, the clients in the
-queue get a reset, and every stream client `logit` serves reconnects after one.
+queue get a reset, and every stream client `logit` serves reconnects after one. [Amended
+2026-11-04: the exposed set also includes every handshake in flight, not only the last instant's,
+and the sysctl is per network namespace, not only node-level. See the amendment at the end.]
 
 ### 3. `shutdown: { delay }`: keep serving after the first signal
 A top-level `shutdown:` block with one field, `delay`, default `0s`, which keeps today's
@@ -190,7 +194,8 @@ During a rolling overlap, two `logit` processes run the same config against the 
   half the flows move to it, with no loss. When the old pod drains, its flows move to the new one.
 - **Loss at close is the closing socket's queue.** For UDP, that's what sat in the old socket's
   receive queue when it closed: near zero for a reader keeping up, one `SO_RCVBUF` for a stalled
-  one. For TCP, it's the accept queue under `tcp_migrate_req=0` (decision 2).
+  one. For TCP, it's the accept queue under `tcp_migrate_req=0` (decision 2). [Amended 2026-11-04: and the
+  handshakes in flight to the closing listener.]
 - **Summaries split.** A flow that moves mid-window has its `aggregate` window split across two
   processes, and each emits a partial sum for the same series. Summarization is per process; the
   operator accepts that with the overlap. Delivery stays at-least-once, and nothing is lost at the
@@ -278,8 +283,9 @@ Under [ADR `telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md), the kerne
 
 ## Amendment (2026-11-04): a close resets in-flight handshakes without `tcp_migrate_req`
 
-Decision 2 says only the connections that complete their handshake "between the last accept and
-the close" are exposed. That undersells it. With `net.ipv4.tcp_migrate_req=0`, the kernel's
+Decision 2 says the connections still exposed are the few that complete their handshake between
+the last accept and the close. That undersells it, and the loopback measurement in Context saw no
+resets because a round trip near zero leaves no handshake in flight at the close. With `net.ipv4.tcp_migrate_req=0`, the kernel's
 default, closing a listener resets every connection in its accept queue and every handshake in
 flight to it, including one whose final ACK hasn't arrived. The count is about the dial rate times
 the round-trip time, on the closing listener's share of the port, so it grows with the clients'
@@ -287,8 +293,8 @@ distance. Keeping the queue near empty by accepting through the delay doesn't re
 
 With `tcp_migrate_req=1` the kernel migrates both to the other listener. The soak saw 7 and 7
 resets at two closes of 23,920 churn dials at 0 (an earlier control read 9 and 14), and none
-across four closes of 44,817 dials at 1. The recommendation changes from "closes a narrow window"
-to: an operator who overlaps TCP listeners sets `net.ipv4.tcp_migrate_req=1` in the network
+across four closes of 44,817 dials at 1. The recommendation changes from closing a narrow window
+to this: an operator who overlaps TCP listeners sets `net.ipv4.tcp_migrate_req=1` in the network
 namespace the listeners share. The sysctl is per namespace, and Docker sets it with `--sysctl` or
 Compose `sysctls:` and no added capability. UDP is unchanged: the sysctl is TCP only.
 [docs/deploying.md](../deploying.md#tcp-listeners-and-tcp_migrate_req) states the corrected
