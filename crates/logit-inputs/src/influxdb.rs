@@ -53,7 +53,7 @@
 //!
 //! **One request, one batch, all or nothing.** The decoder parses the whole body before building
 //! any event, so a parse error delivers nothing. A decoded body is one batch, sent under one
-//! deadline ([`crate::http::deliver_with_deadline`]) that reaches every consumer or none; a `503`
+//! deadline ([`crate::http::deliver_bounded`]) that reaches every consumer or none; a `503`
 //! therefore always means nothing of the body was taken, and a client may resend it whole.
 //!
 //! **Resource cache.** `org`, `orgID`, and `bucket`, each when non-empty, become the private
@@ -80,7 +80,7 @@
 
 use crate::http::{
     body_read_error_message, collect_with_stall_bound, declared_length, decompress,
-    deliver_with_deadline, drive_connection, is_length_limit, json_response, now_nanos, Activity,
+    deliver_bounded, drive_connection, is_length_limit, json_response, now_nanos, Activity,
     BodyReadError, DecompressError, Encoding, Undelivered,
 };
 use crate::listener::Prelude;
@@ -420,41 +420,21 @@ impl Input for InfluxDbInput {
 
                     match tls_acceptor {
                         Some(acceptor) => {
-                            match tokio::time::timeout(handshake_timeout, acceptor.accept(stream))
-                                .await
-                            {
-                                Ok(Ok(tls_stream)) => {
-                                    Prelude::Tls(Box::new(tls_stream), connection_peer)
-                                }
-                                Ok(Err(err)) => {
-                                    Prelude::Failed(format!("TLS handshake failed: {err}"))
-                                }
-                                Err(_elapsed) => Prelude::Failed(format!(
-                                    "TLS handshake did not complete within {handshake_timeout:?}"
-                                )),
-                            }
+                            crate::listener::accept_tls(
+                                acceptor,
+                                stream,
+                                handshake_timeout,
+                                connection_peer,
+                            )
+                            .await
                         }
                         None => {
-                            let first_byte =
-                                tokio::time::timeout(handshake_timeout, stream.peek(&mut [0u8; 1]))
-                                    .await;
-                            match first_byte {
-                                // A clean close or a reset before the first byte is a
-                                // health-check probe, not a fault (`crate::otlp`'s "not a fault").
-                                Ok(Ok(0)) => Prelude::Probe,
-                                Ok(Err(err))
-                                    if err.kind() == std::io::ErrorKind::ConnectionReset =>
-                                {
-                                    Prelude::Probe
-                                }
-                                Ok(Ok(_)) => Prelude::Plain(stream, connection_peer),
-                                Ok(Err(err)) => Prelude::Failed(format!(
-                                    "waiting for a first byte failed: {err}"
-                                )),
-                                Err(_elapsed) => Prelude::Failed(format!(
-                                    "no first byte received within {handshake_timeout:?}"
-                                )),
-                            }
+                            crate::listener::peek_first_byte(
+                                stream,
+                                handshake_timeout,
+                                connection_peer,
+                            )
+                            .await
                         }
                     }
                 };
@@ -498,6 +478,10 @@ impl Input for InfluxDbInput {
                         .await
                     }
                     Prelude::Probe => Ok(()),
+                    Prelude::HandshakeTimeout => {
+                        crate::listener::count_handshake_timeout(&telemetry);
+                        Ok(())
+                    }
                     Prelude::Failed(err) => Err(err),
                     Prelude::ProxyRejected(err) => {
                         drop(live);
@@ -815,8 +799,11 @@ async fn respond(
     }
 
     request_peer.stamp_batches(std::slice::from_mut(&mut batch));
-    match deliver_with_deadline(&shared.sink, vec![batch], shared.busy_after).await {
-        Ok(()) => (name, OK, empty(StatusCode::NO_CONTENT)),
+    match deliver_bounded(&shared.sink, vec![batch], shared.busy_after, || {}, |_| {})
+        .await
+        .map_err(|unfinished| unfinished.undelivered)
+    {
+        Ok(_) => (name, OK, empty(StatusCode::NO_CONTENT)),
         Err(undelivered @ Undelivered::Busy(_)) => {
             undelivered.record(&shared.telemetry);
             shared.diag.clone().warn_throttled(
@@ -1838,6 +1825,30 @@ mod tests {
         expect_inbox_closed(&mut rx).await;
     }
 
+    /// A client that sends no ClientHello is closed at the handshake timeout and counted
+    /// `handshake_timeout`.
+    #[tokio::test]
+    async fn a_silent_tls_connection_is_counted_a_handshake_timeout() {
+        let (addr, _running, _rx, mut probe) = shutdown_listener(
+            InfluxDbInput::new("127.0.0.1:0")
+                .with_tls(
+                    &tls_settings(),
+                    &testdata_dir(),
+                    &logit_pipeline::tls::TlsReloader::new(),
+                )
+                .unwrap()
+                .with_handshake_timeout(Duration::from_millis(100)),
+        )
+        .await;
+        let mut silent = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        logit_pipeline::test_util::expect_closed(&mut silent, "a silent TLS connection").await;
+        probe
+            .wait_for("the handshake_timeout close count", |t| {
+                t.sum("logit.input.connections.closed", &[("reason", "handshake_timeout")]) == 1.0
+            })
+            .await;
+    }
+
     /// A connection still in its TLS accept when shutdown fires ends at once rather than at its
     /// hour-long `handshake_timeout`.
     #[tokio::test]
@@ -1866,6 +1877,24 @@ mod tests {
             Some(0.0),
             "the connection's task ended before the listener returned"
         );
+    }
+
+    /// A connection that sends no byte is closed at the handshake timeout and counted
+    /// `handshake_timeout`.
+    #[tokio::test]
+    async fn a_silent_connection_is_counted_a_handshake_timeout() {
+        let (addr, _running, _rx, mut probe) = shutdown_listener(
+            InfluxDbInput::new("127.0.0.1:0").with_handshake_timeout(Duration::from_millis(50)),
+        )
+        .await;
+        let mut silent = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        logit_pipeline::test_util::expect_closed(&mut silent, "a connection that sent no bytes")
+            .await;
+        probe
+            .wait_for("the handshake_timeout close count", |t| {
+                t.sum("logit.input.connections.closed", &[("reason", "handshake_timeout")]) == 1.0
+            })
+            .await;
     }
 
     // ---- sender address -------------------------------------------------------------------------

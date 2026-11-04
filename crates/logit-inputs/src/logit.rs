@@ -143,6 +143,14 @@
 //! nothing pins a permit forever, and a cap's worth of them turn every later peer into a
 //! `Reject`.
 //!
+//! *Counted, not diagnosed.* Expiry of the TLS accept, or of the `Hello` wait before any byte of
+//! it arrived, closes the connection with `Ok(())`, counted
+//! `logit.input.connections.closed{reason="handshake_timeout"}` (only for a connection holding a
+//! permit; one past the cap is already `rejected{reason="limit"}`). It reaches neither the accept
+//! loop's `connection_error` diagnostic nor `logit.proto.errors{reason="handshake"}`, and no bytes
+//! were framed, so it isn't a loss (`*.dropped`). A TLS accept or a `Hello` that fails, or that
+//! starts and then stalls past the timeout, stays a `connection_error` and a handshake error.
+//!
 //! **Idle timeout.** [`LogitInput::with_idle_timeout`] (`idle_timeout:`, off unless set) bounds
 //! how long a handshaken connection may stay quiet before this listener closes it and returns its
 //! permit (`docs/adr/idle-connection-timeout.md`). It's a rolling deadline, not a per-phase one.
@@ -418,6 +426,8 @@ impl Input for LogitInput {
             let senders = senders.clone();
 
             tokio::spawn(async move {
+                // A connection past the cap is already counted `rejected{reason="limit"}`.
+                let holds_permit = permit.is_some();
                 let result = match tls_acceptor {
                     Some(acceptor) => {
                         match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await
@@ -440,9 +450,13 @@ impl Input for LogitInput {
                                 .await
                             }
                             Ok(Err(err)) => Err(anyhow::anyhow!("TLS handshake failed: {err}")),
-                            Err(_elapsed) => Err(anyhow::anyhow!(
-                                "TLS handshake did not complete within {handshake_timeout:?}"
-                            )),
+                            // Policy, not a fault: counted, never diagnosed.
+                            Err(_elapsed) => {
+                                if holds_permit {
+                                    crate::listener::count_handshake_timeout(&telemetry);
+                                }
+                                Ok(())
+                            }
                         }
                     }
                     None => {
@@ -464,7 +478,7 @@ impl Input for LogitInput {
                     }
                 };
                 // One connection's error (a mid-frame disconnect, a malformed preamble, a failed
-                // or timed-out TLS accept, a cap reject that failed to write) is never fatal to
+                // TLS accept, a cap reject that failed to write) is never fatal to
                 // the listener; only `accept` failing above is.
                 // A batch past its decode budget never ends a connection: the frame loop
                 // refuses it by name and diagnoses it under `decode_budget` there.
@@ -570,7 +584,12 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin + Send>(
     )
     .await
     {
-        Ok(n) => n,
+        Ok(Some(n)) => n,
+        // No `Hello` inside `handshake_timeout`: policy, not a protocol error or a fault.
+        Ok(None) => {
+            crate::listener::count_handshake_timeout(&telemetry);
+            return Ok(());
+        }
         Err(err) => {
             telemetry.count("logit.proto.errors", 1.0, &[("reason", "handshake")]);
             return Err(err);
@@ -1110,7 +1129,8 @@ async fn close_idle<S: AsyncWrite + Unpin>(
 
 /// Reads `Hello` within a fresh `handshake_timeout` (not the TLS accept's remainder; module doc's
 /// "Pre-`Hello` timeout") and replies `HelloAck` or `Reject`, returning an error whenever the
-/// client can't proceed.
+/// client can't proceed, and `Ok(None)` when no byte of a `Hello` arrived within the timeout. A `Hello` that starts and
+/// then stalls is an error.
 ///
 /// `HelloAck` carries the best shared codec, `lz4` or no compression, this listener's
 /// `max_frame_bytes` (every later frame is bounded by it), and the smaller of the offered window
@@ -1124,10 +1144,22 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
     handshake_timeout: Duration,
     telemetry: &Telemetry,
     senders: &SenderTable,
-) -> anyhow::Result<Negotiated> {
-    let read = tokio::time::timeout(handshake_timeout, async {
-        let Some(header_buf) =
-            read_header(stream, None).await.map_err(HeaderReadError::into_inner)?
+) -> anyhow::Result<Option<Negotiated>> {
+    // One deadline for the whole `Hello`. Only a deadline that fires before any byte arrived is a
+    // silent peer; once a byte is in, a stall is a handshake error.
+    let deadline = tokio::time::Instant::now() + handshake_timeout;
+    let mut first = [0u8; frame::HEADER_LEN];
+    let filled = match tokio::time::timeout_at(deadline, stream.read(&mut first)).await {
+        Err(_elapsed) => return Ok(None),
+        Ok(read) => match header_progress(read, 0).map_err(HeaderReadError::into_inner)? {
+            Some(n) => n,
+            None => anyhow::bail!("connection closed before sending Hello"),
+        },
+    };
+    let read = tokio::time::timeout_at(deadline, async {
+        let Some(header_buf) = read_header_rest(stream, None, first, filled)
+            .await
+            .map_err(HeaderReadError::into_inner)?
         else {
             anyhow::bail!("connection closed before sending Hello");
         };
@@ -1206,7 +1238,7 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
         marks: senders.marks(&hello.senders),
     };
     write_control(stream, &ack, handshake_timeout).await?;
-    Ok(Negotiated { compression })
+    Ok(Some(Negotiated { compression }))
 }
 
 /// A header read's idle bounds on a connection with an `idle_timeout`; `None` (unbounded) on one
@@ -1271,6 +1303,7 @@ impl HeaderReadError {
 /// `Reject{GOING_AWAY}` to a peer already writing a frame, costing `logit_out` a reconnect and a
 /// resend of a batch that was on its way. The first-byte deadline firing loses nothing, since no
 /// byte has been read.
+#[cfg(test)]
 async fn read_header<S: AsyncRead + Unpin>(
     stream: &mut S,
     bounds: Option<IdleBounds>,
@@ -2512,8 +2545,98 @@ mod tests {
         control::ControlMessage::decode(&mut payload).unwrap()
     }
 
+    /// A plaintext client that completes the TCP connect and sends no `Hello` is closed after the
+    /// handshake timeout, counted `handshake_timeout` and neither diagnosed nor counted a
+    /// handshake error.
+    #[tokio::test]
+    async fn a_client_that_sends_no_hello_is_counted_a_handshake_timeout() {
+        let mut probe = TelemetryProbe::new();
+        let diag = Diagnostics::new("logit_in");
+        let (addr, input) = bound_input().await;
+        let mut input = input
+            .with_diagnostics(diag.clone())
+            .with_telemetry(probe.telemetry("logit_in", "logit_in", "listener"))
+            .with_handshake_timeout(Duration::from_millis(100));
+        let (sink, _rx) = fanout_into_channel(16);
+        tokio::spawn(async move { input.run(sink).await });
+
+        let mut silent = connect(&addr).await;
+        logit_pipeline::test_util::expect_closed(&mut silent, "a connection that sent no Hello")
+            .await;
+        logit_pipeline::test_util::wait_until("the handshake_timeout close count", || {
+            probe.sum("logit.input.connections.closed", &[("reason", "handshake_timeout")]) == 1.0
+        })
+        .await;
+        assert_eq!(diag.occurrences("connection_error"), 0, "counted, not diagnosed");
+        assert_eq!(probe.sum("logit.proto.errors", &[("reason", "handshake")]), 0.0);
+    }
+
+    /// Bytes that are not a `Hello`, then silence, are a handshake error (the `Hello` started),
+    /// not a silent peer: counted `proto.errors{handshake}` and diagnosed, never
+    /// `handshake_timeout`.
+    #[tokio::test]
+    async fn stray_bytes_then_silence_are_a_handshake_error_not_a_timeout() {
+        let mut probe = TelemetryProbe::new();
+        let diag = Diagnostics::new("logit_in");
+        let (addr, input) = bound_input().await;
+        let mut input = input
+            .with_diagnostics(diag.clone())
+            .with_telemetry(probe.telemetry("logit_in", "logit_in", "listener"))
+            .with_handshake_timeout(Duration::from_millis(100));
+        let (sink, _rx) = fanout_into_channel(16);
+        tokio::spawn(async move { input.run(sink).await });
+
+        let mut stray = connect(&addr).await;
+        stray.write_all(b"<13>hi\n").await.unwrap();
+        logit_pipeline::test_util::expect_closed(&mut stray, "stray bytes then silence").await;
+        probe
+            .wait_for("the stalled Hello counted as a handshake error", |t| {
+                t.sum("logit.proto.errors", &[("reason", "handshake")]) == 1.0
+            })
+            .await;
+        assert_eq!(
+            probe.sum("logit.input.connections.closed", &[("reason", "handshake_timeout")]),
+            0.0
+        );
+        assert_eq!(diag.occurrences("connection_error"), 1);
+    }
+
+    /// A silent TLS client past the cap is counted rejected, not also a handshake timeout.
+    #[tokio::test]
+    async fn a_silent_tls_client_past_the_cap_is_not_counted_a_handshake_timeout() {
+        let mut probe = TelemetryProbe::new();
+        let diag = Diagnostics::new("logit_in");
+        let (addr, input) = bound_input().await;
+        let mut input = input
+            .with_tls(
+                &test_tls_settings(),
+                &testdata_dir(),
+                &logit_pipeline::tls::TlsReloader::new(),
+            )
+            .unwrap()
+            .with_diagnostics(diag.clone())
+            .with_telemetry(probe.telemetry("logit_in", "logit_in", "listener"))
+            .with_max_connections(0)
+            .with_handshake_timeout(Duration::from_millis(100));
+        let (sink, _rx) = fanout_into_channel(16);
+        tokio::spawn(async move { input.run(sink).await });
+
+        let mut silent = connect(&addr).await;
+        logit_pipeline::test_util::expect_closed(&mut silent, "a silent past-the-cap client").await;
+        probe
+            .wait_for("the rejection counted", |t| {
+                t.sum("logit.input.connections.rejected", &[("reason", "limit")]) == 1.0
+            })
+            .await;
+        assert_eq!(
+            probe.sum("logit.input.connections.closed", &[("reason", "handshake_timeout")]),
+            0.0
+        );
+    }
+
     #[tokio::test]
     async fn a_tls_client_that_sends_nothing_releases_its_permit_after_the_handshake_timeout() {
+        let mut probe = TelemetryProbe::new();
         let diag = Diagnostics::new("logit_in");
         let listener_diag = diag.clone();
         let (addr, input) = bound_input().await;
@@ -2525,6 +2648,7 @@ mod tests {
             )
             .unwrap()
             .with_diagnostics(listener_diag)
+            .with_telemetry(probe.telemetry("logit_in", "logit_in", "listener"))
             .with_max_connections(1)
             .with_handshake_timeout(Duration::from_millis(200));
         let (sink, _rx) = fanout_into_channel(16);
@@ -2537,14 +2661,15 @@ mod tests {
         logit_pipeline::test_util::expect_closed(&mut silent, "a silent TLS connection").await;
 
         // The close alone doesn't prove the permit is back: the connection's task drops the
-        // stream, then reports `connection_error`, then drops the permit, with no `.await` in
-        // between. The `logit.input.connections` gauge can't say either, since it counts only a
-        // connection whose TLS accept succeeded. The diagnostic is the task's last step, and on
-        // this current-thread runtime the permit drop runs in the same poll.
+        // stream, then counts the timeout, then drops the permit, with no `.await` in between.
+        // The `logit.input.connections` gauge can't say either, since it counts only a
+        // connection whose TLS accept succeeded. The count is the task's last step, and on this
+        // current-thread runtime the permit drop runs in the same poll.
         logit_pipeline::test_util::wait_until("the silent connection's task to end", || {
-            diag.occurrences("connection_error") >= 1
+            probe.sum("logit.input.connections.closed", &[("reason", "handshake_timeout")]) == 1.0
         })
         .await;
+        assert_eq!(diag.occurrences("connection_error"), 0, "counted, not diagnosed");
 
         // A `HelloAck` here, not `Reject{INTERNAL}`, proves the permit came back.
         let connector = tls_connector().await;

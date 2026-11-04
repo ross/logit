@@ -114,8 +114,50 @@ pub(crate) enum Prelude {
     Plain(tokio::net::TcpStream, ConnectionPeer),
     /// A close or a reset before the first byte: a TCP health check, not a fault.
     Probe,
+    /// The TLS accept or the first-byte peek outlasted `handshake_timeout:`. Policy, not a fault:
+    /// counted by [`count_handshake_timeout`], never diagnosed.
+    HandshakeTimeout,
     Failed(String),
     ProxyRejected(anyhow::Error),
+}
+
+/// Counts a connection closed because its TLS accept or first-byte wait outlasted
+/// `handshake_timeout:`. No request was read, so it is not a loss (`*.dropped`).
+pub(crate) fn count_handshake_timeout(telemetry: &logit_core::telemetry::Telemetry) {
+    telemetry.count("logit.input.connections.closed", 1.0, &[("reason", "handshake_timeout")]);
+}
+
+/// The TLS accept step of an HTTP listener's prelude, bounded by `handshake_timeout`. Expiry is
+/// [`Prelude::HandshakeTimeout`]; a failed accept is [`Prelude::Failed`].
+pub(crate) async fn accept_tls(
+    acceptor: tokio_rustls::TlsAcceptor,
+    stream: tokio::net::TcpStream,
+    handshake_timeout: Duration,
+    peer: ConnectionPeer,
+) -> Prelude {
+    match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await {
+        Ok(Ok(tls_stream)) => Prelude::Tls(Box::new(tls_stream), peer),
+        Ok(Err(err)) => Prelude::Failed(format!("TLS handshake failed: {err}")),
+        Err(_elapsed) => Prelude::HandshakeTimeout,
+    }
+}
+
+/// The plaintext first-byte step of an HTTP listener's prelude: a `peek` that consumes nothing,
+/// bounded by `handshake_timeout`. A clean close or a reset before the first byte is a health
+/// check ([`Prelude::Probe`]); expiry is [`Prelude::HandshakeTimeout`].
+pub(crate) async fn peek_first_byte(
+    stream: tokio::net::TcpStream,
+    handshake_timeout: Duration,
+    peer: ConnectionPeer,
+) -> Prelude {
+    let first_byte = tokio::time::timeout(handshake_timeout, stream.peek(&mut [0u8; 1])).await;
+    match first_byte {
+        Ok(Ok(0)) => Prelude::Probe,
+        Ok(Err(err)) if err.kind() == std::io::ErrorKind::ConnectionReset => Prelude::Probe,
+        Ok(Ok(_)) => Prelude::Plain(stream, peer),
+        Ok(Err(err)) => Prelude::Failed(format!("waiting for a first byte failed: {err}")),
+        Err(_elapsed) => Prelude::HandshakeTimeout,
+    }
 }
 
 /// The pause after a `Resource` or `Other` accept error, so a sustained one (fd exhaustion) can't
