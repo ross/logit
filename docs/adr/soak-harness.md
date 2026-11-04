@@ -838,9 +838,9 @@ the sink's events received, and those its events delivered plus its counted drop
   the most E_r one drain interval held among the last few it moved in, per relay life a kill or an
   `exit` ended or the end sequence didn't stop. The sender flushes on its own period, which can
   span several relay drains, so the last interval alone is often empty while a flush the relay
-  answered after it went uncounted. A life killed before it drained twice, or before its
-  listener moved in an interval, has no interval of its own, so it takes the highest rate and
-  the median interval among the relay's other lives. The listener counts an event sent before it answers and the
+  answered after it went uncounted. A life whose last counts are unseen and whose
+  listener never moved in an interval takes the highest rate among the relay's other lives, and,
+  with fewer than two drains, their median interval too. The listener counts an event sent before it answers and the
   sink counts it delivered after, so a request the relay answered and then lost before counting it
   FAILs here, which V can't show mid-life under cumulative temporality. The two count one unit when
   each delivered event carries one record: `otlp_out` writes one data point per record and

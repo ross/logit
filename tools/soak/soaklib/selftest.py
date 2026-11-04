@@ -9154,7 +9154,9 @@ def _relay_ledger():
         early_kill = row("relay-delivered-early-kill", kill=(7, 15), sut_extra=delivered(6400))
         expect(early_kill is not None and early_kill.status == checks.PASS
                and "ΣE_r 6,300 against Del 6,400 − 100 (the busiest recent drain interval"
-               in early_kill.detail and "= 6,300, ok" in early_kill.detail,
+               in early_kill.detail
+               and "counts are unseen; life 0 borrowed the relay's other lives' rate and "
+                   "interval)" in early_kill.detail and "= 6,300, ok" in early_kill.detail,
                f"a relay life killed before it drained twice is allowed an interval at the "
                f"relay's other lives' rate, got {early_kill}")
         unwritten = row("relay-delivered-unwritten", sut_extra=delivered(

@@ -6182,25 +6182,30 @@ def _relay_tail(tel, listener, life, lives):
     interval. The sender's flushes can be sparser than the relay's drains, so the last
     interval is often empty while a flush the relay answered after it went uncounted.
 
-    A life killed before it drained twice, or before the listener moved in an interval, has
-    no rate or interval of its own, yet the relay can have taken and lost a flush in it. Its
-    rate and interval then come from the relay's other `lives`, the highest rate and the
-    median interval among them, so such a life is allowed the one interval a life with
-    history is."""
+    A life with fewer than two drains has no gaps and no rate, yet the relay can have taken
+    and lost a flush in it, so it takes the highest rate and the median interval among the
+    relay's other `lives`. A life with two or more drains whose listener never moved in an
+    interval keeps its own gaps and takes only the rate. Either way it is allowed the one
+    interval a life with history is.
+
+    Returns `(allowance, borrowed)`, where `borrowed` is None, "rate", or "rate and
+    interval"."""
     def own(of):
         drains = tel.life_drains(of)
         return ([b - a for a, b in zip(drains, drains[1:])],
                 _commit_rate(tel, "logit.component.events.sent", listener, of)[0])
 
     gaps, rate = own(life)
+    borrowed = None
     if not gaps or not rate:
+        borrowed = "rate and interval" if not gaps else "rate"
         rest = [own(other) for other in lives if other != life]
         pooled = [gap for found, _ in rest for gap in found]
         gaps = gaps or pooled
         rate = rate or max((found for _, found in rest), default=0.0)
     if not gaps:
-        return 0
-    return round(rate * statistics.median(gaps))
+        return 0, borrowed
+    return round(rate * statistics.median(gaps)), borrowed
 
 
 def _relay_cross(led, sink, relay, listener, tel, sent, unseen, lives):
@@ -6211,13 +6216,17 @@ def _relay_cross(led, sink, relay, listener, tel, sent, unseen, lives):
                                             component=sink).values())
     unwritten = sum(sum(led.sut.counter_by_life(name, component=sink).values())
                     for name in RELAY_UNWRITTEN)
-    tail = sum(_relay_tail(tel, listener, life, lives) for life in unseen)
+    tails = {life: _relay_tail(tel, listener, life, lives) for life in unseen}
+    tail = sum(allowance for allowance, _ in tails.values())
+    borrowed = "; ".join(f"life {life} borrowed the relay's other lives' {what}"
+                         for life, (allowance, what) in tails.items() if what and allowance)
     total = sum(sent.values())
     floor = max(0, delivered - unwritten - tail)
     text = (f"{sink} to {relay} over the run: ΣE_r {_n(total)} against Del {_n(delivered)}"
             + (f" − unwritten {_n(unwritten)}" if unwritten else "")
             + (f" − {_n(tail)} (the busiest recent drain interval per relay life whose last "
-               "counts are unseen)" if tail else "") + f" = {_n(floor)}")
+               "counts are unseen" + (f"; {borrowed}" if borrowed else "") + ")"
+               if tail else "") + f" = {_n(floor)}")
     if total >= floor:
         return PASS, f"{text}, ok"
     return FAIL, (f"{text}, {_n(floor - total)} delivered to the relay and never counted "
