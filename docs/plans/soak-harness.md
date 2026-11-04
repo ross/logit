@@ -3124,21 +3124,96 @@ under "Deferred to a later round" wait.
     `otlp_out` and `splunk_hec_out` beside `prometheus_out`, `datadog_out`, and `influxdb_out`
     (decided with Ross).
 
-Two follow-ups have no item yet. An overlap of TCP listeners, item 11 over `transport: tcp`,
-will need `net.ipv4.tcp_migrate_req`, without which the connections still in the old socket's
-accept queue at its close are reset rather than moved to the new one. A CA rotation, item 12's
-TLS half carried further, will rotate to a bundle of the old and new CAs, then to a leaf the new
-CA signed.
+Deferred to a later round (decided with Ross, 2026-10-29): the `datadog_trace` pair, resource
+faults, connection adversity, and native-hop variants. Two
+follow-ups had no item: an overlap of TCP listeners, and a CA rotation.
 
-Deferred to a later round (decided with Ross, 2026-10-29):
+Round 4 (decided with Ross, 2026-11-03) takes the list below that was deferred on 2026-10-29,
+and the two follow-ups after it, as items 27 to 34, resource faults first, since they need the
+least new machinery. A survey on this development host (Fedora, cgroup v2 under systemd,
+Docker 29.9, SELinux enforcing) checked each fault's mechanism before it was planned:
 
-- The `datadog_trace_in → datadog_trace_out` pair. The ledger has no span unit, and the harness
-  has no stdlib msgpack reader.
-- Resource faults: a cgroup memory limit, a CPU quota, a file-descriptor limit, a slow disk, and
-  clock steps.
-- Connection adversity: slowloris senders and half-open peers.
-- Native-hop variants: a TLS hop, a window under high RTT, and more senders than the identity
-  table holds.
+27. **A file-descriptor limit (W31).** A `prlimit` action sets the SUT's `RLIMIT_NOFILE` for the
+    step's window and restores it after, through a one-shot of the netem image (which ships
+    `prlimit`) joined to the SUT's PID namespace with `--cap-add SYS_RESOURCE`; it needs no
+    `label=disable`. `docker update` can't change a running container's ulimits. The action
+    records the limit it found and restores that, and reports a SUT start inside the window,
+    since a new process starts with the container's own limit and the fault is gone. Lowering
+    the limit closes nothing already open, so the step sets it a few descriptors above the
+    SUT's steady `logit.process.fds`. `logit.process.fds.limit` reads `/proc/self/limits`, so
+    an `[[expect]]` row confirms the limit landed. What it reaches: `classify_accept_error`'s
+    `resource` class and its backoff on every TCP and HTTP listener
+    (`logit.input.accept.errors{reason="resource"}`), the admin endpoint's accept backoff,
+    `tail_in`'s directory and file opens, a spool segment's create
+    (`buffer.disk.errors{op}`), `file_out`'s reopen, and sink redials. Two scenarios:
+    `fd-limit-tcp` from `tcp-ingress`, which should lose nothing, since the backlog fills and
+    the sender retries, with `[[expect]]` rows on the resource accept errors (above 0 in the
+    window, 0 after it) and on the limit's minimum; and `fd-limit-tail` from
+    `tail-rotate-delete`, whose rotations need opens inside the window. The window excuses
+    `progress` and `ready`. W31 first checks two facts the survey left open: the level of the
+    accept and spool diagnostics, which decides whether `self_log` needs an excuse, and whether
+    a SUT with a TCP listener at the default `max_connections:` of 1024 already logs
+    `fd_limit_warning` at start, since a container's soft limit defaults to 1024 and `logit`
+    doesn't raise it; that one is a product finding for the fixing session, not the harness.
+28. **A CPU quota and memory pressure (W32).** A `cgroup` action writes `cpu.max` or
+    `memory.high` in the SUT's own cgroup (`system.slice/docker-<id>.scope`) for the window
+    and writes `max` back after, through a one-shot with `/sys/fs/cgroup` bound read-write and
+    `label=disable`, without which SELinux denies the write. `docker update` is the wrong tool
+    for both: `--memory` can't return to unlimited, and `--cpus` stays in `HostConfig` and
+    comes back on the next start. A SUT start inside the window makes a new scope and drops the
+    write, which the action reports as `prlimit` does. Both windows excuse what a `pause`
+    excuses: `ready` (the HEALTHCHECK's `logit ready` runs in the throttled cgroup), `progress`,
+    and UDP wire loss. Two scenarios:
+    - `cpu-quota`, from `udp-flood-sink-stop`, at a quarter of a CPU or less for 120 s:
+      `[[expect]]` rows that kernel drops (`logit.input.kernel.dropped`) and the receive queue's
+      drops are counted, and that flush ticks resume after. `rss_slope` and `fd_slope` hold.
+    - `memory-high`, from `sink-outage-block`, with `memory.high` set a margin above what the
+      sink's `buffer:` bound should cost, through a sink outage: an `[[expect]]` maximum on
+      `logit.process.memory.resident.bytes` and no OOM. `logit` has no process-wide memory cap
+      (`max_memory` bounds one Lua VM), so this is the soak that shows a `buffer:` bound bounds
+      memory. `memory.max` isn't planned: its outcome is an OOM kill, which `exit` FAILs, and an
+      expected-OOM excuse waits for a reason to want one.
+29. **A slow disk (W33).** `io.max` doesn't throttle on this host: a 1 MiB/s write limit let
+    4 MiB through with `fsync` in 0.1 s, likely because overlayfs over btrfs over dm-crypt
+    loses the writeback's cgroup. W33 puts a `dm-delay` device over a loop file in the run
+    directory instead, made in a privileged one-shot (the netem image gains `dmsetup`,
+    `losetup`, and `mkfs.ext4`), mounted as an `ext4` Docker volume at the spool path by a
+    compose override, as `spool-enospc` mounts its tmpfs, with the delay changed by
+    `dmsetup suspend`, `reload`, and `resume`. Devices are named per compose project, removed
+    in the end sequence, and swept at the driver's start for a crashed run's leftovers. One
+    scenario, `slow-spool`, from `spool-kill-replay`, with a SUT stop inside the slow window,
+    reaches the spool's segment `sync_data`, its persist worker's cursor write, and the write a
+    cancelled push leaves running. A `dm-flakey` `error_writes` variant reaches
+    `buffer.disk.errors{op}` on real I/O errors. W33 lands last of the three and may be
+    dropped if the device setup proves fragile.
+30. **Clock steps stay deferred.** `CLOCK_REALTIME` can't be namespaced, a time namespace
+    offsets only the monotonic clocks and Docker can't make one, and stepping the host's clock
+    would break the driver's own timeline. `libfaketime` in an image layer could step the SUT's
+    wall clock, but the checks place every drain by the SUT's own NDJSON timestamp, so a step
+    would misplace drains against the fault windows; placing drains by the time the driver read
+    them comes first. `tail-rotate-stale` already reaches the stale paths from the producer's
+    side.
+31. **Connection adversity (W34).** A stdlib one-shot client, cued by a step, against a TCP and
+    an HTTP listener: slowloris connections that trickle one byte at a time under
+    `handshake_timeout:` and `idle_timeout:`, enough of them to fill `max_connections:`, and
+    half-open peers, connections whose packets a partition drops with no FIN or RST. Rows:
+    `logit.input.connections.closed{reason}` per cause, a well-behaved generator's wire loss at
+    0 while the slow clients hold their slots, and no descriptor growth after.
+32. **Native-hop variants (W35).** `native-hop` over TLS from the run's private CA, through a
+    certificate rotation; under a netem delay on the hop long enough that the send window, not
+    the link, bounds throughput, with an `[[expect]]` row on frames in flight; and with more
+    sender identities than `logit_in`'s table holds (`max_connections:` and a quarter more),
+    reached by a small `max_connections:` and repeated sink restarts, each minting an identity,
+    so the table evicts one and `ledger.hop` judges what the evicted sender resends.
+33. **The `datadog_trace_in → datadog_trace_out` pair (W36).** A span unit in the ledger, a
+    stdlib msgpack reader beside `soaklib/otlp.py`, and a scenario on the stand-in from a
+    generator's tracer-shaped payloads.
+34. **A TCP rolling overlap, a CA rotation, and a span join (W37).** Item 11 over
+    `transport: tcp`, with `net.ipv4.tcp_migrate_req` set on the namespace holder (a per-namespace
+    sysctl, so `--sysctl` on that container), without which the connections still in the old
+    socket's accept queue at its close are reset rather than moved to the new one; item 12's
+    TLS half carried to a bundle of the old and new CAs, then a leaf the new CA signed; and a
+    `native-hop-spans` row that joins each `collector` span's parent id to a sender span id.
 
 **Items 1 and 2 land first, as two stacked PRs, W7a and W7b.** Both touch code the harness has
 never driven, and item 2 forces the compose override, the service list, and the per-sink ledger
@@ -3189,6 +3264,14 @@ that items 3, 7, and 11 need.
 | W27 | `soak/w27` | `soak/w27: a syslog_in TCP and TLS soak, and the stream-sink buffer-loss gap` | M | W26 |
 | W28 | `soak/w28` | `soak/w28: graphite_out and otlp_out soaks into real receivers` | M | W27 |
 | W29 | `soak/w29` | `soak/w29: OTLP- and HEC-shaped stand-ins for otlp_out and splunk_hec_out` | M | W28 |
+| W30 | `soak/w30` | `soak/w30: plan round 4, and three round-3 harness follow-ups` | S | — |
+| W31 | `soak/w31` | `soak/w31: file-descriptor-limit soaks, with a prlimit action` | M | W30 |
+| W32 | `soak/w32` | `soak/w32: CPU-quota and memory-pressure soaks, with a cgroup action` | M | W31 |
+| W33 | `soak/w33` | `soak/w33: a slow-disk spool soak on a dm-delay volume` | M | W32 |
+| W34 | `soak/w34` | `soak/w34: slowloris and half-open peer soaks` | M | W32 |
+| W35 | `soak/w35` | `soak/w35: native-hop soaks over TLS, under RTT, and past the identity table` | M | W34 |
+| W36 | `soak/w36` | `soak/w36: a datadog_trace pair soak, with a span unit` | M | W35 |
+| W37 | `soak/w37` | `soak/w37: a TCP rolling overlap, a CA rotation, and a span join row` | M | W36 |
 
 - **W0**: [ADR `soak-harness`](../adr/soak-harness.md), this plan, and a row in each README.
 - **W1a**: `script/soak`, `compose.yaml`, the netem image, `scenario.py`, `docker.py`,
@@ -3371,10 +3454,17 @@ that items 3, 7, and 11 need.
   reset step and its `reset-counted` expectation. Each has an amendment to ADR `soak-harness`
   and self-test fixtures for its rules. The reset step hasn't run yet.
 
-§10's follow-ups to items 11 and 12, and its list deferred to a later round, have no workstream
-yet.
+- **W30**: §10's items 27 to 34 and these rows; a self-test case pinning `label=disable` to the
+  `reset` one-shot; `ledger.relay`'s allowance for a relay life killed before its first flush,
+  from the relay's other lives, with a self-test case; and the round-3 follow-up Findings
+  rewrapped. The stall-kill bound is left to the change that counts a stream sink's abandoned
+  buffer bytes.
+- **W31** to **W37**: items 27, 28, 29, 31, 32, 33, and 34 in turn, each with its action or
+  wire, self-test fixtures for each rule, an amendment to ADR `soak-harness` where it adds a
+  ledger rule or an action, and each scenario's run recorded under "Findings". Item 30 has no
+  workstream.
 
-Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9a → W9b → W10a → W10b → W11a → W11b → W12a → W12b → W12c → W12d → W14 → W13b → W15, linear; W13a, W16, and W17 land off `main` beside W14, and W18, W19, and W20 off `main` after it. W21 → W22 → W23 → W24 → W25 → W26 → W27 → W28 → W29 land after them, a linear stack off `main`. Each PR is based on and targets its
+Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9a → W9b → W10a → W10b → W11a → W11b → W12a → W12b → W12c → W12d → W14 → W13b → W15, linear; W13a, W16, and W17 land off `main` beside W14, and W18, W19, and W20 off `main` after it. W21 → W22 → W23 → W24 → W25 → W26 → W27 → W28 → W29 land after them, a linear stack off `main`. W30 lands off `main`, then W31 → W32 → W33 and W34 → W35 → W36 → W37, two stacks off W32, the second needing none of W33. Each PR is based on and targets its
 parent's branch and is brought up to date with `git merge origin/main`, never a rebase.
 
 ## Findings
