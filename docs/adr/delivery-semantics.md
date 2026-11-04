@@ -403,9 +403,10 @@ The workstream that closes item 3 settled these:
   `partial_success`. `prometheus_in`'s receiver answers `503`. `datadog_in` and `datadog_trace_in`
   answer the `503` with `Retry-After: 1` they use for a busy pipeline, counted under their own
   reason.
-- **`splunk_hec_in` answers by how much of the body was taken.** A refused first batch is `503`
-  code 9 with `Retry-After: 1`. A refused later batch is `500` code 8 with no `ackId`, because code
-  9 promises nothing was taken ([ADR `splunk-hec-relay`](splunk-hec-relay.md)).
+- **`splunk_hec_in` answers by how much of the body was taken.** A body refused before anything
+  was sent is `503` code 9 with `Retry-After: 1`. A refused later batch of a body too large to
+  reserve whole is `500` code 8 with no `ackId`, because code 9 promises nothing was taken
+  ([ADR `splunk-hec-relay`](splunk-hec-relay.md)).
 - **`tail_in` and `docker_in` freeze and stop.** On the first refused batch the driver stops
   writing its checkpoint and returns, and the node finishes, like a finite `generate_in`. The
   frozen checkpoint is the last one written, at or before the last line a consumer took. A restart

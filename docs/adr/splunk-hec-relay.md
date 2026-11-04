@@ -1,6 +1,6 @@
 ---
 created: 2026-09-25
-updated: 2026-11-03
+updated: 2026-11-04
 ---
 
 # Splunk HEC: a lossless pair in the OpenTelemetry exporter's vocabulary, spans as HEC events, and opt-in acknowledgment
@@ -847,3 +847,20 @@ spare clients a resend the posture already accepts, and an id's `true` still mea
 the pipeline", not "delivered by a sink". The operator's remedy is to dedupe downstream, or to
 accept the duplicates, as for the other duplicate windows in this ADR. This record has no
 observation of what Splunk answers for an id pending across its own restart.
+
+## Amendment (2026-11-04): a body is delivered all or none
+
+Decision 3's bounded wait covered a body's first batch only, and the rest waited with no bound.
+A client whose timeout passed during that wait resent the body, and the detached task delivered
+the original too. **Changed:** every batch of a body now waits under the one 5 s deadline, all or
+none ([ADR `otlp-in-busy-answer`](otlp-in-busy-answer.md)'s amendment "A request is delivered all
+or none" has the mechanism, shared with `otlp_in` and `datadog_in`). A `503` code 9 still means
+nothing of the body was taken, and a `200` now also means no part of it waited past the bound.
+
+- **A body with more batches than an inbox holds** (64) sends its first 64 under the deadline
+  and the rest without one, as decision 3 sent every batch after the first, and is counted
+  `logit.input.requests{class="unbounded"}` in place of `ok`. It's the one case where a stall
+  still holds a request open with no bound.
+- **The 2026-09-30 closed-downstream amendment narrows.** A body no consumer takes is refused
+  whole, `503` code 9, before anything is sent. The `500` code 8 for a later batch now arises
+  only in an unbounded body's detached rest.
