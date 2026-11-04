@@ -8,7 +8,7 @@
 # as 501 and as a 503 answered after storing; any other 3xx or 4xx, as a redirect; and a reset
 # after the request left. A stop of the stand-in is the connect-refused row. A kill of the SUT
 # comes first, so the life it ends is reported and every cued row falls in the final life,
-# which the ledger judges exactly. Not cued: a 2xx, which every other request is; a dial past
+# which the ledger judges. Not cued: a 2xx, which every other request is; a dial past
 # `connect_timeout:`; and the request timeout, which a held answer would turn into a stall.
 # The unit is the span, each its own trace: G the spans the generator's writer saw accepted,
 # W the spans the SUT's listener sent, V the spans the stand-in stored under a 2xx answer.

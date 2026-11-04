@@ -6957,7 +6957,7 @@ What the runs showed about `logit` and the harness:
   kill takes the life's last telemetry interval: in the second run life 0 read W − X − V = −210,
   its last drain's sends uncounted. The first run put the kill after the cues, so none of the
   rows the scenario exists for was judged at egress. A measurement fix: moving the kill to the
-  cycle's start judged them in the final life, exactly.
+  cycle's start judged them in the final life.
 - **The listener never answered busy.** The SUT sink's default buffer absorbed each 10 s hold,
   138 batches at most, so `datadog_trace_in` sent every batch without its 2 s busy wait and the
   `503` path stayed unexercised. The generator's 50-batch queue overflowed only across the SUT
