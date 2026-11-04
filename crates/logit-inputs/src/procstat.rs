@@ -33,8 +33,8 @@ use std::io;
 /// builds for. A Linux test pins it against `sysconf`.
 pub(crate) const USER_HZ: u64 = 100;
 
-/// Why a `/proc/self` read reported nothing. A caller stops asking after the first one: none of
-/// these causes clears up later in the same process.
+/// Why a `/proc/self` read reported nothing. [`Unavailable::is_permanent`] says whether asking
+/// again can help.
 #[derive(Debug)]
 pub(crate) enum Unavailable {
     /// Not a Linux build. The non-Linux twins' only answer.
@@ -47,6 +47,26 @@ pub(crate) enum Unavailable {
     Io(io::Error),
     /// The file read, but not in the shape this module parses. Names what was missing.
     Malformed(&'static str),
+}
+
+impl Unavailable {
+    /// Whether the cause holds for the life of the process, so a caller can stop asking.
+    ///
+    /// Permanent: a non-Linux build, a file that doesn't exist or that a sandbox forbids (gVisor,
+    /// a seccomp profile), and contents in a shape this module doesn't parse. Every other I/O
+    /// error is transient, `EMFILE` and `ENFILE` above all: the process at its descriptor limit
+    /// can't open `/proc/self/status`, and that is the moment these metrics matter most.
+    pub(crate) fn is_permanent(&self) -> bool {
+        match self {
+            Self::NotLinux | Self::Malformed(_) => true,
+            Self::Io(err) => matches!(
+                err.kind(),
+                io::ErrorKind::NotFound
+                    | io::ErrorKind::PermissionDenied
+                    | io::ErrorKind::Unsupported
+            ),
+        }
+    }
 }
 
 impl fmt::Display for Unavailable {

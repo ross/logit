@@ -460,9 +460,11 @@ Without that handle, nothing is sampled.
 | `logit.process.uptime` | gauge | Seconds since `internal` started. |
 
 **The procfs points are Linux-only**, and each of their four sources (`status`, `stat`, `fd`,
-`limits`) latches off on its own first failed read, with one diagnostic: `debug` on a non-Linux
-build, `warn` for a failed read on Linux. A sandbox that hides one file silences only the points
-that file feeds. The allocator gauge doesn't depend on procfs.
+`limits`) latches off on its own first permanent failure, with one diagnostic: `debug` on a
+non-Linux build, `warn` for a missing, forbidden, or unparseable file on Linux. A sandbox that
+hides one file silences only the points that file feeds. A transient failure, such as `EMFILE` at
+the descriptor limit, skips that tick's points and retries on the next, with a throttled `warn`
+under the `procfs_status`, `procfs_stat`, `procfs_fd`, or `procfs_limits` key. The allocator gauge doesn't depend on procfs.
 
 **CPU is a delta, like every other `internal` counter.** The first tick's delta is CPU time since
 process start, so a cumulative total downstream equals the kernel's own counter. Every tick emits
