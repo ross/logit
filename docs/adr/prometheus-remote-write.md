@@ -1,6 +1,6 @@
 ---
 created: 2026-09-17
-updated: 2026-10-26
+updated: 2026-11-03
 ---
 
 # Prometheus remote-write: a receiver on `prometheus_in`, a sender on `prometheus_out`
@@ -303,7 +303,8 @@ misconfigured sender, not a tuning problem.
 `204` is what the spec recommends for a successful write, and the batch is handed to the `Fanout`
 **before** the response is built — the ordering `otlp_in` already uses — so channel backpressure
 delays the `204` and the sender's own queue throttles. That is remote-write's flow-control model
-working as designed, not a stalled receiver.
+working as designed, not a stalled receiver. (`otlp_in` has since bounded a request's first batch
+at 2 s and answers busy past it: [ADR `otlp-in-busy-answer`](otlp-in-busy-answer.md).)
 
 **`405 + Allow: POST` is a deliberate divergence from `otlp_in`**, which answers `404` for a
 non-`POST` (`handle_http` in `crates/logit-inputs/src/otlp.rs`). `prometheus_out`'s exposition

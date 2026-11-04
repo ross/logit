@@ -1,6 +1,6 @@
 ---
 created: 2026-09-25
-updated: 2026-10-25
+updated: 2026-11-03
 ---
 
 # Deployment threat model: accidental data inside a trust boundary, not a malicious peer
@@ -101,9 +101,21 @@ consequence that each such entry cites this ADR. The revisit trigger reopens eve
   per-frame stall bound, and that bound is the listener's `idle_timeout`, off by default
   ([ADR `untrusted-input-bounds`](untrusted-input-bounds.md)'s "A total body deadline";
   [ADR `idle-connection-timeout`](idle-connection-timeout.md)'s 2026-09-25 amendment). With enough
-  connections, such a peer holds the whole `max_connections` cap. If the trigger fires, the
-  candidates are a total deadline, a minimum transfer rate, or a per-peer connection cap, each
+  connections, such a peer holds the whole `max_connections` cap. On the HTTP listeners,
+  `idle_timeout` does bound a trickled request head: its deadline runs from the connection's start
+  or the last finished request (`Activity::stamp_progress` moves only when a request finishes), and head bytes don't
+  re-arm it. A body is bounded only per frame (`collect_with_stall_bound`). If the trigger fires,
+  the candidates are a total deadline, a minimum transfer rate, or a per-peer connection cap, each
   worth its false positives only on an untrusted network.
+- **A client trickling bytes holds a TCP stream listener's connection permit.** The stream driver
+  behind `statsd_in`, `syslog_in`, `graphite_in`, and `lines_in` under `transport: tcp` re-arms
+  `idle_timeout` on every read that returns bytes, so nothing bounds a client that sends one byte
+  per interval. With enough connections, such a peer holds the whole `max_connections` cap.
+  Slowloris-style trickling is intentional behavior of an attacker, not accidental data from a
+  misconfigured sender or a wedged peer, so it is outside this ADR's threat model (decided
+  2026-11-03). The revisit trigger and candidates are the body bullet's: a total deadline, a
+  minimum transfer rate, or a per-peer connection cap, each worth its false positives only on an
+  untrusted network.
 - **A native attribute map with keys in descending dictionary order inserts in quadratic time.**
   `read_attr_map` inserts each key into `AttrMap`'s sorted storage as it reads it. Measured:
   80,000 keys take 3.4 s in descending order against 20 ms ascending, and real maps are far too

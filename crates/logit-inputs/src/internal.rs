@@ -282,9 +282,11 @@ type Reader<T> = fn() -> Result<T, Unavailable>;
 /// Samples the procfs- and allocator-backed `logit.process.*` metrics once per `internal` tick
 /// (`docs/adr/process-level-metrics.md`).
 ///
-/// Each of the four procfs sources latches off on its own first failure, with one diagnostic, as
-/// `crate::tcp::AcceptQueueSampler` does: a sandbox that hides one file must not silence the
-/// others. The heap hook is independent of all four.
+/// Each of the four procfs sources latches off on its own first permanent failure
+/// ([`Unavailable::is_permanent`]), with one diagnostic: a sandbox that hides one file must not
+/// silence the others. `crate::tcp::AcceptQueueSampler` shares that per-source latch but latches
+/// on any error. Here a transient failure skips that tick's reading and retries on the next, so a
+/// process at its descriptor limit keeps reporting once the limit clears. The heap hook is independent of all four.
 struct ProcessSampler {
     read_status: Reader<Status>,
     read_cpu: Reader<CpuTicks>,
@@ -335,10 +337,11 @@ impl ProcessSampler {
                     telemetry.gauge("logit.process.threads", status.threads as f64, &[]);
                 }
                 Err(err) => {
-                    self.status_enabled = false;
+                    self.status_enabled = !err.is_permanent();
                     report(
                         diag,
                         &err,
+                        "procfs_status",
                         "/proc/self/status",
                         "logit.process.memory.resident.bytes and logit.process.threads",
                     );
@@ -356,8 +359,14 @@ impl ProcessSampler {
                     telemetry.count("logit.process.cpu.seconds", system, &[("mode", "system")]);
                 }
                 Err(err) => {
-                    self.cpu_enabled = false;
-                    report(diag, &err, "/proc/self/stat", "logit.process.cpu.seconds");
+                    self.cpu_enabled = !err.is_permanent();
+                    report(
+                        diag,
+                        &err,
+                        "procfs_stat",
+                        "/proc/self/stat",
+                        "logit.process.cpu.seconds",
+                    );
                 }
             }
         }
@@ -365,8 +374,8 @@ impl ProcessSampler {
             match (self.read_fds)() {
                 Ok(fds) => telemetry.gauge("logit.process.fds", fds as f64, &[]),
                 Err(err) => {
-                    self.fds_enabled = false;
-                    report(diag, &err, "/proc/self/fd", "logit.process.fds");
+                    self.fds_enabled = !err.is_permanent();
+                    report(diag, &err, "procfs_fd", "/proc/self/fd", "logit.process.fds");
                 }
             }
         }
@@ -375,8 +384,14 @@ impl ProcessSampler {
                 Ok(Some(limit)) => telemetry.gauge("logit.process.fds.limit", limit as f64, &[]),
                 Ok(None) => {}
                 Err(err) => {
-                    self.fds_limit_enabled = false;
-                    report(diag, &err, "/proc/self/limits", "logit.process.fds.limit");
+                    self.fds_limit_enabled = !err.is_permanent();
+                    report(
+                        diag,
+                        &err,
+                        "procfs_limits",
+                        "/proc/self/limits",
+                        "logit.process.fds.limit",
+                    );
                 }
             }
         }
@@ -386,9 +401,18 @@ impl ProcessSampler {
     }
 }
 
-/// The one diagnostic a source gets when it latches off: `debug` on a non-Linux build, where the
-/// absence is expected, and `warn` for a failed read on Linux.
-fn report(diag: &Diagnostics, err: &Unavailable, source: &str, metrics: &str) {
+/// Reports a failed read. A permanent failure gets its one diagnostic, `debug` on a non-Linux
+/// build, where the absence is expected, and `warn` otherwise. A transient one is throttled under
+/// `key` (the throttle is shared across clones), so a descriptor limit that lasts many ticks logs
+/// on the 1st, 2nd, 4th, ... failure.
+fn report(diag: &Diagnostics, err: &Unavailable, key: &'static str, source: &str, metrics: &str) {
+    if !err.is_permanent() {
+        diag.clone().warn_throttled(
+            key,
+            format_args!("{source} could not be read: {err}; {metrics} skip this tick"),
+        );
+        return;
+    }
     let message = format_args!("{source} is not available: {err}; {metrics} will not be reported");
     if matches!(err, Unavailable::NotLinux) {
         diag.debug(message);
@@ -590,6 +614,48 @@ mod tests {
             );
         }
         assert_eq!(CALLS.load(Ordering::Relaxed), 1, "a latched source is never read again");
+    }
+
+    #[test]
+    fn a_transient_failure_skips_the_tick_and_recovers_with_a_throttled_diagnostic() {
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn fds_at_the_limit() -> Result<u64, Unavailable> {
+            // 5 failing ticks with EMFILE, then the limit clears.
+            match CALLS.fetch_add(1, Ordering::Relaxed) {
+                0..=4 => Err(Unavailable::Io(std::io::Error::from_raw_os_error(24))),
+                _ => Ok(11),
+            }
+        }
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("self", "internal", "listener");
+        let diag = Diagnostics::new("self");
+        let mut sampler = ProcessSampler { read_fds: fds_at_the_limit, ..fixed_sampler() };
+
+        for tick in 0..5 {
+            sampler.sample(&telemetry, &diag);
+            let totals = Totals::of(registry.drain(0));
+            assert_eq!(totals.gauge("logit.process.fds", &[]), None, "tick {tick}");
+            assert_eq!(totals.gauge("logit.process.threads", &[]), Some(3.0), "tick {tick}");
+        }
+        assert_eq!(diag.occurrences("procfs_fd"), 5, "every failure counts toward the throttle");
+
+        sampler.sample(&telemetry, &diag);
+        let totals = Totals::of(registry.drain(0));
+        assert_eq!(totals.gauge("logit.process.fds", &[]), Some(11.0), "the source came back");
+    }
+
+    #[test]
+    fn permanent_and_transient_causes_are_told_apart() {
+        let io = |kind| Unavailable::Io(std::io::Error::from(kind));
+        assert!(Unavailable::NotLinux.is_permanent());
+        assert!(Unavailable::Malformed("x").is_permanent());
+        assert!(io(std::io::ErrorKind::NotFound).is_permanent());
+        assert!(io(std::io::ErrorKind::PermissionDenied).is_permanent());
+        assert!(!io(std::io::ErrorKind::Interrupted).is_permanent());
+        assert!(!io(std::io::ErrorKind::WouldBlock).is_permanent());
+        for errno in [24, 23, 12] {
+            assert!(!Unavailable::Io(std::io::Error::from_raw_os_error(errno)).is_permanent());
+        }
     }
 
     #[tokio::test]

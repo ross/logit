@@ -1,6 +1,6 @@
 ---
 created: 2026-09-29
-updated: 2026-10-30
+updated: 2026-11-03
 ---
 
 # Delivery semantics: at-least-once per hop, duplicates absorbed by the data model, and an effectively-once native hop
@@ -642,3 +642,16 @@ negative acknowledgment, and leaving the offset behind such a record would hold 
 forever, re-reading a record that fails the same way each time. The drop is counted, so the loss
 is visible as item 2's permitted loss is. A batch no consumer took is not an exception: as item
 3 says, `kafka_in` doesn't commit it, and stops.
+
+## Amendment: a stream sink counts the sender's share of item 6's loss (2026-11-03)
+
+Item 6's stream hops stay best-effort: a receiver that dies with bytes in either socket buffer
+loses them. The stream sinks now keep a stalled connection rather than redial into a frozen
+receiver's accept queue, so one buffer pair is at risk however long the stall, and over TCP they
+count what their own socket held unacknowledged when the receiver's reset or close destroyed it,
+as `logit.output.bytes.dropped{reason="unacknowledged"}`
+([ADR `stream-sink-stalled-connection`](stream-sink-stalled-connection.md)). The receiver's
+share, which its kernel acknowledged and its process never read, is still uncounted, as is
+anything over a Unix stream. Under `at_least_once`, the head of a frame a stall cut is delivered
+twice once the receiver reads again: the kept connection finishes the frame, and the retry sends
+the batch whole.
