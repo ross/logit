@@ -1584,6 +1584,12 @@ own HTTP/1 header-read timeout is deliberately not used for it: that timeout re-
 keep-alive gap, so it would act as an idle timeout and kill a long-interval exporter's pooled
 connection. `idle_timeout` is that bound made explicit and opt-in.
 
+**A timeout is counted, not logged.** On every kind in the table above, a peer whose TLS accept or
+first-byte wait (`logit_in`: `Hello`) outlasts the budget is closed and counted
+`logit.input.connections.closed{reason="handshake_timeout"}`, with no `connection_error` log line. It
+isn't a loss. A PROXY header that times out is counted
+`connections.rejected{reason="proxy_header"}` instead.
+
 **It is not an idle timeout on any listener.** After a connection passes its pre-message phases,
 `handshake_timeout` doesn't bound the gap before its next frame or request, because a long-lived,
 mostly quiet sender is ordinary traffic, not a fault. Lowering `handshake_timeout` doesn't help
@@ -1639,16 +1645,14 @@ socket. Only two things reset it: bytes read from the peer, and the listener fin
 on the connection (a batch handed downstream, a resend recognized, a response completed). Time spent
 blocked handing a batch to a full downstream never counts, because the clock isn't re-armed until
 that work returns. So a connection stalled on backpressure never looks idle, however long the
-stall. On `prometheus_in`'s remote-write receiver, a request handler parked on a full downstream
-isn't closed by `idle_timeout` or the grace after it either: it holds its connection and its
-permit until the send completes or the client goes away, because closing it would drop a batch
-that never reached the fan-out. `datadog_in` and `influxdb_in` wait at most 5 s, and
-`datadog_trace_in` 2 s, then answer `503` with `Retry-After: 1`. `splunk_hec_in` gives only a
-body's first batch the 5 s deadline, answering `503` code 9 when it passes, and `otlp_in` gives a
-request's first batch 2 s, answering `503` with `Retry-After: 1` (gRPC `UNAVAILABLE`). Once that
-batch is in, the request's later batches wait with no deadline and hold the connection and its
-permit as the receiver does, because a `503` would make the client resend the batch already
-delivered. A periodic
+stall. The HTTP listeners bound that wait and then answer busy, with nothing of the request
+taken: `datadog_in`, `influxdb_in`, and `splunk_hec_in` (code 9) wait at most 5 s, and
+`datadog_trace_in`, `otlp_in` (gRPC `UNAVAILABLE`), and `prometheus_in`'s remote-write receiver
+2 s, then answer `503` with `Retry-After: 1`. A request with more batches than an inbox holds (64)
+is the exception: once its first 64 are in, the rest wait with no deadline and hold the
+connection and its permit until the send completes or the client goes away, because a `503`
+would make the client resend the batches already delivered, and closing it would drop a batch
+that never reached the fan-out. A periodic
 flush tick that finds nothing to send touches neither event, so it never re-arms the clock by
 itself.
 
@@ -3399,14 +3403,17 @@ secret, so a token in it is a token anyone can read.
 
 ## `otlp_in`: a busy answer
 
-If a request's first batch can't reach every consumer directly downstream within 2 s (one full
-consumer is enough), `otlp_in` answers HTTP `503` with `Retry-After: 1`, or gRPC status 14
-(`UNAVAILABLE`), and delivers nothing. The exporter still holds the data and is expected to
-retry, as OTLP exporters do for these answers. A busy request counts
-`logit.input.requests{class="busy"}` once and each of its batches in
-`logit.input.batches.deferred`; neither is loss. Once a request's first batch is
-in, its later batches wait with no deadline, because a `503` would make the client resend a batch
-already delivered. See [ADR `otlp-in-busy-answer`](adr/otlp-in-busy-answer.md).
+A request decodes to one batch per resource. If its batches can't all reach every consumer
+directly downstream within 2 s (one full consumer is enough), `otlp_in` answers HTTP `503` with
+`Retry-After: 1`, or gRPC status 14 (`UNAVAILABLE`), and delivers none of them. The exporter
+still holds the data and is expected to retry, as OTLP exporters do for these answers. A busy
+request counts `logit.input.requests{class="busy"}` once and each of its batches in
+`logit.input.batches.deferred`; neither is loss. A request of more than 64 batches, more than an
+inbox holds, is bounded for its first 64 only: the rest wait with no deadline, because a `503`
+would make the client resend batches already delivered, and the request counts
+`class="unbounded"` in place of `ok`. A client that times out during that wait resends a request
+already taken, so a steady `unbounded` rate is a source of duplicates. See
+[ADR `otlp-in-busy-answer`](adr/otlp-in-busy-answer.md).
 
 ## `prometheus_in`: a busy answer
 
@@ -3538,18 +3545,20 @@ Agent. Any other `Content-Encoding` gets `415`.
 
 **A full pipeline gets `503`, not a blocked connection.** When the pipeline doesn't accept a
 request's batches within 5 seconds, `datadog_in` answers `503` with `Retry-After: 1` rather than
-holding the connection open, which is what `prometheus_in`'s remote-write receiver does. The
+holding the connection open. The
 Agent's forwarder retries a `503` with backoff and holds the payload in its retry queue meanwhile,
 so nothing is lost until that queue fills. A blocked connection would instead cost the Agent 20
 seconds before its own timeout, and then the same retry.
 
-- **A `503` means no consumer holds the batch that timed out.** Each batch goes to every consumer
-  downstream of `datadog_in` or to none, however many there are, so the Agent's retry is its only
-  copy.
-- **Delivery is at-least-once.** A traces or stats request carries one batch per tracer or client
-  payload, and a `503` partway through means the retry delivers the batches already delivered
-  before the deadline again. Datadog's own intake has the same shape: a resent series point
-  overwrites, a resent log or span duplicates.
+- **A `503` means no consumer holds any of the request.** A traces or stats request carries one
+  batch per tracer or client payload, and every batch of it goes to every consumer downstream of
+  `datadog_in` or none does, however many there are, so the Agent's retry is its only copy. A
+  request of more than 64 batches, more than an inbox holds, is bounded for its first 64 only:
+  the rest wait with no deadline, and the request counts
+  `logit.input.requests{class="unbounded"}` in place of `ok`.
+- **Delivery is at-least-once.** A request the Agent resends after `datadog_in` took it, a
+  timeout on the Agent's side, is delivered twice. Datadog's own intake has the same shape: a
+  resent series point overwrites, a resent log or span duplicates.
 - **A request no consumer took gets the same `503` with `Retry-After: 1`**, counted
   `logit.input.requests{class="closed_consumer"}`. It happens once every consumer directly
   downstream has closed, and the Agent's retry delivers the payload after a restart.
@@ -3975,20 +3984,21 @@ one already reported, one never issued, or one from another channel. The listene
 `logit.input.acks.evicted{reason}`. Raise `max_ack_channels` when more clients than that send a
 channel at once. Neither the channel nor the id enters an event.
 
-**A full pipeline gets `503`.** When the pipeline doesn't take a request's first batch within 5
-seconds, the request gets `503` code 9 with `Retry-After: 1`, counted
-`logit.input.requests{class="busy"}`, and its batches `logit.input.batches.deferred`.
-Nothing of the body was taken, and HEC clients retry a code 9. A body with several envelopes
-decodes to one batch per envelope; once the first is delivered, the rest wait for the pipeline
-without a deadline and the request gets `200`, so a retry never repeats part of a body. From a
+**A full pipeline gets `503`.** A body with several envelopes decodes to one batch per envelope.
+When the pipeline doesn't take all of a request's batches within 5 seconds, the request gets
+`503` code 9 with `Retry-After: 1`, counted `logit.input.requests{class="busy"}`, and its batches
+`logit.input.batches.deferred`. Nothing of the body was taken, and HEC clients retry a code 9.
+A body of more than 64 batches, more than an inbox holds, is bounded for its first 64 only: the
+rest wait for the pipeline without a deadline, the request gets `200`, and it counts
+`class="unbounded"` in place of `ok`, so a retry never repeats part of a body. From a
 busy `503` until a later request's data is taken, for at most 5 seconds,
 `/services/collector/health` answers `503` `{"text":"HEC is unhealthy, queues are full","code":18}`,
 Splunk's answer for a full queue, so a load balancer health check steers clients elsewhere.
 
 **A pipeline whose consumers have closed refuses the body.** Once every consumer directly
 downstream of `splunk_hec_in` has closed, which happens as a shutdown tears the graph down, a
-request whose first batch no consumer takes gets `503` code 9 with `Retry-After: 1`, and `/health`
-is left alone. If the consumers close after the first batch was taken, the request gets `500` code
+request no consumer takes gets `503` code 9 with `Retry-After: 1`, and `/health` is left alone.
+If the consumers close while an unbounded body's later batches wait, the request gets `500` code
 8 with no `ackId`, and a retry repeats the batches already taken. Both are counted
 `logit.input.requests{class="closed_consumer"}` and
 `logit.input.batches.dropped{reason="closed_consumer"}`.

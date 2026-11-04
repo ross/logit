@@ -3290,7 +3290,7 @@ Docker 29.9, SELinux enforcing) checked each fault's mechanism before it was pla
     faster than `idle_timeout:` holds the slot until the client leaves or, for a body, the size
     cap; and a first-byte timeout under `handshake_timeout:` counts
     `connections.closed{reason="handshake_timeout"}` on the TCP driver, with no diagnostic,
-    while the HTTP listeners still diagnose it and count nothing. Rows:
+    and the HTTP listeners and `logit_in` count it the same way. Rows:
     `connections.rejected{reason="limit"}` above 0 while the slow clients hold every slot;
     `connections.closed{reason="handshake_timeout"}` for a TCP client that sends nothing past
     `handshake_timeout:`; `connections.closed{reason="idle"}` for a trickled HTTP request head

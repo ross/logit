@@ -88,60 +88,65 @@
 //!
 //! # Backpressure: a bounded wait, then `503`
 //!
-//! `prometheus_in`'s remote-write receiver lets a full downstream block the handler, so the
-//! client's request stays open until the pipeline drains. A Datadog Agent doesn't wait: its
+//! A handler that lets a full downstream block it keeps the client's request open until the
+//! pipeline drains. A Datadog Agent doesn't wait: its
 //! forwarder times a request out after 20 seconds and retries it, so a blocked connection costs
 //! the Agent a slot for 20 seconds and still ends in a retry.
 //!
 //! So ([ADR `datadog-agent-and-intake-relay`](../../../../docs/adr/datadog-agent-and-intake-relay.md),
-//! decision 5) each batch is sent under one deadline per request, [`BUSY_AFTER`] from the start of
-//! delivery, through [`Fanout::send_with_deadline`]: a batch reaches every downstream consumer or
-//! none. When the deadline passes, the request is answered `503` with `Retry-After: 1` and
-//! `{"status":"error","errors":["busy"]}`, counted `logit.input.requests{class="busy"}`, and the
-//! batches not yet delivered are counted `logit.input.batches.deferred`, disjoint from
-//! `logit.component.batches.sent`: the Agent still holds them. The Agent retries a `503` with backoff, which makes the
-//! pair at-least-once end to end:
+//! decision 5 and its all-or-none amendment) a request's batches are sent under one deadline,
+//! [`BUSY_AFTER`] from the start of delivery, all of them reaching every downstream consumer or
+//! none ([`crate::http::deliver_bounded`]). When the deadline passes, the request is answered
+//! `503` with `Retry-After: 1` and `{"status":"error","errors":["busy"]}`, counted
+//! `logit.input.requests{class="busy"}`, and every batch of the request is counted
+//! `logit.input.batches.deferred`, disjoint from `logit.component.batches.sent`: the Agent still
+//! holds them. The Agent retries a `503` with backoff, which makes the pair at-least-once end to
+//! end:
 //!
-//! - **The timed-out batch is delivered to no consumer.** `send_with_deadline` reserves room on
-//!   every consumer's channel before sending to any of them, and releases what it holds if the
-//!   deadline passes first, so the Agent's retry is the only copy, whatever the fan-out.
+//! - **A busy request is delivered to no consumer.** Room for every batch is reserved on every
+//!   consumer's channel before any is sent, and released if the deadline passes first, so the
+//!   Agent's retry is the only copy, whatever the fan-out.
 //! - **A request that decodes to several batches** (traces and stats: one per tracer or client
-//!   payload) is sent in order and answered `503` as a whole if the deadline passes partway. The
-//!   batches fully delivered before the deadline are delivered again by the retry. This matches
-//!   what Datadog's own intake does with a resent request: a resent series point overwrites the
-//!   one it repeats, and a resent log or span duplicates.
+//!   payload) is answered `503` whole or delivered whole. The Agent retries a `503` either way,
+//!   so delivering a prefix first would only make the retry duplicate it.
+//! - **A request with more batches than an inbox holds** (64, the runtime's channel capacity)
+//!   can't be reserved whole. Its first 64 go all or none under the deadline, and once they are
+//!   in, the rest wait for as long as the pipeline takes, since a `503` then would make the retry
+//!   deliver the first twice. It's answered as usual and counted `class="unbounded"` in place of
+//!   `ok`.
 //!
 //! A `503` is also cheaper for the Agent than the block it replaces: it releases the connection at
 //! once, and the Agent's retry queue, not this listener, holds the payload while the pipeline
 //! catches up.
 //!
-//! A batch no consumer takes, because every consumer of the listener has closed, gets the same
+//! A request no consumer takes, because every consumer of the listener has closed, gets the same
 //! `503` and `Retry-After: 1` with `closed_consumer` in place of `busy`, in the body and in
 //! `logit.input.requests{class}`, and is counted
-//! `logit.input.batches.dropped{reason="closed_consumer"}`, that batch and every later one of the
-//! request. The refused batch was offered, so unlike a timed-out
-//! one it also counts in `logit.component.batches.sent`.
+//! `logit.input.batches.dropped{reason="closed_consumer"}`, every batch of it, or for an
+//! unbounded request's rest, the refused batch and every later one. A refused batch was
+//! offered, so unlike a timed-out one it also counts in `logit.component.batches.sent`.
 //!
 //! # Telemetry
 //!
 //! Every name and tag is `&'static`. Per request: `logit.input.requests{route, class}` (class `ok`,
-//! `rejected`, `busy`, or `closed_consumer`; route one of [`Route::name`], or `unknown`),
+//! `unbounded`, `rejected`, `busy`, or `closed_consumer`; route one of [`Route::name`], or
+//! `unknown`),
 //! `logit.input.request.duration` (timing, every exit), and `logit.input.request.bytes` (the
 //! compressed body size, once read). Rejections: `logit.input.requests.rejected{reason}`, reason
 //! `unknown_route`, `method`, `oversize`, `auth`, `encoding`, `malformed_encoding`, `malformed`,
 //! `stalled`, or `body_read` (a body that failed for a reason other than its size, such as a
 //! client disconnecting mid-upload). `logit.input.requests.acknowledged{route}` counts a payload
-//! answered without a send, `logit.input.batches.deferred` the batches a busy `503` left
-//! undelivered, and `logit.input.batches.dropped{reason="closed_consumer"}` those no consumer
+//! answered without a send, `logit.input.batches.deferred` the batches a busy `503` left with the
+//! Agent, and `logit.input.batches.dropped{reason="closed_consumer"}` those no consumer
 //! took. The
 //! connection metrics are `otlp_in`'s verbatim. `docs/design/internal-telemetry.md`'s `datadog_in`
 //! section is the operator-facing account.
 
 use crate::http::{
     body_read_error_message, collect_with_stall_bound, declared_length, decompress,
-    deliver_with_deadline, drive_connection, error_response, is_length_limit, json_response,
-    media_type, now_nanos, Activity, BodyReadError, DecompressError, Encoding, MediaType,
-    Undelivered,
+    deliver_bounded, drive_connection, error_response, is_length_limit, json_response, media_type,
+    now_nanos, Activity, BodyReadError, DecompressError, Encoding, MediaType, Undelivered,
+    Unfinished,
 };
 use crate::listener::Prelude;
 use crate::peer::ConnectionPeer;
@@ -466,41 +471,21 @@ impl Input for DatadogInput {
 
                     match tls_acceptor {
                         Some(acceptor) => {
-                            match tokio::time::timeout(handshake_timeout, acceptor.accept(stream))
-                                .await
-                            {
-                                Ok(Ok(tls_stream)) => {
-                                    Prelude::Tls(Box::new(tls_stream), connection_peer)
-                                }
-                                Ok(Err(err)) => {
-                                    Prelude::Failed(format!("TLS handshake failed: {err}"))
-                                }
-                                Err(_elapsed) => Prelude::Failed(format!(
-                                    "TLS handshake did not complete within {handshake_timeout:?}"
-                                )),
-                            }
+                            crate::listener::accept_tls(
+                                acceptor,
+                                stream,
+                                handshake_timeout,
+                                connection_peer,
+                            )
+                            .await
                         }
                         None => {
-                            let first_byte =
-                                tokio::time::timeout(handshake_timeout, stream.peek(&mut [0u8; 1]))
-                                    .await;
-                            match first_byte {
-                                // A clean close or a reset before the first byte is a
-                                // health-check probe, not a fault (`crate::otlp`'s "not a fault").
-                                Ok(Ok(0)) => Prelude::Probe,
-                                Ok(Err(err))
-                                    if err.kind() == std::io::ErrorKind::ConnectionReset =>
-                                {
-                                    Prelude::Probe
-                                }
-                                Ok(Ok(_)) => Prelude::Plain(stream, connection_peer),
-                                Ok(Err(err)) => Prelude::Failed(format!(
-                                    "waiting for a first byte failed: {err}"
-                                )),
-                                Err(_elapsed) => Prelude::Failed(format!(
-                                    "no first byte received within {handshake_timeout:?}"
-                                )),
-                            }
+                            crate::listener::peek_first_byte(
+                                stream,
+                                handshake_timeout,
+                                connection_peer,
+                            )
+                            .await
                         }
                     }
                 };
@@ -541,6 +526,10 @@ impl Input for DatadogInput {
                         .await
                     }
                     Prelude::Probe => Ok(()),
+                    Prelude::HandshakeTimeout => {
+                        crate::listener::count_handshake_timeout(&telemetry);
+                        Ok(())
+                    }
                     Prelude::Failed(err) => Err(err),
                     Prelude::ProxyRejected(err) => {
                         drop(live);
@@ -874,29 +863,36 @@ async fn respond(
     }
     request_peer.stamp_batches(&mut batches);
 
-    match deliver_with_deadline(&shared.sink, batches, shared.busy_after).await {
-        Ok(()) => (name, OK, route.success()),
-        Err(undelivered) => {
+    // A closed consumer is counted on the delivery's task, so a client that closes during an
+    // unbounded request's detached wait doesn't leave the drop uncounted.
+    let settle = {
+        let (telemetry, mut diag, peer) =
+            (shared.telemetry.clone(), shared.diag.clone(), shared.peer.clone());
+        move |outcome: Result<(), Undelivered>| {
+            if let Err(undelivered) = outcome {
+                undelivered.record(&telemetry);
+                diag.warn_throttled(
+                    "closed_consumer",
+                    format_args!("datadog_in: answered 503 to {peer}: no consumer took the batch"),
+                );
+            }
+        }
+    };
+    match deliver_bounded(&shared.sink, batches, shared.busy_after, || {}, settle).await {
+        Ok(delivery) => (name, delivery.class(), route.success()),
+        Err(Unfinished { undelivered, .. }) => {
             let reason = undelivered.reason();
-            undelivered.record(&shared.telemetry);
-            let mut diag = shared.diag.clone();
-            let _ = match undelivered {
-                Undelivered::Busy(_) => diag.warn_throttled(
+            if let Undelivered::Busy(_) = undelivered {
+                undelivered.record(&shared.telemetry);
+                shared.diag.clone().warn_throttled(
                     "busy",
                     format_args!(
-                        "datadog_in: answered 503 to {}: the pipeline did not accept a batch \
+                        "datadog_in: answered 503 to {}: the pipeline did not accept the request \
                          within {:?}",
                         shared.peer, shared.busy_after
                     ),
-                ),
-                Undelivered::Closed(_) => diag.warn_throttled(
-                    "closed_consumer",
-                    format_args!(
-                        "datadog_in: answered 503 to {}: no consumer took the batch",
-                        shared.peer
-                    ),
-                ),
-            };
+                );
+            }
             let mut response = error_response(StatusCode::SERVICE_UNAVAILABLE, reason);
             response.headers_mut().insert(http::header::RETRY_AFTER, HeaderValue::from_static("1"));
             (name, reason, response)
@@ -1501,6 +1497,53 @@ mod tests {
         assert_eq!(events.sum("logit.input.requests", &[("class", "busy")]), 0.0);
     }
 
+    /// A request is all or none: a stats body of two batches into an inbox with room for one is
+    /// answered `503` with neither delivered, so the Agent's retry is the one copy of each.
+    #[tokio::test]
+    async fn a_multi_batch_request_with_room_for_one_batch_is_503_with_nothing_delivered() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("dd", "datadog_in", "listener");
+        let input = DatadogInput::new("127.0.0.1:0")
+            .with_telemetry(telemetry)
+            .with_busy_after(Duration::from_millis(200));
+        let (addr, mut rx) = start(input, 2).await;
+        let response = post_raw(&addr, "/api/v1/series", "", SERIES_V1).await;
+        assert!(response.starts_with("HTTP/1.1 202"), "{response}");
+
+        let (response, _port) = post_stats_after(&addr, &[]).await;
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        assert_eq!(body_of(&response), r#"{"status":"error","errors":["busy"]}"#);
+
+        recv_batch(&mut rx).await;
+        assert!(rx.try_recv().is_err(), "no batch of the 503'd request was delivered");
+        let events = Totals::of(registry.drain(0));
+        assert_eq!(events.sum("logit.input.batches.deferred", &[]), 2.0);
+        assert_eq!(events.sum("logit.input.requests", &[("class", "busy")]), 1.0);
+    }
+
+    /// A request with more batches than the inbox holds sends the batches past its capacity
+    /// without the bound once the first are in, and is counted `unbounded`, not `ok`.
+    #[tokio::test]
+    async fn a_request_with_more_batches_than_the_inbox_holds_is_counted_unbounded() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("dd", "datadog_in", "listener");
+        let input = DatadogInput::new("127.0.0.1:0")
+            .with_telemetry(telemetry)
+            .with_busy_after(Duration::from_millis(200));
+        let (addr, mut rx) = start(input, 1).await;
+
+        let post = tokio::spawn(async move { post_stats_after(&addr, &[]).await });
+        recv_batch(&mut rx).await;
+        recv_batch(&mut rx).await;
+        let (response, _port) = post.await.expect("the request task");
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+        let events = Totals::of(registry.drain(0));
+        assert_eq!(events.sum("logit.input.requests", &[("class", "unbounded")]), 1.0);
+        assert_eq!(events.sum("logit.input.requests", &[("class", "ok")]), 0.0);
+        assert_eq!(events.sum("logit.input.batches.deferred", &[]), 0.0);
+    }
+
     /// With two consumers and the second full, a `503` leaves the first holding nothing, and the
     /// timed-out batch counts as busy, never as sent (the module doc's "Backpressure" section).
     #[tokio::test]
@@ -1754,6 +1797,30 @@ mod tests {
             .await;
     }
 
+    /// A client that sends no ClientHello is closed at the handshake timeout and counted
+    /// `handshake_timeout`.
+    #[tokio::test]
+    async fn a_silent_tls_connection_is_counted_a_handshake_timeout() {
+        let settings = TlsServerSettings {
+            cert_file: "server.pem".to_string(),
+            key_file: "server.key".to_string(),
+            client_ca_file: None,
+        };
+        let input = DatadogInput::new("127.0.0.1:0")
+            .with_tls(&settings, &testdata_tls_dir(), &logit_pipeline::tls::TlsReloader::new())
+            .unwrap()
+            .with_handshake_timeout(Duration::from_millis(100));
+        let (addr, _running, _rx, mut probe) = shutdown_listener(input).await;
+
+        let mut silent = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        logit_pipeline::test_util::expect_closed(&mut silent, "a silent TLS connection").await;
+        probe
+            .wait_for("the handshake_timeout close count", |t| {
+                t.sum("logit.input.connections.closed", &[("reason", "handshake_timeout")]) == 1.0
+            })
+            .await;
+    }
+
     /// A connection still in its TLS accept when shutdown fires ends at once rather than at its
     /// `handshake_timeout`. That timeout is an hour, far past `Running::stop`'s 5s ceiling, so the
     /// stop returns in time only if the prelude races the signal; the gauge reading 0 right after
@@ -1785,6 +1852,24 @@ mod tests {
             Some(0.0),
             "the connection's task ended before the listener returned"
         );
+    }
+
+    /// A connection that sends no byte is closed at the handshake timeout and counted
+    /// `handshake_timeout`.
+    #[tokio::test]
+    async fn a_silent_connection_is_counted_a_handshake_timeout() {
+        let (addr, _running, _rx, mut probe) = shutdown_listener(
+            DatadogInput::new("127.0.0.1:0").with_handshake_timeout(Duration::from_millis(50)),
+        )
+        .await;
+        let mut silent = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        logit_pipeline::test_util::expect_closed(&mut silent, "a connection that sent no bytes")
+            .await;
+        probe
+            .wait_for("the handshake_timeout close count", |t| {
+                t.sum("logit.input.connections.closed", &[("reason", "handshake_timeout")]) == 1.0
+            })
+            .await;
     }
 
     // ---- sender address: `peer:` and `proxy_protocol:` ----------------------------------------

@@ -20,8 +20,8 @@
 //! trailers wait on the client's delayed ACK.
 //!
 //! **Backpressure: a bounded wait, then busy.** A request decodes to one batch per resource. Its
-//! first batch waits at most [`BUSY_AFTER`] (2 s) for room in every consumer, reaching every
-//! consumer or none ([`crate::http::deliver_first_bounded`]). When the bound passes, nothing of
+//! batches wait at most [`BUSY_AFTER`] (2 s) for room in every consumer, all of them reaching
+//! every consumer or none ([`crate::http::deliver_bounded`]). When the bound passes, nothing of
 //! the request was taken: HTTP answers `503` with `Retry-After: 1` and the body `busy`, gRPC
 //! answers `UNAVAILABLE` (status 14) with the message `busy`, every batch of the request is
 //! counted `logit.input.batches.deferred`, and a throttled `busy` line is logged. Every OTLP
@@ -29,13 +29,15 @@
 //! timeout into a duplicate; 2 s is under the Collector exporters' 5 s default
 //! (ADR `otlp-in-busy-answer`).
 //!
-//! Once the first batch is in, the rest wait for as long as the pipeline takes, through
-//! [`crate::http::deliver_detached`]: a busy answer then would make the client's retry deliver the
-//! first batch twice. A client that gives up and closes during that wait cancels only the
-//! handler's wait, so every consumer still gets every batch, and the retry duplicates on every
-//! branch alike rather than on some. A client that closes during the bounded wait takes the
-//! request with it: no consumer gets any of it. `otlp_out` sends one resource per request, so a
-//! `logit` hop never reaches the unbounded wait.
+//! A request with more batches than an inbox holds (64, the runtime's channel capacity) can't be
+//! reserved whole. Its first 64 go all or none under the bound, and once they are in, the rest
+//! wait for as long as the pipeline takes, through [`crate::http::deliver_detached`]: a busy
+//! answer then would make the client's retry deliver the first twice. Such a request counts
+//! `class="unbounded"` in place of `ok`. A client that gives up and closes during that wait
+//! cancels only the handler's wait, so every consumer still gets every batch, and the retry
+//! duplicates on every branch alike rather than on some. A client that closes during the bounded
+//! wait takes the request with it: no consumer gets any of it. `otlp_out` sends one resource per
+//! request, so a `logit` hop never reaches the unbounded wait.
 //!
 //! **A request no consumer takes is refused, not acknowledged.** When every consumer of the
 //! listener has closed, the request is answered as busy is, with `no consumer took the batch` as
@@ -47,8 +49,8 @@
 //!
 //! **Requests are counted.** `logit.input.requests{route, class}`, once per request on every
 //! exit: `route` is `logs`, `metrics`, or `traces`, or `unknown` for a path or method this
-//! listener doesn't serve, and `class` is `ok`, `rejected`, `busy`, or `closed_consumer`. A
-//! request whose client closes while it waits counts no class.
+//! listener doesn't serve, and `class` is `ok`, `unbounded`, `rejected`, `busy`, or
+//! `closed_consumer`. A request whose client closes while it waits counts no class.
 //!
 //! **TLS is optional, per listener.** `tls:` in config ([`TlsServerSettings`]) turns it on for
 //! both transports; without it the listener accepts plaintext. The handshake runs inside the
@@ -81,8 +83,10 @@
 //! from `handshake_timeout:` by [`OtlpInput::with_handshake_timeout`]) bounds each pre-request
 //! phase, as `crate::tcp`'s driver does (`crates/logit-inputs/src/tcp.rs`'s "Pre-handshake
 //! timeout" section): the PROXY header under `proxy_protocol:`, then the TLS accept on a TLS
-//! listener or the wait for the first byte on a plaintext one. Without it, a client that completes the TCP connect and never speaks pins a
-//! permit forever.
+//! listener or the wait for the first byte on a plaintext one. Without it, a client that completes
+//! the TCP connect and never speaks pins a permit forever. Expiry of the TLS accept or the
+//! first-byte wait closes the connection, counted
+//! `logit.input.connections.closed{reason="handshake_timeout"}` and not diagnosed, as `crate::tcp` does.
 //!
 //! **The plaintext first-byte bound is a `peek`, not a read.** `tokio::net::TcpStream::peek` is
 //! `recv(..., MSG_PEEK)`: it waits for the first byte and leaves it queued, so the stream handed
@@ -95,8 +99,8 @@
 //! check: `demo/haproxy/haproxy.cfg`'s `server logit logit:4318 check` against `demo/logit.yaml`'s
 //! plaintext `browser_in`, a Kubernetes `tcpSocket` probe, `nc -z`. A `peek` of `Ok(0)` or of a
 //! reset (`ECONNRESET`) returns `Ok(())`; only the deadline (a connection held open saying
-//! nothing) and any other read error reach `connection_error`, which a probe would otherwise hit
-//! once per interval, forever. `crate::tcp` makes the same call for an EOF or a reset before its
+//! nothing) is counted `handshake_timeout`, and any other read error reaches `connection_error`,
+//! which a probe would otherwise hit once per interval, forever. `crate::tcp` makes the same call for an EOF or a reset before its
 //! first payload byte (`crates/logit-inputs/src/tcp.rs`'s "Reset before the first byte" section).
 //!
 //! **Sender address.** Under `peer:` and `proxy_protocol:` ([`OtlpInput::with_peer`],
@@ -228,7 +232,7 @@
 
 use crate::http::{
     body_read_error_message, collect_with_stall_bound, drive_connection, Activity, AuthGate,
-    BodyReadError, Undelivered, Unfinished,
+    BodyReadError, Delivery, Undelivered, Unfinished,
 };
 use crate::listener::Prelude;
 use crate::peer::ConnectionPeer;
@@ -275,7 +279,7 @@ const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 /// Also the grace an idle close gives hyper (this module's "Idle timeout").
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// How long a request's first batch may wait for room in every consumer before the request is
+/// How long a request's batches may wait for room in every consumer before the request is
 /// answered busy (this module's "Backpressure"). Under the 5 s export timeout the Collector's
 /// `otlphttp` and `otlp` exporters default to, so a client reads the `503` before it gives up and
 /// resends.
@@ -585,52 +589,35 @@ impl Input for OtlpInput {
                     // connection.
                     match tls_acceptor {
                         // Bounded, or a client that sends no ClientHello pins this permit
-                        // forever. Failure and timeout both reach `connection_error` below, and
-                        // the permit comes back when this task ends. No first-byte peek:
+                        // forever. A failure reaches `connection_error` below and a timeout is
+                        // counted `handshake_timeout`; the permit comes back when this task ends. No first-byte peek:
                         // `acceptor.accept` already waits on the first bytes under the same
                         // budget.
                         Some(acceptor) => {
-                            match tokio::time::timeout(handshake_timeout, acceptor.accept(stream))
-                                .await
-                            {
-                                Ok(Ok(tls_stream)) => {
-                                    Prelude::Tls(Box::new(tls_stream), connection_peer)
-                                }
-                                Ok(Err(err)) => {
-                                    Prelude::Failed(format!("TLS handshake failed: {err}"))
-                                }
-                                Err(_elapsed) => Prelude::Failed(format!(
-                                    "TLS handshake did not complete within {handshake_timeout:?}"
-                                )),
-                            }
+                            crate::listener::accept_tls(
+                                acceptor,
+                                stream,
+                                handshake_timeout,
+                                connection_peer,
+                            )
+                            .await
                         }
                         // The plaintext arm's budget: a `peek` that consumes nothing (this
-                        // module's "peek, not a read"). A read error and the deadline reach
-                        // `connection_error` like the TLS arm's; a clean close or a reset before
+                        // module's "peek, not a read"). A read error reaches
+                        // `connection_error` like the TLS arm's, and the deadline is counted
+                        // `handshake_timeout`; a clean close or a reset before
                         // the first byte is a TCP health check (this module's "not a fault"), as
                         // in `crate::tcp`.
                         None => {
                             // Bound to a local, not matched directly: the scrutinee's
                             // temporaries (`peek`'s borrow of `stream`) would outlive the arms,
                             // and the success arm moves `stream` into `hyper`.
-                            let first_byte =
-                                tokio::time::timeout(handshake_timeout, stream.peek(&mut [0u8; 1]))
-                                    .await;
-                            match first_byte {
-                                Ok(Ok(0)) => Prelude::Probe,
-                                Ok(Err(err))
-                                    if err.kind() == std::io::ErrorKind::ConnectionReset =>
-                                {
-                                    Prelude::Probe
-                                }
-                                Ok(Ok(_)) => Prelude::Plain(stream, connection_peer),
-                                Ok(Err(err)) => Prelude::Failed(format!(
-                                    "waiting for a first byte failed: {err}"
-                                )),
-                                Err(_elapsed) => Prelude::Failed(format!(
-                                    "no first byte received within {handshake_timeout:?}"
-                                )),
-                            }
+                            crate::listener::peek_first_byte(
+                                stream,
+                                handshake_timeout,
+                                connection_peer,
+                            )
+                            .await
                         }
                     }
                 };
@@ -669,6 +656,10 @@ impl Input for OtlpInput {
                         .await
                     }
                     Prelude::Probe => Ok(()),
+                    Prelude::HandshakeTimeout => {
+                        crate::listener::count_handshake_timeout(&telemetry);
+                        Ok(())
+                    }
                     Prelude::Failed(err) => Err(err),
                     Prelude::ProxyRejected(err) => {
                         drop(live);
@@ -885,17 +876,20 @@ async fn respond_http(
     match result {
         Ok(mut batches) => {
             request_peer.stamp_batches(&mut batches);
-            if let Err(undelivered) = deliver(&sink, batches, telemetry, gate, peer).await {
-                let message = match undelivered {
-                    Undelivered::Busy(_) => BUSY,
-                    Undelivered::Closed(_) => NO_CONSUMER_TOOK_THE_BATCH,
-                };
-                let mut response = text_response(StatusCode::SERVICE_UNAVAILABLE, message);
-                response
-                    .headers_mut()
-                    .insert(http::header::RETRY_AFTER, HeaderValue::from_static("1"));
-                return (undelivered.reason(), response);
-            }
+            let delivery = match deliver(&sink, batches, telemetry, gate, peer).await {
+                Ok(delivery) => delivery,
+                Err(undelivered) => {
+                    let message = match undelivered {
+                        Undelivered::Busy(_) => BUSY,
+                        Undelivered::Closed(_) => NO_CONSUMER_TOOK_THE_BATCH,
+                    };
+                    let mut response = text_response(StatusCode::SERVICE_UNAVAILABLE, message);
+                    response
+                        .headers_mut()
+                        .insert(http::header::RETRY_AFTER, HeaderValue::from_static("1"));
+                    return (undelivered.reason(), response);
+                }
+            };
             // The spec: "The server MUST use the same Content-Type in the response as it received
             // in the request." A JSON request gets `{}`, not an empty body
             // ([`export_response_json`]).
@@ -908,7 +902,7 @@ async fn respond_http(
                 .header("content-type", content_type)
                 .body(Full::new(Bytes::from(body)))
                 .expect("a well-formed response always builds");
-            (OK, response)
+            (delivery.class(), response)
         }
         Err(DecodeFailure::TooLarge) => (
             REJECTED,
@@ -1119,7 +1113,9 @@ async fn respond_grpc(
         Ok(mut batches) => {
             request_peer.stamp_batches(&mut batches);
             match deliver(&sink, batches, telemetry, gate, peer).await {
-                Ok(()) => (OK, grpc_response(0, "", Some(export_response(0, "")))),
+                Ok(delivery) => {
+                    (delivery.class(), grpc_response(0, "", Some(export_response(0, ""))))
+                }
                 // `14`, `UNAVAILABLE`, with no `RetryInfo`: the OTLP exporters retry it with
                 // their own backoff.
                 Err(undelivered @ Undelivered::Busy(_)) => {
@@ -1145,29 +1141,30 @@ fn route_name(signal: Option<Signal>) -> &'static str {
     signal.map_or("unknown", Signal::as_str)
 }
 
-/// The `class` tags on `logit.input.requests` other than [`Undelivered::reason`]'s.
-const OK: &str = "ok";
+/// The `class` tag on `logit.input.requests` other than [`Undelivered::reason`]'s and
+/// [`Delivery::class`]'s.
 const REJECTED: &str = "rejected";
 
 /// A busy `503`'s body, and a busy `UNAVAILABLE`'s message.
 const BUSY: &str = "busy";
 
-/// Delivers a request's batches, first batch bounded and the rest detached
-/// ([`crate::http::deliver_first_bounded`]; this module's "Backpressure"). A busy request counts
-/// every batch `logit.input.batches.deferred` and a throttled `busy` line here; a closed consumer
-/// is counted by [`count_undelivered`].
+/// Delivers a request's batches all or none under the bound ([`crate::http::deliver_bounded`];
+/// this module's "Backpressure"). A busy request counts every batch
+/// `logit.input.batches.deferred` and a throttled `busy` line here; a closed consumer is counted
+/// by [`count_undelivered`].
 async fn deliver(
     sink: &Fanout,
     batches: Vec<EventBatch>,
     telemetry: &Telemetry,
     gate: &Gate,
     peer: &ConnectionPeer,
-) -> Result<(), Undelivered> {
+) -> Result<Delivery, Undelivered> {
     let settle = count_undelivered(telemetry, &gate.diag, peer);
     let delivered =
-        crate::http::deliver_first_bounded(sink, batches, gate.busy_after, || {}, settle).await;
-    let Err(Unfinished { undelivered, .. }) = delivered else {
-        return Ok(());
+        crate::http::deliver_bounded(sink, batches, gate.busy_after, || {}, settle).await;
+    let undelivered = match delivered {
+        Ok(delivery) => return Ok(delivery),
+        Err(Unfinished { undelivered, .. }) => undelivered,
     };
     if let Undelivered::Busy(_) = undelivered {
         undelivered.record(telemetry);
@@ -1183,7 +1180,7 @@ async fn deliver(
 }
 
 /// A connection's `auth:` check, the diagnostics a refusal reports under, and the bound on a
-/// request's first batch ([`deliver`]).
+/// request's delivery ([`deliver`]).
 #[derive(Clone)]
 struct Gate {
     auth: AuthGate,
@@ -2434,6 +2431,9 @@ mod tests {
         // One listener for both halves, so the second proves this listener still serves TLS. Its
         // 500ms handshake timeout also bounds the second half's real rustls handshake, which a
         // debug build under load stretches well past 50ms; the close wait's 5s ceiling is 10x it.
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let diag = Diagnostics::new("otlp_in");
+        let listener_diag = diag.clone();
         let mut input = OtlpInput::new("127.0.0.1:0", OtlpTransport::Http)
             .with_tls(
                 &test_tls_settings(None),
@@ -2441,6 +2441,8 @@ mod tests {
                 &logit_pipeline::tls::TlsReloader::new(),
             )
             .unwrap()
+            .with_telemetry(probe.telemetry("otlp_in", "otlp_in", "listener"))
+            .with_diagnostics(diag)
             .with_handshake_timeout(Duration::from_millis(500));
         input.bind().await.expect("binding an ephemeral port should succeed");
         let addr = input.local_addr().expect("bind() leaves a real address behind").to_string();
@@ -2451,6 +2453,11 @@ mod tests {
         // could have closed it.
         let mut silent = tokio::net::TcpStream::connect(&addr).await.unwrap();
         logit_pipeline::test_util::expect_closed(&mut silent, "a silent TLS connection").await;
+        logit_pipeline::test_util::wait_until("the handshake_timeout close count", || {
+            probe.sum("logit.input.connections.closed", &[("reason", "handshake_timeout")]) == 1.0
+        })
+        .await;
+        assert_eq!(listener_diag.occurrences("connection_error"), 0, "counted, not diagnosed");
 
         // The listener still serves real TLS traffic afterwards.
         let mut encoder = logit_proto::otlp::OtlpEncoder::new();
@@ -2540,8 +2547,14 @@ mod tests {
     #[tokio::test]
     async fn a_silent_plaintext_connection_is_closed_after_the_handshake_timeout() {
         let (addr, input) = bound_input(OtlpTransport::Http).await;
-        let mut input =
-            input.with_max_connections(1).with_handshake_timeout(Duration::from_millis(50));
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let diag = Diagnostics::new("otlp_in");
+        let listener_diag = diag.clone();
+        let mut input = input
+            .with_telemetry(probe.telemetry("otlp_in", "otlp_in", "listener"))
+            .with_diagnostics(diag)
+            .with_max_connections(1)
+            .with_handshake_timeout(Duration::from_millis(50));
         let (sink, mut rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
 
@@ -2553,6 +2566,11 @@ mod tests {
             "a plaintext connection that sent no bytes",
         )
         .await;
+        logit_pipeline::test_util::wait_until("the handshake_timeout close count", || {
+            probe.sum("logit.input.connections.closed", &[("reason", "handshake_timeout")]) == 1.0
+        })
+        .await;
+        assert_eq!(listener_diag.occurrences("connection_error"), 0, "counted, not diagnosed");
 
         let mut encoder = logit_proto::otlp::OtlpEncoder::new();
         let payloads =
@@ -2737,7 +2755,7 @@ mod tests {
     /// A listener over one edge per capacity in `capacities`, each carrying consumer telemetry
     /// `c<i>` under the returned probe, so a send that finds one full counts
     /// `logit.component.inbox.full`. The listener's telemetry and diagnostics are on the probe
-    /// too, and its first batch waits at most `busy_after`. Returns each edge's sender beside its
+    /// too, and a request waits at most `busy_after`. Returns each edge's sender beside its
     /// receiver, for filling it.
     #[allow(clippy::type_complexity)] // a test rig's parts, destructured at each call
     async fn busy_listener(
@@ -2878,11 +2896,49 @@ mod tests {
         assert_eq!(probe.sum("logit.input.batches.deferred", &[]), 2.0);
     }
 
-    /// Once the first batch is in, the rest wait for as long as the pipeline takes: a busy answer
-    /// would make the client's retry deliver the first batch twice. The second batch here gets
-    /// room only well past the bound, and the request is still answered `200`.
+    /// A request is all or none: an inbox with room for the first of a two-resource request's
+    /// batches and not the second takes neither, so the client's retry is the one copy of each.
     #[tokio::test]
-    async fn a_request_whose_first_batch_is_taken_waits_past_the_bound_for_the_rest() {
+    async fn an_http_request_with_room_for_only_its_first_batch_is_busy_and_delivers_nothing() {
+        let (addr, _running, mut channels, mut probe) =
+            busy_listener(OtlpTransport::Http, &[2], TEST_BUSY_AFTER).await;
+        fill(&channels[0].0).await;
+
+        let response = export_http(&addr, "/v1/metrics", &two_resource_metrics_payload()).await;
+        assert!(response.starts_with("HTTP/1.1 503"), "got: {response}");
+        assert!(response.ends_with("\r\n\r\nbusy"), "got: {response}");
+        assert_eq!(hosts_received(&mut channels[0].1).await, [""], "the filler alone");
+        assert_eq!(probe.sum("logit.input.batches.deferred", &[]), 2.0);
+        assert_eq!(probe.sum("logit.component.batches.sent", &[]), 0.0);
+        let busy = [("route", "metrics"), ("class", "busy")];
+        assert_eq!(probe.sum("logit.input.requests", &busy), 1.0);
+    }
+
+    /// gRPC answers the same request `UNAVAILABLE`, with nothing delivered.
+    #[tokio::test]
+    async fn a_grpc_request_with_room_for_only_its_first_batch_is_unavailable_and_delivers_nothing()
+    {
+        let (addr, _running, mut channels, mut probe) =
+            busy_listener(OtlpTransport::Grpc, &[2], TEST_BUSY_AFTER).await;
+        fill(&channels[0].0).await;
+
+        let export = grpc_metrics_after(&addr, &[]);
+        let (status, _port) = tokio::time::timeout(logit_pipeline::test_util::RECV_TIMEOUT, export)
+            .await
+            .expect("the call is answered within the bound, not parked");
+        assert_eq!(status, "14");
+        assert_eq!(hosts_received(&mut channels[0].1).await, [""], "the filler alone");
+        assert_eq!(probe.sum("logit.input.batches.deferred", &[]), 2.0);
+        assert_eq!(probe.sum("logit.component.batches.sent", &[]), 0.0);
+    }
+
+    /// A request with more batches than the inbox holds can't be reserved whole: its first
+    /// batches go under the bound, and once they are in, the rest wait for as long as the
+    /// pipeline takes, since a busy answer then would make the client's retry deliver the first
+    /// twice. The second batch here gets room only well past the bound, and the request is
+    /// answered `200` and counted `unbounded`.
+    #[tokio::test]
+    async fn a_request_with_more_batches_than_the_inbox_holds_waits_past_the_bound_for_the_rest() {
         let (addr, _running, mut channels, mut probe) =
             busy_listener(OtlpTransport::Http, &[1], TEST_BUSY_AFTER).await;
 
@@ -2907,7 +2963,9 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
         assert_eq!(probe.sum("logit.input.batches.deferred", &[]), 0.0);
         assert_eq!(probe.sum("logit.input.requests", &[("class", "busy")]), 0.0);
-        assert_eq!(probe.sum("logit.input.requests", &[("class", "ok")]), 1.0);
+        assert_eq!(probe.sum("logit.input.requests", &[("class", "ok")]), 0.0);
+        let unbounded = [("route", "metrics"), ("class", "unbounded")];
+        assert_eq!(probe.sum("logit.input.requests", &unbounded), 1.0);
     }
 
     /// A client that gives up while the rest of its request waits on a full consumer (an
@@ -2941,7 +2999,7 @@ mod tests {
         assert_eq!(a, ["a", "b"], "a: both of the request's batches");
     }
 
-    /// A client that closes while its first batch waits under the bound takes the batch with it:
+    /// A client that closes while its request waits under the bound takes the request with it:
     /// nothing was reserved on every consumer yet, so no consumer gets it, and nothing counts it
     /// deferred, since no answer was written.
     #[tokio::test]
@@ -3523,8 +3581,9 @@ mod tests {
         (addr, running, rx, probe)
     }
 
-    /// Sends a two-resource export to a [`parked_listener`]: its first batch fills the edge's one
-    /// slot, and its second parks in the detached `Fanout::send`. Returns once the park is counted.
+    /// Sends a two-resource export to a [`parked_listener`]: two batches are more than the edge's
+    /// one slot holds, so the first fills it and the second parks in the detached `Fanout::send`.
+    /// Returns once the park is counted.
     async fn park_a_request(
         addr: &str,
         probe: &mut logit_pipeline::test_util::TelemetryProbe,
