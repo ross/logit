@@ -13107,6 +13107,17 @@ def _reset_actions():
     expect(fake.calls[-1][-1] == "reset" and result["rc"] == 0 and result["killed"] == 3,
            f"a reset with no port closes every established connection, got {fake.calls[-1]} "
            f"{result}")
+    other = _NetemDocker([docker.Result(0, "", ""), docker.Result(0, "", "")])
+    other_ctx = faults.Context(docker=other, ids={"generator": "gen"}, netem_image="netem")
+    shaped = scenario.Step("c0s9", 8, 0, "netem", "generator", "delay 100ms loss 10%",
+                           720.0, 730.0)
+    faults.ACTIONS["netem"].apply(other_ctx, shaped)
+    faults.ACTIONS["netem"].revert(other_ctx, shaped)
+    expect(len(other.calls) == 2
+           and all("--security-opt" not in call and "label=disable" not in call
+                   for call in other.calls)
+           and "--security-opt" in fake.calls[0],
+           f"only a reset's one-shot runs unconfined, got {other.calls} {fake.calls[0]}")
     calls = len(fake.calls)
     expect(faults.ACTIONS["reset"].revert(ctx, step) == {"rc": 0, "stderr": ""}
            and len(fake.calls) == calls, "a reset's revert makes no Docker call")
