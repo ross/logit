@@ -145,3 +145,61 @@ Consequences, beside this record's:
 - **A Prometheus with `retry_on_http_429: false` is unaffected by the choice of status**, and one
   under `buffer.delivery: at_most_once` on `prometheus_out` drops a busy `503` as it drops any
   `Ambiguous` answer.
+
+## Amendment: a request is delivered all or none (2026-11-04)
+
+Decision 3 left a multi-resource request's later batches waiting with no bound. A client whose
+timeout passed during that wait resent the request, and the detached task delivered the original
+too: one duplicate per timeout, the outcome this record removed for a one-batch request.
+`datadog_in`'s per-batch deadline had the mirror case: a `503` after a prefix of the request was
+taken, which the client's retry delivered twice.
+
+**Changed:**
+
+1. **Every batch of a request waits under the one deadline, all or none.**
+   `Fanout::send_many_with_deadline` reserves one slot per batch on every consumer's channel
+   (tokio's `Sender::reserve_many`) under `BUSY_AFTER`, and sends nothing until every consumer
+   holds every slot. A deadline that passes first releases what it holds, and nothing is sent or
+   counted. This replaces decisions 1 and 3 for a request that fits. `otlp_in`, `splunk_hec_in`,
+   and `datadog_in` deliver through it, by way of `crate::http::deliver_bounded`, the one bounded
+   helper every HTTP listener now shares; a one-batch request, the only kind `influxdb_in`,
+   `datadog_trace_in`, and `prometheus_in`'s receiver send, goes through
+   `Fanout::send_with_deadline` as before.
+2. **The busy answers don't change.** `otlp_in` answers `503` (gRPC `UNAVAILABLE`),
+   `splunk_hec_in` `503` code 9, and `datadog_in` `503`, each with `Retry-After: 1`, and every
+   batch of the request is counted `logit.input.batches.deferred`.
+3. **A request with more batches than an inbox holds is bounded for its first batches only.**
+   A channel can't reserve more slots than its capacity, the runtime's `CHANNEL_CAPACITY` of 64
+   batches. Such a request sends its first 64 all or none under the deadline and, once they are
+   in, the rest through `deliver_detached`, as decision 3 sent every batch after the first. It's
+   answered as an `ok` request is and counted `logit.input.requests{class="unbounded"}` in place
+   of `ok`, so an operator sees how often the old duplicate can still happen. It isn't a
+   `*.dropped` name: a possible duplicate isn't loss.
+4. **A closed consumer is answered as decision 4 says**, with one difference: a request no
+   consumer takes is refused whole, before anything is sent, so every batch counts
+   `logit.input.batches.dropped{reason="closed_consumer"}`. Only an unbounded request's detached
+   rest can be refused after part of it was taken, which `splunk_hec_in` answers `500` code 8 and
+   `otlp_in` and `datadog_in` answer `503`.
+
+**Alternatives considered:**
+
+- **Bound every batch, each under the same deadline**, as `datadog_in` did. Rejected: a `503`
+  after a prefix was taken makes the client's retry deliver the prefix twice, and every client
+  these listeners serve retries a `503` either way.
+- **Answer a request too large to reserve with `413`.** Rejected: it's a valid request, and an
+  exporter drops a `413` as a permanent failure.
+- **Size each inbox to the largest request.** Rejected: inboxes are built once per graph, and a
+  request's batch count is the sender's to choose.
+
+**Consequences:**
+
+- **Decision 3's "a multi-resource request can still duplicate" now holds only for a request of
+  more than 64 batches**, and `class="unbounded"` counts each one. `otlp_out` sends one resource
+  per request, so a `logit` hop still never reaches it.
+- **A request needs room for all its batches at once.** Under a pipeline that drains slowly, a
+  multi-batch request can be answered busy where its first batch used to get in. While its wait
+  is queued on a full inbox, it holds the slots that inbox has handed it so far, and a sender
+  queued behind it there waits for it, since tokio's channel hands out slots in order. The
+  deadline bounds both.
+- A test that parked a request's later batch on a full inbox now sends a two-batch request into
+  a one-slot inbox, where the request is unbounded.

@@ -395,10 +395,10 @@ never completes. A reviewer can answer each decision below yes or no.
    connection can't race the signal mid-request because hyper owns the read, so its task needs an
    owner the backstop can abort.
 4. **An abort costs the acknowledgment, never a batch.** No HTTP handler awaits `Fanout::send` on
-   the connection task. `otlp_in` and the receiver deliver on a detached task
-   (`deliver_detached`), which an abort doesn't cancel. The Datadog pair use `send_with_deadline`,
-   which reserves every consumer's slot before it sends and counts nothing until it does, and
-   `splunk_hec_in` sends its first batch that way and the rest through `deliver_detached`. The
+   the connection task. Every HTTP listener delivers through `deliver_bounded`, which reserves a
+   slot per batch on every consumer before it sends and counts nothing until it does, and sends a
+   request too large to reserve whole the rest of the way through `deliver_detached`, a detached
+   task an abort doesn't cancel. The
    client sees a reset and resends a batch the pipeline already took. That is ordinary
    at-least-once ([ADR `delivery-semantics`](delivery-semantics.md)). This narrows, at shutdown,
    two earlier rules: the in-flight tracker's "kept until that request completes rather than
@@ -406,11 +406,11 @@ never completes. A reviewer can answer each decision below yes or no.
    for an in-flight request has no ceiling". Both protect a batch blocked in `Fanout::send`,
    and no handler is blocked there on the connection task, so an abort discards no batch. The code
    PRs record in the module doc of `crates/logit-inputs/src/http.rs` that a handler never awaits
-   `Fanout::send` on the connection task: it uses `deliver_detached`, or `deliver_with_deadline`,
-   which sends each batch only once every consumer's slot for it is held.
+   `Fanout::send` on the connection task: it uses `deliver_detached`, or `deliver_bounded`,
+   which sends only once every consumer's slots are held.
 5. **Some tasks outlive an abort, and each ends in bounded time.** hyper spawns h2 stream handlers
    through `TokioExecutor`, outside the set, and detached deliveries are outside it too. A body
-   read fails once its connection is gone. `send_with_deadline` is bounded by `busy_after`. A
+   read fails once its connection is gone. `deliver_bounded`'s wait is bounded by `busy_after`. A
    parked detached send is bounded by its downstream draining or closing: a sink closes its inbox
    at its own `buffer.shutdown_grace`, a transform or a healthy Lua node drains once its
    downstream closes, and a Lua node wedged inside a call is revoked 2 s after the signal or its
