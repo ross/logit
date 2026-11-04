@@ -84,7 +84,8 @@ Three facts from the survey drive the shape of the decision:
    workspace's rationale against the `zstd` crate stays for compressing; senders use gzip.
 
 5. **`datadog_in`'s backpressure is a bounded wait on delivery, then `503` with
-   `Retry-After: 1`**, not `otlp_in`'s blocked connection. A Datadog Agent's forwarder times a
+   `Retry-After: 1`**, not `otlp_in`'s blocked connection (`otlp_in` has since moved to a bounded first batch and a
+   busy answer too: [ADR `otlp-in-busy-answer`](otlp-in-busy-answer.md)). A Datadog Agent's forwarder times a
    request out at 20 seconds and retries it with backoff, so a connection held open until the
    pipeline drains costs the Agent a slot for 20 seconds and still ends in a retry: only an
    expensive `503`. The wait is `BUSY_AFTER` (5 s) per request. Delivery under it is
