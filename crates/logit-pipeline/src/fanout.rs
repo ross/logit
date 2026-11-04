@@ -33,13 +33,13 @@
 //! dropped while parked on a full consumer leaves the ones before it holding the batch and the
 //! rest without it, and a retry then duplicates on some branches only. A send inside an HTTP
 //! handler is exposed to this: a client that closes mid-request drops hyper's service future on
-//! h1, and an h2 `RST_STREAM` cancels the stream's task. `prometheus_in`'s receiver
-//! therefore runs a request's sends on a task of its own and awaits it
-//! (`logit-inputs`' `http::deliver_detached`), so a closing client cancels only the wait.
-//! `datadog_in`, `datadog_trace_in`, and `influxdb_in` call `send_with_deadline` (through
-//! `http::deliver_with_deadline`), which answers "busy" instead. `otlp_in` and `splunk_hec_in` do
-//! both through `http::deliver_first_bounded`: a request's first batch under the deadline, the rest
-//! detached.
+//! h1, and an h2 `RST_STREAM` cancels the stream's task. A listener therefore runs a request's
+//! unbounded sends on a task of its own and awaits it (`logit-inputs`' `http::deliver_detached`),
+//! so a closing client cancels only the wait. `datadog_in`, `datadog_trace_in`, and `influxdb_in`
+//! call `send_with_deadline` (through `http::deliver_with_deadline`), which answers "busy"
+//! instead. `otlp_in`, `splunk_hec_in`, and `prometheus_in`'s receiver do both through
+//! `http::deliver_first_bounded`: a request's first batch under the deadline, the rest detached.
+//! The receiver's write is one batch, so it has no detached rest.
 //!
 //! **A reservation always carries a deadline.** `send_with_deadline` holds a slot on every
 //! consumer it has reached while it waits for the next. In a diamond (`in -> [a, b]`, `b -> a`),
