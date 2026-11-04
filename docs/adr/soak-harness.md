@@ -600,8 +600,8 @@ in the pool, past its limit of 650.
 
 Re-scored, the failed run PASSes with 90 of loss judged against 650, and the passing run reads
 96 as before. A backend stop still opens no judged HTTP window: whether it reaches the wire
-depends on the listener (`otlp_in` holds a request past the writer's timeout, `influxdb_in`
-answers a busy `503`), so its resends' surplus counts 0 as steady state's does.
+depends on the listener (`prometheus_in`'s receiver holds a request past the writer's timeout,
+`influxdb_in` and `otlp_in` answer a busy `503`), so its resends' surplus counts 0 as steady state's does.
 
 ## Amendment: a merge is credited back as delivered, and a keyed discard is judged by absence (2026-10-29)
 

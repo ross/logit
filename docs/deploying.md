@@ -1615,14 +1615,16 @@ socket. Only two things reset it: bytes read from the peer, and the listener fin
 on the connection (a batch handed downstream, a resend recognized, a response completed). Time spent
 blocked handing a batch to a full downstream never counts, because the clock isn't re-armed until
 that work returns. So a connection stalled on backpressure never looks idle, however long the
-stall. On `otlp_in` and `prometheus_in`'s remote-write receiver, a request handler parked on a
-full downstream isn't closed by `idle_timeout` or the grace after it either: it holds its
-connection and its permit until the send completes or the client goes away, because closing it
-would drop a batch that never reached the fan-out. `datadog_in` and `influxdb_in` wait at most
-5 s, and `datadog_trace_in` 2 s, then answer `503` with `Retry-After: 1`. `splunk_hec_in` gives
-only a body's first batch the 5 s deadline, answering `503` code 9 when it passes; once that batch
-is in, the body's later batches wait with no deadline and hold the connection and its permit as
-`otlp_in` does, because a `503` would make the client resend the batch already delivered. A periodic
+stall. On `prometheus_in`'s remote-write receiver, a request handler parked on a full downstream
+isn't closed by `idle_timeout` or the grace after it either: it holds its connection and its
+permit until the send completes or the client goes away, because closing it would drop a batch
+that never reached the fan-out. `datadog_in` and `influxdb_in` wait at most 5 s, and
+`datadog_trace_in` 2 s, then answer `503` with `Retry-After: 1`. `splunk_hec_in` gives only a
+body's first batch the 5 s deadline, answering `503` code 9 when it passes, and `otlp_in` gives a
+request's first batch 2 s, answering `503` with `Retry-After: 1` (gRPC `UNAVAILABLE`). Once that
+batch is in, the request's later batches wait with no deadline and hold the connection and its
+permit as the receiver does, because a `503` would make the client resend the batch already
+delivered. A periodic
 flush tick that finds nothing to send touches neither event, so it never re-arms the clock by
 itself.
 
@@ -3464,10 +3466,10 @@ Agent. Any other `Content-Encoding` gets `415`.
 
 **A full pipeline gets `503`, not a blocked connection.** When the pipeline doesn't accept a
 request's batches within 5 seconds, `datadog_in` answers `503` with `Retry-After: 1` rather than
-holding the connection open, which is what `otlp_in` and `prometheus_in` do. The Agent's forwarder
-retries a `503` with backoff and holds the payload in its retry queue meanwhile, so nothing is lost
-until that queue fills. A blocked connection would instead cost the Agent 20 seconds before its own
-timeout, and then the same retry.
+holding the connection open, which is what `prometheus_in`'s remote-write receiver does. The
+Agent's forwarder retries a `503` with backoff and holds the payload in its retry queue meanwhile,
+so nothing is lost until that queue fills. A blocked connection would instead cost the Agent 20
+seconds before its own timeout, and then the same retry.
 
 - **A `503` means no consumer holds the batch that timed out.** Each batch goes to every consumer
   downstream of `datadog_in` or to none, however many there are, so the Agent's retry is its only

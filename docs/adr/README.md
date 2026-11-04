@@ -10,6 +10,7 @@ the same date, write the record, then add a row here.
 
 | ADR | Created | Updated |
 |---|---|---|
+| [`otlp_in` answers busy: a request's first batch waits at most 2 seconds, then `503` or `UNAVAILABLE`](otlp-in-busy-answer.md) | 2026-11-03 | 2026-11-03 |
 | [Server status inputs: `nginx_stub_status_in` and `apache_status_in` on a scrape driver shared with `prometheus_in`](server-status-scrape-inputs.md) | 2026-10-31 | 2026-11-01 |
 | [`s3_out`: one object per time and size window, delivered at completion, under a key its first batch names](s3-object-archive.md) | 2026-10-30 | 2026-10-30 |
 | [Collecting sink window: a windowed sink keeps its window open across arrivals until its own bound, a deadline, store pressure, or shutdown closes it](collecting-sink-window.md) | 2026-10-30 | 2026-10-30 |
@@ -45,7 +46,7 @@ the same date, write the record, then add a row here.
 | [Stale events are filtered by a `drop_stale`/`has_stale` transform pair](stale-event-filtering.md) | 2026-10-13 | 2026-10-13 |
 | [InfluxDB line-protocol relay: fields as typed `Gauge` records under a measurement carrier, strings as attributes, and an all-or-nothing write](influxdb-line-protocol-relay.md) | 2026-10-13 | 2026-10-25 |
 | [Typed metric scalar: `MetricValue { F64, I64, U64, Bool }` replaces the `f64` in `Gauge`, `GaugeDelta`, and `Sum`](typed-metric-scalar.md) | 2026-10-13 | 2026-10-18 |
-| [Telemetry loss vocabulary: any nonzero `*.dropped` is loss, and intended outcomes use other words](telemetry-loss-vocabulary.md) | 2026-10-13 | 2026-11-02 |
+| [Telemetry loss vocabulary: any nonzero `*.dropped` is loss, and intended outcomes use other words](telemetry-loss-vocabulary.md) | 2026-10-13 | 2026-11-03 |
 | [`kafka_out` OTLP formats: one export request per signal per record, a topic per signal, and a producer per topic behind a multi-topic facade](kafka-otlp-formats.md) | 2026-10-12 | 2026-10-13 |
 | [`kafka_out` SASL: PLAIN, SCRAM, OAUTHBEARER, and AWS MSK IAM, authenticated in the dialer and renewed by redial](kafka-sasl.md) | 2026-10-11 | 2026-10-30 |
 | [`kafka_out`: a pure-Rust producer on `kafka-protocol`, with the Java producer's semantics and named divergences](kafka-output.md) | 2026-10-11 | 2026-10-25 |
@@ -87,7 +88,7 @@ the same date, write the record, then add a row here.
 | [Splunk HEC: a lossless pair in the OpenTelemetry exporter's vocabulary, spans as HEC events, and opt-in acknowledgment](splunk-hec-relay.md) | 2026-09-25 | 2026-10-23 |
 | [VictoriaMetrics interop: existing components, plus zstd on Prometheus remote-write](victoriametrics-interop.md) | 2026-09-24 | 2026-10-26 |
 | [Durable checkpoint writes, observed spool I/O failures, and a feature-gated fault-injection seam](durable-checkpoint-writes-and-fault-injection.md) | 2026-09-24 | 2026-09-28 |
-| [Datadog: two lossless pairs, the Agent's own protocols, and a Datadog-mapped `DdSketch`](datadog-agent-and-intake-relay.md) | 2026-09-23 | 2026-10-25 |
+| [Datadog: two lossless pairs, the Agent's own protocols, and a Datadog-mapped `DdSketch`](datadog-agent-and-intake-relay.md) | 2026-09-23 | 2026-11-03 |
 | [`sample`: consistent, keyed event sampling with an operator override](consistent-sampling-component.md) | 2026-09-22 | 2026-10-25 |
 | [Publish the release image to GHCR, `latest` only, on manual dispatch](publish-release-image-to-ghcr.md) | 2026-09-22 | 2026-10-09 |
 | [`http_access`: web-server access lines normalized to OTel semconv once, natively, from raw fields](http-access-normalization.md) | 2026-09-22 | 2026-10-25 |

@@ -1,6 +1,6 @@
 ---
 created: 2026-09-23
-updated: 2026-10-25
+updated: 2026-11-03
 ---
 
 # Datadog: two lossless pairs, the Agent's own protocols, and a Datadog-mapped `DdSketch`
@@ -242,6 +242,8 @@ Three facts from the survey drive the shape of the decision:
   so blocking buys nothing a `503` doesn't and holds a connection and an Agent worker for the
   whole wait. A plain timeout around `Fanout::send` was rejected with it: it sends consumer by
   consumer, so a deadline between two leaves the first holding a batch the Agent then resends.
+  The premise about `otlp_in`'s clients was false: an OTLP exporter times out and retries as an
+  Agent does (the amendment "`otlp_in` answers busy too" below).
 - **Require `serializer_compressor_kind: gzip` on redirected Agents instead of a zstd decoder.**
   Rejected: it changes what Datadog receives too under dual-shipping, and it's one more edit per
   Agent in a migration whose point is that only the URL changes.
@@ -942,3 +944,13 @@ one name each keep their value now, since the `meta` one is a common key and the
 
 The like pairs stay fixed points with and without each field: a span's meta relays through the
 event's key and a payload's field through the resource's.
+
+## Amendment: `otlp_in` answers busy too (2026-11-03)
+
+Decision 5's rejected alternative said `otlp_in`'s and `prometheus_in`'s clients wait for as long
+as the pipeline takes. They don't: every OTLP exporter has a request timeout (`otlp_out`'s is 10
+seconds, the Collector's 5) and resends a request that timed out, so a blocked `otlp_in`
+delivered each timed-out request twice. [ADR `otlp-in-busy-answer`](otlp-in-busy-answer.md) gives
+`otlp_in` a 2-second bound on a request's first batch and a busy `503` (gRPC `UNAVAILABLE`), by
+`splunk_hec_in`'s first-batch rule. `prometheus_in`'s remote-write receiver still blocks, tracked
+in [`known-gaps/prometheus.md`](../known-gaps/prometheus.md).

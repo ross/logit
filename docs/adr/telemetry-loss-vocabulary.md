@@ -1,6 +1,6 @@
 ---
 created: 2026-10-13
-updated: 2026-11-02
+updated: 2026-11-03
 ---
 
 # Telemetry loss vocabulary: any nonzero `*.dropped` is loss, and intended outcomes use other words
@@ -556,6 +556,7 @@ row reading "unchanged" keeps its name and every reason listed.
 | network listeners | `input.connections.rejected` (`limit`, `proxy_header`) | unchanged |
 | HTTP listeners | `input.requests.rejected` (every reason) | unchanged |
 | `datadog_in`, `datadog_trace_in`, `splunk_hec_in` | `input.batches.dropped` (`busy`) | `input.batches.deferred` (untagged) |
+| `otlp_in` | none: it answered no request busy until [ADR `otlp-in-busy-answer`](otlp-in-busy-answer.md) | `input.batches.deferred` (untagged), for every batch of a request answered busy |
 | `kafka_in` | none: the component postdates this record | `input.batches.deferred` (untagged), for a batch left uncommitted at a revoke's or shutdown's drain deadline; this record's 2026-10-30 amendment |
 | HTTP listeners, `tail_in`, `docker_in`, `logit_in` | `input.batches.dropped` (`closed_consumer`, `rejected`) | unchanged |
 | `splunk_hec_in` | `input.acks.dropped` (`expired`) | `input.acks.evicted` (`expired`) |

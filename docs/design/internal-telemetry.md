@@ -1169,18 +1169,19 @@ idle close is
 `graceful_shutdown()`, a bounded grace, then drop, the same close a stalled request body's
 `408`/`grpc-status: 4` reaches.
 
-There's no frame or request counter. This input's unit of arrival is an HTTP request or a gRPC
-call, and `Fanout` already sees one batch per accepted request, so a counter would only restate it.
-The one request-level point is a refusal no batch records:
-`logit.input.requests.rejected{reason="auth"}` (count), one per request `auth:` refused, HTTP
-`401` or gRPC status 16, before its body was read.
+| Name | Kind | Meaning |
+|---|---|---|
+| `logit.input.requests{route, class}` | count | one per request or gRPC call, every exit included. `route` is `logs`, `metrics`, or `traces`, or `unknown` for a path or method this listener doesn't serve, on both transports; `class` is `ok`, `rejected` (any `4xx`, or a gRPC status other than 0 and 14), `busy`, or `closed_consumer`. A request whose client closes while it waits counts no class |
+| `logit.input.requests.rejected{reason="auth"}` | count | one per request `auth:` refused, HTTP `401` or gRPC status 16, before its body was read |
+| `logit.input.batches.deferred` | count | every batch of a request answered busy: HTTP `503` with `Retry-After: 1`, or gRPC status 14 (`UNAVAILABLE`), because its first batch found no room in every consumer within 2 seconds. Disjoint from `logit.component.batches.sent`. See below |
+| `logit.input.batches.dropped{reason="closed_consumer"}` | count | every batch of a request that no consumer took, the refused one included, because every consumer of the listener has closed. The request is answered as a busy one is, never with a `partial_success`. Not disjoint from `logit.component.batches.sent`: the refused batch is also counted there and once per consumer in `logit.component.events.dropped{reason="closed_consumer"}`; batches after it that were never offered appear only here |
 
-`logit.input.batches.dropped{reason="closed_consumer"}` (count): every batch of a request that no
-consumer took, the refused one included, because every consumer of the listener has closed. The
-request is answered HTTP `503` with `Retry-After: 1` or gRPC status 14 (`UNAVAILABLE`), never a
-`partial_success`. Not disjoint from `logit.component.batches.sent`: the refused batch is also
-counted there and once per consumer in `logit.component.events.dropped{reason="closed_consumer"}`;
-batches after it that were never offered appear only here.
+**A busy request is not a lost one.** Only a request's first batch waits under the bound, and it
+reaches every consumer or none (`Fanout::send_with_deadline`), so a busy answer leaves every
+batch of the request with the client, which retries it as the OTLP specification asks. Read a
+steady busy rate as a pipeline that can't keep up with its exporters. Once the first batch is in,
+the rest wait with no bound, so a request of several resources is never answered busy after part
+of it was taken ([ADR `otlp-in-busy-answer`](../adr/otlp-in-busy-answer.md)).
 
 The OTLP codec counts a metric with no data as
 `logit.input.metrics.skipped{metric_kind="unknown", reason="no_data"}`, and a histogram point
@@ -1189,7 +1190,8 @@ whose `count` isn't the sum of its bucket counts, which keeps its buckets, as
 (`crates/logit-proto/src/otlp/metrics.rs`).
 
 `Diagnostics` keys: `bound`, `request_rejected` (a request `auth:` refused; the peer address and
-why, never the credential, appear in the message text), `connection_error` (one connection's I/O
+why, never the credential, appear in the message text), `busy` (a busy answer), `closed_consumer`
+(a request no consumer took), `connection_error` (one connection's I/O
 failing, a TLS accept that failed or timed out, or a plaintext connection held open past `handshake_timeout` without a
 first byte, which then gave its permit back; never an idle close), `proxy_header` (any
 `connections.rejected{reason="proxy_header"}` refusal), and `forwarded` (under `forwarded:`, a request whose named header names no usable client; the header name and the reason appear in the message text, never the value; a request without the header isn't counted). A plaintext peer that *closes
@@ -1213,7 +1215,7 @@ would add one point per probe interval to this key forever.
 | bind | `logit.input.write.duration` | timing | one per request answered, every exit included, which is why the timer lives in one wrapper around the routing itself |
 | both | `logit.input.samples` | count | a different unit in each mode. See below. |
 
-These are this component's own spellings, not `otlp_in`'s, which counts only refused requests. In `logit.input.writes`:
+These are this component's own spellings, not `otlp_in`'s `logit.input.requests{route, class}`. In `logit.input.writes`:
 
 - `ok` carries the body's `encoding`, so a vmagent that stayed on its default zstd wire, rather
   than downgrading to Snappy, reads as `encoding="zstd"`. It counts a delivered write whose
@@ -1360,8 +1362,8 @@ and the same shared idle tracker (`crates/logit-inputs/src/http.rs`): `logit.inp
 `proxy_protocol: true`, `logit.input.connections.rejected{reason="proxy_header"}` counts a
 connection refused for its PROXY header, as on the shared TCP stream driver.
 
-**Unlike `otlp_in`, it counts requests.** A Datadog Agent posts to about a dozen routes, some of
-which this listener only acknowledges, so the `Fanout`'s batch count can't say which routes are
+**It counts requests by route.** A Datadog Agent posts to about a dozen routes, some of which
+this listener only acknowledges, so the `Fanout`'s batch count can't say which routes are
 arriving or which were refused.
 
 | Name | Kind | Meaning |
