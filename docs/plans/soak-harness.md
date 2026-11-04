@@ -6945,8 +6945,8 @@ What the runs showed about `logit` and the harness:
   bytes-over-limit time. The first run's 425,984 B stalled only 0.40 s. In the first run most
   bytes were kworker writeback, which the scope's PSI doesn't see; in the second, the flusher
   likely wrote back most of each record before the rotation's `fdatasync`. The next VM run
-  should record `sysctl vm.dirty_*`, sample `io.stat`, `io.pressure`, and `/proc/vmstat`'s `nr_dirty` and
-  `nr_writeback` each second, and time each `fdatasync` (`strace -f -T -e fdatasync`).
+  should record `sysctl vm.dirty_*`, sample `io.stat`, `io.pressure`, and `/proc/vmstat`'s
+  `nr_dirty` and `nr_writeback` each second, and time each `fdatasync` (`strace -f -T -e fdatasync`).
 - **Open, not built: the default segment under throttle.** The first run's 18.5 s shutdown at
   the default segment size exceeds Docker's 10 s default stop timeout and nothing asserts it.
   A default-segment variant, or an `[[expect]]` on shutdown drain time, would assert it.
