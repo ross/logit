@@ -1078,8 +1078,10 @@ in every inbox, `503` busy after 5 s with nothing taken and the batch in
 sum to its `logit.component.batches.sent`, and its `busy` ones equal `batches.deferred`, which
 `ledger.intake` holds it to in every life a kill didn't end; a SIGKILL loses the killed life's
 last interval of counts, so that life is reported unjudged. A busy `503` is a retry the producer makes, not loss. `otlp_in`
-counts no requests and never answers busy: a slow downstream holds the request, and a client
-that gives up leaves its batches to be delivered, so it has no identity beyond W − D == E + B.
+answers as `influxdb_in` does, under a 2 s deadline on a request's first batch, and counts its
+requests on `logs`, `metrics`, and `traces`, each a write route, so its row sums them. A request
+decodes to one batch per resource and `otlp_out` sends one resource per request, so both identities hold
+for every `otlp_out` writer.
 From W24 `splunk_hec_in` and `datadog_in` hold the same two identities as `influxdb_in`, on the
 write routes their writers post to, `event` and `series_v2`, under a 5 s deadline
 (`splunk_hec_in` on a request's first batch, `datadog_in` on every batch; a series body is one
@@ -2794,7 +2796,7 @@ where it needs them, and a small check extension.
     resend of a request the SUT took before the answer was lost is a surplus, allowed one
     batch per transport-error attempt, as a TCP window's is per ambiguous attempt. `otlp_in` has
     rows of its own in `checks.HTTP_LISTENERS`, with W per log record and per metric data
-    point (one `Event` each) and no request identity, for W13b's generator, which
+    point (one `Event` each) and the request identities summed over its three routes, for W13b's generator, which
     `otlp-fan-out` runs, and W23's, which `delta-datadog` runs.
     Built as `http-ingress`: each point carries a string field alone, so the SUT decodes no
     gauge, which V can't count, and `kv_metrics` counts one per point. Faults: netem delaying
@@ -5678,10 +5680,12 @@ of 650:
   dropped about half its batches (`overflow_newest`), fewer under the 30% egress loss, and
   through every outage all of them, 101,650 records over the run, none of them in G. A known-gaps candidate
   for `otlp_out` on a slow link, not a ledger finding.
-- **The backend stop backed up to the generator, as `otlp_in` has no busy answer.** The sink's
+- **The backend stop backed up to the generator, as `otlp_in` had no busy answer.** The sink's
   two-batch queue filled, the inboxes behind it held batches of four times the events, and
   `otlp_in` held each request past `otlp_out`'s 10 s timeout: 3 transport errors and 337
   batches' overflow on the generator through the stop, no sink drop, and `rss_slope` flat at +3.4 MiB/h.
+  `otlp_in` now answers busy after 2 s, so the stop reaches the generator as `503`s; see
+  "`otlp_in` answers busy, on `outq/w4`" below.
 - The pause, the stop, and the partition gave 19 transport-error attempts between them, and
   each judged run's surplus stayed inside its allowance once the boundaries netted.
 - No product finding.
