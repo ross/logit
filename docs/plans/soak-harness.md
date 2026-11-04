@@ -6828,6 +6828,64 @@ What the runs showed about `logit` and the harness:
 - **Self-test**: 2,375 expectations after the merges. Each new rule was reverted in turn and
   failed at least one expectation; the PR lists them.
 
+### W31: open-files limits on a TCP listener and a tailer (2026-11-03)
+
+W31 adds the `prlimit` action and the `fd-limit-tcp` and `fd-limit-tail` scenarios. Both ran at
+their default duration on the development host (Docker 29.9, SELinux enforcing), one after the
+other, against `logit:soak-w31` built from `soak/w31` (W31 changes no Rust). A container's
+default limit read 1024 soft and 524288 hard (`/proc/1/limits` in a SUT started from the soak
+image), and `logit` is PID 1 there. The apply read that pair back through `prlimit` with
+`SYS_RESOURCE` and no `label=disable`, and every revert set it back.
+
+| Run | Scenario | Verdict | Highlights |
+|---|---|---|---|
+| `20261104T010333Z` | `fd-limit-tcp`, first cut (limit at cycle offsets 70 s to 150 s) | FAIL | `ledger.wire` and `accepts-recover`, both the harness's; below |
+| `20261104T011502Z` | `fd-limit-tcp` (70 s to 120 s) | PASS, `rss_slope` WARN | `limit-landed` read 20 in 4 drains; 290 resource accept errors in the window and 0 in the mark past it; 8 idle closes; G 880,950 against W 881,023, loss judged 0; Ab − V 0 |
+| `20261104T012438Z` | `fd-limit-tail` | PASS, `rss_slope` WARN | `limit-landed` read 24 in 22 drains; 166 failed listings and 25 failed checkpoint writes in the window, 0 of either in the mark past it; G = W = Ab = V = 1,505,600, W + F − G 0; 33 writer rotations, 27 deletions, `files.open` peaking at 9 and ending at 8 |
+
+What the runs showed about `logit` and the harness:
+
+- **TCP lost nothing.** With the eight connections closed the SUT held 15 descriptors, 24 with
+  them open, so the limit of 20 let five redials in and failed the rest with EMFILE at the
+  listener's 100 ms backoff, about 10 a second from the redials to the revert, each counted and
+  the warning throttled (`accept_error`). Their lines waited in the accept queue; the generator's writes into them
+  stalled past `connect_timeout` and were counted (3 `ambiguous_at_most_once`, 1,810
+  `overflow_newest`), and the queued lines were read after the revert.
+- **The tailer lost nothing.** It held 21 descriptors at the limit's start, two files open; the
+  limit filled at the second rotation in the window. Its opens of the next files failed
+  (`open_error`, throttled), as did its listings of `/shared` and its checkpoint and spool
+  cursor writes on their temporary files, and the first scan after the revert opened every file it had
+  missed from its start.
+- **`internal`'s process metrics stop for the rest of the life at the first EMFILE.** Each
+  `/proc/self` source latches off on any read error and warns once, so
+  `logit.process.memory.resident.bytes`, `logit.process.cpu.seconds`, `logit.process.threads`,
+  `logit.process.fds`, and `logit.process.fds.limit` stopped at the first drain the limit was
+  full and never came back after the revert (`crates/logit-inputs/src/internal.rs`). The
+  metric that would show the exhaustion is the one that goes away. Both runs' `rss_slope` on
+  `logit` WARNs with no sample to fit, and `fd_slope`'s "end" is the last sample before the
+  latch (15 and 23). A product finding for the fixing session.
+- **The admin endpoint's accept failure is logged unthrottled.** `admin: accept failed` is a
+  plain `warn` on every 100 ms backoff (`crates/logit-cli/src/admin.rs`): 547 lines in 55 s in
+  the first TCP run and 1,241 in the tail run, beside the listeners' one throttled line. A
+  product finding.
+- **`fd_limit_warning` fires at start under Docker's default limit.** `tcp-ingress`'s config
+  leaves `statsd_in`'s `max_connections:` at 1024, so every SUT on it warns at start that the
+  caps meet the soft limit of 1024. A product finding (the warning, or the default cap against
+  a default soft limit).
+- **A deferral across a fault-set boundary reads as loss.** In the first cut the limit outlasted
+  the generator pause's recovery, so `ledger.wire` split the run where the pause's window ended:
+  the run holding the queued lines' writes read G − W of 48,282 and the next a surplus of
+  48,474, beyond the boundary netting's cap of the 7,650 the generator sent over the straddling
+  interval. Ending the limit inside the pause's recovery keeps the writes and the reads in one
+  judged run.
+- **The drain straddling a revert carries what came before it.** The first cut's
+  `accepts-recover` read 8 errors in the `after` window, all counted in the 0.9 s before the
+  revert finished, so each scenario's zero row now reads a `mark` starting 8 s past the revert.
+- **Self-test**: 2,882 expectations. Each new rule was reverted in turn and failed at least one
+  expectation: `nofile`'s presence, range, and other actions; the SUT-only and `[random]`
+  refusals; the retention guard's `prlimit` entry and its pause limit; the revert's
+  `started_in_window` branch; the failed read; and `timeline`'s report.
+
 ### Backstop variants: a tailer and a Kafka consumer (2026-11-02)
 
 `sink-outage-stop` soaks the shutdown backstop cutting `statsd_in`'s UDP send on the root
