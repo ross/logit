@@ -3926,13 +3926,14 @@ def _trust_problems(scenario, duration):
                                 f"{cert}'s generation in force; rotate {cert} to a CA the "
                                 "bundle keeps first")
     for spec in rotates:
-        if spec.ca is None or not isinstance(spec.ca, int) or isinstance(spec.ca, bool):
+        ca = 1 if spec.ca is None else spec.ca
+        if not isinstance(ca, int) or isinstance(ca, bool):
             continue
         before = [t for t in trusts if t.at < spec.at and _valid_cas(t)]
         bundle = before[-1].cas if before else [1]
-        if spec.ca not in bundle:
+        if ca not in bundle:
             problems.append(f"step {spec.index + 1} (rotate on {spec.on or '?'}): `ca` "
-                            f"{spec.ca} isn't in the trust bundle in force, {bundle}, so its "
+                            f"{ca} isn't in the trust bundle in force, {bundle}, so its "
                             "peers would refuse the certificate; add it with a trust step "
                             "first")
     if trusts:
