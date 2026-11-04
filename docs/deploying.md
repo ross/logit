@@ -501,13 +501,13 @@ The setting applies to TCP listeners only. A UDP socket has no handshake or acce
 
 The sysctl is per network namespace, and both overlap instances share one, so set it where that
 namespace is owned. A new container's own namespace starts at 0 whatever the host's value, so
-setting it on the host doesn't reach a container. Set it on the container that owns the namespace
-(for example, the holder, or the first container whose network the other joins), with no added
-capability:
+setting it on the host doesn't reach a container. Set it on the container that owns the namespace,
+the one whose network the other instance joins with `--network container:NAME`. Docker applies it
+inside that namespace, with no added capability. On a host, setting it takes root:
 
 ```sh
 docker run --sysctl net.ipv4.tcp_migrate_req=1 ...    # or `sysctls:` in a Compose service
-sysctl -w net.ipv4.tcp_migrate_req=1                  # on a host; persist it in /etc/sysctl.d/
+sysctl -w net.ipv4.tcp_migrate_req=1                  # on a host, as root; persist it in /etc/sysctl.d/
 ```
 
 A `hostNetwork` pod shares the node's namespace and can't set network sysctls, so set it at the
