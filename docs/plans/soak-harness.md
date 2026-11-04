@@ -6893,6 +6893,23 @@ What the runs showed about `logit` and the harness:
   expectation: `nofile`'s presence, range, and other actions; the SUT-only and `[random]`
   refusals; the retention guard's `prlimit` entry and its pause limit; the revert's
   `started_in_window` branch; the failed read; and `timeline`'s report.
+- **Reruns on main (2026-11-04)**, on an image built from `soak/w31` with #979, #981, #982, and
+  #984 merged; both scenarios unchanged.
+  - `fd-limit-tcp`, `20261104T042323Z`: PASS. `rss_slope` PASS on `logit` (-67.7 MiB/h, limit
+    143, 205 s judged) where it had WARNed. `logit.process.fds` and `fds.limit` reported 99
+    drains of the run's 105, 4 of them inside the limit window, and `limit-landed` read 20.
+    `accepts-fail` read 290 resource accept errors in the window and `accepts-recover` 0.
+    G 856,650 against W 856,750, loss judged 1; Ab − V 0.
+  - `fd-limit-tail`, `20261104T043256Z`: PASS. `rss_slope` PASS on `logit` (-17.0 MiB/h, limit
+    79, 1,085 s judged); `fds` reported 283 drains of 309 with 22 inside the limit window.
+    `listings-fail` read 165 and the recover rows 0; G = W = Ab = V = 1,505,700, W + F − G 0;
+    `files.open` peaked at 9 and ended at 8.
+  - `admin: accept failed` lines in the SUT's stderr: 8 in `fd-limit-tcp` (547 before) and 11
+    in `fd-limit-tail` (1,241 before), each carrying a `(xN, further occurrences suppressed)`
+    count.
+  - `logit.output.bytes.dropped{reason="unacknowledged"}` never appeared in any container's
+    telemetry, so it stayed at 0 on `fd-limit-tcp`'s eight `statsd_out` TCP sinks: no
+    connection was reset.
 
 ### Backstop variants: a tailer and a Kafka consumer (2026-11-02)
 
