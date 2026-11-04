@@ -3228,7 +3228,8 @@ Docker 29.9, SELinux enforcing) checked each fault's mechanism before it was pla
     clean ledger. No internal metric times a spool write and `io.stat` has no throttle count.
     `timeline` therefore reports `io.stat`'s `wbytes` and `wios` deltas and the cgroup's
     `io.pressure` stall. `engaged` judges the stall against 1% of the window, so a window that
-    never slowed a write is visible, as `memory.events` is for W32 (ADR `soak-harness`'s amendment "a `cgroup` step limits the writes to the disk behind a SUT path"). A `dm-flakey`
+    never slowed a write is visible, as `memory.events` is for W32 (ADR `soak-harness`'s
+    amendment "a `cgroup` step limits the writes to the disk behind a SUT path"). A `dm-flakey`
     `error_writes` variant, reaching `buffer.disk.errors{op}` on real I/O errors, needs the
     `dm-delay` path's device and stays out of W33 unless that path is the one taken. The
     harness needs Python 3.11 or later and `sudo -n docker`: the VM's Debian 13 image ships
@@ -6943,8 +6944,8 @@ What the runs showed about `logit` and the harness:
   bios is about 11.5 records, so a stall of about 0.53 s per rotation, about 14% of the
   bytes-over-limit time. The first run's 425,984 B stalled only 0.40 s. In the first run most
   bytes were kworker writeback, which the scope's PSI doesn't see; in the second, the flusher
-  likely wrote back most of each record before the rotation's `fdatasync`. The next VM run should record
-  `sysctl vm.dirty_*`, sample `io.stat`, `io.pressure`, and `/proc/vmstat`'s `nr_dirty` and
+  likely wrote back most of each record before the rotation's `fdatasync`. The next VM run
+  should record `sysctl vm.dirty_*`, sample `io.stat`, `io.pressure`, and `/proc/vmstat`'s `nr_dirty` and
   `nr_writeback` each second, and time each `fdatasync` (`strace -f -T -e fdatasync`).
 - **Open, not built: the default segment under throttle.** The first run's 18.5 s shutdown at
   the default segment size exceeds Docker's 10 s default stop timeout and nothing asserts it.
