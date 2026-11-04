@@ -627,7 +627,7 @@ def check_timeline(data):
     rate against the limit, and the stalled time are reported, and one that couldn't read them
     FAILs; `engaged` there reads the stalled time against `IO_ENGAGED_STALL_SHARE` of the
     window. A `slowclient` revert's counts are reported: the most connections it held, its
-    dials, and how many the listener closed."""
+    dials, and how many the listener closed, or under `churn` its dials and how each ended."""
     if data.t0 is None:
         return Result("timeline", SKIP, "no timeline start")
     lines = []
@@ -676,7 +676,14 @@ def check_timeline(data):
              f"connection(s), dialed {_n(done.get('dialed', 0))}, "
              f"{_n(done.get('peer_closed', 0))} closed by the listener"
              for record in actions if record["event"] == "revert"
-             and isinstance(done := record.get("done"), dict)]
+             and isinstance(done := record.get("done"), dict) and done.get("mode") != "churn"]
+    gone += [f"{record.get('step')} (slowclient on {record.get('on')}): churn dialed "
+             f"{_n(done.get('dialed', 0))} ({_n(record.get('connections', 0))} a tick), "
+             f"{_n(done.get('closed', 0))} closed by the listener, "
+             f"{_n(done.get('resets', 0))} reset, {_n(done.get('timeouts', 0))} timed out, "
+             f"{_n(done.get('dial_errors', 0))} failed"
+             for record in actions if record["event"] == "revert"
+             and isinstance(done := record.get("done"), dict) and done.get("mode") == "churn"]
     for record in actions:
         if record["event"] != "revert":
             continue
@@ -3545,6 +3552,10 @@ OVERLAP_HOLD_ACTIONS = ("stop", "kill", "pause", "restart", "exit")
 # with no final sample or drain, after which `ledger.overlap` can't be judged.
 OVERLAP_CLOSES = ("stop", "restart")
 OVERLAP_UNJUDGED = ("kill", "exit")
+# On a TCP wire, what one instance's close can lose of each generator sink's connection to it,
+# in that sink's batches: a write the closing instance's kernel acknowledged and the process
+# never read, and one written before the sink saw the close.
+OVERLAP_TCP_CLOSE_BATCHES = 2
 # The smallest `skb->truesize` the kernel charges one small datagram, so a queue charged `used`
 # bytes holds at most `used / TRUESIZE_FLOOR_B` of them.
 TRUESIZE_FLOOR_B = 512
@@ -3672,7 +3683,7 @@ def check_ledger_overlap(data):
     instance, which closes with no final sample, or with another fault that can lose UDP on its
     way in, is reported and not judged. Each stop's own gap, read from the drain intervals that
     span it, is reported, never judged: interpolating the instances' out-of-phase drains errs by
-    about a generator batch at each edge."""
+    about a generator batch at each edge. A TCP wire's bound is `_tcp_overlap()`'s."""
     if not data.overlap:
         return []
     leds = _instance_ledgers(data)
@@ -3688,6 +3699,9 @@ def check_ledger_overlap(data):
                           for symbol in ("W", "K", "F"))
             for instance, led in leds.items()}
     gap = G - sum(read.values())
+    tcp = [source for source in first.sources if source_wire(source) == "tcp"]
+    if tcp:
+        return _tcp_overlap(data, first, tcp, G, read, gap)
     buckets = {source.get("sut_listener"): _wire_buckets(
         data, first, source, combined=_overlap_ingest(list(leds.values()), source))
         for source in first.sources}
@@ -3751,6 +3765,110 @@ def check_ledger_overlap(data):
                   f"{totals}, {verdict}: {closes} close(s) of an instance's socket, each at most "
                   f"ceil(used / {TRUESIZE_FLOOR_B}) + 1 datagrams, loose by up to a quarter of "
                   "its SO_RCVBUF; below, the generators' end allowance", lines)
+
+
+def check_overlap_migrate(data):
+    """Under `[overlap]` with a TCP source's `migrate_req`, one row over its `churn` slowclient
+    steps, else none: each churn's namespace read `net.ipv4.tcp_migrate_req` at the declared
+    value, or FAILs. With 1, a churn's resets FAIL: the kernel moves a closing instance's
+    handshakes to another listener of the port. With 0, a churn with an instance's stop,
+    restart, kill, or `exit` starting in its window PASSes on a reset and WARNs on none, since a
+    close with no handshake in flight resets nothing; a reset with no close FAILs, as it has no
+    cause the row knows."""
+    migrate = (data.overlap or {}).get("migrate_req")
+    if migrate is None:
+        return []
+    applies = {record.get("step"): record for record in data.timeline
+               if record.get("event") == "apply" and record.get("action") == "slowclient"}
+    churns = [(applies[record.get("step")], record, done) for record in data.timeline
+              if record.get("event") == "revert" and record.get("step") in applies
+              and isinstance(done := record.get("done"), dict) and done.get("mode") == "churn"]
+    if not churns:
+        return []
+    instances = set(data.instances)
+    lines, statuses = [], []
+    for apply, revert, done in churns:
+        start, end = apply.get("started_at"), revert.get("finished_at")
+        closes = [f"{fault.step} {fault.action} on {fault.on}" for fault in data.faults
+                  if fault.on in instances and fault.action in OVERLAP_CLOSES + OVERLAP_UNJUDGED
+                  and start is not None and end is not None and start <= fault.start <= end]
+        resets = done.get("resets", 0)
+        head = (f"{apply.get('step')} churn on {apply.get('on')} at "
+                f"{data.offset(start)}: {_n(done.get('dialed', 0))} dialed, {_n(resets)} reset, "
+                f"{_n(done.get('closed', 0))} closed, closes in its window: "
+                f"{', '.join(closes) or 'none'}")
+        live = apply.get("migrate_req")
+        if live != migrate:
+            statuses.append(FAIL)
+            lines.append(f"{head}; the namespace read tcp_migrate_req {live}, and the scenario "
+                         f"declares {migrate}")
+        elif migrate == 1 and resets:
+            statuses.append(FAIL)
+            lines.append(f"{head}; with tcp_migrate_req 1 a closing instance's handshakes "
+                         "move to the other listener, so none resets")
+        elif migrate == 0 and resets and not closes:
+            statuses.append(FAIL)
+            lines.append(f"{head}; a reset with no instance closing in the window")
+        elif migrate == 0 and closes and not resets:
+            statuses.append(WARN)
+            lines.append(f"{head}; no handshake was in flight at the close, so the control "
+                         "shows nothing")
+        else:
+            statuses.append(PASS)
+            lines.append(head)
+    resets = sum(done.get("resets", 0) for _, _, done in churns)
+    dialed = sum(done.get("dialed", 0) for _, _, done in churns)
+    return Result("overlap.migrate", worst(statuses),
+                  f"tcp_migrate_req {migrate}: {len(churns)} churn step(s), {_n(dialed)} "
+                  f"dialed, {_n(resets)} reset", lines)
+
+
+def _tcp_overlap(data, first, sources, G, read, gap):
+    """`ledger.overlap` on a TCP wire: the run's gap at most `OVERLAP_TCP_CLOSE_BATCHES` of each
+    generator sink's batches per stop or restart of an instance, a connection's write the
+    closing instance acknowledged and never read and one written before the sink saw the close;
+    and below 0 no more than the end allowance and a batch per ambiguous attempt the sinks
+    counted, each a write the instance may have read before the sink resent it. A kill, an
+    `exit`, a `reset`, or a partition that moved an address, the windows `ledger.wire` reports
+    on TCP, is reported and not judged; a netem or a pause is judged, since TCP retransmits."""
+    instances = set(data.instances)
+    batches = sum(sum(first.gen_stats[source.get("service")]["sink_batch"].get(sink, 0.0)
+                      for sink in source_ids(source, "generator_sink"))
+                  for source in sources)
+    lines, unjudged, allowance, closes = [], [], 0.0, 0
+    for fault in sorted(data.faults, key=lambda f: f.start):
+        if fault.on in instances and fault.action in OVERLAP_CLOSES:
+            closes += 1
+            bound = OVERLAP_TCP_CLOSE_BATCHES * batches
+            allowance += bound
+            lines.append(f"{fault.step} {fault.action} on {fault.on} at "
+                         f"{data.offset(fault.start)}: at most {_n(bound)}, "
+                         f"{OVERLAP_TCP_CLOSE_BATCHES} batch(es) of each generator sink")
+        elif (fault.affects("tcp") and wire_judgment(fault, "tcp") == "fault"
+              and not (fault.on in instances and fault.action == "pause")):
+            unjudged.append(f"{fault.step} {fault.action} on {fault.on}")
+            lines.append(f"{fault.step} {fault.action} on {fault.on} at "
+                         f"{data.offset(fault.start)}: can lose a connection's unread writes "
+                         "with no close to bound them, so the run's gap isn't the closes' alone")
+    ambiguous = sum(sum(v for _, v in _ambiguous_drops(first, source))
+                    * first.gen_stats[source.get("service")]["batch"] for source in sources)
+    below = sum(_end_allowance(first, source) for source in sources) + ambiguous
+    split = ", ".join(f"{instance} {_n(value)}" for instance, value in read.items())
+    totals = f"G {_n(G)} − Σ(W + K + F) {_n(sum(read.values()))} ({split}) = {_n(gap)}"
+    if unjudged:
+        return Result("ledger.overlap", SKIP,
+                      f"{totals}, reported, not judged: {'; '.join(unjudged)}", lines)
+    if gap > allowance:
+        status, verdict = FAIL, f"uncounted, over the closes' {_n(allowance)}"
+    elif gap < -below:
+        status, verdict = FAIL, f"a surplus, past the end and resend allowance {_n(below)}"
+    else:
+        status, verdict = PASS, f"within [-{_n(below)}, {_n(allowance)}]"
+    return Result("ledger.overlap", status,
+                  f"{totals}, {verdict}: {closes} close(s) of an instance's connections, each "
+                  f"at most {OVERLAP_TCP_CLOSE_BATCHES} batch(es) of each generator sink; below, "
+                  f"the generators' end allowance and {_n(ambiguous)} for ambiguous attempts",
+                  lines)
 
 
 
@@ -9064,6 +9182,7 @@ CHECKS = (
     check_run, check_timeline, check_exit, check_restarts, check_self_log, check_ready,
     check_progress, check_rss_slope, check_fd_slope, check_ledger_wire, check_cri_dangles,
     check_ledger_overlap,
+    check_overlap_migrate,
     check_ledger_intake, check_ledger_edge, check_ledger_hop, check_spans_join,
     check_ledger_relay,
     check_ledger_script, check_ledger_aggregate,

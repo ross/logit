@@ -176,6 +176,8 @@ CGROUP_SCRIPT = 'if [ $# -eq 2 ]; then printf "%s\\n" "$2" > "$1" || exit 1; fi;
 # `ready` line, polling its log every `SLOWCLIENT_POLL_S`; and how long its revert's
 # `docker stop` waits on SIGTERM before it kills the client.
 SLOWCLIENT_SOURCE = Path(slowclient.__file__).read_text()
+# Where a `churn` client's apply reads its namespace's `net.ipv4.tcp_migrate_req`.
+MIGRATE_REQ_PATH = "/proc/sys/net/ipv4/tcp_migrate_req"
 SLOWCLIENT_READY_S = 30.0
 SLOWCLIENT_POLL_S = 0.25
 SLOWCLIENT_STOP_S = 5
@@ -799,18 +801,29 @@ def _client_event(result, event, last=False):
 
 
 def slowclient_apply(ctx, step):
-    """Starts the step's client on the first network of the service it's `on`, waits up to
+    """Starts the step's client on the first network of the service it's `on`, or of the
+    container whose namespace that service shares, waits up to
     `SLOWCLIENT_READY_S` for its `ready` line (`ready`), and under `half_open` disconnects it
     from that network. A client that printed no `ready` line, opened no connection, or, under
     `half_open`, left bytes unacknowledged, or a disconnect that failed, is `rc` 1, and the
     client is removed."""
     info = ctx.docker.inspect(ctx.ids[step.on]) or {}
+    mode = (info.get("HostConfig") or {}).get("NetworkMode") or ""
+    holder = mode.split(":", 1)[1] if mode.startswith("container:") else None
+    if holder is not None:
+        # An `[overlap]` instance has no network of its own: it's in its holder's namespace.
+        info = ctx.docker.inspect(holder) or {}
     networks = sorted((info.get("NetworkSettings") or {}).get("Networks") or {})
     if not networks:
         return {"rc": 1, "stderr": f"{step.on} is on no network for a client to join"}
     name, network = slowclient_name(ctx, step), networks[0]
     started = ctx.docker.run(slowclient_argv(ctx, step, name, network))
     record = _record(started, container=name, network=network)
+    if step.mode == "churn" and holder is not None:
+        # The namespace's value in force, which `overlap.migrate` reads the resets against.
+        read = ctx.docker.run(["exec", holder, "cat", MIGRATE_REQ_PATH])
+        value = read.stdout.strip()
+        record["migrate_req"] = int(value) if read.rc == 0 and value.isdigit() else None
     if started.rc != 0:
         ctx.docker.run(["rm", "-f", name])
         return record
