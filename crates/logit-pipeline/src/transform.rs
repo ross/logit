@@ -127,6 +127,12 @@ pub trait Transform: Send {
     /// Flushes accumulated state. Called only for a transform whose `flush_interval` returned
     /// `Some`; the default returns nothing rather than panicking.
     ///
+    /// `now` is Unix nanoseconds. A deadline flush gets its grid point, the wall-clock multiple of
+    /// the interval since the node started at or below the flush's wall time, so a late flush and
+    /// the one after it stay an interval apart; the close-time flush gets the wall time itself
+    /// (`docs/adr/aggregation-window-semantics.md`, "Amendment: a deadline flush is stamped on its
+    /// grid point (2026-11-04)").
+    ///
     /// Each emitted `Event` is paired with the bounded, best-effort set of `TraceContext`s that
     /// contributed to it (from `observe_batch_context`; empty if the transform never records
     /// any). `run_flush` unions every group's links onto the one flush span it records for this

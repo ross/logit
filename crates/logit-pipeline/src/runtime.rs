@@ -2024,11 +2024,34 @@ pub async fn send_batch(
 /// with `tokio::time::timeout`. `run_lua` has the same shape through `Handle::block_on`. Flushes
 /// once more when the inbox closes.
 async fn run_transform(
+    transform: Box<dyn Transform + Send>,
+    inbox: mpsc::Receiver<Delivered>,
+    fanout: Fanout,
+    telemetry: Telemetry,
+) -> anyhow::Result<()> {
+    run_transform_with_clock(transform, inbox, fanout, telemetry, now_unix_nanos).await
+}
+
+/// [`run_transform`] with its wall clock as a parameter, so a test can drive the flush stamps
+/// from paused tokio time.
+///
+/// A deadline flush is stamped with [`grid_stamp`]: the wall-clock grid point, anchored at node
+/// start, at or below the flush's wall time. A flush that runs late, behind a send blocked on a
+/// full downstream inbox, and the catch-up flush right after it then carry consecutive grid
+/// points a full interval apart, never two stamps in the same second. The close-time flush takes
+/// the wall time itself: flooring it could repeat the last deadline flush's stamp
+/// (`docs/adr/aggregation-window-semantics.md`, "Amendment: a deadline flush is stamped on its
+/// grid point (2026-11-04)").
+async fn run_transform_with_clock(
     mut transform: Box<dyn Transform + Send>,
     mut inbox: mpsc::Receiver<Delivered>,
     fanout: Fanout,
     telemetry: Telemetry,
+    wall_clock: impl Fn() -> i64,
 ) -> anyhow::Result<()> {
+    // Read before the `Instant` the deadlines count from, so a flush that fires at or after its
+    // deadline reads a wall time at or after its grid point and floors onto it, not the one below.
+    let wall_anchor = wall_clock();
     let mut next_flush =
         transform.flush_interval().map(|interval| tokio::time::Instant::now() + interval);
     // `process_into`'s `emitted`, kept for the node's life so a fan-out transform reuses its
@@ -2040,10 +2063,11 @@ async fn run_transform(
         if let Some(deadline) = next_flush {
             let now_instant = tokio::time::Instant::now();
             if deadline <= now_instant {
-                run_flush(&mut *transform, &fanout, &telemetry).await;
                 let interval = transform
                     .flush_interval()
                     .expect("next_flush is only ever Some for a transform with an interval");
+                let stamp = grid_stamp(wall_clock(), wall_anchor, interval);
+                run_flush(&mut *transform, &fanout, &telemetry, stamp).await;
                 next_flush = Some(advance_flush_deadline(deadline, now_instant, interval));
             }
         }
@@ -2061,7 +2085,7 @@ async fn run_transform(
         let Some(batch) = batch else {
             // Inbox closed: flush once more so an in-flight window isn't lost, then exit.
             if next_flush.is_some() {
-                run_flush(&mut *transform, &fanout, &telemetry).await;
+                run_flush(&mut *transform, &fanout, &telemetry, wall_clock()).await;
             }
             return Ok(());
         };
@@ -2493,8 +2517,9 @@ fn resolve_target_fanouts(
         .collect()
 }
 
-/// Runs one flush, for both `run_transform`'s deadline tick and its close-time flush. Timed as one
-/// call however many resource groups it yields.
+/// Runs one flush, for both `run_transform`'s deadline tick and its close-time flush, handing
+/// `transform.flush` the `now` its caller chose. Timed as one call however many resource groups it
+/// yields.
 ///
 /// Mints one fresh root before `transform.flush(now)` and sends every resource group under it as
 /// siblings: one flush is one unit of work, not one hop per group. A root, not a parent, because a
@@ -2503,7 +2528,12 @@ fn resolve_target_fanouts(
 /// `docs/adr/internal-span-emission-and-deterministic-sampling.md`). The contributing-context
 /// links `Transform::flush` returns per event are unioned onto the flush span, bounded by
 /// `MAX_LINKS_PER_SPAN`.
-async fn run_flush(transform: &mut (dyn Transform + Send), fanout: &Fanout, telemetry: &Telemetry) {
+async fn run_flush(
+    transform: &mut (dyn Transform + Send),
+    fanout: &Fanout,
+    telemetry: &Telemetry,
+    now: i64,
+) {
     // Empty provenance, for the same reason as the fresh root: a flush has no single upstream
     // batch. `Fanout::stamp` fills both `origin` and `previous` with this component's id, as for
     // a listener's first send (`docs/adr/batch-provenance-on-delivered.md`).
@@ -2512,7 +2542,7 @@ async fn run_flush(transform: &mut (dyn Transform + Send), fanout: &Fanout, tele
         telemetry.span("flush", SpanKind::Internal, ctx.trace.trace_id, ctx.trace.span_id, None);
 
     let timer = telemetry.timer("logit.component.flush.duration");
-    let flushed = transform.flush(now_unix_nanos());
+    let flushed = transform.flush(now);
     drop(timer);
 
     let mut total_events: u64 = 0;
@@ -3071,8 +3101,8 @@ fn run_lua_loop(
         worker.set_scope(&None);
 
         let timer = telemetry.timer("logit.component.flush.duration");
-        // The same `now_unix_nanos()` `run_flush` hands `Transform::flush`, so a flush-driven
-        // `Event.new{timestamp = now, ..}` is stamped like an aggregate window
+        // The wall time of the flush itself, not `run_transform`'s grid stamp: a flush-driven
+        // `Event.new{timestamp = now, ..}` carries when it ran
         // (`docs/adr/lua-event-constructor.md`).
         heartbeat.enter();
         let result = worker.flush(now_unix_nanos());
@@ -3472,6 +3502,21 @@ fn now_unix_nanos() -> i64 {
         .as_nanos() as i64
 }
 
+/// Returns the point on the wall-clock grid `anchor + k * interval` at or below `now`, all in Unix
+/// nanoseconds: `now - ((now - anchor) mod interval)`, constant-time however many intervals have
+/// passed. The remainder is Euclidean, so a `now` before `anchor` (the wall clock stepped back past
+/// the node's start) extends the grid backwards instead of rounding toward the anchor; the stamp
+/// is still at or below `now`, and goes back with the clock as `now` itself would.
+fn grid_stamp(now: i64, anchor: i64, interval: Duration) -> i64 {
+    debug_assert!(!interval.is_zero());
+    let interval = interval.as_nanos().max(1) as i128;
+    let now = i128::from(now);
+    let offset = (now - i128::from(anchor)).rem_euclid(interval);
+    // `now - offset` lies in `(now - interval, now]`, so it fits an `i64` unless `now` is within
+    // one interval of `i64::MIN`; saturate rather than wrap there.
+    i64::try_from(now - offset).unwrap_or(i64::MIN)
+}
+
 /// Returns the first point on `deadline`'s interval cadence strictly after `now`. Computing the
 /// remainder makes this constant-time even when a very small interval has missed billions of
 /// ticks. If the platform cannot represent the cadence's next instant, fall back to the smallest
@@ -3525,6 +3570,102 @@ mod tests {
             nanosecond_interval,
         );
         assert_eq!(next, deadline + Duration::from_secs(2) + nanosecond_interval);
+    }
+
+    #[test]
+    fn a_grid_stamp_is_the_grid_point_at_or_below_now() {
+        const S: i64 = 1_000_000_000;
+        let anchor = 1_700_000_000 * S + 123_456_789;
+        let ten = Duration::from_secs(10);
+
+        // On a grid point, the point itself, including the anchor.
+        assert_eq!(grid_stamp(anchor, anchor, ten), anchor);
+        assert_eq!(grid_stamp(anchor + 30 * S, anchor, ten), anchor + 30 * S);
+        // Late by 0.99 of an interval: still the point below, not the next one.
+        assert_eq!(grid_stamp(anchor + 29_900_000_000, anchor, ten), anchor + 20 * S);
+        // Many intervals late.
+        assert_eq!(grid_stamp(anchor + 1_000_000 * S + 7 * S, anchor, ten), anchor + 1_000_000 * S);
+        // A wall clock stepped back past the anchor extends the grid backwards.
+        assert_eq!(grid_stamp(anchor - S, anchor, ten), anchor - 10 * S);
+        assert_eq!(grid_stamp(anchor - 10 * S, anchor, ten), anchor - 10 * S);
+        // A sub-second interval.
+        let quarter = Duration::from_millis(250);
+        assert_eq!(grid_stamp(anchor + 1_100_000_000, anchor, quarter), anchor + S);
+        // Near the ends of `i64`, no overflow.
+        assert_eq!(grid_stamp(i64::MAX, 0, ten), i64::MAX - i64::MAX % (10 * S));
+        assert_eq!(grid_stamp(i64::MIN, 0, ten), i64::MIN);
+    }
+
+    /// Emits one event per flush, timestamped with the `now` it was handed.
+    struct StampingTransform {
+        interval: Duration,
+    }
+
+    impl Transform for StampingTransform {
+        fn process(&mut self, _resource: &Arc<Resource>, _event: &mut Event) -> bool {
+            false
+        }
+
+        fn flush_interval(&self) -> Option<Duration> {
+            Some(self.interval)
+        }
+
+        fn flush(
+            &mut self,
+            now: i64,
+        ) -> Vec<(Arc<Resource>, Option<Arc<Scope>>, Vec<(Event, Vec<SpanLink>)>)> {
+            vec![(
+                Arc::new(Resource::default()),
+                None,
+                vec![(Event::empty(now, AttrMap::new()), Vec::new())],
+            )]
+        }
+    }
+
+    /// A deadline flush held back by a blocked send, and the catch-up flush right after it, carry
+    /// consecutive grid points an interval apart, not two wall times 10 ms apart. The close-time
+    /// flush carries the wall time.
+    #[tokio::test(start_paused = true)]
+    async fn a_late_deadline_flush_and_its_catch_up_are_stamped_an_interval_apart() {
+        const S: i64 = 1_000_000_000;
+        const WALL0: i64 = 1_700_000_000 * S;
+        let interval = Duration::from_secs(10);
+        let start = tokio::time::Instant::now();
+        // Wall time that follows paused tokio time from `WALL0`.
+        let wall_clock = move || WALL0 + start.elapsed().as_nanos() as i64;
+
+        let (in_tx, in_rx) = mpsc::channel(1);
+        let (out_tx, mut out_rx) = mpsc::channel(1);
+        let fanout = Fanout::new(vec![out_tx]);
+        let transform: Box<dyn Transform + Send> = Box::new(StampingTransform { interval });
+        let node = tokio::spawn(run_transform_with_clock(
+            transform,
+            in_rx,
+            fanout,
+            Telemetry::default(),
+            wall_clock,
+        ));
+
+        // The 10 s flush fills the one-slot inbox, so the 20 s flush's send blocks until 39.99 s,
+        // past the 30 s deadline.
+        tokio::time::sleep_until(start + Duration::from_millis(39_990)).await;
+        let mut stamps = Vec::new();
+        for _ in 0..4 {
+            let batch = crate::test_util::recv_batch(&mut out_rx).await;
+            stamps.push(batch.events[0].timestamp - WALL0);
+        }
+        assert_eq!(
+            stamps,
+            [10 * S, 20 * S, 30 * S, 40 * S],
+            "the late 30 s flush ran at 39.99 s and the catch-up at 40 s; each carries its grid \
+             point"
+        );
+
+        tokio::time::sleep_until(start + Duration::from_millis(45_500)).await;
+        drop(in_tx);
+        let last = crate::test_util::recv_batch(&mut out_rx).await;
+        assert_eq!(last.events[0].timestamp - WALL0, 45_500_000_000, "the close-time flush");
+        node.await.expect("no panic").expect("clean exit");
     }
 
     struct RecordingOutput {
@@ -13899,7 +14040,7 @@ mod tests {
         };
         let mut transform = MultiGroupFlushTransform { links_for_first_group: vec![link.clone()] };
 
-        run_flush(&mut transform, &fanout, &telemetry).await;
+        run_flush(&mut transform, &fanout, &telemetry, 0).await;
         drop(out_rx);
 
         let events = registry.drain(0);
@@ -13917,7 +14058,7 @@ mod tests {
         let fanout = Fanout::new(vec![out_tx]);
         let mut transform = MultiGroupFlushTransform { links_for_first_group: Vec::new() };
 
-        run_flush(&mut transform, &fanout, &Telemetry::default()).await;
+        run_flush(&mut transform, &fanout, &Telemetry::default(), 0).await;
 
         let a = out_rx.recv().await.expect("the first group should send").context();
         let b = out_rx.recv().await.expect("the second group should send").context();
@@ -13958,7 +14099,7 @@ mod tests {
             Arc::new(Scope { name: bytes::Bytes::from_static(b"scope-x"), ..Scope::default() });
         let mut transform = ScopedFlushTransform { scope: scope.clone() };
 
-        run_flush(&mut transform, &fanout, &Telemetry::default()).await;
+        run_flush(&mut transform, &fanout, &Telemetry::default(), 0).await;
 
         let delivered = out_rx.recv().await.expect("the group should send");
         let batch = match delivered {
