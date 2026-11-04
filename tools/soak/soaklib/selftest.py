@@ -9625,6 +9625,13 @@ def _span_join():
         expect(early.status == checks.FAIL
                and "1 unmatched outside every killed life's window" in early.detail,
                f"an unmatched child before the window's lower edge FAILs, got {early}")
+        # A window at its bound of 3 and one span below its start that a counted drop
+        # explains: counting that span inside the window puts it over its bound.
+        edge = row("join-edge", unmatched=(196.5, 199, 205, 212), dropped=1)
+        expect(edge.status == checks.PASS
+               and "unmatched 4 (3 inside a killed life's window, 1 outside)" in edge.detail,
+               f"an unmatched child below a window's start counts outside it, not in its bound, "
+               f"got {edge} {edge.lines}")
         stopped = row("join-stopped", unmatched=(199, 205), stop=True)
         expect(stopped.status == checks.FAIL
                and "2 unmatched outside every killed life's window" in stopped.detail,
@@ -14175,13 +14182,15 @@ def _churn_client():
            and done.get("closed") == 0,
            f"a churn client counts a read the listener resets as a reset, got rc {rc} {lines} "
            f"{err}")
-    # A listener that never accepts: no connection ends in `DIAL_TIMEOUT_S`.
+    # A listener that never accepts: no connection ends in `DIAL_TIMEOUT_S`. The wait is
+    # capped, so a timeout past 5 s fails the case instead of stalling the self-test.
     stuck = socket.socket()
     stuck.bind(("127.0.0.1", 0))
     stuck.listen(0)
     try:
         rc, lines, err = _run_client(["churn", "127.0.0.1", str(stuck.getsockname()[1]), "2",
-                                      "0.5", "none"], faults.slowclient.DIAL_TIMEOUT_S + 1.2)
+                                      "0.5", "none"],
+                                     min(faults.slowclient.DIAL_TIMEOUT_S, 5.0) + 1.2)
     finally:
         stuck.close()
     done = lines[-1] if lines else {}
