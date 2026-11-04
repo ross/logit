@@ -1,0 +1,19 @@
+# The system under test in `script/soak`'s standin-datadog-trace scenario: an Agent's APM
+# receiver, `datadog_trace_in`, relaying every span through `datadog_trace_out` as v0.7, gzipped,
+# to the scripted stand-in, which answers as an Agent does. Nothing between them: the pair is a
+# lossless relay. Its `internal` telemetry goes to stdout as NDJSON for the harness to read;
+# `script/soak` runs it with `--log-format json`.
+admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
+components:
+  apm: { type: datadog_trace_in, bind: 0.0.0.0:8126 }
+  agent:
+    type: datadog_trace_out
+    sources: [apm]
+    endpoint: http://standin:8080
+    version: v0.7
+    compression: gzip
+    # Below the stand-in's 5 s keep-alive close, so no write goes out on a connection it closed.
+    idle_timeout: 1s
+    buffer: { retry_max_delay: 2s } # block, at_least_once
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }

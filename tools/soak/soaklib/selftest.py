@@ -257,8 +257,8 @@ import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import (checks, collect, criwriter, docker, driver, faults, otlp, report, sampling,
-               scenario, standin, telemetry,
+from . import (checks, collect, criwriter, docker, driver, faults, msgpack, otlp, report,
+               sampling, scenario, standin, telemetry,
                topic, vm)
 
 _FAILURES = []
@@ -7782,7 +7782,7 @@ def _http_rules(root):
     problems = with_configs(influx_in, statsd_out, "http", "influx", "statsd")
     expect(problems == ["ledger.source 1: an http wire's `generator_sink` must be one of "
                         "influxdb_out, otlp_out, splunk_hec_out, datadog_out, prometheus_out, "
-                        "and 'statsd' is a statsd_out"],
+                        "datadog_trace_out, and 'statsd' is a statsd_out"],
            f"an http wire's writer must be an HTTP sink, got {problems}")
     problems = with_configs(statsd_in, influx_out, None, "statsd", "influx")
     expect(problems == ["ledger.source 1: `generator_sink` 'influx' is an influxdb_out, which "
@@ -11716,8 +11716,9 @@ def _splunk_codec(root):
 
 
 def _standin_on_loopback(root, shape, path, exchange):
-    """Runs the stand-in's handlers for `shape` on loopback ports and `exchange(request, cue)`,
-    where `request(method, path, body, headers)` returns `(status, headers, body)` and
+    """Runs the stand-in's handlers for `shape` on loopback ports, its write paths `path` (one
+    or a tuple), and `exchange(request, cue)`, where `request(path, body, headers, method)`, a
+    `POST` by default, returns `(status, headers, body)` and
     `cue(obj)` posts a cue; returns the record lines it printed."""
     import http.client
     import io
@@ -11736,8 +11737,8 @@ def _standin_on_loopback(root, shape, path, exchange):
     try:
         conn = http.client.HTTPConnection("127.0.0.1", data.server_address[1], timeout=5)
 
-        def request(path, body, headers=None):
-            conn.request("POST", path, body=body, headers=headers or {})
+        def request(path, body, headers=None, method="POST"):
+            conn.request(method, path, body=body, headers=headers or {})
             response = conn.getresponse()
             sent[0] += 1
             return response.status, dict(response.getheaders()), response.read()
@@ -17576,6 +17577,439 @@ def _backstop_ledger():
                f"{far['ledger.egress']}")
 
 
+def _msgpack_reader():
+    """`msgpack.unpack` reads every format into Python values, `pack` round-trips them in the
+    smallest forms, and each bound refuses: a declared length the bytes can't hold, nesting past
+    `MAX_DEPTH`, a container map key, a `str` that isn't UTF-8, `0xc1`, a cut value, trailing
+    bytes, and an empty body."""
+    cases = [
+        (b"\x00", 0), (b"\x7f", 127), (b"\xff", -1), (b"\xe0", -32), (b"\xc0", None),
+        (b"\xc2", False), (b"\xc3", True), (b"\xcc\xff", 255), (b"\xcd\x01\x00", 256),
+        (b"\xce\x00\x01\x00\x00", 65536), (b"\xcf" + (2**64 - 1).to_bytes(8, "big"), 2**64 - 1),
+        (b"\xd0\x80", -128), (b"\xd1\x80\x00", -32768), (b"\xd2\x80\x00\x00\x00", -2**31),
+        (b"\xd3" + (-2**63).to_bytes(8, "big", signed=True), -2**63),
+        (b"\xca" + struct.pack(">f", 1.5), 1.5), (b"\xcb" + struct.pack(">d", -2.25), -2.25),
+        (b"\xa3abc", "abc"), (b"\xd9\x03abc", "abc"), (b"\xda\x00\x03abc", "abc"),
+        (b"\xdb\x00\x00\x00\x03abc", "abc"), (b"\xc4\x02\x01\x02", b"\x01\x02"),
+        (b"\xc5\x00\x01\x09", b"\x09"), (b"\xc6\x00\x00\x00\x01\x09", b"\x09"),
+        (b"\x92\x01\xa1x", [1, "x"]), (b"\xdc\x00\x02\x01\x02", [1, 2]),
+        (b"\xdd\x00\x00\x00\x01\xc0", [None]), (b"\x81\xa1k\x05", {"k": 5}),
+        (b"\xde\x00\x01\x01\x02", {1: 2}), (b"\xdf\x00\x00\x00\x01\xa1a\x90", {"a": []}),
+        (b"\x82\xa1k\x01\xa1k\x02", {"k": 2}),
+        (b"\xd4\x05\x01", msgpack.Ext(5, b"\x01")), (b"\xd8\xff" + b"\x00" * 16,
+                                                     msgpack.Ext(-1, b"\x00" * 16)),
+        (b"\xc7\x03\x07abc", msgpack.Ext(7, b"abc")),
+    ]
+    for raw, want in cases:
+        try:
+            got = msgpack.unpack(raw)
+        except msgpack.MsgpackError as err:
+            got = err
+        expect(got == want and type(got) is type(want),
+               f"msgpack {raw.hex()} reads {want!r}, got {got!r}")
+    for value in (0, 127, 128, 255, 256, 65535, 65536, 2**32, 2**64 - 1, -1, -32, -33, -128,
+                  -129, -2**15 - 1, -2**31 - 1, -2**63, 1.25, "", "a" * 31, "a" * 32,
+                  "a" * 300, b"", b"x" * 70000, [], list(range(15)), list(range(16)),
+                  {str(i): i for i in range(15)}, {str(i): i for i in range(16)}, None, True,
+                  msgpack.Ext(3, b"abc"), [{"spans": [{"trace_id": 2**64 - 1}]}]):
+        raw = msgpack.pack(value)
+        expect(msgpack.unpack(raw) == value, f"{value!r} round-trips, got {msgpack.unpack(raw)!r}")
+    expect(msgpack.pack(1) == b"\x01" and msgpack.pack(200) == b"\xcc\xc8"
+           and msgpack.pack(-5) == b"\xfb" and msgpack.pack("ab") == b"\xa2ab"
+           and msgpack.pack([1]) == b"\x91\x01" and msgpack.pack({"a": 1}) == b"\x81\xa1a\x01",
+           "pack writes each value's smallest form")
+    deep = b"\x91" * (msgpack.MAX_DEPTH + 1) + b"\x00"
+    expect(msgpack.unpack(b"\x91" * msgpack.MAX_DEPTH + b"\x00") is not None,
+           f"{msgpack.MAX_DEPTH} levels of nesting read")
+    for raw, needle in (
+            (b"\xdd\xff\xff\xff\xff", "declares 4294967295 item(s)"),
+            (b"\xdf\x00\x00\x00\x02\x01", "declares 2 item(s)"),
+            (deep, f"nesting past {msgpack.MAX_DEPTH} levels"),
+            (b"\x81\x90\x01", "is a container"), (b"\xa2\xff\xfe", "isn't UTF-8"),
+            (b"\xc1", "0xc1"), (b"\xa5ab", "run past"), (b"\xcd\x01", "run past"),
+            (b"\x01\x02", "1 byte(s) after the value"), (b"", "empty body"),
+            (b"\xc6\xff\xff\xff\xff", "run past")):
+        try:
+            msgpack.unpack(raw)
+            expect(False, f"msgpack {raw[:8].hex()} read")
+        except msgpack.MsgpackError as err:
+            expect(needle in str(err), f"msgpack {raw[:8].hex()} refused with {needle!r}, "
+                                       f"got {err}")
+
+
+def _trace_payload(spans, version="v0.7"):
+    """A tracer body holding `spans`, `[(trace_id, span_id, start_ns)]`, one trace each: a v0.7
+    `TracerPayload` with one chunk per trace, or v0.4's array of traces."""
+    def span(trace_id, span_id, start):
+        return {"service": "soak", "name": "http.request", "resource": "GET /cart",
+                "trace_id": trace_id, "span_id": span_id, "parent_id": 0, "start": start,
+                "duration": 1000, "error": 0, "meta": {}, "metrics": {}, "type": "web"}
+    traces = [[span(*one)] for one in spans]
+    if version == "v0.4":
+        return msgpack.pack(traces)
+    return msgpack.pack({"container_id": "", "language_name": "", "chunks": [
+        {"priority": 1, "origin": "", "spans": trace, "tags": {}} for trace in traces]})
+
+
+def _trace_request(seq, offset, spans, status=200, stored=True, cue=None, answer="status",
+                   path="/v0.7/traces", encoding="gzip"):
+    """One `datadog_trace` stand-in record line at `T0 + offset` whose body holds `spans`."""
+    raw = _trace_payload(spans, "v0.4" if path == "/v0.4/traces" else "v0.7")
+    body = gzip.compress(raw, mtime=0) if encoding == "gzip" else raw
+    return {"event": "request", "seq": seq, "t": T0 + offset, "path": path,
+            "content_type": "application/msgpack", "content_encoding": encoding,
+            "bytes": len(body), "cue": cue, "answer": answer,
+            "status": None if answer == "reset" else status, "stored": stored,
+            "body_b64": base64.b64encode(body).decode()}
+
+
+def _datadog_trace_codec(root):
+    """The `datadog_trace` shape's decoder: v0.7 under gzip and v0.4 under none read one series
+    per span, keyed by its trace and span ids at its start in ms; a stats body holds none; a
+    body of another shape, a cut body, and another path refused; the bodies a real
+    `datadog_trace_out` wrote, from `standin/datadog-trace-vectors.json`, and a dd-trace
+    tracer's recorded v0.4 and stats bodies read as the vectors state; and `stored_spans`
+    counting each accepted span once, a copy reported, and a stored write answered otherwise
+    resent, not accepted."""
+    spans = [(7, 70, 5_000_000), (2**64 - 1, 1, 6_999_999)]
+    for path, encoding in (("/v0.7/traces", "gzip"), ("/v0.4/traces", None)):
+        series = standin.decode_body(_trace_request(1, 0, spans, path=path, encoding=encoding),
+                                     standin.DATADOG_TRACE)
+        expect(series == [({"__name__": "span", "trace_id": "7", "span_id": "70"}, [(5, 1.0)]),
+                          ({"__name__": "span", "trace_id": str(2**64 - 1), "span_id": "1"},
+                           [(6, 1.0)])],
+               f"a {path} body under {encoding} reads one series per span, got {series}")
+    stats = {**_trace_request(1, 0, [], path="/v0.6/stats", encoding=None),
+             "body_b64": base64.b64encode(msgpack.pack({"Stats": []})).decode()}
+    expect(standin.decode_body(stats, standin.DATADOG_TRACE) == [],
+           "a stats body holds no span")
+    for request, needle in (
+            ({**_trace_request(1, 0, spans, encoding=None),
+              "body_b64": base64.b64encode(msgpack.pack([[]])).decode()}, "not a TracerPayload"),
+            ({**_trace_request(1, 0, spans, path="/v0.4/traces", encoding=None),
+              "body_b64": base64.b64encode(msgpack.pack([{"a": 1}])).decode()}, "not an array"),
+            ({**_trace_request(1, 0, spans, encoding=None),
+              "body_b64": base64.b64encode(_trace_payload(spans)[:-3]).decode()}, "msgpack"),
+            ({**_trace_request(1, 0, spans), "path": "/v0.5/traces"}, "no trace route")):
+        try:
+            standin.decode_body(request, standin.DATADOG_TRACE)
+            expect(False, f"a datadog_trace body with {needle} decoded")
+        except standin.DecodeError as err:
+            expect(needle in str(err), f"a datadog_trace body is refused with {needle!r}, "
+                                       f"got {err}")
+    vectors = json.loads((root / "standin" / "datadog-trace-vectors.json").read_text())
+    for vector in vectors["bodies"]:
+        raw = base64.b64decode(vector["body_b64"])
+        if vector.get("file"):
+            raw = (root.parent.parent / vector["file"]).read_bytes()
+        request = {"path": vector["path"], "content_encoding": vector.get("content_encoding"),
+                   "body_b64": base64.b64encode(raw).decode()}
+        series = standin.decode_body(request, standin.DATADOG_TRACE)
+        ids = [[labels["trace_id"], labels["span_id"]] for labels, _ in series]
+        expect(len(series) == vector["spans"] and ids[:len(vector["first"])] == vector["first"],
+               f"{vector['what']} reads {vector['spans']} span(s), first {vector['first']}, got "
+               f"{len(series)}, {ids[:len(vector['first'])]}")
+    accepted = _trace_request(1, 0, spans[:1])
+    copy_of = _trace_request(2, 1, spans[:1])
+    resent = _trace_request(3, 2, spans[1:], status=503)
+    found = standin.stored_spans([accepted, copy_of, resent])
+    expect(found.distinct == 1 and found.arrivals == [(T0, 1), (T0 + 1, 1)]
+           and [c[2:] for c in found.copies] == [(0, 1)] and found.resent == [(2, 1)]
+           and found.undecodable == [],
+           f"stored_spans counts an accepted span once, its copy, and a stored 503 resent, got "
+           f"{found}")
+
+
+def _datadog_trace_server(root):
+    """The stand-in's `datadog_trace` shape on loopback ports: an Agent's `rate_by_service`
+    answer to a `PUT` on `/v0.4/traces` and `/v0.7/traces`, `{}` to a `POST` on `/v0.6/stats`,
+    each recorded as a write; a cued `413`; and `404` on another path; and the shape's paths and
+    default status the same in the stand-in and in `soaklib.standin`."""
+    answers = []
+
+    def exchange(request, cue):
+        answers.append(request("/v0.4/traces", b"\x90", method="PUT"))
+        answers.append(request("/v0.7/traces", b"\x80", method="PUT"))
+        answers.append(request("/v0.6/stats", b"\x80"))
+        cue({"step": "c0s1", "status": 413})
+        answers.append(request("/v0.7/traces", b"\x80", method="PUT"))
+        cue({})
+        answers.append(request("/info", b"", method="PUT"))
+
+    paths = standin.write_paths(standin.DATADOG_TRACE)
+    lines = _standin_on_loopback(root, "datadog_trace", paths, exchange)
+    server = _load_standin_server(root)
+    expect([a[0] for a in answers] == [200, 200, 200, 413, 404]
+           and answers[0][2] == answers[1][2] == server.TRACE_REPLY
+           and answers[2][2] == b"{}"
+           and answers[0][1].get("Content-Type") == "application/json",
+           f"the datadog_trace shape answers as an Agent does, got {answers}")
+    expect([(line["path"], line["status"], line["cue"]) for line in lines[:4]]
+           == [("/v0.4/traces", 200, None), ("/v0.7/traces", 200, None),
+               ("/v0.6/stats", 200, None), ("/v0.7/traces", 413, "c0s1")],
+           f"each write is recorded with its path, answer, and cue, got {lines}")
+    expect(paths == ("/v0.4/traces", "/v0.7/traces", "/v0.6/stats")
+           and server.DEFAULT_PATH["datadog_trace"] == standin.PATHS[standin.DATADOG_TRACE]
+           and server.EXTRA_WRITE_PATHS["datadog_trace"]
+           == standin.EXTRA_WRITE_PATHS[standin.DATADOG_TRACE]
+           and server.DEFAULT_STATUS["datadog_trace"]
+           == standin.DEFAULT_STATUS[standin.DATADOG_TRACE] == 200,
+           "the datadog_trace shape's paths and default status agree in both files")
+
+
+def _span_rules(root):
+    """The span relay's load-time rules, against the shipped standin-datadog-trace scenario."""
+    path = root / "scenarios" / "standin-datadog-trace" / "scenario.toml"
+    raw = tomllib.loads(path.read_text())
+    loaded = scenario.load(path)
+    expect(loaded.standin_shape == "datadog_trace" and "sut_aggregate" not in loaded.ledger,
+           f"standin-datadog-trace loads with no aggregate, got {loaded.ledger}")
+
+    def mutate(change):
+        changed = copy.deepcopy(raw)
+        change(changed)
+        return changed
+
+    for key, value in (("sut_aggregate", "agent"), ("sut_delta", "agent"),
+                       ("sut_script", "agent"), ("split", "copy"), ("vm_every_window", True)):
+        _refused(path, mutate(lambda r, key=key, value=value: r["ledger"].update({key: value})),
+                 f"ledger.{key} can't be combined with a datadog_trace stand-in",
+                 f"a span relay beside {key}")
+    for key, value in (("sut_transforms", ["agent"]), ("fan_out", {"points": 4}),
+                       ("merge", "agent")):
+        _refused(path, mutate(lambda r, key=key, value=value: r["ledger"]["source"][0].update(
+                     {key: value})),
+                 f"`{key}` can't be combined with a datadog_trace stand-in",
+                 f"a span relay's {key}")
+    _refused(path, mutate(lambda r: r["ledger"]["source"][0].update(wire="udp")),
+             "takes wire = \"http\"", "a span relay on another wire")
+    _refused(path, mutate(lambda r: r["ledger"]["source"][0].update(sut_listener="agent")),
+             "sut_listener 'agent' is a datadog_trace_out", "a span relay's listener of "
+             "another kind")
+    _refused(path, mutate(lambda r: r["ledger"]["sink"][0].update(id="apm")),
+             "'apm' is a datadog_trace_in, and a datadog_trace stand-in's sink",
+             "a span relay's sink of another kind")
+    _refused(path, mutate(lambda r: r["ledger"]["sink"].append(dict(r["ledger"]["sink"][0]))),
+             "a datadog_trace stand-in needs one [[ledger.sink]]", "a span relay with two sinks")
+    _refused(path, mutate(lambda r: r["ledger"]["source"].append(
+                 dict(r["ledger"]["source"][0]))),
+             "a datadog_trace stand-in needs one [[ledger.source]]",
+             "a span relay with two sources")
+    _refused(path, mutate(lambda r: r.update(overlap={"instances": ["logit", "logit-b"]})),
+             "[overlap] can't be combined with a datadog_trace stand-in",
+             "a span relay under [overlap]")
+    _refused(path, mutate(lambda r: r["configs"].update(collector="logit-sut.yaml")),
+             "a datadog_trace stand-in needs one SUT service", "a span relay with a second SUT")
+    _refused(path, mutate(lambda r: r["target"].update(shape="otlp")),
+             "missing `sut_aggregate`", "another shape with no aggregate")
+
+
+SPAN_LEDGER = {"source": [{"service": "generator", "generator_input": "load",
+                           "generator_sink": "tracer", "sut_listener": "apm", "wire": "http"}],
+               "wire_loss_outside_faults": 0.0, "sink": [{"id": "agent"}]}
+SPAN_SUT = ("components:\n  apm: { type: datadog_trace_in, bind: 0.0.0.0:8126 }\n"
+            "  agent: { type: datadog_trace_out, sources: [apm], endpoint: http://standin:8080,"
+            " version: v0.7 }\n")
+SPAN_GENERATOR = ("components:\n  load: { type: generate_in }\n"
+                  "  tracer: { type: datadog_trace_out, sources: [load],"
+                  " endpoint: http://logit:8126 }\n")
+# Each 5 s drain's spans: two requests of `SPAN_BATCH`.
+SPAN_BATCH = 10
+# A SUT kill's apply and revert offsets.
+SPAN_KILL = (150, 180)
+
+
+def _span_run(tmp, name, requests_edit=None, sut_extra=(), gen_extra=(), timeline_extra=(),
+              kill=False, lost=0):
+    """A span relay's run directory that balances: from +5 to +300 each 5 s drain counts two
+    requests of `SPAN_BATCH` spans from the generator's `tracer` into the SUT's `apm`, which
+    sends them on, and two to the stand-in, which stores them, each span its own trace. With
+    `kill`, the SUT is killed over `SPAN_KILL`: its last drain before it goes unexported, and
+    `lost` of the spans it sent to its sink in that life never reach the stand-in.
+    `requests_edit(requests)` returns the stand-in record's request lines to write."""
+    lives = [(0, 0, SPAN_KILL[0]), (1, SPAN_KILL[1], 300)] if kill else [(0, 0, 300)]
+    gen, sut, requests = [], [], []
+    span = 0
+    for offset in range(5, 301, 5):
+        stamp = _stamp(T0 + offset)
+        n = 2 * SPAN_BATCH
+        gen += [_line(stamp, "logit.process.uptime", "gauge", float(offset)),
+                _line(stamp, "logit.component.events.sent", "sum", n, component="load"),
+                _line(stamp, "logit.component.events.received", "sum", n, component="tracer"),
+                _line(stamp, "logit.component.events.delivered", "sum", n, component="tracer"),
+                _line(stamp, "logit.component.batches.delivered", "sum", 2, component="tracer")]
+        life = next(((one, start) for one, start, end in lives if start < offset <= end), None)
+        if life is None:
+            continue
+        unexported = kill and life[0] == 0 and offset == SPAN_KILL[0]
+        for index in range(2):
+            ids = [(span + i + 1, span + i + 1, int((T0 + offset - 3 + index) * 1e9))
+                   for i in range(SPAN_BATCH)]
+            span += SPAN_BATCH
+            requests.append(_trace_request(len(requests) + 1, offset - 3 + index, ids))
+        if kill and life[0] == 0 and offset == SPAN_KILL[0] and lost:
+            dropped = requests.pop()
+            del dropped
+        if unexported:
+            continue
+        sut += [_line(stamp, "logit.process.uptime", "gauge", float(offset - life[1]))]
+        for metric, value, component, attrs in (
+                ("logit.component.events.sent", n, "apm", None),
+                ("logit.component.batches.sent", 2, "apm", None),
+                ("logit.input.requests", 2, "apm", {"route": "traces_v04", "class": "ok"}),
+                ("logit.input.spans", n, "apm", None),
+                ("logit.component.events.received", n, "agent", None),
+                ("logit.component.batches.received", 2, "agent", None),
+                ("logit.component.events.delivered", n, "agent", None),
+                ("logit.component.batches.delivered", 2, "agent", None),
+                ("logit.output.records", n, "agent", {"route": "traces_v07"}),
+                ("logit.output.requests", 2, "agent", {"route": "traces_v07",
+                                                       "class": "2xx"})):
+            sut.append(_line(stamp, metric, "sum", value, component=component, attrs=attrs))
+        sut += [_line(stamp, "logit.component.buffer.batches", "gauge", 0, component="agent"),
+                _line(stamp, "logit.component.retrying", "gauge", 0, component="agent")]
+    timeline = [_phase("start", 0, t0=T0)]
+    if kill:
+        timeline += [_action("apply", "c0s9", "kill", "logit", SPAN_KILL[0] - 1,
+                             affects_http_ingress=True),
+                     _action("revert", "c0s9", "kill", "logit", SPAN_KILL[1] - 1, SPAN_KILL[1],
+                             affects_http_ingress=True),
+                     _ready("c0s9", "logit", SPAN_KILL[1] + 1)]
+    timeline += list(timeline_extra) + [_phase("end_begin", 300), _phase("end_end", 330)]
+    run_dir = _run_dir(tmp, name, timeline, sut + list(sut_extra), ledger=SPAN_LEDGER,
+                       configs={"sut": "sut.yaml", "generator": "generator.yaml"},
+                       target={"kind": "standin", "name": "standin", "env": [],
+                               "shape": "datadog_trace"},
+                       services={"logit": "sut", "generator": "generator",
+                                 "standin": "standin"})
+    (run_dir / "configs").mkdir()
+    (run_dir / "configs" / "sut.yaml").write_text(SPAN_SUT)
+    (run_dir / "configs" / "generator.yaml").write_text(SPAN_GENERATOR)
+    (run_dir / "logs" / "generator.stdout").write_text("\n".join(gen + list(gen_extra)) + "\n")
+    (run_dir / "logs" / "logit.stderr").write_text(json.dumps(
+        {"timestamp": _stamp(T0 + 301), "level": "INFO", "message": "drain complete",
+         "target": "logit", "duration": "1ms"}) + "\n")
+    _write_standin(run_dir, requests_edit(requests) if requests_edit else requests,
+                   shape="datadog_trace")
+    return run_dir
+
+
+def _span_ledger():
+    """The ledger in spans over `_span_run`'s fixtures: a relay that balances PASSing every
+    row, `ledger.aggregate` SKIPping; a request the stand-in never stored FAILing egress and the
+    summary as uncounted loss; a copy of an accepted span a surplus in egress, reported by
+    `ledger.standin`; more distinct spans than G a summary surplus; a rejected step's spans held
+    to the sink's `records.dropped{reason="rejected"}` and a 413's to `oversize`, either
+    uncounted FAILing; and a killed life's gap reported."""
+    with tempfile.TemporaryDirectory() as tmp:
+        def rows(name, **kwargs):
+            return {r.id: r for r in checks.run_all(_span_run(tmp, name, **kwargs))}
+
+        clean = rows("span-clean")
+        for row in ("ledger.wire", "ledger.intake", "ledger.edge", "ledger.egress",
+                    "ledger.summary", "ledger.standin", "drops", "identity.sink"):
+            expect(clean[row].status == checks.PASS,
+                   f"a span relay that balances PASSes {row}, got {clean[row]}")
+        expect(clean["ledger.aggregate"].status == checks.SKIP,
+               f"a span relay has no aggregate, so ledger.aggregate SKIPs, got "
+               f"{clean['ledger.aggregate']}")
+        expect("W − X 1,200 − V 1,200 = 0, sink drops 0 (none), exact"
+               in clean["ledger.egress"].detail,
+               f"every relayed span is stored, got {clean['ledger.egress']}")
+        expect("1,200 distinct span(s) accepted <= G 1,200" in clean["ledger.summary"].detail,
+               f"the distinct spans are held to G, got {clean['ledger.summary']}")
+
+        # The stand-in's record lacks one request: 10 spans the SUT sent, never stored.
+        unstored = rows("span-unstored", requests_edit=lambda r: r[:40] + r[41:])
+        expect(unstored["ledger.egress"].status == checks.FAIL
+               and "uncounted loss of 10 span(s)" in unstored["ledger.egress"].detail,
+               f"spans that never reached the stand-in FAIL egress, got "
+               f"{unstored['ledger.egress']}")
+        expect(unstored["ledger.summary"].status == checks.FAIL
+               and "(S_in − V − drops) 10" in unstored["ledger.summary"].detail,
+               f"and the summary, got {unstored['ledger.summary']}")
+
+        # A resend the stand-in accepted twice: V counts both copies, past W − X.
+        copied = rows("span-copy", requests_edit=lambda r: r + [
+            {**r[3], "seq": len(r) + 1, "t": T0 + 299}])
+        expect(copied["ledger.egress"].status == checks.FAIL
+               and "a surplus: 10 span(s)" in copied["ledger.egress"].detail,
+               f"a copy past what the listener sent is a surplus, got {copied['ledger.egress']}")
+        expect(any("10 accepted copy(ies) of a span already accepted (life 0 10)" in line
+                   for line in copied["ledger.standin"].lines),
+               f"ledger.standin reports the copies, got {copied['ledger.standin'].lines}")
+
+        # The generator saw fewer spans accepted than the stand-in holds distinct.
+        short = _at_offset("logit.component.events.delivered", 300, -20, "tracer", add=True)
+        run_dir = _span_run(tmp, "span-over-g")
+        lines = (run_dir / "logs" / "generator.stdout").read_text().splitlines()
+        edited = []
+        for line in lines:
+            for one in (lambda got: got if isinstance(got, list) else [got])(
+                    short(json.loads(line))):
+                edited.append(json.dumps(one))
+        (run_dir / "logs" / "generator.stdout").write_text("\n".join(edited) + "\n")
+        over = {r.id: r for r in checks.run_all(run_dir)}
+        expect(over["ledger.summary"].status == checks.FAIL
+               and "1,200 distinct span(s) accepted > G 1,180, a surplus of 20"
+               in over["ledger.summary"].detail,
+               f"more distinct spans than G FAIL the summary, got {over['ledger.summary']}")
+
+        # The request at +297 answered 400 under a step classed rejected, its 10 spans dropped
+        # and counted, and the one at +298 a 413, counted oversize.
+        def rejected(requests):
+            requests[-2].update(status=400, stored=False, cue="c0s2")
+            requests[-1].update(status=413, stored=False, cue="c0s2")
+            return requests
+
+        def counted(rejected_n=SPAN_BATCH, oversize_n=SPAN_BATCH):
+            stamp = _stamp(T0 + 300)
+            out = [_line(stamp, "logit.output.requests", "sum", 2, component="agent",
+                         attrs={"route": "traces_v07", "class": "4xx"}),
+                   _line(stamp, "logit.output.requests", "sum", -2, component="agent",
+                         attrs={"route": "traces_v07", "class": "2xx"}),
+                   _line(stamp, "logit.component.batches.dropped", "sum", 2, component="agent",
+                         attrs={"reason": "rejected"}),
+                   _line(stamp, "logit.component.events.dropped", "sum", 2 * SPAN_BATCH,
+                         component="agent", attrs={"reason": "rejected"})]
+            for reason, n in (("rejected", rejected_n), ("oversize", oversize_n)):
+                if n:
+                    out.append(_line(stamp, "logit.output.records.dropped", "sum", n,
+                                     component="agent",
+                                     attrs={"route": "traces_v07", "reason": reason}))
+            return out
+
+        cued = _respond_fault("c0s2", 290, 300, status=400, cls="rejected")
+        judged = rows("span-rejected", requests_edit=rejected, timeline_extra=cued,
+                      sut_extra=counted())
+        for row in ("ledger.standin", "ledger.egress", "ledger.summary", "drops"):
+            expect(judged[row].status == checks.PASS,
+                   f"rejected spans the sink counted PASS {row}, got {judged[row]}")
+        expect("W − X 1,200 − V 1,180 = 20, sink drops 20 (records oversize 10, records "
+               "rejected 10), counted: the sink's drops" in judged["ledger.egress"].detail,
+               f"the gap is the sink's records dropped, counted once, got "
+               f"{judged['ledger.egress']}")
+        for name, extra, needle in (
+                ("span-rejected-uncounted", counted(rejected_n=0),
+                 "counted 0 record(s) dropped rejected, the record holds 10"),
+                ("span-oversize-uncounted", counted(oversize_n=0),
+                 "counted 0 record(s) dropped oversize, the record holds 10")):
+            broken = rows(name, requests_edit=rejected, timeline_extra=cued, sut_extra=extra)
+            expect(broken["ledger.standin"].status == checks.FAIL
+                   and needle in broken["ledger.standin"].detail,
+                   f"{name} FAILs ledger.standin, got {broken['ledger.standin']}")
+            expect(broken["ledger.egress"].status == checks.FAIL
+                   and "uncounted loss of 10 span(s)" in broken["ledger.egress"].detail,
+                   f"{name} FAILs egress, got {broken['ledger.egress']}")
+
+        # A kill whose queue held a request's spans: life 0's gap reported, life 1 exact.
+        killed = rows("span-kill", kill=True, lost=1)
+        expect(killed["ledger.egress"].status == checks.PASS
+               and "reported: a kill discards the sink's queue" in killed["ledger.egress"].detail
+               and "life 1 (final): W − X 480 − V 480 = 0" in killed["ledger.egress"].detail,
+               f"a killed life's gap is reported, got {killed['ledger.egress']}")
+
+
 def run(root, quiet=False):
     """Returns 0 when every expectation holds, else prints the failures and returns 1."""
     root = Path(root)
@@ -17626,7 +18060,8 @@ def run(root, quiet=False):
                      _fan_out_ledger, _idle_writer, _boundary_skew, _fan_out_rules,
                      _sampling_vectors, _absent_rules, _absent_checks, _merge_ledger,
                      _merge_rules, _delta_ledger, _delta_rules, _scrape_ledger,
-                     _scrape_rules, _shipped):
+                     _scrape_rules, _msgpack_reader, _datadog_trace_codec,
+                     _datadog_trace_server, _span_rules, _span_ledger, _shipped):
             try:
                 takes_root = (_rules, _expect_rules, _expand, _random, _signals, _hung_inspect,
                               _stalled, _stall_abort,
@@ -17651,7 +18086,8 @@ def run(root, quiet=False):
                               _tls_rules, _tls_driver, _reset_rules, _prlimit_rules,
                               _cgroup_rules, _cgroup_io_rules, _slowclient_rules,
                               _fan_out_rules, _sampling_vectors,
-                              _absent_rules, _merge_rules, _delta_rules, _scrape_rules)
+                              _absent_rules, _merge_rules, _delta_rules, _scrape_rules,
+                              _datadog_trace_codec, _datadog_trace_server, _span_rules)
                 part(root) if part in takes_root else part()
             except Exception as err:  # report the part that broke, then keep going
                 _FAILURES.append(f"{part.__name__}: {type(err).__name__}: {err}")

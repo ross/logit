@@ -6,7 +6,7 @@ it answered (with the raw body, base64), `cue` for each cue it took, and `ready`
 around a life. Decoding happens here, on the host, so `check` re-scores a run from the record
 alone.
 
-Five shapes, each the stand-in's `--shape` and a scenario's `[target] shape`:
+Six shapes, each the stand-in's `--shape` and a scenario's `[target] shape`:
 
 - `remote_write`: a body is a Snappy **block** (never framed) holding a `prometheus.WriteRequest`
   (1.0): `timeseries` is field 1; a `TimeSeries` has `labels` (1) and `samples` (2); a `Label`
@@ -52,6 +52,17 @@ Five shapes, each the stand-in's `--shape` and a scenario's `[target] shape`:
   as Splunk indexes them (`stored_part`). A `/services/collector/ack` poll is no write and holds
   no samples.
 
+- `datadog_trace`: a body is a tracer API request as `datadog_trace_out` writes it, MessagePack
+  under `Content-Encoding` `gzip` or none, read by `msgpack.py`: on `/v0.4/traces` an array of
+  traces, each an array of span maps, and on `/v0.7/traces` a `TracerPayload` map whose `chunks`
+  each hold `spans`; a span map's `trace_id` (the trace id's low 64 bits) and `span_id` are
+  unsigned ints, and `start` is Unix nanoseconds. A `/v0.6/stats` body is a `ClientStatsPayload`
+  map and holds no span. Each span is a series of one sample, `{__name__: "span", trace_id,
+  span_id}` at its start in milliseconds, so the samples the shape's generic rules read are
+  spans. V is spans, not values (`stored_spans`): the spans of each write the stand-in stored
+  and answered `2xx`, every copy, credited to the SUT life it was answered in, since an Agent
+  keeps every copy it accepts and the listener's W counts every request that reached it.
+
 The `otlp` and `splunk` shapes are for cumulative sinks, whose V is `remote_write`'s: one sample
 per `(label set, timestamp)`, a later write replacing an earlier one (`stored_series`).
 
@@ -69,28 +80,38 @@ import urllib.parse
 import zlib
 from dataclasses import dataclass, field
 
-from . import otlp
+from . import msgpack, otlp
 
 REMOTE_WRITE, DATADOG, INFLUXDB = "remote_write", "datadog", "influxdb"
-OTLP, SPLUNK = "otlp", "splunk"
-SHAPES = (REMOTE_WRITE, DATADOG, INFLUXDB, OTLP, SPLUNK)
+OTLP, SPLUNK, DATADOG_TRACE = "otlp", "splunk", "datadog_trace"
+SHAPES = (REMOTE_WRITE, DATADOG, INFLUXDB, OTLP, SPLUNK, DATADOG_TRACE)
 REMOTE_WRITE_PATH = "/api/v1/write"
 DATADOG_SERIES_PATH = "/api/v2/series"
 INFLUXDB_WRITE_PATH = "/api/v2/write"
 OTLP_METRICS_PATH = "/v1/metrics"
 SPLUNK_EVENT_PATH = "/services/collector/event"
 SPLUNK_ACK_PATH = "/services/collector/ack"
+TRACES_V04_PATH = "/v0.4/traces"
+TRACES_V07_PATH = "/v0.7/traces"
+STATS_V06_PATH = "/v0.6/stats"
 # Each shape's write path and the status it answers with no cue; standin/standin.py's
 # DEFAULT_PATH and DEFAULT_STATUS.
 PATHS = {REMOTE_WRITE: REMOTE_WRITE_PATH, DATADOG: DATADOG_SERIES_PATH,
-         INFLUXDB: INFLUXDB_WRITE_PATH, OTLP: OTLP_METRICS_PATH, SPLUNK: SPLUNK_EVENT_PATH}
+         INFLUXDB: INFLUXDB_WRITE_PATH, OTLP: OTLP_METRICS_PATH, SPLUNK: SPLUNK_EVENT_PATH,
+         DATADOG_TRACE: TRACES_V04_PATH}
+# A shape's write paths besides its own: `datadog_trace_out` writes traces to its `version:`'s
+# route and stats to `/v0.6/stats`; standin/standin.py's EXTRA_WRITE_PATHS.
+EXTRA_WRITE_PATHS = {DATADOG_TRACE: (TRACES_V07_PATH, STATS_V06_PATH)}
 # A shape's paths that take requests but no writes.
 OTHER_PATHS = {SPLUNK: (SPLUNK_ACK_PATH,)}
-DEFAULT_STATUS = {REMOTE_WRITE: 200, DATADOG: 202, INFLUXDB: 204, OTLP: 200, SPLUNK: 200}
+DEFAULT_STATUS = {REMOTE_WRITE: 200, DATADOG: 202, INFLUXDB: 204, OTLP: 200, SPLUNK: 200,
+                  DATADOG_TRACE: 200}
 # What a body of each shape is, for a check's message about one that doesn't decode.
 BODY_NAMES = {REMOTE_WRITE: "a Snappy WriteRequest", DATADOG: "a MetricPayload",
               INFLUXDB: "InfluxDB line protocol", OTLP: "an ExportMetricsServiceRequest",
-              SPLUNK: "HEC event JSON"}
+              SPLUNK: "HEC event JSON", DATADOG_TRACE: "a tracer API MessagePack body"}
+# The label a `datadog_trace` span's one-sample series is named by.
+SPAN_NAME = "span"
 # The object keys a HEC metric's series is named by besides its dimensions.
 SPLUNK_ENVELOPE = ("host", "index", "source", "sourcetype")
 SPLUNK_METRIC_PREFIX = "metric_name:"
@@ -614,6 +635,66 @@ def _otlp_series(raw, request):
     return series
 
 
+def write_paths(shape):
+    """The paths a shape takes writes on: its own, then any `EXTRA_WRITE_PATHS`."""
+    return (PATHS[shape],) + EXTRA_WRITE_PATHS.get(shape, ())
+
+
+def _span_id(span, key):
+    value = span.get(key, 0)
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < 1 << 64:
+        raise DecodeError(f"a span's {key} {value!r} isn't an unsigned 64-bit int")
+    return value
+
+
+def tracer_spans(raw, path):
+    """`[(trace_id, span_id, start_ns)]` for each span of a tracer API body as `path` takes it,
+    in wire order: a `/v0.4/traces` (or `/v0.3/traces`) array of traces, each an array of span
+    maps; a `/v0.7/traces` `TracerPayload` map, its `chunks` each a map holding `spans`; and a
+    `/v0.6/stats` `ClientStatsPayload` map, which holds none. A `trace_id` is the trace id's low
+    64 bits, as on the wire. Raises `DecodeError` for a body that isn't that shape."""
+    try:
+        body = msgpack.unpack(raw)
+    except msgpack.MsgpackError as err:
+        raise DecodeError(f"msgpack: {err}") from None
+    if path == STATS_V06_PATH:
+        if not isinstance(body, dict):
+            raise DecodeError(f"a stats body is a {type(body).__name__}, not a map")
+        return []
+    if path == TRACES_V07_PATH:
+        if not isinstance(body, dict):
+            raise DecodeError(f"a v0.7 body is a {type(body).__name__}, not a TracerPayload map")
+        chunks = body.get("chunks") or []
+        if not isinstance(chunks, list) or not all(isinstance(one, dict) for one in chunks):
+            raise DecodeError("a TracerPayload's chunks aren't an array of maps")
+        traces = [one.get("spans") or [] for one in chunks]
+    elif path in (TRACES_V04_PATH, "/v0.3/traces"):
+        if not isinstance(body, list):
+            raise DecodeError(f"a v0.4 body is a {type(body).__name__}, not an array of traces")
+        traces = body
+    else:
+        raise DecodeError(f"{path} is no trace route")
+    spans = []
+    for trace in traces:
+        if not isinstance(trace, list):
+            raise DecodeError(f"a trace is a {type(trace).__name__}, not an array of spans")
+        for span in trace:
+            if not isinstance(span, dict):
+                raise DecodeError(f"a span is a {type(span).__name__}, not a map")
+            start = span.get("start", 0)
+            if isinstance(start, bool) or not isinstance(start, int):
+                raise DecodeError(f"a span's start {start!r} isn't an int")
+            spans.append((_span_id(span, "trace_id"), _span_id(span, "span_id"), start))
+    return spans
+
+
+def _trace_series(raw, request):
+    spans = tracer_spans(decompress(raw, request.get("content_encoding")),
+                         request.get("path"))
+    return [({"__name__": SPAN_NAME, "trace_id": str(trace_id), "span_id": str(span_id)},
+             [(start // 1_000_000, 1.0)]) for trace_id, span_id, start in spans]
+
+
 def splunk_objects(text):
     """The JSON objects of a HEC `/event` body, concatenated with or without whitespace between
     them. Raises `DecodeError` for anything else."""
@@ -707,13 +788,16 @@ def decode_body(request, shape=REMOTE_WRITE):
     `remote_write`, a `MetricPayload` under gzip, deflate, or no compression for `datadog`, and
     uncompressed line protocol for `influxdb`, one series per numeric or boolean field, a
     boolean as 1 or 0, an `ExportMetricsServiceRequest` under gzip or none for `otlp`, one series
-    per data point, and HEC objects under gzip or none for `splunk`, one series per measurement.
+    per data point, HEC objects under gzip or none for `splunk`, one series per measurement,
+    and a tracer API body under gzip or none for `datadog_trace`, one series per span.
     Under `influxdb` a timestamp is floored to the millisecond, so two points of one series
     within a millisecond read as one rewritten sample."""
     if shape == SPLUNK:
         return [sample for one in splunk_request_objects(request)
                 for sample in splunk_samples(one)]
     raw = _raw_body(request)
+    if shape == DATADOG_TRACE:
+        return _trace_series(raw, request)
     if shape == OTLP:
         return _otlp_series(raw, request)
     if shape == INFLUXDB:
@@ -917,6 +1001,60 @@ def stored_counts(requests):
         counts.series.append({"metric": dict(key), "timestamps": stamps,
                               "values": [points[stamp] for stamp in stamps]})
     return counts
+
+
+@dataclass
+class Spans:
+    """A `datadog_trace` stand-in's record as V's terms, over the stored writes in record order.
+    `series` is export-shaped, one series of one sample per distinct span the destination holds.
+    `arrivals` holds one `(t, spans)` per write the stand-in stored and answered `2xx`, `t` its
+    answer's epoch seconds: the spans the sink saw accepted, every copy, which V sums per SUT
+    life. `copies` holds one `(trace_id, span_id, first index, copy index)` per span of such a
+    write already in an earlier one, each index the request's place in the record. `resent`
+    holds one `(index, spans)` per write the stand-in stored but answered otherwise (a cue's
+    `apply`), whose spans the destination keeps and the sink sends again. `undecodable` holds
+    one `(seq, reason)` per stored body that doesn't decode."""
+
+    series: list = field(default_factory=list)
+    arrivals: list = field(default_factory=list)
+    copies: list = field(default_factory=list)
+    resent: list = field(default_factory=list)
+    undecodable: list = field(default_factory=list)
+
+    @property
+    def distinct(self):
+        """The distinct spans the sink saw accepted."""
+        return sum(n for _, n in self.arrivals) - len(self.copies)
+
+
+def stored_spans(requests):
+    """A `datadog_trace` stand-in's record as `Spans`."""
+    spans = Spans()
+    held = {}
+    accepted = {}
+    for index, request in enumerate(requests):
+        if not request.get("stored") or not is_write(request, DATADOG_TRACE):
+            continue
+        try:
+            decoded = decode_body(request, DATADOG_TRACE)
+        except DecodeError as err:
+            spans.undecodable.append((request.get("seq"), str(err)))
+            continue
+        for labels, samples in decoded:
+            held.setdefault(series_key(labels), samples[0][0])
+        if status_class(request) != "2xx":
+            spans.resent.append((index, len(decoded)))
+            continue
+        spans.arrivals.append((request.get("t"), len(decoded)))
+        for labels, _ in decoded:
+            key = (labels["trace_id"], labels["span_id"])
+            if key in accepted:
+                spans.copies.append((*key, accepted[key], index))
+            else:
+                accepted[key] = index
+    spans.series = [{"metric": dict(key), "timestamps": [stamp], "values": [1.0]}
+                    for key, stamp in sorted(held.items())]
+    return spans
 
 
 def unstored_points(requests, series):

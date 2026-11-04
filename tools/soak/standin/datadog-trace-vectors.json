@@ -1,0 +1,32 @@
+{
+  "what": "Bodies the datadog_trace shape's decoder reads in the self-test, each with the spans it holds and the first spans' trace and span ids. A `file` is read from the repository in place of `body_b64`.",
+  "bodies": [
+    {
+      "what": "a dd-trace-py 4.15.2 tracer's recorded v0.4 body",
+      "path": "/v0.4/traces",
+      "content_encoding": null,
+      "file": "testdata/interop/datadog/tracer-v04-v0-4-traces-000.bin",
+      "body_b64": "",
+      "spans": 10,
+      "first": [
+        [
+          "15785587148021361665",
+          "11685112389553893461"
+        ],
+        [
+          "15785587148021361665",
+          "8197691299176281266"
+        ]
+      ]
+    },
+    {
+      "what": "the same tracer's recorded v0.6 stats body",
+      "path": "/v0.6/stats",
+      "content_encoding": null,
+      "file": "testdata/interop/datadog/tracer-v04-v0-6-stats-000.bin",
+      "body_b64": "",
+      "spans": 0,
+      "first": []
+    }
+  ]
+}

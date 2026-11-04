@@ -1,0 +1,237 @@
+# The rows of datadog_trace_out's response-class table a stand-in can answer, against a
+# scripted stand-in for a Datadog Agent's trace API, relaying a generator's tracer-shaped v0.4
+# payloads through `datadog_trace_in` and out as v0.7. Each step tells the stand-in what to
+# answer for 10 s, 60 s apart, so a 30 s progress window fits between one step's recovery and
+# the next, and its `class` names the fault class the sink must read
+# (crates/logit-outputs/src/datadog_trace.rs, "Response classes"). The cued rows: 400; 404;
+# 401, which stands for 403, 405, and 407; 408; 413, counted `oversize`; 415; 429; any 5xx,
+# as 501 and as a 503 answered after storing; any other 3xx or 4xx, as a redirect; and a reset
+# after the request left. A stop of the stand-in is the connect-refused row, and a kill of the
+# SUT ends a life with its queue. Not cued: a 2xx, which every other request is; a dial past
+# `connect_timeout:`; and the request timeout, which a held answer would turn into a stall.
+# The unit is the span, each its own trace: G the spans the generator's writer saw accepted,
+# W the spans the SUT's listener sent, V the spans the stand-in stored under a 2xx answer.
+# `ledger.standin` checks each step's effect at the sink, and that the sink's
+# `records.dropped` under `rejected` and `oversize` is the spans of the requests answered under
+# the rejected steps. The run takes about 15 minutes. The schema is
+# docs/plans/soak-harness.md's "The scenario schema".
+
+name = "standin-datadog-trace"
+description = "datadog_trace_out (v0.4) into datadog_trace_in -> datadog_trace_out (v0.7, gzip) against a stand-in answering each row of the sink's response-class table in turn"
+duration = "15m10s"       # warmup + one cycle + cooldown
+warmup = "60s"
+cooldown = "30s"          # >= recovery_bound
+recovery_bound = "20s"    # retry_max_delay 2s, the generator's 1s, and two telemetry drains
+cycle = "13m40s"          # the last step, its recovery, and two progress windows
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"
+
+[target]
+kind = "standin"
+shape = "datadog_trace"
+
+[ledger]                  # no sut_aggregate: the pair relays every span
+wire_loss_outside_faults = 0.0
+
+[[ledger.source]]
+service = "generator"
+generator_input = "load"
+generator_sink = "tracer"
+sut_listener = "apm"
+wire = "http"             # G the writer's events.delivered, W the listener's events.sent
+
+[[ledger.sink]]           # the one sink, whose writes the stand-in records
+id = "agent"
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64
+fd_growth = 8
+
+[[step]]                  # c0s1: 400, bad data: dropped
+at = "0s"
+action = "respond"
+on = "standin"
+status = 400
+body = "unable to decode"
+class = "rejected"
+for = "10s"
+
+[[step]]                  # c0s2: 404, an Agent without this route: held
+at = "1m"
+action = "respond"
+on = "standin"
+status = 404
+class = "refused"
+for = "10s"
+
+[[step]]                  # c0s3: 401, a proxy's credential, standing for 403, 405, and 407: held
+at = "2m"
+action = "respond"
+on = "standin"
+status = 401
+class = "refused"
+for = "10s"
+
+[[step]]                  # c0s4: 408, a proxy gave up on the request's arrival: retried
+at = "3m"
+action = "respond"
+on = "standin"
+status = 408
+class = "ambiguous"
+for = "10s"
+
+[[step]]                  # c0s5: 413, a body over the Agent's limit: dropped, counted oversize
+at = "4m"
+action = "respond"
+on = "standin"
+status = 413
+class = "rejected"
+for = "10s"
+
+[[step]]                  # c0s6: 415, a media type the Agent doesn't read: held
+at = "5m"
+action = "respond"
+on = "standin"
+status = 415
+class = "refused"
+for = "10s"
+
+[[step]]                  # c0s7: 429, the Agent's rate limiter: held, never sent
+at = "6m"
+action = "respond"
+on = "standin"
+status = 429
+class = "clean"
+for = "10s"
+
+[[step]]                  # c0s8: 501, any 5xx: retried
+at = "7m"
+action = "respond"
+on = "standin"
+status = 501
+class = "ambiguous"
+for = "10s"
+
+[[step]]                  # c0s9: 503 after storing, any 5xx: the resend stores the same spans again
+at = "8m"
+action = "respond"
+on = "standin"
+status = 503
+apply = true
+class = "ambiguous"
+for = "10s"
+
+[[step]]                  # c0s10: a redirect, any other 3xx or 4xx: dropped
+at = "9m"
+action = "respond"
+on = "standin"
+status = 302
+class = "rejected"
+for = "10s"
+
+[[step]]                  # c0s11: a reset after the request left: retried
+at = "10m"
+action = "respond"
+on = "standin"
+answer = "reset"
+class = "ambiguous"
+for = "10s"
+
+[[step]]                  # c0s12: a connect failure: held
+at = "11m"
+action = "stop"
+on = "standin"
+class = "clean"
+for = "10s"
+
+[[step]]                  # c0s13: a kill of the SUT: its queue is lost, uncounted, and reported
+at = "12m"
+action = "kill"
+on = "logit"
+for = "20s"
+
+# One expectation per class, beside ledger.standin's check of every step.
+[[expect]]
+name = "rejected-counts-spans"
+service = "logit"
+metric = "logit.output.records.dropped"
+component = "agent"
+attrs = { reason = "rejected" }
+step = "c0s1"
+window = "through"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "refused-holds"
+service = "logit"
+metric = "logit.component.retrying"
+component = "agent"
+step = "c0s2"
+window = "during"
+reduce = "max"
+min = 1
+
+[[expect]]
+name = "refused-drops-nothing"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "agent"
+step = "c0s2"
+window = "through"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "ambiguous-retries"
+service = "logit"
+metric = "logit.component.retries"
+component = "agent"
+step = "c0s4"
+window = "during"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "oversize-counts-spans"
+service = "logit"
+metric = "logit.output.records.dropped"
+component = "agent"
+attrs = { reason = "oversize" }
+step = "c0s5"
+window = "through"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "clean-holds"
+service = "logit"
+metric = "logit.component.retrying"
+component = "agent"
+step = "c0s7"
+window = "during"
+reduce = "max"
+min = 1
+
+[[expect]]
+name = "connect-failure-holds"
+service = "logit"
+metric = "logit.component.retrying"
+component = "agent"
+step = "c0s12"
+window = "during"
+reduce = "max"
+min = 1
+
+[[expect]]
+name = "retrying-clears"
+service = "logit"
+metric = "logit.component.retrying"
+component = "agent"
+step = "c0s12"
+window = "after"
+reduce = "last"
+max = 0

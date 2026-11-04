@@ -266,7 +266,15 @@ SPLUNK_SHAPE = standin_mod.SPLUNK
 # the one object it names, and a `splunk` `withhold_acks` 2xx, which the sink must read as
 # `ambiguous`, take the opposite rule.
 CLASS_REQUIRED_SHAPES = (standin_mod.DATADOG, standin_mod.INFLUXDB, standin_mod.OTLP,
-                         standin_mod.SPLUNK)
+                         standin_mod.SPLUNK, standin_mod.DATADOG_TRACE)
+# A `datadog_trace` stand-in's run relays spans with no `aggregate`: the one source's listener
+# is a `datadog_trace_in` on an HTTP wire, the one sink a `datadog_trace_out`, and every row
+# counts spans (`_span_problems()`).
+SPAN_LISTENER_KIND = "datadog_trace_in"
+SPAN_SINK_KIND = "datadog_trace_out"
+# The `[ledger]` keys refused beside a span relay, whose rows read no `aggregate`.
+SPAN_REFUSED_KEYS = ("sut_aggregate", "sut_delta", "sut_script", "hop", "split",
+                     "vm_every_window")
 # Kafka's legal topic names (`Topic.validate`): ASCII letters, digits, `.`, `_`, and `-`, up to
 # 249 characters.
 _TOPIC_NAME = re.compile(r"^[A-Za-z0-9._-]{1,249}$")
@@ -360,7 +368,7 @@ FILE_WRITER_KIND = "file_out"
 # An HTTP wire's writers, whose G is also `events.delivered`: the events of the batches the
 # listener answered with a success.
 HTTP_WRITER_KINDS = ("influxdb_out", "otlp_out", "splunk_hec_out", "datadog_out",
-                     "prometheus_out")
+                     "prometheus_out", "datadog_trace_out")
 # A scrape wire's writer: an exposition on `bind:`, whose G is its generator's increments, since
 # a scrape reads running totals (checks.py's `check_ledger_wire`).
 SCRAPE_WRITER_KIND = "prometheus_out"
@@ -385,6 +393,7 @@ LISTENER_WIRES = {
     "otlp_in": ("http", {}),
     "splunk_hec_in": ("http", {}),
     "datadog_in": ("http", {}),
+    "datadog_trace_in": ("http", {}),
     "kafka_in": ("kafka", {}),
 }
 # Each listener kind with no `transport:` that runs in one of several modes, each chosen by the
@@ -1050,8 +1059,10 @@ def from_dict(raw, path):
         ledger_keys = ledger_keys - {"sut_aggregate"}
         ledger_optional = ledger_optional | {"sut_aggregate"}
     # `sut_delta` takes `sut_aggregate`'s place, and `_delta_problems()` refuses both together.
-    # A scrape wire's rows read no `aggregate`, and `_scrape_problems()` refuses one.
-    if isinstance(ledger, dict) and ("sut_delta" in ledger or _scraped(ledger)):
+    # A scrape wire's rows and a span relay's read no `aggregate`, and `_scrape_problems()`
+    # and `_span_problems()` refuse one.
+    if isinstance(ledger, dict) and ("sut_delta" in ledger or _scraped(ledger)
+                                     or _spanned(target)):
         ledger_keys = ledger_keys - {"sut_aggregate"}
         ledger_optional = ledger_optional | {"sut_aggregate"}
     if no_vm and isinstance(ledger, dict):
@@ -1117,6 +1128,7 @@ def from_dict(raw, path):
             problems += _delta_problems(ledger, sut_text, target, "overlap" in raw)
             problems += _scrape_problems(ledger, target, "overlap" in raw, extra_suts,
                                          sut_text, configs, path.parent)
+            problems += _span_problems(ledger, target, "overlap" in raw, extra_suts, sut_text)
             if target["kind"] == KAFKA_TARGET:
                 target["format"] = kafka_format(ledger, sut_text, target["topic"], problems)
             problems += _kafka_wire_problems(ledger, configs, path.parent, sut_text)
@@ -2207,6 +2219,62 @@ def _scraped(ledger):
     sources = ledger.get("source") if isinstance(ledger.get("source"), list) else []
     return any(isinstance(source, dict) and source.get("wire") == SCRAPE_WIRE
                for source in sources)
+
+
+def _spanned(target):
+    """Whether the target is a `datadog_trace` stand-in, whose run relays spans."""
+    return (target.get("kind") == STANDIN_TARGET
+            and target.get("shape") == standin_mod.DATADOG_TRACE)
+
+
+def _span_problems(ledger, target, overlap, extra_suts, sut_text):
+    """What a span relay breaks: under a `datadog_trace` stand-in, one `[[ledger.source]]` on an
+    HTTP wire into a `datadog_trace_in`, with no `sut_transforms`, `fan_out`, or `merge`, one
+    `[[ledger.sink]]` naming a `datadog_trace_out`, and one SUT service; and
+    `SPAN_REFUSED_KEYS` and `[overlap]` refused beside it. The rows count spans from the listener
+    to the stand-in, so nothing between them may add, drop, or reshape one."""
+    if not _spanned(target):
+        return []
+    problems = []
+    sources = ledger.get("source") if isinstance(ledger.get("source"), list) else []
+    if len(sources) != 1:
+        problems.append("a datadog_trace stand-in needs one [[ledger.source]], since every row "
+                        "counts that listener's spans")
+    for index, source in enumerate(sources):
+        if not isinstance(source, dict):
+            continue
+        if source.get("wire") != HTTP_WIRE:
+            problems.append(f"ledger.source {index + 1}: a datadog_trace stand-in's source takes "
+                            f"wire = \"{HTTP_WIRE}\", a writer's tracer API requests")
+        listener = source.get("sut_listener")
+        kind = component_kind(sut_text, listener) if isinstance(listener, str) else None
+        if isinstance(listener, str) and kind is not None and kind != SPAN_LISTENER_KIND:
+            problems.append(f"ledger.source {index + 1}: sut_listener {listener!r} is a {kind}, "
+                            f"and a datadog_trace stand-in's listener is a {SPAN_LISTENER_KIND}")
+        for key in ("sut_transforms", "fan_out", "merge"):
+            if key in source:
+                problems.append(f"ledger.source {index + 1}: `{key}` can't be combined with a "
+                                "datadog_trace stand-in, whose rows count each span from the "
+                                "listener to the sink")
+    sinks = ledger.get("sink") if isinstance(ledger.get("sink"), list) else []
+    if len(sinks) != 1:
+        problems.append("a datadog_trace stand-in needs one [[ledger.sink]], whose writes the "
+                        "stand-in records")
+    for index, sink in enumerate(sinks):
+        sink_id = sink.get("id") if isinstance(sink, dict) else None
+        kind = component_kind(sut_text, sink_id) if isinstance(sink_id, str) else None
+        if kind is not None and kind != SPAN_SINK_KIND:
+            problems.append(f"ledger.sink {index + 1}: {sink_id!r} is a {kind}, and a "
+                            f"datadog_trace stand-in's sink is a {SPAN_SINK_KIND}")
+    for key in SPAN_REFUSED_KEYS:
+        if key in ledger:
+            problems.append(f"ledger.{key} can't be combined with a datadog_trace stand-in, "
+                            "whose rows read no aggregate")
+    if overlap:
+        problems.append("[overlap] can't be combined with a datadog_trace stand-in")
+    if extra_suts:
+        problems.append("a datadog_trace stand-in needs one SUT service")
+    return problems
 
 
 def _scrape_problems(ledger, target, overlap, extra_suts, sut_text, configs, directory):

@@ -10,7 +10,10 @@ Stdlib only; compose runs it in a stock Python image. It serves two ports:
   `ExportMetricsServiceResponse`. Under `splunk` it answers `200` on `/services/collector/event`
   with HEC's success body and an `ackId`, minted per `X-Splunk-Request-Channel` from 0, and takes
   `/services/collector/ack` polls too: each id is answered `true` once minted on the poll's
-  channel, `false` otherwise. The path is compared without its query string, which
+  channel, `false` otherwise. Under `datadog_trace` it answers `200` with the Agent's default
+  `rate_by_service` JSON on `/v0.4/traces` and `/v0.7/traces` and `{}` on `/v0.6/stats`, all
+  three write paths, and takes `PUT`, which `datadog_trace_out` sends on the trace routes, as it
+  takes `POST`. The path is compared without its query string, which
   `influxdb_out` always sends (`org`, `orgID`, `bucket`, `precision`). A request to any other
   path answers `404`, so a misconfigured endpoint can't pass for a stored write.
 - The control port (`--control-port`) takes `POST /cue` from the driver: a JSON object with
@@ -65,10 +68,17 @@ import time
 import urllib.parse
 
 DEFAULT_STATUS = {"remote_write": 200, "datadog": 202, "influxdb": 204, "otlp": 200,
-                  "splunk": 200}
+                  "splunk": 200, "datadog_trace": 200}
 DEFAULT_PATH = {"remote_write": "/api/v1/write", "datadog": "/api/v2/series",
                 "influxdb": "/api/v2/write", "otlp": "/v1/metrics",
-                "splunk": "/services/collector/event"}
+                "splunk": "/services/collector/event", "datadog_trace": "/v0.4/traces"}
+# A shape's write paths besides DEFAULT_PATH's, unless `--path` names one.
+EXTRA_WRITE_PATHS = {"datadog_trace": ("/v0.7/traces", "/v0.6/stats")}
+DATADOG_TRACE_SHAPE = "datadog_trace"
+DATADOG_STATS_PATH = "/v0.6/stats"
+# The body the Agent answers a trace request with when the tracer sent no rates version: the
+# default rate for every service (crates/logit-inputs/src/datadog_trace.rs, "The trace reply").
+TRACE_REPLY = b'{"rate_by_service":{"service:,env:":1.0}}'
 # Statuses whose answer has no body and no `Content-Length` (RFC 9110, section 8.6).
 NO_BODY_STATUSES = (204, 304)
 # The cue key only the `datadog` shape takes.
@@ -109,9 +119,11 @@ class Server(http.server.ThreadingHTTPServer):
 
 
 class State:
-    def __init__(self, shape, path):
+    def __init__(self, shape, paths):
         self.shape = shape
-        self.path = path
+        # The write paths, one or several; the first is DEFAULT_PATH's or `--path`'s.
+        self.paths = (paths,) if isinstance(paths, str) else tuple(paths)
+        self.path = self.paths[0]
         self.lock = threading.Lock()
         self.cue = {}
         # The writes a cue with `count` has left to answer; None for a cue without one.
@@ -385,7 +397,7 @@ def data_handler(state, idle_timeout=IDLE_TIMEOUT_S):
             length = int(self.headers.get("Content-Length") or 0)
             body = self.rfile.read(length) if length else b""
             split = urllib.parse.urlsplit(self.path)
-            cue, seq = state.take(split.path == state.path)
+            cue, seq = state.take(split.path in state.paths)
             record = {
                 "event": "request", "seq": seq, "t": time.time(), "path": split.path,
                 "query": split.query,
@@ -397,9 +409,10 @@ def data_handler(state, idle_timeout=IDLE_TIMEOUT_S):
             channel = self.headers.get(SPLUNK_CHANNEL_HEADER) or ""
             if state.shape == SPLUNK_SHAPE and split.path == SPLUNK_ACK_PATH:
                 self._ack(record, channel, body, cue)
-            elif split.path != state.path:
+            elif split.path not in state.paths:
                 record.update(answer="status", status=404, stored=False)
-                self._answer(404, f"no write path {split.path}; this stand-in takes {state.path}")
+                self._answer(404, f"no write path {split.path}; this stand-in takes "
+                                  f"{', '.join(state.paths)}")
             elif cue.get("answer") == "reset":
                 record.update(answer="reset", status=None, stored=bool(cue.get("apply", False)))
                 self._reset()
@@ -435,11 +448,17 @@ def data_handler(state, idle_timeout=IDLE_TIMEOUT_S):
                                  "application/json", headers)
                 elif state.shape == OTLP_SHAPE and success:
                     self._answer(status, b"", "application/x-protobuf", headers)
+                elif state.shape == DATADOG_TRACE_SHAPE and success:
+                    self._answer(status, b"{}" if split.path == DATADOG_STATS_PATH
+                                 else TRACE_REPLY, "application/json", headers)
                 else:
                     self._answer(status, b"", headers=headers)
             if state.stopping:
                 self.close_connection = True
             emit(record)
+
+        # `datadog_trace_out` sends `PUT` on the trace routes, as dd-trace-java does.
+        do_PUT = do_POST
 
         def _ack(self, record, channel, body, cue):
             # A poll is no write: it spends no cue, and records the cue only when it withholds.
@@ -549,7 +568,8 @@ def main(argv=None):
     parser.add_argument("--idle-timeout", type=float, default=IDLE_TIMEOUT_S,
                         help="seconds a keep-alive connection may sit idle")
     args = parser.parse_args(argv)
-    state = State(args.shape, args.path or DEFAULT_PATH[args.shape])
+    state = State(args.shape, (args.path,) if args.path else
+                  (DEFAULT_PATH[args.shape],) + EXTRA_WRITE_PATHS.get(args.shape, ()))
     data = Server(("0.0.0.0", args.data_port), data_handler(state, args.idle_timeout))
     control = Server(("0.0.0.0", args.control_port), control_handler(state))
     # Joined on close, so a SIGTERM waits for each request in flight.
@@ -575,7 +595,8 @@ def main(argv=None):
     threads = [threading.Thread(target=server.serve_forever) for server in (data, control)]
     for thread in threads:
         thread.start()
-    emit({"event": "ready", "t": time.time(), "shape": args.shape, "path": state.path})
+    emit({"event": "ready", "t": time.time(), "shape": args.shape, "path": state.path,
+          "paths": list(state.paths)})
     for thread in threads:
         thread.join()
     data.server_close()
