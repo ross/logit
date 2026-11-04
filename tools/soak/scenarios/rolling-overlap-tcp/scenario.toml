@@ -144,6 +144,14 @@ action = "stop"
 on = "logit-b"
 for = "60s"
 
+# A connection stays where it was accepted, so an instance started after the other took every
+# connection reads nothing in that life, until the other closes: its series has no segment there,
+# and `ledger.egress` WARNs "resets aren't SUT lives − 1", the known overlap WARN.
+#
+# Over TCP a connection moves only once the stopping instance closes it, after shutdown.delay
+# and a redial, so the other instance's first drain of a stop can read nothing: each row reads
+# the window's total, not every drain.
+
 [[expect]]                # logit-b reads every connection while logit is down
 name = "logit-b-carries-c0s3"
 service = "logit-b"
@@ -151,7 +159,7 @@ metric = "logit.input.frames"
 component = "statsd"
 step = "c0s3"
 window = "during"
-reduce = "min_delta"
+reduce = "delta"
 min = 1
 
 [[expect]]                # and logit while logit-b is
@@ -161,7 +169,7 @@ metric = "logit.input.frames"
 component = "statsd"
 step = "c0s6"
 window = "during"
-reduce = "min_delta"
+reduce = "delta"
 min = 1
 
 [[expect]]
@@ -171,5 +179,5 @@ metric = "logit.input.frames"
 component = "statsd"
 step = "c0s12"
 window = "during"
-reduce = "min_delta"
+reduce = "delta"
 min = 1
