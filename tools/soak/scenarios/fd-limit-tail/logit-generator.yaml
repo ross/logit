@@ -1,0 +1,25 @@
+# The writer in `script/soak`'s fd-limit-tail scenario, tail-rotate-delete's: 1,000 log lines a
+# second into a rotating file in the directory it shares with the system under test, one JSON
+# object per line. Its `internal` telemetry goes to stdout as NDJSON, so the harness reads what
+# it wrote.
+admin: { bind: 127.0.0.1:9600 }
+components:
+  load:
+    type: generate_in               # unbounded
+    rate: 1000
+    batch: 100
+    event:
+      log: "soak line {seq%100}"
+  file:
+    type: file_out
+    sources: [load]
+    path: /shared/app.log
+    format: json
+    # About 44 s of lines per file, and eight files kept, the active one included: every
+    # rotation from the eighth on deletes the oldest, about five minutes old. The tailer reads
+    # each file long before then while it runs. While it can open no file, the writer must
+    # rotate eight times, some 350 s, to delete one the tailer never opened, so the 240 s
+    # limit leaves a margin.
+    rotate: { max_bytes: 4MiB, max_files: 8 }
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }

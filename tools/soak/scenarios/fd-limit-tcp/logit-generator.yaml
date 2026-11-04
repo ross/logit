@@ -1,0 +1,116 @@
+# The load source in `script/soak`'s fd-limit-tcp scenario: 2,000 statsd counter lines a second
+# over eight TCP connections to the system under test, one per sink, each sink fed by its own
+# 250-line-a-second input in batches of 50. The eight connections are what a limited SUT must
+# accept again after its idle timeout closes them. Its `internal` telemetry goes to stdout as
+# NDJSON, so the harness reads what it sent.
+admin: { bind: 127.0.0.1:9600 }
+components:
+  load1:
+    type: generate_in               # unbounded
+    rate: 250
+    batch: 50
+    event:
+      metric: { name: "soak_requests_{seq%100}", kind: sum, value: 1 }
+  statsd1:
+    type: statsd_out
+    sources: [load1]
+    endpoint: logit:8125
+    transport: tcp                  # output.messages counts a batch once its write completes
+    format: statsd
+    # 50 batches is 10 s of this sink's load, so a write stalled for connect_timeout (5 s)
+    # in a connection the SUT can't accept fills its queue and the loss is counted here;
+    # never stall generate_in.
+    buffer: { max_batches: 50, overflow: drop_newest, retry_max_delay: 1s }
+  load2:
+    type: generate_in               # unbounded
+    rate: 250
+    batch: 50
+    event:
+      metric: { name: "soak_requests_{seq%100}", kind: sum, value: 1 }
+  statsd2:
+    type: statsd_out
+    sources: [load2]
+    endpoint: logit:8125
+    transport: tcp                  # output.messages counts a batch once its write completes
+    format: statsd
+    buffer: { max_batches: 50, overflow: drop_newest, retry_max_delay: 1s }
+  load3:
+    type: generate_in               # unbounded
+    rate: 250
+    batch: 50
+    event:
+      metric: { name: "soak_requests_{seq%100}", kind: sum, value: 1 }
+  statsd3:
+    type: statsd_out
+    sources: [load3]
+    endpoint: logit:8125
+    transport: tcp                  # output.messages counts a batch once its write completes
+    format: statsd
+    buffer: { max_batches: 50, overflow: drop_newest, retry_max_delay: 1s }
+  load4:
+    type: generate_in               # unbounded
+    rate: 250
+    batch: 50
+    event:
+      metric: { name: "soak_requests_{seq%100}", kind: sum, value: 1 }
+  statsd4:
+    type: statsd_out
+    sources: [load4]
+    endpoint: logit:8125
+    transport: tcp                  # output.messages counts a batch once its write completes
+    format: statsd
+    buffer: { max_batches: 50, overflow: drop_newest, retry_max_delay: 1s }
+  load5:
+    type: generate_in               # unbounded
+    rate: 250
+    batch: 50
+    event:
+      metric: { name: "soak_requests_{seq%100}", kind: sum, value: 1 }
+  statsd5:
+    type: statsd_out
+    sources: [load5]
+    endpoint: logit:8125
+    transport: tcp                  # output.messages counts a batch once its write completes
+    format: statsd
+    buffer: { max_batches: 50, overflow: drop_newest, retry_max_delay: 1s }
+  load6:
+    type: generate_in               # unbounded
+    rate: 250
+    batch: 50
+    event:
+      metric: { name: "soak_requests_{seq%100}", kind: sum, value: 1 }
+  statsd6:
+    type: statsd_out
+    sources: [load6]
+    endpoint: logit:8125
+    transport: tcp                  # output.messages counts a batch once its write completes
+    format: statsd
+    buffer: { max_batches: 50, overflow: drop_newest, retry_max_delay: 1s }
+  load7:
+    type: generate_in               # unbounded
+    rate: 250
+    batch: 50
+    event:
+      metric: { name: "soak_requests_{seq%100}", kind: sum, value: 1 }
+  statsd7:
+    type: statsd_out
+    sources: [load7]
+    endpoint: logit:8125
+    transport: tcp                  # output.messages counts a batch once its write completes
+    format: statsd
+    buffer: { max_batches: 50, overflow: drop_newest, retry_max_delay: 1s }
+  load8:
+    type: generate_in               # unbounded
+    rate: 250
+    batch: 50
+    event:
+      metric: { name: "soak_requests_{seq%100}", kind: sum, value: 1 }
+  statsd8:
+    type: statsd_out
+    sources: [load8]
+    endpoint: logit:8125
+    transport: tcp                  # output.messages counts a batch once its write completes
+    format: statsd
+    buffer: { max_batches: 50, overflow: drop_newest, retry_max_delay: 1s }
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }

@@ -8034,6 +8034,52 @@ def _file_ledger():
         expect(short_pause["ledger.wire"].status == checks.PASS,
                f"seven rotations in a pause pass, got {short_pause['ledger.wire']}")
 
+        # A prlimit keeps the tailer's open files too and fails its opens of new ones, so it
+        # takes the pause's limit: eight rotations in its window trip the guard, seven don't.
+        limited = [_action("apply", "c0s2", "prlimit", "logit", 200, 201, nofile=24,
+                           found=[1024, 524288], affects_file_ingress=True),
+                   _action("revert", "c0s2", "prlimit", "logit", 260, 260, restored=True)]
+
+        def limit(name, rotations, **kwargs):
+            run_dir = _ledger_run(tmp, name, shutdown_drops=0, life0_extra=30,
+                                  timeline_extra=limited)
+            return {r.id: r for r in checks.run_all(_as_file_wire(
+                run_dir, rotations={o: 1 for o in range(205, 205 + 5 * rotations, 5)},
+                max_files=8, **kwargs))}
+
+        long_limit = limit("file-retention-prlimit", 8, counted=deleting(files=8))
+        expect(long_limit["ledger.wire"].status == checks.FAIL
+               and long_limit["ledger.wire"].detail.startswith(
+                   "the writer rotated 8 time(s) while the SUT was at its open-files limit "
+                   "(prlimit [+200s, +260s]), enough to delete a file it hadn't read: out keeps 8 files, so 8 "
+                   "rotation(s) in a prlimit trip the guard"),
+               f"a prlimit over max_files rotations FAILs, got {long_limit['ledger.wire']}")
+        short_limit = limit("file-retention-prlimit-under", 7)
+        expect(short_limit["ledger.wire"].status == checks.PASS,
+               f"seven rotations in a prlimit pass, got {short_limit['ledger.wire']}")
+
+        # A cgroup keeps the tailer's open files and can slow it below the writer's pace, so it
+        # takes the pause's limit too.
+        throttled = [_action("apply", "c0s2", "cgroup", "logit", 200, 201, cpu=0.02,
+                             found="max 100000", affects_file_ingress=True),
+                     _action("revert", "c0s2", "cgroup", "logit", 260, 260, restored=True)]
+        run_dir = _ledger_run(tmp, "file-retention-cgroup", shutdown_drops=0, life0_extra=30,
+                              timeline_extra=throttled)
+        long_cgroup = {r.id: r for r in checks.run_all(_as_file_wire(
+            run_dir, rotations={o: 1 for o in range(205, 245, 5)}, max_files=8,
+            counted=deleting(files=8)))}
+        expect(long_cgroup["ledger.wire"].status == checks.FAIL
+               and long_cgroup["ledger.wire"].detail.startswith(
+                   "the writer rotated 8 time(s) while the SUT was throttled "
+                   "(cgroup [+200s, +260s])"),
+               f"a cgroup over max_files rotations FAILs, got {long_cgroup['ledger.wire']}")
+        run_dir = _ledger_run(tmp, "file-retention-cgroup-under", shutdown_drops=0,
+                              life0_extra=30, timeline_extra=throttled)
+        short_cgroup = {r.id: r for r in checks.run_all(_as_file_wire(
+            run_dir, rotations={o: 1 for o in range(205, 240, 5)}, max_files=8))}
+        expect(short_cgroup["ledger.wire"].status == checks.PASS,
+               f"seven rotations in a cgroup pass, got {short_cgroup['ledger.wire']}")
+
         # A killed life at 200 lines/s, 5 s drains, and a 5 s checkpoint_interval: below, 1,000
         # lost counts; above, 1,000 lines plus two files x 690 lines a 64 KiB read holds at 95
         # bytes a line; the stopped life adds one split.
@@ -9015,7 +9061,7 @@ RELAY_PER_DRAIN = 100
 
 
 def _relay_run(tmp, name, action="kill", extra=(), stopped=True, keys=True, sut_extra=(),
-               bursty=False):
+               bursty=False, kill=None, silent=()):
     """`_ledger_run`'s two-life run with its sink's writes carried on by a relay, `collector`,
     whose `action` (a `kill` or a `stop`) over `RELAY_KILL` gives it two lives. Each 5 s drain
     the relay's `otlp` sends `RELAY_PER_DRAIN` events on to `victoria_metrics`, which receives
@@ -9023,8 +9069,8 @@ def _relay_run(tmp, name, action="kill", extra=(), stopped=True, keys=True, sut_
     `keys` its sink names `relay_listener` and `relay_sink`. `sut_extra` lines go to `logit`.
     Under `bursty` the relay moves `2 × RELAY_PER_DRAIN` at every other drain (+5, +15, ...)
     and exports no point at the rest, as a 10 s sender into a 5 s drain does, so its killed
-    life's last drain, +200, is empty."""
-    kill = RELAY_KILL
+    life's last drain, +200, is empty. A life in `silent` drains but moves nothing."""
+    kill = kill or RELAY_KILL
     relay_timeline = [_action("apply", "c0s2", action, "collector", kill[0]),
                       _action("revert", "c0s2", action, "collector", kill[1] - 1, kill[1]),
                       _ready("c0s2", "collector", kill[1] + 1)]
@@ -9050,6 +9096,8 @@ def _relay_run(tmp, name, action="kill", extra=(), stopped=True, keys=True, sut_
         start = kill[1] if offset >= kill[1] else -1
         stamp = _stamp(T0 + offset)
         relay.append(_line(stamp, "logit.process.uptime", "gauge", float(offset - start)))
+        if (0 if offset < kill[0] else 1) in silent:
+            continue
         moved = RELAY_PER_DRAIN
         if bursty:
             if offset % 10 == 0:
@@ -9196,6 +9244,22 @@ def _relay_ledger():
                burst.detail and "= 6,200, ok" in burst.detail,
                f"a flush the killed relay answered after its last drain, an empty one, is "
                f"allowed by the busiest of its recent drain intervals, got {burst}")
+        early_kill = row("relay-delivered-early-kill", kill=(7, 15), sut_extra=delivered(6400))
+        expect(early_kill is not None and early_kill.status == checks.PASS
+               and "ΣE_r 6,300 against Del 6,400 − 100 (the busiest recent drain interval"
+               in early_kill.detail
+               and "counts are unseen; life 0 borrowed the relay's other lives' rate and "
+                   "interval)" in early_kill.detail and "= 6,300, ok" in early_kill.detail,
+               f"a relay life killed before it drained twice is allowed an interval at the "
+               f"relay's other lives' rate, got {early_kill}")
+        rate_only = row("relay-delivered-silent-kill", silent=(0,), sut_extra=delivered(2300))
+        expect(rate_only is not None and rate_only.status == checks.PASS
+               and "ΣE_r 2,200 against Del 2,300 − 100 (the busiest recent drain interval"
+               in rate_only.detail
+               and "counts are unseen; life 0 borrowed the relay's other lives' rate)"
+               in rate_only.detail and "= 2,200, ok" in rate_only.detail,
+               f"a killed relay life with drains whose listener never moved keeps its own "
+               f"interval and borrows only the rate, got {rate_only}")
         unwritten = row("relay-delivered-unwritten", sut_extra=delivered(
             6400, at(100, "logit.output.metrics.skipped", 200, component="sink",
                      metric_kind="gauge_histogram")))
@@ -13152,6 +13216,18 @@ def _reset_actions():
     expect(fake.calls[-1][-1] == "reset" and result["rc"] == 0 and result["killed"] == 3,
            f"a reset with no port closes every established connection, got {fake.calls[-1]} "
            f"{result}")
+    other = _NetemDocker([docker.Result(0, "", ""), docker.Result(0, "", "")])
+    other_ctx = faults.Context(docker=other, ids={"generator": "gen"}, netem_image="netem")
+    shaped = scenario.Step("c0s9", 8, 0, "netem", "generator", "delay 100ms loss 10%",
+                           720.0, 730.0)
+    faults.ACTIONS["netem"].apply(other_ctx, shaped)
+    faults.ACTIONS["netem"].revert(other_ctx, shaped)
+    expect(len(other.calls) == 2
+           and all("--security-opt" not in call and "label=disable" not in call
+                   for call in other.calls)
+           and "--security-opt" in fake.calls[0],
+           f"only a reset's and a cgroup's one-shots run unconfined, got {other.calls} "
+           f"{fake.calls[0]}")
     calls = len(fake.calls)
     expect(faults.ACTIONS["reset"].revert(ctx, step) == {"rc": 0, "stderr": ""}
            and len(fake.calls) == calls, "a reset's revert makes no Docker call")
@@ -13170,6 +13246,956 @@ def _reset_actions():
     expect(checks.wire_judgment(fault, "tcp") == "fault"
            and checks.wire_judgment(fault, "http") == "judged",
            "a reset's window is reported on TCP and judged on HTTP")
+
+
+class _PrlimitDocker:
+    """Records each `run_oneshot` call and answers with the next of `answers`; `inspect` answers
+    with `state`, which a test changes between calls."""
+
+    def __init__(self, answers, state):
+        self.calls = []
+        self.answers = list(answers)
+        self.state = state
+
+    def run_oneshot(self, args, timeout=None):
+        self.calls.append(list(args))
+        return self.answers.pop(0)
+
+    def inspect(self, container, timeout=None):
+        return {"State": dict(self.state)}
+
+    def __getattr__(self, name):
+        raise AssertionError(f"_PrlimitDocker.{name} called")
+
+
+def _prlimit_actions():
+    """A `prlimit` reads PID 1's open-files limit in the target's PID namespace with
+    SYS_RESOURCE, then sets the step's `nofile` as both limits; its revert sets what it found
+    back, or, when the process started again inside the window, sets nothing and says so; a read
+    that printed no limit fails the step and leaves nothing to restore; it affects TCP, HTTP,
+    file, and Kafka ingress on the ingress SUT, and egress, never UDP; and `timeline` reports a
+    start inside its window."""
+    running = {"Status": "running", "StartedAt": "2026-10-08T12:00:00Z"}
+    ok = docker.Result(0, "", "")
+    fake = _PrlimitDocker([docker.Result(0, "1024 524288\n", ""), ok, ok], running)
+    ctx = faults.Context(docker=fake, ids={"logit": "sut"}, netem_image="netem")
+    step = scenario.Step("c0s2", 1, 0, "prlimit", "logit", "", 130.0, 210.0, nofile=24)
+    head = ["--pid", "container:sut", "--cap-add", "SYS_RESOURCE", "--entrypoint",
+            "/usr/bin/prlimit", "netem", "--pid", "1"]
+    result = faults.ACTIONS["prlimit"].apply(ctx, step)
+    expect(fake.calls == [head + ["--nofile", "--raw", "--noheadings", "--output", "SOFT,HARD"],
+                          head + ["--nofile=24:24"]]
+           and result["rc"] == 0 and result["found"] == [1024, 524288]
+           and result["nofile"] == 24 and "--security-opt" not in fake.calls[0],
+           f"a prlimit reads PID 1's limit, then sets nofile soft and hard, got {fake.calls} "
+           f"{result}")
+    result = faults.ACTIONS["prlimit"].revert(ctx, step)
+    expect(fake.calls[-1] == head + ["--nofile=1024:524288"] and result["rc"] == 0
+           and result["restored"] is True and step.id not in ctx.state,
+           f"a prlimit's revert sets the limit it found back, got {fake.calls[-1]} {result}")
+
+    fake = _PrlimitDocker([docker.Result(0, "1024 unlimited\n", ""), ok], running)
+    ctx = faults.Context(docker=fake, ids={"logit": "sut"}, netem_image="netem")
+    faults.ACTIONS["prlimit"].apply(ctx, step)
+    fake.state = {"Status": "running", "StartedAt": "2026-10-08T12:03:00Z"}
+    calls = len(fake.calls)
+    result = faults.ACTIONS["prlimit"].revert(ctx, step)
+    expect(len(fake.calls) == calls and result["rc"] == 0 and result["restored"] is False
+           and result["started_in_window"] is True,
+           f"a process started inside the window has its own limit, so the revert sets "
+           f"nothing, got {result}")
+    for status in ("exited", "restarting"):
+        fake = _PrlimitDocker([docker.Result(0, "1024 524288\n", ""), ok], running)
+        ctx = faults.Context(docker=fake, ids={"logit": "sut"}, netem_image="netem")
+        faults.ACTIONS["prlimit"].apply(ctx, step)
+        fake.state = {"Status": status, "StartedAt": running["StartedAt"]}
+        calls = len(fake.calls)
+        result = faults.ACTIONS["prlimit"].revert(ctx, step)
+        expect(len(fake.calls) == calls and result["restored"] is False
+               and result.get("exited_in_window") is True and result["status"] == status
+               and "started_in_window" not in result,
+               f"a container that is {status} at the revert records exited_in_window and sets "
+               f"nothing, got {result}")
+    fake.state = running
+    ctx.state[step.id] = {"found": [1024, "unlimited"], "started_at": running["StartedAt"]}
+    fake.answers.append(ok)
+    faults.ACTIONS["prlimit"].revert(ctx, step)
+    expect(fake.calls[-1][-1] == "--nofile=1024:unlimited",
+           f"an unlimited hard limit is set back as found, got {fake.calls[-1]}")
+
+    for printed, rc in (("", 0), ("1024\n", 0), ("soft hard\n", 0), ("", 1),
+                          ("1024 524288\n", 1)):
+        fake = _PrlimitDocker([docker.Result(rc, printed, "")], running)
+        ctx = faults.Context(docker=fake, ids={"logit": "sut"}, netem_image="netem")
+        result = faults.ACTIONS["prlimit"].apply(ctx, step)
+        expect(result["rc"] != 0 and len(fake.calls) == 1 and step.id not in ctx.state
+               and faults.ACTIONS["prlimit"].revert(ctx, step)
+               == {"rc": 0, "stderr": "", "restored": False},
+               f"a read that printed {printed!r} with rc {rc} fails the step, sets nothing, "
+               f"and leaves nothing to restore, got {result}")
+
+    roles = {"logit": "sut", "generator": "generator", "victoria-metrics": "backend"}
+    action = faults.ACTIONS["prlimit"]
+    on_sut = scenario.Step("x", 0, 0, "prlimit", "logit", "", 0.0, 1.0, nofile=24)
+    expect(all(action.affects(wire, on_sut, roles) for wire in ("tcp", "http", "file", "kafka"))
+           and not action.affects("udp", on_sut, roles) and action.affects_egress(on_sut, roles),
+           "a prlimit on the SUT affects TCP, HTTP, file, and Kafka ingress and egress, never "
+           "UDP")
+    fault = checks.Fault(step="c0s2", action="prlimit", on="logit", start=0.0, end=1.0,
+                         affects_udp_ingress=False, affects_egress=True)
+    expect(checks.wire_judgment(fault, "tcp") == "judged"
+           and checks.wire_judgment(fault, "http") == "judged",
+           "a prlimit's window is judged on TCP and HTTP")
+    with tempfile.TemporaryDirectory() as tmp:
+        timeline = [_phase("start", 0, t0=T0),
+                    _action("apply", "c0s2", "prlimit", "logit", 130, nofile=24,
+                            found=[1024, 524288]),
+                    _action("revert", "c0s2", "prlimit", "logit", 210, restored=False,
+                            started_in_window=True)]
+        result = _status(_run_dir(tmp, "prlimit-restarted", timeline), checks.check_timeline)
+        expect(result.status == checks.PASS
+               and "c0s2 (prlimit on logit): the process started again inside the window"
+               in result.detail,
+               f"timeline reports a prlimit whose process started inside it, got {result}")
+        timeline[-1] = _action("revert", "c0s2", "prlimit", "logit", 210, restored=False,
+                               exited_in_window=True, status="exited")
+        result = _status(_run_dir(tmp, "prlimit-exited", timeline), checks.check_timeline)
+        expect(result.status == checks.PASS
+               and "c0s2 (prlimit on logit): the process exited inside the window (status "
+               "exited), so nothing was restored" in result.detail
+               and "started again" not in result.detail,
+               f"timeline reports a prlimit whose process exited inside it, got {result}")
+
+
+def _prlimit_rules(root):
+    """`load()`'s rules for a `prlimit` step: `nofile` required, a whole number in range, and
+    refused on any other action; a prlimit on the SUT only, and never in a [random] schedule;
+    and the shipped fd-limit scenarios' limits and expectations."""
+    path, raw = _base(root)
+
+    def with_step(**fields):
+        changed = copy.deepcopy(raw)
+        changed["step"] = [{"at": "0s", "action": "prlimit", "on": "logit", "for": "10s",
+                            **fields}]
+        return changed
+
+    try:
+        loaded = scenario.from_dict(with_step(nofile=64), path)
+        scenario.validate(loaded)
+        expanded = scenario.expand(loaded)
+        expect(loaded.steps[0].nofile == 64 and expanded[0].nofile == 64
+               and expanded[0].expected() == {"nofile": 64},
+               f"a prlimit's nofile reaches its step and its records, got {expanded[0]}")
+    except scenario.ScenarioError as err:
+        expect(False, f"a prlimit with nofile 64 loads, got {err.problems}")
+    _refused(path, with_step(), "prlimit needs `nofile`", "a prlimit with no nofile")
+    for nofile in (0, 7, 1048577, "64", 64.0, True):
+        _refused(path, with_step(nofile=nofile), "`nofile` must be a whole number from 8 to "
+                 "1048576", f"a prlimit's nofile {nofile!r}")
+    changed = copy.deepcopy(raw)
+    changed["step"][0]["nofile"] = 64
+    _refused(path, changed, "`nofile` is for prlimit only",
+             f"nofile on a {raw['step'][0]['action']}")
+    _refused(path, with_step(nofile=64, args="64"), "`args` is for netem only",
+             "args on a prlimit")
+    gen = with_step(nofile=64)
+    gen["step"][0]["on"] = "generator"
+    _refused(path, gen, "prlimit is for logit only", "a prlimit on the generator")
+    rand = copy.deepcopy(raw)
+    for key in ("cycle", "step", "expect"):
+        rand.pop(key, None)
+    rand["random"] = {"seed": 1, "gap": {"min": "60s", "max": "90s"},
+                      "fault": [{"weight": 1, "action": "prlimit", "on": "logit",
+                                 "for": {"min": "10s", "max": "20s"}}]}
+    _refused(path, rand, "prlimit takes `nofile`, which a [random] fault can't set",
+             "a prlimit in a [random] schedule")
+
+    for name, metric in (("fd-limit-tcp", "logit.input.accept.errors"),
+                         ("fd-limit-tail", "logit.input.scan.errors")):
+        shipped = scenario.load(root / "scenarios" / name / "scenario.toml")
+        limits = [one for one in scenario.expand(shipped) if one.action == "prlimit"]
+        rows = {exp.name: exp.to_json() for exp in shipped.expectations}
+        landed = rows.get("limit-landed", {})
+        expect(len(limits) == 1 and limits[0].on == "logit"
+               and landed.get("step") == limits[0].id and landed.get("window") == "during"
+               and landed.get("reduce") == "min"
+               and landed.get("min") == landed.get("max") == limits[0].nofile
+               and landed.get("metric") == "logit.process.fds.limit",
+               f"{name} limits the SUT once and expects logit.process.fds.limit to read the "
+               f"limit inside the window, got {limits} {landed}")
+        steps = {one.id: one for one in scenario.expand(shipped)}
+        failed = [exp for exp in rows.values() if exp.get("metric") == metric]
+        inside = [exp for exp in failed if limits and exp.get("step") == limits[0].id
+                  and exp.get("window") == "during" and exp.get("min") == 1]
+        # The drain straddling the revert carries what was counted before it, so the window
+        # that must read none is a mark starting a drain interval past the revert.
+        recovered = [exp for exp in failed if exp.get("max") == 0
+                     and exp.get("window") == "during"
+                     and steps.get(exp.get("step")) is not None
+                     and steps[exp["step"]].action == "mark" and limits
+                     and steps[exp["step"]].start >= limits[0].end + 5]
+        expect(len(inside) == 1 and len(recovered) == 1 and len(failed) == 2,
+               f"{name} expects {metric} above 0 inside the window and 0 from a drain "
+               f"interval past it, got {failed}")
+
+
+class _CgroupDocker:
+    """Records each `run_oneshot` call and answers with the next of `answers`; `inspect` answers
+    with the container's `Id` and `state`, which a test changes between calls."""
+
+    def __init__(self, answers, state, full="f" * 64):
+        self.calls = []
+        self.answers = list(answers)
+        self.state = state
+        self.full = full
+
+    def run_oneshot(self, args, timeout=None):
+        self.calls.append(list(args))
+        return self.answers.pop(0)
+
+    def inspect(self, container, timeout=None):
+        return {"Id": self.full, "State": dict(self.state)}
+
+    def __getattr__(self, name):
+        raise AssertionError(f"_CgroupDocker.{name} called")
+
+
+def _cgroup_actions():
+    """A `cgroup` finds the target's cgroup from the v2 line of its process's
+    `/proc/<pid>/cgroup`, reads the step's file there through a one-shot of the netem image with
+    the hierarchy bound read-write and `label=disable`, writes the step's value and reads it
+    back; its revert writes what it found back, or, when the process started again inside the
+    window, writes nothing and says so; a cgroup it can't find, a failed read, or a read-back
+    that differs fails the step; it affects every ingress wire on the ingress SUT and egress;
+    a drain gap inside its window isn't a hang; and `timeline` reports a start inside it."""
+    full = "f" * 64
+    scope = f"system.slice/docker-{full}.scope"
+    running = {"Status": "running", "StartedAt": "2026-10-08T12:00:00Z", "Pid": 4242}
+    ok = docker.Result
+
+    def context(tmp, answers, cgroup_line=f"0::/{scope}\n", state=running):
+        proc = Path(tmp) / "proc"
+        (proc / "4242").mkdir(parents=True, exist_ok=True)
+        if cgroup_line is not None:
+            (proc / "4242" / "cgroup").write_text(cgroup_line)
+        fake = _CgroupDocker(answers, state)
+        return fake, faults.Context(docker=fake, ids={"logit": "sut"}, netem_image="netem",
+                                    proc_root=str(proc))
+
+    def argv(path, *value):
+        return ["-v", "/sys/fs/cgroup:/cg:rw", "--security-opt", "label=disable",
+                "--entrypoint", "/bin/sh", "netem", "-c", faults.CGROUP_SCRIPT, "sh",
+                f"/cg/{scope}/{path}", *value]
+
+    def events(high, rc=0):
+        return ok(rc, f"low 0\nhigh {high}\nmax 0\noom 0\noom_kill 0\n" if rc == 0 else "",
+                  "No such file" if rc else "")
+
+    cpu = scenario.Step("c0s1", 0, 0, "cgroup", "logit", "", 60.0, 180.0, cpu=0.25)
+    memory = scenario.Step("c0s2", 1, 0, "cgroup", "logit", "", 60.0, 180.0,
+                           memory_high="256M")
+    action = faults.ACTIONS["cgroup"]
+    with tempfile.TemporaryDirectory() as tmp:
+        fake, ctx = context(tmp, [ok(0, "max 100000\n", ""), ok(0, "25000 100000\n", ""),
+                                  ok(0, "max 100000\n", "")])
+        result = action.apply(ctx, cpu)
+        expect(fake.calls == [argv("cpu.max"), argv("cpu.max", "25000 100000")]
+               and result["rc"] == 0 and result["found"] == "max 100000"
+               and result["value"] == "25000 100000" and result["file"] == "cpu.max",
+               f"a cgroup reads cpu.max in the SUT's scope, then writes the quota, unconfined, "
+               f"got {fake.calls} {result}")
+        result = action.revert(ctx, cpu)
+        expect(fake.calls[-1] == argv("cpu.max", "max 100000") and result["rc"] == 0
+               and result["restored"] is True and cpu.id not in ctx.state,
+               f"a cgroup's revert writes what it found back, got {fake.calls[-1]} {result}")
+        fake, ctx = context(tmp, [ok(0, "max\n", ""), events(3), ok(0, "268435456\n", "")])
+        result = action.apply(ctx, memory)
+        expect(fake.calls == [argv("memory.high"), argv("memory.events"),
+                              argv("memory.high", "268435456")]
+               and result["rc"] == 0 and result["high_events_before"] == 3,
+               f"a memory_high of 256M reads memory.events' high count, then writes 268435456 "
+               f"into memory.high, got {fake.calls} {result}")
+        fake.state = dict(running, StartedAt="2026-10-08T12:03:00Z")
+        calls = len(fake.calls)
+        result = action.revert(ctx, memory)
+        expect(len(fake.calls) == calls and result["rc"] == 0 and result["restored"] is False
+               and result["started_in_window"] is True,
+               f"a process started inside the window has a new scope, so the revert writes "
+               f"nothing, got {result}")
+        fake, ctx = context(tmp, [ok(0, "max\n", ""), events(3), ok(0, "268435456\n", "")])
+        action.apply(ctx, memory)
+        fake.state = {"Status": "exited", "StartedAt": running["StartedAt"], "Pid": 0}
+        calls = len(fake.calls)
+        result = action.revert(ctx, memory)
+        expect(len(fake.calls) == calls and result["rc"] == 0 and result["restored"] is False
+               and result["exited_in_window"] is True and "started_in_window" not in result,
+               f"a container that exited inside the window started nothing, so the revert "
+               f"records exited_in_window and writes nothing, got {result}")
+        fake, ctx = context(tmp, [ok(0, "max\n", ""), events(3), ok(0, "268435456\n", ""),
+                                  events(10), ok(0, "max\n", "")])
+        action.apply(ctx, memory)
+        result = action.revert(ctx, memory)
+        expect(fake.calls[-2:] == [argv("memory.events"), argv("memory.high", "max")]
+               and result["rc"] == 0 and result["restored"] is True
+               and result["high_events"] == 7,
+               f"a memory_high's revert counts the window's throttling from memory.events, then "
+               f"writes what it found back, got {fake.calls[-2:]} {result}")
+        fake, ctx = context(tmp, [ok(0, "max\n", ""), events(3), ok(0, "268435456\n", ""),
+                                  events(0, rc=1), ok(0, "max\n", "")])
+        action.apply(ctx, memory)
+        result = action.revert(ctx, memory)
+        expect(result["rc"] == 0 and result["restored"] is True and "high_events" not in result
+               and "memory.events: rc 1" in result.get("events_error", ""),
+               f"a revert that can't read memory.events still restores and says why, got "
+               f"{result}")
+        for answer, why in ((events(0, rc=1), "memory.events: rc 1"),
+                            (ok(0, "low 0\nmax 0\n", ""), "printed no high count")):
+            fake, ctx = context(tmp, [ok(0, "max\n", ""), answer])
+            result = action.apply(ctx, memory)
+            expect(result["rc"] == 1 and why in result["stderr"] and len(fake.calls) == 2
+                   and memory.id not in ctx.state,
+                   f"an apply that can't count memory.high's throttling writes nothing, got "
+                   f"{result}")
+        fake, ctx = context(tmp, [ok(0, "max\n", ""), events(3), ok(0, "268431360\n", ""),
+                                  ok(0, "max\n", "")])
+        result = action.apply(ctx, memory)
+        calls = len(fake.calls)
+        expect(result["rc"] == 1 and "read back '268431360'" in result["stderr"]
+               and fake.calls[-1] == argv("memory.high", "max") and memory.id not in ctx.state
+               and action.revert(ctx, memory) == {"rc": 0, "stderr": "", "restored": False}
+               and len(fake.calls) == calls,
+               f"a read-back that differs fails the step and writes what it found back at once, "
+               f"leaving the revert nothing to write, got {fake.calls[-1]} {result}")
+        fake, ctx = context(tmp, [ok(0, "max\n", ""), events(3), ok(1, "", "Permission denied")])
+        result = action.apply(ctx, memory)
+        calls = len(fake.calls)
+        expect(result["rc"] == 1 and "Permission denied" in result["stderr"]
+               and calls == 3 and memory.id not in ctx.state
+               and action.revert(ctx, memory) == {"rc": 0, "stderr": "", "restored": False}
+               and len(fake.calls) == calls,
+               f"a failed write fails the step and leaves the revert nothing to write, got "
+               f"{result}")
+        fake, ctx = context(tmp, [ok(0, "max 100000\n", ""), ok(0, "25000 100000\n", ""),
+                                  ok(0, "max 100000\n", "")])
+        real_oneshot = fake.run_oneshot
+
+        def restart_on_write(args, timeout=None):
+            answer = real_oneshot(args, timeout)
+            if len(fake.calls) == 2:
+                fake.state = dict(running, StartedAt="2026-10-08T12:00:05Z")
+            return answer
+
+        fake.run_oneshot = restart_on_write
+        result = action.apply(ctx, cpu)
+        calls = len(fake.calls)
+        expect(result["rc"] == 1 and result.get("started_during_apply") is True
+               and fake.calls[-1] == argv("cpu.max", "max 100000") and cpu.id not in ctx.state
+               and action.revert(ctx, cpu) == {"rc": 0, "stderr": "", "restored": False}
+               and len(fake.calls) == calls,
+               f"a process that started again during the apply gets what was found written "
+               f"back at once, and the step fails, got {fake.calls[-1]} {result}")
+        fake, ctx = context(tmp, [ok(0, "max 100000\n", ""), ok(0, "25000 100000\n", "")])
+        real_inspect, inspects = fake.inspect, []
+
+        def restart_after_check(container, timeout=None):
+            inspects.append(container)
+            if len(inspects) == 3:
+                fake.state = dict(running, StartedAt="2026-10-08T12:00:05Z")
+            return real_inspect(container, timeout)
+
+        fake.inspect = restart_after_check
+        result = action.apply(ctx, cpu)
+        calls = len(fake.calls)
+        reverted = action.revert(ctx, cpu)
+        expect(result["rc"] == 0 and len(inspects) == 3
+               and reverted.get("started_in_window") is True and len(fake.calls) == calls,
+               f"the apply takes the cgroup and the start time from one inspect and checks it "
+               f"once after the write, so a start after that check is the revert's to find, "
+               f"got {result} {reverted} after {len(inspects)} inspect(s)")
+        for line, why in ((None, "can't read"), ("0::/\n", "names no cgroup v2 path"),
+                          ("0::/system.slice/docker-0123.scope\n", "names no cgroup v2 path"),
+                          (f"1:name=systemd:/{scope}\n", "names no cgroup v2 path"),
+                          (f"0::/../{scope}\n", "names no cgroup v2 path")):
+            shutil.rmtree(Path(tmp) / "proc", ignore_errors=True)
+            fake, ctx = context(tmp, [], cgroup_line=line)
+            result = action.apply(ctx, cpu)
+            expect(result["rc"] == 1 and why in result["stderr"] and not fake.calls
+                   and cpu.id not in ctx.state
+                   and action.revert(ctx, cpu) == {"rc": 0, "stderr": "", "restored": False},
+                   f"a cgroup line {line!r} fails the step with no one-shot, got {result}")
+        fake, ctx = context(tmp, [], state={"Status": "exited", "Pid": 0})
+        result = action.apply(ctx, cpu)
+        expect(result["rc"] == 1 and "no running process" in result["stderr"]
+               and not fake.calls, f"a cgroup on a stopped container fails the step, got "
+               f"{result}")
+        for printed, rc in (("", 0), ("", 1)):
+            fake, ctx = context(tmp, [ok(rc, printed, "")])
+            result = action.apply(ctx, cpu)
+            expect(result["rc"] != 0 and len(fake.calls) == 1 and cpu.id not in ctx.state,
+                   f"a read that printed {printed!r} with rc {rc} fails the step and writes "
+                   f"nothing, got {result}")
+
+    roles = {"logit": "sut", "generator": "generator", "victoria-metrics": "backend"}
+    on_sut = scenario.Step("x", 0, 0, "cgroup", "logit", "", 0.0, 1.0, cpu=0.25)
+    expect(all(action.affects(wire, on_sut, roles)
+               for wire in ("udp", "tcp", "http", "file", "kafka"))
+           and action.affects_egress(on_sut, roles),
+           "a cgroup on the SUT affects every ingress wire and egress, as a pause does")
+    fault = checks.Fault(step="c0s1", action="cgroup", on="logit", start=0.0, end=1.0,
+                         affects_udp_ingress=True, affects_egress=True)
+    expect(checks.wire_judgment(fault, "udp") == "fault"
+           and checks.wire_judgment(fault, "tcp") == "judged"
+           and checks.wire_judgment(fault, "http") == "judged",
+           "a cgroup's window is reported on UDP and judged on TCP and HTTP")
+    with tempfile.TemporaryDirectory() as tmp:
+        timeline = [_phase("start", 0, t0=T0),
+                    _action("apply", "c0s1", "cgroup", "logit", 60, cpu=0.25),
+                    _action("revert", "c0s1", "cgroup", "logit", 180, restored=False,
+                            started_in_window=True),
+                    _phase("end_begin", 400), _phase("end_end", 450)]
+        result = _status(_run_dir(tmp, "cgroup-restarted", timeline), checks.check_timeline)
+        expect(result.status == checks.PASS
+               and "c0s1 (cgroup on logit): the process started again inside the window"
+               in result.detail,
+               f"timeline reports a cgroup whose process started inside it, got {result}")
+        exited = timeline[:2] + [_action("revert", "c0s1", "cgroup", "logit", 180,
+                                         restored=False, exited_in_window=True,
+                                         status="exited")] + timeline[3:]
+        result = _status(_run_dir(tmp, "cgroup-exited", exited), checks.check_timeline)
+        expect("c0s1 (cgroup on logit): the process exited inside the window (status exited), "
+               "so nothing was restored" in result.detail and "started again" not in result.detail,
+               f"timeline reports a cgroup whose process exited inside it, got {result}")
+        counted = timeline[:2] + [_action("revert", "c0s1", "cgroup", "logit", 180,
+                                          restored=True, high_events=1234)] + timeline[3:]
+        result = _status(_run_dir(tmp, "cgroup-engaged", counted), checks.check_timeline)
+        expect(result.status == checks.PASS
+               and "c0s1 (cgroup on logit): memory.high engaged 1,234 time(s)" in result.detail,
+               f"timeline reports how often a memory.high throttled, got {result}")
+        unread = timeline[:2] + [_action("revert", "c0s1", "cgroup", "logit", 180,
+                                         restored=True, events_error="memory.events: rc 1")
+                                 ] + timeline[3:]
+        result = _status(_run_dir(tmp, "cgroup-unread", unread), checks.check_timeline)
+        expect(result.status == checks.FAIL and "can't count memory.high's throttling"
+               in result.detail,
+               f"timeline FAILs a memory.high revert that couldn't read memory.events, got "
+               f"{result}")
+        for want, count, status in ((True, 0, checks.FAIL), (True, 3, checks.PASS),
+                                    (False, 3, checks.FAIL), (False, 0, checks.PASS)):
+            judged = timeline[:2] + [_action("revert", "c0s1", "cgroup", "logit", 180,
+                                             restored=True, high_events=count, engaged=want)
+                                     ] + timeline[3:]
+            result = _status(_run_dir(tmp, f"cgroup-engaged-{want}-{count}", judged),
+                             checks.check_timeline)
+            expect(result.status == status
+                   and (status == checks.PASS or "and the step expects it" in result.detail),
+                   f"timeline judges engaged = {want} against a count of {count} as {status}, "
+                   f"got {result}")
+        quiet = [line for line in _sut_stdout(400)
+                 if not 70 < (telemetry.parse_rfc3339(json.loads(line)["timestamp"]) - T0) < 100]
+        result = _status(_run_dir(tmp, "cgroup-gap", timeline, quiet), checks.check_progress)
+        expect(not any("went quiet" in line for line in result.lines),
+               f"progress doesn't flag a drain gap inside a cgroup, got {result}")
+        result = _status(_run_dir(tmp, "cgroup-gap-outside", timeline[:1] + timeline[3:],
+                                  quiet), checks.check_progress)
+        expect(any("went quiet" in line for line in result.lines),
+               f"progress flags the same gap with no cgroup, got {result}")
+
+
+def _cgroup_rules(root):
+    """`load()`'s rules for a `cgroup` step: one of `cpu` or `memory_high`, each in range, and
+    neither on any other action; a cgroup on the SUT only, and never in a [random] schedule;
+    and the shipped cpu-quota and memory-high scenarios' steps and expectations."""
+    path, raw = _base(root)
+
+    def with_step(**fields):
+        changed = copy.deepcopy(raw)
+        changed["step"] = [{"at": "0s", "action": "cgroup", "on": "logit", "for": "10s",
+                            **fields}]
+        return changed
+
+    for fields, want in (({"cpu": 0.25}, {"cpu": 0.25}), ({"cpu": 2}, {"cpu": 2}),
+                         ({"memory_high": "256M"}, {"memory_high": "256M"})):
+        try:
+            loaded = scenario.from_dict(with_step(**fields), path)
+            scenario.validate(loaded)
+            expanded = scenario.expand(loaded)
+            expect(expanded[0].expected() == want,
+                   f"a cgroup's {fields} reaches its step and its records, got {expanded[0]}")
+        except scenario.ScenarioError as err:
+            expect(False, f"a cgroup with {fields} loads, got {err.problems}")
+    expect(scenario.memory_bytes("16M") == 16 * 1024 ** 2
+           and scenario.memory_bytes("2G") == 2 * 1024 ** 3
+           and scenario.memory_bytes("512K") == 512 * 1024
+           and scenario.memory_bytes("256") is None and scenario.memory_bytes(256) is None,
+           "memory_bytes reads K, M, and G as powers of 1024 and nothing else")
+    _refused(path, with_step(), "cgroup needs one of `cpu`, `memory_high`, or `io_wbps` and "
+             "`io_wiops`, got none", "a cgroup with no key")
+    _refused(path, with_step(cpu=0.5, memory_high="256M"),
+             "cgroup needs one of `cpu`, `memory_high`, or `io_wbps` and `io_wiops`, got `cpu`, "
+             "`memory_high`", "a cgroup with both keys")
+    for cpu in (0, 0.009, 1025, "0.5", True, -1):
+        _refused(path, with_step(cpu=cpu), "`cpu` must be a number of CPUs from 0.01 to 1024",
+                 f"a cgroup's cpu {cpu!r}")
+    for size in ("256", "256MB", "0M", "15M", "16383K", "1025G", 268435456, "256m", "01M"):
+        _refused(path, with_step(memory_high=size), "`memory_high` must be a whole number with "
+                 "a K, M, or G suffix", f"a cgroup's memory_high {size!r}")
+    _refused(path, with_step(memory_high="16385K"), "`memory_high` must be a whole number of "
+             "4 KiB pages", "a memory_high of 16385K")
+    try:
+        loaded = scenario.from_dict(with_step(memory_high="16388K", engaged=True), path)
+        scenario.validate(loaded)
+        expect(scenario.expand(loaded)[0].expected() == {"memory_high": "16388K",
+                                                         "engaged": True},
+               "a memory_high of whole pages and its engaged reach the step's records")
+    except scenario.ScenarioError as err:
+        expect(False, f"a memory_high of 16388K with engaged loads, got {err.problems}")
+    _refused(path, with_step(cpu=0.5, engaged=True), "`engaged` is for a cgroup step with "
+             "`memory_high`, `io_wbps`, or `io_wiops` only", "engaged on a cpu step")
+    _refused(path, with_step(memory_high="64M", engaged="yes"), "`engaged` must be true or "
+             "false", "an engaged that isn't a bool")
+    for key, value in (("cpu", 0.5), ("memory_high", "256M"), ("engaged", True)):
+        changed = copy.deepcopy(raw)
+        changed["step"][0][key] = value
+        _refused(path, changed, "`engaged` is for a cgroup step with `memory_high`, `io_wbps`, or `io_wiops` only"
+                 if key == "engaged" else f"`{key}` is for cgroup only",
+                 f"{key} on a {raw['step'][0]['action']}")
+    _refused(path, with_step(cpu=0.5, args="50"), "`args` is for netem only", "args on a cgroup")
+    gen = with_step(cpu=0.5)
+    gen["step"][0]["on"] = "generator"
+    _refused(path, gen, "cgroup is for logit only", "a cgroup on the generator")
+    rand = copy.deepcopy(raw)
+    for key in ("cycle", "step", "expect"):
+        rand.pop(key, None)
+    rand["random"] = {"seed": 1, "gap": {"min": "60s", "max": "90s"},
+                      "fault": [{"weight": 1, "action": "cgroup", "on": "logit",
+                                 "for": {"min": "10s", "max": "20s"}}]}
+    _refused(path, rand, "cgroup takes `cpu`, `memory_high`, or an io limit, which a [random] "
+             "fault can't set", "a cgroup in a [random] schedule")
+
+    shipped = scenario.load(root / "scenarios" / "cpu-quota" / "scenario.toml")
+    limits = [one for one in scenario.expand(shipped) if one.action == "cgroup"]
+    rows = {exp.name: exp.to_json() for exp in shipped.expectations}
+    on_quota = {name: row for name, row in rows.items()
+                if limits and row.get("step") == limits[0].id and row.get("window") == "during"}
+    expect(len(limits) == 1 and limits[0].on == "logit" and limits[0].cpu is not None
+           and limits[0].cpu <= 0.25 and limits[0].end - limits[0].start >= 120
+           and any(row.get("metric") == "logit.input.kernel.dropped"
+                   and row.get("min", 0) >= 1 for row in on_quota.values()),
+           f"cpu-quota holds the SUT at a quarter of a CPU or less for 120 s and expects "
+           f"counted drops inside it, got {limits} {on_quota}")
+    shipped = scenario.load(root / "scenarios" / "memory-high" / "scenario.toml")
+    limits = [one for one in scenario.expand(shipped) if one.action == "cgroup"]
+    rows = [exp.to_json() for exp in shipped.expectations]
+    expect(len(limits) == 1 and limits[0].on == "logit" and limits[0].memory_high is not None
+           and limits[0].engaged is False
+           and any(row.get("metric") == "logit.process.memory.resident.bytes"
+                   and row.get("reduce") == "max" and row.get("max") is not None
+                   and row.get("step") == limits[0].id for row in rows),
+           f"memory-high throttles the SUT's memory once and bounds its resident memory, got "
+           f"{limits} {rows}")
+    shipped = scenario.load(root / "scenarios" / "memory-high-pressure" / "scenario.toml")
+    limits = [one for one in scenario.expand(shipped) if one.action == "cgroup"]
+    stops = [one for one in scenario.expand(shipped) if one.action == "stop"]
+    expect(len(limits) == 1 and limits[0].on == "logit" and len(stops) == 1
+           and 30 * 1024 ** 2 < (scenario.memory_bytes(limits[0].memory_high) or 0)
+           < 42 * 1024 ** 2
+           and limits[0].start < stops[0].start and stops[0].end < limits[0].end
+           and limits[0].engaged is True,
+           f"memory-high-pressure throttles the SUT between its steady memory and its outage "
+           f"peak, around the outage, got {limits} {stops}")
+
+
+def _io_tree(tmp, container, host):
+    """A fake `/proc` and `/sys` under `tmp`: process 4242's `mountinfo` (`container`) and
+    `cgroup`, the host's `/proc/1/mountinfo` (`host`), and `/sys/dev/block` links for the disk
+    8:0 with its partition 8:1 and for the unpartitioned 253:0."""
+    root = Path(tmp)
+    shutil.rmtree(root / "proc", ignore_errors=True)
+    shutil.rmtree(root / "sys", ignore_errors=True)
+    proc = root / "proc"
+    (proc / "4242").mkdir(parents=True)
+    (proc / "1").mkdir(parents=True)
+    (proc / "4242" / "cgroup").write_text(f"0::/system.slice/docker-{'f' * 64}.scope\n")
+    (proc / "4242" / "mountinfo").write_text(container)
+    (proc / "1" / "mountinfo").write_text(host)
+    sda = root / "sys" / "devices" / "pci0" / "sda"
+    (sda / "sda1").mkdir(parents=True)
+    (sda / "dev").write_text("8:0\n")
+    (sda / "sda1" / "dev").write_text("8:1\n")
+    (sda / "sda1" / "partition").write_text("1\n")
+    dm = root / "sys" / "devices" / "virtual" / "dm-0"
+    dm.mkdir(parents=True)
+    (dm / "dev").write_text("253:0\n")
+    block = root / "sys" / "dev" / "block"
+    block.mkdir(parents=True)
+    (block / "8:0").symlink_to("../../devices/pci0/sda")
+    (block / "8:1").symlink_to("../../devices/pci0/sda/sda1")
+    (block / "253:0").symlink_to("../../devices/virtual/dm-0")
+    return str(proc), str(root / "sys")
+
+
+_IO_OVERLAY = ("1798 1644 0:104 / / rw,relatime - overlay overlay rw,lowerdir=/l1:/l2,"
+               "upperdir=/var/lib/docker/snap/41201/fs,workdir=/var/lib/docker/snap/41201/work\n"
+               "1799 1798 0:135 / /proc rw - proc proc rw\n"
+               "1800 1798 8:1 /var/lib/docker/volumes/v/_data /spool rw - ext4 /dev/sda1 rw\n"
+               "1801 1798 253:0 /x /data\\040dir rw - ext4 /dev/dm-0 rw\n"
+               "1802 1798 0:150 / /tmp/ram rw - tmpfs tmpfs rw\n")
+_IO_HOST_EXT4 = ("22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n"
+                 "23 22 0:21 / /proc rw shared:2 - proc proc rw\n")
+_IO_HOST_BTRFS = ("48 1 0:38 /root / rw,relatime shared:1 - btrfs /dev/dm-1 rw,subvol=/root\n"
+                  "49 48 0:38 /docker /var/lib/docker rw shared:9 - btrfs /dev/dm-1 rw\n")
+
+
+def _cgroup_io_device():
+    """`io_device` finds the disk behind a path in the SUT: the mount holding it by whole
+    components, an overlay's upperdir through the host's mounts, octal escapes decoded, a
+    partition's whole disk through `/sys/dev/block`, an unpartitioned device as it is; and
+    fails with no block device behind an anonymous device, a missing `/sys` entry, an overlay
+    with no upperdir, or a mountinfo it can't read."""
+    with tempfile.TemporaryDirectory() as tmp:
+        proc, sys_root = _io_tree(tmp, _IO_OVERLAY, _IO_HOST_EXT4)
+        ctx = faults.Context(docker=None, ids={}, netem_image="netem", proc_root=proc,
+                             sys_root=sys_root)
+        device, detail, why = faults.io_device(ctx, 4242, "/tmp/soak-spool")
+        expect(device == "8:0" and why is None and detail.get("partition") == "8:1"
+               and detail.get("fstype") == "overlay" and detail.get("upper_mount") == "/"
+               and detail.get("upper") == "/var/lib/docker/snap/41201/fs",
+               f"an overlay root's spool resolves through its upperdir's host mount, a "
+               f"partition, to the whole disk 8:0, got {device} {detail} {why}")
+        device, detail, why = faults.io_device(ctx, 4242, "/spool/segments")
+        expect(device == "8:0" and detail.get("mount") == "/spool"
+               and detail.get("partition") == "8:1" and "upper" not in detail,
+               f"a volume's own device resolves with no overlay step, got {device} {detail}")
+        device, detail, why = faults.io_device(ctx, 4242, "/spoolx/a")
+        expect(device == "8:0" and detail.get("mount") == "/",
+               f"a mount point matches whole components only, got {device} {detail}")
+        device, detail, why = faults.io_device(ctx, 4242, "/data dir/spool")
+        expect(device == "253:0" and "partition" not in detail and why is None,
+               f"an escaped mount point is decoded and an unpartitioned device is kept, got "
+               f"{device} {detail} {why}")
+        device, detail, why = faults.io_device(ctx, 4242, "/tmp/ram/spool")
+        expect(device is None and "no block device backs /tmp/ram/spool" in why
+               and "tmpfs" in why and "0:150" in why,
+               f"a tmpfs has no block device, got {device} {why}")
+        proc, sys_root = _io_tree(tmp, _IO_OVERLAY, _IO_HOST_BTRFS)
+        ctx = faults.Context(docker=None, ids={}, netem_image="netem", proc_root=proc,
+                             sys_root=sys_root)
+        device, detail, why = faults.io_device(ctx, 4242, "/tmp/soak-spool")
+        expect(device is None and "no block device backs /tmp/soak-spool" in why
+               and "btrfs" in why and "0:38" in why
+               and detail.get("upper_mount") == "/var/lib/docker",
+               f"an overlay over btrfs has only an anonymous device, got {device} {detail} "
+               f"{why}")
+        proc, sys_root = _io_tree(tmp, _IO_OVERLAY.replace("8:1 /var", "8:7 /var"),
+                                  _IO_HOST_EXT4)
+        ctx = faults.Context(docker=None, ids={}, netem_image="netem", proc_root=proc,
+                             sys_root=sys_root)
+        device, detail, why = faults.io_device(ctx, 4242, "/spool")
+        expect(device is None and "no block device backs /spool" in why and "8:7" in why,
+               f"a device with no /sys/dev/block entry fails, got {device} {why}")
+        proc, sys_root = _io_tree(tmp, _IO_OVERLAY.replace("upperdir=", "upper="),
+                                  _IO_HOST_EXT4)
+        ctx = faults.Context(docker=None, ids={}, netem_image="netem", proc_root=proc,
+                             sys_root=sys_root)
+        device, detail, why = faults.io_device(ctx, 4242, "/tmp/soak-spool")
+        expect(device is None and "overlay has no upperdir" in why,
+               f"an overlay with no upperdir fails, got {device} {why}")
+        device, detail, why = faults.io_device(ctx, 9999, "/tmp")
+        expect(device is None and "can't read" in why and "9999/mountinfo" in why,
+               f"an unreadable mountinfo fails, got {device} {why}")
+    expect(faults.io_max_values("8:0 rbps=max wbps=1048576 riops=max wiops=40\n"
+                                "253:0 rbps=max wbps=max riops=7 wiops=max\n", "8:0")
+           == {"rbps": "max", "wbps": "1048576", "riops": "max", "wiops": "40"}
+           and faults.io_max_values("253:0 riops=7\n", "8:0")["wbps"] == "max"
+           and faults.io_max_values("", "8:0")["wiops"] == "max",
+           "io_max_values reads the device's line, and every key at max with none")
+    expect(faults.io_max_line("8:0", {"wbps": "4096", "wiops": "10"}) == "8:0 wbps=4096 wiops=10"
+           and faults.io_max_line("8:0", {"wiops": "max"}) == "8:0 wiops=max",
+           "io_max_line puts the keys it sets on the device, in io.max's order")
+
+
+def _cgroup_io_actions():
+    """An io `cgroup` step resolves the device, reads `io.max`'s line for it (`found`, `max`
+    with none), `io.stat`'s `wbytes` and `wios` (0 with no line) and `io.pressure`'s `some`
+    total, then writes the limit on that device and compares the read-back's keys; its revert
+    reads the counts again, records the window's differences and length, and writes each
+    limited key's found value back. A device it can't resolve, a failed or unparsable count, or
+    a read-back that differs fails the step; a revert that can't read the counts still
+    restores; one after a start inside the window reads nothing."""
+    full = "f" * 64
+    scope = f"system.slice/docker-{full}.scope"
+    running = {"Status": "running", "StartedAt": "2026-10-08T12:00:00Z", "Pid": 4242}
+    ok = docker.Result
+
+    def argv(path, *value):
+        return ["-v", "/sys/fs/cgroup:/cg:rw", "--security-opt", "label=disable",
+                "--entrypoint", "/bin/sh", "netem", "-c", faults.CGROUP_SCRIPT, "sh",
+                f"/cg/{scope}/{path}", *value]
+
+    def stat(wbytes, wios, device="8:0"):
+        return ok(0, f"253:0 rbytes=9 wbytes=9 rios=9 wios=9 dbytes=0 dios=0\n{device} "
+                     f"rbytes=1 wbytes={wbytes} rios=1 wios={wios} dbytes=0 dios=0\n", "")
+
+    def pressure(total):
+        return ok(0, f"some avg10=0.00 avg60=0.00 avg300=0.00 total={total}\n"
+                     "full avg10=0.00 avg60=0.00 avg300=0.00 total=7\n", "")
+
+    class Clock:
+        def __init__(self):
+            self.now = 1000.0
+
+        def __call__(self):
+            return self.now
+
+    wbps = scenario.Step("c0s1", 0, 0, "cgroup", "logit", "", 60.0, 180.0, io_wbps="1M",
+                         io_path="/tmp/soak-spool")
+    both = scenario.Step("c0s2", 1, 0, "cgroup", "logit", "", 60.0, 180.0, io_wbps=4096,
+                         io_wiops=100, io_path="/tmp/soak-spool")
+    action = faults.ACTIONS["cgroup"]
+    with tempfile.TemporaryDirectory() as tmp:
+        def context(answers, host=_IO_HOST_EXT4, state=running):
+            proc, sys_root = _io_tree(tmp, _IO_OVERLAY, host)
+            fake = _CgroupDocker(answers, state)
+            clock = Clock()
+            return fake, clock, faults.Context(docker=fake, ids={"logit": "sut"},
+                                               netem_image="netem", proc_root=proc,
+                                               sys_root=sys_root, clock=clock)
+
+        written = ok(0, "8:0 rbps=max wbps=1048576 riops=max wiops=max\n", "")
+        fake, clock, ctx = context([ok(0, "", ""), stat(100, 10), pressure(500), written,
+                                    stat(5000100, 1010), pressure(6000500), ok(0, "", "")])
+        result = action.apply(ctx, wbps)
+        expect(fake.calls == [argv("io.max"), argv("io.stat"), argv("io.pressure"),
+                              argv("io.max", "8:0 wbps=1048576")]
+               and result["rc"] == 0 and result["found"] == "max" and result["device"] == "8:0"
+               and result["value"] == "8:0 wbps=1048576" and result["file"] == "io.max"
+               and result["io_before"] == {"wbytes": 100, "wios": 10, "stall_us": 500}
+               and result["io_device"].get("partition") == "8:1",
+               f"an io_wbps of 1M reads io.max, io.stat, and io.pressure, then writes "
+               f"'8:0 wbps=1048576' on the spool's disk, got {fake.calls} {result}")
+        clock.now += 120.5
+        result = action.revert(ctx, wbps)
+        expect(fake.calls[-3:] == [argv("io.stat"), argv("io.pressure"),
+                                   argv("io.max", "8:0 wbps=max")]
+               and result["rc"] == 0 and result["restored"] is True
+               and result["io_wbytes"] == 5000000 and result["io_wios"] == 1000
+               and result["io_stall_us"] == 6000000 and result["io_window_s"] == 120.5
+               and result["device"] == "8:0" and wbps.id not in ctx.state,
+               f"the revert records the window's writes, stall, and length, then writes "
+               f"wbps=max, which the kernel reads back as no line, got {fake.calls[-3:]} "
+               f"{result}")
+        limited = ok(0, "8:0 rbps=max wbps=2097152 riops=max wiops=500\n", "")
+        fake, clock, ctx = context([limited, ok(0, "", ""), pressure(0),
+                                    ok(0, "8:0 rbps=max wbps=4096 riops=max wiops=100\n", ""),
+                                    stat(8192, 2), pressure(10), limited])
+        result = action.apply(ctx, both)
+        expect(result["rc"] == 0 and fake.calls[-1] == argv("io.max", "8:0 wbps=4096 wiops=100")
+               and result["found"] == "8:0 rbps=max wbps=2097152 riops=max wiops=500"
+               and result["io_before"] == {"wbytes": 0, "wios": 0, "stall_us": 0},
+               f"io_wbps and io_wiops go on one line, io.stat with no line for the device reads "
+               f"0, and found is the device's line, got {fake.calls[-1]} {result}")
+        result = action.revert(ctx, both)
+        expect(fake.calls[-1] == argv("io.max", "8:0 wbps=2097152 wiops=500")
+               and result["rc"] == 0 and result["io_wbytes"] == 8192 and result["io_wios"] == 2,
+               f"the revert writes each limited key's found value back, got {fake.calls[-1]} "
+               f"{result}")
+        ignored = ok(0, "8:0 rbps=max wbps=max riops=max wiops=max\n", "")
+        fake, clock, ctx = context([ok(0, "", ""), stat(0, 0), pressure(0), ignored,
+                                    ok(0, "", "")])
+        result = action.apply(ctx, wbps)
+        expect(result["rc"] == 1 and "read back" in result["stderr"]
+               and fake.calls[-1] == argv("io.max", "8:0 wbps=max") and wbps.id not in ctx.state,
+               f"a read-back without the limit fails the step and writes found back, got "
+               f"{fake.calls[-1]} {result}")
+        for answers, why in (([ok(0, "", ""), ok(1, "", "No such file")], "io.stat: rc 1"),
+                             ([ok(0, "", ""), stat(0, 0), ok(0, "full total=3\n", "")],
+                              "printed no some total"),
+                             ([ok(0, "", ""), stat(0, 0), ok(1, "", "denied")],
+                              "io.pressure: rc 1"),
+                             ([ok(0, "", ""), ok(0, "8:0 wbytes=x wios=1\n", "")],
+                              "printed wbytes='x'")):
+            fake, clock, ctx = context(answers)
+            result = action.apply(ctx, wbps)
+            expect(result["rc"] == 1 and why in result["stderr"]
+                   and not any(len(call) > len(argv("io.max")) for call in fake.calls)
+                   and wbps.id not in ctx.state,
+                   f"an apply that can't read the counts ({why}) writes nothing, got {result}")
+        fake, clock, ctx = context([], host=_IO_HOST_BTRFS)
+        result = action.apply(ctx, wbps)
+        expect(result["rc"] == 1 and "no block device backs /tmp/soak-spool" in result["stderr"]
+               and not fake.calls and wbps.id not in ctx.state
+               and result["io_device"].get("upper_mount") == "/var/lib/docker",
+               f"a spool on btrfs fails the step with no one-shot, got {result}")
+        fake, clock, ctx = context([ok(0, "", ""), stat(0, 0), pressure(0), written,
+                                    ok(1, "", "gone"), ok(0, "", "")])
+        action.apply(ctx, wbps)
+        result = action.revert(ctx, wbps)
+        expect(result["rc"] == 0 and result["restored"] is True and "io_stall_us" not in result
+               and "io.stat: rc 1" in result.get("io_error", "")
+               and fake.calls[-1] == argv("io.max", "8:0 wbps=max"),
+               f"a revert that can't read the counts still restores and says why, got {result}")
+        fake, clock, ctx = context([ok(0, "", ""), stat(0, 0), pressure(0), written])
+        action.apply(ctx, wbps)
+        fake.state = dict(running, StartedAt="2026-10-08T12:03:00Z")
+        calls = len(fake.calls)
+        result = action.revert(ctx, wbps)
+        expect(len(fake.calls) == calls and result.get("started_in_window") is True
+               and "io_error" not in result,
+               f"a start inside the window reads and writes nothing at the revert, got {result}")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        timeline = [_phase("start", 0, t0=T0),
+                    _action("apply", "c0s1", "cgroup", "logit", 60, io_wbps="1M"),
+                    _action("revert", "c0s1", "cgroup", "logit", 180, restored=True,
+                            io_wbps="1M", device="8:0", io_wbytes=5000000, io_wios=1000,
+                            io_stall_us=6000000, io_window_s=120.0),
+                    _phase("end_begin", 400), _phase("end_end", 450)]
+        result = _status(_run_dir(tmp, "io-reported", timeline), checks.check_timeline)
+        expect(result.status == checks.PASS
+               and "c0s1 (cgroup on logit): io.max on 8:0 over 120.0s: 5,000,000 byte(s) in "
+                   "1,000 write(s), 41,667 B/s and 8.3 writes/s against a limit of 1,048,576 "
+                   "B/s; io.pressure stalled 6.0s (5.0% of the window)" in result.detail,
+               f"timeline reports an io step's writes, rate, limit, and stall, got {result}")
+        unread = timeline[:2] + [_action("revert", "c0s1", "cgroup", "logit", 180,
+                                         restored=True, io_error="io.stat: rc 1")] + timeline[3:]
+        result = _status(_run_dir(tmp, "io-unread", unread), checks.check_timeline)
+        expect(result.status == checks.FAIL
+               and "can't read io.max's writes and stalls: io.stat: rc 1" in result.detail,
+               f"timeline FAILs an io revert that couldn't read its counts, got {result}")
+        for want, stall_us, status in ((True, 1190000, checks.FAIL),
+                                       (True, 1200000, checks.PASS),
+                                       (False, 1200000, checks.FAIL),
+                                       (False, 1190000, checks.PASS)):
+            judged = timeline[:2] + [_action("revert", "c0s1", "cgroup", "logit", 180,
+                                             restored=True, io_wiops=50, device="8:0",
+                                             io_wbytes=0, io_wios=0, io_stall_us=stall_us,
+                                             io_window_s=120.0, engaged=want)] + timeline[3:]
+            result = _status(_run_dir(tmp, f"io-engaged-{want}-{stall_us}", judged),
+                             checks.check_timeline)
+            expect(result.status == status
+                   and any("against a limit of 50 writes/s" in line for line in result.lines)
+                   and (status == checks.PASS or "and the step expects the limit" in result.detail),
+                   f"timeline judges engaged = {want} against {stall_us} us stalled in 120 s as "
+                   f"{status}, got {result}")
+        zero = timeline[:2] + [_action("revert", "c0s1", "cgroup", "logit", 180, restored=True,
+                                       io_wbps="1M", device="8:0", io_wbytes=0, io_wios=0,
+                                       io_stall_us=0, io_window_s=0, engaged=True)
+                               ] + timeline[3:]
+        result = _status(_run_dir(tmp, "io-zero-window", zero), checks.check_timeline)
+        expect(result.status == checks.FAIL,
+               f"a window of no length never reads as engaged, got {result}")
+
+
+def _cgroup_io_rules(root):
+    """`load()`'s rules for an io `cgroup` step: `io_wbps`, `io_wiops`, or both as one limit,
+    each in range, with an absolute `io_path`; neither with another limit nor on another action,
+    nor `io_path` without them; `engaged` allowed; a stop or kill of the SUT may start inside a
+    cgroup step, after its start, and nothing else may; and the shipped slow-spool scenario."""
+    path, raw = _base(root)
+
+    def with_step(**fields):
+        changed = copy.deepcopy(raw)
+        changed["step"] = [{"at": "0s", "action": "cgroup", "on": "logit", "for": "10s",
+                            **fields}]
+        return changed
+
+    spool = {"io_path": "/tmp/soak-spool"}
+    for fields in ({"io_wbps": "1M"}, {"io_wbps": 4096}, {"io_wbps": "4K"},
+                   {"io_wbps": "1024G"}, {"io_wiops": 1}, {"io_wiops": 1000000},
+                   {"io_wbps": "256K", "io_wiops": 50}, {"io_wbps": "1M", "engaged": False}):
+        try:
+            loaded = scenario.from_dict(with_step(**fields, **spool), path)
+            scenario.validate(loaded)
+            expect(scenario.expand(loaded)[0].expected() == {**fields, **spool},
+                   f"an io cgroup's {fields} reaches its step and its records")
+        except scenario.ScenarioError as err:
+            expect(False, f"an io cgroup with {fields} loads, got {err.problems}")
+    expect(scenario.io_bytes("1M") == 1024 ** 2 and scenario.io_bytes("4K") == 4096
+           and scenario.io_bytes("2G") == 2 * 1024 ** 3 and scenario.io_bytes("512") == 512
+           and scenario.io_bytes(4096) == 4096
+           and all(scenario.io_bytes(bad) is None
+                   for bad in ("1m", "1MB", "0", "01K", "1.5M", "", 0, -1, True, 1.5)),
+           "io_bytes reads a whole number, bare or with K, M, or G as powers of 1024")
+    for wbps in ("2K", 4095, "1025G", "1MB", True, -1, "0", 1.5):
+        _refused(path, with_step(io_wbps=wbps, **spool), "`io_wbps` must be a whole number of "
+                 "bytes a second", f"an io_wbps {wbps!r}")
+    for wiops in (0, 1000001, 1.5, True, "100"):
+        _refused(path, with_step(io_wiops=wiops, **spool), "`io_wiops` must be a whole number "
+                 "of writes a second from 1 to 1,000,000", f"an io_wiops {wiops!r}")
+    _refused(path, with_step(io_wbps="1M"), "an io limit needs `io_path`", "an io_wbps with no "
+             "io_path")
+    for where in ("tmp/soak-spool", "/tmp/../etc", "/tmp/soak spool", 5, "/tmp/\tx"):
+        _refused(path, with_step(io_wbps="1M", io_path=where), "`io_path` must be an absolute "
+                 "path", f"an io_path {where!r}")
+    _refused(path, with_step(cpu=0.5, **spool), "`io_path` is for a cgroup step with `io_wbps` "
+             "or `io_wiops` only", "an io_path on a cpu step")
+    _refused(path, with_step(cpu=0.5, io_wbps="1M", **spool), "cgroup needs one of `cpu`, "
+             "`memory_high`, or `io_wbps` and `io_wiops`, got `cpu`, `io_wbps`",
+             "a cpu and an io_wbps")
+    _refused(path, with_step(memory_high="64M", io_wiops=5, **spool), "cgroup needs one of",
+             "a memory_high and an io_wiops")
+    for key, value in (("io_wbps", "1M"), ("io_wiops", 5), ("io_path", "/tmp")):
+        changed = copy.deepcopy(raw)
+        changed["step"][0][key] = value
+        _refused(path, changed, f"`{key}` is for cgroup only" if key != "io_path" else
+                 "`io_path` is for a cgroup step with `io_wbps` or `io_wiops` only",
+                 f"{key} on a {raw['step'][0]['action']}")
+
+    def overlap(first, second):
+        changed = copy.deepcopy(raw)
+        changed["step"] = [{"on": "logit", **first}, {"on": "logit", **second}]
+        return changed
+
+    throttle = {"at": "0s", "action": "cgroup", "cpu": 0.5, "for": "60s"}
+    for action in ("stop", "kill"):
+        try:
+            loaded = scenario.from_dict(overlap(throttle, {"at": "20s", "action": action,
+                                                           "for": "60s"}), path)
+            scenario.validate(loaded)
+            expect(True, "")
+        except scenario.ScenarioError as err:
+            expect(False, f"a {action} starting inside a cgroup loads, got {err.problems}")
+    engaged = {"at": "0s", "action": "cgroup", "memory_high": "64M", "engaged": True,
+               "for": "60s"}
+    for action in ("stop", "kill"):
+        _refused(path, overlap(engaged, {"at": "20s", "action": action, "for": "60s"}),
+                 "`engaged` can't be judged on a cgroup step a stop or kill ends",
+                 f"an engaged cgroup a {action} starts inside")
+    for second, what in (({"at": "0s", "action": "stop", "for": "20s"}, "a stop at its start"),
+                         ({"at": "20s", "action": "pause", "for": "20s"}, "a pause inside it"),
+                         ({"at": "20s", "action": "restart", "for": "20s"},
+                          "a restart inside it")):
+        _refused(path, overlap(throttle, second), "two faults overlap on logit",
+                 f"{what} of a cgroup")
+    _refused(path, overlap({"at": "0s", "action": "stop", "for": "60s"},
+                           {**throttle, "at": "20s"}), "two faults overlap on logit",
+             "a cgroup inside a stop")
+
+    name = "slow-spool"
+    shipped = scenario.load(root / "scenarios" / name / "scenario.toml")
+    steps = scenario.expand(shipped)
+    throttles = [one for one in steps if one.action == "cgroup"]
+    sut_stops = [one for one in steps if one.action == "stop" and one.on == "logit"]
+    outages = [one for one in steps if one.action == "stop" and one.on == "victoria-metrics"]
+    sut = (root / "scenarios" / name / "logit-sut.yaml").read_text()
+    expect(len(throttles) == 2 and len(sut_stops) == 1 and len(outages) == 1
+           and all(one.on == "logit" and one.io_wbps is not None
+                   and one.io_path == "/tmp/soak-spool" for one in throttles)
+           and f"path: {throttles[0].io_path}" in sut
+           and throttles[0].start < sut_stops[0].start < throttles[0].end < sut_stops[0].end
+           and sut_stops[0].end < throttles[1].start < outages[0].end < throttles[1].end
+           and outages[0].start < throttles[0].start
+           and throttles[1].engaged is True and throttles[0].engaged is None,
+           f"slow-spool limits the spool's writes through the outage's backlog, stops the SUT "
+           f"inside that limit, and limits the new process through the replay, got {steps}")
+    rows = {exp.name: exp.to_json() for exp in shipped.expectations}
+    expect(rows.get("spool-replayed-at-restart", {}).get("step") == sut_stops[0].id
+           and rows.get("no-torn-tail", {}).get("max") == 0
+           and rows.get("sink-never-drops", {}).get("max") == 0
+           and rows.get("no-spool-errors", {}).get("metric")
+           == "logit.component.buffer.disk.errors",
+           f"slow-spool expects a replay after the stop, no torn tail, no drop, and no spool "
+           f"error, got {rows}")
 
 
 def _reset_rules(root):
@@ -15189,6 +16215,17 @@ def _copytruncate_ledger():
                and reread.detail.startswith("W + F − G 4,000 is surplus, outside the replay "
                                             "band [0, 1]"),
                f"a copy made while the SUT was down read from 0 FAILs, got {reread}")
+        # A prlimit leaves the tailer running, so a copy made inside one is a running step's: it
+        # may read its copy again after bytes were appended, and the band is not the down band.
+        limited = [_action("apply", "c0s2", "prlimit", "logit", 200, 201, nofile=24,
+                           found=[1024, 524288], affects_file_ingress=True),
+                   _action("revert", "c0s2", "prlimit", "logit", 260, 260, restored=True)]
+        inside = limited + ops_of((210, 5_000, 30, 2_850))
+        limit = run("ct-prlimit", 5_001, short=30, ops=inside)["ledger.wire"]
+        expect(limit.status == checks.PASS
+               and "copytruncate at +210s, a tailer running: [-30, +5,001]" in "\n".join(limit.lines),
+               f"a copytruncate inside a prlimit window is a running tailer's, got {limit} "
+               f"{limit.lines}")
         # A shortfall past the records means a write landed unrecorded: every running step may
         # then have read past its copy.
         short = run("ct-shortfall", 8_003, short=150)["ledger.wire"]
@@ -15555,6 +16592,14 @@ def _cri_ledger():
                    "enough to compress a file it hadn't read: 3 rotation(s) in a pause trip the "
                    "guard"),
                f"three rotations in a pause FAIL, got {thrice['ledger.wire']}")
+        # A prlimit keeps the open files too, so it takes the pause's limit, not a stop's.
+        limit = [_action("apply", "c0s2", "prlimit", "logit", 200, 201, nofile=24,
+                         found=[1024, 524288]),
+                 _action("revert", "c0s2", "prlimit", "logit", 230, 230, restored=True)]
+        limited = run("cri-prlimit-twice", timeline_extra=limit, rotations={205: 1, 225: 1})
+        expect(limited["ledger.wire"].status == checks.PASS,
+               f"two rotations in a prlimit pass at the pause's limit, got "
+               f"{limited['ledger.wire']}")
 
 
 def _dangle_log(run_dir, dangles):
@@ -16057,7 +17102,9 @@ def run(root, quiet=False):
                      _overlap_driver, _overlap_checks, _idp_rules, _refresh_checks,
                      _signal_rules, _signal_actions, _sighup_driver,
                      _reopen_checks, _tls_rules, _tls_actions, _tls_driver, _tls_checks,
-                     _reset_actions, _reset_rules,
+                     _reset_actions, _reset_rules, _prlimit_actions, _prlimit_rules,
+                     _cgroup_actions, _cgroup_rules, _cgroup_io_device, _cgroup_io_actions,
+                     _cgroup_io_rules,
                      _fan_out_ledger, _idle_writer, _boundary_skew, _fan_out_rules,
                      _sampling_vectors, _absent_rules, _absent_checks, _merge_ledger,
                      _merge_rules, _delta_ledger, _delta_rules, _scrape_ledger,
@@ -16083,7 +17130,9 @@ def run(root, quiet=False):
                               _splunk_server, _new_shape_rules,
                               _overlap_rules, _overlap_driver, _idp_rules, _signal_rules,
                               _sighup_driver,
-                              _tls_rules, _tls_driver, _reset_rules, _fan_out_rules, _sampling_vectors,
+                              _tls_rules, _tls_driver, _reset_rules, _prlimit_rules,
+                              _cgroup_rules, _cgroup_io_rules,
+                              _fan_out_rules, _sampling_vectors,
                               _absent_rules, _merge_rules, _delta_rules, _scrape_rules)
                 part(root) if part in takes_root else part()
             except Exception as err:  # report the part that broke, then keep going

@@ -839,7 +839,9 @@ the sink's events received, and those its events delivered plus its counted drop
   the most E_r one drain interval held among the last few it moved in, per relay life a kill or an
   `exit` ended or the end sequence didn't stop. The sender flushes on its own period, which can
   span several relay drains, so the last interval alone is often empty while a flush the relay
-  answered after it went uncounted. The listener counts an event sent before it answers and the
+  answered after it went uncounted. A life whose last counts are unseen and whose
+  listener never moved in an interval takes the highest rate among the relay's other lives, and,
+  with fewer than two drains, their median interval too. The listener counts an event sent before it answers and the
   sink counts it delivered after, so a request the relay answered and then lost before counting it
   FAILs here, which V can't show mid-life under cumulative temporality. The two count one unit when
   each delivered event carries one record: `otlp_out` writes one data point per record and
@@ -866,6 +868,117 @@ kernel sends each peer a reset: the side the step is `on` reads `ECONNABORTED`, 
   a step that did nothing and it gets no window.
 - **A namespace fault.** Under `[overlap]` or beside an `idp` it goes on the holder, as `netem`
   and `partition` do, since a member shares the holder's namespace.
+
+## Amendment: a `prlimit` step sets the SUT's open-files limit for its window (2026-11-03)
+
+No fault reached what a process does when it runs out of file descriptors: a listener's accept
+backoff, a tailer's failed opens, a spool's or a checkpoint's failed create. A `prlimit` step
+runs util-linux's `prlimit` from a one-shot of the netem image joined to the SUT's PID
+namespace (`--pid container:<id>`, CAP_SYS_RESOURCE) against PID 1, which is `logit`, since the
+compose file runs it with no init. It reads the soft and hard `RLIMIT_NOFILE`, sets both to the
+step's `nofile`, and its revert sets what it read back. `docker update` can't change a running
+container's ulimits, and the step needs no `label=disable`.
+
+- **Set above what's open.** Lowering the limit closes nothing, so a scenario sets it a few
+  descriptors above the SUT's steady `logit.process.fds` and lets the fault's own opens fill
+  it: a generator's redials, or a tailer's opens at its writer's rotations. An `[[expect]]` row
+  on `logit.process.fds.limit` confirms the limit landed.
+- **A new process ends the fault.** A process started inside the window has the container's own
+  limit, so the revert then sets nothing and records `started_in_window`; one that isn't running
+  has no process to restore, and the revert records `exited_in_window`. `timeline` reports both.
+- **Judged on TCP and HTTP, reported on the file, cri, and Kafka wires.** A limited listener
+  leaves a connection in the accept queue and a sink retries a failed dial, so the TCP and HTTP
+  wires judge the window. The file, cri, and Kafka wires report it like every window there and
+  judge the run against the replay band. A file wire's retention guard bounds it as a pause: the
+  tailer keeps what it has open and can open nothing its writer creates. UDP is not affected.
+- **On a SUT only, and never in a `[random]` schedule**, which can't set `nofile`.
+
+## Amendment: a `cgroup` step sets a CPU quota or a memory throttle for its window (2026-11-03)
+
+No fault reached what a process does when it gets less CPU than its load costs, or when the
+kernel reclaims from it: a receive queue that fills while its reader waits for a share, a
+flush tick that runs late, a bounded queue that holds memory where it should. A `cgroup` step
+writes `cpu.max` (from `cpu`, CPUs per 100 ms period) or `memory.high` (from `memory_high`) in
+the SUT container's own cgroup, `system.slice/docker-<id>.scope` under Docker's systemd driver,
+through a one-shot of the netem image with the host's `/sys/fs/cgroup` bound read-write and
+`--security-opt label=disable`, which SELinux requires for the write. The path comes from the
+cgroup v2 line of the process's `/proc/<pid>/cgroup` on the host and must name the container's
+full id, else the step fails. The apply records what the file held, writes, and reads back, and
+fails on a read-back that differs; the revert writes what it found back.
+
+- **Not `docker update`.** `--memory` can't return a container to unlimited, and `--cpus` is
+  kept in the container's config and comes back on its next start, so a step couldn't end its
+  own fault.
+- **A new process ends the fault.** A start inside the window makes the scope again with the
+  container's own settings, so the revert writes nothing and records `started_in_window`; a
+  container not running at the revert lost its scope with its process, and the revert writes
+  nothing and records `exited_in_window`. `timeline` reports either.
+- **Excused as a pause is.** Every thread in the cgroup shares the quota or the throttle, the
+  HEALTHCHECK's `logit ready` included, so the window excuses `ready`, `progress` and its drain
+  gap, and UDP wire loss; TCP and HTTP windows are judged, since a slowed listener leaves its
+  lines in the sender's or the accept queue, and a file wire's retention guard bounds it as a
+  pause.
+- **The record says whether the throttle engaged.** No `internal` metric reads the cgroup, so
+  on a `memory_high` step the apply and the revert each read `memory.events`' `high` count, and
+  the revert records the difference, the times the kernel throttled the cgroup over the limit
+  in the window. `timeline` reports it, and FAILs a revert that couldn't read it. A limit above
+  what the SUT costs reads 0 and shows a bound holding; one below it shows the throttle. A
+  `memory_high` step's optional `engaged` states which the scenario means: `true` FAILs a count
+  of 0, and `false` FAILs any count above it, so a scenario can't pass while measuring the other
+  case. `memory_high` is a whole number of 4 KiB pages, since the kernel rounds any other value
+  down and the read-back would differ.
+- **The write lands in the scope it read.** The apply takes the cgroup path and `StartedAt` from
+  one `docker inspect`, and inspects again after the write: a process that started again in
+  between has a new scope, so the apply writes `found` back to the path it wrote and fails the
+  step. It keeps what the revert needs only after a write that read back as written, so a failed
+  apply leaves the revert nothing to write.
+- **`memory.high`, not `memory.max`.** Over `memory.high` the kernel throttles and reclaims and
+  never kills, so a scenario can show that a `buffer:` bound bounds memory with no exit to
+  excuse. `memory.max` ends in an OOM kill, which `exit` FAILs; an expected-OOM excuse waits for
+  a reason to want one.
+- **On a SUT only, and never in a `[random]` schedule**, which can't set `cpu` or
+  `memory_high`.
+
+## Amendment: a `cgroup` step limits the writes to the disk behind a SUT path (2026-11-04)
+
+A spool's `sync_data`, its cursor's fsyncs, and a shutdown with a write in flight run on a fast
+local disk in every other scenario, so nothing showed what a slow disk does to them. A
+`cgroup` step's `io_wbps` (bytes a second) and `io_wiops` (writes a second), either or both as
+one limit, write `<major>:<minor> wbps=<n> wiops=<n>` into the SUT's `io.max` through the same
+one-shot as the other limits, for the disk behind the step's `io_path`; the revert writes each
+limited key's found value back, `max` when the device had no line.
+
+- **The device comes from the mounts, not the step.** The mount holding `io_path` in the
+  process's `/proc/<pid>/mountinfo` names it; for an overlay, the host mount holding its
+  `upperdir` in `/proc/1/mountinfo` does, since `docker inspect` names no layer directory under
+  the containerd snapshotter. `io.max` takes a whole disk, so a partition maps to its disk
+  through `/sys/dev/block/<major>:<minor>/../dev`. A device with major 0 (btrfs, tmpfs, an
+  overlay with no host mount found) has no block device to limit, so the step fails before it
+  writes, with `no block device backs <path>`.
+- **The stalled time is the engagement's observable.** `io.stat` counts what the cgroup wrote
+  and has no count of throttled writes, so the apply and the revert each read the device's
+  `wbytes` and `wios` and `io.pressure`'s `some` total, and the revert records the window's
+  differences and length. `timeline` reports them with the write rate against the limit. An io
+  step's optional `engaged` reads the stalled time against 1% of the window: an unthrottled
+  spool's fsyncs on a local disk stall less than that. A segment rotation syncs a whole record
+  at once, so a limit stalls a larger share even above the spool's average pace; a spool whose
+  segments don't rotate in the window can read under 1% while throttled, since the flusher's
+  writeback lands in `wbytes` but not in the scope's stall. The stalled time also counts a stall
+  an unthrottled write would have had, so a run that reads `engaged` near the line needs the
+  rate beside it.
+- **A stop or kill may start inside a `cgroup` step.** A start makes the cgroup again with no
+  limit, so a fault that wants the stop's shutdown under the limit and the next life's replay
+  under it too takes two steps, the first containing the stop. The stop or kill must start
+  after the cgroup's apply, which needs a running process; the cgroup's revert then records
+  `exited_in_window` or `started_in_window` as for any other end of the process. Such a step
+  takes no `engaged`, since its counts go with the process's scope. No other step
+  may overlap a `cgroup` on its service.
+- **`io.max` needs cgroup writeback.** On a host whose container storage is overlayfs over
+  btrfs over dm-crypt, a 1 MiB/s limit let 4 MiB with `fsync` through in 0.1 s, since the
+  writeback loses the writer's cgroup there, and the device is anonymous anyway. `slow-spool`
+  runs on the perf VM's ext4 managed disk (ADR `disposable-azure-perf-vm`), and
+  `tools/soak/vm-io-probe.sh` checks a host before it does. A `dm-delay` device under the spool
+  would slow it on any host, and is the fallback if the VM's probe fails.
 
 ## Amendment: a backend kill is allowed on a tailed sink, and `ledger.tail` measures it (2026-11-03)
 
