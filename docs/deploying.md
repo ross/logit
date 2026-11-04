@@ -1584,6 +1584,12 @@ own HTTP/1 header-read timeout is deliberately not used for it: that timeout re-
 keep-alive gap, so it would act as an idle timeout and kill a long-interval exporter's pooled
 connection. `idle_timeout` is that bound made explicit and opt-in.
 
+**A timeout is counted, not logged.** On every kind in the table above, a peer whose TLS accept or
+first-byte wait (`logit_in`: `Hello`) outlasts the budget is closed and counted
+`logit.input.connections.closed{reason="handshake_timeout"}`, with no `connection_error` log line. It
+isn't a loss. A PROXY header that times out is counted
+`connections.rejected{reason="proxy_header"}` instead.
+
 **It is not an idle timeout on any listener.** After a connection passes its pre-message phases,
 `handshake_timeout` doesn't bound the gap before its next frame or request, because a long-lived,
 mostly quiet sender is ordinary traffic, not a fault. Lowering `handshake_timeout` doesn't help

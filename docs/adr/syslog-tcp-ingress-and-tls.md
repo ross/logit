@@ -1,6 +1,6 @@
 ---
 created: 2026-09-13
-updated: 2026-10-26
+updated: 2026-11-04
 ---
 
 # `syslog_in` gains TCP and TLS ingress; `syslog_out` gains TLS
@@ -563,3 +563,14 @@ the wire.
   queued at shutdown and none reached the server.
 - Against a permitted certificate, the first message arrived 1.002 to 1.003 s after the handshake
   under both servers, the `1s` wait, and every message arrived.
+
+## Amendment: a pre-message timeout is counted, on every listener that bounds one (2026-11-04)
+
+The stream driver counts a TLS accept or first-byte wait that outlasts `handshake_timeout` as
+`logit.input.connections.closed{reason="handshake_timeout"}` and no longer diagnoses it as
+`connection_error`: it is policy like an idle close, and nothing was framed, so it is not a loss.
+The six HTTP listeners and `logit_in` bound the same phases and now count it the same way. For
+`logit_in` the phases are the TLS accept and the `Hello` read, and a silent peer is not also a
+`logit.proto.errors{reason="handshake"}`. A PROXY header that times out stays
+`connections.rejected{reason="proxy_header"}`, and a TLS accept or `Hello` that fails, rather than
+times out, stays a diagnosed error.

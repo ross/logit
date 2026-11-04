@@ -81,8 +81,10 @@
 //! from `handshake_timeout:` by [`OtlpInput::with_handshake_timeout`]) bounds each pre-request
 //! phase, as `crate::tcp`'s driver does (`crates/logit-inputs/src/tcp.rs`'s "Pre-handshake
 //! timeout" section): the PROXY header under `proxy_protocol:`, then the TLS accept on a TLS
-//! listener or the wait for the first byte on a plaintext one. Without it, a client that completes the TCP connect and never speaks pins a
-//! permit forever.
+//! listener or the wait for the first byte on a plaintext one. Without it, a client that completes
+//! the TCP connect and never speaks pins a permit forever. Expiry of the TLS accept or the
+//! first-byte wait closes the connection, counted
+//! `logit.input.connections.closed{reason="handshake_timeout"}` and not diagnosed, as `crate::tcp` does.
 //!
 //! **The plaintext first-byte bound is a `peek`, not a read.** `tokio::net::TcpStream::peek` is
 //! `recv(..., MSG_PEEK)`: it waits for the first byte and leaves it queued, so the stream handed
@@ -95,8 +97,8 @@
 //! check: `demo/haproxy/haproxy.cfg`'s `server logit logit:4318 check` against `demo/logit.yaml`'s
 //! plaintext `browser_in`, a Kubernetes `tcpSocket` probe, `nc -z`. A `peek` of `Ok(0)` or of a
 //! reset (`ECONNRESET`) returns `Ok(())`; only the deadline (a connection held open saying
-//! nothing) and any other read error reach `connection_error`, which a probe would otherwise hit
-//! once per interval, forever. `crate::tcp` makes the same call for an EOF or a reset before its
+//! nothing) is counted `handshake_timeout`, and any other read error reaches `connection_error`,
+//! which a probe would otherwise hit once per interval, forever. `crate::tcp` makes the same call for an EOF or a reset before its
 //! first payload byte (`crates/logit-inputs/src/tcp.rs`'s "Reset before the first byte" section).
 //!
 //! **Sender address.** Under `peer:` and `proxy_protocol:` ([`OtlpInput::with_peer`],
@@ -585,8 +587,8 @@ impl Input for OtlpInput {
                     // connection.
                     match tls_acceptor {
                         // Bounded, or a client that sends no ClientHello pins this permit
-                        // forever. Failure and timeout both reach `connection_error` below, and
-                        // the permit comes back when this task ends. No first-byte peek:
+                        // forever. A failure reaches `connection_error` below and a timeout is
+                        // counted `handshake_timeout`; the permit comes back when this task ends. No first-byte peek:
                         // `acceptor.accept` already waits on the first bytes under the same
                         // budget.
                         Some(acceptor) => {
@@ -603,8 +605,9 @@ impl Input for OtlpInput {
                             }
                         }
                         // The plaintext arm's budget: a `peek` that consumes nothing (this
-                        // module's "peek, not a read"). A read error and the deadline reach
-                        // `connection_error` like the TLS arm's; a clean close or a reset before
+                        // module's "peek, not a read"). A read error reaches
+                        // `connection_error` like the TLS arm's, and the deadline is counted
+                        // `handshake_timeout`; a clean close or a reset before
                         // the first byte is a TCP health check (this module's "not a fault"), as
                         // in `crate::tcp`.
                         None => {

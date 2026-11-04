@@ -796,6 +796,7 @@ async fn accept_unix(
         };
         let stamped = if accept.record_peer { PeerAttrs::from_unix(&addr) } else { None };
         let shared = accept.shared(ConnectionPeer::unix(Arc::clone(&path), stamped));
+        let shared_telemetry = accept.telemetry.clone();
         let handshake_timeout = accept.handshake_timeout;
         let idle_timeout = accept.idle_timeout;
         let mut conn_shutdown = shutdown.clone();
@@ -820,7 +821,8 @@ async fn accept_unix(
                 }
                 Ok(Err(err)) => Err(format!("waiting for a first byte failed: {err}")),
                 Err(_elapsed) => {
-                    Err(format!("no first byte received within {handshake_timeout:?}"))
+                    crate::listener::count_handshake_timeout(&shared_telemetry);
+                    Ok(())
                 }
             }
         });
