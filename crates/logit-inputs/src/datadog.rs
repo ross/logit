@@ -88,10 +88,10 @@
 //!
 //! # Backpressure: a bounded wait, then `503`
 //!
-//! `otlp_in` and `prometheus_in` let a full downstream block the handler, so the client's request
-//! stays open until the pipeline drains. That suits a client that waits patiently. A Datadog Agent
-//! doesn't: its forwarder times a request out after 20 seconds and retries it, so a blocked
-//! connection costs the Agent a slot for 20 seconds and still ends in a retry.
+//! `prometheus_in`'s remote-write receiver lets a full downstream block the handler, so the
+//! client's request stays open until the pipeline drains. A Datadog Agent doesn't wait: its
+//! forwarder times a request out after 20 seconds and retries it, so a blocked connection costs
+//! the Agent a slot for 20 seconds and still ends in a retry.
 //!
 //! So ([ADR `datadog-agent-and-intake-relay`](../../../../docs/adr/datadog-agent-and-intake-relay.md),
 //! decision 5) each batch is sent under one deadline per request, [`BUSY_AFTER`] from the start of

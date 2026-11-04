@@ -265,11 +265,13 @@ SOURCE_KEYS = {"service", "generator_input", "generator_sink", "sut_listener"}
 LISTED_SOURCE_KEYS = ("generator_input", "generator_sink")
 OPTIONAL_SOURCE_KEYS = {"sut_transforms", "wire", "fan_out", "merge", "socket_buffers"}
 # A `tcp` source's `socket_buffers`: the most bytes one connection's receive buffer on the SUT
-# (`receive`) and send buffer on the generator (`send`) can hold, which `ledger.wire` bounds a
-# stalled kill's loss by (checks.py's `_stalled_kill_bound`). Each must equal the maximum the
-# scenario's compose override sets for that end (`SOCKET_SYSCTLS`): a new network namespace
-# copies the host's values, which a scenario can't know. A source needs it when a `kill` lands
-# inside a `pause` of the SUT.
+# (`receive`) and send buffer on the generator (`send`) can hold. Only `receive` enters the
+# bound `ledger.wire` holds a stalled kill's uncounted loss to (checks.py's
+# `_stalled_kill_bound`): the generator's sink keeps one connection and counts what its send
+# queue held unacknowledged, so `send` is validated but not used in the bound. Each must equal
+# the maximum the scenario's compose override sets for that end (`SOCKET_SYSCTLS`): a new
+# network namespace copies the host's values, which a scenario can't know. A source needs it
+# when a `kill` lands inside a `pause` of the SUT.
 SOCKET_BUFFER_KEYS = ("receive", "send")
 SOCKET_SYSCTLS = {"receive": "net.ipv4.tcp_rmem", "send": "net.ipv4.tcp_wmem"}
 # The one transform kind `fan_out` may name: it emits one event per point of a parent's message
@@ -2872,7 +2874,8 @@ def stalled_kills(steps):
 
 def _stalled_kill_problems(scenario):
     """A `tcp` source names `socket_buffers` when a stalled kill lands on `logit`, whose
-    listener holds every source: `ledger.wire` bounds what the kill loses by them."""
+    listener holds every source: `ledger.wire` holds the loss the generator doesn't count
+    to the `receive` share."""
     if not any(kill.on == SUT_SERVICE for _, kill in stalled_kills(scenario.steps)):
         return []
     return [f"ledger.source {index + 1}: a kill inside a pause of {SUT_SERVICE} loses what its "
