@@ -645,7 +645,9 @@ sut_transforms = ["parse", "labels", "count", "metrics_only"]   # optional, in o
   which the scenario's compose override sets, since a new network namespace copies the host's
   maxima. `load()` checks both values against the override (`scenario.compose_sysctls`). A
   `tcp` source needs it when a stalled kill, a `kill` inside a `pause` of the SUT, is on the
-  schedule, because `ledger.wire` bounds that kill's loss by it (§6).
+  schedule, because `ledger.wire` bounds that kill's uncounted loss by the `receive` value (§6).
+  The `send` value is checked but not used in the bound: the generator's sink counts what its
+  send queue held as `unacknowledged`.
 - With the role map: every source's `service` is a `generator`, and every `generator` in the
   stack has a source, because a generator with none would put lines into a listener with no
   G behind them.
@@ -1303,17 +1305,17 @@ The rows:
   A stalled kill, a `kill` that starts inside a `pause` of the SUT and ends with it, lands on a
   frozen process: Docker signals a paused container and then thaws it, and the process dies on
   the pending SIGKILL before it reads anything more. Its fault run is reported as a kill's is,
-  and its loss, G − W over the run, is also held to a bound (`checks._stalled_kill_bound`):
-  G from the SUT's last drain to the pause, read and never exported or still in the buffers,
-  plus each connection the generator opened before the kill times the source's
-  `socket_buffers` receive and send bytes, in lines at the generator sink's
-  `logit.output.batch.bytes` per `output.messages`, plus one batch per edge. A write stalled
-  past the generator's `connect_timeout` drops its connection, and the redial completes into
-  the frozen listener's accept queue, since the kernel finishes the handshake, and fills
-  another pair of buffers; the connections are 1 plus the generator sink's
-  `logit.output.reconnects` from the pause to one generator drain past the kill. A loss past
-  the bound FAILs; without `socket_buffers` or the generator's bytes the loss is reported with
-  no bound.
+  and its loss, G − W over the run, is also held to a bound (`checks._stalled_kill_bound`).
+  The generator's stream sink keeps its one stalled connection and counts what its send queue
+  held unacknowledged, when the receiver's reset destroys it, as
+  `logit.output.bytes.dropped{reason="unacknowledged"}` (U); `ledger.wire` requires U at each
+  stalled kill and FAILs a U past the loss. It holds the rest, loss less U, to G from the SUT's
+  last drain to the pause, read and never exported or still in the SUT's receive buffer, which
+  is at most the source's `socket_buffers` receive bytes, in lines at the generator sink's
+  `logit.output.batch.bytes` per `output.messages`, plus one batch per edge. The send buffer
+  and redials are not part of the bound; `logit.output.reconnects` over the pause is shown. A
+  loss past the bound FAILs; without `socket_buffers` or the generator's bytes the loss is
+  reported with no bound.
 
   On an HTTP wire (W14) the row judges G − (W − X), and every lifecycle fault, `partition`,
   and netem of the ingress SUT or of a generator, and a `mark` or `exit` on the ingress SUT,
