@@ -976,7 +976,9 @@ the operator-facing account of all of this.
   `[[expect]]` rows on the kernel's counted drops inside it and on a
   flush and a delivery in every drain after it, and `sink-outage-block`'s outage under a
   `memory.high` a margin above what its bounded queues cost, with a maximum on
-  `logit.process.memory.resident.bytes`. `tail-copytruncate` rotates a never-rotating writer's file with `copytruncate` steps (a
+  `logit.process.memory.resident.bytes`; `memory-high-pressure` sets it below that cost, and the
+  step's record counts the throttle's engagements from `memory.events`, which `timeline`
+  reports. `tail-copytruncate` rotates a never-rotating writer's file with `copytruncate` steps (a
   one-shot container copies and truncates it, recording the lines lost between the two) while
   the SUT runs, is stopped, and is killed, compresses finished copies with `gzip` steps, and
   restores one under a new inode with a `replace` step, so content claims, rejected resumes, and

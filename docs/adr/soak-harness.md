@@ -917,6 +917,11 @@ fails on a read-back that differs; the revert writes what it found back.
   gap, and UDP wire loss; TCP and HTTP windows are judged, since a slowed listener leaves its
   lines in the sender's or the accept queue, and a file wire's retention guard bounds it as a
   pause.
+- **The record says whether the throttle engaged.** No `internal` metric reads the cgroup, so
+  on a `memory_high` step the apply and the revert each read `memory.events`' `high` count, and
+  the revert records the difference, the times the kernel throttled the cgroup over the limit
+  in the window. `timeline` reports it, and FAILs a revert that couldn't read it. A limit above
+  what the SUT costs reads 0 and shows a bound holding; one below it shows the throttle.
 - **`memory.high`, not `memory.max`.** Over `memory.high` the kernel throttles and reclaims and
   never kills, so a scenario can show that a `buffer:` bound bounds memory with no exit to
   excuse. `memory.max` ends in an OOM kill, which `exit` FAILs; an expected-OOM excuse waits for
