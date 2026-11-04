@@ -904,9 +904,12 @@ the operator-facing account of all of this.
   generator's stop, and at least 1 around a `reset` step, which closes the generator's connection with `ss -K` from a
   one-shot container in its network namespace (a kernel with `CONFIG_INET_DIAG_DESTROY`).
   `syslog-stall-kill` and `syslog-stall-kill-default` kill the SUT inside a pause (a stalled
-  kill), with each socket buffer capped at 256 KiB and at Linux's default maxima, and
-  `ledger.wire` holds the lines the frozen listener's connections held to each connection's two
-  buffers (the source's `socket_buffers`, checked against the compose override's sysctls).
+  kill), with each socket buffer capped at 256 KiB and at Linux's default maxima: the
+  generator keeps its one stalled connection, `[[expect]]` rows assert no redial during either
+  pause, and `ledger.wire` requires the generator's
+  `logit.output.bytes.dropped{reason="unacknowledged"}` for each kill and holds the rest of its
+  loss, the receiver's share, to the SUT's receive buffer (the source's `socket_buffers`,
+  checked against the compose override's sysctls).
   `http-ingress` sends InfluxDB points from `influxdb_out` into `influxdb_in`, its source
   declared `wire = "http"`: G is the points the listener answered `204` for and W its
   `events.sent`, a busy `503` and `logit.input.batches.deferred` are a retry, not loss, and only
@@ -953,8 +956,8 @@ the operator-facing account of all of this.
   `otlp-egress` send a cumulative `aggregate` through `graphite_out` and `otlp_out` over HTTP
   into VictoriaMetrics' own Graphite and OTLP listeners, under `vm_every_window`;
   `graphite-egress` also SIGKILLs VictoriaMetrics twice, and `ledger.tail` (a sink's
-  `kill_unflushed`) holds the datapoints `graphite_out` counted written to the samples stored, the
-  tail a stream sink can't count, bounded by what the backend held unsaved;
+  `kill_unflushed`) holds the datapoints `graphite_out` counted written, less those it counted
+  unacknowledged, to the samples stored, the rest bounded by what the backend held unsaved;
   `otlp-grpc-egress` sends it over gRPC to a second `logit`, `collector`, which passes it on
   through `prometheus_out`. `collector` is the sink's `relay`, so `logit` keeps `aggregate`
   and the sink, and V splits on `logit`'s lives; `ledger.relay` balances `collector` on its own
