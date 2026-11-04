@@ -2162,6 +2162,7 @@ mod tests {
         let (receiver, _) = listener.accept().await.unwrap();
         let mut receiver = receiver.into_std().unwrap();
         receiver.set_nonblocking(false).unwrap();
+        receiver.set_read_timeout(Some(RECV_TIMEOUT)).unwrap();
         let held = wait_idle(fd, &receiver, 0, a.end - a_tail).await;
         let queued = a.end - a_tail - held;
 
