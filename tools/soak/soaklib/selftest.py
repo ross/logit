@@ -8970,7 +8970,7 @@ RELAY_PER_DRAIN = 100
 
 
 def _relay_run(tmp, name, action="kill", extra=(), stopped=True, keys=True, sut_extra=(),
-               bursty=False, kill=None):
+               bursty=False, kill=None, silent=()):
     """`_ledger_run`'s two-life run with its sink's writes carried on by a relay, `collector`,
     whose `action` (a `kill` or a `stop`) over `RELAY_KILL` gives it two lives. Each 5 s drain
     the relay's `otlp` sends `RELAY_PER_DRAIN` events on to `victoria_metrics`, which receives
@@ -8978,7 +8978,7 @@ def _relay_run(tmp, name, action="kill", extra=(), stopped=True, keys=True, sut_
     `keys` its sink names `relay_listener` and `relay_sink`. `sut_extra` lines go to `logit`.
     Under `bursty` the relay moves `2 × RELAY_PER_DRAIN` at every other drain (+5, +15, ...)
     and exports no point at the rest, as a 10 s sender into a 5 s drain does, so its killed
-    life's last drain, +200, is empty."""
+    life's last drain, +200, is empty. A life in `silent` drains but moves nothing."""
     kill = kill or RELAY_KILL
     relay_timeline = [_action("apply", "c0s2", action, "collector", kill[0]),
                       _action("revert", "c0s2", action, "collector", kill[1] - 1, kill[1]),
@@ -9005,6 +9005,8 @@ def _relay_run(tmp, name, action="kill", extra=(), stopped=True, keys=True, sut_
         start = kill[1] if offset >= kill[1] else -1
         stamp = _stamp(T0 + offset)
         relay.append(_line(stamp, "logit.process.uptime", "gauge", float(offset - start)))
+        if (0 if offset < kill[0] else 1) in silent:
+            continue
         moved = RELAY_PER_DRAIN
         if bursty:
             if offset % 10 == 0:
@@ -9159,6 +9161,14 @@ def _relay_ledger():
                    "interval)" in early_kill.detail and "= 6,300, ok" in early_kill.detail,
                f"a relay life killed before it drained twice is allowed an interval at the "
                f"relay's other lives' rate, got {early_kill}")
+        rate_only = row("relay-delivered-silent-kill", silent=(0,), sut_extra=delivered(2300))
+        expect(rate_only is not None and rate_only.status == checks.PASS
+               and "ΣE_r 2,200 against Del 2,300 − 100 (the busiest recent drain interval"
+               in rate_only.detail
+               and "counts are unseen; life 0 borrowed the relay's other lives' rate)"
+               in rate_only.detail and "= 2,200, ok" in rate_only.detail,
+               f"a killed relay life with drains whose listener never moved keeps its own "
+               f"interval and borrows only the rate, got {rate_only}")
         unwritten = row("relay-delivered-unwritten", sut_extra=delivered(
             6400, at(100, "logit.output.metrics.skipped", 200, component="sink",
                      metric_kind="gauge_histogram")))
