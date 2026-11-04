@@ -3207,13 +3207,13 @@ Docker 29.9, SELinux enforcing) checked each fault's mechanism before it was pla
     `connections.closed{reason="idle"}`, while the TCP driver re-arms its clock on every read
     that returns bytes, so a byte sent faster than `idle_timeout:` holds the slot until the
     client leaves; and a first-byte timeout under `handshake_timeout:` shows only as the
-    `connection_error` diagnostic, with no counter, which W34 either judges from stderr or
-    proposes a counter for to the fixing session. Rows: `connections.rejected{reason="limit"}`
+    `connection_error` diagnostic, with no counter yet, so W34 judges it from stderr unless the
+    fixing session's `connections.closed{reason="handshake_timeout"}` has landed. Rows: `connections.rejected{reason="limit"}`
     above 0 while the slow clients hold every slot; `connections.closed{reason="idle"}` for
     the trickle on an HTTP listener and for the half-open peers on both, since they send
-    nothing; on the TCP listener, the trickle holding its slot with no close, recorded as a
-    product finding (nothing bounds a connection that sends bytes but never completes a
-    frame); the generator's wire loss at 0 with its connection opened before the slots fill (a
+    nothing; on the TCP listener, the trickle holding its slot with no close, pinned as the
+    limit [ADR `deployment-threat-model`](../adr/deployment-threat-model.md) documents ("A
+    stalled or dribbled body holds its connection permit"), not a new finding; the generator's wire loss at 0 with its connection opened before the slots fill (a
     redial in that phase is refused, and allowed for); and no descriptor growth after.
 32. **Native-hop variants (W35).** `native-hop` over TLS from the run's private CA, through a
     certificate rotation; under a netem delay on the hop long enough that the send window, not
