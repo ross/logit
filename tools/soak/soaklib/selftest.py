@@ -9306,7 +9306,7 @@ TWO_SUT_COLLECTOR_CONFIG = ("components:\n"
 
 def _two_sut_run(tmp, name, kill_on="collector", collector_lives=2, extra=0, short=0,
                  hop_dropped=0, drops=(), pause=False, logit_lives=None, replayed=3,
-                 stalled=False, partial=False, collector_restart=False):
+                 stalled=False, partial=False, collector_restart=False, evicted=()):
     """A two-SUT run across a native hop: the generator and `logit` move `PER_DRAIN` lines per
     5 s drain into `logit`'s one life, whose hop sink `hop` takes each drain's lines in 10
     frames; `collector`'s `logit_in` `hop_in` forwards them into `window`, which delivers one
@@ -9322,8 +9322,8 @@ def _two_sut_run(tmp, name, kill_on="collector", collector_lives=2, extra=0, sho
     life leaves 3 hop batches queued, and its next life's first drain replays `replayed`; under
     `stalled` its hop sink delivers nothing in its last two drains and leaves 23 queued; under
     `partial` it delivers 2 of its last drain's 10 and leaves 11 queued. `collector_restart`
-    stops `collector` over the same span as that kill, a graceful restart.
-    `collector` counts one
+    stops `collector` over the same span as that kill, a graceful restart. `evicted` lists
+    `(offset, count)` pairs of `logit.input.senders.evicted` at `hop_in`. `collector` counts one
     `events.dropped{reason="stale"}` at `window`. `drops` adds a count of 1 for each `(service,
     metric, component, reason)`, `service` being "logit" or "collector"."""
     if logit_lives is None:
@@ -9406,6 +9406,9 @@ def _two_sut_run(tmp, name, kill_on="collector", collector_lives=2, extra=0, sho
                 egress.append(_line(stamp, metric, "gauge", 0, component="sink"))
     egress.append(_line(_stamp(T0 + 100), "logit.component.events.dropped", "sum", 1,
                         component="window", attrs={"reason": "stale"}))
+    for offset, count in evicted:
+        egress.append(_line(_stamp(T0 + offset), "logit.input.senders.evicted", "sum", count,
+                            component="hop_in"))
     for service, metric, component, reason in drops:
         line = _line(_stamp(T0 + 150), metric, "sum", 1, component=component,
                      attrs={"reason": reason})
@@ -9724,6 +9727,36 @@ def _two_sut_checks():
                "collector, restarted at +213s, forwards again)" in again["ledger.hop"].detail,
                f"a killed logit's replay forwarded again by a collector that restarted in "
                f"between passes, got {again['ledger.hop']}")
+        # A replay into a full sender table: an eviction beyond the life's own identity's means
+        # a replayed identity was taken back by a forward, so the replayed frames may be
+        # forwarded twice; one eviction, or one counted after the replay's window, allows none.
+        evicted = hop_row("two-logit-evicted", kill_on="logit", collector_lives=1, extra=1250,
+                          evicted=((215, 2),))
+        expect(evicted["ledger.hop"].status == checks.PASS
+               and "= -1,250, within allowance (allowance [-1,300, 100]" in
+               evicted["ledger.hop"].detail
+               and "logit life 1: −300 (its 3 replayed frames, which collector, evicting 2 "
+               "identities as it took them, more than the life's own one, may forward again)"
+               in evicted["ledger.hop"].detail,
+               f"a replay that met an eviction beyond its own identity's may be forwarded "
+               f"again, got {evicted['ledger.hop']}")
+        expect("plus an eviction allowance 300, the frames replayed into a full sender table"
+               in evicted["ledger.summary"].detail,
+               f"ledger.summary allows the same frames end to end, got "
+               f"{evicted['ledger.summary']}")
+        own = hop_row("two-logit-evicted-own", kill_on="logit", collector_lives=1, extra=1250,
+                      evicted=((215, 1),))
+        expect(own["ledger.hop"].status == checks.FAIL
+               and "= -1,250, surplus" in own["ledger.hop"].detail
+               and "replayed frames" not in own["ledger.hop"].detail,
+               f"the one eviction a life's own identity causes allows nothing, got "
+               f"{own['ledger.hop']}")
+        late_evict = hop_row("two-logit-evicted-late", kill_on="logit", collector_lives=1,
+                             extra=1250, evicted=((215, 1), (230, 1)))
+        expect(late_evict["ledger.hop"].status == checks.FAIL
+               and "= -1,250, surplus" in late_evict["ledger.hop"].detail,
+               f"an eviction after the replay's window allows nothing, got "
+               f"{late_evict['ledger.hop']}")
         lost = hop_row("two-logit-tail", kill_on="logit", collector_lives=1, extra=500)
         expect(lost["ledger.hop"].status == checks.PASS
                and "= -500, within allowance" in lost["ledger.hop"].detail,

@@ -5905,8 +5905,9 @@ def _end_to_end(data, led):
     on an HTTP wire no X, which the client resends), plus one generator batch per ambiguous
     attempt on a TCP wire and per transport-error attempt or ack timeout on an HTTP wire, as
     `ledger.wire` allows, and
-    on a file wire the replay band's upper edge, and on a `cri` wire S, each split line's
-    second event. With a `fan_out`, each source's share is
+    on a file wire the replay band's upper edge, on a `cri` wire S, each split line's
+    second event, and across a hop the frames replayed into a full sender table that
+    `ledger.hop` allows (`_evicted_replays`). With a `fan_out`, each source's share is
     carried through its chain instead (`Ledger.through`). A kill on either side shifts lives but
     never adds increments, so V above that is a surplus whatever was killed; V below it is the
     per-life rows' to judge."""
@@ -5941,9 +5942,13 @@ def _end_to_end(data, led):
     files = files + kafkas
     # On a `cri` wire each split line's second event reaches `aggregate` too.
     splits = sum(sum(led.per[listener]["S"].values()) for listener in files)
-    limit = led.G - counted + partial + resent + replay + splits
+    # A replay a full sender table met can forward again what the hop already forwarded.
+    replays = _evicted_replays(led)
+    evicted = sum(replayed for _, replayed, _ in replays) * round(led.per_frame) if replays else 0
+    limit = led.G - counted + partial + resent + replay + splits + evicted
     bound = ("G − counted" + (" + partial" if partial else "") + (" + resent" if https else "")
-             + (" + replay" if files else "") + (" + S" if splits else ""))
+             + (" + replay" if files else "") + (" + S" if splits else "")
+             + (" + evicted" if evicted else ""))
     carried = ""
     if led.reshaped:
         # Each source's own share of the limit, in its listener's events, carried through its
@@ -5983,6 +5988,8 @@ def _end_to_end(data, led):
                     + (f" plus the replay band's {_n(replay)}" if files else "")
                     + (f" plus S {_n(splits)}, the split lines' second events" if splits
                        else "")
+                    + (f" plus an eviction allowance {_n(evicted)}, the frames replayed into "
+                       "a full sender table" if evicted else "")
                     + carried + ": " + "; ".join(parts))
 
 
@@ -6014,6 +6021,46 @@ def _commit_rate(tel, name, component, life):
     moved = [(a, b) for a, b in zip(drains, drains[1:]) if b > a and by_ts.get(b)]
     rate = max((by_ts[b] / (b - a) for a, b in moved[-COMMIT_RATE_INTERVALS:]), default=0.0)
     return rate, (moved[-1][1] if moved else None)
+
+
+def _evicted_replays(led):
+    """`[(life, replayed, evictions)]`: each ingress life after the first whose spool replayed
+    frames while the far SUT's `logit_in` counted more than one sender eviction, from the life's
+    start to the end of its replay's window, its first drain that counted a replay plus two of
+    the far SUT's drain intervals, or the next life's start if sooner. A life's own identity
+    evicts at most one, when its first frame takes a slot in a full table; any other eviction in
+    that window is a replayed identity the table no longer held, taken back by a forward of a
+    frame it had acknowledged before (docs/plans/soak-harness.md's "The native hop (W10b)").
+    The life's replayed frames bound those forwards. A collector restart's forgotten marks are
+    allowed apart, and evict nothing."""
+    if led.hop is None:
+        return []
+    sink, listener = led.hop.get("sink"), led.hop.get("listener")
+    evicted = [(ts, v) for ts, v, _ in
+               led.sut.counter_points("logit.input.senders.evicted", component=listener) if v]
+    if not evicted:
+        return []
+    drains = sorted(led.sut.drains)
+    gaps = [b - a for a, b in zip(drains, drains[1:]) if b > a]
+    gap = statistics.median(gaps) if gaps else 0.0
+    replays = {}
+    for ts, v, life in led.ingress.counter_points("logit.component.buffer.disk.replayed",
+                                                  component=sink):
+        if v and life > 0:
+            first, total = replays.get(life, (ts, 0))
+            replays[life] = (min(first, ts), total + v)
+    starts = led.inn.life_starts
+    found = []
+    for life, (first, replayed) in sorted(replays.items()):
+        if life >= len(starts):
+            continue
+        end = first + 2 * gap
+        if life + 1 < len(starts):
+            end = min(end, starts[life + 1])
+        count = sum(v for ts, v in evicted if starts[life] < ts <= end)
+        if count > 1:
+            found.append((life, replayed, count))
+    return found
 
 
 def _first_moved(tel, name, component, life):
@@ -6064,7 +6111,10 @@ def check_ledger_hop(data):
     the far SUT can make it forward a resend twice: a kill forgets its marks, and a pause
     leaves frames in an ended connection that a resend races (docs/deploying.md),
     each up to one send window of frames below 0. A partition or packet loss can't: the race
-    needs a forward parked on a full inbox. Any other
+    needs a forward parked on a full inbox. An ingress life whose replay met more evictions at
+    the far SUT than its own identity causes may have its replayed frames forwarded again, each
+    of an identity the full table had evicted (`_evicted_replays`), so the gap may fall by
+    those frames too. Any other
     gap FAILs, as a surplus below the allowance or uncounted loss above it. Resends, resumed
     frames, and reconnects are shown beside it. The lines report the running gap at each
     fault's start, the hop's backlog plus any surplus so far, from both sides' running totals,
@@ -6110,6 +6160,13 @@ def check_ledger_hop(data):
         low, high = low - race, high + tail
         allowances.append(f"{out.service} life {life} killed: −{_n(race)} (its marks lost), "
                           f"+{_n(tail)} ({rate:,.0f}/s over its last drain interval)")
+    for life, replayed, count in _evicted_replays(led):
+        resent = replayed * frame
+        low -= resent
+        allowances.append(f"{inn.service} life {life}: −{_n(resent)} (its {_n(replayed)} "
+                          f"replayed frames, which {out.service}, evicting {_n(count)} "
+                          f"identities as it took them, more than the life's own one, may "
+                          f"forward again)")
     for fault in data.faults:
         if fault.on == out.service and fault.action == "pause":
             low -= race
