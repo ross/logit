@@ -645,7 +645,9 @@ sut_transforms = ["parse", "labels", "count", "metrics_only"]   # optional, in o
   which the scenario's compose override sets, since a new network namespace copies the host's
   maxima. `load()` checks both values against the override (`scenario.compose_sysctls`). A
   `tcp` source needs it when a stalled kill, a `kill` inside a `pause` of the SUT, is on the
-  schedule, because `ledger.wire` bounds that kill's loss by it (§6).
+  schedule, because `ledger.wire` bounds that kill's uncounted loss by the `receive` value (§6).
+  The `send` value is checked but not used in the bound: the generator's sink counts what its
+  send queue held as `unacknowledged`.
 - With the role map: every source's `service` is a `generator`, and every `generator` in the
   stack has a source, because a generator with none would put lines into a listener with no
   G behind them.
@@ -1305,17 +1307,17 @@ The rows:
   A stalled kill, a `kill` that starts inside a `pause` of the SUT and ends with it, lands on a
   frozen process: Docker signals a paused container and then thaws it, and the process dies on
   the pending SIGKILL before it reads anything more. Its fault run is reported as a kill's is,
-  and its loss, G − W over the run, is also held to a bound (`checks._stalled_kill_bound`):
-  G from the SUT's last drain to the pause, read and never exported or still in the buffers,
-  plus each connection the generator opened before the kill times the source's
-  `socket_buffers` receive and send bytes, in lines at the generator sink's
-  `logit.output.batch.bytes` per `output.messages`, plus one batch per edge. A write stalled
-  past the generator's `connect_timeout` drops its connection, and the redial completes into
-  the frozen listener's accept queue, since the kernel finishes the handshake, and fills
-  another pair of buffers; the connections are 1 plus the generator sink's
-  `logit.output.reconnects` from the pause to one generator drain past the kill. A loss past
-  the bound FAILs; without `socket_buffers` or the generator's bytes the loss is reported with
-  no bound.
+  and its loss, G − W over the run, is also held to a bound (`checks._stalled_kill_bound`).
+  The generator's stream sink keeps its one stalled connection and counts what its send queue
+  held unacknowledged, when the receiver's reset destroys it, as
+  `logit.output.bytes.dropped{reason="unacknowledged"}` (U); `ledger.wire` requires U at each
+  stalled kill and FAILs a U past the loss. It holds the rest, loss less U, to G from the SUT's
+  last drain to the pause, read and never exported or still in the SUT's receive buffer, which
+  is at most the source's `socket_buffers` receive bytes, in lines at the generator sink's
+  `logit.output.batch.bytes` per `output.messages`, plus one batch per edge. The send buffer
+  and redials are not part of the bound; `logit.output.reconnects` over the pause is shown. A
+  loss past the bound FAILs; without `socket_buffers` or the generator's bytes the loss is
+  reported with no bound.
 
   On an HTTP wire (W14) the row judges G − (W − X), and every lifecycle fault, `partition`,
   and netem of the ingress SUT or of a generator, and a `mark` or `exit` on the ingress SUT,
@@ -6975,6 +6977,49 @@ acknowledged"). Each scenario ran once at its default length on the development 
 
 The 8-hour runs close the gap the 1 h runs of W17 and W18 left: a leak that grows per redial or
 per deletion did not show in either path over 8 hours.
+
+### A stalled receiver with the kept connection (2026-11-03)
+
+The stream sinks keep a stalled connection and count what a destroyed one held unacknowledged
+([ADR `stream-sink-stalled-connection`](../adr/stream-sink-stalled-connection.md)), so the four
+scenarios of "A backend kill's tail and a stalled receiver" ran again, once each at their default
+length on the development host, against `logit:soak-outq` built from `outq/w1`. Every row of
+the four runs passed. `ledger.wire` now requires the generator's
+`logit.output.bytes.dropped{reason="unacknowledged"}` (U) at each stalled kill and holds the
+loss less U to G from the SUT's last drain to the pause plus the receive buffer at
+`socket_buffers`, plus a batch per edge.
+
+| Scenario, stall | Lost before | Redials before | Lost after | U counted | Redials in the pause |
+|---|---|---|---|---|---|
+| `syslog-stall-kill`, 30 s | 21,339 | 5 | 3,865 | 88,664 bytes, 1,412 lines | 0 |
+| `syslog-stall-kill`, 90 s | 71,586 | 16 | 17,553 | 256,800 bytes, 4,089 lines | 0 |
+| `syslog-stall-kill-default`, 30 s | 35,163 | 4 | 4,651 | 102,592 bytes, 1,634 lines | 0 |
+| `syslog-stall-kill-default`, 90 s | 113,899 | 12 | 46,473 | 127,120 bytes, 2,024 lines | 0 |
+
+- **The loss no longer grows with redials.** `syslog-stall-kill` (`20261104T005055Z`) lost 3,865
+  and 17,553 lines, against 21,339 and 71,586 before. The uncounted rest, 2,453 and 13,463
+  lines, held 527 and 9,527 lines the listener read before the pause and never exported, and
+  each remainder, 1,926 and 3,936 lines at 62.8 bytes a line, was under the 4,174 lines one
+  256 KiB receive buffer holds. Its bounds were 4,901 and 13,902. The long stall's U, 256,800
+  bytes, is about the 256 KiB send buffer.
+- **Under default autotuning the receiver's share varied with the buffer's history.**
+  `syslog-stall-kill-default` (`20261104T005233Z`) lost 4,651 and 46,473 lines. Less the
+  listener's unexported 585 and 9,560, the receiver's share was 2,432 lines, about 150 KB, in
+  the short stall and 34,889, about 2.2 MB, in the long one, within bounds of 100,967 and
+  109,942 set by the 6 MiB receive maximum. U read only 102,592 and 127,120 bytes, which points to
+  a send buffer that grew little from its 16 KiB start. The harness uses the receive maximum because the kept
+  connection was read before the pause, so its buffer can be past its initial size, as the long
+  stall's was.
+- **A kill of a reader that keeps up still loses about one export interval.**
+  `syslog-tcp-ingress` (`20261104T010437Z`) passed with the reset step: the kill's gap read
+  9,838 lines, the stop's 18, and the generator counted no unacknowledged bytes. The generator
+  redialed 4 times, after the SUT's stop, its kill, its partition, and the reset, and none
+  during the pause, which read one ambiguous attempt and a surplus of 144 lines against 300
+  allowed.
+- **A backend kill's tail is unchanged.** `graphite-egress` (`20261104T010754Z`) read
+  M 11,000 − S 10,700 = 300 in its one SUT life against a bound of 400, as before, and the sink
+  counted no unacknowledged bytes at either kill, so all 300 are what VictoriaMetrics had taken
+  and not saved. Each of the four reconnect expectations read 1.
 
 ### `otlp_in` answers busy, on `outq/w4` (2026-11-04)
 

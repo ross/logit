@@ -904,13 +904,20 @@ the generator counted every line in them as written.
   revert starts the container; the pause's revert finds it exited or started since its apply,
   unpauses nothing, records `unpaused: false`, and the driver and `timeline` expect no
   readiness probe for it. Any other overlap of the two stays refused.
-- **The loss is bounded by the buffers.** On a `tcp` source the stalled kill's fault run is
-  reported as a kill's is, and its G − W is held to G from the SUT's last drain to the pause,
-  plus each connection the generator opened before the kill times the source's
-  `socket_buffers`, in lines at the generator's bytes per line, plus a batch per edge. A write
-  stalled past `connect_timeout` drops its connection, and the redial completes into the frozen
-  listener's accept queue and fills another pair, so the connections are 1 plus the generator
-  sink's reconnects through the stall. Past the bound the row FAILs.
+- **The generator counts its share, and the rest is bounded by the receive buffer.** A write
+  stalled past `connect_timeout` keeps its connection while the listener still answers ([ADR
+  `stream-sink-stalled-connection`](stream-sink-stalled-connection.md)), so one buffer pair is
+  at risk however long the stall, and `[[expect]]` rows assert no redial during the pause. The
+  kill resets that connection, and the generator's sink counts what its send queue still held
+  as `logit.output.bytes.dropped{reason="unacknowledged"}` (U). On a `tcp` source the stalled
+  kill's fault run is reported as a kill's is; it FAILs when the generator counted no U from
+  the kill to one drain past its revert, or a U past G − W by more than a batch per edge, and
+  holds G − W − U to G from the SUT's last drain to the pause, plus the source's
+  `socket_buffers` receive bytes (what the SUT's kernel acknowledged and never delivered, which
+  nothing counts), plus a batch per edge, U and the buffer in lines at the generator's bytes
+  per line. The receive maximum stands in for the buffer's size at the kill: the connection was
+  read before the pause, so autotuning may have grown it past its initial size. Past the bound
+  the row FAILs.
 - **The buffers are the override's.** A new network namespace copies the host's maxima, so a
   scenario's compose override sets `net.ipv4.tcp_rmem` on the SUT and `tcp_wmem` on the
   generator, and `load()` holds `socket_buffers` to them. `syslog-stall-kill` caps both at

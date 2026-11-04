@@ -2,8 +2,9 @@
 # VictoriaMetrics' carbon plaintext listener, which the override turns on. The faults are the
 # backend's stop and restart, which make the stream driver redial, netem and a partition on the
 # SUT, and two kills of the backend, which measure the frames the sink counted written that
-# never reached storage (docs/known-gaps/sinks.md, "A stream sink doesn't count the bytes its
-# peer never acknowledged"). The schema is docs/plans/soak-harness.md's "The scenario schema".
+# never reached storage (docs/known-gaps/sinks.md, "A stream sink counts only the sender's share
+# of the bytes its receiver never acknowledged"). The schema is docs/plans/soak-harness.md's "The
+# scenario schema".
 
 name = "graphite-egress"
 description = "generator -> statsd_in (UDP) -> aggregate 10s cumulative -> graphite_out plaintext TCP -> VictoriaMetrics :2003"
@@ -85,9 +86,10 @@ for = "45s"
 
 # A SIGKILL of the backend while windows flow, twice, half a 10 s window apart in phase:
 # the kernel closes its connection, so the sink's next send probes it closed and redials, and
-# each redial fails until the revert starts VictoriaMetrics again. What it ingested and hadn't
-# saved, and anything still in its socket, is gone with nothing counting it; ledger.tail holds
-# the sink's written datapoints to the stored samples, and ledger.windows leaves the gap to it.
+# each redial fails until the revert starts VictoriaMetrics again. The sink counts what its own
+# socket still held unacknowledged; what VictoriaMetrics ingested and hadn't saved, and what its
+# socket held unread, is gone with nothing counting it. ledger.tail holds the sink's written
+# datapoints less the counted ones to the stored samples, and ledger.windows leaves the gap to it.
 [[step]]
 at = "11m15s"
 action = "kill"

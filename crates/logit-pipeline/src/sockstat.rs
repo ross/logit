@@ -1,4 +1,7 @@
-//! Per-socket kernel counters, read straight off a file descriptor this process already owns.
+//! Per-socket kernel counters, read straight off a file descriptor this process already owns: a
+//! listener's receive-side drops and fill ([`meminfo`], [`listen_queue`]), and a stream sink's
+//! unacknowledged send queue and whether its TCP peer still answers ([`send_queue`],
+//! [`tcp_peer_answering`]).
 //!
 //! **`getsockopt`, not procfs.** `/proc/net/udp[6]`'s `drops` column means parsing the whole
 //! netns's socket table and matching our socket by address, or by inode when `SO_REUSEADDR` or a
@@ -25,7 +28,7 @@ pub type RawFd = std::os::fd::RawFd;
 #[cfg(not(unix))]
 pub type RawFd = std::ffi::c_int;
 
-/// The raw descriptor behind `socket`, for [`meminfo`]/[`listen_queue`]. `None` on a platform with
+/// The raw descriptor behind `socket`, for the readers below. `None` on a platform with
 /// no `RawFd`; it exists so that `cfg` lives here rather than in every caller.
 #[cfg(unix)]
 pub fn fd_of<S: std::os::fd::AsRawFd>(socket: &S) -> Option<RawFd> {
@@ -48,7 +51,8 @@ pub fn fd_of<S>(_socket: &S) -> Option<RawFd> {
 /// The values are kernel UAPI: `include/uapi/linux/sock_diag.h` (v6.12) numbers `SK_MEMINFO_*`
 /// from 0 in the order below, `SK_MEMINFO_VARS` still 9; `include/uapi/linux/tcp.h` (v6.12) opens
 /// `struct tcp_info` with eight `__u8`s and four `__u32`s, putting `tcpi_state` at 0,
-/// `tcpi_unacked` at 24, and `tcpi_sacked` at 28 on every architecture. [`listen_queue`]'s
+/// `tcpi_retransmits` at 2, `tcpi_probes` at 3, `tcpi_unacked` at 24, and `tcpi_sacked` at 28 on
+/// every architecture. [`listen_queue`]'s
 /// hardcoded `TCP_LISTEN = 10` (from `include/net/tcp_states.h`, which starts at
 /// `TCP_ESTABLISHED = 1`) can't be asserted: `libc` has no Linux `TCP_LISTEN`.
 ///
@@ -68,6 +72,8 @@ const _: () = {
     assert!((libc::SK_MEMINFO_DROPS as usize) < 9);
 
     assert!(std::mem::offset_of!(libc::tcp_info, tcpi_state) == 0);
+    assert!(std::mem::offset_of!(libc::tcp_info, tcpi_retransmits) == 2);
+    assert!(std::mem::offset_of!(libc::tcp_info, tcpi_probes) == 3);
     assert!(std::mem::offset_of!(libc::tcp_info, tcpi_unacked) == 24);
     assert!(std::mem::offset_of!(libc::tcp_info, tcpi_sacked) == 28);
     // `parse_listen_queue`'s length check covers `tcpi_sacked` alone, so it must be the later.
@@ -88,7 +94,7 @@ pub enum Unavailable {
     NoDescriptor,
     /// Not a Linux build. The non-Linux twins' only answer.
     NotLinux,
-    /// The `getsockopt` failed, and this is what the kernel said. `ENOPROTOOPT` is the
+    /// The `getsockopt` or `ioctl` failed, and this is what the kernel said. `ENOPROTOOPT` is the
     /// kernel-is-too-old case (and the one a sandbox like gVisor gives for an option it does not
     /// implement); `EBADF`/`ENOTSOCK` mean the descriptor is wrong, not the kernel.
     Syscall(std::io::Error),
@@ -128,7 +134,7 @@ impl std::fmt::Display for Unavailable {
         match self {
             Self::NoDescriptor => f.write_str("this platform exposes no raw file descriptor"),
             Self::NotLinux => f.write_str("these counters are Linux-only"),
-            Self::Syscall(err) => write!(f, "getsockopt failed: {err}"),
+            Self::Syscall(err) => write!(f, "the kernel refused the read: {err}"),
             Self::ShortReply { len, needed } => write!(
                 f,
                 "the kernel returned {len} bytes, fewer than the {needed} these fields occupy"
@@ -372,6 +378,84 @@ pub fn listen_queue(_fd: RawFd) -> Result<(u32, u32), Unavailable> {
     Err(Unavailable::NotLinux)
 }
 
+/// The bytes a stream socket has queued to send that the peer hasn't acknowledged, as
+/// `SIOCOUTQ` reports them. On TCP that is `write_seq - snd_una` (`tcp_ioctl`,
+/// `net/ipv4/tcp.c`): bytes sent and unacknowledged plus bytes not yet sent. `Err` for a
+/// non-Linux build, a failed `ioctl`, or a listening socket (`EINVAL`).
+///
+/// **It still reads after the peer resets the connection.** `tcp_reset` purges the write queue
+/// but leaves `write_seq` and `snd_una`, so a socket in `TCP_CLOSE` after a reset reports the
+/// bytes the reset destroyed (`send_queue_still_reads_what_a_reset_destroyed`). A clean close
+/// that the peer read through reads 0.
+///
+/// **On `AF_UNIX` it isn't a loss count.** `unix_outq_len` is `sk_wmem_alloc`, the `truesize` of
+/// skbs sitting on the peer's receive queue, and the peer's close frees them, so it reads 0 once
+/// the peer is gone (`send_queue_of_a_unix_stream_reads_zero_once_the_peer_closes`).
+#[cfg(target_os = "linux")]
+pub fn send_queue(fd: RawFd) -> Result<u32, Unavailable> {
+    let mut queued: libc::c_int = 0;
+    // Linux's `SIOCOUTQ` is `TIOCOUTQ` (`include/uapi/linux/sockios.h`), and `libc` names only
+    // the latter.
+    // SAFETY: `queued` is a live, exclusively-borrowed `c_int`, the type `TIOCOUTQ` writes; an
+    // invalid or non-socket `fd` is reported as `-1`, not undefined behavior.
+    let rc = unsafe { libc::ioctl(fd, libc::TIOCOUTQ, std::ptr::from_mut(&mut queued)) };
+    if rc != 0 {
+        return Err(Unavailable::Syscall(std::io::Error::last_os_error()));
+    }
+    Ok(u32::try_from(queued).unwrap_or(0))
+}
+
+/// Non-Linux twin of [`send_queue`]: `SIOCOUTQ`'s meaning is Linux's.
+#[cfg(not(target_os = "linux"))]
+pub fn send_queue(_fd: RawFd) -> Result<u32, Unavailable> {
+    Err(Unavailable::NotLinux)
+}
+
+/// Whether a connected TCP socket's peer is still answering: no retransmission timeout has fired
+/// since the last ACK (`tcpi_retransmits == 0`), and at most one zero-window or keepalive probe
+/// is outstanding (`tcpi_probes < 2`). `tcp_ack` zeroes the probe count on any ACK that isn't
+/// old, so a receiver that stopped reading but still ACKs the window probes reads as answering,
+/// and a vanished or partitioned host doesn't once its second probe or first retransmission goes
+/// unanswered. The retransmission count resets only on an ACK that advances `snd_una`, so a live
+/// receiver that answers a retransmission with a zero-window ACK reads as not answering. `Err` for a non-Linux build, a failed `getsockopt`, or a short reply.
+#[cfg(target_os = "linux")]
+pub fn tcp_peer_answering(fd: RawFd) -> Result<bool, Unavailable> {
+    // SAFETY: as in `listen_queue`: an all-zero `tcp_info` is a valid value.
+    let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+    // SAFETY: as in `listen_queue`: `info` and `len` are live and exclusively borrowed, and the
+    // pointer is valid for writes of the `len` bytes named alongside it.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_INFO,
+            std::ptr::from_mut(&mut info).cast::<libc::c_void>(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(Unavailable::Syscall(std::io::Error::last_os_error()));
+    }
+    parse_peer_answering(&info, len)
+}
+
+/// [`tcp_peer_answering`]'s reply, without the syscall, split out so it is unit-tested.
+#[cfg(target_os = "linux")]
+fn parse_peer_answering(info: &libc::tcp_info, len: libc::socklen_t) -> Result<bool, Unavailable> {
+    let filled = std::mem::offset_of!(libc::tcp_info, tcpi_probes) + 1;
+    if (len as usize) < filled {
+        return Err(Unavailable::ShortReply { len: len as usize, needed: filled });
+    }
+    Ok(info.tcpi_retransmits == 0 && info.tcpi_probes < 2)
+}
+
+/// Non-Linux twin of [`tcp_peer_answering`]: `TCP_INFO` is Linux's.
+#[cfg(not(target_os = "linux"))]
+pub fn tcp_peer_answering(_fd: RawFd) -> Result<bool, Unavailable> {
+    Err(Unavailable::NotLinux)
+}
+
 /// Turns the free-running, wrapping [`SockMeminfo::drops`] into the per-interval delta a counter
 /// metric wants.
 ///
@@ -534,6 +618,142 @@ mod tests {
         assert!(matches!(err, Unavailable::Syscall(_)), "{err:?}");
     }
 
+    /// A connected loopback pair: `(client, accepted)`.
+    #[cfg(target_os = "linux")]
+    fn tcp_pair() -> (std::net::TcpStream, std::net::TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("should bind loopback");
+        let addr = listener.local_addr().expect("a bound listener has an address");
+        let client = std::net::TcpStream::connect(addr).expect("loopback connect should succeed");
+        let (accepted, _peer) = listener.accept().expect("the connection should be accepted");
+        (client, accepted)
+    }
+
+    /// Writes into `stream` until the kernel refuses more, and returns what it took.
+    #[cfg(target_os = "linux")]
+    fn fill_send_buffer(stream: &mut impl std::io::Write) -> u64 {
+        let chunk = vec![b'x'; 64 * 1024];
+        let mut written = 0;
+        loop {
+            match stream.write(&chunk) {
+                Ok(n) => written += n as u64,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return written,
+                Err(err) => panic!("a write into a live socket failed: {err}"),
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn tcp_info_of(fd: RawFd) -> libc::tcp_info {
+        // SAFETY: as in `listen_queue`.
+        let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+        // SAFETY: as in `listen_queue`.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_INFO,
+                std::ptr::from_mut(&mut info).cast::<libc::c_void>(),
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0, "TCP_INFO on a live TCP socket: {}", std::io::Error::last_os_error());
+        info
+    }
+
+    /// The receiver closes with the client's bytes unread, so its kernel answers with a reset.
+    /// The client's queue was purged, but the ioctl still reports every byte the receiver never
+    /// acknowledged: with what it did acknowledge, all that was written.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn send_queue_still_reads_what_a_reset_destroyed() {
+        use std::os::fd::AsRawFd;
+
+        /// `TCP_CLOSE` from `include/net/tcp_states.h`.
+        const TCP_CLOSE: u8 = 7;
+        let (mut client, accepted) = tcp_pair();
+        client.set_nonblocking(true).unwrap();
+        let written = fill_send_buffer(&mut client);
+        let fd = client.as_raw_fd();
+
+        drop(accepted);
+        crate::test_util::wait_until("the reset to close the client's socket", || {
+            tcp_info_of(fd).tcpi_state == TCP_CLOSE
+        })
+        .await;
+
+        let queued = send_queue(fd).expect("SIOCOUTQ reads a closed TCP socket");
+        let acked = tcp_info_of(fd).tcpi_bytes_acked - 1; // `tcpi_bytes_acked` counts the SYN.
+        assert!(queued > 0, "the receiver's window was full, so bytes were left unacknowledged");
+        assert_eq!(u64::from(queued) + acked, written, "queued {queued}, acked {acked}");
+    }
+
+    /// A receiver that read everything and closed leaves nothing queued.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn send_queue_reads_zero_after_a_close_the_peer_read_through() {
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+
+        /// `TCP_CLOSE_WAIT` from `include/net/tcp_states.h`.
+        const TCP_CLOSE_WAIT: u8 = 8;
+        let (mut client, mut accepted) = tcp_pair();
+        client.write_all(&[b'y'; 1000]).unwrap();
+        accepted.read_exact(&mut [0u8; 1000]).unwrap();
+        drop(accepted);
+        let fd = client.as_raw_fd();
+        crate::test_util::wait_until("the receiver's FIN", || {
+            tcp_info_of(fd).tcpi_state == TCP_CLOSE_WAIT
+        })
+        .await;
+
+        assert_eq!(send_queue(fd).expect("SIOCOUTQ reads a closing TCP socket"), 0);
+    }
+
+    /// On `AF_UNIX` the queue is the bytes charged to the peer's receive queue, and the peer's
+    /// close frees them: nothing is left to count.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn send_queue_of_a_unix_stream_reads_zero_once_the_peer_closes() {
+        use std::os::fd::AsRawFd;
+
+        let (mut sender, receiver) = std::os::unix::net::UnixStream::pair().unwrap();
+        sender.set_nonblocking(true).unwrap();
+        fill_send_buffer(&mut sender);
+        assert!(send_queue(sender.as_raw_fd()).unwrap() > 0, "the receiver's queue is full");
+
+        drop(receiver);
+        assert_eq!(send_queue(sender.as_raw_fd()).unwrap(), 0, "the close freed the queue");
+    }
+
+    /// A receiver that stops reading but stays up ACKs the client's zero-window probes, which
+    /// resets the probe count each time: it reads as answering however long it stays frozen. On
+    /// loopback the ACK lands before the sender counts its probe, so the count sits at 1.
+    /// `tcpi_backoff` rises once per probe the timer sent, so waiting on it waits on probes.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_receiver_that_stopped_reading_still_answers_window_probes() {
+        use std::os::fd::AsRawFd;
+
+        let (mut client, _accepted) = tcp_pair();
+        client.set_nonblocking(true).unwrap();
+        fill_send_buffer(&mut client);
+        let fd = client.as_raw_fd();
+
+        let (mut retransmits, mut probes) = (0, 0);
+        crate::test_util::wait_until("three zero-window probes", || {
+            let info = tcp_info_of(fd);
+            retransmits = retransmits.max(info.tcpi_retransmits);
+            probes = probes.max(info.tcpi_probes);
+            info.tcpi_backoff >= 3
+        })
+        .await;
+
+        assert_eq!(retransmits, 0, "nothing was sent that went unacknowledged past a timeout");
+        assert!(probes < 2, "each probe was answered before the next: {probes} outstanding");
+        assert!(tcp_peer_answering(fd).expect("TCP_INFO reads a live socket"));
+    }
+
     /// The reply parsers, including branches no real kernel reaches. `script/unsafe-check miri`
     /// runs this module by path, so a test here must not need a real fd.
     mod reply_parsing {
@@ -607,6 +827,28 @@ mod tests {
                     "{err:?}"
                 );
             }
+        }
+
+        /// The peer answers only while no retransmission timeout has fired and fewer than two
+        /// probes are outstanding.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn the_peer_answers_while_nothing_is_retransmitted_and_one_probe_at_most_is_out() {
+            // SAFETY: an all-zero `tcp_info` is a valid value, as `listen_queue` states.
+            let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
+            for (retransmits, probes, answering) in
+                [(0, 0, true), (0, 1, true), (0, 2, false), (1, 0, false), (3, 5, false)]
+            {
+                info.tcpi_retransmits = retransmits;
+                info.tcpi_probes = probes;
+                assert_eq!(
+                    parse_peer_answering(&info, 4).expect("4 bytes reaches tcpi_probes"),
+                    answering,
+                    "retransmits={retransmits} probes={probes}"
+                );
+            }
+            let err = parse_peer_answering(&info, 3).expect_err("3 bytes stops before tcpi_probes");
+            assert!(matches!(err, Unavailable::ShortReply { len: 3, needed: 4 }), "{err:?}");
         }
 
         /// The one failure an operator must never be told is their kernel's fault.

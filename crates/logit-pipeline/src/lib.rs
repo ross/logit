@@ -7,7 +7,7 @@
 //! (`docs/design/pipeline-graph.md`'s "Crate layout" section). Keep this crate buildable without
 //! any concrete input/output/transform kind.
 
-// `sockstat`'s `getsockopt` calls are one of the codebase's three raw-`libc` `unsafe` call sites
+// `sockstat`'s `getsockopt` and `ioctl` calls are one of the codebase's three raw-`libc` `unsafe` call sites
 // (docs/adr/out-of-ci-unsafe-verification.md). Denied per crate, not in `[workspace.lints]`: see
 // `logit-inputs/src/lib.rs`'s matching comment for why.
 #![deny(unsafe_op_in_unsafe_fn)]

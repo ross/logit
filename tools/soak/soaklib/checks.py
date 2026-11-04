@@ -1816,8 +1816,9 @@ _SIZE_UNITS = {"B": 1, "KB": 1000, "MB": 1000 ** 2, "GB": 1000 ** 3,
 # generator never counted. Under `at_least_once` the sink then resends the whole batch, and under
 # `at_most_once` it drops the batch `ambiguous_at_most_once`, one drop per such attempt; either
 # way the attempt leaves at most one batch of surplus (crates/logit-outputs/src/stream.rs's module
-# table). A stalled kill, a `kill` inside a `pause` of the SUT, is reported too, and its fault
-# run's loss is held to the bound its connections' buffers allow (`_stalled_kill_bound`).
+# table). A stalled kill, a `kill` inside a `pause` of the SUT, is reported too: the generator
+# must count the unacknowledged bytes the kill destroyed, and its fault run's loss less that
+# count is held to the bound the SUT's receive buffer allows (`_stalled_kill_bound`).
 TCP_REPORTED_ACTIONS = ("stop", "kill", "restart", "exit", "reset")
 TCP_AMBIGUOUS_CLASS = "ambiguous"
 # On an HTTP wire G counts only points the listener answered with a success, which it does once
@@ -3664,22 +3665,30 @@ def stalled_kills(data, service):
             for pause in pauses if pause.start < kill.start < pause.end]
 
 
+# The reason a stream sink counts the bytes its socket held unacknowledged when a receiver's
+# reset or close destroyed them (docs/adr/stream-sink-stalled-connection.md, decision 4).
+UNACKNOWLEDGED = ("logit.output.bytes.dropped", {"reason": "unacknowledged"})
+
+
 def _stalled_kill_bound(led, source, pause, kill, anchors):
-    """`(bound, text)` for a stalled kill on a `tcp` source, or `(None, why)` when it can't be
-    bounded. The kill loses the lines its generator counted after the SUT's last drain: those
-    it read before the pause and never exported, and those every connection's buffers held,
-    which the frozen process never read. A stalled write past `connect_timeout` drops its
-    connection and the redial completes into the frozen listener's accept queue, so each
-    connection the generator opened before the kill holds its own receive buffer on the SUT and
-    send buffer on the generator, up to the source's `socket_buffers` each. The bound is G
-    between the SUT's last drain and the pause, plus that many connections' two buffers in
-    lines at the generator's bytes per line (`logit.output.batch.bytes` over
-    `logit.output.messages`), plus one batch at each edge of the run. Connections are 1 plus the
-    generator sink's `logit.output.reconnects` from the pause to one generator drain past the
-    kill, since a dial is exported at the drain after it."""
+    """`(bound, counted, text)` for a stalled kill on a `tcp` source, or `(None, None, why)`
+    when it can't be bounded. The kill loses the lines its generator counted after the SUT's
+    last drain: those the SUT read before the pause and never exported, those its kernel
+    acknowledged into the receive buffer the frozen process never read (R), and those still in
+    the generator's send queue unacknowledged (U). The generator keeps its one stalled
+    connection, so one buffer pair holds the stall's lines whatever its length, and its sink
+    counts U as `logit.output.bytes.dropped{reason="unacknowledged"}` once the kill's reset
+    reaches it. `counted` is U in lines at the generator's bytes per line
+    (`logit.output.batch.bytes` over `logit.output.messages`), from the generator drains after
+    the kill to one past its revert, since the sink counts it at its next attempt and a count
+    is exported at the drain after it. The bound holds the uncounted rest, lost − U: G between
+    the SUT's last drain and the pause, plus R, at most the source's `socket_buffers` receive
+    bytes in lines, plus one batch at each edge of the run. `logit.output.reconnects` from the
+    pause to the kill's revert is shown, since a redial into the frozen listener's accept queue
+    would hold another buffer pair."""
     buffers = source.get("socket_buffers")
     if not isinstance(buffers, dict):
-        return None, "not bounded: the source names no socket_buffers"
+        return None, None, "not bounded: the source names no socket_buffers"
     gen = led.gens[source.get("service")]
     sinks = source_ids(source, "generator_sink")
     anchor_ts = [t for t, _ in anchors]
@@ -3694,27 +3703,32 @@ def _stalled_kill_bound(led, source, pause, kill, anchors):
     redials = sum(value for sink in sinks
                   for ts, value, _ in gen.counter_points("logit.output.reconnects",
                                                          component=sink)
-                  if pause.start < ts <= kill.start + period)
-    connections = 1 + redials
+                  if pause.start < ts <= kill.start)
     messages = sum(sum(gen.counter_by_life("logit.output.messages", component=sink).values())
                    for sink in sinks)
     written = sum(sum(gen.counter_by_life("logit.output.batch.bytes", component=sink).values())
                   for sink in sinks)
     if not messages or not written:
-        return None, ("not bounded: the generator's sink counted no logit.output.batch.bytes "
-                      "or messages, so its bytes per line are unknown")
+        return None, None, ("not bounded: the generator's sink counted no "
+                            "logit.output.batch.bytes or messages, so its bytes per line are "
+                            "unknown")
     per_line = written / messages
-    held = connections * (buffers["receive"] + buffers["send"]) / per_line
+    name, attrs = UNACKNOWLEDGED
+    k_bytes = sum(value for sink in sinks
+                  for ts, value, _ in gen.counter_points(name, component=sink, **attrs)
+                  if kill.start < ts <= kill.end + period)
+    counted = k_bytes / per_line
+    received = buffers["receive"] / per_line
     batch = led.gen_stats[source.get("service")]["batch"]
-    bound = before + held + 2 * batch
+    bound = before + received + 2 * batch
     text = (f"G {_n(round(before))} from the SUT's last drain at {led.data.offset(last)} to "
             f"the pause, read and never exported or still buffered, + {_n(round(during))} "
-            f"during the {kill.start - pause.start:.0f}s stall; bound {_n(round(bound))} = "
-            f"{_n(round(before))} + {connections} connection(s) ({redials} redial(s)) x "
-            f"({_n(buffers['receive'])} + {_n(buffers['send'])}) bytes at "
-            f"{per_line:.1f} bytes per line ({_n(round(held))}) + 2 edge(s) x one "
-            f"{_n(batch)}-line batch")
-    return bound, text
+            f"during the {kill.start - pause.start:.0f}s stall, {_n(redials)} redial(s) in it; "
+            f"U {_n(k_bytes)} unacknowledged byte(s) counted, {_n(round(counted))} line(s) at "
+            f"{per_line:.1f} bytes per line; R (the receiver's share) uncounted, bound "
+            f"{_n(round(bound))} = {_n(round(before))} + R at most {_n(buffers['receive'])} "
+            f"bytes ({_n(round(received))}) + 2 edge(s) x one {_n(batch)}-line batch")
+    return bound, counted, text
 
 
 def _wire_buckets(data, led, source, combined=None, anchors_out=None):
@@ -3821,8 +3835,8 @@ def check_ledger_wire(data):
     reported windows of faults that can affect that source's wire and at the end. On UDP that
     loss is by design and every affecting window is reported; on TCP F is the listener's counted
     framer drops, only a process end, a `reset`, or a partition that moved an address is
-    reported, a stalled kill's run with its loss held to its buffers' bound
-    (`_stalled_kill_bound`), and every other affecting window is judged with a surplus allowed
+    reported, a stalled kill's run with its loss less the generator's unacknowledged count
+    held to its receive buffer's bound (`_stalled_kill_bound`), and every other affecting window is judged with a surplus allowed
     for its ambiguous attempts (`wire_judgment`); on HTTP G counts acknowledged points against
     W − X, only a kill or an exit is reported, and every other affecting window is judged with
     a surplus allowed for its transport-error attempts (`HTTP_REPORTED_ACTIONS`). See
@@ -4208,7 +4222,8 @@ def _wire_one(data, led, source, instances=None):
         status = FAIL
         lines[:0] = surplus
 
-    # A stalled kill's run is reported, and its loss is held to the bound its buffers allow.
+    # A stalled kill's run is reported, and its loss less the generator's unacknowledged count
+    # is held to the bound the receive buffer allows.
     stalled_parts = []
     if wire_name == "tcp":
         by_run = {}
@@ -4223,22 +4238,40 @@ def _wire_one(data, led, source, instances=None):
         for index, kills in sorted(by_run.items()):
             start, end, _, _, g, wk, _ = runs[index]
             lost = g - wk
-            texts, bound = [], 0.0
+            texts, bound, counted, uncounted_kills = [], 0.0, 0.0, []
             for pause, kill in kills:
-                one, text = _stalled_kill_bound(led, source, pause, kill, anchors)
+                one, k_lines, text = _stalled_kill_bound(led, source, pause, kill, anchors)
                 texts.append(f"{kill.step} inside {pause.step}: {text}")
                 bound = None if one is None or bound is None else bound + one
+                if k_lines is not None:
+                    counted += k_lines
+                    if k_lines <= 0:
+                        uncounted_kills.append(kill.step)
             span = f"[{data.offset(start)}, {data.offset(end)}]"
+            rest = lost - counted
+            head = f"stalled kill {span}: lost {_n(round(lost))}, U {_n(round(counted))} counted"
+            over = False
             if bound is None:
-                part = (f"stalled kill {span}: lost {_n(round(lost))}; " + "; ".join(texts))
-            elif lost > bound:
-                status = FAIL
-                part = (f"stalled kill {span}: lost {_n(round(lost))}, over its bound "
+                part = f"{head}; " + "; ".join(texts)
+            elif uncounted_kills:
+                over = True
+                part = (f"{head}, but the generator counted no unacknowledged bytes after "
+                        f"{', '.join(uncounted_kills)}, though its buffers held lines; "
+                        + "; ".join(texts))
+            elif counted > lost + 2 * batch:
+                over = True
+                part = (f"{head}, more than the {_n(round(lost))} lost plus 2 edge batches: "
+                        "counted loss that was delivered; " + "; ".join(texts))
+            elif rest > bound:
+                over = True
+                part = (f"{head}, {_n(round(rest))} uncounted, over its bound "
                         f"{_n(round(bound))}; " + "; ".join(texts))
             else:
-                part = (f"stalled kill {span}: lost {_n(round(lost))}, within its bound "
-                        f"{_n(round(bound))}, uncounted by design; " + "; ".join(texts))
-            if lost > (bound if bound is not None else lost):
+                part = (f"{head}, {_n(round(rest))} uncounted within its bound "
+                        f"{_n(round(bound))}: U counted, R (the receiver's share) uncounted; "
+                        + "; ".join(texts))
+            if over:
+                status = FAIL
                 lines.insert(0, part)
             else:
                 lines.append(part)
@@ -6457,15 +6490,26 @@ def tail_spans(data, sink, interval, period):
             for f in data.faults if f.action == "kill" and f.on == one.get("backend")]
 
 
+# How far U, read as datapoints at the sink's mean bytes per datapoint, may exceed M − S in
+# `ledger.tail`: a carbon line's length varies with its path and value, so U's lines can be
+# shorter or longer than the mean.
+TAIL_U_ROUNDING = 0.05
+
+
 def check_ledger_tail(data):
     """Under a `[[ledger.sink]]`'s `kill_unflushed`, per SUT life: M, the datapoints the sink
     counted written (`logit.output.datapoints`, one per sample whether a frame holds one or many),
     against S, the distinct `(series, timestamp)` samples its export holds in that life
     (`stored_samples_by_life`). The sink writes one datapoint per sample (scenario.py's
     `TAIL_SINK_KINDS`) and a resend rewrites the same sample, so M − S is what it counted written
-    and the backend never stored: the frames a stream sink can't count (docs/known-gaps/sinks.md),
-    with what the backend held in memory when killed. Under a cumulative `aggregate` V and
-    `ledger.egress` can't see it, since the next window's total covers a lost one. 0 passes; a life
+    and the backend never stored. U, the sink's `logit.output.bytes.dropped{reason=
+    "unacknowledged"}` in the life read as datapoints at its mean bytes per datapoint, is the
+    part the sink counted: what its socket still held when the backend's reset destroyed it.
+    M − S − U is the rest, which a stream sink can't count (docs/known-gaps/sinks.md): what the
+    backend's kernel acknowledged and it never read, and what it held in memory when killed. U
+    past M − S by more than `TAIL_U_ROUNDING` of U FAILs. Under a cumulative `aggregate` V and
+    `ledger.egress` can't see the loss, since the next window's total covers a lost one. M − S − U
+    of 0 passes; a life
     holding a kill of the sink's backend passes up to its bound, the datapoints the sink counted in
     the drains from `kill_unflushed` plus one aggregate interval before each kill to two drain
     periods after it: what the backend had ingested and not yet saved, or never read from its
@@ -6493,10 +6537,23 @@ def check_ledger_tail(data):
         counted = led.sut.counter_by_life("logit.output.datapoints", component=sink)
         stored = stored_samples_by_life(led.series[sink], led.life_starts)
         spans = tail_spans(data, sink, led.interval, period)
+        name, attrs = UNACKNOWLEDGED
+        unacked = led.sut.counter_by_life(name, component=sink, **attrs)
+        sent_bytes = sum(led.sut.counter_by_life("logit.output.batch.bytes",
+                                                 component=sink).values())
+        per_point = sent_bytes / sum(counted.values()) if sum(counted.values()) else 0.0
         parts = []
         for life in led.lives:
             m, v = counted.get(life, 0), stored.get(life, 0)
-            lost = m - v
+            k_bytes = unacked.get(life, 0)
+            k = round(k_bytes / per_point) if per_point else 0
+            if k_bytes and not per_point:
+                status = FAIL
+                parts.append(f"life {life}: {_n(k_bytes)} unacknowledged byte(s) with no "
+                             "logit.output.batch.bytes to read them as datapoints")
+            k_text = (f", U {_n(k_bytes)} unacknowledged byte(s) counted, {_n(k)} datapoint(s) "
+                      f"at {per_point:.1f} bytes each" if k_bytes else "")
+            lost = m - v - k
             kills = [(a, b, kill) for a, b, kill in spans
                      if vm.life_at(led.life_starts, kill.start) == life]
             bound = sum(value for ts, value, _ in written
@@ -6507,15 +6564,24 @@ def check_ledger_tail(data):
                 f"counted from {data.offset(a)} to {data.offset(b)}" for a, b, kill in kills)
             if life in led.killed and life != led.final:
                 verdict = "reported: a killed SUT life's last drain doesn't hold all of M"
+            elif lost < 0 and m >= v and -lost <= math.ceil(k * TAIL_U_ROUNDING):
+                verdict = (f"every lost datapoint counted, U's {_n(-lost)} past the "
+                           f"{_n(m - v)} lost within {TAIL_U_ROUNDING:.0%} of U, the error of "
+                           "reading bytes as datapoints at their mean length")
+            elif lost < 0 and m >= v:
+                status = FAIL
+                verdict = (f"U exceeds the {_n(m - v)} lost by {_n(-lost)}, past "
+                           f"{TAIL_U_ROUNDING:.0%} of U: counted unacknowledged datapoints the "
+                           "backend stored")
             elif lost < 0:
                 status = FAIL
                 verdict = (f"a surplus: {_n(-lost)} stored sample(s) the sink never counted "
                            "written")
             elif lost == 0:
-                verdict = "exact"
+                verdict = "every lost datapoint counted" if k else "exact"
             elif kills and lost <= bound:
-                verdict = (f"tail loss within the bound {_n(bound)}, uncounted by design: "
-                           "written, never stored")
+                verdict = (f"tail loss within the bound {_n(bound)}, uncounted: what the "
+                           "backend acknowledged and never stored")
             elif kills:
                 status = FAIL
                 verdict = f"lost past the bound {_n(bound)}"
@@ -6523,7 +6589,8 @@ def check_ledger_tail(data):
                 status = FAIL
                 verdict = "uncounted loss in a life with no kill of the backend"
             part = (f"life {life}{' (final)' if life == led.final else ''}: M {_n(m)} − S "
-                    f"{_n(v)} = {_n(lost)}, {verdict}" + (f" ({each})" if each else ""))
+                    f"{_n(v)}" + (f" − U {_n(k)}" if k_bytes else "") + f" = {_n(lost)}"
+                    + k_text + f", {verdict}" + (f" ({each})" if each else ""))
             parts.append(part)
             lines.append(f"{sink}: {part}")
         groups.append(f"{sink}: " + "; ".join(parts))
@@ -8223,6 +8290,10 @@ def _balanced_drop(led, service, name, component, reason, batch_drops, event_dro
                                    and component not in led.sinks)
     if name == "logit.component.bytes.dropped":
         return True
+    if (sinks_side and name == UNACKNOWLEDGED[0] and reason == UNACKNOWLEDGED[1]["reason"]
+            and any(one.get("id") == component and "kill_unflushed" in one
+                    for one in led.data.ledger.get("sink") or [])):
+        return True  # U, which `ledger.tail` judges
     if (name == "logit.component.events.dropped" and (component, reason) in batch_drops
             and _balanced_drop(led, service, "logit.component.batches.dropped", component,
                                reason, batch_drops, event_drops)):
