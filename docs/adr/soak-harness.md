@@ -991,13 +991,15 @@ it opens and replays its unpersisted frames under the identities that sent them,
 restarts are enough to fill a small table. `ledger.hop` and `ledger.summary`'s end-to-end bound
 allowed no duplicate for it, and `native-hop-identities` reaches one.
 
-- **One sender evicts only a retired identity, until a replay spans more identities than the
-  table holds.** Every frame of an identity is sent before any frame of a later one, and a
-  replay refreshes each identity it touches, so a graceful restart, or a kill with its spool's
-  cursor persisted since, evicts an identity that sends nothing again. A crash loop whose lives
+- **One sender evicts an identity that sends nothing again, until a crash loop's unpersisted
+  span reaches the table's capacity.** Every frame of an identity is sent before any frame of a
+  later one, and a replay refreshes each identity it touches, so a graceful restart, or a kill
+  with its spool's cursor persisted since, evicts a retired identity. A crash loop whose lives
   each die before their first cursor persist leaves every life's commits to the next one's
-  replay; once that replay names more identities than the table holds, the first is gone, and
-  each one it takes back evicts the next it replays, so the whole replay is forwarded again.
+  replay. Once the span of lives to replay equals the table's capacity, the next life's own
+  identity evicts the oldest identity of that span, which the life after it replays again; once
+  that replay names more identities than the table holds, the first is gone, and each one it
+  takes back evicts the next it replays, so the whole replay is forwarded again.
 - **Judged from `logit.input.senders.evicted`.** A life's own identity evicts at most one, when
   its first frame takes a slot; any other eviction counted at the far SUT from the life's start
   to its replay's window's end (its first drain that counted a replay plus two of the far SUT's
@@ -1012,7 +1014,12 @@ allowed no duplicate for it, and `native-hop-identities` reaches one.
   persists its cursor only once `checkpoint_interval` has passed since it opened, so
   `ledger.replay`'s band for the hop sink, one interval at the life's last commit rate, held
   only for a life that outlived it. For a life killed sooner the commit term is every batch it
-  delivered, its own replay included, plus its delivered rate after its last drain. The first
+  delivered, its own replay included, plus its delivered rate after its last drain. That holds
+  only while the spool rolled no segment, because `DiskQueue::roll_read_cursor` persists the
+  cursor at every segment boundary whatever the interval, and the harness can't see a roll
+  (`buffer.disk.segments` is a gauge sampled at drains). A scenario using the band sets
+  `segment_bytes` large enough that no roll happens, as `native-hop-identities` does with
+  512MiB. The first
   `native-hop-identities` run FAILed three lives of its crash loop on the old band, each replay
   about one life's commits over it.
 

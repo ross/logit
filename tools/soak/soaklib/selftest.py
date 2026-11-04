@@ -9789,6 +9789,22 @@ def _two_sut_checks():
                in evicted["ledger.summary"].detail,
                f"ledger.summary allows the same frames end to end, got "
                f"{evicted['ledger.summary']}")
+        # The backend's surplus over G decides ledger.summary: 200 is inside the 300 eviction
+        # allowance, 400 is past it.
+        inside = hop_row("two-logit-evicted-inside", kill_on="logit", collector_lives=1,
+                         extra=2200, evicted=((215, 2),))
+        expect(inside["ledger.summary"].status == checks.PASS
+               and "V 60,200 <= G − counted + evicted 60,300"
+               in inside["ledger.summary"].detail,
+               f"a backend surplus inside the eviction allowance passes, got "
+               f"{inside['ledger.summary']}")
+        past = hop_row("two-logit-evicted-past", kill_on="logit", collector_lives=1,
+                       extra=2400, evicted=((215, 2),))
+        expect(past["ledger.summary"].status == checks.FAIL
+               and "V 60,400 > G − counted + evicted 60,300, a surplus of 100"
+               in past["ledger.summary"].detail,
+               f"a backend surplus past the eviction allowance FAILs, got "
+               f"{past['ledger.summary']}")
         own = hop_row("two-logit-evicted-own", kill_on="logit", collector_lives=1, extra=1250,
                       evicted=((215, 1),))
         expect(own["ledger.hop"].status == checks.FAIL
