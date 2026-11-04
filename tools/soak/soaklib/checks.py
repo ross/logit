@@ -638,7 +638,7 @@ def check_timeline(data):
             for record in actions
             if record["event"] == "revert" and record.get("started_in_window")]
     gone += [f"{record.get('step')} ({record.get('action')} on {record.get('on')}): the process "
-             "exited inside the window, so nothing was restored"
+             f"exited inside the window (status {record.get('status')}), so nothing was restored"
              for record in actions
              if record["event"] == "revert" and record.get("exited_in_window")]
     if lines:

@@ -281,16 +281,20 @@ def prlimit_apply(ctx, step):
 
 
 def prlimit_revert(ctx, step):
-    """Sets the limit the apply found back, unless the process started again inside the window,
-    whose new process has the container's own limit: the record then says so
-    (`started_in_window`) and sets nothing. An apply that failed left nothing to restore."""
+    """Sets the limit the apply found back, unless the process ended or started again inside
+    the window. A running container with a new `StartedAt` has the container's own limit
+    (`started_in_window`); one that isn't running has no process to restore
+    (`exited_in_window`, with its status). Either sets nothing. An apply that failed left
+    nothing to restore."""
     saved = ctx.state.pop(step.id, None)
     if saved is None:
         return {"rc": 0, "stderr": "", "restored": False}
     state = (ctx.docker.inspect(ctx.ids[step.on]) or {}).get("State") or {}
-    if state.get("Status") != "running" or state.get("StartedAt") != saved["started_at"]:
-        return {"rc": 0, "stderr": "", "restored": False, "started_in_window": True,
+    if state.get("Status") != "running":
+        return {"rc": 0, "stderr": "", "restored": False, "exited_in_window": True,
                 "status": state.get("Status")}
+    if state.get("StartedAt") != saved["started_at"]:
+        return {"rc": 0, "stderr": "", "restored": False, "started_in_window": True}
     soft, hard = saved["found"]
     result = ctx.docker.run_oneshot(prlimit_argv(ctx, step, f"--nofile={soft}:{hard}"))
     return _record(result, restored=result.rc == 0, nofile=saved["found"])
@@ -754,8 +758,9 @@ ACTIONS = {
     ),
     # A limit on the SUT fails its accepts, opens, and dials once its descriptors reach it: a
     # TCP or HTTP sender's connection waits in the accept queue, a tailer's new file waits for
-    # the next scan, and a sink's redial is retried. It loses nothing on any of them, so no wire
-    # reports its window; it never touches a bound UDP socket.
+    # the next scan, and a sink's redial is retried. It loses nothing on a TCP or HTTP wire, so
+    # those judge its window; a file, cri, or Kafka wire reports it like any window there and
+    # judges the run against the replay band. It never touches a bound UDP socket.
     "prlimit": Action(
         apply=prlimit_apply,
         revert=prlimit_revert,

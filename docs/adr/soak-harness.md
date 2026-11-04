@@ -883,12 +883,13 @@ container's ulimits, and the step needs no `label=disable`.
   it: a generator's redials, or a tailer's opens at its writer's rotations. An `[[expect]]` row
   on `logit.process.fds.limit` confirms the limit landed.
 - **A new process ends the fault.** A process started inside the window has the container's own
-  limit, so the revert then sets nothing and records `started_in_window`, which `timeline`
-  reports.
-- **Judged, never reported.** A limited listener leaves a connection in the accept queue, a
-  tailer finds an unopened file at its next scan, and a sink retries a failed dial, so no wire
-  reports the window. A file wire's retention guard bounds it as a pause: the tailer keeps what
-  it has open and can open nothing its writer creates.
+  limit, so the revert then sets nothing and records `started_in_window`; one that isn't running
+  has no process to restore, and the revert records `exited_in_window`. `timeline` reports both.
+- **Judged on TCP and HTTP, reported on the file, cri, and Kafka wires.** A limited listener
+  leaves a connection in the accept queue and a sink retries a failed dial, so the TCP and HTTP
+  wires judge the window. The file, cri, and Kafka wires report it like every window there and
+  judge the run against the replay band. A file wire's retention guard bounds it as a pause: the
+  tailer keeps what it has open and can open nothing its writer creates. UDP is not affected.
 - **On a SUT only, and never in a `[random]` schedule**, which can't set `nofile`.
 
 ## Amendment: a `cgroup` step sets a CPU quota or a memory throttle for its window (2026-11-03)
