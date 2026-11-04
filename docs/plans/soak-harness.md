@@ -6932,6 +6932,41 @@ What the runs showed about `logit` and the harness:
 - **Self-test**: 2,375 expectations after the merges. Each new rule was reverted in turn and
   failed at least one expectation; the PR lists them.
 
+### W36: the `datadog_trace` pair against an Agent stand-in, in spans (2026-11-04)
+
+W36 adds the `datadog_trace` stand-in shape, `soaklib/msgpack.py`, the span ledger, and
+`standin-datadog-trace`. The scenario ran twice at its default duration on the development host,
+one after the other, against `logit:soak-w36` built from `soak/w36` (W36 changes no Rust).
+
+| Run | Scenario | Verdict | Highlights |
+|---|---|---|---|
+| `20261104T185238Z` | `standin-datadog-trace` | PASS | the SUT kill last, so every cued row fell in the killed life and `ledger.egress` only reported its gap, 8,820 against 9,000 counted drops |
+| `20261104T191140Z` | `standin-datadog-trace` | PASS | the kill first; the final life's W − X − V 9,000 equal to the sink's `records.dropped`, 6,000 `rejected` and 3,000 `oversize`; 257,550 distinct spans accepted of G 266,550; 240 spans stored under the `503` and resent, no accepted copy; every class signature at the sink |
+
+What the runs showed about `logit` and the harness:
+
+- **The tracer-API sink reads every cued row as its table says.** The `400`, `413`, and `302`
+  steps each dropped all 100 of their requests, 30 spans each, counted under
+  `records.dropped`, `oversize` for the `413`. The `404`, `401`, `415`, and `429` steps each
+  held the head through 8 attempts in 10 s at the 2 s retry cap, a `retrying` line naming
+  `refused` or `clean`, with nothing dropped. The `408`, `501`, `503`, and the reset were
+  retried as `ambiguous`; the `503` steps stored 240 spans that the resends then stored again
+  under a `2xx`, which is why V's accepted writes held no copy. A stop of the stand-in was 4
+  `connect_error` attempts, `clean`. No product defect.
+- **The kill belongs first.** A killed life's egress gap is reported, never judged, since the
+  kill takes the life's last telemetry interval: in the second run life 0 read W − X − V = −210,
+  its last drain's sends uncounted. The first run put the kill after the cues, so none of the
+  rows the scenario exists for was judged at egress. A measurement fix: moving the kill to the
+  cycle's start judged them in the final life, exactly.
+- **The listener never answered busy.** The SUT sink's default buffer absorbed each 10 s hold,
+  138 batches at most, so `datadog_trace_in` sent every batch without its 2 s busy wait and the
+  `503` path stayed unexercised. The generator's 50-batch queue overflowed only across the SUT
+  kill, 172 batches counted `overflow_newest` at its writer, loss outside G.
+- **Self-test**: 3,270 expectations. Reverting each new rule fails its case: the egress loss
+  and surplus verdicts, the summary's terms and its distinct-span bound, the stand-in's
+  `rejected` and `oversize` counts, the six span-relay scenario rules, and the msgpack reader's
+  length, depth, container-key, and trailing-byte bounds.
+
 ### W35: the native hop over TLS, under RTT, and past the sender table (2026-11-04)
 
 W35 adds `native-hop-tls`, `native-hop-rtt`, and `native-hop-identities`, `ledger.hop`'s and
