@@ -1023,7 +1023,8 @@ allowed no duplicate for it, and `native-hop-identities` reaches one.
   cursor at every segment boundary whatever the interval, and the harness can't see a roll
   (`buffer.disk.segments` is a gauge sampled at drains). The band therefore requires the hop
   sink to declare `segment_bytes`, set large enough that no roll happens, as
-  `native-hop-identities` does with 512MiB; a sink that doesn't gets the one-interval band, and
+  `native-hop-identities` does with 512MiB. The declaration is the scenario's assertion: the
+  harness doesn't check its size. A sink that doesn't declare one gets the one-interval band, and
   the row says no `segment_bytes` is set. The first
   `native-hop-identities` run FAILed three lives of its crash loop on the old band, each replay
   about one life's commits over it.

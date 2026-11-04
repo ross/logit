@@ -2383,8 +2383,8 @@ the other.
   never persisted, and in a crash loop each life's replay carries the one before (W35). That
   assumes the spool rolled no segment, since `DiskQueue::roll_read_cursor` persists the cursor
   at every segment boundary; the rule requires the hop sink to declare `segment_bytes`, large
-  enough that no roll happens, as `native-hop-identities` does with 512MiB, and a sink that
-  doesn't gets the one-interval band.
+  enough that no roll happens, as `native-hop-identities` does with 512MiB (the harness takes
+  the size on trust), and a sink that doesn't gets the one-interval band.
   The first two `native-hop` runs found both terms: a kill inside `collector`'s stop replayed 55
   batches over the queue, 50 it received in the 5 s before the kill and 5 committed before the
   stop and never persisted.

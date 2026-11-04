@@ -1521,7 +1521,7 @@ def component_duration(text, component, key):
 
 
 def component_bytes(text, component, key):
-    """A byte-size field of one component in a YAML text (`512MiB`, `64KiB`, `1GB`, or a bare
+    """A byte-size field of one component in a YAML text (`512MiB`, `64KiB`, `1GiB`, or a bare
     count), in bytes, or None."""
     units = {"": 1, "B": 1, "KiB": 1024, "MiB": MIB, "GiB": 1024 * MIB, "KB": 1000,
              "MB": 1000 ** 2, "GB": 1000 ** 3}
@@ -6825,7 +6825,8 @@ def check_ledger_replay(data):
     the cursor at every segment boundary whatever the interval, and the harness can't see a
     roll (`buffer.disk.segments` is a gauge sampled at drains). The band therefore requires the
     sink to declare `segment_bytes`, which the scenario sets large enough that no roll happens;
-    a sink that doesn't gets the one-interval band, and the row says so."""
+    the declaration is the scenario's assertion, and the harness doesn't check its size. A sink
+    that doesn't declare one gets the one-interval band, and the row says so."""
     if _overlapped(data):
         return _per_instance(data, check_ledger_replay)
     led = _ledger(data)
