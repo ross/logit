@@ -2378,6 +2378,9 @@ the other.
   averages low over it), and
   t from its last drain to the `docker kill`'s return, replayed − queued is in
   [−(delivered × t) − 1, received × t + the commit rate × the checkpoint interval + 1].
+  A spool persists only once the interval has passed since it opened, so for a life killed
+  sooner after its start the commit term is every batch it delivered, plus delivered × t: it
+  never persisted, and in a crash loop each life's replay carries the one before (W35).
   The first two `native-hop` runs found both terms: a kill inside `collector`'s stop replayed 55
   batches over the queue, 50 it received in the 5 s before the kill and 5 committed before the
   stop and never persisted.
@@ -6899,6 +6902,58 @@ What the runs showed about `logit` and the harness:
   the stopped stand-in, which never reach the record, as in W9a.
 - **Self-test**: 2,375 expectations after the merges. Each new rule was reverted in turn and
   failed at least one expectation; the PR lists them.
+
+### W35: the native hop over TLS, under RTT, and past the sender table (2026-11-04)
+
+W35 adds `native-hop-tls`, `native-hop-rtt`, and `native-hop-identities`, `ledger.hop`'s and
+`ledger.summary`'s allowance for a replay into a full sender table, and the hop sink's replay
+band for a life killed inside its first checkpoint. Each ran once at its default duration on the
+development host, one after the other, against `logit:soak-w35` built from `soak/w35` before it
+merged `soak/w34` and `main` (W35 changes no Rust; `main`'s merge brought `prometheus_in`'s busy
+answer, which none of the three runs). Item 32 assumed `max_connections:` sizes `logit_in`'s
+table; it does, at `max_connections + max_connections / 4` identities
+(`crates/logit-inputs/src/logit/senders.rs`), each eviction counted
+`logit.input.senders.evicted`.
+
+| Run | Scenario | Verdict | Highlights |
+|---|---|---|---|
+| `20261104T174012Z` | `native-hop-tls` | PASS, rescored | three probes served generations 2, 2 (after the broken rotation), and 4; two server reloads, one failure, one client reload, each `notAfter` a day up; a reconnect after `collector`'s restart and 7 resends after `logit`'s kill; `ledger.hop` −1,400 within [−10,000, 816]; G 1,691,700, V 1,691,500 |
+| `20261104T175703Z` | `native-hop-rtt` | PASS | `in_flight` and `window` at 4 under both long delays, at most 1 under the 50 ms control; the spool's backlog rose 909 batches in 150 s at 1 s and 249 in 120 s at 500 ms and drained to 1 after each; `ledger.hop` 0; G = W = V = 1,571,700 |
+| `20261104T181321Z` | `native-hop-identities` | PASS, rescored | `senders` 5 at most; evictions 0 at capacity, 1 at the sixth identity, 7 in the last replay, 13 over the run; 2,806 resends; `ledger.hop` −315,300 within [−655,255, 3,732], life 11's 957 replayed frames allowed; V 2,007,300 against G 1,751,800 plus that allowance |
+
+What the runs showed about `logit` and the harness:
+
+- **A probe of `logit_in` is a `connection_error`.** The probe completes its TLS handshake and
+  closes with no `Hello`, which `logit_in` diagnoses as "connection closed before sending
+  Hello", once per probe. `no-connection-errors` FAILed on those 3, and the run was rescored
+  against rows of one per probe over the run and none around the restart and the kill, the
+  handshakes that matter. A measurement fix: no handshake of `logit`'s failed.
+- **The window bounds the hop as the arithmetic says.** `statsd_in` hands the hop 10 batches a
+  second, one frame each. At 1 s of delay 4 frames a round trip carry about 4 a second, and the
+  backlog rose 6.1 a second; at 500 ms, about 8, and it rose 2.1 a second. At 50 ms the window
+  carries 80 a second, and `in_flight` never read above 1. Nothing was lost or forwarded twice.
+- **One sender evicts a retired identity, and only a crash loop changes that.** Five graceful
+  restarts made six identities, and the sixth evicted the oldest with nothing more to send: no
+  duplicate. In the crash loop each life replayed every frame the loop had committed, its
+  replay deduplicated while the table held all its identities (826 resends in the fifth life's
+  first drain). The sixth life's replay spanned six identities in a table of five: the first
+  was gone, and each one it took back evicted the next it replayed, so `collector` forwarded
+  the whole replay again, 275,400 events in one drain with no resend and 7 evictions. That is
+  the duplicate ADR `native-hop-identity-and-sequence` accepts for an evicted sender, made a
+  whole replay's worth by LRU order; at the default 1,280 identities one sender would need
+  1,281 lives with no cursor persist to reach it. Not a defect, but an operator with a small
+  `max_connections:` and crash-looping senders should know it.
+- **`ledger.replay` read a crash loop as replaying too much.** Its band allowed one checkpoint
+  interval of commits at the life's last commit rate, and lives 9 to 11 replayed 693 to 957
+  batches against bands of at most 657. A spool persists only once the interval has passed since it
+  opened, so a life killed 15 s in never persisted, and each replay carried the one before.
+  The band now takes every batch such a life delivered, and the run, rescored, passes with each
+  replay within about 50 batches of the life's commits plus its queue. A harness fix: every
+  replay matched what the spool's persist rule predicts.
+- **Self-test**: 3,127 expectations. Reverting the eviction allowance fails its passing case
+  and the `ledger.summary` text case; reverting the replay band's crash-loop term fails its
+  case. The eviction rule's one-eviction and late-eviction cases, and the replay band's
+  outlived-checkpoint case, FAIL as they should with each rule in place.
 
 ### W34: slowloris and half-open peers on a TCP and an HTTP listener (2026-11-04)
 

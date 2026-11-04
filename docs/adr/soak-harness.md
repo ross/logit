@@ -1008,6 +1008,13 @@ allowed no duplicate for it, and `native-hop-identities` reaches one.
 - **An upper bound, not a count.** `logit_in` can't tell a forward of an identity it no longer
   holds from a new one, and exports nothing per frame, so the row can't count the duplicates;
   the replayed frames bound them, the never-delivered backlog among them included.
+- **A life killed inside its first checkpoint replays everything it committed.** A spool
+  persists its cursor only once `checkpoint_interval` has passed since it opened, so
+  `ledger.replay`'s band for the hop sink, one interval at the life's last commit rate, held
+  only for a life that outlived it. For a life killed sooner the commit term is every batch it
+  delivered, its own replay included, plus its delivered rate after its last drain. The first
+  `native-hop-identities` run FAILed three lives of its crash loop on the old band, each replay
+  about one life's commits over it.
 
 ## Amendment: a killed life's requests answered after its last drain are reported (2026-11-04)
 
