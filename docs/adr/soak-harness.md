@@ -891,6 +891,38 @@ container's ulimits, and the step needs no `label=disable`.
   it has open and can open nothing its writer creates.
 - **On a SUT only, and never in a `[random]` schedule**, which can't set `nofile`.
 
+## Amendment: a `cgroup` step sets a CPU quota or a memory throttle for its window (2026-11-03)
+
+No fault reached what a process does when it gets less CPU than its load costs, or when the
+kernel reclaims from it: a receive queue that fills while its reader waits for a share, a
+flush tick that runs late, a bounded queue that holds memory where it should. A `cgroup` step
+writes `cpu.max` (from `cpu`, CPUs per 100 ms period) or `memory.high` (from `memory_high`) in
+the SUT container's own cgroup, `system.slice/docker-<id>.scope` under Docker's systemd driver,
+through a one-shot of the netem image with the host's `/sys/fs/cgroup` bound read-write and
+`--security-opt label=disable`, which SELinux requires for the write. The path comes from the
+cgroup v2 line of the process's `/proc/<pid>/cgroup` on the host and must name the container's
+full id, else the step fails. The apply records what the file held, writes, and reads back, and
+fails on a read-back that differs; the revert writes what it found back.
+
+- **Not `docker update`.** `--memory` can't return a container to unlimited, and `--cpus` is
+  kept in the container's config and comes back on its next start, so a step couldn't end its
+  own fault.
+- **A new process ends the fault.** A start inside the window makes the scope again with the
+  container's own settings, so the revert writes nothing and records `started_in_window`; a
+  container not running at the revert lost its scope with its process, and the revert writes
+  nothing and records `exited_in_window`. `timeline` reports either.
+- **Excused as a pause is.** Every thread in the cgroup shares the quota or the throttle, the
+  HEALTHCHECK's `logit ready` included, so the window excuses `ready`, `progress` and its drain
+  gap, and UDP wire loss; TCP and HTTP windows are judged, since a slowed listener leaves its
+  lines in the sender's or the accept queue, and a file wire's retention guard bounds it as a
+  pause.
+- **`memory.high`, not `memory.max`.** Over `memory.high` the kernel throttles and reclaims and
+  never kills, so a scenario can show that a `buffer:` bound bounds memory with no exit to
+  excuse. `memory.max` ends in an OOM kill, which `exit` FAILs; an expected-OOM excuse waits for
+  a reason to want one.
+- **On a SUT only, and never in a `[random]` schedule**, which can't set `cpu` or
+  `memory_high`.
+
 ## Amendment: a backend kill is allowed on a tailed sink, and `ledger.tail` measures it (2026-11-03)
 
 A `kill` was for the SUT only. A stream sink can't count what it wrote that its receiver dies

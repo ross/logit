@@ -969,7 +969,14 @@ the operator-facing account of all of this.
   fault's own opens fill it: eight generator redials after an idle close, with `[[expect]]` rows
   on `logit.input.accept.errors{reason="resource"}` in the window and none after, and a tailer's
   opens at its writer's rotations, with rows on its failed directory listings; each asserts that
-  `logit.process.fds.limit` read the limit, and neither may lose a line. `tail-copytruncate` rotates a never-rotating writer's file with `copytruncate` steps (a
+  `logit.process.fds.limit` read the limit, and neither may lose a line. `cpu-quota` and
+  `memory-high` starve the SUT through its own cgroup (a `cgroup` step, a one-shot with
+  `/sys/fs/cgroup` bound and `label=disable` writing `cpu.max` or `memory.high` and writing back
+  what it found), whose window excuses what a pause's does: a UDP flood under 0.02 CPUs, with
+  `[[expect]]` rows on the kernel's counted drops inside it and on a
+  flush and a delivery in every drain after it, and `sink-outage-block`'s outage under a
+  `memory.high` a margin above what its bounded queues cost, with a maximum on
+  `logit.process.memory.resident.bytes`. `tail-copytruncate` rotates a never-rotating writer's file with `copytruncate` steps (a
   one-shot container copies and truncates it, recording the lines lost between the two) while
   the SUT runs, is stopped, and is killed, compresses finished copies with `gzip` steps, and
   restores one under a new inode with a `replace` step, so content claims, rejected resumes, and

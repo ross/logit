@@ -93,8 +93,8 @@ STANDIN_ROLES = {"standin": STANDIN_ROLE}
 # Every action the scenario schema accepts. faults.py implements them; the names must match its
 # ACTIONS.
 ACTION_NAMES = ("netem", "pause", "stop", "kill", "restart", "partition", "reset", "prlimit",
-                "mark", "exit", "respond", "signal", "rename", "rotate", "probe", "copytruncate",
-                "gzip", "replace")
+                "cgroup", "mark", "exit", "respond", "signal", "rename", "rotate", "probe",
+                "copytruncate", "gzip", "replace")
 # The actions that take `port`: a `probe`, which needs the listener's, and a `reset`, which
 # closes only the connections whose local or remote port it is, and every one without it.
 PORT_ACTIONS = ("probe", "reset")
@@ -108,6 +108,8 @@ SUT_ONLY_ACTIONS = {
     "exit": "an expected exit is one the SUT's own config causes",
     "prlimit": ("the checks score its window on the SUT's own listeners, files, and sinks, and "
                 "a generator's failed dials have no rule"),
+    "cgroup": ("the checks score its window on the SUT's own listeners and sinks, and a slowed "
+               "generator's loss has no rule"),
 }
 # A `prlimit` step's `nofile`: the open-files limit, soft and hard, it sets on the SUT's process
 # for its window. Below `PRLIMIT_MIN_NOFILE` the process can't open the stdio and runtime
@@ -115,6 +117,18 @@ SUT_ONLY_ACTIONS = {
 # kernel refuses the hard limit.
 PRLIMIT_MIN_NOFILE = 8
 PRLIMIT_MAX_NOFILE = 1048576
+# A `cgroup` step's keys, one per step: `cpu`, the CPUs `cpu.max` allows per period, and
+# `memory_high`, the `memory.high` throttle as a whole number with a `K`, `M`, or `G` suffix
+# (powers of 1024, as the kernel reads them). `CGROUP_MIN_CPU` is the kernel's least quota,
+# 1 ms per 100 ms period. Below `CGROUP_MIN_MEMORY_HIGH` the process can't hold its own
+# binary and runtime, so it does nothing but reclaim.
+CGROUP_KEYS = ("cpu", "memory_high")
+CGROUP_MIN_CPU = 0.01
+CGROUP_MAX_CPU = 1024
+CGROUP_MIN_MEMORY_HIGH = 16 * 1024 ** 2
+CGROUP_MAX_MEMORY_HIGH = 1024 ** 4
+_MEMORY_HIGH = re.compile(r"^([1-9][0-9]*)([KMG])$")
+_MEMORY_UNITS = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}
 # The `SUT_ONLY_ACTIONS` allowed on a scrape wire's generator: it sends nothing, so a kill
 # loses only the increments after the SUT's last scrape, which `ledger.wire` bounds per life.
 SCRAPED_GENERATOR_ACTIONS = ("kill",)
@@ -230,7 +244,8 @@ _TARGET_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 PRIVATE_ENV_PREFIX = "soak-env-"
 STEP_KEYS = {"at", "action", "on", "args", "for", "ready", "code", "key", "class", "signal",
-             "path", "to", "cert", "days", "broken", "port", "nofile", *RESPOND_KEYS}
+             "path", "to", "cert", "days", "broken", "port", "nofile", *CGROUP_KEYS,
+             *RESPOND_KEYS}
 RANDOM_KEYS = {"seed", "gap", "fault"}
 RANDOM_FAULT_KEYS = {"weight", "action", "on", "args", "for"}
 RANGE_KEYS = {"min", "max"}
@@ -553,6 +568,9 @@ class StepSpec:
     port: object = None
     # A `prlimit`'s open-files limit.
     nofile: object = None
+    # A `cgroup`'s CPU quota or memory throttle.
+    cpu: object = None
+    memory_high: object = None
 
 
 # The `Step` fields `expected()` writes into its JSON and its timeline records, each under its
@@ -564,7 +582,8 @@ STEP_FIELDS = (("ready", "ready"), ("code", "code"), ("key", "key"), ("status", 
                ("invalid_event", "invalid_event"), ("withhold_acks", "withhold_acks"),
                ("fault_class", "class"),
                ("signal", "signal"), ("path", "path"), ("to", "to"), ("cert", "cert"),
-               ("days", "days"), ("broken", "broken"), ("port", "port"), ("nofile", "nofile"))
+               ("days", "days"), ("broken", "broken"), ("port", "port"), ("nofile", "nofile"),
+               ("cpu", "cpu"), ("memory_high", "memory_high"))
 
 
 @dataclass
@@ -636,6 +655,8 @@ class Step:
     broken: object = None
     port: object = None
     nofile: object = None
+    cpu: object = None
+    memory_high: object = None
 
     def expected(self):
         """The fields this step sets (`STEP_FIELDS`), for its JSON and its timeline records."""
@@ -1075,6 +1096,7 @@ def from_dict(raw, path):
             signal=raw_step.get("signal"), path=raw_step.get("path"), to=raw_step.get("to"),
             cert=raw_step.get("cert"), days=raw_step.get("days"), broken=raw_step.get("broken"),
             port=raw_step.get("port"), nofile=raw_step.get("nofile"),
+            cpu=raw_step.get("cpu"), memory_high=raw_step.get("memory_high"),
         ))
         if "for" not in raw_step:
             problems.append(f"{where}: every fault needs `for`, so its revert is scheduled with it")
@@ -2922,6 +2944,7 @@ def validate(scenario, duration=None, seed=None):
         problems += _signal_problems(spec, where)
         problems += _tls_step_problems(spec, where, scenario.tls)
         problems += _prlimit_problems(spec, where)
+        problems += _cgroup_problems(spec, where)
         if spec.for_ <= 0:
             problems.append(f"{where}: `for` must be longer than 0s")
         if spec.action == "netem":
@@ -3034,6 +3057,36 @@ def _prlimit_problems(spec, where):
             or not PRLIMIT_MIN_NOFILE <= spec.nofile <= PRLIMIT_MAX_NOFILE):
         return [f"{where}: `nofile` must be a whole number from {PRLIMIT_MIN_NOFILE} to "
                 f"{PRLIMIT_MAX_NOFILE}, got {spec.nofile!r}"]
+    return []
+
+
+def memory_bytes(text):
+    """The bytes a `memory_high` value names, or None when it isn't a whole number with a
+    `K`, `M`, or `G` suffix."""
+    match = _MEMORY_HIGH.match(text) if isinstance(text, str) else None
+    return int(match.group(1)) * _MEMORY_UNITS[match.group(2)] if match else None
+
+
+def _cgroup_problems(spec, where):
+    """What a step breaks of the `cgroup` rule: one of `CGROUP_KEYS` on a `cgroup`, never on
+    another action; `cpu` a number from `CGROUP_MIN_CPU` to `CGROUP_MAX_CPU`; `memory_high` a
+    size from `CGROUP_MIN_MEMORY_HIGH` to `CGROUP_MAX_MEMORY_HIGH`."""
+    given = [key for key in CGROUP_KEYS if getattr(spec, key) is not None]
+    if spec.action != "cgroup":
+        return [f"{where}: `{key}` is for cgroup only" for key in given]
+    if len(given) != 1:
+        return [f"{where}: cgroup needs one of `cpu` or `memory_high`, got "
+                f"{', '.join(f'`{key}`' for key in given) or 'neither'}"]
+    if spec.cpu is not None:
+        if (not isinstance(spec.cpu, (int, float)) or isinstance(spec.cpu, bool)
+                or not CGROUP_MIN_CPU <= spec.cpu <= CGROUP_MAX_CPU):
+            return [f"{where}: `cpu` must be a number of CPUs from {CGROUP_MIN_CPU} to "
+                    f"{CGROUP_MAX_CPU}, got {spec.cpu!r}"]
+        return []
+    size = memory_bytes(spec.memory_high)
+    if size is None or not CGROUP_MIN_MEMORY_HIGH <= size <= CGROUP_MAX_MEMORY_HIGH:
+        return [f"{where}: `memory_high` must be a whole number with a K, M, or G suffix from "
+                f"16M to 1024G, got {spec.memory_high!r}"]
     return []
 
 
@@ -3517,6 +3570,9 @@ def _random_problems(scenario, duration):
         if template.action == "prlimit":
             problems.append(f"{where}: prlimit takes `nofile`, which a [random] fault can't "
                             "set; write it as a [[step]]")
+        if template.action == "cgroup":
+            problems.append(f"{where}: cgroup takes `cpu` or `memory_high`, which a [random] "
+                            "fault can't set; write it as a [[step]]")
         if template.action in NO_WINDOW_ACTIONS:
             problems.append(f"{where}: {template.action} opens no fault window and takes keys a "
                             "[random] fault can't set; write it as a [[step]]")
@@ -3880,6 +3936,7 @@ def expand(scenario, duration=None, seed=None):
                     invalid_event=spec.invalid_event, withhold_acks=spec.withhold_acks,
                     signal=spec.signal, path=spec.path, to=spec.to, cert=spec.cert,
                     days=spec.days, broken=spec.broken, port=spec.port, nofile=spec.nofile,
+                    cpu=spec.cpu, memory_high=spec.memory_high,
                 ))
         cycle += 1
     steps.sort(key=lambda s: (s.start, s.spec_index))

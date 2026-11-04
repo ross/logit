@@ -34,6 +34,19 @@ Facts a maintainer needs here (docs/plans/soak-harness.md, "Netem scope"):
   container's ulimits. Lowering the limit closes nothing already open. A process started
   inside the window starts with the container's own limit, so the fault is gone: the revert
   then sets nothing and records `started_in_window`, as a pause's revert records `unpaused`.
+- A `cgroup` writes `cpu.max` or `memory.high` in the target's own cgroup for its window,
+  through a one-shot netem container with the host's `/sys/fs/cgroup` bound read-write at
+  `CGROUP_MOUNT` and `--security-opt label=disable`, without which SELinux denies the write. The
+  cgroup's path is the cgroup v2 (`0::`) line of `/proc/<pid>/cgroup` on the host, for the PID
+  `docker inspect` reports, and must name the container's full id; under the systemd driver
+  it's `system.slice/docker-<id>.scope`. The apply reads the file (`found`, `max` or
+  `max 100000` on a container started with no limit), writes the step's value, and reads it
+  back, and a value read back other than the one written is `rc` 1; the revert writes `found`
+  back. `docker update` is the wrong tool: `--memory` can't return to unlimited, and `--cpus`
+  stays in the container's config and comes back on its next start. A start inside the window
+  makes the scope again with the container's own settings, so the revert then writes nothing
+  and records `started_in_window`; a container not running at the revert lost its scope with
+  its process, and the revert writes nothing and records `exited_in_window`.
 - A `kill` is `docker kill -s KILL`: the process gets no shutdown signal, so it writes no final
   `internal` drain, no shutdown drops, and no `exiting` or `drain complete` line, and the container
   exits with `KILL_EXIT_CODE`. Its revert is a `docker start`, as a `stop`'s is. The container is
@@ -88,7 +101,7 @@ from pathlib import Path
 from . import fileops
 from .scenario import (BACKEND_ROLE, BROKER_ROLE, GENERATOR_ROLE, IDP_ROLE, NETNS_ROLE,
                        SHARED_MOUNT, STANDIN_ROLE, STOP_TIMEOUT_S, SUT_ROLE, SUT_SERVICE,
-                       TLS_MOUNT)
+                       TLS_MOUNT, memory_bytes)
 
 NETEM_LIMIT = "100000"
 # The timeline key recording, per `[[ledger.source]]` wire, whether a step can affect it.
@@ -114,6 +127,13 @@ FILEOPS_PULL_TIMEOUT_S = 600
 # util-linux's `prlimit` in the netem image, and the PID it acts on in the target's namespace.
 PRLIMIT_ENTRYPOINT = "/usr/bin/prlimit"
 PRLIMIT_PID = "1"
+# Where a `cgroup` one-shot mounts the host's cgroup v2 hierarchy, the period it writes into
+# `cpu.max` (the kernel's default), and the script it runs: with a value, write it, then print
+# the file.
+CGROUP_HOST_ROOT = "/sys/fs/cgroup"
+CGROUP_MOUNT = "/cg"
+CPU_PERIOD_US = 100000
+CGROUP_SCRIPT = 'if [ $# -eq 2 ]; then printf "%s\\n" "$2" > "$1" || exit 1; fi; cat "$1"'
 
 
 @dataclass
@@ -134,6 +154,8 @@ class Context:
     tls_dir: object = None
     tls_certs: dict = field(default_factory=dict)
     user: object = None
+    # Where a `cgroup` reads a process's `/proc/<pid>/cgroup`: the host's procfs.
+    proc_root: str = "/proc"
 
 
 @dataclass
@@ -272,6 +294,93 @@ def prlimit_revert(ctx, step):
     soft, hard = saved["found"]
     result = ctx.docker.run_oneshot(prlimit_argv(ctx, step, f"--nofile={soft}:{hard}"))
     return _record(result, restored=result.rc == 0, nofile=saved["found"])
+
+
+def cgroup_setting(step):
+    """`(file, value)`: the cgroup file a `cgroup` step writes and what it writes there."""
+    if step.cpu is not None:
+        return "cpu.max", f"{round(step.cpu * CPU_PERIOD_US)} {CPU_PERIOD_US}"
+    return "memory.high", str(memory_bytes(step.memory_high))
+
+
+def cgroup_dir(ctx, service):
+    """`(path, None)`: the container's cgroup relative to the hierarchy's root, from the cgroup
+    v2 line of its process's `/proc/<pid>/cgroup` on the host; or `(None, why)` when the
+    container isn't running or the line doesn't name its full id."""
+    info = ctx.docker.inspect(ctx.ids[service]) or {}
+    pid = (info.get("State") or {}).get("Pid")
+    full = info.get("Id")
+    if not pid or not full:
+        return None, f"{service} has no running process to find its cgroup by"
+    where = Path(ctx.proc_root, str(pid), "cgroup")
+    try:
+        text = where.read_text()
+    except OSError as err:
+        return None, f"can't read {where}: {err}"
+    for line in text.splitlines():
+        if line.startswith("0::/"):
+            path = line[len("0::/"):].strip()
+            if full in path.split("/")[-1] and ".." not in path.split("/"):
+                return path, None
+    return None, f"{where} names no cgroup v2 path for container {full[:12]}"
+
+
+def cgroup_argv(ctx, path, *value):
+    """`docker run --rm` arguments that print the cgroup file at `path` under the mount, after
+    writing `value` into it when one is given."""
+    return ["-v", f"{CGROUP_HOST_ROOT}:{CGROUP_MOUNT}:rw", "--security-opt", "label=disable",
+            "--entrypoint", "/bin/sh", ctx.netem_image, "-c", CGROUP_SCRIPT, "sh",
+            f"{CGROUP_MOUNT}/{path}", *value]
+
+
+def _cgroup_write(ctx, path, value, **extra):
+    """Writes `value` and reads it back; a read-back that differs is `rc` 1."""
+    result = ctx.docker.run_oneshot(cgroup_argv(ctx, path, value))
+    record = _record(result, path=path, value=value, **extra)
+    if result.rc == 0 and result.stdout.strip() != value:
+        record.update(rc=1, stderr=f"wrote {value!r} to {path} and read back "
+                                   f"{result.stdout.strip()[-200:]!r}")
+    return record
+
+
+def cgroup_apply(ctx, step):
+    """Finds the target's cgroup, reads the step's file there (`found`), writes the step's value,
+    and leaves the path, `found`, and the process's start time for the revert. A cgroup it can't
+    find or a read that printed nothing is `rc` 1 and writes nothing."""
+    name, value = cgroup_setting(step)
+    started = _started_at(ctx, step.on)
+    found_dir, why = cgroup_dir(ctx, step.on)
+    if found_dir is None:
+        return {"rc": 1, "stderr": why, "file": name}
+    path = f"{found_dir}/{name}"
+    read = ctx.docker.run_oneshot(cgroup_argv(ctx, path))
+    found = read.stdout.strip()
+    if read.rc != 0 or not found:
+        record = _record(read, file=name, path=path)
+        record.update(rc=read.rc or 1, stderr=record["stderr"] or f"{path} read empty")
+        return record
+    ctx.state[step.id] = {"path": path, "found": found, "started_at": started}
+    return _cgroup_write(ctx, path, value, file=name, found=found)
+
+
+def cgroup_revert(ctx, step):
+    """Writes what the apply found back, unless the process exited inside the window, whose
+    scope went with it (`exited_in_window`), or started again there, whose new scope has the
+    container's own settings (`started_in_window`): the record then says which and writes
+    nothing. An apply that failed left nothing to restore."""
+    saved = ctx.state.pop(step.id, None)
+    if saved is None:
+        return {"rc": 0, "stderr": "", "restored": False}
+    state = (ctx.docker.inspect(ctx.ids[step.on]) or {}).get("State") or {}
+    if state.get("Status") != "running":
+        return {"rc": 0, "stderr": "", "restored": False, "exited_in_window": True,
+                "status": state.get("Status")}
+    if state.get("StartedAt") != saved["started_at"]:
+        return {"rc": 0, "stderr": "", "restored": False, "started_in_window": True,
+                "status": state.get("Status")}
+    record = _cgroup_write(ctx, saved["path"], saved["found"])
+    record["restored"] = record["rc"] == 0
+    return record
 
 
 def _started_at(ctx, service):
@@ -651,6 +760,19 @@ ACTIONS = {
         apply=prlimit_apply,
         revert=prlimit_revert,
         affects_udp_ingress=_never,
+        affects_egress=_on_sut_or_destination,
+        affects_tcp_ingress=_on_ingress_sut,
+        affects_file_ingress=_on_ingress_sut,
+        affects_http_ingress=_on_ingress_sut,
+        affects_kafka_ingress=_on_ingress_sut,
+    ),
+    # A CPU quota or memory pressure on the SUT slows every task in it, as a pause stops them:
+    # the receive queue and then the kernel drop UDP, a TCP or HTTP sender waits, and a sink's
+    # deliveries fall behind.
+    "cgroup": Action(
+        apply=cgroup_apply,
+        revert=cgroup_revert,
+        affects_udp_ingress=_on_ingress_sut,
         affects_egress=_on_sut_or_destination,
         affects_tcp_ingress=_on_ingress_sut,
         affects_file_ingress=_on_ingress_sut,

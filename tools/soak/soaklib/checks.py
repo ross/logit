@@ -156,8 +156,11 @@ def is_sink_fault_line(entry):
         entry.message == "degraded" and not entry.key)
 READY_WITHIN_S = 30
 FRESHNESS_MAX_AGE_S = 30
-# How many `internal` intervals stdout may go quiet while the container runs unpaused.
+# How many `internal` intervals stdout may go quiet while the container runs unpaused, and the
+# actions on a service that excuse a longer gap: those that stop its process, and a `cgroup`,
+# whose quota or reclaim can hold its drain as a pause does.
 DRAIN_GAP_INTERVALS = 3
+DRAIN_HELD_ACTIONS = ("stop", "kill", "pause", "restart", "exit", "cgroup")
 SECONDS_PER_HOUR = 3600
 MIB = 1024 * 1024
 # An `[[expect]]` `slope` is fitted only over at least this many samples spanning this long.
@@ -599,8 +602,9 @@ def stalled(results):
 def check_timeline(data):
     """FAILs when the schedule didn't run as written: an apply or revert that returned nonzero,
     a fail-fast stop, or a start or unpause of a `logit` service with no `ready` record. An
-    early revert in the end sequence isn't probed, so it needs none. A `prlimit` whose process
-    started again inside its window is reported: its limit went with the old process."""
+    early revert in the end sequence isn't probed, so it needs none. A `prlimit` or `cgroup`
+    whose process started again inside its window is reported: its limit went with the old
+    process."""
     if data.t0 is None:
         return Result("timeline", SKIP, "no timeline start")
     lines = []
@@ -629,10 +633,14 @@ def check_timeline(data):
             lines.append(f"{record['on']} {'unpaused' if action == 'pause' else 'started'} at "
                          f"{data.offset(record.get('finished_at'))} ({record.get('step')}) "
                          "with no readiness probe recorded")
-    gone = [f"{record.get('step')} (prlimit on {record.get('on')}): the process started again "
-            "inside the window, so its limit ended there and nothing was restored"
+    gone = [f"{record.get('step')} ({record.get('action')} on {record.get('on')}): the process "
+            "started again inside the window, so its limit ended there and nothing was restored"
             for record in actions
             if record["event"] == "revert" and record.get("started_in_window")]
+    gone += [f"{record.get('step')} ({record.get('action')} on {record.get('on')}): the process "
+             "exited inside the window, so nothing was restored"
+             for record in actions
+             if record["event"] == "revert" and record.get("exited_in_window")]
     if lines:
         return Result("timeline", FAIL, lines[0], lines + gone)
     return Result("timeline", PASS, f"{len(actions)} apply/revert action(s) returned 0; "
@@ -1073,8 +1081,7 @@ def check_progress(data):
         if len(drains) < 3:
             continue
         interval = statistics.median(b - a for a, b in zip(drains, drains[1:]))
-        held = data.windows(on=service, actions=("stop", "kill", "pause", "restart", "exit"),
-                            extend=False)
+        held = data.windows(on=service, actions=DRAIN_HELD_ACTIONS, extend=False)
         for a, b in zip(drains, drains[1:]):
             if b - a > DRAIN_GAP_INTERVALS * interval and not any(
                 s <= b and e >= a for s, e in held
@@ -1808,11 +1815,12 @@ DEFAULT_FILE_OUT_MAX_FILES = 5
 # The SUT actions during which a file wire's tailer reads nothing while its writer keeps
 # rotating.
 FILE_DOWN_ACTIONS = ("pause", "stop", "kill", "restart", "exit")
-# Those and a `prlimit`, during which the tailer can open no file the writer creates, which
-# `_file_retention_problems` and `_cri_writer_problems` bound. A pause and a prlimit keep the
-# files the tailer has open (`FILE_HELD_ACTIONS`), and a prlimit's tailer goes on reading them.
-FILE_RETENTION_ACTIONS = FILE_DOWN_ACTIONS + ("prlimit",)
-FILE_HELD_ACTIONS = ("pause", "prlimit")
+# Those, a `prlimit`, during which the tailer can open no file the writer creates, and a
+# `cgroup`, which can slow it below the writer's pace, all of which `_file_retention_problems`
+# and `_cri_writer_problems` bound. A pause, a prlimit, and a cgroup keep the files the tailer
+# has open (`FILE_HELD_ACTIONS`), and under the last two the tailer goes on reading them.
+FILE_RETENTION_ACTIONS = FILE_DOWN_ACTIONS + ("prlimit", "cgroup")
+FILE_HELD_ACTIONS = ("pause", "prlimit", "cgroup")
 _SIZE_UNITS = {"B": 1, "KB": 1000, "MB": 1000 ** 2, "GB": 1000 ** 3,
                "KiB": 1024, "MiB": 1024 ** 2, "GiB": 1024 ** 3}
 # On a TCP wire the actions that end a SUT or generator process, a `reset` of a connection, or a
@@ -4382,7 +4390,9 @@ def _file_writers(data, led, source):
 
 def _held(fault):
     """How a `FILE_RETENTION_ACTIONS` fault held the tailer, for a retention guard's line."""
-    return "was down" if fault.action in FILE_DOWN_ACTIONS else "was at its open-files limit"
+    if fault.action in FILE_DOWN_ACTIONS:
+        return "was down"
+    return "was at its open-files limit" if fault.action == "prlimit" else "was throttled"
 
 
 def _file_retention_problems(data, led, source):
@@ -4398,7 +4408,7 @@ def _file_retention_problems(data, led, source):
       deletion. Only a file the writer created after the pause began is lost: created at the
       pause's first rotation, it's deleted at its `max_files + 1`th, so the limit is
       `max_files`. A `prlimit` keeps them too, and its tailer can't open a file created in its
-      window, so it takes the pause's limit.
+      window, so it takes the pause's limit, as does a `cgroup`, whose tailer may fall behind.
 
     A restarted tailer never finds a deleted file, and the loss is counted only as far as the
     last checkpoint knew (docs/known-gaps/tailing.md), so the ledger can't see all of it any

@@ -230,6 +230,11 @@ settle window would leave a life no fit. `fanin` and `tcp-ingress` set `60s`, an
   `[random]` schedule: a one-shot netem container in its PID namespace sets PID 1's open-files
   limit, soft and hard, to the step's required `nofile`, a whole number from 8 to 1048576, and
   its revert sets back the limit it found, unless the process started again inside the window.
+  W32 adds `cgroup`, on a SUT only, never in a `[random]` schedule: a one-shot netem container
+  with the host's `/sys/fs/cgroup` bound writes `cpu.max` from the step's `cpu`, 0.01 to 1024,
+  or `memory.high` from its `memory_high`, a whole number with a `K`, `M`, or `G` suffix from
+  16M to 1024G, one of the two, in the SUT's own cgroup, and its revert writes back what
+  it found, unless the process started again inside the window.
 - `[ledger] vm_every_window`, optional, is `true` or `false`; `[ledger] sut_script`, optional,
   is a component id.
 - `[[ledger.source]]` (W8b) has the rules under "Sources" below.
@@ -3485,7 +3490,10 @@ that items 3, 7, and 11 need.
 - **W31**: item 27: the `prlimit` action, its rules and the file wire's retention guard for
   it, self-test fixtures for each, the `fd-limit-tcp` and `fd-limit-tail` scenarios, an
   amendment to ADR `soak-harness`, and both runs recorded under "Findings".
-- **W32** to **W37**: items 28, 29, 31, 32, 33, and 34 in turn, each with its action or
+- **W32**: item 28: the `cgroup` action, its rules, its window's excuses, self-test fixtures
+  for each, the `cpu-quota` and `memory-high` scenarios, an amendment to ADR `soak-harness`,
+  and both runs recorded under "Findings".
+- **W33** to **W37**: items 29, 31, 32, 33, and 34 in turn, each with its action or
   wire, self-test fixtures for each rule, an amendment to ADR `soak-harness` where it adds a
   ledger rule or an action, and each scenario's run recorded under "Findings". Item 30 has no
   workstream.
@@ -6827,6 +6835,49 @@ What the runs showed about `logit` and the harness:
   the stopped stand-in, which never reach the record, as in W9a.
 - **Self-test**: 2,375 expectations after the merges. Each new rule was reverted in turn and
   failed at least one expectation; the PR lists them.
+
+### W32: a CPU quota and memory pressure on the SUT's cgroup (2026-11-03)
+
+W32 adds the `cgroup` action and the `cpu-quota` and `memory-high` scenarios. Each ran at its
+default duration on the development host (Docker 29.9, cgroup v2 under the systemd driver,
+SELinux enforcing), one at a time, against `logit:soak-w32` built from `soak/w32` (W32 changes
+no Rust). The SUT's cgroup was `system.slice/docker-<id>.scope`, the cgroup v2 line of its
+process's `/proc/<pid>/cgroup`; on a container started with no limit `cpu.max` read
+`max 100000` and `memory.high` `max`, and every revert wrote those back. A write from a
+one-shot without `label=disable` failed with `Permission denied`.
+
+| Run | Scenario | Verdict | Highlights |
+|---|---|---|---|
+| `20261104T020422Z` | `memory-high` with `memory.high` at 512M, to measure | PASS | the cgroup peaked at 42.0 MiB (`memory.peak`) and resident memory at 45.5 MiB in the outage, 26 to 30 MiB steady |
+| `20261104T021156Z` | `memory-high` (64M) | PASS | `resident-bounded` read 46.2 MiB at most against 56; the cgroup peaked at 41.6 MiB and `memory.events` counted no `high` event; `OOMKilled` false; G = W = 731,300, Ab = V = 640,300 |
+| `20261104T022255Z` | `cpu-quota`, first cut | FAIL | `expect.queue-evicts`: the receive queue evicted nothing; below |
+| `20261104T023047Z` | `cpu-quota` | PASS | `quota-landed` read 2.23 CPU-seconds over the 120 s window against the quota's 2.4; 1,876,030 kernel drops in it of G 7,310,900 over the run; every drain of the mark past the revert read a flush (1,000 events at least) and a delivery (10 at least) and no drop; V = Ab = W 5,422,639 |
+
+What the runs showed about `logit` and the harness:
+
+- **A CPU quota drops in the kernel, never in the receive queue.** Unthrottled, the flood cost
+  the SUT about 0.058 CPUs (`logit.process.cpu.seconds`, 0.29 s per 5 s drain). At 0.02 the
+  socket's reader and the decode loop behind the receive queue wait on the same quota, so the
+  queue never filled and evicted nothing, and the socket's receive buffer overflowed instead:
+  `logit.input.kernel.dropped` counted 78% of what the generator sent in the window, and
+  `ledger.wire` read G = W + K with no uncounted line. The first cut's `queue-evicts` row
+  expected both drops; the scenario now expects the kernel's alone and none of either after.
+- **A bounded outage stays under 64M.** Through the 90 s outage the sink's two-batch queue, its
+  64-batch inbox, and `aggregate`'s inbox held the SUT's cgroup at 42 MiB, so a `memory.high`
+  of 64M never throttled: `memory.events` read `high 0`, and `logit.process.memory.resident.bytes`
+  read through the window with no gap, so procfs kept answering. A limit below that peak would
+  show the throttle's own behavior; that isn't this scenario's claim.
+- **Self-test flake.** One `script/soak run` stopped at its self-test with `_stall_abort`'s
+  "after a stall nothing applies, and the open step reverts early, got []" while another
+  agent's soak and an image build shared the host; four reruns passed. It isn't W32's code,
+  and is noted for the flake log.
+- **Self-test**: 2,938 expectations. Each new rule was reverted in turn and failed at least one
+  expectation: the cgroup v2 line, the full-id and `..` checks, a missing process, the failed
+  read, the read-back, `label=disable` on the one-shot, the revert's `started_in_window` and
+  `exited_in_window` branches and `timeline`'s report of each, UDP ingress, the drain gap's
+  excuse, the retention guard's entry and its pause limit, and the scenario rules: one key, the
+  `cpu` and `memory_high` ranges and forms, a bool `cpu`, either key on another action, the
+  SUT-only and `[random]` refusals, and the keys reaching the expanded step.
 
 ### W31: open-files limits on a TCP listener and a tailer (2026-11-03)
 
