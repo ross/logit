@@ -977,6 +977,33 @@ SIGTERM, records the counts it prints, and removes it.
 - **On a SUT only, and never in a `[random]` schedule**, which can't set `address`, `mode`, or
   `connections`.
 
+## Amendment: a replay into a full sender table may be forwarded again (2026-11-04)
+
+`logit_in` holds a high-water mark for `max_connections + max_connections / 4` sender
+identities and evicts the least recently seen when a new one takes a slot in a full table
+(`crates/logit-inputs/src/logit/senders.rs`). A `logit_out` spool mints an identity every time
+it opens and replays its unpersisted frames under the identities that sent them, so one SUT's
+restarts are enough to fill a small table. `ledger.hop` and `ledger.summary`'s end-to-end bound
+allowed no duplicate for it, and `native-hop-identities` reaches one.
+
+- **One sender evicts only a retired identity, until a replay spans more identities than the
+  table holds.** Every frame of an identity is sent before any frame of a later one, and a
+  replay refreshes each identity it touches, so a graceful restart, or a kill with its spool's
+  cursor persisted since, evicts an identity that sends nothing again. A crash loop whose lives
+  each die before their first cursor persist leaves every life's commits to the next one's
+  replay; once that replay names more identities than the table holds, the first is gone, and
+  each one it takes back evicts the next it replays, so the whole replay is forwarded again.
+- **Judged from `logit.input.senders.evicted`.** A life's own identity evicts at most one, when
+  its first frame takes a slot; any other eviction counted at the far SUT from the life's start
+  to its replay's window's end (its first drain that counted a replay plus two of the far SUT's
+  drain intervals, or the next life's start) is a replayed identity a forward took back. Such a
+  life allows its replayed frames, `logit.component.buffer.disk.replayed` × the largest frame,
+  below 0 in `ledger.hop` and above `G − counted` end to end. A life with one eviction allows
+  nothing.
+- **An upper bound, not a count.** `logit_in` can't tell a forward of an identity it no longer
+  holds from a new one, and exports nothing per frame, so the row can't count the duplicates;
+  the replayed frames bound them, the never-delivered backlog among them included.
+
 ## Amendment: a killed life's requests answered after its last drain are reported (2026-11-04)
 
 `ledger.standin` holds the record's requests per status class to the sink's

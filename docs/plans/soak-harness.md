@@ -2335,7 +2335,12 @@ the other.
   acknowledged. Each `pause` of `collector` allows − one send window: the resend can race the
   frames an ended connection still holds
   ([`docs/deploying.md`](../deploying.md#forwarding-between-logit-nodes)). A partition or packet loss
-  allows nothing: the race needs a forward parked on a full inbox. Any other gap FAILs, below
+  allows nothing: the race needs a forward parked on a full inbox. A `logit` life whose replay
+  met more sender evictions at `collector` than its own identity causes, from its start to its
+  first drain that counted a replay plus two of `collector`'s drain intervals (or the next
+  life's start), allows − its replayed frames, `buffer.disk.replayed` in frames of the largest
+  frame: a replayed identity the full table had evicted is forwarded again (W35). Any other gap
+  FAILs, below
   the allowance as a surplus and above it as uncounted. A `rejected` or `disk_corrupt` batch
   drop at the hop sink FAILs too. Resends, resumed frames, and reconnects are shown beside it,
   and the row's lines give the running gap at each fault's start, the hop's backlog plus any
@@ -2345,7 +2350,8 @@ the other.
   bound end to end, which no kill or restart can loosen: each egress group's V over the whole
   run is at most G less every counted loss (K, D, B, X, the hop's drops, and X_B, and on a TCP
   wire F), plus one generator batch per ambiguous attempt of a TCP source, the partial-frame
-  surplus `ledger.wire` allows. A duplicate
+  surplus `ledger.wire` allows, and the replayed frames `ledger.hop` allows for a replay into a
+  full sender table. A duplicate
   forwarded across the hop adds the same increments to E_B, A, Ab, and V, so every per-life term
   balances around it; this bound and `ledger.hop` are what see it, the bound only once the
   surplus exceeds the run's uncounted loss, the wire loss among it.
@@ -3505,7 +3511,11 @@ that items 3, 7, and 11 need.
   rules, self-test fixtures for each, the `slowloris-tcp` and `slowloris-http` scenarios, the
   killed-life allowance in `ledger.standin` for requests answered after the life's last drain,
   an amendment to ADR `soak-harness` for each, and both runs recorded under "Findings".
-- **W33**, and **W35** to **W37**: items 29, 32, 33, and 34 in turn, each with its action or
+- **W35**: item 32: the `native-hop-tls`, `native-hop-rtt`, and `native-hop-identities`
+  scenarios, `ledger.hop`'s and `ledger.summary`'s allowance for a replay into a full sender
+  table, self-test fixtures for it, an amendment to ADR `soak-harness`, and the runs recorded
+  under "Findings".
+- **W33**, and **W36** and **W37**: items 29, 33, and 34 in turn, each with its action or
   wire, self-test fixtures for each rule, an amendment to ADR `soak-harness` where it adds a
   ledger rule or an action, and each scenario's run recorded under "Findings". Item 30 has no
   workstream.
