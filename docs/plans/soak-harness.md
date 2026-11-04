@@ -6971,3 +6971,46 @@ acknowledged"). Each scenario ran once at its default length on the development 
 
 The 8-hour runs close the gap the 1 h runs of W17 and W18 left: a leak that grows per redial or
 per deletion did not show in either path over 8 hours.
+
+### A stalled receiver with the kept connection (2026-11-03)
+
+The stream sinks keep a stalled connection and count what a destroyed one held unacknowledged
+([ADR `stream-sink-stalled-connection`](../adr/stream-sink-stalled-connection.md)), so the four
+scenarios of "A backend kill's tail and a stalled receiver" ran again, once each at their default
+length on the development host, against `logit:soak-outq` built from `outq/w1`. Every row of
+the four runs passed. `ledger.wire` now requires the generator's
+`logit.output.bytes.dropped{reason="unacknowledged"}` (U) at each stalled kill and holds the
+loss less U to G from the SUT's last drain to the pause plus the receive buffer at
+`socket_buffers`, plus a batch per edge.
+
+| Scenario, stall | Lost before | Redials before | Lost after | U counted | Redials in the pause |
+|---|---|---|---|---|---|
+| `syslog-stall-kill`, 30 s | 21,339 | 5 | 3,865 | 88,664 bytes, 1,412 lines | 0 |
+| `syslog-stall-kill`, 90 s | 71,586 | 16 | 17,553 | 256,800 bytes, 4,089 lines | 0 |
+| `syslog-stall-kill-default`, 30 s | 35,163 | 4 | 4,651 | 102,592 bytes, 1,634 lines | 0 |
+| `syslog-stall-kill-default`, 90 s | 113,899 | 12 | 46,473 | 127,120 bytes, 2,024 lines | 0 |
+
+- **The loss no longer grows with redials.** `syslog-stall-kill` (`20261104T005055Z`) lost 3,865
+  and 17,553 lines, against 21,339 and 71,586 before. The uncounted rest, 2,453 and 13,463
+  lines, held 527 and 9,527 lines the listener read before the pause and never exported, and
+  each remainder, 1,926 and 3,936 lines at 62.8 bytes a line, was under the 4,174 lines one
+  256 KiB receive buffer holds. Its bounds were 4,901 and 13,902. The long stall's U, 256,800
+  bytes, is about the 256 KiB send buffer.
+- **Under default autotuning the receiver's share varied with the buffer's history.**
+  `syslog-stall-kill-default` (`20261104T005233Z`) lost 4,651 and 46,473 lines. Less the
+  listener's unexported 585 and 9,560, the receiver's share was 2,432 lines, about 150 KB, in
+  the short stall and 34,889, about 2.2 MB, in the long one, within bounds of 100,967 and
+  109,942 set by the 6 MiB receive maximum. U read only 102,592 and 127,120 bytes, which points to
+  a send buffer that grew little from its 16 KiB start. The harness uses the receive maximum because the kept
+  connection was read before the pause, so its buffer can be past its initial size, as the long
+  stall's was.
+- **A kill of a reader that keeps up still loses about one export interval.**
+  `syslog-tcp-ingress` (`20261104T010437Z`) passed with the reset step: the kill's gap read
+  9,838 lines, the stop's 18, and the generator counted no unacknowledged bytes. The generator
+  redialed 4 times, after the SUT's stop, its kill, its partition, and the reset, and none
+  during the pause, which read one ambiguous attempt and a surplus of 144 lines against 300
+  allowed.
+- **A backend kill's tail is unchanged.** `graphite-egress` (`20261104T010754Z`) read
+  M 11,000 − S 10,700 = 300 in its one SUT life against a bound of 400, as before, and the sink
+  counted no unacknowledged bytes at either kill, so all 300 are what VictoriaMetrics had taken
+  and not saved. Each of the four reconnect expectations read 1.

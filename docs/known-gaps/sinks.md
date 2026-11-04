@@ -120,24 +120,27 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - up to 64 KiB of ciphertext still queued in a TLS session, which never reached the socket.
 
   A receiver that half-closes and keeps reading is overcounted: its FIN reads as a close.
-  - **Measured, before the driver kept a stalled connection:** against a reader that keeps up,
-    the loss is too small to see. In `syslog-tcp-ingress` and `syslog-tls-ingress`, at 2,000
-    lines a second with each buffer capped at 256 KiB, four kills' gaps of 9,800 to 9,916 lines
-    each fell within about 400 lines, the error of the estimate, of what the listener read after
-    its last export. A receiver stalled behind a full receive buffer loses what its buffers hold,
-    and the loss grew with the stall: each write stalled past `connect_timeout` redialed into the
-    frozen listener's accept queue and filled another pair. In `syslog-stall-kill` (256 KiB
-    buffers) a kill 30 s into a stall lost 21,339 lines, about 1.3 MB, and one 90 s into a stall
-    lost 71,586, about 4.5 MB. Under Linux's default autotuning (`syslog-stall-kill-default`) the
-    losses were 35,163 and 113,899 lines, about 2.2 MB and 7.2 MB, far below the maxima: about
-    half a megabyte per connection (2.2 MB over 5 connections, 7.2 MB over 13) against a pair's
-    10 MiB, because a receiver that is never read grows its buffer only in `recvmsg`. The
-    harness's bound is about 20 times the loss there. At a backend, two kills of VictoriaMetrics
-    under `graphite-egress` lost 300 datapoints against a bound of 400 ([plan
-    `soak-harness`](../plans/soak-harness.md)'s "A backend kill's tail and a stalled receiver").
-  - **Revisit:** re-measure `syslog-stall-kill` and `syslog-stall-kill-default` with the kept
-    connection, which should put one buffer pair at risk whatever the stall's length, and replace
-    the numbers above.
+  - **Measured:** against a reader that keeps up, the loss is too small to see. In
+    `syslog-tcp-ingress`, at 2,000 lines a second with each buffer capped at 256 KiB, a kill's
+    gap of 9,838 lines fell within the estimate's error of what the listener read after its last
+    export, and the generator counted no unacknowledged bytes. A receiver stalled behind a full
+    receive buffer loses one buffer pair, whatever the stall's length: the generator kept its
+    connection and redialed 0 times in each stall. In `syslog-stall-kill` (256 KiB buffers) a
+    kill 30 s into a stall lost 3,865 lines, of which the generator counted 88,664 bytes (1,412
+    lines) unacknowledged, and one 90 s into a stall lost 17,553, of which it counted 256,800
+    bytes (4,089 lines). The uncounted rest, 2,453 and 13,463 lines, holds what the listener read
+    and never exported before the pause, 527 and 9,527 lines; the remainder, up to about 250 KB,
+    is the receiver's share. Under Linux's default autotuning (`syslog-stall-kill-default`) the
+    kills lost 4,651 and 46,473 lines, with 102,592 and 127,120 bytes counted; the receiver's
+    share was about 150 KB in the short stall and 2.2 MB in the long one, which points to a
+    receive buffer that autotuning grew while the listener still read. The driver that redialed lost 21,339
+    and 71,586 lines in the capped scenario and 35,163 and 113,899 under autotuning, none of it
+    counted. At a backend, two kills of VictoriaMetrics under `graphite-egress` lost 300
+    datapoints against a bound of 400, as the redialing driver did, with nothing counted
+    unacknowledged: the sink's socket held nothing unacknowledged at either kill, so the loss is
+    what VictoriaMetrics had acknowledged and not saved
+    ([plan `soak-harness`](../plans/soak-harness.md)'s "A stalled receiver with the kept
+    connection").
 
 - **A kept-alive connection a destination closed first reads as `Ambiguous`.** An HTTP sink
   closes a pooled connection idle past its `idle_timeout:` (30 s by default) before reusing it,
