@@ -1,6 +1,6 @@
 ---
 created: 2026-10-08
-updated: 2026-11-03
+updated: 2026-11-04
 ---
 
 # A soak harness: real containers over ordinary config, one-shot netem, and a reset-aware ledger as the loss oracle
@@ -937,6 +937,43 @@ fails on a read-back that differs; the revert writes what it found back.
   a reason to want one.
 - **On a SUT only, and never in a `[random]` schedule**, which can't set `cpu` or
   `memory_high`.
+
+## Amendment: a `cgroup` step limits the writes to the disk behind a SUT path (2026-11-04)
+
+A spool's `sync_data`, its cursor's fsyncs, and a shutdown with a write in flight run on a fast
+local disk in every other scenario, so nothing showed what a slow disk does to them. A
+`cgroup` step's `io_wbps` (bytes a second) and `io_wiops` (writes a second), either or both as
+one limit, write `<major>:<minor> wbps=<n> wiops=<n>` into the SUT's `io.max` through the same
+one-shot as the other limits, for the disk behind the step's `io_path`; the revert writes each
+limited key's found value back, `max` when the device had no line.
+
+- **The device comes from the mounts, not the step.** The mount holding `io_path` in the
+  process's `/proc/<pid>/mountinfo` names it; for an overlay, the host mount holding its
+  `upperdir` in `/proc/1/mountinfo` does, since `docker inspect` names no layer directory under
+  the containerd snapshotter. `io.max` takes a whole disk, so a partition maps to its disk
+  through `/sys/dev/block/<major>:<minor>/../dev`. A device with major 0 (btrfs, tmpfs, an
+  overlay with no host mount found) has no block device to limit, so the step fails before it
+  writes, with `no block device backs <path>`.
+- **The stalled time is the engagement's observable.** `io.stat` counts what the cgroup wrote
+  and has no count of throttled writes, so the apply and the revert each read the device's
+  `wbytes` and `wios` and `io.pressure`'s `some` total, and the revert records the window's
+  differences and length. `timeline` reports them with the write rate against the limit. An io
+  step's optional `engaged` reads the stalled time against 1% of the window: an unthrottled
+  spool's fsyncs on a local disk stall less than that, and a limit below the spool's pace
+  stalls a large share. The stalled time also counts a stall an unthrottled write would have
+  had, so a run that reads `engaged` near the line needs the rate beside it.
+- **A stop or kill may start inside a `cgroup` step.** A start makes the cgroup again with no
+  limit, so a fault that wants the stop's shutdown under the limit and the next life's replay
+  under it too takes two steps, the first containing the stop. The stop or kill must start
+  after the cgroup's apply, which needs a running process; the cgroup's revert then records
+  `exited_in_window` or `started_in_window` as for any other end of the process. No other step
+  may overlap a `cgroup` on its service.
+- **`io.max` needs cgroup writeback.** On a host whose container storage is overlayfs over
+  btrfs over dm-crypt, a 1 MiB/s limit let 4 MiB with `fsync` through in 0.1 s, since the
+  writeback loses the writer's cgroup there, and the device is anonymous anyway. `slow-spool`
+  runs on the perf VM's ext4 managed disk (ADR `disposable-azure-perf-vm`), and
+  `tools/soak/vm-io-probe.sh` checks a host before it does. A `dm-delay` device under the spool
+  would slow it on any host, and is the fallback if the VM's probe fails.
 
 ## Amendment: a backend kill is allowed on a tailed sink, and `ledger.tail` measures it (2026-11-03)
 

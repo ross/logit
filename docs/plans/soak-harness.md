@@ -208,8 +208,9 @@ settle window would leave a life no fit. `fanin` and `tcp-ingress` set `60s`, an
 
 - Every fault carries `for`, so its revert is scheduled with it. `netem clear` is a revert, never
   a step.
-- No two faults overlap on one container, except a `signal` inside a `rename` (W12c), and a
-  `signal` or a `probe` inside a `rotate` (W12d).
+- No two faults overlap on one container, except a `signal` inside a `rename` (W12c), a
+  `signal` or a `probe` inside a `rotate` (W12d), and a `stop` or `kill` starting inside a
+  `cgroup` after its start (W33).
 - No netem on a container during its `stop`, `kill`, `pause`, `partition`, or `exit`, because the qdisc
   is lost with the namespace and `docker run --network container:<id>` needs a running target.
 - No fault ends inside `cooldown`, and `cooldown` is at least `recovery_bound`.
@@ -237,7 +238,14 @@ settle window would leave a life no fit. `fanin` and `tcp-ingress` set `60s`, an
   it found, unless the process started again or exited inside the window; on a `memory_high`
   step it records the window's `memory.events` `high` count, which `timeline` reports, and an
   optional `engaged`, `true` or `false` and refused on any other step, FAILs a count of 0 or a
-  count above 0 respectively; `memory_high` must be a whole number of 4 KiB pages.
+  count above 0 respectively; `memory_high` must be a whole number of 4 KiB pages. W33 adds
+  `io.max` to it: `io_wbps`, a whole number bare or with a `K`, `M`, or `G` suffix from 4K to
+  1024G, and `io_wiops`, a whole number from 1 to 1,000,000, either or both as the step's one
+  limit, with `io_path`, an absolute path with no `..` and no whitespace, required with them
+  and refused elsewhere. The step writes them on the disk behind `io_path`, fails when no block
+  device backs it, and records the window's `io.stat` `wbytes` and `wios` and `io.pressure`
+  stalled time, which `timeline` reports; `engaged` is allowed on an io step, where it reads
+  the stalled time against 1% of the window.
 - `[ledger] vm_every_window`, optional, is `true` or `false`; `[ledger] sut_script`, optional,
   is a component id.
 - `[[ledger.source]]` (W8b) has the rules under "Sources" below.
@@ -3521,7 +3529,14 @@ that items 3, 7, and 11 need.
 - **W32**: item 28: the `cgroup` action, its rules, its window's excuses, self-test fixtures
   for each, the `cpu-quota`, `memory-high`, and `memory-high-pressure` scenarios, an amendment
   to ADR `soak-harness`, and the eight runs of the three recorded under "Findings".
-- **W33** to **W37**: items 29, 31, 32, 33, and 34 in turn, each with its action or
+- **W33**: item 29's `io.max` path: the `cgroup` action's `io_wbps`, `io_wiops`, and
+  `io_path` keys and their rules, the device resolution from the SUT's and the host's
+  mountinfo, the `io.stat` and `io.pressure` reads and `timeline`'s report and `engaged`
+  judgment, a `stop` or `kill` allowed inside a `cgroup` step, self-test fixtures for each, the
+  `slow-spool` scenario, `tools/soak/vm-io-probe.sh`, the README's "Running a scenario on the
+  perf VM", and an amendment to ADR `soak-harness`. The `dm-delay` fallback waits for the VM's
+  probe to fail, and the runs happen on the perf VM.
+- **W34** to **W37**: items 31, 32, 33, and 34 in turn, each with its action or
   wire, self-test fixtures for each rule, an amendment to ADR `soak-harness` where it adds a
   ledger rule or an action, and each scenario's run recorded under "Findings". Item 30 has no
   workstream.
