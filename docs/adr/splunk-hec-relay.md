@@ -834,11 +834,12 @@ event or the batch carries always beats the process hostname.
 Decision 5's ledger (`AckLedger`) is in memory only. A restarted `splunk_hec_in` has no record of
 the ids the old process issued, so it answers a poll for one `false`, the answer for any id not
 pending on the polled channel, and counts it `logit.input.acks.polled{result="unknown"}`. The old
-process had already taken the body into the pipeline before it issued the id, so a client that
-polls for an id the restart forgot times out, treats the request as not delivered, and resends it.
-`splunk_hec_out` under `ack: true` does this per `ack_timeout`, and resends the whole batch. The
-result is duplicates of the batches whose acks were pending at the restart, never loss, which is
-the at-least-once posture ([ADR `delivery-semantics`](delivery-semantics.md)). The soak scenario
+process had already taken the body into the pipeline before it issued the id, so nothing is lost
+whatever the client does next. `splunk_hec_out` under `ack: true` times out per `ack_timeout`,
+an `Ambiguous` fault: under `at_least_once`, the default, it resends the whole batch, a duplicate
+of a batch whose acks were pending at the restart, which is the at-least-once posture
+([ADR `delivery-semantics`](delivery-semantics.md)); under `at_most_once` it drops a batch the
+old process already took. No other client's answer to a forgotten id is recorded. The soak scenario
 `splunk-hec-ingress` counts it as `logit.output.acks{result="timeout"}` on the writer.
 
 **Decided, not open:** persisting the ledger would add a disk state to a stand-in for HEC, to

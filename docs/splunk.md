@@ -158,10 +158,11 @@ front of a `useACK` token, it needs a channel too. `splunk_hec_in` requires a ch
 on that channel `true` once, then `false`, and any other id `false`.
 
 `splunk_hec_in` keeps its ids in memory, so a restart forgets every id the old process issued and
-answers a poll for one `false`. A client that waits on that id, such as `splunk_hec_out` with
-`ack: true`, times out and resends the whole request, although the old process had already taken
-its body. A restart therefore duplicates the requests whose acknowledgments were pending, and
-loses none. Dedupe downstream if duplicates matter.
+answers a poll for one `false`. The old process had already taken the body, so nothing is lost.
+`splunk_hec_out` with `ack: true` times out on that id and, under the default `at_least_once`,
+resends the whole batch, so a restart duplicates the batches whose acknowledgments were pending.
+Under `at_most_once` it drops them instead, and they're still delivered once. Dedupe downstream if
+duplicates matter.
 
 ### Size caps
 
