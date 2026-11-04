@@ -413,10 +413,11 @@ pub fn send_queue(_fd: RawFd) -> Result<u32, Unavailable> {
 
 /// Whether a connected TCP socket's peer is still answering: no retransmission timeout has fired
 /// since the last ACK (`tcpi_retransmits == 0`), and at most one zero-window or keepalive probe
-/// is outstanding (`tcpi_probes < 2`). Both counters reset on every ACK (`tcp_ack`), so a
-/// receiver that stopped reading but still ACKs the window probes reads as answering, and a
-/// vanished or partitioned host doesn't once its second probe or first retransmission goes
-/// unanswered. `Err` for a non-Linux build, a failed `getsockopt`, or a short reply.
+/// is outstanding (`tcpi_probes < 2`). `tcp_ack` zeroes the probe count on any ACK that isn't
+/// old, so a receiver that stopped reading but still ACKs the window probes reads as answering,
+/// and a vanished or partitioned host doesn't once its second probe or first retransmission goes
+/// unanswered. The retransmission count resets only on an ACK that advances `snd_una`, so a live
+/// receiver that answers a retransmission with a zero-window ACK reads as not answering. `Err` for a non-Linux build, a failed `getsockopt`, or a short reply.
 #[cfg(target_os = "linux")]
 pub fn tcp_peer_answering(fd: RawFd) -> Result<bool, Unavailable> {
     // SAFETY: as in `listen_queue`: an all-zero `tcp_info` is a valid value.

@@ -931,7 +931,8 @@ What `logit` does about it ([ADR
   cut frame's tail first. `logit.output.reconnects` stays flat through the stall. A redial would park a
   new connection, with a new pair of full buffers, in the frozen receiver's accept queue on every
   retry, all lost when the receiver dies. A TCP connection whose peer has stopped answering (a
-  host that's gone or partitioned) is closed instead.
+  host that's gone or partitioned) is closed instead, and so is one whose live receiver answered
+  a retransmission with a zero-window acknowledgment, which reads the same way.
 - **The sender's share of a loss is counted.** When the receiver's reset or close ends a TCP
   connection, the sink counts the bytes of earlier batches its own socket still held unacknowledged
   as `logit.output.bytes.dropped{reason="unacknowledged"}`, with a throttled `unacknowledged`

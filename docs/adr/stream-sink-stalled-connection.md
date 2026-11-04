@@ -53,11 +53,14 @@ written), and 0 once the receiver closes, because the close frees it.
    and another begun on one connection.
 3. **A TCP peer that isn't answering is closed instead.** Before keeping a stalled TCP
    connection, the driver reads `TCP_INFO` (`sockstat::tcp_peer_answering`): it keeps the
-   connection only if `tcpi_retransmits == 0` and `tcpi_probes < 2`. Both reset on every ACK, so a
-   receiver that stopped reading but still ACKs the zero-window probes stays answering however
-   long it stalls; measured on loopback over 8 s, `tcpi_probes` never passed 1 and
-   `tcpi_retransmits` stayed 0 while `tcpi_backoff` reached 5. A vanished or partitioned host
-   fails a probe or a retransmission and is closed, as before, uncounted (decision 5). A Unix
+   connection only if `tcpi_retransmits == 0` and `tcpi_probes < 2`. `tcp_ack` zeroes
+   `tcpi_probes` on any ACK that isn't old, so a receiver that stopped reading but still ACKs
+   the zero-window probes stays answering however long it stalls; measured on loopback over 8 s,
+   `tcpi_probes` never passed 1 and `tcpi_retransmits` stayed 0 while `tcpi_backoff` reached 5.
+   `tcpi_retransmits` resets only on an ACK that advances `snd_una`, so a live receiver that
+   answers a retransmission timeout's resend with a zero-window ACK still reads as not
+   answering, and its connection is closed, uncounted. A vanished or partitioned host fails a
+   probe or a retransmission and is closed, as before, uncounted (decision 5). A Unix
    stream is always kept, and so is a connection whose `TCP_INFO` can't be read: a dead peer
    still ends in a write error once the kernel gives up.
 4. **The bytes a destroyed connection held are counted.** When a pooled connection ends with its
@@ -74,13 +77,16 @@ written), and 0 once the receiver closes, because the close frees it.
    so a receiver that resumes still gets the bytes, and a count would break "any nonzero
    `*.dropped` is loss". A Unix stream is never counted: its queue reads 0 once the receiver
    closes.
-6. **The batch being attempted is left out of the count.** The bytes of the frame an attempt
-   returned `Ambiguous` for, and its finished tail, belong to a batch that is resent under
-   `at_least_once` or counted `batches.dropped{reason="ambiguous_at_most_once"}`, so they aren't
-   counted again. On plaintext the queue is the last `SIOCOUTQ` bytes the stream accepted, and
-   the overlap with that frame is computed. Under TLS the queue is ciphertext, so the frame is
-   taken out whole with the most framing it could carry (29 bytes per 16 KiB record and per
-   write call), unless the bytes after it can't fit in the queue and a full session together.
+6. **Every batch already accounted for is left out of the count.** The bytes of each frame an
+   attempt returned `Ambiguous` for, and its finished tail, belong to a batch that is resent
+   under `at_least_once` or counted `batches.dropped{reason="ambiguous_at_most_once"}`, so they
+   aren't counted again. The connection keeps every such frame's stream offsets, not only the
+   last one's, because an earlier frame's bytes can still be queued behind a later one, and
+   forgets a frame once a queue reading shows it has left. On plaintext the queue is the last
+   `SIOCOUTQ` bytes the stream accepted, and each frame's overlap with it is computed. Under TLS
+   the queue is ciphertext, so each frame is taken out whole with the most framing it could
+   carry (29 bytes per 16 KiB record and per write call), unless the bytes after it can't fit
+   in the queue and a full session together.
    The count is a floor: it leaves out up to 64 KiB of ciphertext queued in the rustls session,
    which a boxed stream doesn't expose.
 7. **The count is on the sink's ungated handles.** It is the destination's verdict on batches an
@@ -112,7 +118,7 @@ written), and 0 once the receiver closes, because the close frees it.
   it read 47,615 where `SIOCOUTQ` read 2,591,744. `SIOCOUTQ` held after the reset, so no fallback
   was needed.
 - **Resume a kept frame instead of writing the batch again.** Under `at_least_once` the retried
-  batch's head arrives twice: once as the kept frame finishes, once in the resend. The driver
+  batch arrives twice: once as the kept frame finishes, once whole in the resend. The driver
   could recognize the resend's frame as the one it holds and write only the tail. That needs
   frames to encode byte-identically across attempts, which no stream sink promises. It is
   bounded at one batch per stall, inside the `Ambiguous` allowance the posture already accepts,
@@ -125,8 +131,12 @@ written), and 0 once the receiver closes, because the close frees it.
 - A receiver that stops reading puts one buffer pair at risk, whatever the stall's length, and
   `logit.output.reconnects` stays flat through the stall. Each attempt in the stall waits
   `connect_timeout`, as a redial's stalled write did.
-- Under `at_least_once` the stalled frame's head is delivered twice once the receiver reads
-  again: the kept connection finishes the frame, and the retry sends the whole batch.
+- Under `at_least_once` the whole stalled batch is delivered twice once the receiver reads
+  again: the kept connection finishes the frame, and the retry sends the frame whole.
+- A live receiver with a closed window whose kernel answered a retransmission timeout's resend
+  with a zero-window ACK reads as not answering (decision 3). Its connection is closed and
+  redialed, uncounted, as a stall's connection was before this decision. The measurements above
+  didn't produce that case, so how often a real stall meets it is unmeasured.
 - The sender's share of a receiver's death is counted. The receiver's share, acknowledged by its
   kernel and never read, isn't, and neither is anything on a Unix stream, a stall's closed
   connection, or shutdown (`docs/known-gaps/sinks.md`). A receiver that half-closes and keeps

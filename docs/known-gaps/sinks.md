@@ -116,7 +116,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - `statsd_out` over a Unix stream, whose receiver's close frees the sender's queue
     (`unix_outq_len` reads the receiver's charged memory, not unacknowledged bytes);
   - a connection the driver closes after its peer stopped answering, or at shutdown, whose bytes
-    the kernel keeps trying to deliver after the close;
+    the kernel keeps trying to deliver after the close. A live receiver with a closed window that
+    answers a retransmission with a zero-window ACK reads as not answering, so its connection is
+    closed and redialed too; how often a real stall meets that is unmeasured;
   - up to 64 KiB of ciphertext still queued in a TLS session, which never reached the socket.
 
   A receiver that half-closes and keeps reading is overcounted: its FIN reads as a close.
