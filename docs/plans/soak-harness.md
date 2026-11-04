@@ -6841,7 +6841,7 @@ image), and `logit` is PID 1 there. The apply read that pair back through `prlim
 |---|---|---|---|
 | `20261104T010333Z` | `fd-limit-tcp`, first cut (limit at cycle offsets 70 s to 150 s) | FAIL | `ledger.wire` and `accepts-recover`, both the harness's; below |
 | `20261104T011502Z` | `fd-limit-tcp` (70 s to 120 s) | PASS, `rss_slope` WARN | `limit-landed` read 20 in 4 drains; 290 resource accept errors in the window and 0 in the mark past it; 8 idle closes; G 880,950 against W 881,023, loss judged 0; Ab − V 0 |
-| `20261104T012438Z` | `fd-limit-tail` | PASS, `rss_slope` WARN | `limit-landed` read 24 in 22 drains; 166 failed listings and 25 failed checkpoint writes in the window, 0 of either in the mark past it; G = W = Ab = V = 1,505,600, W + F − G 0; 33 writer rotations, 27 deletions, `files.open` peaking at 9 and ending at 8 |
+| `20261104T012438Z` | `fd-limit-tail` | PASS, `rss_slope` WARN | `limit-landed` read 24 in 22 drains; 165 failed listings in the window (166 counting the drain that straddles the revert) and 25 failed checkpoint writes in the window, 0 of either in the mark past it; G = W = Ab = V = 1,505,600, W + F − G 0; 33 writer rotations, 27 deletions, `files.open` peaking at 9 and ending at 8 |
 
 What the runs showed about `logit` and the harness:
 
