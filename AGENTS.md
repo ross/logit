@@ -978,12 +978,13 @@ the operator-facing account of all of this.
   `memory.high` a margin above what its bounded queues cost, with a maximum on
   `logit.process.memory.resident.bytes`; `memory-high-pressure` sets it below that cost, and the
   step's record counts the throttle's engagements from `memory.events`, which `timeline`
-  reports. `tail-copytruncate` rotates a never-rotating writer's file with `copytruncate` steps (a
-  one-shot container copies and truncates it, recording the lines lost between the two) while
-  the SUT runs, is stopped, and is killed, compresses finished copies with `gzip` steps, and
-  restores one under a new inode with a `replace` step, so content claims, rejected resumes, and
-  compressed skips run under soak; `ledger.wire` takes each copytruncate's lost lines and a
-  running one's possible re-read of its copy from that record. `cri-rotate` runs `cri_in`
+  holds to each step's `engaged`: `true` there, `false` on `memory-high`. `tail-copytruncate`
+  rotates a never-rotating writer's file with `copytruncate` steps (a one-shot container copies and
+  truncates it, recording the lines lost between the two) while the SUT runs, is stopped, and is
+  killed, compresses finished copies with `gzip` steps, and restores one under a new inode with a
+  `replace` step, so content claims, rejected resumes, and compressed skips run under soak;
+  `ledger.wire` takes each copytruncate's lost lines and a running one's possible re-read of its
+  copy from that record. `cri-rotate` runs `cri_in`
   against a stdlib writer, `soaklib/criwriter.py`, that keeps a kubelet pod log tree in
   the CRI format (interleaved streams, 16 KiB `P` pieces, conmon's short stalled `P`, the
   kubelet's rename, reopen, and gzip rotation with a line split across each rename, and a

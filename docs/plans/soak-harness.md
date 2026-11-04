@@ -235,7 +235,9 @@ settle window would leave a life no fit. `fanin` and `tcp-ingress` set `60s`, an
   or `memory.high` from its `memory_high`, a whole number with a `K`, `M`, or `G` suffix from
   16M to 1024G, one of the two, in the SUT's own cgroup, and its revert writes back what
   it found, unless the process started again or exited inside the window; on a `memory_high`
-  step it records the window's `memory.events` `high` count, which `timeline` reports.
+  step it records the window's `memory.events` `high` count, which `timeline` reports, and an
+  optional `engaged`, `true` or `false` and refused on any other step, FAILs a count of 0 or a
+  count above 0 respectively; `memory_high` must be a whole number of 4 KiB pages.
 - `[ledger] vm_every_window`, optional, is `true` or `false`; `[ledger] sut_script`, optional,
   is a component id.
 - `[[ledger.source]]` (W8b) has the rules under "Sources" below.
@@ -3492,8 +3494,8 @@ that items 3, 7, and 11 need.
   it, self-test fixtures for each, the `fd-limit-tcp` and `fd-limit-tail` scenarios, an
   amendment to ADR `soak-harness`, and both runs recorded under "Findings".
 - **W32**: item 28: the `cgroup` action, its rules, its window's excuses, self-test fixtures
-  for each, the `cpu-quota`, `memory-high`, and `memory-high-pressure` scenarios, an amendment to ADR `soak-harness`,
-  and both runs recorded under "Findings".
+  for each, the `cpu-quota`, `memory-high`, and `memory-high-pressure` scenarios, an amendment
+  to ADR `soak-harness`, and the eight runs of the three recorded under "Findings".
 - **W33** to **W37**: items 29, 31, 32, 33, and 34 in turn, each with its action or
   wire, self-test fixtures for each rule, an amendment to ADR `soak-harness` where it adds a
   ledger rule or an action, and each scenario's run recorded under "Findings". Item 30 has no
@@ -6854,8 +6856,10 @@ one-shot without `label=disable` failed with `Permission denied`.
 | `20261104T021156Z` | `memory-high` (64M) | PASS | `resident-bounded` read 46.2 MiB at most against 56; the cgroup peaked at 41.6 MiB and `memory.events` counted no `high` event; `OOMKilled` false; G = W = 731,300, Ab = V = 640,300 |
 | `20261104T022255Z` | `cpu-quota`, first cut | FAIL | `expect.queue-evicts`: the receive queue evicted nothing; below |
 | `20261104T024801Z` | `memory-high-pressure` (36M) | PASS | `timeline`: memory.high engaged 49 times; the cgroup held at 36.5 MiB at most (`memory.peak`) while resident memory peaked at 44.4 MiB; `OOMKilled` false; G = W = 731,200, Ab = V = 638,000, uncounted 0; 88,000 datagrams evicted and counted, as in `memory-high` |
-| `20261104T025526Z` | `memory-high` (64M), with the engagement count | PASS | `timeline`: memory.high engaged 0 times; `resident-bounded` 47.6 MiB at most |
+| `20261104T025526Z` | `memory-high` (64M), with the engagement count | PASS | `timeline`: memory.high engaged 0 times; `resident-bounded` 45.4 MiB at most |
 | `20261104T023047Z` | `cpu-quota` | PASS | `quota-landed` read 2.23 CPU-seconds over the 120 s window against the quota's 2.4; 1,876,030 kernel drops in it of G 7,310,900 over the run; every drain of the mark past the revert read a flush (1,000 events at least) and a delivery (10 at least) and no drop; V = Ab = W 5,422,639 |
+| `20261104T033454Z` | `memory-high-pressure` (36M), `engaged = true`, the apply's restart guard | PASS | `timeline`: memory.high engaged 40 times; G = W = 731,300, Ab = V = 639,700, uncounted 0; 88,200 datagrams evicted and counted |
+| `20261104T034207Z` | `cpu-quota`, the apply's restart guard | PASS | `quota-landed` read 2.20 CPU-seconds; 1,926,959 kernel drops in the window of G 7,311,000; every drain of the mark read a flush and a delivery and no drop; uncounted 0 |
 
 What the runs showed about `logit` and the harness:
 
@@ -6882,7 +6886,7 @@ What the runs showed about `logit` and the harness:
   "after a stall nothing applies, and the open step reverts early, got []" while another
   agent's soak and an image build shared the host; four reruns passed. It isn't W32's code,
   and is noted for the flake log.
-- **Self-test**: 2,954 expectations. Each new rule was reverted in turn and failed at least one
+- **Self-test**: 2,965 expectations. Each new rule was reverted in turn and failed at least one
   expectation: the `memory.events` reads at the apply and the revert, the `high` line's parse,
   the window's difference, a failed read at each end, `timeline`'s engagement line and its FAIL
   on an unread count, the cgroup v2 line, the full-id and `..` checks, a missing process, the failed
@@ -6890,7 +6894,13 @@ What the runs showed about `logit` and the harness:
   `exited_in_window` branches and `timeline`'s report of each, UDP ingress, the drain gap's
   excuse, the retention guard's entry and its pause limit, and the scenario rules: one key, the
   `cpu` and `memory_high` ranges and forms, a bool `cpu`, either key on another action, the
-  SUT-only and `[random]` refusals, and the keys reaching the expanded step.
+  SUT-only and `[random]` refusals, and the keys reaching the expanded step. So did the rules
+  added in review: `timeline`'s FAIL of `engaged = true` against a count of 0 and of
+  `engaged = false` against one above it, `engaged` refused off a `memory_high` step and when it
+  isn't a bool, the whole-page `memory_high`, the apply's write-back on a read-back that differs,
+  its state kept only after a write that read back as written, its second inspect and the
+  write-back when the process started again during it, and the cgroup and start time taken from
+  one inspect.
 
 ### W31: open-files limits on a TCP listener and a tailer (2026-11-03)
 

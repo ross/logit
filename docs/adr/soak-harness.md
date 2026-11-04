@@ -921,7 +921,16 @@ fails on a read-back that differs; the revert writes what it found back.
   on a `memory_high` step the apply and the revert each read `memory.events`' `high` count, and
   the revert records the difference, the times the kernel throttled the cgroup over the limit
   in the window. `timeline` reports it, and FAILs a revert that couldn't read it. A limit above
-  what the SUT costs reads 0 and shows a bound holding; one below it shows the throttle.
+  what the SUT costs reads 0 and shows a bound holding; one below it shows the throttle. A
+  `memory_high` step's optional `engaged` states which the scenario means: `true` FAILs a count
+  of 0, and `false` FAILs any count above it, so a scenario can't pass while measuring the other
+  case. `memory_high` is a whole number of 4 KiB pages, since the kernel rounds any other value
+  down and the read-back would differ.
+- **The write lands in the scope it read.** The apply takes the cgroup path and `StartedAt` from
+  one `docker inspect`, and inspects again after the write: a process that started again in
+  between has a new scope, so the apply writes `found` back to the path it wrote and fails the
+  step. It keeps what the revert needs only after a write that read back as written, so a failed
+  apply leaves the revert nothing to write.
 - **`memory.high`, not `memory.max`.** Over `memory.high` the kernel throttles and reclaims and
   never kills, so a scenario can show that a `buffer:` bound bounds memory with no exit to
   excuse. `memory.max` ends in an OOM kill, which `exit` FAILs; an expected-OOM excuse waits for
