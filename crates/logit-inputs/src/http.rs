@@ -7,8 +7,8 @@
 //! ([`collect_with_stall_bound`], which holds one buffer per body however many reads it arrives
 //! in). All six listeners build and read through these. The two Datadog listeners,
 //! `splunk_hec_in`, and `influxdb_in` also share their request helpers here: `Content-Encoding` and `Content-Type`
-//! parsing, bounded decompression, the JSON response shapes and the
-//! deadline-bounded delivery. `otlp_in`'s `auth:` and the receiver's `bind_auth:` check, count,
+//! parsing, bounded decompression, and the JSON response shapes. All six deliver a request through
+//! [`deliver_bounded`]. `otlp_in`'s `auth:` and the receiver's `bind_auth:` check, count,
 //! and challenge through [`AuthGate`]; the `Authorization` parse and the constant-time key check
 //! every listener shares are `logit_proto::auth`'s.
 //!
@@ -27,8 +27,8 @@
 //! still running at the grace (`crate::listener::ConnectionTasks`). That abort must cost a client
 //! its acknowledgment, which it answers by resending, and never a batch part-way through a send.
 //! Two shapes satisfy the rule: [`deliver_detached`] sends on a task of its own, which the abort
-//! doesn't reach, and [`deliver_with_deadline`] sends nothing until it holds a slot on every
-//! consumer, so a wait dropped before then has sent and counted nothing. The first shape's wait
+//! doesn't reach, and [`deliver_bounded`] sends nothing until it holds a slot for every batch on
+//! every consumer, so a wait dropped before then has sent and counted nothing. A detached wait
 //! can still be dropped after the send, so a listener counts a detached delivery's outcome in
 //! its `settle` callback, on that task, never after the wait.
 
@@ -40,6 +40,7 @@ use hyper::server::conn::http2;
 use hyper_util::rt::TokioExecutor;
 use hyper_util::server::conn::auto;
 use logit_core::{Diagnostics, Telemetry};
+use logit_pipeline::SendManyError;
 use logit_proto::auth::{Credentials, Denied};
 use std::future::Future;
 use std::pin::Pin;
@@ -576,7 +577,8 @@ pub(crate) fn error_response(
 /// every one after it, which were never offered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Undelivered {
-    /// The deadline passed before every consumer had room ([`deliver_with_deadline`] only).
+    /// The deadline passed before every consumer had room for the request ([`deliver_bounded`]
+    /// only).
     Busy(usize),
     /// No consumer took a batch: the listener's direct consumers are all closed.
     Closed(usize),
@@ -669,80 +671,93 @@ where
     }
 }
 
-/// Sends `batches` in order under one deadline, `busy_after` from now: the bounded wait a listener
-/// answers busy after (`crate::datadog`'s "Backpressure" section). Each batch
-/// reaches every consumer or none ([`logit_pipeline::Fanout::send_with_deadline`]). The `Err`
-/// counts the refused batch and every one after it: [`Undelivered::Busy`] for a deadline that
-/// passed, [`Undelivered::Closed`] for a batch no consumer took.
-pub(crate) async fn deliver_with_deadline(
-    sink: &logit_pipeline::Fanout,
-    batches: Vec<logit_core::EventBatch>,
-    busy_after: std::time::Duration,
-) -> Result<(), Undelivered> {
-    let deadline = tokio::time::Instant::now() + busy_after;
-    let total = batches.len();
-    for (sent, batch) in batches.into_iter().enumerate() {
-        match sink.send_with_deadline(batch, deadline).await {
-            Ok(true) => {}
-            Ok(false) => return Err(Undelivered::Closed(total - sent)),
-            Err(_) => return Err(Undelivered::Busy(total - sent)),
-        }
-    }
-    Ok(())
+/// How much of a delivered request [`deliver_bounded`]'s deadline covered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Delivery {
+    /// Every batch went out all or none under the deadline.
+    Bounded,
+    /// The request held more batches than a consumer's inbox can, so only the first
+    /// [`logit_pipeline::Fanout::max_reservation`] went out under the deadline and the rest
+    /// through [`deliver_detached`]. A client that times out during that wait resends a request
+    /// already taken: `class="unbounded"` on `logit.input.requests` where a listener counts it.
+    Unbounded,
 }
 
-/// Sends a request's first batch through [`deliver_with_deadline`] under `busy_after`, then the
-/// rest through [`deliver_detached`]: the shape of a listener that answers busy only while nothing
-/// of the request is taken (`splunk_hec_in`, `otlp_in`). Once a batch is delivered, a busy answer
-/// would tell the client nothing was taken, and its retry would deliver that batch twice, so the
-/// rest wait for as long as the pipeline takes.
+impl Delivery {
+    /// The `class` (`logit.input.requests`) value for a request delivered this way.
+    pub(crate) fn class(self) -> &'static str {
+        match self {
+            Delivery::Bounded => "ok",
+            Delivery::Unbounded => "unbounded",
+        }
+    }
+}
+
+/// Sends one request's `batches` all or none under one deadline, `busy_after` from now: the
+/// bounded wait every HTTP listener answers busy after (`docs/adr/otlp-in-busy-answer.md`'s
+/// "All or none" amendment). [`logit_pipeline::Fanout::send_many_with_deadline`] reserves room for
+/// every batch on every consumer before sending any, so a busy answer always means nothing of the
+/// request was taken, and the client's resend is the one copy.
+///
+/// A request with more batches than [`logit_pipeline::Fanout::max_reservation`] can't be reserved
+/// whole: its first `max_reservation` batches go all or none under the deadline, then the rest
+/// through [`deliver_detached`], and the `Ok` is [`Delivery::Unbounded`]. Once that head is in, a
+/// busy answer would make the retry deliver it twice, so the rest wait for as long as the pipeline
+/// takes.
 ///
 /// [`Undelivered::Busy`] carries every batch of the request and is the caller's to count and
 /// answer: nothing was sent, and the client still holds the body. Every [`Undelivered::Closed`]
-/// outcome reaches `settle` first, the first batch's refusal inline and a later one on the
-/// delivery's task, so the caller counts a closed consumer there alone. `accepted` runs once the
-/// first batch is in every inbox, before the rest are offered, and [`Unfinished::taken`] says
-/// whether it ran. Empty `batches` is `Ok` and runs neither callback.
-pub(crate) async fn deliver_first_bounded<F>(
+/// outcome reaches `settle` first, a refused head inline and a refused rest on the delivery's
+/// task, so a caller that counts a closed consumer in `settle` counts it there alone. `accepted`
+/// runs once the bounded batches are in every inbox, before any rest is offered, and
+/// [`Unfinished::taken`] says whether it ran. Empty `batches` is `Ok` and runs neither callback.
+pub(crate) async fn deliver_bounded<F>(
     sink: &logit_pipeline::Fanout,
-    batches: Vec<logit_core::EventBatch>,
+    mut batches: Vec<logit_core::EventBatch>,
     busy_after: std::time::Duration,
     accepted: impl FnOnce(),
     settle: F,
-) -> Result<(), Unfinished>
+) -> Result<Delivery, Unfinished>
 where
     F: FnOnce(Result<(), Undelivered>) + Send + 'static,
 {
     if batches.is_empty() {
-        return Ok(());
+        return Ok(Delivery::Bounded);
     }
+    let deadline = tokio::time::Instant::now() + busy_after;
     let total = batches.len();
-    let mut batches = batches.into_iter();
-    let first: Vec<logit_core::EventBatch> = batches.by_ref().take(1).collect();
-    match deliver_with_deadline(sink, first, busy_after).await {
-        Ok(()) => {
+    let rest = batches.split_off(total.min(sink.max_reservation()));
+    match sink.send_many_with_deadline(batches, deadline).await {
+        Ok(true) => {
             accepted();
-            deliver_detached(sink, batches.collect(), settle)
+            if rest.is_empty() {
+                return Ok(Delivery::Bounded);
+            }
+            deliver_detached(sink, rest, settle)
                 .await
+                .map(|()| Delivery::Unbounded)
                 .map_err(|undelivered| Unfinished { undelivered, taken: true })
         }
-        Err(Undelivered::Busy(_)) => {
-            Err(Unfinished { undelivered: Undelivered::Busy(total), taken: false })
-        }
-        Err(Undelivered::Closed(_)) => {
+        Ok(false) => {
             let undelivered = Undelivered::Closed(total);
             settle(Err(undelivered));
             Err(Unfinished { undelivered, taken: false })
         }
+        // `OverCapacity` can't arise: the head is cut to `max_reservation`. Read as busy, it
+        // would leave the whole request with the client, which is still true.
+        Err(SendManyError::Timeout(_) | SendManyError::OverCapacity(_)) => {
+            Err(Unfinished { undelivered: Undelivered::Busy(total), taken: false })
+        }
     }
 }
 
-/// A request [`deliver_first_bounded`] didn't finish delivering.
+/// A request [`deliver_bounded`] didn't finish delivering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Unfinished {
     /// The batches left undelivered, the refused one included.
     pub(crate) undelivered: Undelivered,
-    /// Whether the first batch reached every inbox, so a client's retry repeats it.
+    /// Whether some batches reached every inbox before the refusal, so a client's retry repeats
+    /// them. Only an [`Delivery::Unbounded`] request's detached rest can be refused after that.
     pub(crate) taken: bool,
 }
 

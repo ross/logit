@@ -26,23 +26,24 @@
 //! Every `Delivered` also carries a [`BatchContext`]: a [`TraceContext`]
 //! (`docs/adr/trace-context-propagation-on-delivered.md`) and a [`Provenance`], which node created
 //! the batch and which last handed it off (`docs/adr/batch-provenance-on-delivered.md`).
-//! `Fanout::send`/`send_blocking`/`send_with_deadline` record a listener's span around the send
+//! `Fanout::send`/`send_blocking`/`send_with_deadline` record a listener's span around the send,
+//! and `send_many_with_deadline` one per batch
 //! (`docs/adr/internal-span-emission-and-deterministic-sampling.md`).
 //!
 //! **A send must not be dropped part way.** `send` delivers consumer by consumer, so a send
 //! dropped while parked on a full consumer leaves the ones before it holding the batch and the
 //! rest without it, and a retry then duplicates on some branches only. A send inside an HTTP
 //! handler is exposed to this: a client that closes mid-request drops hyper's service future on
-//! h1, and an h2 `RST_STREAM` cancels the stream's task. `prometheus_in`'s receiver
-//! therefore runs a request's sends on a task of its own and awaits it
-//! (`logit-inputs`' `http::deliver_detached`), so a closing client cancels only the wait.
-//! `datadog_in`, `datadog_trace_in`, and `influxdb_in` call `send_with_deadline` (through
-//! `http::deliver_with_deadline`), which answers "busy" instead. `otlp_in` and `splunk_hec_in` do
-//! both through `http::deliver_first_bounded`: a request's first batch under the deadline, the rest
-//! detached.
+//! h1, and an h2 `RST_STREAM` cancels the stream's task. A listener therefore runs a request's
+//! unbounded sends on a task of its own and awaits it (`logit-inputs`' `http::deliver_detached`),
+//! so a closing client cancels only the wait. Every HTTP listener sends a request through
+//! `http::deliver_bounded` instead, which calls `send_many_with_deadline`: every batch of the
+//! request reaches every consumer or none, and the listener answers "busy" when the deadline
+//! passes first. Only a request with more batches than an inbox holds sends its rest detached.
 //!
 //! **A reservation always carries a deadline.** `send_with_deadline` holds a slot on every
-//! consumer it has reached while it waits for the next. In a diamond (`in -> [a, b]`, `b -> a`),
+//! consumer it has reached while it waits for the next, and `send_many_with_deadline` a slot per
+//! batch. In a diamond (`in -> [a, b]`, `b -> a`),
 //! enough parked senders can hold all of `a`'s capacity while waiting on `b`, `b` can then never
 //! send into `a`, so `b` never drains and no sender ever gets `b`'s slot. Only the deadline
 //! releases the held slots and breaks that cycle, so there is no deadline-less reservation.
@@ -199,6 +200,35 @@ impl std::fmt::Display for SendTimeout {
 }
 
 impl std::error::Error for SendTimeout {}
+
+/// Why [`Fanout::send_many_with_deadline`] sent nothing. Each variant hands the batches back.
+#[derive(Debug, PartialEq)]
+pub enum SendManyError {
+    /// The deadline passed before every consumer had room for every batch, so no consumer
+    /// received any of them.
+    Timeout(Vec<EventBatch>),
+    /// More batches than some consumer's inbox can hold at once ([`Fanout::max_reservation`]),
+    /// so no wait could ever reserve them all. Nothing was offered.
+    OverCapacity(Vec<EventBatch>),
+}
+
+impl std::fmt::Display for SendManyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeout(_) => f.write_str(
+                "not every consumer had room for every batch before the deadline; none received \
+                 any",
+            ),
+            Self::OverCapacity(batches) => write!(
+                f,
+                "{} batches exceed a consumer's inbox capacity; none were offered",
+                batches.len()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SendManyError {}
 
 /// A send's place in line, kept across [`Fanout::send_resumable`] attempts: the `reserve()` it
 /// is parked on, if any, and its `send.blocked.duration` timer. Holds no slot between attempts
@@ -415,7 +445,12 @@ struct InFlightCounter {
 
 impl InFlightCounter {
     fn enter(&self, n: usize) -> InFlight<'_> {
-        let add = (1 << EVENTS_BITS) | (n as u64).min(EVENTS_MASK);
+        self.enter_batches(1, n)
+    }
+
+    /// [`InFlightCounter::enter`] for `batches` batches holding `events` events in all.
+    fn enter_batches(&self, batches: usize, events: usize) -> InFlight<'_> {
+        let add = ((batches as u64) << EVENTS_BITS) | (events as u64).min(EVENTS_MASK);
         self.word.fetch_add(add, Ordering::Relaxed);
         InFlight { word: &self.word, add }
     }
@@ -605,7 +640,8 @@ impl Fanout {
     }
 
     /// [`Fanout::send`] with all-edges-or-nothing delivery under `deadline`: the call for a
-    /// listener that answers "busy" rather than blocking its client (`datadog_in`).
+    /// listener that answers "busy" rather than blocking its client, through
+    /// [`Fanout::send_many_with_deadline`] for a request of one batch.
     ///
     /// Mints the root context, the Producer span, and the provenance stamp exactly as `send` does.
     /// Then, before sending anything, it reserves a slot on every consumer's channel, all held at
@@ -640,7 +676,7 @@ impl Fanout {
         let _in_flight = self.in_flight(batch.events.len());
         let timer = self.telemetry.timer("logit.component.send.blocked.duration");
         // Until every slot is held, a timeout or a dropped future discards both unrecorded.
-        let mut unsent = Unsent(Some((span, timer)));
+        let mut unsent = Unsent(Some((span, Some(timer))));
         let reserve_all = async {
             let mut permits = Vec::with_capacity(self.consumers.len());
             for edge in &self.consumers {
@@ -690,6 +726,139 @@ impl Fanout {
         self.record_send(n);
         drop(timer);
         span.finish();
+        Ok(taken)
+    }
+
+    /// The most batches [`Fanout::send_many_with_deadline`] can reserve at once: the smallest
+    /// inbox capacity among the consumers, closed ones included. `usize::MAX` with no consumers.
+    pub fn max_reservation(&self) -> usize {
+        self.consumers.iter().map(|edge| edge.tx.max_capacity()).min().unwrap_or(usize::MAX)
+    }
+
+    /// [`Fanout::send_with_deadline`] for several batches at once, all or none: the call for a
+    /// listener whose request decodes to several batches and that answers "busy" rather than
+    /// blocking its client (`otlp_in`, `splunk_hec_in`, `datadog_in`).
+    ///
+    /// Before sending anything it reserves `batches.len()` slots on every consumer's channel, all
+    /// held at once, under one deadline. If `deadline` passes first, it returns
+    /// [`SendManyError::Timeout`] with nothing sent or counted: the held slots are released, no
+    /// consumer receives any batch, and no batch's span, `batches.sent`/`events.sent`, or
+    /// `send.blocked.duration` sample is recorded. Once every consumer holds every slot, each batch
+    /// goes out in order to every consumer, as `send_with_deadline` sends one, with its own root
+    /// context, span, and counts. The wait is shared, so the call records one
+    /// `send.blocked.duration` sample, not one per batch. A consumer whose wait is queued holds the slots it has been
+    /// handed so far, and a sender queued behind it on that inbox waits for it: tokio's channel
+    /// hands slots out in order. The deadline bounds both.
+    ///
+    /// One batch goes through `send_with_deadline` itself. More batches than
+    /// [`Fanout::max_reservation`] return [`SendManyError::OverCapacity`] before anything is
+    /// offered: tokio's `reserve_many` reads that request as a closed channel, and the caller
+    /// splits instead. A closed consumer is skipped and counted
+    /// `events.dropped{reason="closed_consumer"}` per batch once the batches go out; `Ok(false)` is
+    /// a request no consumer took. Empty `batches` sends nothing and returns `Ok(true)` when a
+    /// consumer is open.
+    pub async fn send_many_with_deadline(
+        &self,
+        mut batches: Vec<EventBatch>,
+        deadline: tokio::time::Instant,
+    ) -> Result<bool, SendManyError> {
+        let count = batches.len();
+        if count == 1 {
+            let batch = batches.pop().expect("one batch");
+            return self.send_with_deadline(batch, deadline).await.map_err(|SendTimeout(batch)| {
+                // `batches` kept its allocation, so handing the batch back allocates nothing.
+                batches.push(batch);
+                SendManyError::Timeout(batches)
+            });
+        }
+        if self.consumers.is_empty() {
+            return Ok(false);
+        }
+        if count > self.max_reservation() {
+            return Err(SendManyError::OverCapacity(batches));
+        }
+        if count == 0 {
+            return Ok(self.consumers.iter().any(|edge| !edge.tx.is_closed()));
+        }
+        let events: usize = batches.iter().map(|batch| batch.events.len()).sum();
+        let _in_flight = self.in_flight.as_ref().map(|c| c.enter_batches(count, events));
+        // Until every slot is held, a timeout or a dropped future discards every batch's span and
+        // the call's timer unrecorded. The wait is one for every batch, so the call records one
+        // `send.blocked.duration` sample, carried by the first batch's entry: a sample per batch
+        // would sum to the wait times the batch count.
+        let mut unsent: Vec<(TraceContext, Unsent)> = batches
+            .iter()
+            .enumerate()
+            .map(|(i, batch)| {
+                let trace = TraceContext::new_root();
+                let mut span = self.telemetry.span(
+                    "send",
+                    SpanKind::Producer,
+                    trace.trace_id,
+                    trace.span_id,
+                    None,
+                );
+                span.events(batch.events.len() as u64);
+                let timer =
+                    (i == 0).then(|| self.telemetry.timer("logit.component.send.blocked.duration"));
+                (trace, Unsent(Some((span, timer))))
+            })
+            .collect();
+        let reserve_all = async {
+            let mut permits = Vec::with_capacity(self.consumers.len());
+            for edge in &self.consumers {
+                // As in `send_with_deadline`: `None` is a closed consumer, and `try_reserve_many`
+                // can't overtake a parked reserver. `count` is within every edge's capacity, so
+                // an `Err` from `reserve_many` is a closed channel.
+                tokio::task::coop::consume_budget().await;
+                let permit = match edge.tx.try_reserve_many(count) {
+                    Ok(permits) => Some(permits),
+                    Err(TrySendError::Closed(())) => None,
+                    Err(TrySendError::Full(())) => {
+                        let _blocked = edge.found_full();
+                        edge.tx.reserve_many(count).await.ok()
+                    }
+                };
+                permits.push(permit);
+            }
+            permits
+        };
+        let Ok(mut permits) = tokio::time::timeout_at(deadline, reserve_all).await else {
+            // Dropping the partial `permits` inside the cancelled future releases every held slot,
+            // and dropping `unsent` cancels every span and timer.
+            return Err(SendManyError::Timeout(batches));
+        };
+        let mut taken = false;
+        let mut blocked = None;
+        for (batch, (trace, mut unsent)) in batches.into_iter().zip(unsent.drain(..)) {
+            let (span, timer) = unsent.0.take().expect("taken only here, once every slot is held");
+            blocked = blocked.or(timer);
+            let ctx = self.stamp(trace.into());
+            let n = batch.events.len();
+            if permits.len() == 1 {
+                match permits[0].as_mut().and_then(Iterator::next) {
+                    Some(permit) => {
+                        permit.send(Delivered::Owned(batch, ctx));
+                        taken = true;
+                    }
+                    None => self.record_dropped_on_close(&self.consumers[0], n),
+                }
+            } else {
+                let batch = Arc::new(batch);
+                for (permit, edge) in permits.iter_mut().zip(&self.consumers) {
+                    match permit.as_mut().and_then(Iterator::next) {
+                        Some(permit) => {
+                            permit.send(Delivered::Shared(batch.clone(), ctx));
+                            taken = true;
+                        }
+                        None => self.record_dropped_on_close(edge, n),
+                    }
+                }
+            }
+            self.record_send(n);
+            span.finish();
+        }
+        drop(blocked);
         Ok(taken)
     }
 
@@ -969,12 +1138,14 @@ impl Fanout {
 /// The span and blocked-duration timer of an all-or-nothing send that has not sent yet. Dropped
 /// while still holding them (a deadline passed, or the send's future was dropped), it cancels
 /// both, so a send that never happened records nothing.
-struct Unsent(Option<(logit_core::SpanGuard, logit_core::telemetry::Timer)>);
+struct Unsent(Option<(logit_core::SpanGuard, Option<logit_core::telemetry::Timer>)>);
 
 impl Drop for Unsent {
     fn drop(&mut self) {
         if let Some((span, timer)) = self.0.take() {
-            timer.cancel();
+            if let Some(timer) = timer {
+                timer.cancel();
+            }
             span.cancel();
         }
     }
@@ -1290,6 +1461,138 @@ mod tests {
         rx_b.recv().await.expect("b's prefill");
         assert!(rx_b.try_recv().is_err(), "b must not receive the timed-out batch either");
         assert_nothing_recorded_as_sent(&registry.drain(0));
+    }
+
+    /// Two batches into an inbox with room for one: the deadline passes with nothing sent, the
+    /// one held slot released, and nothing counted.
+    #[tokio::test(start_paused = true)]
+    async fn send_many_with_deadline_with_room_for_all_but_one_times_out_sending_nothing() {
+        let registry = Registry::with_span_sampling(1.0);
+        let telemetry = registry.telemetry_for("in", "otlp_in", "listener");
+        let (tx, mut rx) = mpsc::channel(3);
+        tx.try_send(Delivered::Owned(batch(1), BatchContext::default())).expect("prefill");
+        tx.try_send(Delivered::Owned(batch(1), BatchContext::default())).expect("prefill");
+        let probe = tx.clone();
+        let fanout = Fanout::new(vec![tx]).with_telemetry(telemetry);
+
+        let result = fanout.send_many_with_deadline(vec![batch(2), batch(3)], in_ms(100)).await;
+
+        let Err(SendManyError::Timeout(back)) = result else { panic!("the deadline passes first") };
+        let sizes: Vec<usize> = back.iter().map(|b| b.events.len()).collect();
+        assert_eq!(sizes, [2, 3], "every batch comes back whole, in order");
+        assert_eq!(probe.capacity(), 1, "the slot the wait was handed must be released");
+        for _ in 0..2 {
+            let prefilled = rx.recv().await.expect("a prefilled batch");
+            assert_eq!(prefilled.batch_context(), BatchContext::default());
+        }
+        assert!(rx.try_recv().is_err(), "neither batch may be enqueued");
+        assert_nothing_recorded_as_sent(&registry.drain(0));
+    }
+
+    /// Two consumers, one with room for both batches and one with room for only one: neither
+    /// receives anything, and the first's reserved slots are released.
+    #[tokio::test(start_paused = true)]
+    async fn send_many_with_deadline_with_one_of_two_consumers_short_delivers_to_neither() {
+        let registry = Registry::with_span_sampling(1.0);
+        let telemetry = registry.telemetry_for("in", "otlp_in", "listener");
+        let (tx_a, mut rx_a) = mpsc::channel(2);
+        let (tx_b, mut rx_b) = mpsc::channel(2);
+        tx_b.try_send(Delivered::Owned(batch(1), BatchContext::default())).expect("prefill b");
+        let probe_a = tx_a.clone();
+        let fanout = Fanout::new(vec![tx_a, tx_b]).with_telemetry(telemetry);
+
+        let result = fanout.send_many_with_deadline(vec![batch(1), batch(1)], in_ms(100)).await;
+
+        assert!(matches!(result, Err(SendManyError::Timeout(_))), "got {result:?}");
+        assert!(rx_a.try_recv().is_err(), "a must not hold a batch of a refused request");
+        assert_eq!(probe_a.capacity(), 2, "a's reserved slots must be released, not leaked");
+        rx_b.recv().await.expect("b's prefill");
+        assert!(rx_b.try_recv().is_err(), "b must not receive either batch");
+        assert_nothing_recorded_as_sent(&registry.drain(0));
+    }
+
+    /// With room everywhere, every consumer gets every batch in order, shared, and each batch
+    /// counts and records as a `send_with_deadline` of it would.
+    #[tokio::test(start_paused = true)]
+    async fn send_many_with_deadline_with_room_delivers_every_batch_to_every_consumer() {
+        let registry = Registry::with_span_sampling(1.0);
+        let telemetry = registry.telemetry_for("in", "otlp_in", "listener");
+        let (tx_a, mut rx_a) = mpsc::channel(2);
+        let (tx_b, mut rx_b) = mpsc::channel(2);
+        let fanout =
+            Fanout::new(vec![tx_a, tx_b]).with_telemetry(telemetry).with_component("otlp_in");
+
+        let taken = fanout.send_many_with_deadline(vec![batch(2), batch(3)], in_ms(100)).await;
+
+        assert_eq!(taken, Ok(true));
+        for rx in [&mut rx_a, &mut rx_b] {
+            let first = rx.recv().await.expect("the first batch");
+            let second = rx.recv().await.expect("the second batch");
+            assert!(matches!(first, Delivered::Shared(..)), "a fan-out shares each batch");
+            assert_eq!(first.provenance().origin_str(), Some("otlp_in"));
+            let sizes = [first, second].map(|d| crate::unwrap_batch(d).events.len());
+            assert_eq!(sizes, [2, 3], "in order");
+        }
+        let events = registry.drain(0);
+        assert_eq!(counter_value(&events, "logit.component.batches.sent"), Some(2.0));
+        assert_eq!(counter_value(&events, "logit.component.events.sent"), Some(5.0));
+        assert_eq!(events.iter().filter(|e| e.span.is_some()).count(), 2, "a span per batch");
+        assert_eq!(
+            timing_count(&events, "logit.component.send.blocked.duration"),
+            1,
+            "one sample for the call's one wait"
+        );
+    }
+
+    /// A closed consumer is skipped, and each batch counts its events dropped there, as
+    /// `send_with_deadline` counts one.
+    #[tokio::test(start_paused = true)]
+    async fn send_many_with_deadline_skips_and_counts_a_closed_consumer() {
+        let registry = Registry::new();
+        let telemetry = registry.telemetry_for("in", "otlp_in", "listener");
+        let (tx_a, rx_a) = mpsc::channel(2);
+        let (tx_b, mut rx_b) = mpsc::channel(2);
+        drop(rx_a);
+        let fanout = Fanout::new(vec![tx_a, tx_b]).with_telemetry(telemetry);
+
+        let taken = fanout.send_many_with_deadline(vec![batch(1), batch(2)], in_ms(100)).await;
+
+        assert_eq!(taken, Ok(true), "b took both");
+        rx_b.recv().await.expect("b's first batch");
+        rx_b.recv().await.expect("b's second batch");
+        let events = registry.drain(0);
+        assert_eq!(counter_value(&events, "logit.component.events.dropped"), Some(3.0));
+        assert_eq!(counter_value(&events, "logit.component.batches.sent"), Some(2.0));
+
+        let (tx, rx) = mpsc::channel(2);
+        drop(rx);
+        let closed = Fanout::new(vec![tx]);
+        let taken = closed.send_many_with_deadline(vec![batch(1), batch(1)], in_ms(100)).await;
+        assert_eq!(taken, Ok(false), "no consumer took the request");
+    }
+
+    /// More batches than an inbox can hold is refused up front, never waited on and never read
+    /// as a closed consumer, which tokio's `reserve_many` reports it as.
+    #[tokio::test(start_paused = true)]
+    async fn send_many_with_deadline_over_capacity_offers_nothing_and_counts_no_drop() {
+        let registry = Registry::with_span_sampling(1.0);
+        let telemetry = registry.telemetry_for("in", "otlp_in", "listener");
+        let (tx_a, mut rx_a) = mpsc::channel(4);
+        let (tx_b, mut rx_b) = mpsc::channel(2);
+        let fanout = Fanout::new(vec![tx_a, tx_b]).with_telemetry(telemetry);
+        assert_eq!(fanout.max_reservation(), 2, "the smaller inbox bounds a reservation");
+
+        let result =
+            fanout.send_many_with_deadline(vec![batch(1), batch(1), batch(1)], in_ms(100)).await;
+
+        let Err(SendManyError::OverCapacity(back)) = result else {
+            panic!("three batches exceed b's capacity of two: {result:?}")
+        };
+        assert_eq!(back.len(), 3);
+        assert!(rx_a.try_recv().is_err() && rx_b.try_recv().is_err(), "nothing offered");
+        let events = registry.drain(0);
+        assert_eq!(counter_value(&events, "logit.component.events.dropped"), None);
+        assert_nothing_recorded_as_sent(&events);
     }
 
     /// The resumable case: a timed-out attempt releases the slot it held on `a` but keeps its

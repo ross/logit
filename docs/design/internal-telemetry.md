@@ -597,16 +597,17 @@ every producer the send-side numbers for free:
 
 | Name | Kind | Meaning |
 |---|---|---|
-| `logit.component.batches.sent` | count | one per `Fanout::send` call, regardless of fan-out width. A `Fanout::send_with_deadline` (`datadog_in`) that times out sends nothing and counts nothing, span and `send.blocked.duration` included |
+| `logit.component.batches.sent` | count | one per `Fanout::send` call, regardless of fan-out width. A `Fanout::send_with_deadline` or `send_many_with_deadline` (the HTTP listeners) that times out sends nothing and counts nothing, span and `send.blocked.duration` included; one that sends counts one per batch |
 | `logit.component.events.sent` | count | events in that batch |
-| `logit.component.send.blocked.duration` | timing | time spent inside one `Fanout::send` call (all consumers) |
+| `logit.component.send.blocked.duration` | timing | time spent inside one `Fanout::send` call (all consumers). A `send_many_with_deadline` call records one sample for its one wait, however many batches it sends |
 | `logit.component.events.dropped{reason="closed_consumer"}` | count | a consumer's channel was already closed. The first drop on each edge, one producer to one consumer, also logs a `closed_consumer` warn line naming both; later drops on that edge are counted only |
 
 #### Inbox side: recorded under the consumer
 
 `send.blocked.duration` is the producer's total and can't say which consumer it waited on. The
 inbox metrics are recorded under the *consumer's* component id by the same send paths
-(`Fanout::send*`, the blocking Lua path, and `Fanout::send_with_deadline`), so the consumer that
+(`Fanout::send*`, the blocking Lua path, and `Fanout::send_with_deadline` and
+`send_many_with_deadline`), so the consumer that
 constrains its producer is the one that carries them:
 
 | Name | Kind | Meaning |
@@ -616,7 +617,8 @@ constrains its producer is the one that carries them:
 | `logit.component.inbox.batches` | gauge | the inbox's depth, sampled after each receive (`run_transform`, `run_router`, `run_route_signals`, `run_lua`, and a sink's `drain_inbox`). A consumer parked in a full downstream send, or a sink parked on its full store, receives nothing and so reports no new depth; its `inbox.full` and `inbox.blocked.duration` are the signal then |
 
 A send tries the inbox first. On a full inbox it counts `inbox.full`, starts the consumer's blocked
-timer, and waits as before. A `Fanout::send_with_deadline` that times out sends nothing, but an
+timer, and waits as before. A `Fanout::send_with_deadline` or `send_many_with_deadline` that
+times out sends nothing, but an
 `inbox.full` it observed stays counted, because that observes the consumer's state and isn't a
 send. The consumer's blocked timer, dropped by the timeout, records the time to cancel.
 
@@ -923,7 +925,7 @@ and referenced below. A listener on `logit-inputs::tcp::TcpListener` records:
 | `logit.input.connections.rejected{reason="limit"}` | count | a connection closed at the connection cap, before any TLS handshake |
 | `logit.input.connections.rejected{reason="proxy_header"}` | count | a connection under `proxy_protocol: true` whose PROXY header was missing, malformed, cut short by the peer closing, or not complete within `handshake_timeout`; read before any TLS handshake |
 | `logit.input.accept.errors{reason="connection"\|"resource"\|"fatal"\|"other"}` | count | an `accept()` that failed, by class (`crates/logit-inputs/src/listener.rs`'s `classify_accept_error` has the table). `connection` retries at once; `resource` (fd exhaustion, realistically) and `other` back off 100 ms and continue; `fatal` ends the listener |
-| `logit.input.connections.closed{reason="idle"\|"shutdown"\|"reset"\|"handshake_timeout"}` | count | `idle`: an operator-configured `idle_timeout:` closed the connection. Policy, not a fault: counted, never diagnosed, and only possible when the field is set. `handshake_timeout`: on the stream driver (`statsd_in`, `syslog_in`, `graphite_in`, and `lines_in` under `transport: tcp`, and `statsd_in` and `lines_in` under `transport: unix_stream`) only, the TLS accept or the wait for the connection's first byte outlasted `handshake_timeout:`. Counted, never diagnosed, and not a loss, since nothing was framed. A PROXY header that times out is `connections.rejected{reason="proxy_header"}`. The HTTP listeners and `logit_in` bound the same phases but don't count the close yet. `reset`: on this driver only, the peer reset the connection (`ECONNRESET`) after its first payload byte, also diagnosed `connection_error`. Not a loss: a partial frame the reset cut off is counted `frames.dropped{reason="truncated"}`, and a reset between frames loses nothing. A reset before the first payload byte, which is how a load balancer ends a health check, isn't counted. A Unix stream socket shares the code but doesn't count one in practice: Linux resets a Unix peer only when the other end closes with bytes it hasn't read, and the driver never writes to a peer. `shutdown`: an HTTP listener (`otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, `influxdb_in`, and `prometheus_in`'s remote-write receiver) closed an open connection at shutdown, one count per connection whose close sequence finished before `run_input`'s backstop. It lands after the shutdown signal, so only a dedicated `internal` pipeline exports it (see "With a dedicated pipeline, `internal` drains last"). The stream listeners and `logit_in` don't count a shutdown close |
+| `logit.input.connections.closed{reason="idle"\|"shutdown"\|"reset"\|"handshake_timeout"}` | count | `idle`: an operator-configured `idle_timeout:` closed the connection. Policy, not a fault: counted, never diagnosed, and only possible when the field is set. `handshake_timeout`: on the stream driver (`statsd_in`, `syslog_in`, `graphite_in`, and `lines_in` under `transport: tcp`, and `statsd_in` and `lines_in` under `transport: unix_stream`), the six HTTP listeners (`otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, `influxdb_in`, and `prometheus_in`'s remote-write receiver), and `logit_in`, the TLS accept or the wait for the connection's first byte (`logit_in`: the `Hello`) outlasted `handshake_timeout:`. Counted, never diagnosed, and not a loss, since nothing was framed or read. `logit_in` doesn't also count it `logit.proto.errors{reason="handshake"}`. A PROXY header that times out is `connections.rejected{reason="proxy_header"}`. `reset`: on this driver only, the peer reset the connection (`ECONNRESET`) after its first payload byte, also diagnosed `connection_error`. Not a loss: a partial frame the reset cut off is counted `frames.dropped{reason="truncated"}`, and a reset between frames loses nothing. A reset before the first payload byte, which is how a load balancer ends a health check, isn't counted. A Unix stream socket shares the code but doesn't count one in practice: Linux resets a Unix peer only when the other end closes with bytes it hasn't read, and the driver never writes to a peer. `shutdown`: an HTTP listener (`otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, `influxdb_in`, and `prometheus_in`'s remote-write receiver) closed an open connection at shutdown, one count per connection whose close sequence finished before `run_input`'s backstop. It lands after the shutdown signal, so only a dedicated `internal` pipeline exports it (see "With a dedicated pipeline, `internal` drains last"). The stream listeners and `logit_in` don't count a shutdown close |
 | `logit.input.frames` / `logit.input.frame.bytes` | count/sum | frames received, at the protocol's own unit |
 | `logit.input.frames.dropped{reason="oversize"\|"drained"\|"malformed"\|"truncated"\|"undecodable"}` | count | the same per-reason shape `logit.proto.errors{reason}` uses. `drained` is a line-framed listener's line that crossed its bound before its `LF` arrived: counted once, after which the connection discards input until its next `LF`. `undecodable` is a frame the decoder rejected whole (the `bad_frame` diagnostic): the only reason counted *after* `logit.input.frames`, so it is also in that count |
 
@@ -1170,17 +1172,19 @@ idle close is
 
 | Name | Kind | Meaning |
 |---|---|---|
-| `logit.input.requests{route, class}` | count | one per request or gRPC call, every exit included. `route` is `logs`, `metrics`, or `traces`, or `unknown` for a path or method this listener doesn't serve, on both transports; `class` is `ok`, `rejected` (any `4xx`, or a gRPC status other than 0 and 14), `busy`, or `closed_consumer`. A request whose client closes while it waits counts no class |
+| `logit.input.requests{route, class}` | count | one per request or gRPC call, every exit included. `route` is `logs`, `metrics`, or `traces`, or `unknown` for a path or method this listener doesn't serve, on both transports; `class` is `ok`, `unbounded` (answered as `ok` is, but too many batches to reserve whole, so those past an inbox's 64 waited with no bound; see below), `rejected` (any `4xx`, or a gRPC status other than 0 and 14), `busy`, or `closed_consumer`. A request whose client closes while it waits counts no class |
 | `logit.input.requests.rejected{reason="auth"}` | count | one per request `auth:` refused, HTTP `401` or gRPC status 16, before its body was read |
-| `logit.input.batches.deferred` | count | every batch of a request answered busy: HTTP `503` with `Retry-After: 1`, or gRPC status 14 (`UNAVAILABLE`), because its first batch found no room in every consumer within 2 seconds. Disjoint from `logit.component.batches.sent`. See below |
+| `logit.input.batches.deferred` | count | every batch of a request answered busy: HTTP `503` with `Retry-After: 1`, or gRPC status 14 (`UNAVAILABLE`), because its batches found no room in every consumer within 2 seconds. Disjoint from `logit.component.batches.sent`. See below |
 | `logit.input.batches.dropped{reason="closed_consumer"}` | count | every batch of a request that no consumer took, the refused one included, because every consumer of the listener has closed. The request is answered as a busy one is, never with a `partial_success`. Not disjoint from `logit.component.batches.sent`: the refused batch is also counted there and once per consumer in `logit.component.events.dropped{reason="closed_consumer"}`; batches after it that were never offered appear only here |
 
-**A busy request is not a lost one.** Only a request's first batch waits under the bound, and it
-reaches every consumer or none (`Fanout::send_with_deadline`), so a busy answer leaves every
-batch of the request with the client, which retries it as the OTLP specification asks. Read a
-steady busy rate as a pipeline that can't keep up with its exporters. Once the first batch is in,
-the rest wait with no bound, so a request of several resources is never answered busy after part
-of it was taken ([ADR `otlp-in-busy-answer`](../adr/otlp-in-busy-answer.md)).
+**A busy request is not a lost one.** Every batch of a request waits under the bound, and they
+all reach every consumer or none do (`Fanout::send_many_with_deadline`), so a busy answer leaves
+every batch of the request with the client, which retries it as the OTLP specification asks.
+Read a steady busy rate as a pipeline that can't keep up with its exporters. A request of more
+than 64 batches, more than an inbox holds, can't be reserved whole: its first 64 wait under the
+bound and the rest with none, and it counts `class="unbounded"`. A client that times out during
+that wait resends a request already taken, so read a steady `unbounded` rate as a source of
+duplicates ([ADR `otlp-in-busy-answer`](../adr/otlp-in-busy-answer.md)).
 
 The OTLP codec counts a metric with no data as
 `logit.input.metrics.skipped{metric_kind="unknown", reason="no_data"}`, and a histogram point
@@ -1191,8 +1195,7 @@ whose `count` isn't the sum of its bucket counts, which keeps its buckets, as
 `Diagnostics` keys: `bound`, `request_rejected` (a request `auth:` refused; the peer address and
 why, never the credential, appear in the message text), `busy` (a busy answer), `closed_consumer`
 (a request no consumer took), `connection_error` (one connection's I/O
-failing, a TLS accept that failed or timed out, or a plaintext connection held open past `handshake_timeout` without a
-first byte, which then gave its permit back; never an idle close), `proxy_header` (any
+failing, or a TLS accept that failed; never a TLS accept or first-byte wait that outlasted `handshake_timeout`, which is counted `connections.closed{reason="handshake_timeout"}` and gives its permit back, nor an idle close), `proxy_header` (any
 `connections.rejected{reason="proxy_header"}` refusal), and `forwarded` (under `forwarded:`, a request whose named header names no usable client; the header name and the reason appear in the message text, never the value; a request without the header isn't counted). A plaintext peer that *closes
 cleanly or resets* before sending a request byte, after a complete PROXY header under
 `proxy_protocol: true`, is not counted: that's what a TCP health check looks like, and counting it
@@ -1210,16 +1213,17 @@ would add one point per probe interval to this key forever.
 |---|---|---|---|
 | scrape | `logit.input.scrapes{class="2xx"\|"4xx"\|"5xx"\|"other"\|"network_error"\|"timeout"\|"parse_error"\|"oversize"}` | count | one per target per tick: the HTTP classes plus three ways a scrape fails before or after a status (`parse_error` is a 2xx body that wouldn't decode) |
 | scrape | `logit.input.scrape.duration` | timing | one per target per tick, recorded regardless of outcome |
-| bind | `logit.input.writes{class="ok"\|"not_found"\|"method"\|"unauthorized"\|"unsupported"\|"oversize"\|"timeout"\|"bad_request"\|"closed_consumer"}`, plus `encoding="snappy"\|"zstd"` on `class="ok"` | count | one per request, one class per row of the module doc's routes table. A write that reaches delivery is counted on the delivery's task, so it counts even when its sender closed before the response. See below. |
+| bind | `logit.input.writes{class="ok"\|"not_found"\|"method"\|"unauthorized"\|"unsupported"\|"oversize"\|"timeout"\|"bad_request"\|"busy"\|"closed_consumer"}`, plus `encoding="snappy"\|"zstd"` on `class="ok"` | count | one per request, one class per row of the module doc's routes table. A write is counted `ok` once its batch is in every inbox, so it counts even when its sender closed before the response; one whose sender closed during the bounded wait counts no class. See below. |
+| bind | `logit.input.batches.deferred` | count | the batch of a write answered busy: `503` with `Retry-After: 1`, because it found no room in every consumer within 2 seconds. Disjoint from `logit.component.batches.sent`. Not loss: the sender resends it |
 | bind | `logit.input.write.duration` | timing | one per request answered, every exit included, which is why the timer lives in one wrapper around the routing itself |
 | both | `logit.input.samples` | count | a different unit in each mode. See below. |
 
 These are this component's own spellings, not `otlp_in`'s `logit.input.requests{route, class}`. In `logit.input.writes`:
 
 - `ok` carries the body's `encoding`, so a vmagent that stayed on its default zstd wire, rather
-  than downgrading to Snappy, reads as `encoding="zstd"`. It counts a delivered write whose
-  sender timed out waiting for the `204` too: the batch went out, and the sender's resend is the
-  ordinary at-least-once duplicate. So `ok` and `closed_consumer` sum to the listener's
+  than downgrading to Snappy, reads as `encoding="zstd"`. It's counted the moment the batch is in
+  every inbox, so a sender that closes after that, before the `204` reaches it, still counts. So
+  `ok` and `closed_consumer` sum to the listener's
   `logit.component.batches.sent` while no write decodes to nothing: a write that decodes to no
   events, such as a 1.0 metadata-only request, is answered `204` and counts `ok` with no batch sent.
 - `unauthorized` is a `401` from `bind_auth:`, checked before the body. It's also counted
@@ -1233,6 +1237,11 @@ These are this component's own spellings, not `otlp_in`'s `logit.input.requests{
   `idle_timeout:` is set**, because the per-frame stall bound is derived from it and it's off by
   default. On a default `bind:` this class never fires, and a half-uploaded request holds its
   connection permit instead.
+- `busy` is a write whose batch found no room in every consumer within 2 seconds, answered `503`
+  with `Retry-After: 1` and the body `busy`, with a throttled `busy` diagnostic. Nothing of it was
+  delivered, and `logit.input.batches.deferred` counts its batch. A sender retries a `5xx`, so
+  it's not loss; read a steady rate as a pipeline that can't keep up with its senders
+  ([ADR `otlp-in-busy-answer`](../adr/otlp-in-busy-answer.md)'s remote-write amendment).
 - `closed_consumer` is a write no consumer took, answered `503`. Its samples aren't counted in
   `logit.input.samples`, and `logit.input.batches.dropped{reason="closed_consumer"}` counts the
   batch. Not disjoint from `logit.component.batches.sent`: the refused batch is also counted there
@@ -1367,7 +1376,7 @@ arriving or which were refused.
 
 | Name | Kind | Meaning |
 |---|---|---|
-| `logit.input.requests{route, class}` | count | one per request, every exit included. `class` is `ok`, `rejected`, `busy`, or `closed_consumer` (a `503` for a request no consumer took); `route` is `series_v2`, `series_v1`, `distribution_points`, `sketches`, `service_checks`, `events`, `intake`, `logs`, `traces`, `stats`, `validate` (both validate paths), `health`, one of the acknowledged routes below, or `unknown` for a path this listener doesn't serve |
+| `logit.input.requests{route, class}` | count | one per request, every exit included. `class` is `ok`, `unbounded` (answered as `ok` is, but too many batches to reserve whole; see below), `rejected`, `busy`, or `closed_consumer` (a `503` for a request no consumer took); `route` is `series_v2`, `series_v1`, `distribution_points`, `sketches`, `service_checks`, `events`, `intake`, `logs`, `traces`, `stats`, `validate` (both validate paths), `health`, one of the acknowledged routes below, or `unknown` for a path this listener doesn't serve |
 | `logit.input.request.duration` | timing | one per request, every exit included, time spent waiting on a busy downstream too |
 | `logit.input.request.bytes` | count | the compressed body size, once the body has been read |
 | `logit.input.requests.rejected{reason}` | count | one per `4xx`: `unknown_route` (`404`), `method` (`405`), `auth` (`403`), `encoding` (`415`), `oversize` (`413`, compressed or decompressed), `stalled` (`408`, only with `idle_timeout:` set), `body_read` (`413` for a body that failed for another reason, such as a client disconnecting mid-upload), `malformed_encoding` (`400`, a stream that doesn't decompress), or `malformed` (`400`, a payload the codec rejects whole) |
@@ -1381,14 +1390,15 @@ undelivered batches are counted `batches.deferred`. The Agent keeps the payload 
 so a deferred batch isn't lost. Read a steady busy rate as a pipeline that can't keep up with its Agents: the Agent's retry queue is absorbing the
 difference and drops payloads only once it fills.
 
-Each batch reaches every downstream consumer or none (`Fanout::send_with_deadline`), so the batch
-that timed out is counted only under `batches.deferred`, never under
-`logit.component.batches.sent`, and no consumer holds it. A traces or stats request that decodes to
-several batches can still be answered `503` after some of them were fully delivered; those count as
-`batches.sent`, and the Agent's retry delivers them again (the module doc's "Backpressure" section,
-[ADR `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md) decision 5).
+A request's batches all reach every downstream consumer or none do
+(`Fanout::send_many_with_deadline`), so a busy request's batches are counted only under
+`batches.deferred`, never under `logit.component.batches.sent`, and no consumer holds any of them.
+A traces or stats request of more than 64 batches, more than an inbox holds, is bounded for its
+first 64 only, the rest wait with no bound, and it counts `class="unbounded"` (the module doc's
+"Backpressure" section, [ADR `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md)'s
+amendment "`datadog_in` delivers a request all or none").
 
-A timed-out `send_with_deadline` counts nothing sent, but an `inbox.full` it observed stays counted
+A timed-out send counts nothing sent, but an `inbox.full` it observed stays counted
 under the consumer, and the consumer's `inbox.blocked.duration` records the time until the timeout
 cancelled the wait.
 
@@ -1462,24 +1472,27 @@ PROXY header, as on the shared TCP stream driver.
 
 | Name | Kind | Meaning |
 |---|---|---|
-| `logit.input.requests{route, class}` | count | one per request, every exit included. `class` is `ok`, `rejected`, `busy` (a `503`: code 9 on a post, code 18 on `/health`), or `closed_consumer` (no consumer took a batch: `503` code 9 for the first batch of a body, `500` code 8 for a later one); `route` is `event` (`/services/collector`, `/event`, `/event/1.0`), `raw` (`/raw`, `/raw/1.0`), `ack`, `health` (`/health`, `/health/1.0`), or `unknown` for a path this listener doesn't serve |
+| `logit.input.requests{route, class}` | count | one per request, every exit included. `class` is `ok`, `unbounded` (answered as `ok` is, but too many batches to reserve whole; see below), `rejected`, `busy` (a `503`: code 9 on a post, code 18 on `/health`), or `closed_consumer` (no consumer took a batch: `503` code 9 for a body refused before anything was sent, `500` code 8 for a later batch of an unbounded one); `route` is `event` (`/services/collector`, `/event`, `/event/1.0`), `raw` (`/raw`, `/raw/1.0`), `ack`, `health` (`/health`, `/health/1.0`), or `unknown` for a path this listener doesn't serve |
 | `logit.input.request.duration` | timing | one per request, every exit included, time spent waiting on a busy downstream too |
 | `logit.input.request.bytes` | count | the body size as sent (before gzip decompression), once the body has been read |
 | `logit.input.requests.rejected{reason}` | count | one per `4xx`: `unknown_route` (`404`), `method` (`405`), `query_token` (`400` code 16, a token in the query string), `auth` (`401` code 2 or 3, `403` code 4), `encoding` (`415`, anything but identity or gzip), `oversize` (`413`, as sent or decompressed), `stalled` (`408`, only with `idle_timeout:` set), `body_read` (`413` for a body that failed for another reason, such as a client disconnecting mid-upload), `malformed_encoding` (`400` code 6, a gzip stream that doesn't decompress), `no_data` (`400` code 5, an empty body or a `/raw` body with no non-empty line), `malformed` (`400` code 6: a `/event` object the codec can't parse, after the objects before it were delivered, or an `/ack` body that isn't `{"acks":[…]}`), or `no_channel` (`400` code 10, an `/ack` request that names no channel) |
 | `logit.input.batches.deferred` | count | batches a busy `503` left with the client to resend, disjoint from `logit.component.batches.sent`. See below |
-| `logit.input.batches.dropped{reason="closed_consumer"}` | count | every batch of the request that no consumer took, the refused one included, answered `503` code 9 for the first batch of a body and `500` code 8 for a later one. Not disjoint from `logit.component.batches.sent`: the refused batch is also counted there and once per consumer in `logit.component.events.dropped{reason="closed_consumer"}`; batches after it that were never offered appear only here. |
+| `logit.input.batches.dropped{reason="closed_consumer"}` | count | every batch of the request that no consumer took, the refused one included, answered `503` code 9 for a body refused before anything was sent and `500` code 8 for a later batch of an unbounded one. Not disjoint from `logit.component.batches.sent`: the refused batch is also counted there and once per consumer in `logit.component.events.dropped{reason="closed_consumer"}`; batches after it that were never offered appear only here. |
 | `logit.input.acks.issued` | count | `ackId`s issued, one per `200`, or code 6 after a delivered prefix, to a request that names a channel |
 | `logit.input.acks.polled{result}` | count | ids asked about on `/ack`: `acked` (answered `true`), or `unknown` (answered `false`: already reported, never issued on that channel, or evicted) |
 | `logit.input.acks.evicted{reason}` | count | ids issued and never reported, bookkeeping only (the data was delivered): `expired` (more than `max_pending_acks` newer ids issued on the channel) or `channel` (evicted with its channel) |
 | `logit.input.ack_channels.evicted` | count | channels evicted, least recently used first, once `max_ack_channels` are held |
 
 **A busy request is not a lost one**, as on `datadog_in`: after 5 seconds without the pipeline
-taking a request's first batch, the request gets `503` code 9 with `Retry-After: 1`, counted
+taking all of a request's batches, the request gets `503` code 9 with `Retry-After: 1`, counted
 `class="busy"`, with nothing of it delivered, and every HEC client retries it. A `/event` body
-that carries several envelopes decodes to one batch per resource; once the first is delivered,
-the rest wait without a deadline and the request gets `200` (or, for a body cut short, its code
-6), so `logit.input.request.duration` can run past 5 seconds while `busy` stays flat (the module
-doc's "Backpressure" section). From a busy answer until a later request's data is taken, for at
+that carries several envelopes decodes to one batch per resource, and they all reach every
+consumer or none do. A body of more than 64 batches, more than an inbox holds, is bounded for its
+first 64 only: the rest wait without a deadline, the request gets `200` and counts
+`class="unbounded"`, and `logit.input.request.duration` can run
+past 5 seconds while `busy` stays flat (the module doc's "Backpressure" section). A body cut
+short gets its prefix's code 6 and counts `rejected` whatever the delivery, so an unbounded one
+counts `rejected` too. From a busy answer until a later request's data is taken, for at
 most 5 seconds, `/health` answers `503` code 18, counted
 `logit.input.requests{route="health", class="busy"}`.
 
@@ -1622,7 +1635,8 @@ the property the minimal-watch-set design is for.
   payload over `max_frame_bytes`: with a `compressed_len` within `frame::compressed_bound` of it,
   the frame is read and answered `Ack{rejected(too_large)}`, the connection kept; past that bound,
   `Reject{FRAME_TOO_LARGE}` and a close. `handshake` is any handshake that ends without a
-  `HelloAck`: no `Hello` within `handshake_timeout`, stray bytes, a header over the control-message
+  `HelloAck`, other than a silent peer (no byte of a `Hello` within `handshake_timeout`, counted
+  `connections.closed{reason="handshake_timeout"}` instead): stray bytes, a header over the control-message
   cap, a `Hello` that fails to decode (a missing, repeated, or unknown field, or a `window` of 0),
   or a version or codec `Reject`. `decode_budget` is a well-formed batch that would decode
   past its per-frame budget (`native::DecodeBudget`), a batch too large for the frame cap it
@@ -1639,7 +1653,7 @@ the property the minimal-watch-set design is for.
   six reject at the cap rather than queueing behind a permit. Here a connection this
   listener closed still counts, and holds its permit, while it lingers: after its last answer it
   reads and discards until the peer closes or for `handshake_timeout`.
-- `logit.input.connections.closed{reason="idle"}` (count), the third point all six share. Here the
+- `logit.input.connections.closed{reason="idle"\|"handshake_timeout"}` (count), the third point all six share. `handshake_timeout` is a peer whose TLS accept outlasted `handshake_timeout` or that sent no byte of a `Hello` within it, on a connection holding a permit; it's counted, not diagnosed, and not a loss. Here the
   idle time is measured from the last frame handled rather than from bytes read, because a peer
   waiting on a delayed ack isn't idle. The close writes `Reject{GOING_AWAY, "idle for <dur>"}`, the
   same signal an ordinary shutdown sends, and returns `Ok(())`: it's never

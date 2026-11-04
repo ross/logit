@@ -6,8 +6,8 @@
 admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
 components:
   remote_write:
-    # One batch per request, one event per sample. It never answers busy: backpressure holds
-    # the `204` until the pipeline takes the batch.
+    # One batch per request, one event per sample. A batch that finds no room within 2 s is
+    # answered a busy `503` with nothing taken, and the generator retries it.
     type: prometheus_in
     bind: 0.0.0.0:9090
   count:

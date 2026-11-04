@@ -1,6 +1,6 @@
 ---
 created: 2026-09-23
-updated: 2026-11-03
+updated: 2026-11-04
 ---
 
 # Datadog: two lossless pairs, the Agent's own protocols, and a Datadog-mapped `DdSketch`
@@ -84,7 +84,7 @@ Three facts from the survey drive the shape of the decision:
    workspace's rationale against the `zstd` crate stays for compressing; senders use gzip.
 
 5. **`datadog_in`'s backpressure is a bounded wait on delivery, then `503` with
-   `Retry-After: 1`**, not `otlp_in`'s blocked connection (`otlp_in` has since moved to a bounded first batch and a
+   `Retry-After: 1`**, not `otlp_in`'s blocked connection (`otlp_in` has since moved to a bounded wait and a
    busy answer too: [ADR `otlp-in-busy-answer`](otlp-in-busy-answer.md)). A Datadog Agent's forwarder times a
    request out at 20 seconds and retries it with backoff, so a connection held open until the
    pipeline drains costs the Agent a slot for 20 seconds and still ends in a retry: only an
@@ -93,7 +93,8 @@ Three facts from the survey drive the shape of the decision:
    is reserved before any consumer is sent the batch, so a `503` means no consumer holds the batch
    that timed out, and the Agent's retry is the only copy. Batches of a multi-batch request
    (traces, stats) fully delivered before the deadline are delivered again by that retry, which
-   is what Datadog's own intake does with a resent request.
+   is what Datadog's own intake does with a resent request. (Amended: a request is now delivered
+   all or none; see "`datadog_in` delivers a request all or none" below.)
 
 6. **msgpack is hand-rolled** in `logit_proto::msgpack` (`nil`, bool, int, float, str, bin, array,
    map), the pickle precedent; `agent-payload`'s protos are vendored at a pinned tag and generated
@@ -953,5 +954,31 @@ as the pipeline takes. They don't: every OTLP exporter has a request timeout (`o
 seconds, the Collector's 5) and resends a request that timed out, so a blocked `otlp_in`
 delivered each timed-out request twice. [ADR `otlp-in-busy-answer`](otlp-in-busy-answer.md) gives
 `otlp_in` a 2-second bound on a request's first batch and a busy `503` (gRPC `UNAVAILABLE`), by
-`splunk_hec_in`'s first-batch rule. `prometheus_in`'s remote-write receiver still blocks, tracked
-in [`known-gaps/prometheus.md`](../known-gaps/prometheus.md).
+`splunk_hec_in`'s first-batch rule. `prometheus_in`'s remote-write receiver followed on
+2026-11-04, by that record's amendment "`prometheus_in`'s remote-write receiver answers busy
+too".
+
+## Amendment: `datadog_in` delivers a request all or none (2026-11-04)
+
+Decision 5 bounded each batch of a multi-batch request (traces, stats) under the one deadline, so
+a `503` could follow a prefix of the request already delivered, and the Agent's retry delivered
+that prefix again. The decision took that prefix behavior to match Datadog's intake, but that was
+never verified: nothing in this record shows how the intake treats a request it can take only part
+of, only how it treats a resent one. **Changed:** every batch of a request now waits under the
+one 5 s deadline, all or none, through the mechanism
+[ADR `otlp-in-busy-answer`](otlp-in-busy-answer.md)'s amendment "A request is delivered all or
+none" gives `otlp_in` and `splunk_hec_in`: room for every batch is reserved on every consumer
+before any is sent. The 5 s bound is unchanged. A `503` now always means nothing of the request was taken.
+
+The Agent retries a `503` whole: its forwarder's `HTTPTransaction.internalProcess`
+(`comp/forwarder/defaultforwarder/transaction/transaction.go` in `datadog-agent`) drops a
+transaction only on a `400` or `413`, or on a `403` its secret refresh can't fix, reschedules it
+on any other status above `400`, and resends the same payload. So delivering a prefix first
+bought no delivery the retry doesn't make, and cost a duplicate of it. All or none loses nothing
+and removes the prefix duplicate.
+
+A request with more batches than an inbox holds (64) sends its first 64 under the deadline and
+the rest without one, and is counted `logit.input.requests{class="unbounded"}` in place of `ok`.
+A request no consumer takes is refused whole, every batch counted
+`logit.input.batches.dropped{reason="closed_consumer"}`. Decision 11's `datadog_trace_in` sends
+one batch per request and is unchanged.

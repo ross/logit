@@ -45,7 +45,8 @@ pub use accumulator::{BatchAccumulator, FlushReason};
 pub use buffer_full::FullLabels;
 pub use disk_queue::{DiskQueue, DiskQueueConfig};
 pub use fanout::{
-    BatchContext, Delivered, Edge, Fanout, Reservation, SendTimeout, SendsInFlight, TraceContext,
+    BatchContext, Delivered, Edge, Fanout, Reservation, SendManyError, SendTimeout, SendsInFlight,
+    TraceContext,
 };
 pub use input::{Input, InputRuntimeConfig};
 pub use logit_proto::native::SeqId;

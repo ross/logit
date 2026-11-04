@@ -1111,10 +1111,11 @@ write routes their writers post to, `event` and `series_v2`, under a 5 s deadlin
 batch). A `/event` body decodes to one batch per envelope, so the identities
 hold while each body carries one, as a writer with one resource sends. `prometheus_in`'s
 remote-write receiver counts each request in `logit.input.writes{class}`, with no `route` tag,
-decodes it to one batch, and never answers busy: backpressure holds its `204` until the
-pipeline takes the batch, past a writer's timeout, which resends while the held batch still
-delivers. So it holds the first identity alone, `ok` and `closed_consumer` writes summing to
-`batches.sent`, while no write decodes to nothing (a `204` with no batch). Its wire is keyed on
+decodes it to one batch, and answers `503` `busy` when that batch waits 2 s, delivering nothing
+(since #991; before it, backpressure held the `204` past a writer's timeout, which resent while
+the held batch still delivered). So it holds both identities, `ok` and `closed_consumer` writes
+summing to `batches.sent` and `busy` ones to `batches.deferred`, while no write decodes to
+nothing (a `204` with no batch). Its wire is keyed on
 its mode, since it has no `transport:` (`scenario.LISTENER_MODES`): `bind:` is the receiver, an
 HTTP wire, and `scrape_targets:` the scrape wire. The writer's
 `logit.component.events.received` is reported beside G as the points attempted, and its
@@ -3051,7 +3052,7 @@ under "Deferred to a later round" wait.
       `datadog_out` reads as `Ambiguous`. A `503` partway through a multi-batch body happens on
       traces and stats only, out of scope here.
     - `rw-ingress`: generator `prometheus_out` sending remote-write → SUT `prometheus_in` on
-      `bind:`. The receiver never answers busy: backpressure delays the `204`, and the sender's
+      `bind:`. The receiver never answers busy (until #991): backpressure delays the `204`, and the sender's
       10 s timeout is `Ambiguous` and resends. Rows on `logit.input.writes{class}` and
       `logit.input.samples`.
 
@@ -3255,7 +3256,7 @@ Docker 29.9, SELinux enforcing) checked each fault's mechanism before it was pla
     faster than `idle_timeout:` holds the slot until the client leaves or, for a body, the size
     cap; and a first-byte timeout under `handshake_timeout:` counts
     `connections.closed{reason="handshake_timeout"}` on the TCP driver, with no diagnostic,
-    while the HTTP listeners still diagnose it and count nothing. Rows:
+    and the HTTP listeners and `logit_in` count it the same way. Rows:
     `connections.rejected{reason="limit"}` above 0 while the slow clients hold every slot;
     `connections.closed{reason="handshake_timeout"}` for a TCP client that sends nothing past
     `handshake_timeout:`; `connections.closed{reason="idle"}` for a trickled HTTP request head
