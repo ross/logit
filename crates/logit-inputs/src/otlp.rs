@@ -599,9 +599,7 @@ impl Input for OtlpInput {
                                 Ok(Err(err)) => {
                                     Prelude::Failed(format!("TLS handshake failed: {err}"))
                                 }
-                                Err(_elapsed) => Prelude::Failed(format!(
-                                    "TLS handshake did not complete within {handshake_timeout:?}"
-                                )),
+                                Err(_elapsed) => Prelude::HandshakeTimeout,
                             }
                         }
                         // The plaintext arm's budget: a `peek` that consumes nothing (this
@@ -627,9 +625,7 @@ impl Input for OtlpInput {
                                 Ok(Err(err)) => Prelude::Failed(format!(
                                     "waiting for a first byte failed: {err}"
                                 )),
-                                Err(_elapsed) => Prelude::Failed(format!(
-                                    "no first byte received within {handshake_timeout:?}"
-                                )),
+                                Err(_elapsed) => Prelude::HandshakeTimeout,
                             }
                         }
                     }
@@ -669,6 +665,10 @@ impl Input for OtlpInput {
                         .await
                     }
                     Prelude::Probe => Ok(()),
+                    Prelude::HandshakeTimeout => {
+                        crate::listener::count_handshake_timeout(&telemetry);
+                        Ok(())
+                    }
                     Prelude::Failed(err) => Err(err),
                     Prelude::ProxyRejected(err) => {
                         drop(live);
@@ -2434,6 +2434,9 @@ mod tests {
         // One listener for both halves, so the second proves this listener still serves TLS. Its
         // 500ms handshake timeout also bounds the second half's real rustls handshake, which a
         // debug build under load stretches well past 50ms; the close wait's 5s ceiling is 10x it.
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let diag = Diagnostics::new("otlp_in");
+        let listener_diag = diag.clone();
         let mut input = OtlpInput::new("127.0.0.1:0", OtlpTransport::Http)
             .with_tls(
                 &test_tls_settings(None),
@@ -2441,6 +2444,8 @@ mod tests {
                 &logit_pipeline::tls::TlsReloader::new(),
             )
             .unwrap()
+            .with_telemetry(probe.telemetry("otlp_in", "otlp_in", "listener"))
+            .with_diagnostics(diag)
             .with_handshake_timeout(Duration::from_millis(500));
         input.bind().await.expect("binding an ephemeral port should succeed");
         let addr = input.local_addr().expect("bind() leaves a real address behind").to_string();
@@ -2451,6 +2456,11 @@ mod tests {
         // could have closed it.
         let mut silent = tokio::net::TcpStream::connect(&addr).await.unwrap();
         logit_pipeline::test_util::expect_closed(&mut silent, "a silent TLS connection").await;
+        logit_pipeline::test_util::wait_until("the handshake_timeout close count", || {
+            probe.sum("logit.input.connections.closed", &[("reason", "handshake_timeout")]) == 1.0
+        })
+        .await;
+        assert_eq!(listener_diag.occurrences("connection_error"), 0, "counted, not diagnosed");
 
         // The listener still serves real TLS traffic afterwards.
         let mut encoder = logit_proto::otlp::OtlpEncoder::new();
@@ -2540,8 +2550,14 @@ mod tests {
     #[tokio::test]
     async fn a_silent_plaintext_connection_is_closed_after_the_handshake_timeout() {
         let (addr, input) = bound_input(OtlpTransport::Http).await;
-        let mut input =
-            input.with_max_connections(1).with_handshake_timeout(Duration::from_millis(50));
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let diag = Diagnostics::new("otlp_in");
+        let listener_diag = diag.clone();
+        let mut input = input
+            .with_telemetry(probe.telemetry("otlp_in", "otlp_in", "listener"))
+            .with_diagnostics(diag)
+            .with_max_connections(1)
+            .with_handshake_timeout(Duration::from_millis(50));
         let (sink, mut rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
 
@@ -2553,6 +2569,11 @@ mod tests {
             "a plaintext connection that sent no bytes",
         )
         .await;
+        logit_pipeline::test_util::wait_until("the handshake_timeout close count", || {
+            probe.sum("logit.input.connections.closed", &[("reason", "handshake_timeout")]) == 1.0
+        })
+        .await;
+        assert_eq!(listener_diag.occurrences("connection_error"), 0, "counted, not diagnosed");
 
         let mut encoder = logit_proto::otlp::OtlpEncoder::new();
         let payloads =

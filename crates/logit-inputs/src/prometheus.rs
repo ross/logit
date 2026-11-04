@@ -1093,9 +1093,7 @@ impl Input for PrometheusReceiver {
                                 Ok(Err(err)) => {
                                     Prelude::Failed(format!("TLS handshake failed: {err}"))
                                 }
-                                Err(_elapsed) => Prelude::Failed(format!(
-                                    "TLS handshake did not complete within {handshake_timeout:?}"
-                                )),
+                                Err(_elapsed) => Prelude::HandshakeTimeout,
                             }
                         }
                         // The plaintext arm's budget. `peek` is `recv(..., MSG_PEEK)`: it
@@ -1117,9 +1115,7 @@ impl Input for PrometheusReceiver {
                                 Ok(Err(err)) => Prelude::Failed(format!(
                                     "waiting for a first byte failed: {err}"
                                 )),
-                                Err(_elapsed) => Prelude::Failed(format!(
-                                    "no first byte received within {handshake_timeout:?}"
-                                )),
+                                Err(_elapsed) => Prelude::HandshakeTimeout,
                             }
                         }
                     }
@@ -1167,6 +1163,10 @@ impl Input for PrometheusReceiver {
                         .await
                     }
                     Prelude::Probe => Ok(()),
+                    Prelude::HandshakeTimeout => {
+                        crate::listener::count_handshake_timeout(&telemetry);
+                        Ok(())
+                    }
                     Prelude::Failed(err) => Err(err),
                     Prelude::ProxyRejected(err) => {
                         drop(live);

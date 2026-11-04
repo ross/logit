@@ -684,9 +684,7 @@ async fn accept_tcp(
                                 Prelude::Tls(Box::new(tls_stream), connection_peer)
                             }
                             Ok(Err(err)) => Prelude::Failed(format!("TLS handshake failed: {err}")),
-                            Err(_elapsed) => Prelude::Failed(format!(
-                                "TLS handshake did not complete within {handshake_timeout:?}"
-                            )),
+                            Err(_elapsed) => Prelude::HandshakeTimeout,
                         }
                     }
                     None => {
@@ -704,9 +702,7 @@ async fn accept_tcp(
                             Ok(Err(err)) => {
                                 Prelude::Failed(format!("waiting for a first byte failed: {err}"))
                             }
-                            Err(_elapsed) => Prelude::Failed(format!(
-                                "no first byte received within {handshake_timeout:?}"
-                            )),
+                            Err(_elapsed) => Prelude::HandshakeTimeout,
                         }
                     }
                 }
@@ -739,6 +735,10 @@ async fn accept_tcp(
                     .await
                 }
                 Prelude::Probe => Ok(()),
+                Prelude::HandshakeTimeout => {
+                    crate::listener::count_handshake_timeout(&context.telemetry);
+                    Ok(())
+                }
                 Prelude::Failed(err) => Err(err),
                 Prelude::ProxyRejected(err) => {
                     context.telemetry.count(

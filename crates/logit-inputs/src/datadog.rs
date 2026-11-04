@@ -475,9 +475,7 @@ impl Input for DatadogInput {
                                 Ok(Err(err)) => {
                                     Prelude::Failed(format!("TLS handshake failed: {err}"))
                                 }
-                                Err(_elapsed) => Prelude::Failed(format!(
-                                    "TLS handshake did not complete within {handshake_timeout:?}"
-                                )),
+                                Err(_elapsed) => Prelude::HandshakeTimeout,
                             }
                         }
                         None => {
@@ -497,9 +495,7 @@ impl Input for DatadogInput {
                                 Ok(Err(err)) => Prelude::Failed(format!(
                                     "waiting for a first byte failed: {err}"
                                 )),
-                                Err(_elapsed) => Prelude::Failed(format!(
-                                    "no first byte received within {handshake_timeout:?}"
-                                )),
+                                Err(_elapsed) => Prelude::HandshakeTimeout,
                             }
                         }
                     }
@@ -541,6 +537,10 @@ impl Input for DatadogInput {
                         .await
                     }
                     Prelude::Probe => Ok(()),
+                    Prelude::HandshakeTimeout => {
+                        crate::listener::count_handshake_timeout(&telemetry);
+                        Ok(())
+                    }
                     Prelude::Failed(err) => Err(err),
                     Prelude::ProxyRejected(err) => {
                         drop(live);

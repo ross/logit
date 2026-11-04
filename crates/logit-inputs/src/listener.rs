@@ -114,8 +114,17 @@ pub(crate) enum Prelude {
     Plain(tokio::net::TcpStream, ConnectionPeer),
     /// A close or a reset before the first byte: a TCP health check, not a fault.
     Probe,
+    /// The TLS accept or the first-byte peek outlasted `handshake_timeout:`. Policy, not a fault:
+    /// counted by [`count_handshake_timeout`], never diagnosed.
+    HandshakeTimeout,
     Failed(String),
     ProxyRejected(anyhow::Error),
+}
+
+/// Counts a connection closed because its TLS accept or first-byte wait outlasted
+/// `handshake_timeout:`. No request was read, so it is not a loss (`*.dropped`).
+pub(crate) fn count_handshake_timeout(telemetry: &logit_core::telemetry::Telemetry) {
+    telemetry.count("logit.input.connections.closed", 1.0, &[("reason", "handshake_timeout")]);
 }
 
 /// The pause after a `Resource` or `Other` accept error, so a sustained one (fd exhaustion) can't
