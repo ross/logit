@@ -13442,6 +13442,10 @@ def _cgroup_actions():
                 "--entrypoint", "/bin/sh", "netem", "-c", faults.CGROUP_SCRIPT, "sh",
                 f"/cg/{scope}/{path}", *value]
 
+    def events(high, rc=0):
+        return ok(rc, f"low 0\nhigh {high}\nmax 0\noom 0\noom_kill 0\n" if rc == 0 else "",
+                  "No such file" if rc else "")
+
     cpu = scenario.Step("c0s1", 0, 0, "cgroup", "logit", "", 60.0, 180.0, cpu=0.25)
     memory = scenario.Step("c0s2", 1, 0, "cgroup", "logit", "", 60.0, 180.0,
                            memory_high="256M")
@@ -13459,11 +13463,13 @@ def _cgroup_actions():
         expect(fake.calls[-1] == argv("cpu.max", "max 100000") and result["rc"] == 0
                and result["restored"] is True and cpu.id not in ctx.state,
                f"a cgroup's revert writes what it found back, got {fake.calls[-1]} {result}")
-        fake, ctx = context(tmp, [ok(0, "max\n", ""), ok(0, "268435456\n", "")])
+        fake, ctx = context(tmp, [ok(0, "max\n", ""), events(3), ok(0, "268435456\n", "")])
         result = action.apply(ctx, memory)
-        expect(fake.calls[-1] == argv("memory.high", "268435456") and result["rc"] == 0,
-               f"a memory_high of 256M writes 268435456 into memory.high, got {fake.calls} "
-               f"{result}")
+        expect(fake.calls == [argv("memory.high"), argv("memory.events"),
+                              argv("memory.high", "268435456")]
+               and result["rc"] == 0 and result["high_events_before"] == 3,
+               f"a memory_high of 256M reads memory.events' high count, then writes 268435456 "
+               f"into memory.high, got {fake.calls} {result}")
         fake.state = dict(running, StartedAt="2026-10-08T12:03:00Z")
         calls = len(fake.calls)
         result = action.revert(ctx, memory)
@@ -13471,7 +13477,7 @@ def _cgroup_actions():
                and result["started_in_window"] is True,
                f"a process started inside the window has a new scope, so the revert writes "
                f"nothing, got {result}")
-        fake, ctx = context(tmp, [ok(0, "max\n", ""), ok(0, "268435456\n", "")])
+        fake, ctx = context(tmp, [ok(0, "max\n", ""), events(3), ok(0, "268435456\n", "")])
         action.apply(ctx, memory)
         fake.state = {"Status": "exited", "StartedAt": running["StartedAt"], "Pid": 0}
         calls = len(fake.calls)
@@ -13480,11 +13486,36 @@ def _cgroup_actions():
                and result["exited_in_window"] is True and "started_in_window" not in result,
                f"a container that exited inside the window started nothing, so the revert "
                f"records exited_in_window and writes nothing, got {result}")
-        fake, ctx = context(tmp, [ok(0, "max\n", ""), ok(0, "268431360\n", "")])
+        fake, ctx = context(tmp, [ok(0, "max\n", ""), events(3), ok(0, "268435456\n", ""),
+                                  events(10), ok(0, "max\n", "")])
+        action.apply(ctx, memory)
+        result = action.revert(ctx, memory)
+        expect(fake.calls[-2:] == [argv("memory.events"), argv("memory.high", "max")]
+               and result["rc"] == 0 and result["restored"] is True
+               and result["high_events"] == 7,
+               f"a memory_high's revert counts the window's throttling from memory.events, then "
+               f"writes what it found back, got {fake.calls[-2:]} {result}")
+        fake, ctx = context(tmp, [ok(0, "max\n", ""), events(3), ok(0, "268435456\n", ""),
+                                  events(0, rc=1), ok(0, "max\n", "")])
+        action.apply(ctx, memory)
+        result = action.revert(ctx, memory)
+        expect(result["rc"] == 0 and result["restored"] is True and "high_events" not in result
+               and "memory.events: rc 1" in result.get("events_error", ""),
+               f"a revert that can't read memory.events still restores and says why, got "
+               f"{result}")
+        for answer, why in ((events(0, rc=1), "memory.events: rc 1"),
+                            (ok(0, "low 0\nmax 0\n", ""), "printed no high count")):
+            fake, ctx = context(tmp, [ok(0, "max\n", ""), answer])
+            result = action.apply(ctx, memory)
+            expect(result["rc"] == 1 and why in result["stderr"] and len(fake.calls) == 2
+                   and memory.id not in ctx.state,
+                   f"an apply that can't count memory.high's throttling writes nothing, got "
+                   f"{result}")
+        fake, ctx = context(tmp, [ok(0, "max\n", ""), events(3), ok(0, "268431360\n", "")])
         result = action.apply(ctx, memory)
         expect(result["rc"] == 1 and "read back '268431360'" in result["stderr"],
                f"a read-back that differs from the value written fails the step, got {result}")
-        fake, ctx = context(tmp, [ok(0, "max\n", ""), ok(1, "", "Permission denied")])
+        fake, ctx = context(tmp, [ok(0, "max\n", ""), events(3), ok(1, "", "Permission denied")])
         result = action.apply(ctx, memory)
         expect(result["rc"] == 1 and "Permission denied" in result["stderr"],
                f"a failed write fails the step, got {result}")
@@ -13541,6 +13572,20 @@ def _cgroup_actions():
         expect("c0s1 (cgroup on logit): the process exited inside the window (status exited), "
                "so nothing was restored" in result.detail and "started again" not in result.detail,
                f"timeline reports a cgroup whose process exited inside it, got {result}")
+        counted = timeline[:2] + [_action("revert", "c0s1", "cgroup", "logit", 180,
+                                          restored=True, high_events=1234)] + timeline[3:]
+        result = _status(_run_dir(tmp, "cgroup-engaged", counted), checks.check_timeline)
+        expect(result.status == checks.PASS
+               and "c0s1 (cgroup on logit): memory.high engaged 1,234 time(s)" in result.detail,
+               f"timeline reports how often a memory.high throttled, got {result}")
+        unread = timeline[:2] + [_action("revert", "c0s1", "cgroup", "logit", 180,
+                                         restored=True, events_error="memory.events: rc 1")
+                                 ] + timeline[3:]
+        result = _status(_run_dir(tmp, "cgroup-unread", unread), checks.check_timeline)
+        expect(result.status == checks.FAIL and "can't count memory.high's throttling"
+               in result.detail,
+               f"timeline FAILs a memory.high revert that couldn't read memory.events, got "
+               f"{result}")
         quiet = [line for line in _sut_stdout(400)
                  if not 70 < (telemetry.parse_rfc3339(json.loads(line)["timestamp"]) - T0) < 100]
         result = _status(_run_dir(tmp, "cgroup-gap", timeline, quiet), checks.check_progress)
@@ -13628,6 +13673,15 @@ def _cgroup_rules(root):
                    and row.get("step") == limits[0].id for row in rows),
            f"memory-high throttles the SUT's memory once and bounds its resident memory, got "
            f"{limits} {rows}")
+    shipped = scenario.load(root / "scenarios" / "memory-high-pressure" / "scenario.toml")
+    limits = [one for one in scenario.expand(shipped) if one.action == "cgroup"]
+    stops = [one for one in scenario.expand(shipped) if one.action == "stop"]
+    expect(len(limits) == 1 and limits[0].on == "logit" and len(stops) == 1
+           and 30 * 1024 ** 2 < (scenario.memory_bytes(limits[0].memory_high) or 0)
+           < 42 * 1024 ** 2
+           and limits[0].start < stops[0].start and stops[0].end < limits[0].end,
+           f"memory-high-pressure throttles the SUT between its steady memory and its outage "
+           f"peak, around the outage, got {limits} {stops}")
 
 
 def _reset_rules(root):

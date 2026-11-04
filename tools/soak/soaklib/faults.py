@@ -42,7 +42,9 @@ Facts a maintainer needs here (docs/plans/soak-harness.md, "Netem scope"):
   it's `system.slice/docker-<id>.scope`. The apply reads the file (`found`, `max` or
   `max 100000` on a container started with no limit), writes the step's value, and reads it
   back, and a value read back other than the one written is `rc` 1; the revert writes `found`
-  back. `docker update` is the wrong tool: `--memory` can't return to unlimited, and `--cpus`
+  back. On a `memory.high` step the apply and the revert each read `memory.events`, and the
+  revert records the difference in its `high` count (`high_events`), the times the kernel
+  throttled the cgroup in the window. `docker update` is the wrong tool: `--memory` can't return to unlimited, and `--cpus`
   stays in the container's config and comes back on its next start. A start inside the window
   makes the scope again with the container's own settings, so the revert then writes nothing
   and records `started_in_window`; a container not running at the revert lost its scope with
@@ -349,8 +351,10 @@ def _cgroup_write(ctx, path, value, **extra):
 
 def cgroup_apply(ctx, step):
     """Finds the target's cgroup, reads the step's file there (`found`), writes the step's value,
-    and leaves the path, `found`, and the process's start time for the revert. A cgroup it can't
-    find or a read that printed nothing is `rc` 1 and writes nothing."""
+    and leaves the path, `found`, and the process's start time for the revert. A `memory.high`
+    step also reads `memory.events`' `high` count first (`high_events_before`), so the revert
+    can count the window's. A cgroup it can't find, or a read that printed nothing or no count,
+    is `rc` 1 and writes nothing."""
     name, value = cgroup_setting(step)
     started = _started_at(ctx, step.on)
     found_dir, why = cgroup_dir(ctx, step.on)
@@ -363,15 +367,40 @@ def cgroup_apply(ctx, step):
         record = _record(read, file=name, path=path)
         record.update(rc=read.rc or 1, stderr=record["stderr"] or f"{path} read empty")
         return record
-    ctx.state[step.id] = {"path": path, "found": found, "started_at": started}
-    return _cgroup_write(ctx, path, value, file=name, found=found)
+    saved = {"path": path, "found": found, "started_at": started}
+    extra = {}
+    if name == "memory.high":
+        before, why = memory_high_events(ctx, found_dir)
+        if before is None:
+            return {"rc": 1, "stderr": why, "file": name, "path": path, "found": found}
+        saved.update(events_dir=found_dir, high_before=before)
+        extra["high_events_before"] = before
+    ctx.state[step.id] = saved
+    return _cgroup_write(ctx, path, value, file=name, found=found, **extra)
+
+
+def memory_high_events(ctx, found_dir):
+    """`(count, None)`: the `high` line of the cgroup's `memory.events`, the times the kernel
+    throttled it over `memory.high`; or `(None, why)` when the read failed or printed no such
+    line."""
+    path = f"{found_dir}/memory.events"
+    read = ctx.docker.run_oneshot(cgroup_argv(ctx, path))
+    if read.rc != 0:
+        return None, f"{path}: rc {read.rc}: {read.stderr.strip()[-200:]}"
+    for line in read.stdout.splitlines():
+        words = line.split()
+        if len(words) == 2 and words[0] == "high" and words[1].isdigit():
+            return int(words[1]), None
+    return None, f"{path} printed no high count: {read.stdout.strip()[-200:]!r}"
 
 
 def cgroup_revert(ctx, step):
     """Writes what the apply found back, unless the process exited inside the window, whose
     scope went with it (`exited_in_window`), or started again there, whose new scope has the
     container's own settings (`started_in_window`): the record then says which and writes
-    nothing. An apply that failed left nothing to restore."""
+    nothing. On a `memory.high` step it first reads `memory.events` again and records how many
+    times the kernel throttled the cgroup in the window (`high_events`), or why it couldn't
+    (`events_error`). An apply that failed left nothing to restore."""
     saved = ctx.state.pop(step.id, None)
     if saved is None:
         return {"rc": 0, "stderr": "", "restored": False}
@@ -382,7 +411,12 @@ def cgroup_revert(ctx, step):
     if state.get("StartedAt") != saved["started_at"]:
         return {"rc": 0, "stderr": "", "restored": False, "started_in_window": True,
                 "status": state.get("Status")}
-    record = _cgroup_write(ctx, saved["path"], saved["found"])
+    events = {}
+    if "events_dir" in saved:
+        after, why = memory_high_events(ctx, saved["events_dir"])
+        events = ({"events_error": why} if after is None
+                  else {"high_events": after - saved["high_before"]})
+    record = _cgroup_write(ctx, saved["path"], saved["found"], **events)
     record["restored"] = record["rc"] == 0
     return record
 

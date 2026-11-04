@@ -603,8 +603,9 @@ def check_timeline(data):
     """FAILs when the schedule didn't run as written: an apply or revert that returned nonzero,
     a fail-fast stop, or a start or unpause of a `logit` service with no `ready` record. An
     early revert in the end sequence isn't probed, so it needs none. A `prlimit` or `cgroup`
-    whose process started again inside its window is reported: its limit went with the old
-    process."""
+    whose process started again or exited inside its window is reported: its limit went with
+    the old process. A `memory.high` revert's throttle count is reported, and one that couldn't
+    read `memory.events` FAILs, since nothing then says whether the throttle engaged."""
     if data.t0 is None:
         return Result("timeline", SKIP, "no timeline start")
     lines = []
@@ -641,6 +642,13 @@ def check_timeline(data):
              f"exited inside the window (status {record.get('status')}), so nothing was restored"
              for record in actions
              if record["event"] == "revert" and record.get("exited_in_window")]
+    engaged = [f"{record.get('step')} (cgroup on {record.get('on')}): memory.high engaged "
+               f"{_n(record['high_events'])} time(s)"
+               for record in actions if record["event"] == "revert" and "high_events" in record]
+    lines += [f"{record.get('step')} (cgroup on {record.get('on')}): can't count memory.high's "
+              f"throttling: {record['events_error']}"
+              for record in actions if record["event"] == "revert" and "events_error" in record]
+    gone += engaged
     if lines:
         return Result("timeline", FAIL, lines[0], lines + gone)
     return Result("timeline", PASS, f"{len(actions)} apply/revert action(s) returned 0; "
