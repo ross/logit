@@ -159,7 +159,7 @@
 //! ## Backpressure: a bounded wait, then busy
 //!
 //! A write's one batch waits at most [`BUSY_AFTER`] (2 s) for room in every consumer, reaching
-//! every consumer or none ([`crate::http::deliver_first_bounded`]). When the bound passes, nothing
+//! every consumer or none ([`crate::http::deliver_bounded`]). When the bound passes, nothing
 //! of the write was taken: the receiver answers `503` with `Retry-After: 1` and the body `busy`,
 //! counts the batch `logit.input.batches.deferred` and the write
 //! `logit.input.writes{class="busy"}`, and logs a throttled `busy` line. Every remote-write sender
@@ -1541,8 +1541,8 @@ async fn write_response(
         return (Some(("ok", Some(encoding))), no_content(seen, written, decoded.exemplars));
     }
     // **Before** the response is built, under `busy_after` (the module doc's "Backpressure"). The
-    // write is one batch, so `deliver_first_bounded`'s detached rest is always empty: the batch
-    // reaches every consumer or none, and a sender that closes mid-wait cancels the whole write.
+    // write is one batch, so `deliver_bounded` never has a detached rest: the batch reaches every
+    // consumer or none, and a sender that closes mid-wait cancels the whole write.
     // `accepted` runs in the same poll as the send that delivered it, so a sender that closes
     // after that still has its write counted `ok`.
     let mut batch = vec![EventBatch { resource, scope: None, events }];
@@ -1566,8 +1566,7 @@ async fn write_response(
             }
         }
     };
-    let delivered =
-        crate::http::deliver_first_bounded(sink, batch, busy_after, accepted, settle).await;
+    let delivered = crate::http::deliver_bounded(sink, batch, busy_after, accepted, settle).await;
     if let Err(unfinished) = delivered {
         let undelivered = unfinished.undelivered;
         let (class, message) = match undelivered {

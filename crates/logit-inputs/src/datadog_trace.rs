@@ -201,9 +201,8 @@
 
 use crate::http::{
     body_read_error_message, collect_with_stall_bound, declared_length, decompress,
-    deliver_with_deadline, drive_connection, error_response, is_length_limit, json_response,
-    media_type, now_nanos, Activity, BodyReadError, DecompressError, Encoding, MediaType,
-    Undelivered,
+    deliver_bounded, drive_connection, error_response, is_length_limit, json_response, media_type,
+    now_nanos, Activity, BodyReadError, DecompressError, Encoding, MediaType, Undelivered,
 };
 use crate::listener::{ConnectionTasks, Prelude};
 use crate::peer::{ConnectionPeer, PeerAttrs};
@@ -1120,8 +1119,11 @@ async fn respond(
     }
 
     let spans = batch.events.iter().filter(|event| event.span.is_some()).count();
-    match deliver_with_deadline(&shared.sink, vec![batch], shared.busy_after).await {
-        Ok(()) => {
+    match deliver_bounded(&shared.sink, vec![batch], shared.busy_after, || {}, |_| {})
+        .await
+        .map_err(|unfinished| unfinished.undelivered)
+    {
+        Ok(_) => {
             if spans > 0 {
                 shared.telemetry.count("logit.input.spans", spans as f64, &[]);
             }

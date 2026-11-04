@@ -53,7 +53,7 @@
 //!
 //! **One request, one batch, all or nothing.** The decoder parses the whole body before building
 //! any event, so a parse error delivers nothing. A decoded body is one batch, sent under one
-//! deadline ([`crate::http::deliver_with_deadline`]) that reaches every consumer or none; a `503`
+//! deadline ([`crate::http::deliver_bounded`]) that reaches every consumer or none; a `503`
 //! therefore always means nothing of the body was taken, and a client may resend it whole.
 //!
 //! **Resource cache.** `org`, `orgID`, and `bucket`, each when non-empty, become the private
@@ -80,7 +80,7 @@
 
 use crate::http::{
     body_read_error_message, collect_with_stall_bound, declared_length, decompress,
-    deliver_with_deadline, drive_connection, is_length_limit, json_response, now_nanos, Activity,
+    deliver_bounded, drive_connection, is_length_limit, json_response, now_nanos, Activity,
     BodyReadError, DecompressError, Encoding, Undelivered,
 };
 use crate::listener::Prelude;
@@ -815,8 +815,11 @@ async fn respond(
     }
 
     request_peer.stamp_batches(std::slice::from_mut(&mut batch));
-    match deliver_with_deadline(&shared.sink, vec![batch], shared.busy_after).await {
-        Ok(()) => (name, OK, empty(StatusCode::NO_CONTENT)),
+    match deliver_bounded(&shared.sink, vec![batch], shared.busy_after, || {}, |_| {})
+        .await
+        .map_err(|unfinished| unfinished.undelivered)
+    {
+        Ok(_) => (name, OK, empty(StatusCode::NO_CONTENT)),
         Err(undelivered @ Undelivered::Busy(_)) => {
             undelivered.record(&shared.telemetry);
             shared.diag.clone().warn_throttled(

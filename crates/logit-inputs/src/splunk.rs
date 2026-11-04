@@ -101,34 +101,38 @@
 //! # Backpressure: a bounded wait, then `503`
 //!
 //! A `503` code 9 means nothing of the body was taken, as on Splunk, so a client (and
-//! `splunk_hec_out`) may resend it whole. The request's first batch is sent under a deadline,
-//! [`BUSY_AFTER`] from the start of delivery, reaching every downstream consumer or none
-//! ([`crate::datadog`]'s "Backpressure" section has the mechanism). When the deadline passes, the
-//! request is answered `503` `{"text":"Server is busy","code":9}` with `Retry-After: 1`, counted
+//! `splunk_hec_out`) may resend it whole. A `/event` body carrying several envelopes decodes to
+//! one batch per resource, and every batch is sent under one deadline, [`BUSY_AFTER`] from the
+//! start of delivery, all of them reaching every downstream consumer or none
+//! ([`crate::http::deliver_bounded`]). When the deadline passes, the request is answered `503`
+//! `{"text":"Server is busy","code":9}` with `Retry-After: 1`, counted
 //! `logit.input.requests{class="busy"}`, and every batch of the body is counted
 //! `logit.input.batches.deferred`. Every HEC client retries a code 9.
 //!
-//! **Once the first batch is delivered, the rest wait without a deadline.** A `/event` body
-//! carrying several envelopes decodes to one batch per resource, and a `503` after one of them was
-//! delivered would make the client's retry deliver it twice. So the remaining batches go through
-//! [`crate::http::deliver_detached`], which waits until the pipeline takes them, however long
-//! that is, and the request is answered (`200`, or a prefix's code 6); `idle_timeout` doesn't
-//! close a connection with a request in flight. A client that closes the connection while it
-//! waits still gets every batch delivered; it saw no answer, so its retry duplicates the body, the
-//! ordinary at-least-once outcome. [`crate::http::deliver_first_bounded`] holds both steps.
+//! **A body with more batches than an inbox holds waits without a deadline for the rest.** It
+//! can't be reserved whole, so its first 64 batches (the runtime's channel capacity) go all or
+//! none under the deadline, and once they are in, the rest go through
+//! [`crate::http::deliver_detached`], which waits until the pipeline takes them, however long that
+//! is: a `503` then would make the client's retry deliver the first batches twice. The request is
+//! answered (`200`, or a prefix's code 6) and counted `class="unbounded"` in place of `ok`;
+//! `idle_timeout` doesn't close a connection with a request in flight. A client that closes the
+//! connection while it waits still gets every batch delivered; it saw no answer, so its retry
+//! duplicates the body, the ordinary at-least-once outcome.
 //!
-//! **A batch no consumer takes is refused.** When every consumer of the listener has closed, a
-//! refused first batch is answered as busy is (`503` code 9, `Retry-After: 1`, nothing of the
-//! body taken) but counted `closed_consumer`, and leaves `/health` alone: a closed downstream
-//! doesn't drain. A refused later batch is answered `500` code 8 with no `ackId` drawn, ahead of
-//! any code 6 the body would have earned; the batches before it were delivered, so a client's
-//! retry repeats them. Either way `logit.input.batches.dropped{reason="closed_consumer"}` counts
-//! the refused batch and every one after it.
+//! **A batch no consumer takes is refused.** When every consumer of the listener has closed, the
+//! body is answered as busy is (`503` code 9, `Retry-After: 1`, nothing of the body taken) but
+//! counted `closed_consumer`, and leaves `/health` alone: a closed downstream doesn't drain. A
+//! refused batch of an unbounded body's detached rest is answered `500` code 8 with no `ackId`
+//! drawn, ahead of any code 6 the body would have earned; the batches before it were delivered,
+//! so a client's retry repeats them. Either way
+//! `logit.input.batches.dropped{reason="closed_consumer"}` counts the refused batch and every one
+//! after it.
 //!
 //! # Telemetry
 //!
 //! Every name and tag is `&'static`. Per request: `logit.input.requests{route, class}` (class `ok`,
-//! `rejected`, `busy`, or `closed_consumer`; route `event`, `raw`, `ack`, `health`, or `unknown`),
+//! `unbounded`, `rejected`, `busy`, or `closed_consumer`; route `event`, `raw`, `ack`, `health`, or
+//! `unknown`),
 //! `logit.input.request.duration` (timing, every exit), and `logit.input.request.bytes` (the body
 //! size as sent, once read). Rejections: `logit.input.requests.rejected{reason}`, reason
 //! `unknown_route`, `method`, `oversize`, `query_token`, `auth`, `encoding`,
@@ -148,7 +152,7 @@
 
 use crate::http::{
     body_read_error_message, collect_with_stall_bound, declared_length, decompress,
-    deliver_first_bounded, drive_connection, is_length_limit, json_response, now_nanos, Activity,
+    deliver_bounded, drive_connection, is_length_limit, json_response, now_nanos, Activity,
     BodyReadError, DecompressError, Encoding, Undelivered, Unfinished,
 };
 use crate::listener::Prelude;
@@ -1116,8 +1120,7 @@ async fn respond(
             }
         };
 
-    // Every batch, before the first is delivered: the split below delivers a prefix that a code 6
-    // or a closed consumer can follow.
+    // Every batch, before any is delivered.
     request_peer.stamp_batches(&mut batches);
     // The drop is counted on the delivery's task, so a client that closes mid-wait doesn't
     // leave it uncounted.
@@ -1130,41 +1133,43 @@ async fn respond(
             }
         }
     };
-    // Only the first batch waits under the deadline (`deliver_first_bounded`). Only a delivery
+    // Every batch waits under the deadline, all or none (`deliver_bounded`). Only a delivery
     // clears a busy `/health`: a body the codec skipped whole says nothing about the pipeline.
     let accepted = || shared.health.mark_accepted();
-    match deliver_first_bounded(&shared.sink, batches, shared.busy_after, accepted, settle).await {
-        Ok(()) => {}
-        Err(Unfinished { undelivered: undelivered @ Undelivered::Busy(_), .. }) => {
-            // The whole body, not only the batch the deadline refused: a `503` code 9 leaves
-            // every batch with the client.
-            undelivered.record(&shared.telemetry);
-            shared.diag.clone().warn_throttled(
-                "busy",
-                format_args!(
-                    "splunk_hec_in: answered 503 to {}: the pipeline did not accept a batch \
+    let delivery =
+        match deliver_bounded(&shared.sink, batches, shared.busy_after, accepted, settle).await {
+            Ok(delivery) => delivery,
+            Err(Unfinished { undelivered: undelivered @ Undelivered::Busy(_), .. }) => {
+                // The whole body, not only the batch the deadline refused: a `503` code 9 leaves
+                // every batch with the client.
+                undelivered.record(&shared.telemetry);
+                shared.diag.clone().warn_throttled(
+                    "busy",
+                    format_args!(
+                        "splunk_hec_in: answered 503 to {}: the pipeline did not accept a batch \
                      within {:?}",
-                    shared.peer, shared.busy_after
-                ),
-            );
-            shared.health.mark_busy();
-            return (name, BUSY, server_busy());
-        }
-        Err(Unfinished { undelivered, taken: false }) => {
-            return (name, undelivered.reason(), server_busy());
-        }
-        Err(Unfinished { undelivered, taken: true }) => {
-            // Before the `ackId` draw, so a refused body mints no id.
-            let response = hec_response(HecStatus::INTERNAL_SERVER_ERROR);
-            return (name, undelivered.reason(), response);
-        }
-    }
+                        shared.peer, shared.busy_after
+                    ),
+                );
+                shared.health.mark_busy();
+                return (name, BUSY, server_busy());
+            }
+            Err(Unfinished { undelivered, taken: false }) => {
+                return (name, undelivered.reason(), server_busy());
+            }
+            Err(Unfinished { undelivered, taken: true }) => {
+                // Only an unbounded body's detached rest. Before the `ackId` draw, so a refused body
+                // mints no id.
+                let response = hec_response(HecStatus::INTERNAL_SERVER_ERROR);
+                return (name, undelivered.reason(), response);
+            }
+        };
     // Drawn once from the channel's ledger, for a `200` or a delivered prefix's code 6 alike.
     let ack_id = channel.map(|channel| issue_ack_id(shared, &channel));
     if let Some(err) = invalid {
         return (name, REJECTED, reject_hec_error(shared, &err, ack_id));
     }
-    (name, OK, json_response(StatusCode::OK, Bytes::from(encode_success(ack_id))))
+    (name, delivery.class(), json_response(StatusCode::OK, Bytes::from(encode_success(ack_id))))
 }
 
 /// Why a decoded `/event` or `/raw` body delivers nothing ([`decode_route`]).
@@ -1878,6 +1883,59 @@ mod tests {
         assert!(!events.has("logit.input.batches.dropped", &[]), "a busy 503 is not loss");
     }
 
+    /// A body is all or none: two envelopes into an inbox with room for one are answered `503`
+    /// code 9 with neither delivered, so the client's resend is the one copy of each.
+    #[tokio::test]
+    async fn a_two_envelope_body_with_room_for_one_batch_is_503_code_9_with_nothing_delivered() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("hec", "splunk_hec_in", "listener");
+        let input = SplunkHecInput::new("127.0.0.1:0")
+            .with_telemetry(telemetry)
+            .with_busy_after(Duration::from_millis(200));
+        let (addr, mut rx) = start(input, 2).await;
+        let path = "/services/collector/event";
+        let response = post_raw(&addr, path, "", ONE_EVENT).await;
+        assert_eq!(body_of(&response), SUCCESS, "{response}");
+
+        let body = b"{\"host\":\"a\",\"event\":\"1\",\"time\":1}\
+                     {\"host\":\"b\",\"event\":\"2\",\"time\":2}";
+        let response = post_raw(&addr, path, "", body).await;
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        assert_eq!(body_of(&response), r#"{"text":"Server is busy","code":9}"#);
+
+        recv_batch(&mut rx).await;
+        assert!(rx.try_recv().is_err(), "no batch of the 503'd body was delivered");
+        let events = Totals::of(registry.drain(0));
+        assert_eq!(events.sum("logit.input.batches.deferred", &[]), 2.0);
+        assert_eq!(events.sum("logit.input.requests", &[("class", "busy")]), 1.0);
+    }
+
+    /// A body with more batches than the inbox holds sends the batches past its capacity without
+    /// the bound once the first are in, and is counted `unbounded`, not `ok`.
+    #[tokio::test]
+    async fn a_body_with_more_batches_than_the_inbox_holds_is_counted_unbounded() {
+        let registry = logit_core::Registry::new();
+        let telemetry = registry.telemetry_for("hec", "splunk_hec_in", "listener");
+        let input = SplunkHecInput::new("127.0.0.1:0")
+            .with_telemetry(telemetry)
+            .with_busy_after(Duration::from_millis(200));
+        let (addr, mut rx) = start(input, 1).await;
+        let body = b"{\"host\":\"a\",\"event\":\"1\",\"time\":1}\
+                     {\"host\":\"b\",\"event\":\"2\",\"time\":2}";
+        let request =
+            tokio::spawn(
+                async move { post_raw(&addr, "/services/collector/event", "", body).await },
+            );
+
+        recv_batch(&mut rx).await;
+        recv_batch(&mut rx).await;
+        let response = request.await.unwrap();
+        assert_eq!(body_of(&response), SUCCESS, "{response}");
+        let events = Totals::of(registry.drain(0));
+        assert_eq!(events.sum("logit.input.requests", &[("class", "unbounded")]), 1.0);
+        assert_eq!(events.sum("logit.input.requests", &[("class", "ok")]), 0.0);
+    }
+
     /// A first batch no consumer takes is answered as a full downstream is, but counted
     /// `closed_consumer`, and leaves `/health` alone.
     #[tokio::test]
@@ -1911,8 +1969,9 @@ mod tests {
         assert_eq!(events.sum("logit.input.acks.issued", &[]), 0.0);
     }
 
-    /// The consumer closes after the body's first batch is in: the refused second batch is a
-    /// `500` code 8 that draws no `ackId`, and counts itself.
+    /// A body of two batches into a one-slot inbox can't be reserved whole, so its second batch
+    /// is sent without the bound once the first is in. The consumer closes then: the refused
+    /// second batch is a `500` code 8 that draws no `ackId`, and counts itself.
     #[tokio::test]
     async fn a_later_batch_no_consumer_takes_is_500_code_8_and_draws_no_ack_id() {
         let registry = logit_core::Registry::new();
