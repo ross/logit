@@ -908,9 +908,10 @@ the generator counted every line in them as written.
   reported as a kill's is, and its G − W is held to G from the SUT's last drain to the pause,
   plus each connection the generator opened before the kill times the source's
   `socket_buffers`, in lines at the generator's bytes per line, plus a batch per edge. A write
-  stalled past `connect_timeout` drops its connection, and the redial completes into the frozen
-  listener's accept queue and fills another pair, so the connections are 1 plus the generator
-  sink's reconnects through the stall. Past the bound the row FAILs.
+  stalled past `connect_timeout` keeps its connection while the listener still answers ([ADR
+  `stream-sink-stalled-connection`](stream-sink-stalled-connection.md)); a redial would complete
+  into the frozen listener's accept queue and fill another pair. So the connections are 1 plus
+  the generator sink's reconnects through the stall. Past the bound the row FAILs.
 - **The buffers are the override's.** A new network namespace copies the host's maxima, so a
   scenario's compose override sets `net.ipv4.tcp_rmem` on the SUT and `tcp_wmem` on the
   generator, and `load()` holds `socket_buffers` to them. `syslog-stall-kill` caps both at

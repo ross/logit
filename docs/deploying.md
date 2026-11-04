@@ -920,14 +920,32 @@ matters more than the held batch.
 `syslog_out`, `statsd_out`, and `graphite_out` over TCP or TLS, and `statsd_out` over a Unix
 stream, count a batch sent once the kernel or the TLS session takes its bytes. A line protocol
 carries no acknowledgment, so a receiver that dies with bytes still in either socket buffer loses
-them, and neither side counts the loss
-([ADR `delivery-semantics`](adr/delivery-semantics.md), item 6). The posture can't help: no
-fault reaches the sink for those bytes. Where a lost tail matters, use a protocol with an
-acknowledgment: the native hop (`logit_out` to `logit_in`), or an HTTP sink whose destination
-answers after it holds the batch. Smaller socket buffers narrow the window, at a throughput
-cost. Over TCP and TLS they're `net.ipv4.tcp_wmem` on the sender and `net.ipv4.tcp_rmem` on the
-receiver. Those settings cover TCP sockets only: a Unix stream's buffer is the sending socket's
-`SO_SNDBUF`, which defaults to `net.core.wmem_default`.
+them ([ADR `delivery-semantics`](adr/delivery-semantics.md), item 6). The posture can't help: no
+fault reaches the sink for those bytes.
+
+What `logit` does about it ([ADR
+`stream-sink-stalled-connection`](adr/stream-sink-stalled-connection.md)):
+
+- **A receiver that stops reading keeps its connection.** Once a write accepts nothing for
+  `connect_timeout`, the attempt fails, and the next one uses the same connection, writing the
+  cut frame's tail first. `logit.output.reconnects` stays flat through the stall. A redial would park a
+  new connection, with a new pair of full buffers, in the frozen receiver's accept queue on every
+  retry, all lost when the receiver dies. A TCP connection whose peer has stopped answering (a
+  host that's gone or partitioned) is closed instead.
+- **The sender's share of a loss is counted.** When the receiver's reset or close ends a TCP
+  connection, the sink counts the bytes of earlier batches its own socket still held unacknowledged
+  as `logit.output.bytes.dropped{reason="unacknowledged"}`, with a throttled `unacknowledged`
+  warning. Under TLS the count is wire bytes, record framing included.
+- **The receiver's share isn't.** Bytes the receiver's kernel acknowledged and its process never
+  read are gone with it, and nothing reports them to the sender. Nor is anything counted over a
+  Unix stream, whose receiver's close frees the sender's queue, or for a connection closed at
+  shutdown or after its peer stopped answering ([`docs/known-gaps/sinks.md`](known-gaps/sinks.md)).
+
+Where a lost tail matters, use a protocol with an acknowledgment: the native hop (`logit_out` to
+`logit_in`), or an HTTP sink whose destination answers after it holds the batch. Smaller socket
+buffers narrow the window, at a throughput cost. Over TCP and TLS they're `net.ipv4.tcp_wmem` on
+the sender and `net.ipv4.tcp_rmem` on the receiver. Those settings cover TCP sockets only: a Unix
+stream's buffer is the sending socket's `SO_SNDBUF`, which defaults to `net.core.wmem_default`.
 
 ### Sink failure semantics
 

@@ -101,35 +101,43 @@ Entry format and the other areas: [the known-gaps index](README.md).
   - **To close:** a dead-letter sink for rejected batches and a split-on-`413` retry step in the
     shared HTTP driver, each with its own ADR.
 
-- **A stream sink doesn't count the bytes its peer never acknowledged.** A stream with no
-  application acknowledgment is best-effort by decision
+- **A stream sink counts only the sender's share of the bytes its receiver never acknowledged.**
+  A stream with no application acknowledgment is best-effort by decision
   ([ADR `delivery-semantics`](../adr/delivery-semantics.md), item 6, "A wire that can't confirm
   delivery bounds its hop"), and [Deploying `logit`](../deploying.md#a-stream-sink-has-no-acknowledgment)
-  has the operator's workaround. What's open is counting and measuring that loss.
-  `syslog_out`, `statsd_out`, and `graphite_out` over TCP or TLS, and `statsd_out` over a Unix
-  stream, count a batch's messages in `logit.output.messages` once the frame's write and flush
-  return (`crates/logit-outputs/src/stream.rs`). When the receiver ends with bytes in either
-  socket buffer, the next send's probe finds the connection closed and redials, and nothing
-  reports the frames already counted.
-  - **To close, the sender's part:** on a failed connection, `SIOCOUTQ` (or `TCP_INFO`'s
-    unacknowledged bytes) says how much the peer never acknowledged, and the driver could count
-    that as loss. The receiver's part, acknowledged by its kernel and never read, can't be seen
-    from the sender without an application acknowledgment such as RELP's.
-  - **Measured, a stalled receiver:** against a reader that keeps up, the loss is too small to
-    see. In `syslog-tcp-ingress` and `syslog-tls-ingress`, at 2,000 lines a second with each
-    buffer capped at 256 KiB, four kills' gaps of 9,800 to 9,916 lines each fell within about
-    400 lines, the error of the estimate, of what the listener read after its last export. A
-    receiver stalled behind a full receive buffer loses what its buffers hold, and the loss grows
-    with the stall: each write stalled past `connect_timeout` redials into the frozen listener's
-    accept queue and fills another pair. In `syslog-stall-kill` (256 KiB buffers) a kill 30 s
-    into a stall lost 21,339 lines, about 1.3 MB, and one 90 s into a stall lost 71,586, about
-    4.5 MB. Under Linux's default autotuning (`syslog-stall-kill-default`) the losses were 35,163
-    and 113,899 lines, about 2.2 MB and 7.2 MB, far below the maxima: about half a megabyte per
-    connection (2.2 MB over 5 connections, 7.2 MB over 13) against a pair's 10 MiB, because a
-    receiver that is never read grows its buffer only in `recvmsg`. The harness's bound is about
-    20 times the loss there. At a backend, two kills of VictoriaMetrics under `graphite-egress`
-    lost 300 datapoints against a bound of 400 ([plan `soak-harness`](../plans/soak-harness.md)'s
-    "A backend kill's tail and a stalled receiver").
+  has the operator's workaround. `syslog_out`, `statsd_out`, and `graphite_out` over TCP or TLS
+  keep a stalled connection, and count what their own socket still held unacknowledged when the
+  receiver's reset or close ends it, as `logit.output.bytes.dropped{reason="unacknowledged"}`
+  ([ADR `stream-sink-stalled-connection`](../adr/stream-sink-stalled-connection.md)). These stay
+  uncounted:
+  - the receiver's share: bytes its kernel acknowledged into its receive buffer that its process
+    never read, which the sender can't see without an application acknowledgment (for
+    `syslog_out`, the RELP entry in [syslog.md](syslog.md));
+  - `statsd_out` over a Unix stream, whose receiver's close frees the sender's queue
+    (`unix_outq_len` reads the receiver's charged memory, not unacknowledged bytes);
+  - a connection the driver closes after its peer stopped answering, or at shutdown, whose bytes
+    the kernel keeps trying to deliver after the close;
+  - up to 64 KiB of ciphertext still queued in a TLS session, which never reached the socket.
+
+  A receiver that half-closes and keeps reading is overcounted: its FIN reads as a close.
+  - **Measured, before the driver kept a stalled connection:** against a reader that keeps up,
+    the loss is too small to see. In `syslog-tcp-ingress` and `syslog-tls-ingress`, at 2,000
+    lines a second with each buffer capped at 256 KiB, four kills' gaps of 9,800 to 9,916 lines
+    each fell within about 400 lines, the error of the estimate, of what the listener read after
+    its last export. A receiver stalled behind a full receive buffer loses what its buffers hold,
+    and the loss grew with the stall: each write stalled past `connect_timeout` redialed into the
+    frozen listener's accept queue and filled another pair. In `syslog-stall-kill` (256 KiB
+    buffers) a kill 30 s into a stall lost 21,339 lines, about 1.3 MB, and one 90 s into a stall
+    lost 71,586, about 4.5 MB. Under Linux's default autotuning (`syslog-stall-kill-default`) the
+    losses were 35,163 and 113,899 lines, about 2.2 MB and 7.2 MB, far below the maxima: about
+    half a megabyte per connection (2.2 MB over 5 connections, 7.2 MB over 13) against a pair's
+    10 MiB, because a receiver that is never read grows its buffer only in `recvmsg`. The
+    harness's bound is about 20 times the loss there. At a backend, two kills of VictoriaMetrics
+    under `graphite-egress` lost 300 datapoints against a bound of 400 ([plan
+    `soak-harness`](../plans/soak-harness.md)'s "A backend kill's tail and a stalled receiver").
+  - **Revisit:** re-measure `syslog-stall-kill` and `syslog-stall-kill-default` with the kept
+    connection, which should put one buffer pair at risk whatever the stall's length, and replace
+    the numbers above.
 
 - **A kept-alive connection a destination closed first reads as `Ambiguous`.** An HTTP sink
   closes a pooled connection idle past its `idle_timeout:` (30 s by default) before reusing it,
