@@ -114,7 +114,8 @@
 //! none under the deadline, and once they are in, the rest go through
 //! [`crate::http::deliver_detached`], which waits until the pipeline takes them, however long that
 //! is: a `503` then would make the client's retry deliver the first batches twice. The request is
-//! answered (`200`, or a prefix's code 6) and counted `class="unbounded"` in place of `ok`;
+//! answered `200` and counted `class="unbounded"` in place of `ok`, or, for a body cut short, its
+//! prefix's code 6, which counts `rejected` whatever the delivery: one class per request.
 //! `idle_timeout` doesn't close a connection with a request in flight. A client that closes the
 //! connection while it waits still gets every batch delivered; it saw no answer, so its retry
 //! duplicates the body, the ordinary at-least-once outcome.

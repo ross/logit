@@ -599,7 +599,7 @@ every producer the send-side numbers for free:
 |---|---|---|
 | `logit.component.batches.sent` | count | one per `Fanout::send` call, regardless of fan-out width. A `Fanout::send_with_deadline` or `send_many_with_deadline` (the HTTP listeners) that times out sends nothing and counts nothing, span and `send.blocked.duration` included; one that sends counts one per batch |
 | `logit.component.events.sent` | count | events in that batch |
-| `logit.component.send.blocked.duration` | timing | time spent inside one `Fanout::send` call (all consumers) |
+| `logit.component.send.blocked.duration` | timing | time spent inside one `Fanout::send` call (all consumers). A `send_many_with_deadline` call records one sample for its one wait, however many batches it sends |
 | `logit.component.events.dropped{reason="closed_consumer"}` | count | a consumer's channel was already closed. The first drop on each edge, one producer to one consumer, also logs a `closed_consumer` warn line naming both; later drops on that edge are counted only |
 
 #### Inbox side: recorded under the consumer
@@ -1489,9 +1489,11 @@ taking all of a request's batches, the request gets `503` code 9 with `Retry-Aft
 `class="busy"`, with nothing of it delivered, and every HEC client retries it. A `/event` body
 that carries several envelopes decodes to one batch per resource, and they all reach every
 consumer or none do. A body of more than 64 batches, more than an inbox holds, is bounded for its
-first 64 only: the rest wait without a deadline, the request gets `200` (or, for a body cut
-short, its code 6) and counts `class="unbounded"`, and `logit.input.request.duration` can run
-past 5 seconds while `busy` stays flat (the module doc's "Backpressure" section). From a busy answer until a later request's data is taken, for at
+first 64 only: the rest wait without a deadline, the request gets `200` and counts
+`class="unbounded"`, and `logit.input.request.duration` can run
+past 5 seconds while `busy` stays flat (the module doc's "Backpressure" section). A body cut
+short gets its prefix's code 6 and counts `rejected` whatever the delivery, so an unbounded one
+counts `rejected` too. From a busy answer until a later request's data is taken, for at
 most 5 seconds, `/health` answers `503` code 18, counted
 `logit.input.requests{route="health", class="busy"}`.
 

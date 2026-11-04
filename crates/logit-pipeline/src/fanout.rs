@@ -676,7 +676,7 @@ impl Fanout {
         let _in_flight = self.in_flight(batch.events.len());
         let timer = self.telemetry.timer("logit.component.send.blocked.duration");
         // Until every slot is held, a timeout or a dropped future discards both unrecorded.
-        let mut unsent = Unsent(Some((span, timer)));
+        let mut unsent = Unsent(Some((span, Some(timer))));
         let reserve_all = async {
             let mut permits = Vec::with_capacity(self.consumers.len());
             for edge in &self.consumers {
@@ -745,7 +745,8 @@ impl Fanout {
     /// consumer receives any batch, and no batch's span, `batches.sent`/`events.sent`, or
     /// `send.blocked.duration` sample is recorded. Once every consumer holds every slot, each batch
     /// goes out in order to every consumer, as `send_with_deadline` sends one, with its own root
-    /// context, span, and counts. A consumer whose wait is queued holds the slots it has been
+    /// context, span, and counts. The wait is shared, so the call records one
+    /// `send.blocked.duration` sample, not one per batch. A consumer whose wait is queued holds the slots it has been
     /// handed so far, and a sender queued behind it on that inbox waits for it: tokio's channel
     /// hands slots out in order. The deadline bounds both.
     ///
@@ -782,10 +783,13 @@ impl Fanout {
         let events: usize = batches.iter().map(|batch| batch.events.len()).sum();
         let _in_flight = self.in_flight.as_ref().map(|c| c.enter_batches(count, events));
         // Until every slot is held, a timeout or a dropped future discards every batch's span and
-        // timer unrecorded.
+        // the call's timer unrecorded. The wait is one for every batch, so the call records one
+        // `send.blocked.duration` sample, carried by the first batch's entry: a sample per batch
+        // would sum to the wait times the batch count.
         let mut unsent: Vec<(TraceContext, Unsent)> = batches
             .iter()
-            .map(|batch| {
+            .enumerate()
+            .map(|(i, batch)| {
                 let trace = TraceContext::new_root();
                 let mut span = self.telemetry.span(
                     "send",
@@ -795,7 +799,8 @@ impl Fanout {
                     None,
                 );
                 span.events(batch.events.len() as u64);
-                let timer = self.telemetry.timer("logit.component.send.blocked.duration");
+                let timer =
+                    (i == 0).then(|| self.telemetry.timer("logit.component.send.blocked.duration"));
                 (trace, Unsent(Some((span, timer))))
             })
             .collect();
@@ -824,8 +829,10 @@ impl Fanout {
             return Err(SendManyError::Timeout(batches));
         };
         let mut taken = false;
+        let mut blocked = None;
         for (batch, (trace, mut unsent)) in batches.into_iter().zip(unsent.drain(..)) {
             let (span, timer) = unsent.0.take().expect("taken only here, once every slot is held");
+            blocked = blocked.or(timer);
             let ctx = self.stamp(trace.into());
             let n = batch.events.len();
             if permits.len() == 1 {
@@ -849,9 +856,9 @@ impl Fanout {
                 }
             }
             self.record_send(n);
-            drop(timer);
             span.finish();
         }
+        drop(blocked);
         Ok(taken)
     }
 
@@ -1131,12 +1138,14 @@ impl Fanout {
 /// The span and blocked-duration timer of an all-or-nothing send that has not sent yet. Dropped
 /// while still holding them (a deadline passed, or the send's future was dropped), it cancels
 /// both, so a send that never happened records nothing.
-struct Unsent(Option<(logit_core::SpanGuard, logit_core::telemetry::Timer)>);
+struct Unsent(Option<(logit_core::SpanGuard, Option<logit_core::telemetry::Timer>)>);
 
 impl Drop for Unsent {
     fn drop(&mut self) {
         if let Some((span, timer)) = self.0.take() {
-            timer.cancel();
+            if let Some(timer) = timer {
+                timer.cancel();
+            }
             span.cancel();
         }
     }
@@ -1528,7 +1537,11 @@ mod tests {
         assert_eq!(counter_value(&events, "logit.component.batches.sent"), Some(2.0));
         assert_eq!(counter_value(&events, "logit.component.events.sent"), Some(5.0));
         assert_eq!(events.iter().filter(|e| e.span.is_some()).count(), 2, "a span per batch");
-        assert_eq!(timing_count(&events, "logit.component.send.blocked.duration"), 2);
+        assert_eq!(
+            timing_count(&events, "logit.component.send.blocked.duration"),
+            1,
+            "one sample for the call's one wait"
+        );
     }
 
     /// A closed consumer is skipped, and each batch counts its events dropped there, as

@@ -1677,8 +1677,10 @@ class HttpListener:
 # deadline on a request's batches, all or none: a `/event` body decodes to one batch per
 # envelope and a series body to one batch, so the identities hold while each body carries one
 # envelope (crates/logit-inputs/src/splunk.rs and datadog.rs, "Backpressure"). A request of
-# more batches than an inbox holds counts `class="unbounded"` in place of `ok`, which a
-# one-batch request never does, so no row reads it. `prometheus_in`'s
+# more batches than an inbox holds counts `class="unbounded"` in place of `ok`, and the
+# `ok` + `closed_consumer` identity would fail for one. No shipped scenario sends more than one
+# batch per request, so an unbounded request can't occur there; a scenario that did would need
+# the identity extended. `prometheus_in`'s
 # remote-write receiver counts each request once in `logit.input.writes{class}`, with no
 # `route` tag, decodes it to one batch, and answers as `influxdb_in` does under a 2 s deadline
 # (crates/logit-inputs/src/prometheus.rs, "Backpressure"). It counts `ok` in the poll its batch
