@@ -176,9 +176,9 @@ request's batches exist:
 |---|---|---|
 | `otlp_in` HTTP | `handle_http`, after decode | One per resource |
 | `otlp_in` gRPC | `handle_grpc`, after decode | One per resource |
-| `datadog_in` | `respond`, before `deliver_with_deadline` | One, or one per `TracerPayload` or stats payload |
+| `datadog_in` | `respond`, before `deliver_bounded` | One, or one per `TracerPayload` or stats payload |
 | `datadog_trace_in` | `respond`, beside `apply_tracer_headers` | One |
-| `splunk_hec_in` | `respond`, before the split into a deadline-bound first batch and detached rest | One per envelope |
+| `splunk_hec_in` | `respond`, before `deliver_bounded` | One per envelope |
 | Remote-write receiver | `write_response`, before building the batch | One |
 
 `splunk_hec_in` stamps before its split because a code 6 can follow a delivered prefix. A handler
