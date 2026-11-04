@@ -208,8 +208,9 @@ settle window would leave a life no fit. `fanin` and `tcp-ingress` set `60s`, an
 
 - Every fault carries `for`, so its revert is scheduled with it. `netem clear` is a revert, never
   a step.
-- No two faults overlap on one container, except a `signal` inside a `rename` (W12c), and a
-  `signal` or a `probe` inside a `rotate` (W12d).
+- No two faults overlap on one container, except a `signal` inside a `rename` (W12c), a
+  `signal` or a `probe` inside a `rotate` (W12d), and a `stop` or `kill` starting inside a
+  `cgroup` after its start (W33).
 - No netem on a container during its `stop`, `kill`, `pause`, `partition`, or `exit`, because the qdisc
   is lost with the namespace and `docker run --network container:<id>` needs a running target.
 - No fault ends inside `cooldown`, and `cooldown` is at least `recovery_bound`.
@@ -226,7 +227,27 @@ settle window would leave a life no fit. `fanin` and `tcp-ingress` set `60s`, an
   follow-ups add `reset`, on any service: a one-shot netem container in its namespace closes
   its established TCP connections with `ss -K`, or those on the step's optional `port`, 1 to
   65535, and fails the step when it closed none. Under `[overlap]` or beside an `idp` it goes
-  on the holder, as `netem` and `partition` do.
+  on the holder, as `netem` and `partition` do. W31 adds `prlimit`, on a SUT only, never in a
+  `[random]` schedule: a one-shot netem container in its PID namespace sets PID 1's open-files
+  limit, soft and hard, to the step's required `nofile`, a whole number from 8 to 1048576, and
+  its revert sets back the limit it found, unless the process started again inside the window.
+  W32 adds `cgroup`, on a SUT only, never in a `[random]` schedule: a one-shot netem container
+  with the host's `/sys/fs/cgroup` bound writes `cpu.max` from the step's `cpu`, 0.01 to 1024,
+  or `memory.high` from its `memory_high`, a whole number with a `K`, `M`, or `G` suffix from
+  16M to 1024G, one of the two, in the SUT's own cgroup, and its revert writes back what
+  it found, unless the process started again or exited inside the window; on a `memory_high`
+  step it records the window's `memory.events` `high` count, which `timeline` reports, and an
+  optional `engaged`, `true` or `false` and refused on any other step, FAILs a count of 0 or a
+  count above 0 respectively; `memory_high` must be a whole number of 4 KiB pages. W33 adds
+  `io.max` to it: `io_wbps`, a whole number bare or with a `K`, `M`, or `G` suffix from 4K to
+  1024G, and `io_wiops`, a whole number from 1 to 1,000,000, either or both as the step's one
+  limit, with `io_path`, an absolute path with no `..` and no whitespace, required with them
+  and refused elsewhere. The step writes them on the disk behind `io_path`, fails when no block
+  device backs it, and records the window's `io.stat` `wbytes` and `wios` and `io.pressure`
+  stalled time, which `timeline` reports; `engaged` is allowed on an io step, where it reads
+  the stalled time against 1% of the window. A `stop` or `kill` of the SUT may start inside a
+  `cgroup` step, after its start; such a step takes no `engaged`, since its counts go with the
+  process's scope.
 - `[ledger] vm_every_window`, optional, is `true` or `false`; `[ledger] sut_script`, optional,
   is a component id.
 - `[[ledger.source]]` (W8b) has the rules under "Sources" below.
@@ -3128,21 +3149,139 @@ under "Deferred to a later round" wait.
     `otlp_out` and `splunk_hec_out` beside `prometheus_out`, `datadog_out`, and `influxdb_out`
     (decided with Ross).
 
-Two follow-ups have no item yet. An overlap of TCP listeners, item 11 over `transport: tcp`,
-will need `net.ipv4.tcp_migrate_req`, without which the connections still in the old socket's
-accept queue at its close are reset rather than moved to the new one. A CA rotation, item 12's
-TLS half carried further, will rotate to a bundle of the old and new CAs, then to a leaf the new
-CA signed.
+Deferred to a later round (decided with Ross, 2026-10-29): the `datadog_trace` pair, resource
+faults, connection adversity, and native-hop variants. Two
+follow-ups had no item: an overlap of TCP listeners, and a CA rotation.
 
-Deferred to a later round (decided with Ross, 2026-10-29):
+Round 4 (decided with Ross, 2026-11-03) takes that list and those two follow-ups as items 27 to
+34, resource faults first, since they need the least new machinery; item 30 splits clock steps
+out of the resource faults to record why they stay deferred. A survey on this development host (Fedora, cgroup v2 under systemd,
+Docker 29.9, SELinux enforcing) checked each fault's mechanism before it was planned:
 
-- The `datadog_trace_in → datadog_trace_out` pair. The ledger has no span unit, and the harness
-  has no stdlib msgpack reader.
-- Resource faults: a cgroup memory limit, a CPU quota, a file-descriptor limit, a slow disk, and
-  clock steps.
-- Connection adversity: slowloris senders and half-open peers.
-- Native-hop variants: a TLS hop, a window under high RTT, and more senders than the identity
-  table holds.
+27. **A file-descriptor limit (W31).** A `prlimit` action sets the SUT's `RLIMIT_NOFILE` for the
+    step's window and restores it after, through a one-shot of the netem image (which ships
+    `prlimit`) joined to the SUT's PID namespace with `--cap-add SYS_RESOURCE`; it needs no
+    `label=disable`. `docker update` can't change a running container's ulimits. The action
+    records the limit it found and restores that, and reports a SUT start inside the window,
+    since a new process starts with the container's own limit and the fault is gone. Lowering
+    the limit closes nothing already open, so the step sets it a few descriptors above the
+    SUT's steady `logit.process.fds`. `logit.process.fds.limit` reads `/proc/self/limits`, so
+    an `[[expect]]` row confirms the limit landed. What it reaches: `classify_accept_error`'s
+    `resource` class and its backoff on every TCP and HTTP listener
+    (`logit.input.accept.errors{reason="resource"}`), the admin endpoint's accept backoff,
+    `tail_in`'s directory and file opens, a spool segment's create
+    (`buffer.disk.errors{op}`), `file_out`'s reopen, and sink redials. Two scenarios:
+    `fd-limit-tcp` from `tcp-ingress`, which should lose nothing, since the backlog fills and
+    the sender retries, with `[[expect]]` rows on the resource accept errors (above 0 in the
+    window, 0 after it) and on the limit's minimum; and `fd-limit-tail` from
+    `tail-rotate-delete`, whose rotations need opens inside the window. The window excuses
+    `progress` and `ready`. `self_log` needs no excuse: the accept and spool diagnostics are
+    throttled warnings (`absorb_accept_error`'s `accept_error`, `count_fs_error`'s
+    `disk_fs_error`). `logit run` raises its soft open-files limit to the hard limit at start, so
+    `fd_limit_warning`, which warns when the listeners' `max_connections:` total is at or above
+    the soft limit, stays quiet under a container's default 1024 soft and 524288 hard, and the
+    step's restore writes back soft equal to hard.
+28. **A CPU quota and memory pressure (W32).** A `cgroup` action writes `cpu.max` or
+    `memory.high` in the SUT's own cgroup (`system.slice/docker-<id>.scope`) for the window
+    and writes `max` back after, through a one-shot with `/sys/fs/cgroup` bound read-write and
+    `label=disable`, without which SELinux denies the write. `docker update` is the wrong tool
+    for both: `--memory` can't return to unlimited, and `--cpus` stays in `HostConfig` and
+    comes back on the next start. A SUT start inside the window makes a new scope and drops the
+    write, which the action reports as `prlimit` does. Both windows excuse what a `pause`
+    excuses: `ready` (the HEALTHCHECK's `logit ready` runs in the throttled cgroup), `progress`,
+    and UDP wire loss. Two scenarios:
+    - `cpu-quota`, from `udp-flood-sink-stop`, at a quarter of a CPU or less for 120 s:
+      `[[expect]]` rows that kernel drops (`logit.input.kernel.dropped`) and the receive queue's
+      drops are counted, and that flush ticks resume after. `rss_slope` and `fd_slope` hold.
+    - `memory-high`, from `sink-outage-block`, with `memory.high` set a margin above what the
+      sink's `buffer:` bound should cost, through a sink outage: an `[[expect]]` maximum on
+      `logit.process.memory.resident.bytes` and no OOM. `logit` has no process-wide memory cap
+      (`max_memory` bounds one Lua VM), so this is the soak that shows a `buffer:` bound bounds
+      memory. `memory.max` isn't planned: its outcome is an OOM kill, which `exit` FAILs, and an
+      expected-OOM excuse waits for a reason to want one.
+29. **A slow disk (W33), on the perf VM.** `io.max` doesn't throttle on the development host: a
+    1 MiB/s write limit let 4 MiB through with `fsync` in 0.1 s, likely because overlayfs over
+    btrfs over dm-crypt loses the writeback's cgroup. W33 runs on the disposable perf VM
+    instead (ADR `disposable-azure-perf-vm`; decided with Ross, 2026-11-04), where privileged
+    host state is thrown away with the VM, and its root filesystem is ext4 on a managed disk,
+    where cgroup writeback is supported. Two mechanisms, tried in order:
+    - **`io.max` through the `cgroup` action.** W32's action gains `io_wbps` and `io_wiops`
+      keys, written as `<major>:<minor> wbps=<n>` or `wiops=<n>` in the SUT's `io.max`, the
+      device behind the mount that holds `io_path` in the SUT's mountinfo, followed through an
+      overlay's `upperdir` to the host mount, a partition replaced by its whole disk. It needs
+      no new image and no privilege beyond W32's `label=disable`, and reverts by writing back
+      each limited key's found value (`max` when the device had none). The VM's first step is
+      the probe the survey ran here: a throwaway container under a 1 MiB/s `wbps` writing 4
+      MiB with `fsync`, which must take about 4 s.
+    - **`dm-delay`, if the probe fails.** A `dm-delay` device over a loop file in the run
+      directory, made in a privileged one-shot (the netem image gains `dmsetup`, `losetup`,
+      and `mkfs.ext4`), mounted as an `ext4` Docker volume at the spool path by a compose
+      override, as `spool-enospc` mounts its tmpfs, with the delay changed by `dmsetup
+      suspend`, `reload`, and `resume`. Devices are named per compose project, removed in the
+      end sequence, and swept at the driver's start.
+
+    One scenario, `slow-spool`, from `spool-kill-replay`, slows the spool's writes for a window
+    through a sink outage and stops the SUT inside it. It reaches the spool's segment
+    `sync_data`, its persist worker's cursor write with two fsyncs, and the write a cancelled
+    push leaves running (`disk_queue.rs`'s `HeldWriteFile`). Expected: slow syncs with no loss, no
+    `*.dropped` unless the `buffer:` bound trips, the next life replaying the spool, and a
+    clean ledger. No internal metric times a spool write and `io.stat` has no throttle count.
+    `timeline` therefore reports `io.stat`'s `wbytes` and `wios` deltas and the cgroup's
+    `io.pressure` stall. `engaged` judges the stall against 1% of the window, so a window that
+    never slowed a write is visible, as `memory.events` is for W32 (ADR `soak-harness`'s
+    amendment "a `cgroup` step limits the writes to the disk behind a SUT path"). A `dm-flakey`
+    `error_writes` variant, reaching `buffer.disk.errors{op}` on real I/O errors, needs the
+    `dm-delay` path's device and stays out of W33 unless that path is the one taken. The
+    harness needs Python 3.11 or later and `sudo -n docker`: the VM's Debian 13 image ships
+    Python 3.13, which cloud-init itself runs on, and its cloud-init installs Docker CE.
+30. **Clock steps stay deferred.** `CLOCK_REALTIME` can't be namespaced, a time namespace
+    offsets only the monotonic clocks and Docker can't make one, and stepping the host's clock
+    would break the driver's own timeline. `libfaketime` in an image layer could step the SUT's
+    wall clock, but the checks place every drain by the SUT's own NDJSON timestamp, so a step
+    would misplace drains against the fault windows; placing drains by the time the driver read
+    them comes first. `tail-rotate-stale` already reaches the stale paths from the producer's
+    side.
+31. **Connection adversity (W34).** A stdlib one-shot client, cued by a step, against a TCP and
+    an HTTP listener: slowloris connections that trickle one byte at a time under
+    `handshake_timeout:` and `idle_timeout:`, enough of them to fill `max_connections:`, and
+    half-open peers, connections whose packets a partition drops with no FIN or RST. What each
+    cause reaches: a full listener refuses a new connection before any TLS accept and counts
+    `logit.input.connections.rejected{reason="limit"}`, on the TCP driver and the HTTP
+    listeners alike; a trickling client is past its first byte, so `handshake_timeout:` no
+    longer bounds it, and `idle_timeout:`, when the scenario sets it, bounds it only in an HTTP
+    request's head, where the clock re-arms only when a request finishes, counted
+    `connections.closed{reason="idle"}`; an HTTP body is read under a per-frame stall bound and
+    the TCP driver re-arms its clock on every read that returns bytes, so in either a byte sent
+    faster than `idle_timeout:` holds the slot until the client leaves or, for a body, the size
+    cap; and a first-byte timeout under `handshake_timeout:` counts
+    `connections.closed{reason="handshake_timeout"}` on the TCP driver, with no diagnostic,
+    while the HTTP listeners still diagnose it and count nothing. Rows:
+    `connections.rejected{reason="limit"}` above 0 while the slow clients hold every slot;
+    `connections.closed{reason="handshake_timeout"}` for a TCP client that sends nothing past
+    `handshake_timeout:`; `connections.closed{reason="idle"}` for a trickled HTTP request head
+    and for the half-open peers on both listeners, since they send nothing; a trickled HTTP body
+    holding its slot with no close, the limit
+    [ADR `deployment-threat-model`](../adr/deployment-threat-model.md) documents ("A stalled or
+    dribbled body holds its connection permit"); a TCP trickle holding its slot the same way,
+    the limit the same ADR documents beside it ("A client trickling bytes holds a TCP stream
+    listener's connection permit"); the generator's wire loss at 0 with its connection opened
+    before the slots fill (a redial in that phase is refused, and allowed for); and no
+    descriptor growth after.
+32. **Native-hop variants (W35).** `native-hop` over TLS from the run's private CA, through a
+    certificate rotation; under a netem delay on the hop long enough that the send window, not
+    the link, bounds throughput, with an `[[expect]]` row on frames in flight; and with more
+    sender identities than `logit_in`'s table holds (`max_connections:` and a quarter more),
+    reached by a small `max_connections:` and repeated sink restarts, each minting an identity,
+    so the table evicts one and `ledger.hop` judges what the evicted sender resends.
+33. **The `datadog_trace_in → datadog_trace_out` pair (W36).** A span unit in the ledger, a
+    stdlib msgpack reader beside `soaklib/otlp.py`, and a scenario on the stand-in from a
+    generator's tracer-shaped payloads.
+34. **A TCP rolling overlap, a CA rotation, and a span join (W37).** Item 11 over
+    `transport: tcp`, with `net.ipv4.tcp_migrate_req` set on the namespace holder (a per-namespace
+    sysctl, so `--sysctl` on that container), without which the connections still in the old
+    socket's accept queue at its close are reset rather than moved to the new one; item 12's
+    TLS half carried to a bundle of the old and new CAs, then a leaf the new CA signed; and a
+    `native-hop-spans` row that joins each `collector` span's parent id to a sender span id.
 
 **Items 1 and 2 land first, as two stacked PRs, W7a and W7b.** Both touch code the harness has
 never driven, and item 2 forces the compose override, the service list, and the per-sink ledger
@@ -3193,6 +3332,14 @@ that items 3, 7, and 11 need.
 | W27 | `soak/w27` | `soak/w27: a syslog_in TCP and TLS soak, and the stream-sink buffer-loss gap` | M | W26 |
 | W28 | `soak/w28` | `soak/w28: graphite_out and otlp_out soaks into real receivers` | M | W27 |
 | W29 | `soak/w29` | `soak/w29: OTLP- and HEC-shaped stand-ins for otlp_out and splunk_hec_out` | M | W28 |
+| W30 | `soak/w30` | `soak/w30: plan round 4, and three round-3 harness follow-ups` | S | — |
+| W31 | `soak/w31` | `soak/w31: file-descriptor-limit soaks, with a prlimit action` | M | W30 |
+| W32 | `soak/w32` | `soak/w32: CPU-quota and memory-pressure soaks, with a cgroup action` | M | W31 |
+| W33 | `soak/w33` | `soak/w33: a slow-disk spool soak on the perf VM` | M | W32 |
+| W34 | `soak/w34` | `soak/w34: slowloris and half-open peer soaks` | M | W32 |
+| W35 | `soak/w35` | `soak/w35: native-hop soaks over TLS, under RTT, and past the identity table` | M | W34 |
+| W36 | `soak/w36` | `soak/w36: a datadog_trace pair soak, with a span unit` | M | W35 |
+| W37 | `soak/w37` | `soak/w37: a TCP rolling overlap, a CA rotation, and a span join row` | M | W36 |
 
 - **W0**: [ADR `soak-harness`](../adr/soak-harness.md), this plan, and a row in each README.
 - **W1a**: `script/soak`, `compose.yaml`, the netem image, `scenario.py`, `docker.py`,
@@ -3375,10 +3522,30 @@ that items 3, 7, and 11 need.
   reset step and its `reset-counted` expectation. Each has an amendment to ADR `soak-harness`
   and self-test fixtures for its rules. The reset step hasn't run yet.
 
-§10's follow-ups to items 11 and 12, and its list deferred to a later round, have no workstream
-yet.
+- **W30**: §10's items 27 to 34 and these rows; a self-test case pinning `label=disable` to the
+  `reset` one-shot; `ledger.relay`'s allowance for a relay life killed before its first flush,
+  from the relay's other lives, with a self-test case; and the round-3 follow-up Findings
+  rewrapped. The stall-kill bound is left to the change that counts a stream sink's abandoned
+  buffer bytes.
+- **W31**: item 27: the `prlimit` action, its rules and the file wire's retention guard for
+  it, self-test fixtures for each, the `fd-limit-tcp` and `fd-limit-tail` scenarios, an
+  amendment to ADR `soak-harness`, and both runs recorded under "Findings".
+- **W32**: item 28: the `cgroup` action, its rules, its window's excuses, self-test fixtures
+  for each, the `cpu-quota`, `memory-high`, and `memory-high-pressure` scenarios, an amendment
+  to ADR `soak-harness`, and the eight runs of the three recorded under "Findings".
+- **W33**: item 29's `io.max` path: the `cgroup` action's `io_wbps`, `io_wiops`, and
+  `io_path` keys and their rules, the device resolution from the SUT's and the host's
+  mountinfo, the `io.stat` and `io.pressure` reads and `timeline`'s report and `engaged`
+  judgment, a `stop` or `kill` allowed inside a `cgroup` step, self-test fixtures for each, the
+  `slow-spool` scenario, `tools/soak/vm-io-probe.sh`, the README's "Running a scenario on the
+  perf VM", and an amendment to ADR `soak-harness`. The `dm-delay` fallback waits for the VM's
+  probe to fail, and the runs happen on the perf VM.
+- **W34** to **W37**: items 31, 32, 33, and 34 in turn, each with its action or
+  wire, self-test fixtures for each rule, an amendment to ADR `soak-harness` where it adds a
+  ledger rule or an action, and each scenario's run recorded under "Findings". Item 30 has no
+  workstream.
 
-Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9a → W9b → W10a → W10b → W11a → W11b → W12a → W12b → W12c → W12d → W14 → W13b → W15, linear; W13a, W16, and W17 land off `main` beside W14, and W18, W19, and W20 off `main` after it. W21 → W22 → W23 → W24 → W25 → W26 → W27 → W28 → W29 land after them, a linear stack off `main`. Each PR is based on and targets its
+Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9a → W9b → W10a → W10b → W11a → W11b → W12a → W12b → W12c → W12d → W14 → W13b → W15, linear; W13a, W16, and W17 land off `main` beside W14, and W18, W19, and W20 off `main` after it. W21 → W22 → W23 → W24 → W25 → W26 → W27 → W28 → W29 land after them, a linear stack off `main`. W30 lands off `main`, then W31 → W32 → W33 and W34 → W35 → W36 → W37, two stacks off W32, the second needing none of W33. Each PR is based on and targets its
 parent's branch and is brought up to date with `git merge origin/main`, never a rebase.
 
 ## Findings
@@ -6718,6 +6885,211 @@ What the runs showed about `logit` and the harness:
 - **Self-test**: 2,375 expectations after the merges. Each new rule was reverted in turn and
   failed at least one expectation; the PR lists them.
 
+### W33: a slow spool on the perf VM (2026-11-04)
+
+W33 adds the `cgroup` action's `io_wbps` and `io_wiops` keys, `tools/soak/vm-io-probe.sh`, and
+the `slow-spool` scenario. Both runs were on the disposable perf VM (`Standard_F8as_v6`, 8 cores
+of an AMD EPYC 9V74, 31 GiB, Debian 13 `debian-13:13-gen2`, kernel 6.12.115+deb13.1-cloud-amd64,
+Docker 29.9.3 with the containerd image store, Python 3.13.5), one after the other, at the
+scenario's default duration, with the driver running docker with no `sudo` (`DOCKER=docker`).
+The root filesystem is ext4 on `/dev/nvme0n1p1`, a 128 GiB Premium_LRS managed disk; a
+container's root is overlayfs whose upperdir, under
+`/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/`, sits on that ext4
+partition (259:7), and `io_device` resolved its whole disk, 259:0, in the probe and in every
+apply.
+
+The probe PASSed on the first try: under `259:0 wbps=1048576`, 4 MiB with `fsync` took 4.05 s,
+and `io.stat` counted 4,194,304 bytes in 17 writes. With no limit the same `dd` took 0.06 s, its
+cgroup's `io.pressure` `some` total gaining 71 µs and 2,059 µs in two tries, and six 40 KiB
+writes with `fsync` 3 s apart stalled 641 µs in all (about 0.004% of their 18 s); under
+`wbps=32768` those six stalled 7.5 s.
+
+| Run | Scenario | Verdict | Highlights |
+|---|---|---|---|
+| `20261104T160417Z` | `slow-spool`, first cut (the default 64MiB `segment_bytes`) | FAIL | `timeline`: `c0s4` wrote 425,984 bytes in 11 writes over 123.8 s, 3,441 B/s against the 32,768 limit, and stalled 0.40 s (0.3%), under `engaged`'s 1%; below. Every other row PASS; the SUT's stop inside `c0s2` took 18.7 s (`drain complete` 18.5 s), exit 0 |
+| `20261104T161635Z` | `slow-spool`, `segment_bytes: 64KiB` | PASS | `timeline`: both applies rc 0 on 259:0; `c0s4` wrote 1,503,232 bytes in 30 writes over 123.5 s, 12,169 B/s against 32,768, and stalled 6.4 s (5.2%). The stop inside `c0s2` took 9.8 s (`drain complete` 9.56 s), exit 0, against 14 ms unthrottled at the end. 5 records replayed at the restart, none truncated, no second replay, no `buffer.disk.errors`, no drop; G 760,700, W 741,400, Ab = V = 530,800, uncounted 0; `ledger.windows`' widest gap 10.0 s |
+
+Both runs used `logit:soak` built on the VM from the branch (`sha256:91d57082f118` at
+`1dfa6a27`, `sha256:a6784b790215` at `2aef5edd`).
+
+What the runs showed about `logit` and the harness:
+
+- **A spool push doesn't wait on the disk.** The first cut's limit throttled the writeback and
+  nothing in the SUT waited on it: a push writes its record with no `fsync`, and a segment is
+  synced only when it rotates and at close ([ADR `disk-backed-sink-buffer`](../adr/disk-backed-sink-buffer.md)),
+  so under the default 64MiB the segment never rotated, the flusher wrote 3.4 KB/s of the
+  spool's 12.8 KiB/s back under the limit, and the stall the run saw was the cursor persists'
+  `fsync`s. The scenario's premise, a `sync_data` per window, held only with a segment smaller
+  than one record: `segment_bytes: 64KiB` rotates at every push (each window's record is
+  130,978 bytes, from `logit.component.buffer.bytes`), and the rotation syncs the previous
+  record under the limit. That stalled 5.2% of the window, five times the threshold and more
+  than a thousand times the unthrottled share. It stalled less than the bytes over the limit
+  would predict (1.5 MB at 32K is 46 s); `io.pressure` counts only the time a task waited, and
+  the run doesn't show how much writeback the flusher did between rotations. The 1% threshold
+  stays: it sits between 0.004% and 5.2%.
+- **A shutdown under a slow disk syncs the unsynced segment.** The first cut's stop drained in
+  18.5 s, against 15 ms unthrottled at the end of the same run, because `finish` syncs the
+  active segment, which held every record since the last writeback; at one record per segment
+  it took 9.6 s. Both are under the driver's 30 s `docker stop -t`, but past Docker's default
+  10 s, which would SIGKILL a spool mid-sync on a slow disk; the next open recovers it, so it's
+  replay, not loss. An operator note, not a defect.
+- **Records sit in the page cache between rotations.** Under the default segment size and a
+  slow disk the dirty backlog grows with the outage; a power loss loses what the flusher hadn't
+  written. That is the ADR's documented durability, with per-push `fsync` left to a later knob.
+- **`rss_slope` WARNed on `logit` in the first cut** with no life of enough samples outside the
+  fault windows and PASSed in the second (-444.5 MiB/h over 60 s, limit 334): the scenario's
+  windows cover most of each life, so the row is thin either way.
+- **Self-test**: 3,049 expectations, unchanged by the scenario fix.
+- **Open: the 6.4 s stall against the ~46 s the bytes predict.** `c0s4`'s 1,503,232 B in 30
+  bios is about 11.5 records, so a stall of about 0.53 s per rotation, about 14% of the
+  bytes-over-limit time. The first run's 425,984 B stalled only 0.40 s. In the first run most
+  bytes were kworker writeback, which the scope's PSI doesn't see; in the second, the flusher
+  likely wrote back most of each record before the rotation's `fdatasync`. The next VM run
+  should record `sysctl vm.dirty_*`, sample `io.stat`, `io.pressure`, and `/proc/vmstat`'s
+  `nr_dirty` and `nr_writeback` each second, and time each `fdatasync`
+  (`strace -f -T -e fdatasync`).
+- **Open, not built: the default segment under throttle.** The first run's 18.5 s shutdown at
+  the default segment size exceeds Docker's 10 s default stop timeout and nothing asserts it.
+  A default-segment variant, or an `[[expect]]` on shutdown drain time, would assert it.
+
+### W32: a CPU quota and memory pressure on the SUT's cgroup (2026-11-03)
+
+W32 adds the `cgroup` action and the `cpu-quota`, `memory-high`, and `memory-high-pressure`
+scenarios. Each ran at its
+default duration on the development host (Docker 29.9, cgroup v2 under the systemd driver,
+SELinux enforcing), one at a time, against `logit:soak-w32` built from `soak/w32` (W32 changes
+no Rust). The SUT's cgroup was `system.slice/docker-<id>.scope`, the cgroup v2 line of its
+process's `/proc/<pid>/cgroup`; on a container started with no limit `cpu.max` read
+`max 100000` and `memory.high` `max`, and every revert wrote those back. A write from a
+one-shot without `label=disable` failed with `Permission denied`.
+
+| Run | Scenario | Verdict | Highlights |
+|---|---|---|---|
+| `20261104T020422Z` | `memory-high` with `memory.high` at 512M, to measure | PASS | the cgroup peaked at 42.0 MiB (`memory.peak`) and resident memory at 45.5 MiB in the outage, 26 to 30 MiB steady |
+| `20261104T021156Z` | `memory-high` (64M) | PASS | `resident-bounded` read 46.2 MiB at most against 56; the cgroup peaked at 41.6 MiB and `memory.events` counted no `high` event; `OOMKilled` false; G = W = 731,300, Ab = V = 640,300 |
+| `20261104T022255Z` | `cpu-quota`, first cut | FAIL | `expect.queue-evicts`: the receive queue evicted nothing; below |
+| `20261104T024801Z` | `memory-high-pressure` (36M) | PASS | `timeline`: memory.high engaged 49 times; the cgroup held at 36.5 MiB at most (`memory.peak`) while resident memory peaked at 44.4 MiB; `OOMKilled` false; G = W = 731,200, Ab = V = 638,000, uncounted 0; 88,000 datagrams evicted and counted, as in `memory-high` |
+| `20261104T025526Z` | `memory-high` (64M), with the engagement count | PASS | `timeline`: memory.high engaged 0 times; `resident-bounded` 45.4 MiB at most |
+| `20261104T023047Z` | `cpu-quota` | PASS | `quota-landed` read 2.23 CPU-seconds over the 120 s window against the quota's 2.4; 1,876,030 kernel drops in it of G 7,310,900 over the run; every drain of the mark past the revert read a flush (1,000 events at least) and a delivery (10 at least) and no drop; V = Ab = W 5,422,639 |
+| `20261104T033454Z` | `memory-high-pressure` (36M), `engaged = true`, the apply's restart guard | PASS | `timeline`: memory.high engaged 40 times; G = W = 731,300, Ab = V = 639,700, uncounted 0; 88,200 datagrams evicted and counted |
+| `20261104T034207Z` | `cpu-quota`, the apply's restart guard | PASS | `quota-landed` read 2.20 CPU-seconds; 1,926,959 kernel drops in the window of G 7,311,000; every drain of the mark read a flush and a delivery and no drop; uncounted 0 |
+
+What the runs showed about `logit` and the harness:
+
+- **A CPU quota drops in the kernel, never in the receive queue.** Unthrottled, the flood cost
+  the SUT about 0.058 CPUs (`logit.process.cpu.seconds`, 0.29 s per 5 s drain). At 0.02 the
+  socket's reader and the decode loop behind the receive queue wait on the same quota, so the
+  queue never filled and evicted nothing, and the socket's receive buffer overflowed instead:
+  `logit.input.kernel.dropped` counted 78% of what the generator sent in the window, and
+  `ledger.wire` read G = W + K with no uncounted line. The first cut's `queue-evicts` row
+  expected both drops; the scenario now expects the kernel's alone and none of either after.
+- **A bounded outage stays under 64M.** Through the 90 s outage the sink's two-batch queue, its
+  64-batch inbox, and `aggregate`'s inbox held the SUT's cgroup at 42 MiB, so a `memory.high`
+  of 64M never throttled: `memory.events` read `high 0`, and `logit.process.memory.resident.bytes`
+  read through the window with no gap, so procfs kept answering. A limit below that peak would
+  show the throttle's own behavior, which `memory-high-pressure` does.
+- **A throttle below the outage's cost loses nothing uncounted.** At 36M the kernel throttled
+  the cgroup 49 times through the outage and held its charge to 36.5 MiB, reclaiming while the
+  queues filled. The SUT kept its pace: the listener's evictions matched `memory-high`'s 88,000,
+  the kernel dropped nothing, and the ledger balanced with no uncounted loss. Resident memory,
+  44.4 MiB at its peak, stays above the cgroup's charge, since it counts pages the cgroup
+  doesn't, so an `[[expect]]` on it can't show the throttle; the step's `memory.events` count
+  does, and no `internal` metric reads it.
+- **Self-test flake.** One `script/soak run` stopped at its self-test with `_stall_abort`'s
+  "after a stall nothing applies, and the open step reverts early, got []" while another
+  agent's soak and an image build shared the host; four reruns passed. It isn't W32's code,
+  and is noted for the flake log.
+- **Self-test**: 2,965 expectations. Each new rule was reverted in turn and failed at least one
+  expectation: the `memory.events` reads at the apply and the revert, the `high` line's parse,
+  the window's difference, a failed read at each end, `timeline`'s engagement line and its FAIL
+  on an unread count, the cgroup v2 line, the full-id and `..` checks, a missing process, the failed
+  read, the read-back, `label=disable` on the one-shot, the revert's `started_in_window` and
+  `exited_in_window` branches and `timeline`'s report of each, UDP ingress, the drain gap's
+  excuse, the retention guard's entry and its pause limit, and the scenario rules: one key, the
+  `cpu` and `memory_high` ranges and forms, a bool `cpu`, either key on another action, the
+  SUT-only and `[random]` refusals, and the keys reaching the expanded step. So did the rules
+  added in review: `timeline`'s FAIL of `engaged = true` against a count of 0 and of
+  `engaged = false` against one above it, `engaged` refused off a `memory_high` step and when it
+  isn't a bool, the whole-page `memory_high`, the apply's write-back on a read-back that differs,
+  its state kept only after a write that read back as written, its second inspect and the
+  write-back when the process started again during it, and the cgroup and start time taken from
+  one inspect.
+
+### W31: open-files limits on a TCP listener and a tailer (2026-11-03)
+
+W31 adds the `prlimit` action and the `fd-limit-tcp` and `fd-limit-tail` scenarios. Both ran at
+their default duration on the development host (Docker 29.9, SELinux enforcing), one after the
+other, against `logit:soak-w31` built from `soak/w31` (W31 changes no Rust). A container's
+default limit read 1024 soft and 524288 hard (`/proc/1/limits` in a SUT started from the soak
+image), and `logit` is PID 1 there. The apply read that pair back through `prlimit` with
+`SYS_RESOURCE` and no `label=disable`, and every revert set it back.
+
+| Run | Scenario | Verdict | Highlights |
+|---|---|---|---|
+| `20261104T010333Z` | `fd-limit-tcp`, first cut (limit at cycle offsets 70 s to 150 s) | FAIL | `ledger.wire` and `accepts-recover`, both the harness's; below |
+| `20261104T011502Z` | `fd-limit-tcp` (70 s to 120 s) | PASS, `rss_slope` WARN | `limit-landed` read 20 in 4 drains; 290 resource accept errors in the window and 0 in the mark past it; 8 idle closes; G 880,950 against W 881,023, loss judged 0; Ab − V 0 |
+| `20261104T012438Z` | `fd-limit-tail` | PASS, `rss_slope` WARN | `limit-landed` read 24 in 22 drains; 165 failed listings in the window (166 counting the drain that straddles the revert) and 25 failed checkpoint writes in the window, 0 of either in the mark past it; G = W = Ab = V = 1,505,600, W + F − G 0; 33 writer rotations, 27 deletions, `files.open` peaking at 9 and ending at 8 |
+
+What the runs showed about `logit` and the harness:
+
+- **TCP lost nothing.** With the eight connections closed the SUT held 15 descriptors, 24 with
+  them open, so the limit of 20 let five redials in and failed the rest with EMFILE at the
+  listener's 100 ms backoff, about 10 a second from the redials to the revert, each counted and
+  the warning throttled (`accept_error`). Their lines waited in the accept queue; the generator's writes into them
+  stalled past `connect_timeout` and were counted (3 `ambiguous_at_most_once`, 1,810
+  `overflow_newest`), and the queued lines were read after the revert.
+- **The tailer lost nothing.** It held 21 descriptors at the limit's start, two files open; the
+  limit filled at the second rotation in the window. Its opens of the next files failed
+  (`open_error`, throttled), as did its listings of `/shared` and its checkpoint and spool
+  cursor writes on their temporary files, and the first scan after the revert opened every file it had
+  missed from its start.
+- **`internal`'s process metrics stop for the rest of the life at the first EMFILE.** Each
+  `/proc/self` source latches off on any read error and warns once, so
+  `logit.process.memory.resident.bytes`, `logit.process.cpu.seconds`, `logit.process.threads`,
+  `logit.process.fds`, and `logit.process.fds.limit` stopped at the first drain the limit was
+  full and never came back after the revert (`crates/logit-inputs/src/internal.rs`). The
+  metric that would show the exhaustion is the one that goes away. Both runs' `rss_slope` on
+  `logit` WARNs with no sample to fit, and `fd_slope`'s "end" is the last sample before the
+  latch (15 and 23). A product finding for the fixing session.
+- **The admin endpoint's accept failure is logged unthrottled.** `admin: accept failed` is a
+  plain `warn` on every 100 ms backoff (`crates/logit-cli/src/admin.rs`): 547 lines in 55 s in
+  the first TCP run and 1,241 in the tail run, beside the listeners' one throttled line. A
+  product finding.
+- **`fd_limit_warning` fires at start under Docker's default limit.** `tcp-ingress`'s config
+  leaves `statsd_in`'s `max_connections:` at 1024, so every SUT on it warns at start that the
+  caps meet the soft limit of 1024. A product finding (the warning, or the default cap against
+  a default soft limit).
+- **A deferral across a fault-set boundary reads as loss.** In the first cut the limit outlasted
+  the generator pause's recovery, so `ledger.wire` split the run where the pause's window ended:
+  the run holding the queued lines' writes read G − W of 48,282 and the next a surplus of
+  48,474, beyond the boundary netting's cap of the 7,650 the generator sent over the straddling
+  interval. Ending the limit inside the pause's recovery keeps the writes and the reads in one
+  judged run.
+- **The drain straddling a revert carries what came before it.** The first cut's
+  `accepts-recover` read 8 errors in the `after` window, all counted in the 0.9 s before the
+  revert finished, so each scenario's zero row now reads a `mark` starting 8 s past the revert.
+- **Self-test**: 2,882 expectations. Each new rule was reverted in turn and failed at least one
+  expectation: `nofile`'s presence, range, and other actions; the SUT-only and `[random]`
+  refusals; the retention guard's `prlimit` entry and its pause limit; the revert's
+  `started_in_window` branch; the failed read; and `timeline`'s report.
+- **Reruns on main (2026-11-04)**, on an image built from `soak/w31` with #979, #981, #982, and
+  #984 merged; both scenarios unchanged.
+  - `fd-limit-tcp`, `20261104T042323Z`: PASS. `rss_slope` PASS on `logit` (-67.7 MiB/h, limit
+    143, 205 s judged) where it had WARNed. `logit.process.fds` and `fds.limit` reported 99
+    drains of the run's 105, 4 of them inside the limit window, and `limit-landed` read 20.
+    `accepts-fail` read 290 resource accept errors in the window and `accepts-recover` 0.
+    G 856,650 against W 856,750, loss judged 1; Ab − V 0.
+  - `fd-limit-tail`, `20261104T043256Z`: PASS. `rss_slope` PASS on `logit` (-17.0 MiB/h, limit
+    79, 1,085 s judged); `fds` reported 283 drains of 309 with 22 inside the limit window.
+    `listings-fail` read 165 and the recover rows 0; G = W = Ab = V = 1,505,700, W + F − G 0;
+    `files.open` peaked at 9 and ended at 8.
+  - `admin: accept failed` lines in the SUT's stderr: 8 in `fd-limit-tcp` (547 before) and 11
+    in `fd-limit-tail` (1,241 before), each carrying a `(xN, further occurrences suppressed)`
+    count.
+  - `logit.output.bytes.dropped{reason="unacknowledged"}` never appeared in any container's
+    telemetry, so it stayed at 0 on `fd-limit-tcp`'s eight `statsd_out` TCP sinks: no
+    connection was reset.
+
 ### Backstop variants: a tailer and a Kafka consumer (2026-11-02)
 
 `sink-outage-stop` soaks the shutdown backstop cutting `statsd_in`'s UDP send on the root
@@ -6948,32 +7320,32 @@ acknowledged"). Each scenario ran once at its default length on the development 
 ### Round 3 follow-ups, on `soak/round3-followups` (2026-11-03)
 
 - **`otlp-grpc-egress` passed with `ledger.relay` balanced** (`20261103T223813Z`, 17 minutes).
-  `ledger.relay` balanced on all three `collector` lives: life 0 read E_r 4,700 = S_r 4,700 =
-  Del_r 4,700, life 1 (killed) 1,600 on each, and life 2 4,300 on each, with no relay drop.
-  The cross line read ΣE_r 10,600 against Del 10,000 less 100, so no point `logit` delivered went missing
-  at the relay. `ledger.egress` read Ab − V of 0 on both lives, and no batch was dropped over
-  the run.
-- **`syslog-tcp-ingress` with the `reset` step passed on its rerun** (`20261103T230043Z`, 15
-  minutes 15 seconds). Its first run (`20261103T222138Z`) failed `timeline` and `reset-counted`: SELinux confined the
-  netem container and blocked its `sock_diag` socket, so `ss -K` never applied and
-  `reset-counted` read "never applied cleanly". The reset one-shot now runs with
-  `label=disable`, and the step fails on a denied `ss`. On the rerun `reset-counted` read 1 and
-  `resets-run` read 1 against a limit of 1, and the pause, partition, generator stop, SUT stop,
-  and SUT kill each read 0 resets. The wire loss read 40 lines against a limit of 2,100.
-- **The 8-hour `kafka-sasl-reauth` run passed** (`20261103T141635Z`, 28,800 s, on the
-  development host). The sink redialed 1,069 times, 133.9 an hour, inside [80, 300], and 74
-  attempts, 9.3 an hour, were `ambiguous` against a limit of 40 an hour; none was `refused` and no batch
-  was dropped. The topic held 144,040 distinct records with 0 duplicate copies, equal to the
-  records the sink saw accepted, and G, W, and Ab each read 57,611,200. `rss_slope` read +0.0
-  MiB/h on the generator and +0.2 on `logit` against 65, from one life each, and descriptors held
-  at 17 on `logit`. All 221 faults recovered within 45 s over 147 starts.
-- **The 8-hour `tail-rotate-delete` run passed** (`20261103T141647Z`, 28,800 s). The tailer
-  rotated 3,714 files while the driver counted 646 deletions (the writer rotated 652 times), read no lost bytes, and logged no checkpoint
-  error. `files.open` peaked at 10 against a limit of 10 and ended at 8, process descriptors
-  peaked at 28 against 31, and watches peaked at 11 against 11. `logit` rose from a median of 20
-  descriptors after warmup to 26 at the end, inside the +10 limit; `rss_slope` read -28.8 to
-  +0.9 MiB/h across its lives against 69. `ledger.wire` read W + F − G of -900 inside the replay
-  band [-80,002, 102,239] over 16 kills, and all 40 faults recovered within 45 s.
+  `ledger.relay` balanced on all three `collector` lives: life 0 read E_r 4,700 = S_r 4,700 = Del_r
+  4,700, life 1 (killed) 1,600 on each, and life 2 4,300 on each, with no relay drop. The cross line
+  read ΣE_r 10,600 against Del 10,000 less 100, so no point `logit` delivered went missing at the
+  relay. `ledger.egress` read Ab − V of 0 on both lives, and no batch was dropped over the run.
+- **`syslog-tcp-ingress` with the `reset` step passed on its rerun** (`20261103T230043Z`, 15 minutes
+  15 seconds). Its first run (`20261103T222138Z`) failed `timeline` and `reset-counted`: SELinux
+  confined the netem container and blocked its `sock_diag` socket, so `ss -K` never applied and
+  `reset-counted` read "never applied cleanly". The reset one-shot now runs with `label=disable`,
+  and the step fails on a denied `ss`. On the rerun `reset-counted` read 1 and `resets-run` read 1
+  against a limit of 1, and the pause, partition, generator stop, SUT stop, and SUT kill each read 0
+  resets. The wire loss read 40 lines against a limit of 2,100.
+- **The 8-hour `kafka-sasl-reauth` run passed** (`20261103T141635Z`, 28,800 s, on the development
+  host). The sink redialed 1,069 times, 133.9 an hour, inside [80, 300], and 74 attempts, 9.3 an
+  hour, were `ambiguous` against a limit of 40 an hour; none was `refused` and no batch was dropped.
+  The topic held 144,040 distinct records with 0 duplicate copies, equal to the records the sink saw
+  accepted, and G, W, and Ab each read 57,611,200. `rss_slope` read +0.0 MiB/h on the generator and
+  +0.2 on `logit` against 65, from one life each, and descriptors held at 17 on `logit`. All 221
+  faults recovered within 45 s over 147 starts.
+- **The 8-hour `tail-rotate-delete` run passed** (`20261103T141647Z`, 28,800 s). The tailer rotated
+  3,714 files while the driver counted 646 deletions (the writer rotated 652 times), read no lost
+  bytes, and logged no checkpoint error. `files.open` peaked at 10 against a limit of 10 and ended
+  at 8, process descriptors peaked at 28 against 31, and watches peaked at 11 against 11. `logit`
+  rose from a median of 20 descriptors after warmup to 26 at the end, inside the +10 limit;
+  `rss_slope` read -28.8 to +0.9 MiB/h across its lives against 69. `ledger.wire` read W + F − G of
+  -900 inside the replay band [-80,002, 102,239] over 16 kills, and all 40 faults recovered within
+  45 s.
 
 The 8-hour runs close the gap the 1 h runs of W17 and W18 left: a leak that grows per redial or
 per deletion did not show in either path over 8 hours.

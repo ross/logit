@@ -1,0 +1,116 @@
+# A 20,000 lines/s UDP flood into `statsd_in` while a CPU quota on the SUT's cgroup holds it to
+# a small share of one CPU for 120 s, below what the flood costs. Every thread in the cgroup
+# waits for its share, the socket read loop and the decode loop behind its receive queue alike,
+# so the queue keeps up with the reads and the kernel drops what the socket can't hold, counted.
+# Once the quota is written back the SUT reads, flushes, and delivers at its old pace. The schema is
+# docs/plans/soak-harness.md's "The scenario schema".
+
+name = "cpu-quota"
+description = "a 20,000 lines/s statsd flood with the SUT's cgroup held to 0.02 CPUs for 120s: the kernel drops and counts, and flushes resume after"
+duration = "6m"           # warmup + one cycle + cooldown
+warmup = "60s"
+cooldown = "60s"          # >= recovery_bound
+recovery_bound = "45s"
+cycle = "4m"              # the quota, its recovery, and two progress windows of steady state
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"
+
+[ledger]
+sut_aggregate = "window"
+wire_loss_outside_faults = 0.0
+
+[[ledger.source]]         # one per generator the ledger follows into the SUT
+service = "generator"
+generator_input = "load"
+generator_sink = "statsd"
+sut_listener = "statsd"
+
+[[ledger.sink]]           # one per SUT sink the ledger follows to its backend
+id = "victoria_metrics"
+backend = "victoria-metrics"
+vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64
+fd_growth = 8
+
+# The flood costs the SUT about 0.05 CPUs; 0.02 is 2 ms of every 100 ms period.
+[[step]]
+at = "0s"
+action = "cgroup"
+on = "logit"
+cpu = 0.02
+for = "120s"
+
+# The drain straddling the revert carries what was counted before it, so the window that must
+# see the SUT at its old pace starts a drain interval and more past the revert.
+[[step]]
+at = "128s"
+action = "mark"
+on = "logit"
+for = "40s"
+
+# The process gets no more CPU than the quota allows: 2.4 s over the window, with a drain's
+# share of slack on either side.
+[[expect]]
+name = "quota-landed"
+service = "logit"
+metric = "logit.process.cpu.seconds"
+step = "c0s1"
+window = "during"
+reduce = "delta"
+max = 3
+
+[[expect]]
+name = "kernel-drops"
+service = "logit"
+metric = "logit.input.kernel.dropped"
+component = "statsd"
+step = "c0s1"
+window = "during"
+reduce = "delta"
+min = 1
+
+# Every drain past the revert reads a flush and a delivery, and no drop.
+[[expect]]
+name = "flushes-resume"
+service = "logit"
+metric = "logit.component.flush.events"
+component = "window"
+step = "c0s2"
+window = "during"
+reduce = "min_delta"
+min = 1
+
+[[expect]]
+name = "deliveries-resume"
+service = "logit"
+metric = "logit.component.batches.delivered"
+component = "victoria_metrics"
+step = "c0s2"
+window = "during"
+reduce = "min_delta"
+min = 1
+
+[[expect]]
+name = "queue-recovers"
+service = "logit"
+metric = "logit.component.datagrams.dropped"
+component = "statsd"
+step = "c0s2"
+window = "during"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "kernel-recovers"
+service = "logit"
+metric = "logit.input.kernel.dropped"
+component = "statsd"
+step = "c0s2"
+window = "during"
+reduce = "delta"
+max = 0

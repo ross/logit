@@ -1,0 +1,170 @@
+# spool-kill-replay on a slow disk, meant for the perf VM (tools/soak/README.md's "Running a
+# scenario on the perf VM"): `io.max` throttles nothing on a host whose container storage has
+# no block device behind it (btrfs, or overlayfs over btrfs over dm-crypt), where the `cgroup`
+# steps fail at the apply. VictoriaMetrics stops for 150 s. An `io.max` write limit on the disk
+# behind the SUT's spool covers the backlog's writes, and the SUT is stopped inside it and
+# started again after it, while VictoriaMetrics is still down; a second limit on the new
+# process covers the rest of the outage and the replay into VictoriaMetrics once it's back. A
+# start makes the SUT's cgroup again with no limit, so one step can't span the stop.
+#
+# The spool writes about 64 bytes a series per 10 s window, so this generator's 2,000 series
+# write about 128 KiB a window (`logit.component.buffer.bytes` grew 130,978 bytes a window on
+# the perf VM), 12.8 KiB/s. A push doesn't fsync; the SUT's `segment_bytes`, below one record,
+# rotates the segment at every push, and the rotation's `sync_data` of the previous record
+# waits on the limit. On the perf VM the second step's window stalled 6.4 s of 124 s (5.2%)
+# at 32K a second, against under 0.01% for an unthrottled fsync there: slow, and not so slow
+# that the spool falls behind `aggregate`. No `internal`
+# metric times a spool write, so the second step's `engaged` judges `io.pressure`'s stalled
+# time, and `timeline` reports the bytes and writes `io.stat` counted. The schema is
+# docs/plans/soak-harness.md's "The scenario schema".
+
+name = "slow-spool"
+description = "spool-kill-replay with an io.max write limit on the SUT's spool through a 150s VictoriaMetrics stop, the SUT stopped inside it; for the perf VM"
+duration = "6m15s"        # warmup + one cycle + cooldown
+warmup = "60s"
+cooldown = "60s"          # >= recovery_bound
+recovery_bound = "45s"
+cycle = "4m15s"           # the stop and two progress windows; no recovery row for the stop
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"
+
+[ledger]
+sut_aggregate = "window"
+wire_loss_outside_faults = 0.0
+# Every series is written about 10 times a window, so each has a sample in every window, and
+# a spooled window lost in the middle or at the tail shows as a gap.
+vm_every_window = true
+
+[[ledger.source]]         # one per generator the ledger follows into the SUT
+service = "generator"
+generator_input = "load"
+generator_sink = "statsd"
+sut_listener = "statsd"
+
+[[ledger.sink]]           # one per SUT sink the ledger follows to its backend
+id = "victoria_metrics"
+backend = "victoria-metrics"
+vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64
+fd_growth = 8
+
+[[step]]
+at = "0s"
+action = "stop"
+on = "victoria-metrics"
+for = "150s"
+
+# The backlog's writes under the limit, and the SUT's shutdown with a write in flight. The
+# process exits inside the window, so the revert finds no cgroup and `timeline` reports it.
+[[step]]
+at = "5s"
+action = "cgroup"
+on = "logit"
+io_wbps = "32K"
+io_path = "/tmp/soak-spool"
+for = "55s"
+
+[[step]]
+at = "40s"
+action = "stop"
+on = "logit"
+for = "30s"
+
+# The new process replays the spool at open, spools on top of it until VictoriaMetrics is
+# back, and drains it after, all under the limit.
+[[step]]
+at = "75s"
+action = "cgroup"
+on = "logit"
+io_wbps = "32K"
+io_path = "/tmp/soak-spool"
+engaged = true           # the limit must stall the spool's writes
+for = "120s"
+
+[[expect]]
+name = "spool-holds-the-outage"
+service = "logit"
+metric = "logit.component.buffer.disk.segments"
+component = "victoria_metrics"
+step = "c0s1"
+window = "during"
+reduce = "max"
+min = 1
+
+[[expect]]
+name = "spool-queues-windows"
+service = "logit"
+metric = "logit.component.buffer.batches"
+component = "victoria_metrics"
+step = "c0s1"
+window = "during"
+reduce = "max"
+min = 2
+
+# The restarted process finds the stopped one's records at open.
+[[expect]]
+name = "spool-replayed-at-restart"
+service = "logit"
+metric = "logit.component.buffer.disk.replayed"
+component = "victoria_metrics"
+step = "c0s3"
+window = "after"
+reduce = "delta"
+min = 1
+
+# A shutdown under the limit still ends each record whole: the next open truncates nothing.
+[[expect]]
+name = "no-torn-tail"
+service = "logit"
+metric = "logit.component.buffer.disk.truncated"
+component = "victoria_metrics"
+step = "c0s3"
+window = "through"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "no-second-replay"
+service = "logit"
+metric = "logit.component.buffer.disk.replayed"
+component = "victoria_metrics"
+step = "c0s1"
+window = "after"
+reduce = "delta"
+max = 0
+
+# A slow write is a slow write, never a failed one.
+[[expect]]
+name = "no-spool-errors"
+service = "logit"
+metric = "logit.component.buffer.disk.errors"
+component = "victoria_metrics"
+step = "c0s1"
+window = "through"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "sink-never-drops"
+service = "logit"
+metric = "logit.component.batches.dropped"
+component = "victoria_metrics"
+step = "c0s1"
+window = "through"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "retrying-clears"
+service = "logit"
+metric = "logit.component.retrying"
+component = "victoria_metrics"
+step = "c0s4"
+window = "after"
+reduce = "last"
+max = 0

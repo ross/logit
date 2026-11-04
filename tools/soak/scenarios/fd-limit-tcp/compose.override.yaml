@@ -1,0 +1,12 @@
+# Caps the socket buffers on each end of the generator's TCP connections, in each container's
+# own network namespace, as tcp-ingress does. A connection the SUT can't accept holds what the
+# generator wrote into it in the SUT's receive buffer until the SUT accepts it; with about 15 s
+# of one sink's lines held there, a sink's write into one stalls past `connect_timeout` inside
+# the limit's window, and its counted drops stay out of G.
+services:
+  logit:
+    sysctls:
+      net.ipv4.tcp_rmem: "4096 65536 262144"
+  generator:
+    sysctls:
+      net.ipv4.tcp_wmem: "4096 16384 262144"

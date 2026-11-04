@@ -1,0 +1,114 @@
+# tcp-ingress's pipeline over eight connections, under an open-files limit on the SUT that leaves
+# room for its own descriptors and fewer than eight more. A generator pause past the SUT's
+# `idle_timeout` closes all eight; the limit lands while they're closed, and the generator's
+# eight redials fill it. The listener then fails its accepts with EMFILE, counted
+# `logit.input.accept.errors{reason="resource"}`, backs off, and leaves the rest in the accept
+# queue, where the generator's lines wait until the revert raises the limit. TCP loses nothing,
+# so `ledger.wire` judges the window. The schema is docs/plans/soak-harness.md's "The scenario
+# schema".
+
+name = "fd-limit-tcp"
+description = "generator (8 connections) -> statsd_in (TCP) under an open-files limit -> aggregate 10s cumulative -> prometheus_out RW1 zstd -> VictoriaMetrics"
+duration = "8m"           # warmup + one cycle + cooldown; --duration overrides
+warmup = "60s"            # no faults: baseline rate, RSS, fds
+cooldown = "120s"         # no faults at the end; >= recovery_bound
+recovery_bound = "45s"    # retry_max_delay 10s + two aggregate windows + a drain
+cycle = "5m"              # >= last recovery (3m33s) + 2 x progress_window
+compose = "compose.override.yaml"   # caps both ends' TCP socket buffers
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"
+
+[ledger]                  # component ids the checker reads; no rates here
+sut_aggregate = "window"
+wire_loss_outside_faults = 0.0
+
+[[ledger.source]]
+service = "generator"
+generator_input = ["load1", "load2", "load3", "load4", "load5", "load6", "load7", "load8"]
+generator_sink = ["statsd1", "statsd2", "statsd3", "statsd4", "statsd5", "statsd6", "statsd7",
+                  "statsd8"]
+sut_listener = "statsd"
+wire = "tcp"              # G output.messages, W input.frames, F the framer's counted drops
+
+[[ledger.sink]]
+id = "victoria_metrics"
+backend = "victoria-metrics"
+vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64   # WARN under 1h, FAIL above
+fd_growth = 8
+
+# Silent past the SUT's 60 s idle_timeout, so it closes all eight connections at about 60 s.
+[[step]]
+at = "0s"
+action = "pause"
+on = "generator"
+for = "90s"
+
+# The SUT holds 24 descriptors with the eight connections open and 15 with them closed: its
+# listeners, stdio, and the runtimes' epoll instances and eventfds. A limit of 20 leaves room
+# for `internal`'s /proc reads and a readiness probe's connection until the generator's redials
+# at 90 s take it. The revert at 120 s ends inside the pause's recovery, so `ledger.wire` judges
+# the lines the generator wrote into the accept queue and the reads after the revert in one
+# run of drain intervals.
+[[step]]
+at = "70s"
+action = "prlimit"
+on = "logit"
+nofile = 20
+for = "50s"
+
+# The drain straddling the revert carries the accept errors counted before it, so the window
+# that must see none starts a drain interval and more past the revert.
+[[step]]
+at = "128s"
+action = "mark"
+on = "logit"
+for = "40s"
+
+[[expect]]
+name = "limit-landed"
+service = "logit"
+metric = "logit.process.fds.limit"
+step = "c0s2"
+window = "during"
+reduce = "min"
+min = 20
+max = 20
+
+[[expect]]
+name = "accepts-fail"
+service = "logit"
+metric = "logit.input.accept.errors"
+component = "statsd"
+attrs = { reason = "resource" }
+step = "c0s2"
+window = "during"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "accepts-recover"
+service = "logit"
+metric = "logit.input.accept.errors"
+component = "statsd"
+attrs = { reason = "resource" }
+step = "c0s3"
+window = "during"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "idle-close"
+service = "logit"
+metric = "logit.input.connections.closed"
+component = "statsd"
+attrs = { reason = "idle" }
+step = "c0s1"
+window = "during"
+reduce = "delta"
+min = 8

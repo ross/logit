@@ -119,7 +119,7 @@ from .scenario import (CRI_WIRE, DEFAULT_RSS_SETTLE_S, DEFAULT_WIRE, EXPECT_REDU
                        HTTP_WIRE, KAFKA_TARGET, KAFKA_WIRE, SCRAPE_WIRE, LOCAL_TARGET, LOGIT_ROLES, NO_WINDOW_ACTIONS,
                        IDP_ROLE, RUN_WINDOW, SHARED_DIR, SHARED_MOUNT, STANDIN_ROLE, STANDIN_TARGET,
                        SUT_CONFIG_ENV, SUT_CONFIG_KEY, SUT_SERVICE, TARGET_SPLIT,
-                       component_blocks, config_env,
+                       component_blocks, config_env, io_bytes,
                        listener_wire, parse_duration, source_ids, source_pairs,
                        stdio_shared_targets, tls_reload_polls)
 
@@ -156,8 +156,17 @@ def is_sink_fault_line(entry):
         entry.message == "degraded" and not entry.key)
 READY_WITHIN_S = 30
 FRESHNESS_MAX_AGE_S = 30
-# How many `internal` intervals stdout may go quiet while the container runs unpaused.
+# How many `internal` intervals stdout may go quiet while the container runs unpaused, and the
+# actions on a service that excuse a longer gap: those that stop its process, and a `cgroup`,
+# whose quota or reclaim can hold its drain as a pause does.
 DRAIN_GAP_INTERVALS = 3
+DRAIN_HELD_ACTIONS = ("stop", "kill", "pause", "restart", "exit", "cgroup")
+# The share of an io step's window that `io.pressure`'s `some` total must reach for the limit to
+# count as engaged. An unthrottled spool's fsyncs on a local disk stall a small fraction of
+# that. A segment rotation syncs a whole record at once, so a write limit stalls a larger share
+# even above the spool's average pace; a spool whose segments don't rotate in the window can read
+# under it while throttled, since the flusher's writeback isn't the scope's stall.
+IO_ENGAGED_STALL_SHARE = 0.01
 SECONDS_PER_HOUR = 3600
 MIB = 1024 * 1024
 # An `[[expect]]` `slope` is fitted only over at least this many samples spanning this long.
@@ -599,7 +608,14 @@ def stalled(results):
 def check_timeline(data):
     """FAILs when the schedule didn't run as written: an apply or revert that returned nonzero,
     a fail-fast stop, or a start or unpause of a `logit` service with no `ready` record. An
-    early revert in the end sequence isn't probed, so it needs none."""
+    early revert in the end sequence isn't probed, so it needs none. A `prlimit` or `cgroup`
+    whose process started again or exited inside its window is reported: its limit went with
+    the old process. A `memory.high` revert's throttle count is reported, and one that couldn't
+    read `memory.events` FAILs, since nothing then says whether the throttle engaged; so does a
+    count that contradicts the step's `engaged`. An io revert's written bytes and writes, their
+    rate against the limit, and the stalled time are reported, and one that couldn't read them
+    FAILs; `engaged` there reads the stalled time against `IO_ENGAGED_STALL_SHARE` of the
+    window."""
     if data.t0 is None:
         return Result("timeline", SKIP, "no timeline start")
     lines = []
@@ -628,10 +644,72 @@ def check_timeline(data):
             lines.append(f"{record['on']} {'unpaused' if action == 'pause' else 'started'} at "
                          f"{data.offset(record.get('finished_at'))} ({record.get('step')}) "
                          "with no readiness probe recorded")
+    gone = [f"{record.get('step')} ({record.get('action')} on {record.get('on')}): the process "
+            "started again inside the window, so its limit ended there and nothing was restored"
+            for record in actions
+            if record["event"] == "revert" and record.get("started_in_window")]
+    gone += [f"{record.get('step')} ({record.get('action')} on {record.get('on')}): the process "
+             f"exited inside the window (status {record.get('status')}), so nothing was restored"
+             for record in actions
+             if record["event"] == "revert" and record.get("exited_in_window")]
+    engaged = [f"{record.get('step')} (cgroup on {record.get('on')}): memory.high engaged "
+               f"{_n(record['high_events'])} time(s)"
+               for record in actions if record["event"] == "revert" and "high_events" in record]
+    lines += [f"{record.get('step')} (cgroup on {record.get('on')}): can't count memory.high's "
+              f"throttling: {record['events_error']}"
+              for record in actions if record["event"] == "revert" and "events_error" in record]
+    gone += engaged
+    for record in actions:
+        if record["event"] != "revert":
+            continue
+        if "io_error" in record:
+            lines.append(f"{record.get('step')} (cgroup on {record.get('on')}): can't read "
+                         f"io.max's writes and stalls: {record['io_error']}")
+        if "io_stall_us" not in record:
+            continue
+        line, stalled = _io_window(record)
+        gone.append(line)
+        want = record.get("engaged")
+        if (want is True and not stalled) or (want is False and stalled):
+            lines.append(f"{record.get('step')} (cgroup on {record.get('on')}): io.pressure "
+                         f"stalled {record['io_stall_us'] / 1e6:.2f}s, "
+                         f"{'under' if not stalled else 'at or above'} "
+                         f"{IO_ENGAGED_STALL_SHARE:.0%} of the window, and the step expects "
+                         f"the limit {'to engage' if want else 'never to engage'}")
+    for record in actions:
+        if record["event"] != "revert" or "high_events" not in record:
+            continue
+        want, count = record.get("engaged"), record["high_events"]
+        if (want is True and count <= 0) or (want is False and count > 0):
+            lines.append(f"{record.get('step')} (cgroup on {record.get('on')}): memory.high "
+                         f"engaged {_n(count)} time(s), and the step expects it "
+                         f"{'to engage' if want else 'never to engage'}")
     if lines:
-        return Result("timeline", FAIL, lines[0], lines)
+        return Result("timeline", FAIL, lines[0], lines + gone)
     return Result("timeline", PASS, f"{len(actions)} apply/revert action(s) returned 0; "
-                  f"{starts} start(s) or unpause(s) each probed; no fail fast")
+                  f"{starts} start(s) or unpause(s) each probed; no fail fast"
+                  + "".join(f"; {line}" for line in gone), gone)
+
+
+def _io_window(record):
+    """`(line, stalled)`: an io revert's report, and whether its stalled time reached
+    `IO_ENGAGED_STALL_SHARE` of its window, the engagement `engaged` judges."""
+    window = record.get("io_window_s") or 0
+    stall_s = record["io_stall_us"] / 1e6
+    share = stall_s / window if window > 0 else 0.0
+    rate = record["io_wbytes"] / window if window > 0 else 0.0
+    limits = []
+    if record.get("io_wbps") is not None:
+        limits.append(f"{_n(io_bytes(record['io_wbps']) or 0)} B/s")
+    if record.get("io_wiops") is not None:
+        limits.append(f"{_n(record['io_wiops'])} writes/s")
+    line = (f"{record.get('step')} (cgroup on {record.get('on')}): io.max on "
+            f"{record.get('device')} over {window:.1f}s: {_n(record['io_wbytes'])} byte(s) in "
+            f"{_n(record['io_wios'])} write(s), {_n(round(rate))} B/s and "
+            f"{record['io_wios'] / window if window > 0 else 0.0:,.1f} writes/s against a limit "
+            f"of {' and '.join(limits) or 'none'}; io.pressure stalled {stall_s:.1f}s "
+            f"({share:.1%} of the window)")
+    return line, window > 0 and share >= IO_ENGAGED_STALL_SHARE
 
 
 def check_exit(data):
@@ -1067,8 +1145,7 @@ def check_progress(data):
         if len(drains) < 3:
             continue
         interval = statistics.median(b - a for a, b in zip(drains, drains[1:]))
-        held = data.windows(on=service, actions=("stop", "kill", "pause", "restart", "exit"),
-                            extend=False)
+        held = data.windows(on=service, actions=DRAIN_HELD_ACTIONS, extend=False)
         for a, b in zip(drains, drains[1:]):
             if b - a > DRAIN_GAP_INTERVALS * interval and not any(
                 s <= b and e >= a for s, e in held
@@ -1803,8 +1880,14 @@ TAIL_REPLAY_FILES = 2
 # `RotateConfig`). It counts the active file.
 DEFAULT_FILE_OUT_MAX_FILES = 5
 # The SUT actions during which a file wire's tailer reads nothing while its writer keeps
-# rotating (`_file_retention_problems`).
-FILE_RETENTION_ACTIONS = ("pause", "stop", "kill", "restart", "exit")
+# rotating.
+FILE_DOWN_ACTIONS = ("pause", "stop", "kill", "restart", "exit")
+# Those, a `prlimit`, during which the tailer can open no file the writer creates, and a
+# `cgroup`, which can slow it below the writer's pace, all of which `_file_retention_problems`
+# and `_cri_writer_problems` bound. A pause, a prlimit, and a cgroup keep the files the tailer
+# has open (`FILE_HELD_ACTIONS`), and under the last two the tailer goes on reading them.
+FILE_RETENTION_ACTIONS = FILE_DOWN_ACTIONS + ("prlimit", "cgroup")
+FILE_HELD_ACTIONS = ("pause", "prlimit", "cgroup")
 _SIZE_UNITS = {"B": 1, "KB": 1000, "MB": 1000 ** 2, "GB": 1000 ** 3,
                "KiB": 1024, "MiB": 1024 ** 2, "GiB": 1024 ** 3}
 # On a TCP wire the actions that end a SUT or generator process, a `reset` of a connection, or a
@@ -3172,7 +3255,7 @@ class Ledger:
         low = high = 0
         lines = []
         down = [fault for fault in self.data.faults
-                if fault.on == self.inn.service and fault.action in FILE_RETENTION_ACTIONS]
+                if fault.on == self.inn.service and fault.action in FILE_DOWN_ACTIONS]
         for source in self.sources:
             if source.get("sut_listener") not in listeners or source_wire(source) != FILE_WIRE:
                 continue
@@ -4405,6 +4488,13 @@ def _file_writers(data, led, source):
             for sink in source_ids(source, "generator_sink")]
 
 
+def _held(fault):
+    """How a `FILE_RETENTION_ACTIONS` fault held the tailer, for a retention guard's line."""
+    if fault.action in FILE_DOWN_ACTIONS:
+        return "was down"
+    return "was at its open-files limit" if fault.action == "prlimit" else "was throttled"
+
+
 def _file_retention_problems(data, led, source):
     """One problem per window of the ingress SUT's `FILE_RETENTION_ACTIONS` in which a file
     source's writer rotated often enough to delete a file the tailer hadn't read. `file_out`
@@ -4417,7 +4507,8 @@ def _file_retention_problems(data, led, source):
     - A pause keeps the tailer's descriptors, so a file it had open stays readable after a
       deletion. Only a file the writer created after the pause began is lost: created at the
       pause's first rotation, it's deleted at its `max_files + 1`th, so the limit is
-      `max_files`.
+      `max_files`. A `prlimit` keeps them too, and its tailer can't open a file created in its
+      window, so it takes the pause's limit, as does a `cgroup`, whose tailer may fall behind.
 
     A restarted tailer never finds a deleted file, and the loss is counted only as far as the
     last checkpoint knew (docs/known-gaps/tailing.md), so the ledger can't see all of it any
@@ -4433,12 +4524,12 @@ def _file_retention_problems(data, led, source):
         for fault in data.faults:
             if fault.on != service or fault.action not in FILE_RETENTION_ACTIONS:
                 continue
-            limit = max_files if fault.action == "pause" else max(1, max_files - 2)
+            limit = max_files if fault.action in FILE_HELD_ACTIONS else max(1, max_files - 2)
             rotated = gen.counter_in("logit.output.file.rotations", fault.start - pad,
                                      fault.end + pad, component=sink)
             if rotated >= limit:
                 problems.append(
-                    f"the writer rotated {_n(rotated)} time(s) while the SUT was down "
+                    f"the writer rotated {_n(rotated)} time(s) while the SUT {_held(fault)} "
                     f"({fault.action} [{data.offset(fault.start)}, {data.offset(fault.end)}]), "
                     f"enough to delete a file it hadn't read: {sink} keeps {max_files} files, "
                     f"so {limit} rotation(s) in a {fault.action} trip the guard")
@@ -4633,8 +4724,8 @@ CRI_SPLIT = "soak.writer.lines.split"
 # The rotations a SUT down window may hold before a `cri` writer compresses a file the tailer
 # hadn't finished, which `cri_in` never reads: a rotation compresses every uncompressed rotated
 # file, so a stop, kill, restart, or `exit` loses the live file's unread tail at its second
-# rotation, and a pause, whose tailer keeps reading what it holds open, the file created at
-# its first rotation at its third.
+# rotation, and a pause or a `prlimit`, whose tailer keeps what it holds open, the file
+# created at its first rotation at its third.
 CRI_DOWN_ROTATIONS = 2
 CRI_PAUSE_ROTATIONS = 3
 
@@ -4668,12 +4759,13 @@ def _cri_writer_problems(data, led, source, G, S):
     for fault in data.faults:
         if fault.on != led.inn.service or fault.action not in FILE_RETENTION_ACTIONS:
             continue
-        limit = CRI_PAUSE_ROTATIONS if fault.action == "pause" else CRI_DOWN_ROTATIONS
+        limit = (CRI_PAUSE_ROTATIONS if fault.action in FILE_HELD_ACTIONS
+                 else CRI_DOWN_ROTATIONS)
         rotated = sum(gen.counter_in(CRI_ROTATIONS, fault.start - pad, fault.end + pad,
                                      component=sink) for sink in sinks)
         if rotated >= limit:
             problems.append(
-                f"the writer rotated {_n(rotated)} time(s) while the SUT was down "
+                f"the writer rotated {_n(rotated)} time(s) while the SUT {_held(fault)} "
                 f"({fault.action} [{data.offset(fault.start)}, {data.offset(fault.end)}]), "
                 f"enough to compress a file it hadn't read: {limit} rotation(s) in a "
                 f"{fault.action} trip the guard")
@@ -6196,7 +6288,8 @@ def check_ledger_relay(data):
                 continue
             parts.append(f"{sink['id']} to {text}, {verdict}")
             lines.append(f"{text}, {verdict}")
-        cross_status, cross = _relay_cross(led, sink["id"], relay, listener, tel, sent, unseen)
+        cross_status, cross = _relay_cross(led, sink["id"], relay, listener, tel, sent, unseen,
+                                            view.lives)
         if cross_status == FAIL:
             status = FAIL
             parts.insert(0, cross)
@@ -6217,19 +6310,39 @@ RELAY_UNWRITTEN = ("logit.output.metrics.dropped", "logit.output.metrics.skipped
                    "logit.output.records.dropped")
 
 
-def _relay_tail(tel, listener, life):
+def _relay_tail(tel, listener, life, lives):
     """What a relay life's unseen end can hold of E_r: the highest rate `_commit_rate` reads
     over the drain intervals the listener last moved in, times the life's median drain
     interval. The sender's flushes can be sparser than the relay's drains, so the last
-    interval is often empty while a flush the relay answered after it went uncounted."""
-    gaps = [b - a for a, b in zip(tel.life_drains(life), tel.life_drains(life)[1:])]
+    interval is often empty while a flush the relay answered after it went uncounted.
+
+    A life with fewer than two drains has no gaps and no rate, yet the relay can have taken
+    and lost a flush in it, so it takes the highest rate and the median interval among the
+    relay's other `lives`. A life with two or more drains whose listener never moved in an
+    interval keeps its own gaps and takes only the rate. Either way it is allowed the one
+    interval a life with history is.
+
+    Returns `(allowance, borrowed)`, where `borrowed` is None, "rate", or "rate and
+    interval"."""
+    def own(of):
+        drains = tel.life_drains(of)
+        return ([b - a for a, b in zip(drains, drains[1:])],
+                _commit_rate(tel, "logit.component.events.sent", listener, of)[0])
+
+    gaps, rate = own(life)
+    borrowed = None
+    if not gaps or not rate:
+        borrowed = "rate and interval" if not gaps else "rate"
+        rest = [own(other) for other in lives if other != life]
+        pooled = [gap for found, _ in rest for gap in found]
+        gaps = gaps or pooled
+        rate = rate or max((found for _, found in rest), default=0.0)
     if not gaps:
-        return 0
-    rate, _ = _commit_rate(tel, "logit.component.events.sent", listener, life)
-    return round(rate * statistics.median(gaps))
+        return 0, borrowed
+    return round(rate * statistics.median(gaps)), borrowed
 
 
-def _relay_cross(led, sink, relay, listener, tel, sent, unseen):
+def _relay_cross(led, sink, relay, listener, tel, sent, unseen, lives):
     """`(status, text)`: `ledger.relay`'s run-total check across the two processes, ΣE_r against
     what `logit`'s `sink` counted delivered less its unwritten records and less each life in
     `unseen`'s `_relay_tail`."""
@@ -6237,13 +6350,17 @@ def _relay_cross(led, sink, relay, listener, tel, sent, unseen):
                                             component=sink).values())
     unwritten = sum(sum(led.sut.counter_by_life(name, component=sink).values())
                     for name in RELAY_UNWRITTEN)
-    tail = sum(_relay_tail(tel, listener, life) for life in unseen)
+    tails = {life: _relay_tail(tel, listener, life, lives) for life in unseen}
+    tail = sum(allowance for allowance, _ in tails.values())
+    borrowed = "; ".join(f"life {life} borrowed the relay's other lives' {what}"
+                         for life, (allowance, what) in tails.items() if what and allowance)
     total = sum(sent.values())
     floor = max(0, delivered - unwritten - tail)
     text = (f"{sink} to {relay} over the run: ΣE_r {_n(total)} against Del {_n(delivered)}"
             + (f" − unwritten {_n(unwritten)}" if unwritten else "")
             + (f" − {_n(tail)} (the busiest recent drain interval per relay life whose last "
-               "counts are unseen)" if tail else "") + f" = {_n(floor)}")
+               "counts are unseen" + (f"; {borrowed}" if borrowed else "") + ")"
+               if tail else "") + f" = {_n(floor)}")
     if total >= floor:
         return PASS, f"{text}, ok"
     return FAIL, (f"{text}, {_n(floor - total)} delivered to the relay and never counted "
