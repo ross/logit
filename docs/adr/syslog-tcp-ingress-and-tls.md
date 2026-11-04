@@ -571,6 +571,6 @@ The stream driver counts a TLS accept or first-byte wait that outlasts `handshak
 `connection_error`: it is policy like an idle close, and nothing was framed, so it is not a loss.
 The six HTTP listeners and `logit_in` bound the same phases and now count it the same way. For
 `logit_in` the phases are the TLS accept and the `Hello` read, and a silent peer is not also a
-`logit.proto.errors{reason="handshake"}`. A PROXY header that times out stays
+`logit.proto.errors{reason="handshake"}`; a `Hello` that starts and then stalls is still a handshake error. A PROXY header that times out stays
 `connections.rejected{reason="proxy_header"}`, and a TLS accept or `Hello` that fails, rather than
 times out, stays a diagnosed error.

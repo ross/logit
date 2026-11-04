@@ -1627,7 +1627,7 @@ the property the minimal-watch-set design is for.
   payload over `max_frame_bytes`: with a `compressed_len` within `frame::compressed_bound` of it,
   the frame is read and answered `Ack{rejected(too_large)}`, the connection kept; past that bound,
   `Reject{FRAME_TOO_LARGE}` and a close. `handshake` is any handshake that ends without a
-  `HelloAck`, other than a silent peer (no `Hello` within `handshake_timeout`, counted
+  `HelloAck`, other than a silent peer (no byte of a `Hello` within `handshake_timeout`, counted
   `connections.closed{reason="handshake_timeout"}` instead): stray bytes, a header over the control-message
   cap, a `Hello` that fails to decode (a missing, repeated, or unknown field, or a `window` of 0),
   or a version or codec `Reject`. `decode_budget` is a well-formed batch that would decode
@@ -1645,7 +1645,7 @@ the property the minimal-watch-set design is for.
   six reject at the cap rather than queueing behind a permit. Here a connection this
   listener closed still counts, and holds its permit, while it lingers: after its last answer it
   reads and discards until the peer closes or for `handshake_timeout`.
-- `logit.input.connections.closed{reason="idle"\|"handshake_timeout"}` (count), the third point all six share. `handshake_timeout` is a peer whose TLS accept or `Hello` outlasted `handshake_timeout`; it's counted, not diagnosed, and not a loss. Here the
+- `logit.input.connections.closed{reason="idle"\|"handshake_timeout"}` (count), the third point all six share. `handshake_timeout` is a peer whose TLS accept outlasted `handshake_timeout` or that sent no byte of a `Hello` within it, on a connection holding a permit; it's counted, not diagnosed, and not a loss. Here the
   idle time is measured from the last frame handled rather than from bytes read, because a peer
   waiting on a delayed ack isn't idle. The close writes `Reject{GOING_AWAY, "idle for <dur>"}`, the
   same signal an ordinary shutdown sends, and returns `Ok(())`: it's never
