@@ -7,10 +7,12 @@
 # process covers the rest of the outage and the replay into VictoriaMetrics once it's back. A
 # start makes the SUT's cgroup again with no limit, so one step can't span the stop.
 #
-# The spool writes about 64 bytes a series per 10 s window (spool-kill-replay's 100 series
-# queued 6,376 bytes a batch), so this generator's 2,000 series write about 127 KiB a window,
-# 12.7 KiB/s. At 32K a second each window's segment write and `sync_data` take about 4 s of
-# the window: slow, and not so slow that the spool falls behind `aggregate`. No `internal`
+# The spool writes about 64 bytes a series per 10 s window, so this generator's 2,000 series
+# write about 128 KiB a window (`logit.component.buffer.bytes` grew 130,978 bytes a window on
+# the perf VM), 12.8 KiB/s. A push doesn't fsync; the SUT's `segment_bytes`, below one record,
+# rotates the segment at every push, and the rotation's `sync_data` of the previous record
+# waits on the limit. At 32K a second that is about 4 s of the window: slow, and not so slow
+# that the spool falls behind `aggregate`. No `internal`
 # metric times a spool write, so the second step's `engaged` judges `io.pressure`'s stalled
 # time, and `timeline` reports the bytes and writes `io.stat` counted. The schema is
 # docs/plans/soak-harness.md's "The scenario schema".

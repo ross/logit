@@ -21,6 +21,11 @@ components:
     # The driver stops and starts this container but never recreates it, so a directory in
     # its own filesystem survives the stop with no volume, and its writes reach the disk
     # behind the container's writable layer, which the `cgroup` steps' `io_path` names.
-    buffer: { disk: { path: /tmp/soak-spool } }
+    # A push writes its record with no fsync; only a rotation or the close syncs a segment, so
+    # under the default 64MiB a window's record waits in the page cache, the flusher writes it
+    # back under the limit, and no task of the SUT waits on it. A segment smaller than one
+    # window's record (about 128 KiB) rotates at every push, which syncs the previous record
+    # under the limit.
+    buffer: { disk: { path: /tmp/soak-spool, segment_bytes: 64KiB } }
   self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
   telemetry: { type: stdio_out, sources: [self], format: json }

@@ -484,7 +484,9 @@ a pause's do, and each asserts what the starved SUT counted and that it recovere
 and is meant for the perf VM ([Running a scenario on the perf VM](#running-a-scenario-on-the-perf-vm)):
 on a host whose container storage has no block device behind it, such as btrfs, both steps
 fail at the apply and `timeline` FAILs. It runs `spool-kill-replay`'s pipeline with 2,000
-series, so each 10 s window spools about 127 KiB, and stops VictoriaMetrics for 150 s. An
+series, so each 10 s window spools about 128 KiB, and stops VictoriaMetrics for 150 s. A push
+writes with no fsync, so its `segment_bytes` of 64KiB, below one window's record, rotates the
+segment at every push, and each rotation's `sync_data` waits on the limit. An
 `io_wbps` of 32K on the disk behind `/tmp/soak-spool` covers the backlog's writes, and the SUT
 is stopped inside it for 30 s, so its shutdown writes under the limit; the process exits inside
 the window, so that step's revert finds no cgroup. A second limit on the new process covers its
