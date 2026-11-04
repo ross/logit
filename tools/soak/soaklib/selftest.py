@@ -9510,6 +9510,124 @@ def _two_sut_run(tmp, name, kill_on="collector", collector_lives=2, extra=0, sho
     return run_dir
 
 
+def _span_line(offset, component, trace, span, parent=None):
+    """One `internal` span event as `stdio_out`'s JSON writes it, started at `offset`."""
+    body = {"name": f"{component} send", "trace_id": trace, "span_id": span, "kind": "producer"}
+    if parent is not None:
+        body["parent_span_id"] = parent
+    return json.dumps({"timestamp": _stamp(T0 + offset), "span": body,
+                       "attributes": {"component": component, "kind": "x", "role": "x"}},
+                      separators=(",", ":"))
+
+
+def _join_run(tmp, name, unmatched=(), wrong_trace=False, dropped=0, children=True,
+              buffer_held=False):
+    """`_two_sut_run`'s run with a kill on `logit` (+203 to +213), with spans: `logit`'s
+    listener `in` records two spans a drain interval in each life, and `collector`'s `hop_in`
+    one child of each, 0.2 s later. `unmatched` adds a `collector` child at each offset whose
+    parent `logit` never exported; `wrong_trace` gives one child its parent's span id under
+    another trace id; `dropped` adds that many `logit.internal.spans.dropped` at `logit`;
+    `children` false records only roots at `collector`; and `buffer_held` holds the hop sink's
+    queue in `logit`'s next life until +260."""
+    run_dir = _two_sut_run(tmp, name, kill_on="logit", collector_lives=1)
+    ingress, egress = [], []
+    offsets = [o for o in range(5, 300, 5)
+               if not TWO_SUT_KILL[0] - 3 < o < TWO_SUT_KILL[1] + 3]
+    for index, offset in enumerate(offsets):
+        for one in range(2):
+            trace = f"{index:016x}{one:016x}"
+            span = f"{index:014x}a{one}"
+            ingress.append(_span_line(offset + one, "in", trace, span))
+            if children:
+                parent_trace = trace if not (wrong_trace and index == 3 and one == 0) \
+                    else "f" * 32
+                egress.append(_span_line(offset + one + 0.2, "hop_in", parent_trace,
+                                         f"{index:014x}b{one}", span))
+            else:
+                egress.append(_span_line(offset + one + 0.2, "hop_in", trace,
+                                         f"{index:014x}b{one}"))
+    for number, offset in enumerate(unmatched):
+        egress.append(_span_line(offset, "hop_in", "e" * 32, f"{number:014x}cc",
+                                 f"{number:014x}dd"))
+    if dropped:
+        ingress.append(_line(_stamp(T0 + 98), "logit.internal.spans.dropped", "sum", dropped,
+                             component="in", attrs={"reason": "buffer_full"}))
+    for service, extra in (("logit", ingress), ("collector", egress)):
+        path = run_dir / "logs" / f"{service}.stdout"
+        kept = path.read_text().splitlines()
+        if buffer_held and service == "logit":
+            # The base run's queue reads 0 at every drain of the next life; hold it at 4 there
+            # until +260.
+            held = [_stamp(T0 + offset) for offset in range(TWO_SUT_KILL[1], 260, 5)]
+            kept = [line.replace('"value":0}', '"value":4}')
+                    if '"logit.component.buffer.batches"' in line
+                    and any(stamp in line for stamp in held) else line for line in kept]
+        path.write_text("\n".join(kept + extra) + "\n")
+    return run_dir
+
+
+def _span_join():
+    """`spans.join` joins each `collector` hop span with a parent to a span `logit` exported:
+    every child joined PASSes; an unmatched child inside a killed life's window, from its last
+    drain to its next life's first drain whose hop queue reads 0, PASSes up to one drain
+    interval's worth of joined parents plus one, and past it FAILs; one outside every window
+    FAILs, unless `logit` counted that many spans dropped; a parent id under another trace id
+    doesn't join; a far side with no child SKIPs; and span lines parse with their component and
+    life."""
+    with tempfile.TemporaryDirectory() as tmp:
+        def row(name, **kwargs):
+            rows = {r.id: r for r in checks.run_all(_join_run(tmp, name, **kwargs))}
+            return rows["spans.join"]
+
+        tel = telemetry.parse_ndjson([
+            _line(_stamp(T0 + 5), "logit.process.uptime", "gauge", 5.0),
+            _line(_stamp(T0 + 50), "logit.process.uptime", "gauge", 2.0),
+            _span_line(20, "in", "a" * 32, "b" * 16),
+            _span_line(49.5, "hop_in", "a" * 32, "c" * 16, "b" * 16)])
+        expect([(s.component, s.span_id, s.parent_span_id, s.life) for s in tel.spans]
+               == [("in", "b" * 16, None, 0), ("hop_in", "c" * 16, "b" * 16, 1)]
+               and len(tel.points) == 2,
+               f"span lines parse beside the points, each in the life it started in, got "
+               f"{[(s.component, s.span_id, s.parent_span_id, s.life) for s in tel.spans]}")
+        joined = row("join-all")
+        expect(joined.status == checks.PASS
+               and "spans with a parent 112: joined 112" in joined.detail
+               and "unmatched 0" in joined.detail,
+               f"every child joined to a sender span PASSes, got {joined}")
+        inside = row("join-inside", unmatched=(199, 205, 212))
+        expect(inside.status == checks.PASS
+               and "unmatched 3 (3 inside a killed life's window, 0 outside)" in inside.detail
+               and any("logit life 0 killed: 3 unmatched" in line and "at most 3" in line
+                       for line in inside.lines),
+               f"unmatched children inside the killed life's window PASS up to its bound, got "
+               f"{inside} {inside.lines}")
+        over = row("join-over", unmatched=(199, 200, 205, 212))
+        expect(over.status == checks.FAIL and "a window over its bound" in over.detail,
+               f"more unmatched children than the window's bound FAIL, got {over}")
+        outside = row("join-outside", unmatched=(100,))
+        expect(outside.status == checks.FAIL
+               and "1 unmatched outside every killed life's window" in outside.detail
+               and any("outside every killed life's window" in line for line in outside.lines),
+               f"an unmatched child outside every window FAILs, got {outside}")
+        late = row("join-late", unmatched=(240,))
+        expect(late.status == checks.FAIL,
+               f"an unmatched child after the next life's queue read 0 FAILs, got {late}")
+        held = row("join-held", unmatched=(240,), buffer_held=True)
+        expect(held.status == checks.PASS,
+               f"the window runs to the next life's first drain whose hop queue reads 0, got "
+               f"{held}")
+        counted = row("join-counted", unmatched=(100,), dropped=1)
+        expect(counted.status == checks.PASS and "counted 1 span(s) dropped" in counted.detail,
+               f"an unmatched child the sender's counted span drop explains PASSes, got "
+               f"{counted}")
+        wrong = row("join-trace", wrong_trace=True)
+        expect(wrong.status == checks.FAIL and "unmatched 1" in wrong.detail,
+               f"a parent span id under another trace id doesn't join, got {wrong}")
+        roots = row("join-roots", children=False)
+        expect(roots.status == checks.SKIP and "recorded no hop_in span with a parent"
+               in roots.detail, f"a far side with no child SKIPs, got {roots}")
+
+
 def _tcp_hop_run(tmp, name, extra, ambiguous_at=None):
     """`_two_sut_run`'s unkilled one-life hop run with its one source on a TCP wire: `logit`
     counts `input.frames` in place of datagrams, the generator counts no `output.datagrams`,
@@ -18087,7 +18205,7 @@ def run(root, quiet=False):
                      _sampling_vectors, _absent_rules, _absent_checks, _merge_ledger,
                      _merge_rules, _delta_ledger, _delta_rules, _scrape_ledger,
                      _scrape_rules, _msgpack_reader, _datadog_trace_codec,
-                     _datadog_trace_server, _span_rules, _span_ledger, _shipped):
+                     _datadog_trace_server, _span_rules, _span_ledger, _span_join, _shipped):
             try:
                 takes_root = (_rules, _expect_rules, _expand, _random, _signals, _hung_inspect,
                               _stalled, _stall_abort,

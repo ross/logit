@@ -6409,6 +6409,110 @@ def check_ledger_hop(data):
     return Result("ledger.hop", status, detail, lines)
 
 
+# How far before a killed sender life's last drain a dangling parent's child may start: the
+# parent is recorded after that drain, and its child starts once the frame reaches the far SUT,
+# so only clock rounding puts the child earlier.
+SPAN_JOIN_SLACK_S = 1.0
+
+
+def _dangling_windows(data, led, joined):
+    """`[(life, start, end, bound)]`: for each ingress life a scheduled `kill` ended, the window
+    in which a far span may continue a parent the life recorded after its last drain, which it
+    never exported (docs/known-gaps/telemetry.md's internal-spans entry, item 7): from that
+    drain, less `SPAN_JOIN_SLACK_S`, to the first drain of the next life whose hop sink's
+    `logit.component.buffer.batches` reads 0, when its spool's replay of the killed life's
+    frames is done, else the next life's last drain. `bound` is one drain interval's worth of
+    such parents: the most joined parents (`joined`, `{span_id: Span}`) that started in any one
+    drain interval of the killed life, plus one, since the life lost at most the interval after
+    its last drain."""
+    sink = led.hop.get("sink")
+    tel = led.ingress
+    windows = []
+    for life in led.inn.killed:
+        drains = tel.life_drains(life)
+        if not drains:
+            continue
+        start = drains[-1] - SPAN_JOIN_SLACK_S
+        following = tel.life_drains(life + 1)
+        empty = [ts for ts, value, point_life in tel.gauge_series(
+            "logit.component.buffer.batches", component=sink)
+                 if point_life == life + 1 and value == 0]
+        end = empty[0] if empty else (following[-1] if following else data.end)
+        parents = sorted(span.ts for span in joined.values() if span.life == life)
+        per = [bisect.bisect_left(parents, b) - bisect.bisect_left(parents, a)
+               for a, b in zip(drains, drains[1:])]
+        windows.append((life, start, end, max(per, default=0) + 1))
+    return windows
+
+
+def check_spans_join(data):
+    """Across a `[[ledger.hop]]` whose far SUT records spans, one row joining each span the far
+    SUT's `logit_in` recorded with a parent, its hop listener's, to a span with that trace id and
+    span id the ingress SUT exported: `logit_out` carries a batch's incoming context only for a
+    trace its own process sampled (docs/adr/native-hop-trace-context.md), so every such parent
+    is a sender span. A parent the sender recorded after its last drain is never exported
+    (docs/known-gaps/telemetry.md's internal-spans entry, item 7), so an unmatched span is
+    allowed inside a killed sender life's window (`_dangling_windows`), up to the window's bound,
+    and up to the sender's `logit.internal.spans.dropped` anywhere; every other unmatched span
+    FAILs. SKIP when the far SUT recorded no span with a parent on the hop listener."""
+    if not data.ledger.get("hop"):
+        return []
+    led = _ledger(data)
+    skipped = _skip_without_sut("spans.join", led)
+    if skipped:
+        return skipped
+    listener = led.hop.get("listener")
+    children = [span for span in led.sut.spans
+                if span.component == listener and span.parent_span_id]
+    if not children:
+        return Result("spans.join", SKIP, f"{led.out.service} recorded no {listener} span with "
+                                          "a parent")
+    roots = sum(1 for span in led.sut.spans
+                if span.component == listener and not span.parent_span_id)
+    sent = {(span.trace_id, span.span_id): span for span in led.ingress.spans}
+    joined, unmatched = {}, []
+    for child in children:
+        parent = sent.get((child.trace_id, child.parent_span_id))
+        if parent is None:
+            unmatched.append(child)
+        else:
+            joined[parent.span_id] = parent
+    windows = _dangling_windows(data, led, joined)
+    lines, over = [], []
+    outside = []
+    for child in unmatched:
+        if not any(start <= child.ts <= end for _, start, end, _ in windows):
+            outside.append(child)
+    for life, start, end, bound in windows:
+        inside = sum(1 for child in unmatched if start <= child.ts <= end)
+        text = (f"{led.inn.service} life {life} killed: {_n(inside)} unmatched from its last "
+                f"drain ({data.offset(start + SPAN_JOIN_SLACK_S)}) to its replay's end "
+                f"({data.offset(end)}), at most {_n(bound)} (the most joined parents in one of "
+                "its drain intervals, plus one)")
+        lines.append(text)
+        if inside > bound:
+            over.append(text)
+    dropped = sum(point.value for point in led.ingress.matching(
+        "logit.internal.spans.dropped") if isinstance(point.value, (int, float)))
+    for child in outside[:5]:
+        lines.append(f"unmatched {child.name} span {child.span_id} at "
+                     f"{data.offset(child.ts)}: parent {child.parent_span_id} in trace "
+                     f"{child.trace_id}, outside every killed life's window")
+    head = (f"{led.out.service}'s {listener} spans with a parent {_n(len(children))}: joined "
+            f"{_n(len(children) - len(unmatched))} to {led.inn.service}'s exported spans, "
+            f"unmatched {_n(len(unmatched))} ({_n(len(unmatched) - len(outside))} inside a killed "
+            f"life's window, {_n(len(outside))} outside); {_n(roots)} root(s) with no parent; "
+            f"{led.inn.service} counted {_n(dropped)} span(s) dropped")
+    if over:
+        return Result("spans.join", FAIL, f"{head}: a window over its bound", lines)
+    if len(outside) > dropped:
+        return Result("spans.join", FAIL,
+                      f"{head}: {_n(len(outside))} unmatched outside every killed life's "
+                      f"window, over the {_n(dropped)} spans the sender counted dropped", lines)
+    return Result("spans.join", PASS, f"{head}: each unmatched span a parent the sender "
+                                      "recorded after its last drain or counted dropped", lines)
+
+
 def _relay_reasons(tel, name, component, life):
     """`{reason: summed delta}` for a `sum` metric of one component in one life."""
     sums = {}
@@ -8948,7 +9052,8 @@ CHECKS = (
     check_run, check_timeline, check_exit, check_restarts, check_self_log, check_ready,
     check_progress, check_rss_slope, check_fd_slope, check_ledger_wire, check_cri_dangles,
     check_ledger_overlap,
-    check_ledger_intake, check_ledger_edge, check_ledger_hop, check_ledger_relay,
+    check_ledger_intake, check_ledger_edge, check_ledger_hop, check_spans_join,
+    check_ledger_relay,
     check_ledger_script, check_ledger_aggregate,
     check_ledger_egress, check_ledger_windows, check_ledger_tail, check_ledger_absent,
     check_ledger_replay,
