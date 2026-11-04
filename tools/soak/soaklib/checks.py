@@ -6154,7 +6154,8 @@ def check_ledger_relay(data):
                 continue
             parts.append(f"{sink['id']} to {text}, {verdict}")
             lines.append(f"{text}, {verdict}")
-        cross_status, cross = _relay_cross(led, sink["id"], relay, listener, tel, sent, unseen)
+        cross_status, cross = _relay_cross(led, sink["id"], relay, listener, tel, sent, unseen,
+                                            view.lives)
         if cross_status == FAIL:
             status = FAIL
             parts.insert(0, cross)
@@ -6175,19 +6176,34 @@ RELAY_UNWRITTEN = ("logit.output.metrics.dropped", "logit.output.metrics.skipped
                    "logit.output.records.dropped")
 
 
-def _relay_tail(tel, listener, life):
+def _relay_tail(tel, listener, life, lives):
     """What a relay life's unseen end can hold of E_r: the highest rate `_commit_rate` reads
     over the drain intervals the listener last moved in, times the life's median drain
     interval. The sender's flushes can be sparser than the relay's drains, so the last
-    interval is often empty while a flush the relay answered after it went uncounted."""
-    gaps = [b - a for a, b in zip(tel.life_drains(life), tel.life_drains(life)[1:])]
+    interval is often empty while a flush the relay answered after it went uncounted.
+
+    A life killed before it drained twice, or before the listener moved in an interval, has
+    no rate or interval of its own, yet the relay can have taken and lost a flush in it. Its
+    rate and interval then come from the relay's other `lives`, the highest rate and the
+    median interval among them, so such a life is allowed the one interval a life with
+    history is."""
+    def own(of):
+        drains = tel.life_drains(of)
+        return ([b - a for a, b in zip(drains, drains[1:])],
+                _commit_rate(tel, "logit.component.events.sent", listener, of)[0])
+
+    gaps, rate = own(life)
+    if not gaps or not rate:
+        rest = [own(other) for other in lives if other != life]
+        pooled = [gap for found, _ in rest for gap in found]
+        gaps = gaps or pooled
+        rate = rate or max((found for _, found in rest), default=0.0)
     if not gaps:
         return 0
-    rate, _ = _commit_rate(tel, "logit.component.events.sent", listener, life)
     return round(rate * statistics.median(gaps))
 
 
-def _relay_cross(led, sink, relay, listener, tel, sent, unseen):
+def _relay_cross(led, sink, relay, listener, tel, sent, unseen, lives):
     """`(status, text)`: `ledger.relay`'s run-total check across the two processes, ΣE_r against
     what `logit`'s `sink` counted delivered less its unwritten records and less each life in
     `unseen`'s `_relay_tail`."""
@@ -6195,7 +6211,7 @@ def _relay_cross(led, sink, relay, listener, tel, sent, unseen):
                                             component=sink).values())
     unwritten = sum(sum(led.sut.counter_by_life(name, component=sink).values())
                     for name in RELAY_UNWRITTEN)
-    tail = sum(_relay_tail(tel, listener, life) for life in unseen)
+    tail = sum(_relay_tail(tel, listener, life, lives) for life in unseen)
     total = sum(sent.values())
     floor = max(0, delivered - unwritten - tail)
     text = (f"{sink} to {relay} over the run: ΣE_r {_n(total)} against Del {_n(delivered)}"

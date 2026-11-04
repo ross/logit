@@ -8970,7 +8970,7 @@ RELAY_PER_DRAIN = 100
 
 
 def _relay_run(tmp, name, action="kill", extra=(), stopped=True, keys=True, sut_extra=(),
-               bursty=False):
+               bursty=False, kill=None):
     """`_ledger_run`'s two-life run with its sink's writes carried on by a relay, `collector`,
     whose `action` (a `kill` or a `stop`) over `RELAY_KILL` gives it two lives. Each 5 s drain
     the relay's `otlp` sends `RELAY_PER_DRAIN` events on to `victoria_metrics`, which receives
@@ -8979,7 +8979,7 @@ def _relay_run(tmp, name, action="kill", extra=(), stopped=True, keys=True, sut_
     Under `bursty` the relay moves `2 × RELAY_PER_DRAIN` at every other drain (+5, +15, ...)
     and exports no point at the rest, as a 10 s sender into a 5 s drain does, so its killed
     life's last drain, +200, is empty."""
-    kill = RELAY_KILL
+    kill = kill or RELAY_KILL
     relay_timeline = [_action("apply", "c0s2", action, "collector", kill[0]),
                       _action("revert", "c0s2", action, "collector", kill[1] - 1, kill[1]),
                       _ready("c0s2", "collector", kill[1] + 1)]
@@ -9151,6 +9151,12 @@ def _relay_ledger():
                burst.detail and "= 6,200, ok" in burst.detail,
                f"a flush the killed relay answered after its last drain, an empty one, is "
                f"allowed by the busiest of its recent drain intervals, got {burst}")
+        early_kill = row("relay-delivered-early-kill", kill=(7, 15), sut_extra=delivered(6400))
+        expect(early_kill is not None and early_kill.status == checks.PASS
+               and "ΣE_r 6,300 against Del 6,400 − 100 (the busiest recent drain interval"
+               in early_kill.detail and "= 6,300, ok" in early_kill.detail,
+               f"a relay life killed before it drained twice is allowed an interval at the "
+               f"relay's other lives' rate, got {early_kill}")
         unwritten = row("relay-delivered-unwritten", sut_extra=delivered(
             6400, at(100, "logit.output.metrics.skipped", 200, component="sink",
                      metric_kind="gauge_histogram")))
