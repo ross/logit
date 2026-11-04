@@ -1337,8 +1337,8 @@ and `datadog_in` also count their requests, so `ledger.intake` holds each one's 
 `batches.sent` and its `busy` ones to `batches.deferred` in every SUT life a kill didn't end,
 and reports a killed life unjudged. `prometheus_in`'s receiver counts
 `logit.input.writes{class}`, with no route tag, and `ledger.intake` holds its `ok` and
-`closed_consumer` writes to `batches.sent` and its `busy` ones to `batches.deferred`. `otlp_in` counts `logit.input.requests{route, class}`, with a `busy` class for its bounded
-first batch, and `ledger.intake` sums its `logs`, `metrics`, and `traces` routes against its
+`closed_consumer` writes to `batches.sent` and its `busy` ones to `batches.deferred`. `otlp_in` counts `logit.input.requests{route, class}`, with a `busy` class for a request its
+bound refused whole, and `ledger.intake` sums its `logs`, `metrics`, and `traces` routes against its
 `batches.sent` and `batches.deferred`. `otlp_in` sends one event per log record and per metric data
 point, the units G counts while each event carries one. An HTTP writer sends its own batches,
 one per request, so a resend's allowance is the writer's batch, its events received over its

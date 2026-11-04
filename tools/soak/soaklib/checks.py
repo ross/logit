@@ -1668,15 +1668,17 @@ class HttpListener:
 # the batch counted sent and its events dropped (crates/logit-inputs/src/influxdb.rs,
 # "Responses"; docs/design/internal-telemetry.md, "influxdb_in"). So per life its `ok` and
 # `closed_consumer` requests sum to its `batches.sent`, and its `busy` requests equal its
-# `batches.deferred`. `otlp_in` answers as `influxdb_in` does under a 2 s deadline on a request's
-# first batch, on every route, `logs`, `metrics`, and `traces`, each a write route, so its row
-# sums them: a request decodes to one batch per resource, and `otlp_out` sends one resource per
-# request, so the identities hold for every `otlp_out` writer (crates/logit-inputs/src/otlp.rs,
-# "Backpressure"). `splunk_hec_in` and `datadog_in` answer as `influxdb_in`
-# does on the route each writer posts to, `event` and `series_v2`, under a 5 s deadline
-# (`splunk_hec_in` on a request's first batch, `datadog_in` on every batch): a `/event` body
-# decodes to one batch per envelope and a series body to one batch, so the identities hold while each body carries one envelope
-# (crates/logit-inputs/src/splunk.rs and datadog.rs, "Backpressure"). `prometheus_in`'s
+# `batches.deferred`. `otlp_in` answers as `influxdb_in` does under a 2 s deadline on a
+# request's batches, all or none, on every route, `logs`, `metrics`, and `traces`, each a write
+# route, so its row sums them: a request decodes to one batch per resource, and `otlp_out` sends
+# one resource per request, so the identities hold for every `otlp_out` writer
+# (crates/logit-inputs/src/otlp.rs, "Backpressure"). `splunk_hec_in` and `datadog_in` answer as
+# `influxdb_in` does on the route each writer posts to, `event` and `series_v2`, under a 5 s
+# deadline on a request's batches, all or none: a `/event` body decodes to one batch per
+# envelope and a series body to one batch, so the identities hold while each body carries one
+# envelope (crates/logit-inputs/src/splunk.rs and datadog.rs, "Backpressure"). A request of
+# more batches than an inbox holds counts `class="unbounded"` in place of `ok`, which a
+# one-batch request never does, so no row reads it. `prometheus_in`'s
 # remote-write receiver counts each request once in `logit.input.writes{class}`, with no
 # `route` tag, decodes it to one batch, and answers as `influxdb_in` does under a 2 s deadline
 # (crates/logit-inputs/src/prometheus.rs, "Backpressure"). It counts `ok` in the poll its batch
