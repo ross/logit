@@ -19,22 +19,36 @@
 //! Every accepted socket has `TCP_NODELAY` on ([`crate::http::accept`]), or a gRPC response's
 //! trailers wait on the client's delayed ACK.
 //!
-//! **Backpressure reaches the client.** A UDP listener's slow downstream means the kernel drops
-//! datagrams; TCP has no such escape hatch. A slow downstream blocks the handler's delivery, which
-//! stops reading that connection, which the client feels as its own write blocking. That is
-//! correct for a reliable protocol (an OTLP exporter retries or buffers on its own timeout):
-//! `docs/design/pipeline-graph.md`'s "Backpressure" section. A client that gives up and closes
-//! cancels only the handler's wait: [`crate::http::deliver_detached`] runs the request's sends on
-//! a task of their own, so every consumer still gets every batch of the request, however many
-//! batches (one per resource) it decoded to, and counts a refused batch dropped on that task. The
-//! retry then duplicates on every branch alike rather than on some.
+//! **Backpressure: a bounded wait, then busy.** A request decodes to one batch per resource. Its
+//! first batch waits at most [`BUSY_AFTER`] (2 s) for room in every consumer, reaching every
+//! consumer or none ([`crate::http::deliver_first_bounded`]). When the bound passes, nothing of
+//! the request was taken: HTTP answers `503` with `Retry-After: 1` and the body `busy`, gRPC
+//! answers `UNAVAILABLE` (status 14) with the message `busy`, every batch of the request is
+//! counted `logit.input.batches.deferred`, and a throttled `busy` line is logged. Every OTLP
+//! exporter has its own request timeout and resends on it, so a wait with no bound turned each
+//! timeout into a duplicate; 2 s is under the Collector exporters' 5 s default
+//! (ADR `otlp-in-busy-answer`).
+//!
+//! Once the first batch is in, the rest wait for as long as the pipeline takes, through
+//! [`crate::http::deliver_detached`]: a busy answer then would make the client's retry deliver the
+//! first batch twice. A client that gives up and closes during that wait cancels only the
+//! handler's wait, so every consumer still gets every batch, and the retry duplicates on every
+//! branch alike rather than on some. A client that closes during the bounded wait takes the
+//! request with it: no consumer gets any of it. `otlp_out` sends one resource per request, so a
+//! `logit` hop never reaches the unbounded wait.
 //!
 //! **A request no consumer takes is refused, not acknowledged.** When every consumer of the
-//! listener has closed, the request is answered `503` with `Retry-After: 1` (gRPC `UNAVAILABLE`,
-//! status 14) and its undelivered batches are counted
-//! `logit.input.batches.dropped{reason="closed_consumer"}`, beside a throttled
-//! `closed_consumer` line. Never a `partial_success`, which tells
-//! the exporter the rejected items are permanently bad and must not be retried.
+//! listener has closed, the request is answered as busy is, with `no consumer took the batch` as
+//! the message, and its undelivered batches are counted
+//! `logit.input.batches.dropped{reason="closed_consumer"}`, beside a throttled `closed_consumer`
+//! line, counted on the delivery's task when a later batch is the one refused. Never a
+//! `partial_success`, which tells the exporter the rejected items are permanently bad and must not
+//! be retried.
+//!
+//! **Requests are counted.** `logit.input.requests{route, class}`, once per request on every
+//! exit: `route` is `logs`, `metrics`, or `traces`, or `unknown` for a path or method this
+//! listener doesn't serve, and `class` is `ok`, `rejected`, `busy`, or `closed_consumer`. A
+//! request whose client closes while it waits counts no class.
 //!
 //! **TLS is optional, per listener.** `tls:` in config ([`TlsServerSettings`]) turns it on for
 //! both transports; without it the listener accepts plaintext. The handshake runs inside the
@@ -150,7 +164,8 @@
 //! [`drive_connection`] races it in the two waits before the close: the wait on a request in
 //! flight and the idle wait. Either trigger runs the same close sequence, which doesn't race the
 //! signal itself. A request in flight is served out, hyper ends an h1 connection after its current
-//! response and GOAWAYs an h2 one, and nothing is answered `503`. A shutdown close counts
+//! response and GOAWAYs an h2 one, and shutdown answers nothing `503` itself: a request in flight
+//! still meets the busy bound. A shutdown close counts
 //! `logit.input.connections.closed{reason="shutdown"}`, which only a dedicated `internal` pipeline
 //! exports, since it lands after a mixed one's final drain. The pre-serve steps (the PROXY header, the TLS
 //! accept, the first-byte peek) race the signal as a whole and end with nothing of a request read.
@@ -213,7 +228,7 @@
 
 use crate::http::{
     body_read_error_message, collect_with_stall_bound, drive_connection, Activity, AuthGate,
-    BodyReadError,
+    BodyReadError, Undelivered, Unfinished,
 };
 use crate::listener::Prelude;
 use crate::peer::ConnectionPeer;
@@ -259,6 +274,12 @@ const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 /// `logit_in` and `crate::tcp`, mirrored by hand in `logit_config::default_handshake_timeout`.
 /// Also the grace an idle close gives hyper (this module's "Idle timeout").
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long a request's first batch may wait for room in every consumer before the request is
+/// answered busy (this module's "Backpressure"). Under the 5 s export timeout the Collector's
+/// `otlphttp` and `otlp` exporters default to, so a client reads the `503` before it gives up and
+/// resends.
+const BUSY_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Which OTLP wire transport this listener accepts. Mirrors `logit_outputs::otlp::OtlpTransport`
 /// rather than sharing a type, since neither crate depends on `logit-config`.
@@ -311,6 +332,8 @@ pub struct OtlpInput {
     forwarded: Option<ForwardedHeader>,
     /// `auth:` in config. See [`Self::with_auth`].
     auth: AuthGate,
+    /// [`BUSY_AFTER`] unless [`Self::with_busy_after`] sets it.
+    busy_after: std::time::Duration,
 }
 
 impl OtlpInput {
@@ -330,6 +353,7 @@ impl OtlpInput {
             proxy_protocol: false,
             forwarded: None,
             auth: AuthGate::default(),
+            busy_after: BUSY_AFTER,
         }
     }
 
@@ -434,6 +458,12 @@ impl OtlpInput {
         self.auth = AuthGate::new(credentials, "otlp_in", "request_rejected");
         self
     }
+
+    /// Overrides [`BUSY_AFTER`]. Not a config field: a test and tuning hook, as on `datadog_in`.
+    pub fn with_busy_after(mut self, busy_after: std::time::Duration) -> Self {
+        self.busy_after = busy_after;
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -526,6 +556,7 @@ impl Input for OtlpInput {
             let (record_peer, proxy_protocol) = (self.peer, self.proxy_protocol);
             let forwarded = self.forwarded;
             let auth = self.auth.clone();
+            let busy_after = self.busy_after;
             let mut conn_shutdown = shutdown.clone();
             tasks.spawn(async move {
                 // Held for the connection's lifetime; released on drop.
@@ -615,7 +646,7 @@ impl Input for OtlpInput {
                             transport,
                             sink,
                             telemetry.clone(),
-                            Gate { auth: auth.clone(), diag: diag.clone() },
+                            Gate { auth: auth.clone(), diag: diag.clone(), busy_after },
                             connection_peer,
                             idle_timeout,
                             handshake_timeout,
@@ -629,7 +660,7 @@ impl Input for OtlpInput {
                             transport,
                             sink,
                             telemetry.clone(),
-                            Gate { auth: auth.clone(), diag: diag.clone() },
+                            Gate { auth: auth.clone(), diag: diag.clone(), busy_after },
                             connection_peer,
                             idle_timeout,
                             handshake_timeout,
@@ -757,6 +788,7 @@ where
     }
 }
 
+/// One OTLP/HTTP request, counted once in `logit.input.requests{route, class}` on every exit.
 async fn handle_http(
     req: http::Request<Incoming>,
     sink: Fanout,
@@ -766,26 +798,44 @@ async fn handle_http(
     activity: &Activity,
     stall: Option<std::time::Duration>,
 ) -> Result<http::Response<Full<Bytes>>, std::convert::Infallible> {
+    let route = route_name(route_path(req.uri().path()));
+    let (class, response) = respond_http(req, sink, &telemetry, gate, peer, activity, stall).await;
+    telemetry.count("logit.input.requests", 1.0, &[("route", route), ("class", class)]);
+    Ok(response)
+}
+
+/// [`handle_http`]'s answer, with the `class` it counts.
+async fn respond_http(
+    req: http::Request<Incoming>,
+    sink: Fanout,
+    telemetry: &Telemetry,
+    gate: &Gate,
+    peer: &ConnectionPeer,
+    activity: &Activity,
+    stall: Option<std::time::Duration>,
+) -> (&'static str, http::Response<Full<Bytes>>) {
     #[cfg(test)]
     if req.headers().contains_key(tests::PANIC_HEADER) {
         panic!("a test asked this handler to panic");
     }
     if req.method() != Method::POST {
-        return Ok(text_response(StatusCode::NOT_FOUND, "not found"));
+        return (REJECTED, text_response(StatusCode::NOT_FOUND, "not found"));
     }
     let Some(signal) = route_path(req.uri().path()) else {
-        return Ok(text_response(StatusCode::NOT_FOUND, "not found"));
+        return (REJECTED, text_response(StatusCode::NOT_FOUND, "not found"));
     };
     // Before every other header and the body (this module's "Authentication").
     if let Err(denied) = gate.auth.check(req.headers()) {
-        gate.auth.reject(denied, peer, &telemetry, &gate.diag);
+        gate.auth.reject(denied, peer, telemetry, &gate.diag);
         let mut response = text_response(StatusCode::UNAUTHORIZED, "unauthorized");
         gate.auth.challenge(response.headers_mut());
-        return Ok(response);
+        return (REJECTED, response);
     }
     let encoding = match request_encoding(req.headers()) {
         Ok(encoding) => encoding,
-        Err(message) => return Ok(text_response(StatusCode::UNSUPPORTED_MEDIA_TYPE, &message)),
+        Err(message) => {
+            return (REJECTED, text_response(StatusCode::UNSUPPORTED_MEDIA_TYPE, &message))
+        }
     };
     // Matched on value, not presence: an explicit `identity` declares no compression and must not
     // be a `415`.
@@ -793,10 +843,13 @@ async fn handle_http(
         Ok(crate::http::Encoding::Identity) => false,
         Ok(crate::http::Encoding::Gzip) => true,
         Ok(_) | Err(_) => {
-            return Ok(text_response(
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "unsupported Content-Encoding -- this input speaks 'identity' and 'gzip' only",
-            ));
+            return (
+                REJECTED,
+                text_response(
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    "unsupported Content-Encoding -- this input speaks 'identity' and 'gzip' only",
+                ),
+            );
         }
     };
 
@@ -808,16 +861,22 @@ async fn handle_http(
         // connection closes once this response is out (this module's "Idle timeout").
         Err(BodyReadError::Stalled(stall)) => {
             activity.request_close();
-            return Ok(text_response(
-                StatusCode::REQUEST_TIMEOUT,
-                &format!("request body stalled for {stall:?}"),
-            ));
+            return (
+                REJECTED,
+                text_response(
+                    StatusCode::REQUEST_TIMEOUT,
+                    &format!("request body stalled for {stall:?}"),
+                ),
+            );
         }
         Err(BodyReadError::Failed(err)) => {
-            return Ok(text_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                &body_read_error_message(err.as_ref()),
-            ))
+            return (
+                REJECTED,
+                text_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    &body_read_error_message(err.as_ref()),
+                ),
+            )
         }
     };
     let decoder = OtlpDecoder::new().with_telemetry(telemetry.clone());
@@ -825,14 +884,16 @@ async fn handle_http(
     match result {
         Ok(mut batches) => {
             request_peer.stamp_batches(&mut batches);
-            let settle = count_undelivered(&telemetry, &gate.diag, peer);
-            if crate::http::deliver_detached(&sink, batches, settle).await.is_err() {
-                let mut response =
-                    text_response(StatusCode::SERVICE_UNAVAILABLE, NO_CONSUMER_TOOK_THE_BATCH);
+            if let Err(undelivered) = deliver(&sink, batches, telemetry, gate, peer).await {
+                let message = match undelivered {
+                    Undelivered::Busy(_) => BUSY,
+                    Undelivered::Closed(_) => NO_CONSUMER_TOOK_THE_BATCH,
+                };
+                let mut response = text_response(StatusCode::SERVICE_UNAVAILABLE, message);
                 response
                     .headers_mut()
                     .insert(http::header::RETRY_AFTER, HeaderValue::from_static("1"));
-                return Ok(response);
+                return (undelivered.reason(), response);
             }
             // The spec: "The server MUST use the same Content-Type in the response as it received
             // in the request." A JSON request gets `{}`, not an empty body
@@ -841,21 +902,25 @@ async fn handle_http(
                 RequestEncoding::Protobuf => ("application/x-protobuf", export_response(0, "")),
                 RequestEncoding::Json => ("application/json", export_response_json()),
             };
-            Ok(http::Response::builder()
+            let response = http::Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", content_type)
                 .body(Full::new(Bytes::from(body)))
-                .expect("a well-formed response always builds"))
+                .expect("a well-formed response always builds");
+            (OK, response)
         }
-        Err(DecodeFailure::TooLarge) => Ok(text_response(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "decompressed request exceeds the maximum allowed size",
-        )),
+        Err(DecodeFailure::TooLarge) => (
+            REJECTED,
+            text_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "decompressed request exceeds the maximum allowed size",
+            ),
+        ),
         Err(DecodeFailure::BadGzip) => {
-            Ok(text_response(StatusCode::BAD_REQUEST, "invalid gzip body"))
+            (REJECTED, text_response(StatusCode::BAD_REQUEST, "invalid gzip body"))
         }
         Err(DecodeFailure::Malformed(err)) => {
-            Ok(text_response(StatusCode::BAD_REQUEST, &err.to_string()))
+            (REJECTED, text_response(StatusCode::BAD_REQUEST, &err.to_string()))
         }
     }
 }
@@ -951,6 +1016,7 @@ fn request_encoding(headers: &HeaderMap) -> Result<RequestEncoding, String> {
     ))
 }
 
+/// One OTLP/gRPC call, counted once in `logit.input.requests{route, class}` on every exit.
 async fn handle_grpc(
     req: http::Request<Incoming>,
     sink: Fanout,
@@ -960,21 +1026,34 @@ async fn handle_grpc(
     activity: &Activity,
     stall: Option<std::time::Duration>,
 ) -> Result<http::Response<GrpcBody>, std::convert::Infallible> {
+    let route = route_name(grpc_signal(req.uri().path()));
+    let (class, response) = respond_grpc(req, sink, &telemetry, gate, peer, activity, stall).await;
+    telemetry.count("logit.input.requests", 1.0, &[("route", route), ("class", class)]);
+    Ok(response)
+}
+
+/// [`handle_grpc`]'s answer, with the `class` it counts.
+async fn respond_grpc(
+    req: http::Request<Incoming>,
+    sink: Fanout,
+    telemetry: &Telemetry,
+    gate: &Gate,
+    peer: &ConnectionPeer,
+    activity: &Activity,
+    stall: Option<std::time::Duration>,
+) -> (&'static str, http::Response<GrpcBody>) {
     if req.method() != Method::POST {
-        return Ok(grpc_response(12, "only POST is supported", None));
+        return (REJECTED, grpc_response(12, "only POST is supported", None));
     }
     let path = req.uri().path();
-    let Some(signal) = [Signal::Logs, Signal::Metrics, Signal::Traces]
-        .into_iter()
-        .find(|s| s.grpc_method() == path)
-    else {
-        return Ok(grpc_response(12, &format!("unknown method {path}"), None));
+    let Some(signal) = grpc_signal(path) else {
+        return (REJECTED, grpc_response(12, &format!("unknown method {path}"), None));
     };
     // gRPC metadata is HTTP/2 headers, so `authorization` reads as on the HTTP side. `16`,
     // `UNAUTHENTICATED`, carries no challenge (this module's "Authentication").
     if let Err(denied) = gate.auth.check(req.headers()) {
-        gate.auth.reject(denied, peer, &telemetry, &gate.diag);
-        return Ok(grpc_response(16, "unauthenticated", None));
+        gate.auth.reject(denied, peer, telemetry, &gate.diag);
+        return (REJECTED, grpc_response(16, "unauthenticated", None));
     }
     // The frame's compressed flag (`grpc::unframe`) drives decompression; this check only rejects
     // an undecodable encoding up front with a clear message.
@@ -983,11 +1062,9 @@ async fn handle_grpc(
         // ADR `untrusted-input-bounds` makes that uniform across the HTTP listeners.
         let enc = enc.to_str().unwrap_or("").trim();
         if !enc.eq_ignore_ascii_case("identity") && !enc.eq_ignore_ascii_case("gzip") {
-            return Ok(grpc_response(
-                12,
-                "unsupported grpc-encoding -- this input speaks 'identity' and 'gzip' only",
-                None,
-            ));
+            let message =
+                "unsupported grpc-encoding -- this input speaks 'identity' and 'gzip' only";
+            return (REJECTED, grpc_response(12, message, None));
         }
     }
 
@@ -1000,40 +1077,35 @@ async fn handle_grpc(
         // this response is out.
         Err(BodyReadError::Stalled(stall)) => {
             activity.request_close();
-            return Ok(grpc_response(4, &format!("request body stalled for {stall:?}"), None));
+            let message = format!("request body stalled for {stall:?}");
+            return (REJECTED, grpc_response(4, &message, None));
         }
         Err(BodyReadError::Failed(err)) => {
-            return Ok(grpc_response(8, &body_read_error_message(err.as_ref()), None))
+            return (REJECTED, grpc_response(8, &body_read_error_message(err.as_ref()), None))
         }
     };
     let Some((compressed, payload)) = grpc::unframe(&framed) else {
-        return Ok(grpc_response(3, "malformed gRPC message frame", None));
+        return (REJECTED, grpc_response(3, "malformed gRPC message frame", None));
     };
     // `Export` is unary, so its body is one message. Bytes after it are a sender's encoder bug,
     // answered rather than dropped unread (ADR `untrusted-input-bounds`).
     let leftover = framed.len() - 5 - payload.len();
     if leftover != 0 {
-        return Ok(grpc_response(
-            3,
-            &format!(
-                "the request body carries {leftover} bytes after its gRPC message; a unary call \
-                 takes one message"
-            ),
-            None,
-        ));
+        let message = format!(
+            "the request body carries {leftover} bytes after its gRPC message; a unary call takes \
+             one message"
+        );
+        return (REJECTED, grpc_response(3, &message, None));
     }
     let payload = if compressed {
         match grpc::inflate_bounded(payload, MAX_REQUEST_BYTES) {
             Ok(inflated) => inflated,
             Err(InflateError::TooLarge) => {
-                return Ok(grpc_response(
-                    8,
-                    "decompressed request exceeds the maximum allowed size",
-                    None,
-                ));
+                let message = "decompressed request exceeds the maximum allowed size";
+                return (REJECTED, grpc_response(8, message, None));
             }
             Err(InflateError::Malformed) => {
-                return Ok(grpc_response(3, "invalid gzip payload", None));
+                return (REJECTED, grpc_response(3, "invalid gzip payload", None));
             }
         }
     } else {
@@ -1044,21 +1116,77 @@ async fn handle_grpc(
     match decoder.decode_signal(signal, payload) {
         Ok(mut batches) => {
             request_peer.stamp_batches(&mut batches);
-            let settle = count_undelivered(&telemetry, &gate.diag, peer);
-            match crate::http::deliver_detached(&sink, batches, settle).await {
-                Ok(()) => Ok(grpc_response(0, "", Some(export_response(0, "")))),
-                Err(_) => Ok(grpc_response(14, NO_CONSUMER_TOOK_THE_BATCH, None)),
+            match deliver(&sink, batches, telemetry, gate, peer).await {
+                Ok(()) => (OK, grpc_response(0, "", Some(export_response(0, "")))),
+                // `14`, `UNAVAILABLE`, with no `RetryInfo`: the OTLP exporters retry it with
+                // their own backoff.
+                Err(undelivered @ Undelivered::Busy(_)) => {
+                    (undelivered.reason(), grpc_response(14, BUSY, None))
+                }
+                Err(undelivered @ Undelivered::Closed(_)) => {
+                    (undelivered.reason(), grpc_response(14, NO_CONSUMER_TOOK_THE_BATCH, None))
+                }
             }
         }
-        Err(err) => Ok(grpc_response(3, &err.to_string(), None)),
+        Err(err) => (REJECTED, grpc_response(3, &err.to_string(), None)),
     }
 }
 
-/// A connection's `auth:` check and the diagnostics a refusal reports under.
+/// Matches an OTLP/gRPC method path to its [`Signal`].
+fn grpc_signal(path: &str) -> Option<Signal> {
+    [Signal::Logs, Signal::Metrics, Signal::Traces].into_iter().find(|s| s.grpc_method() == path)
+}
+
+/// The `route` tag on `logit.input.requests`: the signal, or `unknown` for a path or method this
+/// listener doesn't serve.
+fn route_name(signal: Option<Signal>) -> &'static str {
+    signal.map_or("unknown", Signal::as_str)
+}
+
+/// The `class` tags on `logit.input.requests` other than [`Undelivered::reason`]'s.
+const OK: &str = "ok";
+const REJECTED: &str = "rejected";
+
+/// A busy `503`'s body, and a busy `UNAVAILABLE`'s message.
+const BUSY: &str = "busy";
+
+/// Delivers a request's batches, first batch bounded and the rest detached
+/// ([`crate::http::deliver_first_bounded`]; this module's "Backpressure"). A busy request counts
+/// every batch `logit.input.batches.deferred` and a throttled `busy` line here; a closed consumer
+/// is counted by [`count_undelivered`].
+async fn deliver(
+    sink: &Fanout,
+    batches: Vec<EventBatch>,
+    telemetry: &Telemetry,
+    gate: &Gate,
+    peer: &ConnectionPeer,
+) -> Result<(), Undelivered> {
+    let settle = count_undelivered(telemetry, &gate.diag, peer);
+    let delivered =
+        crate::http::deliver_first_bounded(sink, batches, gate.busy_after, || {}, settle).await;
+    let Err(Unfinished { undelivered, .. }) = delivered else {
+        return Ok(());
+    };
+    if let Undelivered::Busy(_) = undelivered {
+        undelivered.record(telemetry);
+        gate.diag.clone().warn_throttled(
+            "busy",
+            format_args!(
+                "otlp_in: answered busy to {peer}: the pipeline did not accept a batch within {:?}",
+                gate.busy_after
+            ),
+        );
+    }
+    Err(undelivered)
+}
+
+/// A connection's `auth:` check, the diagnostics a refusal reports under, and the bound on a
+/// request's first batch ([`deliver`]).
 #[derive(Clone)]
 struct Gate {
     auth: AuthGate,
     diag: Diagnostics,
+    busy_after: std::time::Duration,
 }
 
 /// The refusal's message, on both transports.
@@ -1071,7 +1199,7 @@ fn count_undelivered(
     telemetry: &Telemetry,
     diag: &Diagnostics,
     peer: &ConnectionPeer,
-) -> impl FnOnce(Result<(), crate::http::Undelivered>) + Send + 'static {
+) -> impl FnOnce(Result<(), Undelivered>) + Send + 'static {
     let (telemetry, mut diag, peer) = (telemetry.clone(), diag.clone(), peer.clone());
     move |outcome| {
         if let Err(undelivered) = outcome {
@@ -1868,6 +1996,9 @@ mod tests {
         assert_eq!(probe.sum("logit.input.batches.dropped", &[("reason", "closed_consumer")]), 1.0);
         let closed = [("key", "closed_consumer")];
         assert_eq!(probe.sum("logit.component.diagnostics", &closed), 1.0, "its line");
+        let class = [("route", "traces"), ("class", "closed_consumer")];
+        assert_eq!(probe.sum("logit.input.requests", &class), 1.0);
+        assert_eq!(probe.sum("logit.input.batches.deferred", &[]), 0.0, "not busy");
     }
 
     #[tokio::test]
@@ -1886,6 +2017,8 @@ mod tests {
         assert_eq!(probe.sum("logit.input.batches.dropped", &[("reason", "closed_consumer")]), 1.0);
         let closed = [("key", "closed_consumer")];
         assert_eq!(probe.sum("logit.component.diagnostics", &closed), 1.0, "its line");
+        let class = [("route", "traces"), ("class", "closed_consumer")];
+        assert_eq!(probe.sum("logit.input.requests", &class), 1.0);
     }
 
     // ---- gRPC: garbage-frame status test ----
@@ -2599,32 +2732,262 @@ mod tests {
         hosts
     }
 
-    /// A client that gives up while its request waits on a full consumer (an exporter's own
-    /// timeout under backpressure) cancels only the handler's wait, not the delivery: every
-    /// consumer still gets every batch of the request. The client never saw a `200`, so its retry
-    /// duplicates on every branch alike, the ordinary at-least-once outcome, where a split would
-    /// duplicate on some branches and not others.
+    /// A listener over one edge per capacity in `capacities`, each carrying consumer telemetry
+    /// `c<i>` under the returned probe, so a send that finds one full counts
+    /// `logit.component.inbox.full`. The listener's telemetry and diagnostics are on the probe
+    /// too, and its first batch waits at most `busy_after`. Returns each edge's sender beside its
+    /// receiver, for filling it.
+    #[allow(clippy::type_complexity)] // a test rig's parts, destructured at each call
+    async fn busy_listener(
+        transport: OtlpTransport,
+        capacities: &[usize],
+        busy_after: Duration,
+    ) -> (
+        String,
+        logit_pipeline::test_util::Running,
+        Vec<(mpsc::Sender<logit_pipeline::Delivered>, mpsc::Receiver<logit_pipeline::Delivered>)>,
+        logit_pipeline::test_util::TelemetryProbe,
+    ) {
+        let probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let telemetry = probe.telemetry("otlp_in", "otlp_in", "listener");
+        let diag = Diagnostics::new("otlp_in").with_telemetry(telemetry.clone());
+        let (addr, input) = bound_input(transport).await;
+        let input =
+            input.with_telemetry(telemetry).with_diagnostics(diag).with_busy_after(busy_after);
+        let mut edges = Vec::new();
+        let mut channels = Vec::new();
+        for (i, &capacity) in capacities.iter().enumerate() {
+            let (tx, rx) = mpsc::channel(capacity);
+            let consumer = probe.telemetry(&format!("c{i}"), "null_out", "sink");
+            edges.push(logit_pipeline::fanout::Edge::new(tx.clone()).with_telemetry(consumer));
+            channels.push((tx, rx));
+        }
+        let running =
+            logit_pipeline::test_util::spawn_input(input, Fanout::from_edges(edges)).await;
+        (addr, running, channels, probe)
+    }
+
+    /// Fills `tx`'s inbox with one [`metric_batch`], through a `Fanout` that counts nothing.
+    async fn fill(tx: &mpsc::Sender<logit_pipeline::Delivered>) {
+        assert!(Fanout::new(vec![tx.clone()]).send(metric_batch()).await, "the filler is taken");
+    }
+
+    /// A test's busy bound: a send to a consumer with room never meets it.
+    const TEST_BUSY_AFTER: Duration = Duration::from_millis(200);
+
+    /// Far past any wait in these tests, so a first batch parked on a full edge stays parked
+    /// rather than being answered busy at the bound.
+    const PARKED_BUSY_AFTER: Duration = Duration::from_secs(30);
+
+    /// Writes one keep-alive HTTP/1.1 export of `body` to `path` and reads its whole response.
+    async fn export_http(addr: &str, path: &str, body: &[u8]) -> String {
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        write_request(&mut client, addr, path, body).await;
+        crate::http::read_response(&mut client, "the export").await
+    }
+
+    #[test]
+    fn default_busy_after_is_two_seconds() {
+        let input = OtlpInput::new("127.0.0.1:0", OtlpTransport::Http);
+        assert_eq!(input.busy_after, Duration::from_secs(2));
+    }
+
+    /// A request whose batch finds every consumer full past the bound is answered `503` with
+    /// `Retry-After: 1`, nothing delivered: the client still holds the body, so the batch is
+    /// counted `deferred`, not dropped.
     #[tokio::test]
-    async fn a_client_that_closes_while_its_batches_wait_still_delivers_them_to_every_consumer() {
-        let (addr, mut input) = bound_input(OtlpTransport::Http).await;
-        let (tx_a, mut rx_a) = mpsc::channel(16);
-        let (tx_b, mut rx_b) = mpsc::channel(1);
-        let sink = Fanout::new(vec![tx_a, tx_b]);
-        // Fills b's one slot, so the request's first send waits on b; a's copy is drained here.
-        sink.send(metric_batch()).await;
-        logit_pipeline::test_util::recv_batch(&mut rx_a).await;
-        tokio::spawn(async move { input.run(sink).await });
+    async fn an_http_request_that_waits_past_the_bound_is_answered_busy_and_delivers_nothing() {
+        let (addr, _running, mut channels, mut probe) =
+            busy_listener(OtlpTransport::Http, &[1], TEST_BUSY_AFTER).await;
+        fill(&channels[0].0).await;
+
+        let started = tokio::time::Instant::now();
+        let response = export_http(&addr, "/v1/metrics", &metric_body()).await;
+        assert!(response.starts_with("HTTP/1.1 503"), "got: {response}");
+        assert!(started.elapsed() >= TEST_BUSY_AFTER, "answered before the bound");
+        assert!(response.to_ascii_lowercase().contains("retry-after: 1"), "got: {response}");
+        assert!(response.ends_with("\r\n\r\nbusy"), "got: {response}");
+
+        let rx = &mut channels[0].1;
+        logit_pipeline::test_util::recv_batch(rx).await;
+        logit_pipeline::test_util::assert_no_batch(rx, TEST_BUSY_AFTER, "the busy request").await;
+        assert_eq!(probe.sum("logit.input.batches.deferred", &[]), 1.0);
+        assert_eq!(probe.sum("logit.input.batches.dropped", &[]), 0.0);
+        assert_eq!(probe.sum("logit.component.batches.sent", &[]), 0.0);
+        assert_eq!(probe.sum("logit.component.diagnostics", &[("key", "busy")]), 1.0);
+        let busy = [("route", "metrics"), ("class", "busy")];
+        assert_eq!(probe.sum("logit.input.requests", &busy), 1.0);
+    }
+
+    /// gRPC answers the same wait `UNAVAILABLE`, status 14, with `busy` as its message.
+    #[tokio::test]
+    async fn a_grpc_request_that_waits_past_the_bound_is_answered_unavailable() {
+        let (addr, _running, mut channels, mut probe) =
+            busy_listener(OtlpTransport::Grpc, &[1], TEST_BUSY_AFTER).await;
+        fill(&channels[0].0).await;
+
+        let export = grpc_export(&addr, grpc_message(false, &one_span_payload()), None);
+        let trailers = tokio::time::timeout(logit_pipeline::test_util::RECV_TIMEOUT, export)
+            .await
+            .expect("the call is answered within the bound, not parked");
+        assert_eq!(trailers.get("grpc-status").unwrap(), "14");
+        assert_eq!(trailers.get("grpc-message").unwrap(), "busy");
+
+        let rx = &mut channels[0].1;
+        logit_pipeline::test_util::recv_batch(rx).await;
+        logit_pipeline::test_util::assert_no_batch(rx, TEST_BUSY_AFTER, "the busy call").await;
+        assert_eq!(probe.sum("logit.input.batches.deferred", &[]), 1.0);
+        assert_eq!(probe.sum("logit.component.diagnostics", &[("key", "busy")]), 1.0);
+        let busy = [("route", "traces"), ("class", "busy")];
+        assert_eq!(probe.sum("logit.input.requests", &busy), 1.0);
+    }
+
+    /// In a diamond, one full consumer is enough to answer busy, and the consumer with room
+    /// doesn't get the batch either: a retry then delivers it once to each.
+    #[tokio::test]
+    async fn a_request_one_of_two_consumers_cant_take_reaches_neither() {
+        let (addr, _running, mut channels, mut probe) =
+            busy_listener(OtlpTransport::Http, &[16, 1], TEST_BUSY_AFTER).await;
+        fill(&channels[1].0).await;
+
+        let response = export_http(&addr, "/v1/metrics", &metric_body()).await;
+        assert!(response.starts_with("HTTP/1.1 503"), "got: {response}");
+
+        let window = TEST_BUSY_AFTER;
+        logit_pipeline::test_util::assert_no_batch(&mut channels[0].1, window, "the open edge")
+            .await;
+        logit_pipeline::test_util::recv_batch(&mut channels[1].1).await;
+        logit_pipeline::test_util::assert_no_batch(&mut channels[1].1, window, "the full edge")
+            .await;
+        assert_eq!(probe.sum("logit.input.batches.deferred", &[]), 1.0);
+    }
+
+    /// A busy answer leaves every batch of the request with the client, so all of a
+    /// two-resource request's batches are counted deferred.
+    #[tokio::test]
+    async fn a_busy_two_resource_request_defers_both_batches() {
+        let (addr, _running, mut channels, mut probe) =
+            busy_listener(OtlpTransport::Http, &[1], TEST_BUSY_AFTER).await;
+        fill(&channels[0].0).await;
+
+        let response = export_http(&addr, "/v1/metrics", &two_resource_metrics_payload()).await;
+        assert!(response.starts_with("HTTP/1.1 503"), "got: {response}");
+        assert_eq!(hosts_received(&mut channels[0].1).await, [""], "the filler alone");
+        assert_eq!(probe.sum("logit.input.batches.deferred", &[]), 2.0);
+    }
+
+    /// Once the first batch is in, the rest wait for as long as the pipeline takes: a busy answer
+    /// would make the client's retry deliver the first batch twice. The second batch here gets
+    /// room only well past the bound, and the request is still answered `200`.
+    #[tokio::test]
+    async fn a_request_whose_first_batch_is_taken_waits_past_the_bound_for_the_rest() {
+        let (addr, _running, mut channels, mut probe) =
+            busy_listener(OtlpTransport::Http, &[1], TEST_BUSY_AFTER).await;
 
         let mut client = tokio::net::TcpStream::connect(&addr).await.unwrap();
         write_request(&mut client, &addr, "/v1/metrics", &two_resource_metrics_payload()).await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        drop(client);
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        probe
+            .wait_for("the second batch to wait on the full edge", |t| {
+                t.sum("logit.component.inbox.full", &[]) >= 1.0
+            })
+            .await;
+        // A negative window three times the bound: no answer, busy or otherwise, while the second
+        // batch waits.
+        logit_pipeline::test_util::expect_still_open(
+            &mut client,
+            TEST_BUSY_AFTER * 3,
+            "a request whose first batch was taken",
+        )
+        .await;
 
-        let b = hosts_received(&mut rx_b).await;
-        let a = hosts_received(&mut rx_a).await;
-        assert_eq!(b, ["", "a", "b"], "b: the filler, then both of the request's batches");
+        assert_eq!(hosts_received(&mut channels[0].1).await, ["a", "b"]);
+        let response = crate::http::read_response(&mut client, "the export").await;
+        assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+        assert_eq!(probe.sum("logit.input.batches.deferred", &[]), 0.0);
+        assert_eq!(probe.sum("logit.input.requests", &[("class", "busy")]), 0.0);
+        assert_eq!(probe.sum("logit.input.requests", &[("class", "ok")]), 1.0);
+    }
+
+    /// A client that gives up while the rest of its request waits on a full consumer (an
+    /// exporter's own timeout under backpressure) cancels only the handler's wait, not the
+    /// delivery: every consumer still gets every batch of the request. The client never saw a
+    /// `200`, so its retry duplicates on every branch alike, the ordinary at-least-once outcome,
+    /// where a split would duplicate on some branches and not others.
+    #[tokio::test]
+    async fn a_client_that_closes_while_its_batches_wait_still_delivers_them_to_every_consumer() {
+        let (addr, _running, mut channels, mut probe) =
+            busy_listener(OtlpTransport::Http, &[16, 1], TEST_BUSY_AFTER).await;
+
+        let mut client = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        write_request(&mut client, &addr, "/v1/metrics", &two_resource_metrics_payload()).await;
+        // The first batch took the full edge's one slot, and the second waits on it.
+        probe
+            .wait_for("the second batch to wait on the full edge", |t| {
+                t.sum("logit.component.inbox.full", &[]) >= 1.0
+            })
+            .await;
+        drop(client);
+        probe
+            .wait_for("the closed connection to end its task", |t| {
+                t.gauge("logit.input.connections", &[]) == Some(0.0)
+            })
+            .await;
+
+        let b = hosts_received(&mut channels[1].1).await;
+        let a = hosts_received(&mut channels[0].1).await;
+        assert_eq!(b, ["a", "b"], "b: both of the request's batches");
         assert_eq!(a, ["a", "b"], "a: both of the request's batches");
+    }
+
+    /// A client that closes while its first batch waits under the bound takes the batch with it:
+    /// nothing was reserved on every consumer yet, so no consumer gets it, and nothing counts it
+    /// deferred, since no answer was written.
+    #[tokio::test]
+    async fn a_client_that_closes_during_the_bounded_wait_delivers_nothing() {
+        let (addr, _running, mut channels, mut probe) =
+            busy_listener(OtlpTransport::Http, &[16, 1], PARKED_BUSY_AFTER).await;
+        fill(&channels[1].0).await;
+
+        let mut client = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        write_request(&mut client, &addr, "/v1/metrics", &metric_body()).await;
+        probe
+            .wait_for("the batch to wait on the full edge", |t| {
+                t.sum("logit.component.inbox.full", &[]) >= 1.0
+            })
+            .await;
+        drop(client);
+        probe
+            .wait_for("the closed connection to end its task", |t| {
+                t.gauge("logit.input.connections", &[]) == Some(0.0)
+            })
+            .await;
+
+        assert_eq!(hosts_received(&mut channels[1].1).await, [""], "b: the filler alone");
+        assert_eq!(hosts_received(&mut channels[0].1).await, Vec::<String>::new(), "a: nothing");
+        assert_eq!(probe.sum("logit.input.batches.deferred", &[]), 0.0);
+        assert_eq!(probe.sum("logit.component.batches.sent", &[]), 0.0);
+    }
+
+    /// Every request counts once in `logit.input.requests{route, class}`: the signal it posted,
+    /// or `unknown` for a path this listener doesn't serve.
+    #[tokio::test]
+    async fn requests_are_counted_by_route_and_class() {
+        let (addr, _running, mut channels, mut probe) =
+            busy_listener(OtlpTransport::Http, &[16], TEST_BUSY_AFTER).await;
+        let response = export_http(&addr, "/v1/metrics", &metric_body()).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+        logit_pipeline::test_util::recv_batch(&mut channels[0].1).await;
+        let response = export_http(&addr, "/v1/elsewhere", &metric_body()).await;
+        assert!(response.starts_with("HTTP/1.1 404"), "got: {response}");
+        let response = export_http(&addr, "/v1/logs", b"not protobuf").await;
+        assert!(response.starts_with("HTTP/1.1 400"), "got: {response}");
+
+        let ok = [("route", "metrics"), ("class", "ok")];
+        assert_eq!(probe.sum("logit.input.requests", &ok), 1.0);
+        let unknown = [("route", "unknown"), ("class", "rejected")];
+        assert_eq!(probe.sum("logit.input.requests", &unknown), 1.0);
+        let malformed = [("route", "logs"), ("class", "rejected")];
+        assert_eq!(probe.sum("logit.input.requests", &malformed), 1.0);
     }
 
     fn metric_batch() -> logit_core::EventBatch {
@@ -2907,7 +3270,7 @@ mod tests {
     async fn a_request_blocked_on_a_full_downstream_is_not_closed_as_idle() {
         let idle = Duration::from_millis(100);
         let (addr, input) = bound_input(OtlpTransport::Http).await;
-        let mut input = input.with_idle_timeout(Some(idle));
+        let mut input = input.with_idle_timeout(Some(idle)).with_busy_after(PARKED_BUSY_AFTER);
         let (sink, mut rx) = fanout_into_channel_with_capacity(1);
         tokio::spawn(async move { input.run(sink).await });
 
@@ -3143,7 +3506,8 @@ mod tests {
         let (addr, input) = bound_input(OtlpTransport::Http).await;
         let input = input
             .with_telemetry(probe.telemetry("otlp_in", "otlp_in", "listener"))
-            .with_handshake_timeout(SHUTDOWN_GRACE);
+            .with_handshake_timeout(SHUTDOWN_GRACE)
+            .with_busy_after(PARKED_BUSY_AFTER);
         let (tx, rx) = mpsc::channel(1);
         let edge = logit_pipeline::fanout::Edge::new(tx)
             .with_telemetry(probe.telemetry("sink", "null_out", "sink"));
@@ -3152,20 +3516,16 @@ mod tests {
         (addr, running, rx, probe)
     }
 
-    /// Sends two exports on one keep-alive connection to a [`parked_listener`]: the first fills
-    /// the edge's one slot and is answered, the second parks in `Fanout::send`. Returns once the
-    /// park is counted.
+    /// Sends a two-resource export to a [`parked_listener`]: its first batch fills the edge's one
+    /// slot, and its second parks in the detached `Fanout::send`. Returns once the park is counted.
     async fn park_a_request(
         addr: &str,
         probe: &mut logit_pipeline::test_util::TelemetryProbe,
     ) -> tokio::net::TcpStream {
         let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
-        write_request(&mut client, addr, "/v1/metrics", &metric_body()).await;
-        let head = read_response_head(&mut client, "the export that fills the slot").await;
-        assert!(head.starts_with("HTTP/1.1 200"), "got: {head}");
-        write_request(&mut client, addr, "/v1/metrics", &metric_body()).await;
+        write_request(&mut client, addr, "/v1/metrics", &two_resource_metrics_payload()).await;
         probe
-            .wait_for("the second export to park on the full edge", |t| {
+            .wait_for("the second batch to park on the full edge", |t| {
                 t.sum("logit.component.inbox.full", &[]) >= 1.0
             })
             .await;
@@ -3261,8 +3621,8 @@ mod tests {
         drop(sender);
     }
 
-    /// A request parked in `Fanout::send` when shutdown fires is served out: both batches reach
-    /// the consumer, the client gets its 200, then the connection closes and the listener
+    /// A request parked in `Fanout::send` when shutdown fires is served out: both of its batches
+    /// reach the consumer, the client gets its 200, then the connection closes and the listener
     /// returns. Dropping it instead would cost a batch the client was never answered for.
     #[tokio::test]
     async fn shutdown_serves_a_parked_request_out_then_closes_its_connection() {

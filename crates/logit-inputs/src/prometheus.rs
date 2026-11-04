@@ -1496,7 +1496,7 @@ async fn write_response(
         telemetry.count("logit.input.samples", written as f64, &[]);
         return (Some(("ok", Some(encoding))), no_content(seen, written, decoded.exemplars));
     }
-    // **Before** the response is built, as in `otlp_in`: channel backpressure delays the `204` and
+    // **Before** the response is built: channel backpressure delays the `204` and
     // the sender's queue throttles, remote-write's own flow-control model. On its own task, so a
     // sender that disconnects mid-wait cancels only the wait, never part of the fan-out. Counted
     // there too: a sender whose request timeout fires during the wait drops this future, and its
