@@ -920,14 +920,33 @@ matters more than the held batch.
 `syslog_out`, `statsd_out`, and `graphite_out` over TCP or TLS, and `statsd_out` over a Unix
 stream, count a batch sent once the kernel or the TLS session takes its bytes. A line protocol
 carries no acknowledgment, so a receiver that dies with bytes still in either socket buffer loses
-them, and neither side counts the loss
-([ADR `delivery-semantics`](adr/delivery-semantics.md), item 6). The posture can't help: no
-fault reaches the sink for those bytes. Where a lost tail matters, use a protocol with an
-acknowledgment: the native hop (`logit_out` to `logit_in`), or an HTTP sink whose destination
-answers after it holds the batch. Smaller socket buffers narrow the window, at a throughput
-cost. Over TCP and TLS they're `net.ipv4.tcp_wmem` on the sender and `net.ipv4.tcp_rmem` on the
-receiver. Those settings cover TCP sockets only: a Unix stream's buffer is the sending socket's
-`SO_SNDBUF`, which defaults to `net.core.wmem_default`.
+them ([ADR `delivery-semantics`](adr/delivery-semantics.md), item 6). The posture can't help: no
+fault reaches the sink for those bytes.
+
+What `logit` does about it ([ADR
+`stream-sink-stalled-connection`](adr/stream-sink-stalled-connection.md)):
+
+- **A receiver that stops reading keeps its connection.** Once a write accepts nothing for
+  `connect_timeout`, the attempt fails, and the next one uses the same connection, writing the
+  cut frame's tail first. `logit.output.reconnects` stays flat through the stall. A redial would park a
+  new connection, with a new pair of full buffers, in the frozen receiver's accept queue on every
+  retry, all lost when the receiver dies. A TCP connection whose peer has stopped answering (a
+  host that's gone or partitioned) is closed instead, and so is one whose live receiver answered
+  a retransmission with a zero-window acknowledgment, which reads the same way.
+- **The sender's share of a loss is counted.** When the receiver's reset or close ends a TCP
+  connection, the sink counts the bytes of earlier batches its own socket still held unacknowledged
+  as `logit.output.bytes.dropped{reason="unacknowledged"}`, with a throttled `unacknowledged`
+  warning. Under TLS the count is wire bytes, record framing included.
+- **The receiver's share isn't.** Bytes the receiver's kernel acknowledged and its process never
+  read are gone with it, and nothing reports them to the sender. Nor is anything counted over a
+  Unix stream, whose receiver's close frees the sender's queue, or for a connection closed at
+  shutdown or after its peer stopped answering ([`docs/known-gaps/sinks.md`](known-gaps/sinks.md)).
+
+Where a lost tail matters, use a protocol with an acknowledgment: the native hop (`logit_out` to
+`logit_in`), or an HTTP sink whose destination answers after it holds the batch. Smaller socket
+buffers narrow the window, at a throughput cost. Over TCP and TLS they're `net.ipv4.tcp_wmem` on
+the sender and `net.ipv4.tcp_rmem` on the receiver. Those settings cover TCP sockets only: a Unix
+stream's buffer is the sending socket's `SO_SNDBUF`, which defaults to `net.core.wmem_default`.
 
 ### Sink failure semantics
 
@@ -1615,14 +1634,16 @@ socket. Only two things reset it: bytes read from the peer, and the listener fin
 on the connection (a batch handed downstream, a resend recognized, a response completed). Time spent
 blocked handing a batch to a full downstream never counts, because the clock isn't re-armed until
 that work returns. So a connection stalled on backpressure never looks idle, however long the
-stall. On `otlp_in` and `prometheus_in`'s remote-write receiver, a request handler parked on a
-full downstream isn't closed by `idle_timeout` or the grace after it either: it holds its
-connection and its permit until the send completes or the client goes away, because closing it
-would drop a batch that never reached the fan-out. `datadog_in` and `influxdb_in` wait at most
-5 s, and `datadog_trace_in` 2 s, then answer `503` with `Retry-After: 1`. `splunk_hec_in` gives
-only a body's first batch the 5 s deadline, answering `503` code 9 when it passes; once that batch
-is in, the body's later batches wait with no deadline and hold the connection and its permit as
-`otlp_in` does, because a `503` would make the client resend the batch already delivered. A periodic
+stall. On `prometheus_in`'s remote-write receiver, a request handler parked on a full downstream
+isn't closed by `idle_timeout` or the grace after it either: it holds its connection and its
+permit until the send completes or the client goes away, because closing it would drop a batch
+that never reached the fan-out. `datadog_in` and `influxdb_in` wait at most 5 s, and
+`datadog_trace_in` 2 s, then answer `503` with `Retry-After: 1`. `splunk_hec_in` gives only a
+body's first batch the 5 s deadline, answering `503` code 9 when it passes, and `otlp_in` gives a
+request's first batch 2 s, answering `503` with `Retry-After: 1` (gRPC `UNAVAILABLE`). Once that
+batch is in, the request's later batches wait with no deadline and hold the connection and its
+permit as the receiver does, because a `503` would make the client resend the batch already
+delivered. A periodic
 flush tick that finds nothing to send touches neither event, so it never re-arms the clock by
 itself.
 
@@ -2196,6 +2217,8 @@ components:
   `logit.input.connections.rejected{reason="limit"}` (nonzero means the `max_connections` cap is
   binding), `logit.input.connections.closed{reason="reset"}` (a peer that reset its connection
   after sending data; a partial frame it cut off is also counted `truncated`),
+  `logit.input.connections.closed{reason="handshake_timeout"}` (a peer whose TLS accept or first-byte
+  wait outlasted `handshake_timeout:`; not a loss),
   `logit.input.frames`/`.frame.bytes` (one frame is one statsd line), and
   `logit.input.frames.dropped{reason="oversize"|"drained"|"truncated"}`. On either transport, a malformed
   *line* is the decoder's `logit.input.messages.dropped{reason="malformed"}` (diagnostic `bad_line`),
@@ -3346,6 +3369,17 @@ shares the page's origin instead of opening `otlp_in` to arbitrary browser origi
 (`docs/known-gaps/otlp.md`). Leave `auth:` off a listener a browser sends to: a web page can't keep a
 secret, so a token in it is a token anyone can read.
 
+## `otlp_in`: a busy answer
+
+If a request's first batch can't reach every consumer directly downstream within 2 s (one full
+consumer is enough), `otlp_in` answers HTTP `503` with `Retry-After: 1`, or gRPC status 14
+(`UNAVAILABLE`), and delivers nothing. The exporter still holds the data and is expected to
+retry, as OTLP exporters do for these answers. A busy request counts
+`logit.input.requests{class="busy"}` once and each of its batches in
+`logit.input.batches.deferred`; neither is loss. Once a request's first batch is
+in, its later batches wait with no deadline, because a `503` would make the client resend a batch
+already delivered. See [ADR `otlp-in-busy-answer`](adr/otlp-in-busy-answer.md).
+
 ## `otlp_in`: a request no consumer took
 
 When every consumer directly downstream of `otlp_in` has closed, which happens as a shutdown tears
@@ -3464,10 +3498,10 @@ Agent. Any other `Content-Encoding` gets `415`.
 
 **A full pipeline gets `503`, not a blocked connection.** When the pipeline doesn't accept a
 request's batches within 5 seconds, `datadog_in` answers `503` with `Retry-After: 1` rather than
-holding the connection open, which is what `otlp_in` and `prometheus_in` do. The Agent's forwarder
-retries a `503` with backoff and holds the payload in its retry queue meanwhile, so nothing is lost
-until that queue fills. A blocked connection would instead cost the Agent 20 seconds before its own
-timeout, and then the same retry.
+holding the connection open, which is what `prometheus_in`'s remote-write receiver does. The
+Agent's forwarder retries a `503` with backoff and holds the payload in its retry queue meanwhile,
+so nothing is lost until that queue fills. A blocked connection would instead cost the Agent 20
+seconds before its own timeout, and then the same retry.
 
 - **A `503` means no consumer holds the batch that timed out.** Each batch goes to every consumer
   downstream of `datadog_in` or to none, however many there are, so the Agent's retry is its only
@@ -5480,7 +5514,9 @@ listener"](#idle_timeout-on-a-tcp-listener) above.
   `syslog_out` peers) and `logit.input.connections.rejected{reason="limit"}` (nonzero means the
   `max_connections` cap is binding), and `logit.input.connections.closed{reason="reset"}`, a
   peer that reset its connection after sending data. A reset that cut off a partial frame is also
-  counted `frames.dropped{reason="truncated"}`.
+  counted `frames.dropped{reason="truncated"}`. `connections.closed{reason="handshake_timeout"}`
+  counts a peer whose TLS accept or first-byte wait outlasted `handshake_timeout:`; it isn't a
+  loss.
 - Both: a handshake failure, a framing violation, or an oversize or malformed frame surfaces through
   `logit.component.diagnostics{key="connection_error"|"framing_error"}` and
   `logit.input.frames.dropped{reason="oversize"|"malformed"|"truncated"}`. There is no separate

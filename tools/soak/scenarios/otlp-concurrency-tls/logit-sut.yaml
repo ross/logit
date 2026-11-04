@@ -7,7 +7,7 @@
 admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
 components:
   otlp:
-    type: otlp_in                   # a slow downstream holds the request; never 503 busy
+    type: otlp_in                   # a slow downstream holds the first batch 2 s, then 503 busy
     bind: 0.0.0.0:4318
     protocol: http
     tls:

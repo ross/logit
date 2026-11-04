@@ -1,14 +1,15 @@
 # A receiver stalled behind a full receive buffer, then killed while it's frozen:
 # syslog-tcp-ingress's stream into `syslog_in` over TCP, with each socket buffer capped at 256 KiB.
 # A pause of the SUT stops it reading while its kernel keeps the connection; the generator writes
-# until both buffers fill, then its write stalls past `connect_timeout`, drops the connection, and
-# redials into the frozen listener's accept queue, filling another pair. A kill inside the pause
-# ends the process before it reads any of them, so every line the generator counted written into
-# those buffers is lost with nothing counting it (docs/known-gaps/sinks.md, "A stream sink doesn't
-# count the bytes its peer never acknowledged"). `ledger.wire` reports each stalled kill's loss and
-# holds it to its bound: what the generator counted after the SUT's last drain before the pause,
-# plus each connection's two buffers at `socket_buffers`. The schema is
-# docs/plans/soak-harness.md's "The scenario schema".
+# until both buffers fill, then its write stalls past `connect_timeout`, and its sink keeps the
+# connection with the frame's unwritten tail. A kill inside the pause ends the process before it
+# reads either buffer, and its kernel resets the connection. The generator counts what its send
+# queue held as `logit.output.bytes.dropped{reason="unacknowledged"}`; the lines the SUT's kernel
+# acknowledged and the process never read stay uncounted (docs/known-gaps/sinks.md, "A stream sink
+# counts only the sender's share of the bytes its receiver never acknowledged"). `ledger.wire`
+# reports each stalled kill's loss, requires the generator's count, and holds the rest to its
+# bound: what the generator counted after the SUT's last drain before the pause, plus the receive
+# buffer at `socket_buffers`. The schema is docs/plans/soak-harness.md's "The scenario schema".
 
 name = "syslog-stall-kill"
 description = "generator syslog_out (TCP, at_least_once) -> syslog_in, each socket buffer capped at 256 KiB -> kv -> kv_metrics -> aggregate 10s cumulative -> prometheus_out RW1 zstd -> VictoriaMetrics; the SUT killed inside two pauses"
@@ -63,7 +64,7 @@ action = "kill"
 on = "logit"
 for = "30s"
 
-# A 90 s stall, three times as long, for as many more redials into the frozen listener.
+# A 90 s stall, three times as long, which still holds one connection's buffers.
 [[step]]
 at = "2m30s"
 action = "pause"
@@ -127,6 +128,28 @@ step = "c0s3"
 window = "during"
 reduce = "max"
 min = 1
+
+# The generator keeps its one connection through each stall instead of redialing into the
+# frozen listener's accept queue. Its one redial follows the kill's restart, at the pause's end.
+[[expect]]
+name = "short-stall-keeps-connection"
+service = "generator"
+metric = "logit.output.reconnects"
+component = "syslog"
+step = "c0s1"
+window = "during"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "long-stall-keeps-connection"
+service = "generator"
+metric = "logit.output.reconnects"
+component = "syslog"
+step = "c0s3"
+window = "during"
+reduce = "delta"
+max = 0
 
 # Under at_least_once the generator resends an ambiguous batch and never drops one.
 [[expect]]

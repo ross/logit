@@ -1,6 +1,6 @@
 ---
 created: 2026-09-25
-updated: 2026-10-23
+updated: 2026-11-03
 ---
 
 # Splunk HEC: a lossless pair in the OpenTelemetry exporter's vocabulary, spans as HEC events, and opt-in acknowledgment
@@ -828,3 +828,22 @@ no event-level `host.name`, so a relay of their traffic is unchanged
 
 The 2026-10-14 amendment's "a `host.name` the batch carries always wins" now reads: a host the
 event or the batch carries always beats the process hostname.
+
+## Amendment (2026-11-03): the listener's ack ledger doesn't survive a restart
+
+Decision 5's ledger (`AckLedger`) is in memory only. A restarted `splunk_hec_in` has no record of
+the ids the old process issued, so it answers a poll for one `false`, the answer for any id not
+pending on the polled channel, and counts it `logit.input.acks.polled{result="unknown"}`. The old
+process had already taken the body into the pipeline before it issued the id, so nothing is lost
+whatever the client does next. `splunk_hec_out` under `ack: true` times out per `ack_timeout`,
+an `Ambiguous` fault: under `at_least_once`, the default, it resends the whole batch, a duplicate
+of a batch whose acks were pending at the restart, which is the at-least-once posture
+([ADR `delivery-semantics`](delivery-semantics.md)); under `at_most_once` it drops a batch the
+old process already took. No other client's answer to a forgotten id is recorded. The soak scenario
+`splunk-hec-ingress` counts it as `logit.output.acks{result="timeout"}` on the writer.
+
+**Decided, not open:** persisting the ledger would add a disk state to a stand-in for HEC, to
+spare clients a resend the posture already accepts, and an id's `true` still means "accepted into
+the pipeline", not "delivered by a sink". The operator's remedy is to dedupe downstream, or to
+accept the duplicates, as for the other duplicate windows in this ADR. This record has no
+observation of what Splunk answers for an id pending across its own restart.

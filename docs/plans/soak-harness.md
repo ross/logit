@@ -645,7 +645,9 @@ sut_transforms = ["parse", "labels", "count", "metrics_only"]   # optional, in o
   which the scenario's compose override sets, since a new network namespace copies the host's
   maxima. `load()` checks both values against the override (`scenario.compose_sysctls`). A
   `tcp` source needs it when a stalled kill, a `kill` inside a `pause` of the SUT, is on the
-  schedule, because `ledger.wire` bounds that kill's loss by it (§6).
+  schedule, because `ledger.wire` bounds that kill's uncounted loss by the `receive` value (§6).
+  The `send` value is checked but not used in the bound: the generator's sink counts what its
+  send queue held as `unacknowledged`.
 - With the role map: every source's `service` is a `generator`, and every `generator` in the
   stack has a source, because a generator with none would put lines into a listener with no
   G behind them.
@@ -1078,8 +1080,10 @@ in every inbox, `503` busy after 5 s with nothing taken and the batch in
 sum to its `logit.component.batches.sent`, and its `busy` ones equal `batches.deferred`, which
 `ledger.intake` holds it to in every life a kill didn't end; a SIGKILL loses the killed life's
 last interval of counts, so that life is reported unjudged. A busy `503` is a retry the producer makes, not loss. `otlp_in`
-counts no requests and never answers busy: a slow downstream holds the request, and a client
-that gives up leaves its batches to be delivered, so it has no identity beyond W − D == E + B.
+answers as `influxdb_in` does, under a 2 s deadline on a request's first batch, and counts its
+requests on `logs`, `metrics`, and `traces`, each a write route, so its row sums them. A request
+decodes to one batch per resource and `otlp_out` sends one resource per request, so both identities hold
+for every `otlp_out` writer.
 From W24 `splunk_hec_in` and `datadog_in` hold the same two identities as `influxdb_in`, on the
 write routes their writers post to, `event` and `series_v2`, under a 5 s deadline
 (`splunk_hec_in` on a request's first batch, `datadog_in` on every batch; a series body is one
@@ -1303,17 +1307,17 @@ The rows:
   A stalled kill, a `kill` that starts inside a `pause` of the SUT and ends with it, lands on a
   frozen process: Docker signals a paused container and then thaws it, and the process dies on
   the pending SIGKILL before it reads anything more. Its fault run is reported as a kill's is,
-  and its loss, G − W over the run, is also held to a bound (`checks._stalled_kill_bound`):
-  G from the SUT's last drain to the pause, read and never exported or still in the buffers,
-  plus each connection the generator opened before the kill times the source's
-  `socket_buffers` receive and send bytes, in lines at the generator sink's
-  `logit.output.batch.bytes` per `output.messages`, plus one batch per edge. A write stalled
-  past the generator's `connect_timeout` drops its connection, and the redial completes into
-  the frozen listener's accept queue, since the kernel finishes the handshake, and fills
-  another pair of buffers; the connections are 1 plus the generator sink's
-  `logit.output.reconnects` from the pause to one generator drain past the kill. A loss past
-  the bound FAILs; without `socket_buffers` or the generator's bytes the loss is reported with
-  no bound.
+  and its loss, G − W over the run, is also held to a bound (`checks._stalled_kill_bound`).
+  The generator's stream sink keeps its one stalled connection and counts what its send queue
+  held unacknowledged, when the receiver's reset destroys it, as
+  `logit.output.bytes.dropped{reason="unacknowledged"}` (U); `ledger.wire` requires U at each
+  stalled kill and FAILs a U past the loss. It holds the rest, loss less U, to G from the SUT's
+  last drain to the pause, read and never exported or still in the SUT's receive buffer, which
+  is at most the source's `socket_buffers` receive bytes, in lines at the generator sink's
+  `logit.output.batch.bytes` per `output.messages`, plus one batch per edge. The send buffer
+  and redials are not part of the bound; `logit.output.reconnects` over the pause is shown. A
+  loss past the bound FAILs; without `socket_buffers` or the generator's bytes the loss is
+  reported with no bound.
 
   On an HTTP wire (W14) the row judges G − (W − X), and every lifecycle fault, `partition`,
   and netem of the ingress SUT or of a generator, and a `mark` or `exit` on the ingress SUT,
@@ -2794,7 +2798,7 @@ where it needs them, and a small check extension.
     resend of a request the SUT took before the answer was lost is a surplus, allowed one
     batch per transport-error attempt, as a TCP window's is per ambiguous attempt. `otlp_in` has
     rows of its own in `checks.HTTP_LISTENERS`, with W per log record and per metric data
-    point (one `Event` each) and no request identity, for W13b's generator, which
+    point (one `Event` each) and the request identities summed over its three routes, for W13b's generator, which
     `otlp-fan-out` runs, and W23's, which `delta-datadog` runs.
     Built as `http-ingress`: each point carries a string field alone, so the SUT decodes no
     gauge, which V can't count, and `kv_metrics` counts one per point. Faults: netem delaying
@@ -5678,10 +5682,12 @@ of 650:
   dropped about half its batches (`overflow_newest`), fewer under the 30% egress loss, and
   through every outage all of them, 101,650 records over the run, none of them in G. A known-gaps candidate
   for `otlp_out` on a slow link, not a ledger finding.
-- **The backend stop backed up to the generator, as `otlp_in` has no busy answer.** The sink's
+- **The backend stop backed up to the generator, as `otlp_in` had no busy answer.** The sink's
   two-batch queue filled, the inboxes behind it held batches of four times the events, and
   `otlp_in` held each request past `otlp_out`'s 10 s timeout: 3 transport errors and 337
   batches' overflow on the generator through the stop, no sink drop, and `rss_slope` flat at +3.4 MiB/h.
+  `otlp_in` now answers busy after 2 s, so the stop reaches the generator as `503`s; see
+  "`otlp_in` answers busy, on `outq/w4`" below.
 - The pause, the stop, and the partition gave 19 transport-error attempts between them, and
   each judged run's surplus stayed inside its allowance once the boundaries netted.
 - No product finding.
@@ -6971,3 +6977,78 @@ acknowledged"). Each scenario ran once at its default length on the development 
 
 The 8-hour runs close the gap the 1 h runs of W17 and W18 left: a leak that grows per redial or
 per deletion did not show in either path over 8 hours.
+
+### A stalled receiver with the kept connection (2026-11-03)
+
+The stream sinks keep a stalled connection and count what a destroyed one held unacknowledged
+([ADR `stream-sink-stalled-connection`](../adr/stream-sink-stalled-connection.md)), so the four
+scenarios of "A backend kill's tail and a stalled receiver" ran again, once each at their default
+length on the development host, against `logit:soak-outq` built from `outq/w1`. Every row of
+the four runs passed. `ledger.wire` now requires the generator's
+`logit.output.bytes.dropped{reason="unacknowledged"}` (U) at each stalled kill and holds the
+loss less U to G from the SUT's last drain to the pause plus the receive buffer at
+`socket_buffers`, plus a batch per edge.
+
+| Scenario, stall | Lost before | Redials before | Lost after | U counted | Redials in the pause |
+|---|---|---|---|---|---|
+| `syslog-stall-kill`, 30 s | 21,339 | 5 | 3,865 | 88,664 bytes, 1,412 lines | 0 |
+| `syslog-stall-kill`, 90 s | 71,586 | 16 | 17,553 | 256,800 bytes, 4,089 lines | 0 |
+| `syslog-stall-kill-default`, 30 s | 35,163 | 4 | 4,651 | 102,592 bytes, 1,634 lines | 0 |
+| `syslog-stall-kill-default`, 90 s | 113,899 | 12 | 46,473 | 127,120 bytes, 2,024 lines | 0 |
+
+- **The loss no longer grows with redials.** `syslog-stall-kill` (`20261104T005055Z`) lost 3,865
+  and 17,553 lines, against 21,339 and 71,586 before. The uncounted rest, 2,453 and 13,463
+  lines, held 527 and 9,527 lines the listener read before the pause and never exported, and
+  each remainder, 1,926 and 3,936 lines at 62.8 bytes a line, was under the 4,174 lines one
+  256 KiB receive buffer holds. Its bounds were 4,901 and 13,902. The long stall's U, 256,800
+  bytes, is about the 256 KiB send buffer.
+- **Under default autotuning the receiver's share varied with the buffer's history.**
+  `syslog-stall-kill-default` (`20261104T005233Z`) lost 4,651 and 46,473 lines. Less the
+  listener's unexported 585 and 9,560, the receiver's share was 2,432 lines, about 150 KB, in
+  the short stall and 34,889, about 2.2 MB, in the long one, within bounds of 100,967 and
+  109,942 set by the 6 MiB receive maximum. U read only 102,592 and 127,120 bytes, which points to
+  a send buffer that grew little from its 16 KiB start. The harness uses the receive maximum because the kept
+  connection was read before the pause, so its buffer can be past its initial size, as the long
+  stall's was.
+- **A kill of a reader that keeps up still loses about one export interval.**
+  `syslog-tcp-ingress` (`20261104T010437Z`) passed with the reset step: the kill's gap read
+  9,838 lines, the stop's 18, and the generator counted no unacknowledged bytes. The generator
+  redialed 4 times, after the SUT's stop, its kill, its partition, and the reset, and none
+  during the pause, which read one ambiguous attempt and a surplus of 144 lines against 300
+  allowed.
+- **A backend kill's tail is unchanged.** `graphite-egress` (`20261104T010754Z`) read
+  M 11,000 − S 10,700 = 300 in its one SUT life against a bound of 400, as before, and the sink
+  counted no unacknowledged bytes at either kill, so all 300 are what VictoriaMetrics had taken
+  and not saved. Each of the four reconnect expectations read 1.
+
+### `otlp_in` answers busy, on `outq/w4` (2026-11-04)
+
+`otlp_in` now answers a request whose first batch finds no room within 2 s `503` (gRPC
+`UNAVAILABLE`), counts `logit.input.requests{route, class}` and `logit.input.batches.deferred`,
+and holds the sibling identities in `ledger.intake`
+([ADR `otlp-in-busy-answer`](../adr/otlp-in-busy-answer.md)). Each scenario ran once at its
+default length on the development host, against `logit:soak-outq-w4` built from the branch.
+Every row of the three runs passed.
+
+- **The backend stop now reaches the generator as busy answers, not timeouts.** `otlp-fan-out`
+  (`20261104T024349Z`, 16 minutes) read 13 busy `503`s, 13 deferred batches, and 13 `5xx`
+  answers at the generator through the VictoriaMetrics stop, with no transport error there; the
+  two transport errors came from the SUT's pause. W13b's run read 3 transport errors and 337
+  batches' overflow through the same stop; this one read 424 batches' overflow there, 2,025 over
+  the run, all counted. The overflow doesn't go away, since a busy answer leaves the batch in
+  the generator's queue, as a timeout did. `ledger.intake` read requests `ok` 5,024 against
+  `batches.sent` 5,024 and `busy` 13 against `deferred` 13 in life 0, and 2,609 and 0 in the
+  final life. `rss_slope` read +2.3 MiB/h on `logit`.
+- **With eight requests in flight, the stop still fills every slot.** `otlp-concurrency-tls`
+  (`20261104T024738Z`, 12 minutes) read 21 busy `503`s, 21 deferred, and 21 `5xx` answers, no
+  transport error, `in_flight` 8 through the stop on one HTTP/2 connection, and 362 batches'
+  overflow there, 462 over the run. G read 339,750 against the 2026-10-25 run's 341,050, with
+  no uncounted loss either time.
+- **The gRPC relay never went busy.** `otlp-grpc-egress` (`20261104T024738Z-2`, 17 minutes 50
+  seconds) read 106 requests at `collector`'s `otlp_in`, none busy and none deferred, and
+  `ledger.relay` balanced on all three `collector` lives (4,700, 1,600, and 4,300), as on
+  `soak/round3-followups`.
+- No product finding.
+
+The `otlp_in counts no requests` lines in W13b's and W23's recorded tables describe `otlp_in`
+before the change; they're left as recorded.

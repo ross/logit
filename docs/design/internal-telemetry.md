@@ -460,9 +460,11 @@ Without that handle, nothing is sampled.
 | `logit.process.uptime` | gauge | Seconds since `internal` started. |
 
 **The procfs points are Linux-only**, and each of their four sources (`status`, `stat`, `fd`,
-`limits`) latches off on its own first failed read, with one diagnostic: `debug` on a non-Linux
-build, `warn` for a failed read on Linux. A sandbox that hides one file silences only the points
-that file feeds. The allocator gauge doesn't depend on procfs.
+`limits`) latches off on its own first permanent failure, with one diagnostic: `debug` on a
+non-Linux build, `warn` for a missing, forbidden, or unparseable file on Linux. A sandbox that
+hides one file silences only the points that file feeds. A transient failure, such as `EMFILE` at
+the descriptor limit, skips that tick's points and retries on the next, with a throttled `warn`
+under the `procfs_status`, `procfs_stat`, `procfs_fd`, or `procfs_limits` key. The allocator gauge doesn't depend on procfs.
 
 **CPU is a delta, like every other `internal` counter.** The first tick's delta is CPU time since
 process start, so a cumulative total downstream equals the kernel's own counter. Every tick emits
@@ -540,7 +542,7 @@ config asked for never uses the word:
 
 | Name | Meaning | Tags |
 |---|---|---|
-| `*.dropped` | Loss: data that should have left `logit` and didn't, such as queue overflow, a destination's rejection, shutdown, a disk fault, an oversize item, malformed input, a closed consumer, a relative gauge or delta nothing upstream resolved, or a gap in `logit`'s own implementation. | Always `reason`, never `metric_kind`; `signal` or `route` where the counter needs one. |
+| `*.dropped` | Loss: data that should have left `logit` and didn't, such as queue overflow, a destination's rejection, bytes a stream sink's receiver never acknowledged, shutdown, a disk fault, an oversize item, malformed input, a closed consumer, a relative gauge or delta nothing upstream resolved, or a gap in `logit`'s own implementation. | Always `reason`, never `metric_kind`; `signal` or `route` where the counter needs one. |
 | `logit.component.events.discarded` | A filter, `sample`, `aggregate`, `cumulative_to_delta`, `dedup_timestamps`, `route_signals`, or Lua script removed an event because the config asked it to. A record `aggregate` or `cumulative_to_delta` dropped is counted under its own `*.dropped` as well. | None. |
 | `logit.component.events.copied` | A router delivered an event to more than one destination, or `route_signals` split one into a part per target; counts the deliveries past each event's first. Nothing is lost. | None. |
 | `*.omitted` | A piece (a tag, label, attribute, field, structured-data element, link, sample value, or a metric record or span beside a log body) removed from a record that's still delivered. | `reason` where more than one cause exists. |
@@ -921,15 +923,12 @@ and referenced below. A listener on `logit-inputs::tcp::TcpListener` records:
 | `logit.input.connections.rejected{reason="limit"}` | count | a connection closed at the connection cap, before any TLS handshake |
 | `logit.input.connections.rejected{reason="proxy_header"}` | count | a connection under `proxy_protocol: true` whose PROXY header was missing, malformed, cut short by the peer closing, or not complete within `handshake_timeout`; read before any TLS handshake |
 | `logit.input.accept.errors{reason="connection"\|"resource"\|"fatal"\|"other"}` | count | an `accept()` that failed, by class (`crates/logit-inputs/src/listener.rs`'s `classify_accept_error` has the table). `connection` retries at once; `resource` (fd exhaustion, realistically) and `other` back off 100 ms and continue; `fatal` ends the listener |
-| `logit.input.connections.closed{reason="idle"\|"shutdown"\|"reset"}` | count | `idle`: an operator-configured `idle_timeout:` closed the connection. Policy, not a fault: counted, never diagnosed, and only possible when the field is set. `reset`: on this driver only, the peer reset the connection (`ECONNRESET`) after its first payload byte, also diagnosed `connection_error`. Not a loss: a partial frame the reset cut off is counted `frames.dropped{reason="truncated"}`, and a reset between frames loses nothing. A reset before the first payload byte, which is how a load balancer ends a health check, isn't counted. A Unix stream socket shares the code but doesn't count one in practice: Linux resets a Unix peer only when the other end closes with bytes it hasn't read, and the driver never writes to a peer. `shutdown`: an HTTP listener (`otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, `influxdb_in`, and `prometheus_in`'s remote-write receiver) closed an open connection at shutdown, one count per connection whose close sequence finished before `run_input`'s backstop. It lands after the shutdown signal, so only a dedicated `internal` pipeline exports it (see "With a dedicated pipeline, `internal` drains last"). The stream listeners and `logit_in` don't count a shutdown close |
+| `logit.input.connections.closed{reason="idle"\|"shutdown"\|"reset"\|"handshake_timeout"}` | count | `idle`: an operator-configured `idle_timeout:` closed the connection. Policy, not a fault: counted, never diagnosed, and only possible when the field is set. `handshake_timeout`: on the stream driver (`statsd_in`, `syslog_in`, `graphite_in`, and `lines_in` under `transport: tcp`, and `statsd_in` and `lines_in` under `transport: unix_stream`) only, the TLS accept or the wait for the connection's first byte outlasted `handshake_timeout:`. Counted, never diagnosed, and not a loss, since nothing was framed. A PROXY header that times out is `connections.rejected{reason="proxy_header"}`. The HTTP listeners and `logit_in` bound the same phases but don't count the close yet. `reset`: on this driver only, the peer reset the connection (`ECONNRESET`) after its first payload byte, also diagnosed `connection_error`. Not a loss: a partial frame the reset cut off is counted `frames.dropped{reason="truncated"}`, and a reset between frames loses nothing. A reset before the first payload byte, which is how a load balancer ends a health check, isn't counted. A Unix stream socket shares the code but doesn't count one in practice: Linux resets a Unix peer only when the other end closes with bytes it hasn't read, and the driver never writes to a peer. `shutdown`: an HTTP listener (`otlp_in`, `datadog_in`, `datadog_trace_in`, `splunk_hec_in`, `influxdb_in`, and `prometheus_in`'s remote-write receiver) closed an open connection at shutdown, one count per connection whose close sequence finished before `run_input`'s backstop. It lands after the shutdown signal, so only a dedicated `internal` pipeline exports it (see "With a dedicated pipeline, `internal` drains last"). The stream listeners and `logit_in` don't count a shutdown close |
 | `logit.input.frames` / `logit.input.frame.bytes` | count/sum | frames received, at the protocol's own unit |
 | `logit.input.frames.dropped{reason="oversize"\|"drained"\|"malformed"\|"truncated"\|"undecodable"}` | count | the same per-reason shape `logit.proto.errors{reason}` uses. `drained` is a line-framed listener's line that crossed its bound before its `LF` arrived: counted once, after which the connection discards input until its next `LF`. `undecodable` is a frame the decoder rejected whole (the `bad_frame` diagnostic): the only reason counted *after* `logit.input.frames`, so it is also in that count |
 
 The driver's `Diagnostics` keys: `framing_error` (any `frames.dropped` reason), `bad_frame` (a
-decoder that rejects a whole frame), `connection_error` (I/O, a TLS handshake that failed or
-timed out, or a connection that sent no first byte inside `handshake_timeout` and so gave its
-permit back; never an idle close, nor a reset before the connection's first payload byte; a reset
-after it is also counted `connections.closed{reason="reset"}`), `proxy_header` (any `connections.rejected{reason="proxy_header"}`
+decoder that rejects a whole frame), `connection_error` (I/O, or a TLS accept that failed; never a TLS accept or first-byte wait that outlasted `handshake_timeout`, which is counted `connections.closed{reason="handshake_timeout"}`, never an idle close, nor a reset before the connection's first payload byte; a reset after it is also counted `connections.closed{reason="reset"}`), `proxy_header` (any `connections.rejected{reason="proxy_header"}`
 refusal), and `accept_error` (any `accept.errors` reason). These keys
 and the decoder's own `bad_line` throttle listener-wide rather than per connection, because a `Diagnostics` clone shares its original's
 counts ([ADR `service-lifecycle-and-output-retry`](../adr/service-lifecycle-and-output-retry.md)'s
@@ -1169,18 +1168,19 @@ idle close is
 `graceful_shutdown()`, a bounded grace, then drop, the same close a stalled request body's
 `408`/`grpc-status: 4` reaches.
 
-There's no frame or request counter. This input's unit of arrival is an HTTP request or a gRPC
-call, and `Fanout` already sees one batch per accepted request, so a counter would only restate it.
-The one request-level point is a refusal no batch records:
-`logit.input.requests.rejected{reason="auth"}` (count), one per request `auth:` refused, HTTP
-`401` or gRPC status 16, before its body was read.
+| Name | Kind | Meaning |
+|---|---|---|
+| `logit.input.requests{route, class}` | count | one per request or gRPC call, every exit included. `route` is `logs`, `metrics`, or `traces`, or `unknown` for a path or method this listener doesn't serve, on both transports; `class` is `ok`, `rejected` (any `4xx`, or a gRPC status other than 0 and 14), `busy`, or `closed_consumer`. A request whose client closes while it waits counts no class |
+| `logit.input.requests.rejected{reason="auth"}` | count | one per request `auth:` refused, HTTP `401` or gRPC status 16, before its body was read |
+| `logit.input.batches.deferred` | count | every batch of a request answered busy: HTTP `503` with `Retry-After: 1`, or gRPC status 14 (`UNAVAILABLE`), because its first batch found no room in every consumer within 2 seconds. Disjoint from `logit.component.batches.sent`. See below |
+| `logit.input.batches.dropped{reason="closed_consumer"}` | count | every batch of a request that no consumer took, the refused one included, because every consumer of the listener has closed. The request is answered as a busy one is, never with a `partial_success`. Not disjoint from `logit.component.batches.sent`: the refused batch is also counted there and once per consumer in `logit.component.events.dropped{reason="closed_consumer"}`; batches after it that were never offered appear only here |
 
-`logit.input.batches.dropped{reason="closed_consumer"}` (count): every batch of a request that no
-consumer took, the refused one included, because every consumer of the listener has closed. The
-request is answered HTTP `503` with `Retry-After: 1` or gRPC status 14 (`UNAVAILABLE`), never a
-`partial_success`. Not disjoint from `logit.component.batches.sent`: the refused batch is also
-counted there and once per consumer in `logit.component.events.dropped{reason="closed_consumer"}`;
-batches after it that were never offered appear only here.
+**A busy request is not a lost one.** Only a request's first batch waits under the bound, and it
+reaches every consumer or none (`Fanout::send_with_deadline`), so a busy answer leaves every
+batch of the request with the client, which retries it as the OTLP specification asks. Read a
+steady busy rate as a pipeline that can't keep up with its exporters. Once the first batch is in,
+the rest wait with no bound, so a request of several resources is never answered busy after part
+of it was taken ([ADR `otlp-in-busy-answer`](../adr/otlp-in-busy-answer.md)).
 
 The OTLP codec counts a metric with no data as
 `logit.input.metrics.skipped{metric_kind="unknown", reason="no_data"}`, and a histogram point
@@ -1189,7 +1189,8 @@ whose `count` isn't the sum of its bucket counts, which keeps its buckets, as
 (`crates/logit-proto/src/otlp/metrics.rs`).
 
 `Diagnostics` keys: `bound`, `request_rejected` (a request `auth:` refused; the peer address and
-why, never the credential, appear in the message text), `connection_error` (one connection's I/O
+why, never the credential, appear in the message text), `busy` (a busy answer), `closed_consumer`
+(a request no consumer took), `connection_error` (one connection's I/O
 failing, a TLS accept that failed or timed out, or a plaintext connection held open past `handshake_timeout` without a
 first byte, which then gave its permit back; never an idle close), `proxy_header` (any
 `connections.rejected{reason="proxy_header"}` refusal), and `forwarded` (under `forwarded:`, a request whose named header names no usable client; the header name and the reason appear in the message text, never the value; a request without the header isn't counted). A plaintext peer that *closes
@@ -1213,7 +1214,7 @@ would add one point per probe interval to this key forever.
 | bind | `logit.input.write.duration` | timing | one per request answered, every exit included, which is why the timer lives in one wrapper around the routing itself |
 | both | `logit.input.samples` | count | a different unit in each mode. See below. |
 
-These are this component's own spellings, not `otlp_in`'s, which counts only refused requests. In `logit.input.writes`:
+These are this component's own spellings, not `otlp_in`'s `logit.input.requests{route, class}`. In `logit.input.writes`:
 
 - `ok` carries the body's `encoding`, so a vmagent that stayed on its default zstd wire, rather
   than downgrading to Snappy, reads as `encoding="zstd"`. It counts a delivered write whose
@@ -1360,8 +1361,8 @@ and the same shared idle tracker (`crates/logit-inputs/src/http.rs`): `logit.inp
 `proxy_protocol: true`, `logit.input.connections.rejected{reason="proxy_header"}` counts a
 connection refused for its PROXY header, as on the shared TCP stream driver.
 
-**Unlike `otlp_in`, it counts requests.** A Datadog Agent posts to about a dozen routes, some of
-which this listener only acknowledges, so the `Fanout`'s batch count can't say which routes are
+**It counts requests by route.** A Datadog Agent posts to about a dozen routes, some of which
+this listener only acknowledges, so the `Fanout`'s batch count can't say which routes are
 arriving or which were refused.
 
 | Name | Kind | Meaning |
@@ -2191,7 +2192,7 @@ decision 1). For `statsd_out`, `syslog_out`, `graphite_out`, `collectd_out`, `in
 |---|---|---|
 | Encode-side | once per batch, however many attempts the runtime makes | `batch.bytes`; `messages.dropped` for a reason the encoder decided; `tags.omitted`, `tags.normalized`, `messages.skipped`, `messages.normalized`, `messages.truncated`, `fields.omitted`, `events.skipped`, `events.dropped`, `structured_data.omitted`; the codec counters of `statsd_out`, `graphite_out`, `collectd_out`, `otlp_out`, `prometheus_out`, `splunk_hec_out`, `datadog_out`, and `datadog_trace_out` (`metrics.dropped`, `metrics.skipped`, `metrics.degraded`, `metrics.normalized`, `attributes.normalized`, `identity.sanitized`, `labels.omitted`, `labels.normalized`, `spans.degraded`, `stats.dropped`, `stats.degraded`); `splunk_hec_out`'s `records.dropped{reason="oversize"}` for an object over `max_body_bytes`; `datadog_out`'s `records.dropped{reason="stale"\|"too_many_tags"\|"needs_agent_processing"\|"not_datadog_origin"}` and its `too_many_tags` diagnostic; both Datadog sinks' `records.dropped{reason="oversize"}` for an event too large to send alone; `influxdb_out`'s `metrics.dropped{reason="no_bucket"}` and its `no_bucket` diagnostic, for a batch it never sends; `kafka_out`'s `records.dropped{reason="oversize"}`, `records.unkeyed`, `events.skipped{reason="no_log"}`, `metrics.omitted{reason="format"}`, `spans.omitted{reason="format"}`, its `oversize` diagnostic, and under `format: otlp_proto` or `otlp_json` `events.skipped{reason="no_payload"}`, `attributes.normalized{reason="u64_as_double"}`, and the OTLP codec's `metrics.skipped`, `metrics.dropped`, and `metrics.degraded`; `file.rotations` and `file.reopens`; and every `logit.component.diagnostics` count an encoder emits, `datadog_trace_out`'s `bad_header` included |
 | Transport | once per attempt | `requests`, `request.duration`, `request.bytes`, `reconnects`, and what the attempt sent or had accepted: `messages`, `datagrams`, `datapoints`, `samples`, `records` |
-| Kernel or destination verdict, and packer backstop | once per attempt that meets it | `messages.dropped{reason="oversize_datagram"}`, from `EMSGSIZE` or from the packer's skip of an entry over the cap; `splunk_hec_out`'s `records.dropped{reason="invalid_event"}`, its `records.dropped{reason="oversize"}` from Splunk Cloud's oversize answer, `requests.rejected`, and `acks`; `datadog_out`'s `records.dropped{route="series", reason="rejected"}` from a series `202`'s body; `prometheus_out`'s `samples.dropped{reason="not_written"}` from a 2.0 receiver's written count; the Datadog sinks' `records.dropped{reason="oversize"}` for a request answered `413`; `otlp_out`'s `records.dropped{signal, reason="rejected"\|"ambiguous_at_most_once"}`, from a `partial_success` (`rejected` only) or a verdict that names a signal, and the Datadog sinks' `records.dropped{route, reason="rejected"\|"ambiguous_at_most_once"}` for a request answered with a verdict that names it (counted even when the send ends `Ok`); `kafka_out`'s `records.dropped{reason="rejected"\|"invalid_timestamp"\|"invalid_record"\|"ambiguous_at_most_once"}` for a partition batch; and the diagnostics a verdict raises (`remote_write_rejected`, `remote_write_version_unsupported`, `remote_write_samples_not_written`, `remote_write_samples_written_unreadable`, `otlp_partial_success`, `signal_rejected`, `invalid_event`, `token_rejected`, `request_refused`, `request_rejected`, `api_key_rejected`, `series_rejected`, `ack_unsupported`, `ack_timeout`, `oversize` for Splunk Cloud's answer, and `kafka_out`'s `rejected`, `invalid_timestamp`, and `invalid_record`). `otlp_out`, `datadog_out`, `datadog_trace_out`, and `kafka_out` meet each of their verdicts at most once per batch, because a retry never resends a signal, request, or partition batch the destination settled; only `splunk_hec_out` and the datagram sinks meet one again on a retry |
+| Kernel or destination verdict, and packer backstop | once per attempt that meets it | `messages.dropped{reason="oversize_datagram"}`, from `EMSGSIZE` or from the packer's skip of an entry over the cap; `splunk_hec_out`'s `records.dropped{reason="invalid_event"}`, its `records.dropped{reason="oversize"}` from Splunk Cloud's oversize answer, `requests.rejected`, and `acks`; `datadog_out`'s `records.dropped{route="series", reason="rejected"}` from a series `202`'s body; `prometheus_out`'s `samples.dropped{reason="not_written"}` from a 2.0 receiver's written count; the Datadog sinks' `records.dropped{reason="oversize"}` for a request answered `413`; `otlp_out`'s `records.dropped{signal, reason="rejected"\|"ambiguous_at_most_once"}`, from a `partial_success` (`rejected` only) or a verdict that names a signal, and the Datadog sinks' `records.dropped{route, reason="rejected"\|"ambiguous_at_most_once"}` for a request answered with a verdict that names it (counted even when the send ends `Ok`); `kafka_out`'s `records.dropped{reason="rejected"\|"invalid_timestamp"\|"invalid_record"\|"ambiguous_at_most_once"}` for a partition batch; the stream driver's `bytes.dropped{reason="unacknowledged"}` and its `unacknowledged` diagnostic, once per TCP connection that ends with earlier batches' bytes unacknowledged; and the diagnostics a verdict raises (`remote_write_rejected`, `remote_write_version_unsupported`, `remote_write_samples_not_written`, `remote_write_samples_written_unreadable`, `otlp_partial_success`, `signal_rejected`, `invalid_event`, `token_rejected`, `request_refused`, `request_rejected`, `api_key_rejected`, `series_rejected`, `ack_unsupported`, `ack_timeout`, `oversize` for Splunk Cloud's answer, and `kafka_out`'s `rejected`, `invalid_timestamp`, and `invalid_record`). `otlp_out`, `datadog_out`, `datadog_trace_out`, and `kafka_out` meet each of their verdicts at most once per batch, because a retry never resends a signal, request, or partition batch the destination settled; only `splunk_hec_out` and the datagram sinks meet one again on a retry |
 
 The sinks with encoders count the first class through a gate `Output::observe_batch` arms
 (`crates/logit-outputs/src/accounting.rs`); `stdio_out` and `file_out` count after the write that
@@ -2348,10 +2349,19 @@ itself. The sink emits each once per batch, however many attempts the runtime ma
   steady state means the peer or the network, not this sink, is unstable. Counted on plaintext and
   TLS (RFC 5425) connections alike, because both go through the pooled-stream driver
   `statsd_out` and `graphite_out` share (`crates/logit-outputs/src/stream.rs`). A failed connect
-  doesn't count. UDP is connectionless and never reports it.
+  doesn't count. A receiver that stops reading doesn't raise it: the driver keeps the stalled
+  connection while the peer still answers. UDP is connectionless and never reports it.
+- `logit.output.bytes.dropped{reason="unacknowledged"}` (count, TCP only): when a pooled
+  connection ends with its data destroyed (the receiver's reset or close, unsolicited bytes, a TLS
+  alert, or a failed write), the bytes of earlier batches its send queue still held that the
+  receiver never acknowledged, read with `SIOCOUTQ` before the close, with a throttled
+  `unacknowledged` warning. Bytes on the wire: under TLS, ciphertext. The attempt that met the
+  close counts its own batch through `requests` and its posture, so its bytes are left out. What
+  the receiver had acknowledged into its own buffer, a stall's closed connection, and shutdown are
+  never counted (`docs/known-gaps/sinks.md`). Linux only.
 
-`Diagnostics` keys: `invalid_structured_data`, `message_truncated`, `oversize_datagram`, and
-`oversize_header`, mirroring the counters above.
+`Diagnostics` keys: `invalid_structured_data`, `message_truncated`, `oversize_datagram`,
+`oversize_header`, and `unacknowledged`, mirroring the counters above.
 
 ##### `statsd_out`
 
@@ -2414,6 +2424,8 @@ itself. The sink emits each once per batch, however many attempts the runtime ma
   Under `unix` it counts each reconnect of the connected datagram socket after a timeout or a gone
   receiver ([ADR `datadog-agent-and-intake-relay`](../adr/datadog-agent-and-intake-relay.md),
   decision 12). UDP is connectionless and never reports it.
+- `logit.output.bytes.dropped{reason="unacknowledged"}` (count, `tcp` only): as for `syslog_out`.
+  A `unix_stream` receiver's close frees the queue the count reads, so nothing is counted there.
 
 A `MetricKind::GaugeDelta` reaching this encoder with `relative_gauges: false` reports under
 `logit.component.diagnostics{key="gauge_delta_unresolved"}`, the same key `influxdb_out` uses, so
@@ -2482,6 +2494,7 @@ under one component id, as for `collectd_out`. The sink adds only what a socket 
   both transports.
 - `logit.output.reconnects` (count, TCP only): every connect *after* the first, including the
   redial after the probe finds a pooled connection closed, as for `syslog_out`.
+- `logit.output.bytes.dropped{reason="unacknowledged"}` (count, TCP only): as for `syslog_out`.
 - `logit.output.messages`: entries actually sent (one plaintext line, or one
   already-length-prefixed pickle frame).
 - `logit.output.datapoints`: Σ each sent entry's own datapoint count (`MessageBuf<usize>`'s `meta`).
