@@ -111,11 +111,11 @@
 //! **Once the first batch is delivered, the rest wait without a deadline.** A `/event` body
 //! carrying several envelopes decodes to one batch per resource, and a `503` after one of them was
 //! delivered would make the client's retry deliver it twice. So the remaining batches go through
-//! [`deliver_detached`], which waits until the pipeline takes them, however long that is, and the
-//! request is answered (`200`, or a prefix's code 6); `idle_timeout` doesn't close a connection
-//! with a request in flight. A client that closes the connection while it waits still gets every
-//! batch delivered; it saw no answer, so its retry duplicates the body, the ordinary at-least-once
-//! outcome.
+//! [`crate::http::deliver_detached`], which waits until the pipeline takes them, however long
+//! that is, and the request is answered (`200`, or a prefix's code 6); `idle_timeout` doesn't
+//! close a connection with a request in flight. A client that closes the connection while it
+//! waits still gets every batch delivered; it saw no answer, so its retry duplicates the body, the
+//! ordinary at-least-once outcome. [`crate::http::deliver_first_bounded`] holds both steps.
 //!
 //! **A batch no consumer takes is refused.** When every consumer of the listener has closed, a
 //! refused first batch is answered as busy is (`503` code 9, `Retry-After: 1`, nothing of the
@@ -148,8 +148,8 @@
 
 use crate::http::{
     body_read_error_message, collect_with_stall_bound, declared_length, decompress,
-    deliver_detached, deliver_with_deadline, drive_connection, is_length_limit, json_response,
-    now_nanos, Activity, BodyReadError, DecompressError, Encoding, Undelivered,
+    deliver_first_bounded, drive_connection, is_length_limit, json_response, now_nanos, Activity,
+    BodyReadError, DecompressError, Encoding, Undelivered, Unfinished,
 };
 use crate::listener::Prelude;
 use crate::peer::ConnectionPeer;
@@ -1119,54 +1119,44 @@ async fn respond(
     // Every batch, before the first is delivered: the split below delivers a prefix that a code 6
     // or a closed consumer can follow.
     request_peer.stamp_batches(&mut batches);
-    if !batches.is_empty() {
-        // Only the first batch waits under the deadline: once one is delivered, a `503` would
-        // tell the client nothing was taken, and its retry would deliver that batch twice.
-        let total = batches.len();
-        let mut batches = batches.into_iter();
-        let first: Vec<EventBatch> = batches.by_ref().take(1).collect();
-        match deliver_with_deadline(&shared.sink, first, shared.busy_after).await {
-            Ok(()) => {
-                // Only a delivery clears a busy `/health`: a body the codec skipped whole says
-                // nothing about the pipeline.
-                shared.health.mark_accepted();
-                // The drop is counted on the delivery's task, so a client that closes mid-wait
-                // doesn't leave it uncounted.
-                let settle = {
-                    let (telemetry, diag) = (shared.telemetry.clone(), shared.diag.clone());
-                    let peer = shared.peer.clone();
-                    move |outcome: Result<(), Undelivered>| {
-                        if let Err(undelivered) = outcome {
-                            count_closed(&telemetry, diag, &peer, undelivered.count());
-                        }
-                    }
-                };
-                let delivered = deliver_detached(&shared.sink, batches.collect(), settle).await;
-                if let Err(undelivered) = delivered {
-                    // Before the `ackId` draw, so a refused body mints no id.
-                    let response = hec_response(HecStatus::INTERNAL_SERVER_ERROR);
-                    return (name, undelivered.reason(), response);
-                }
+    // The drop is counted on the delivery's task, so a client that closes mid-wait doesn't
+    // leave it uncounted.
+    let settle = {
+        let (telemetry, diag) = (shared.telemetry.clone(), shared.diag.clone());
+        let peer = shared.peer.clone();
+        move |outcome: Result<(), Undelivered>| {
+            if let Err(undelivered) = outcome {
+                count_closed(&telemetry, diag, &peer, undelivered.count());
             }
-            Err(Undelivered::Busy(_)) => {
-                // The whole body, not only the batch the deadline refused: a `503` code 9 leaves
-                // every batch with the client.
-                Undelivered::Busy(total).record(&shared.telemetry);
-                shared.diag.clone().warn_throttled(
-                    "busy",
-                    format_args!(
-                        "splunk_hec_in: answered 503 to {}: the pipeline did not accept a batch \
-                         within {:?}",
-                        shared.peer, shared.busy_after
-                    ),
-                );
-                shared.health.mark_busy();
-                return (name, BUSY, server_busy());
-            }
-            Err(undelivered @ Undelivered::Closed(_)) => {
-                count_closed(&shared.telemetry, shared.diag.clone(), &shared.peer, total);
-                return (name, undelivered.reason(), server_busy());
-            }
+        }
+    };
+    // Only the first batch waits under the deadline (`deliver_first_bounded`). Only a delivery
+    // clears a busy `/health`: a body the codec skipped whole says nothing about the pipeline.
+    let accepted = || shared.health.mark_accepted();
+    match deliver_first_bounded(&shared.sink, batches, shared.busy_after, accepted, settle).await {
+        Ok(()) => {}
+        Err(Unfinished { undelivered: undelivered @ Undelivered::Busy(_), .. }) => {
+            // The whole body, not only the batch the deadline refused: a `503` code 9 leaves
+            // every batch with the client.
+            undelivered.record(&shared.telemetry);
+            shared.diag.clone().warn_throttled(
+                "busy",
+                format_args!(
+                    "splunk_hec_in: answered 503 to {}: the pipeline did not accept a batch \
+                     within {:?}",
+                    shared.peer, shared.busy_after
+                ),
+            );
+            shared.health.mark_busy();
+            return (name, BUSY, server_busy());
+        }
+        Err(Unfinished { undelivered, taken: false }) => {
+            return (name, undelivered.reason(), server_busy());
+        }
+        Err(Unfinished { undelivered, taken: true }) => {
+            // Before the `ackId` draw, so a refused body mints no id.
+            let response = hec_response(HecStatus::INTERNAL_SERVER_ERROR);
+            return (name, undelivered.reason(), response);
         }
     }
     // Drawn once from the channel's ledger, for a `200` or a delivered prefix's code 6 alike.

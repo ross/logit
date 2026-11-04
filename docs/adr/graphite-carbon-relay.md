@@ -1,6 +1,6 @@
 ---
 created: 2026-09-13
-updated: 2026-10-21
+updated: 2026-11-03
 ---
 
 # Graphite/Carbon relay: untyped datapoints as `Gauge`, tags as attributes, a restricted pickle codec, and a multi-value switch
@@ -220,8 +220,8 @@ possibly-slow `Fanout::send`.
 slow `sink.send(batch).await` blocking the per-connection read loop stalls that connection's socket
 buffer, which the sending client feels directly as its own write blocking — the same argument
 `otlp_in`'s module doc made at the time ("This is the first listener with real backpressure to
-its source... TCP... has no such escape hatch"; today its "Backpressure reaches the client"
-paragraph, `crates/logit-inputs/src/otlp.rs`) and the same
+its source... TCP... has no such escape hatch"; today its "Backpressure: a bounded wait,
+then busy" paragraph, `crates/logit-inputs/src/otlp.rs`, per [ADR `otlp-in-busy-answer`](otlp-in-busy-answer.md)) and the same
 shape `logit_in`'s connection loop relies on. So `graphite_in`'s TCP half carries **no
 `ReceiveQueue`**: nothing between a connection's read buffer and its own `BatchAccumulator`/
 `Fanout::send` needs bounding beyond the connection cap already established by `logit_in`

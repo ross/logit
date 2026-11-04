@@ -344,7 +344,9 @@
 //!
 //! TCP sends one octet-counted frame per batch through the pooled-stream driver in
 //! `crate::stream`, shared with `statsd_out` and `graphite_out`; its module doc lists the
-//! fault rules. On TLS a write `Err` is `Fault::Ambiguous`, and on both a batch is called
+//! fault rules, and why a receiver that stops reading keeps its connection and a connection that
+//! ends with bytes unacknowledged counts `logit.output.bytes.dropped{reason="unacknowledged"}`.
+//! On TLS a write `Err` is `Fault::Ambiguous`, and on both a batch is called
 //! delivered only after a flush. A new TLS 1.3 connection to a server that asks for a client
 //! certificate reads for `accept_timeout:` (default 1 s, [`SyslogOutput::with_accept_timeout`])
 //! before its first write, so a rejected certificate is a `Fault::Refused` that holds the queue
@@ -1807,7 +1809,8 @@ impl SyslogOutput {
                     sink: "syslog_out",
                     nodelay: false,
                 };
-                let result = pool.send(&dial, &self.frame_buf, &self.telemetry).await;
+                let result =
+                    pool.send(&dial, &self.frame_buf, &self.telemetry, &mut self.diag).await;
                 if result.is_ok() {
                     self.telemetry.count("logit.output.messages", self.messages.len() as f64, &[]);
                 }
@@ -1842,8 +1845,8 @@ impl Output for SyslogOutput {
     /// drops its connection, so there's normally nothing left to flush. On TLS "flushed" is a
     /// property of the session, not the socket, which is why it stays.
     async fn flush(&mut self) -> anyhow::Result<()> {
-        if let Conn::Tcp { pool, .. } = &mut self.conn {
-            pool.flush().await.context("flushing syslog_out TCP stream")?;
+        if let Conn::Tcp { pool, connect_timeout } = &mut self.conn {
+            pool.flush(*connect_timeout).await.context("flushing syslog_out TCP stream")?;
         }
         Ok(())
     }

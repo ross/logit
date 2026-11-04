@@ -446,7 +446,9 @@
 //! connect after the first counts `logit.output.reconnects`, on TLS and plaintext alike.
 //!
 //! The stream transports send through the driver in `crate::stream`, shared with `syslog_out`
-//! and `graphite_out`; its module doc lists the fault rules. On TLS a write `Err` is
+//! and `graphite_out`; its module doc lists the fault rules, and why a receiver that stops
+//! reading keeps its connection and a TCP connection that ends with bytes unacknowledged counts
+//! `logit.output.bytes.dropped{reason="unacknowledged"}`. On TLS a write `Err` is
 //! `Fault::Ambiguous`, not retried under this sink's default posture ("Delivery posture" below).
 //! A new TLS 1.3 connection to a server that asks for a client certificate reads for
 //! `accept_timeout:` (default 1 s, [`StatsdOutput::with_accept_timeout`]) before its first write,
@@ -2665,7 +2667,7 @@ impl StatsdOutput {
                     sink: "statsd_out",
                     nodelay: false,
                 };
-                let result = pool.send(&dial, &self.packet_buf, &self.telemetry).await;
+                let result = pool.send(&dial, &self.packet_buf, &self.telemetry, report.diag).await;
                 count_stream_send(&self.telemetry, self.lines.len(), result)
             }
             Conn::UnixStream { pool, connect_timeout } => {
@@ -2684,7 +2686,7 @@ impl StatsdOutput {
                     sink: "statsd_out",
                     nodelay: false,
                 };
-                let result = pool.send(&dial, &self.packet_buf, &self.telemetry).await;
+                let result = pool.send(&dial, &self.packet_buf, &self.telemetry, report.diag).await;
                 count_stream_send(&self.telemetry, self.lines.len(), result)
             }
         };
@@ -2715,8 +2717,10 @@ impl Output for StatsdOutput {
     /// `send` flushes and retains nothing between calls, so this only flushes a stream as a
     /// backstop at shutdown.
     async fn flush(&mut self) -> anyhow::Result<()> {
-        if let Conn::Tcp { pool, .. } | Conn::UnixStream { pool, .. } = &mut self.conn {
-            pool.flush().await.context("flushing statsd_out stream")?;
+        if let Conn::Tcp { pool, connect_timeout } | Conn::UnixStream { pool, connect_timeout } =
+            &mut self.conn
+        {
+            pool.flush(*connect_timeout).await.context("flushing statsd_out stream")?;
         }
         Ok(())
     }
