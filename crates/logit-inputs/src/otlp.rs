@@ -798,7 +798,8 @@ async fn handle_http(
     activity: &Activity,
     stall: Option<std::time::Duration>,
 ) -> Result<http::Response<Full<Bytes>>, std::convert::Infallible> {
-    let route = route_name(route_path(req.uri().path()));
+    let route =
+        route_name((req.method() == Method::POST).then(|| route_path(req.uri().path())).flatten());
     let (class, response) = respond_http(req, sink, &telemetry, gate, peer, activity, stall).await;
     telemetry.count("logit.input.requests", 1.0, &[("route", route), ("class", class)]);
     Ok(response)
@@ -1026,7 +1027,8 @@ async fn handle_grpc(
     activity: &Activity,
     stall: Option<std::time::Duration>,
 ) -> Result<http::Response<GrpcBody>, std::convert::Infallible> {
-    let route = route_name(grpc_signal(req.uri().path()));
+    let route =
+        route_name((req.method() == Method::POST).then(|| grpc_signal(req.uri().path())).flatten());
     let (class, response) = respond_grpc(req, sink, &telemetry, gate, peer, activity, stall).await;
     telemetry.count("logit.input.requests", 1.0, &[("route", route), ("class", class)]);
     Ok(response)
@@ -2969,7 +2971,7 @@ mod tests {
     }
 
     /// Every request counts once in `logit.input.requests{route, class}`: the signal it posted,
-    /// or `unknown` for a path this listener doesn't serve.
+    /// or `unknown` for a path or method this listener doesn't serve.
     #[tokio::test]
     async fn requests_are_counted_by_route_and_class() {
         let (addr, _running, mut channels, mut probe) =
@@ -2981,11 +2983,16 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 404"), "got: {response}");
         let response = export_http(&addr, "/v1/logs", b"not protobuf").await;
         assert!(response.starts_with("HTTP/1.1 400"), "got: {response}");
+        let mut client = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let get = format!("GET /v1/metrics HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+        client.write_all(get.as_bytes()).await.unwrap();
+        let response = crate::http::read_response(&mut client, "the GET").await;
+        assert!(response.starts_with("HTTP/1.1 404"), "got: {response}");
 
         let ok = [("route", "metrics"), ("class", "ok")];
         assert_eq!(probe.sum("logit.input.requests", &ok), 1.0);
         let unknown = [("route", "unknown"), ("class", "rejected")];
-        assert_eq!(probe.sum("logit.input.requests", &unknown), 1.0);
+        assert_eq!(probe.sum("logit.input.requests", &unknown), 2.0, "a wrong method is unknown");
         let malformed = [("route", "logs"), ("class", "rejected")];
         assert_eq!(probe.sum("logit.input.requests", &malformed), 1.0);
     }
