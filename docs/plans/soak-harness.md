@@ -6891,6 +6891,13 @@ What the runs showed about `logit` and the harness:
 - **No warning line accompanies a limit refusal or a timeout close.** Neither run logged a WARN
   for the 801 and 810 refusals or the 80 and 24 timeout closes; each is counted, and none is a
   `*.dropped`, so the loss vocabulary asks for no line. Not a finding.
+- **`max_open` in the two runs above is the old count.** The client sampled it right after
+  each `create_connection`, before a read saw the listener's close, so it read 24 of 24 with 15
+  slots free. It now samples at each tick after the read pass, so it means the connections the
+  listener let the client hold; the recorded runs' numbers have not been redone.
+- **A killed client no longer leaks.** `compose down --remove-orphans` doesn't remove a
+  container with no `config-hash` label (Compose 5.6.0), so teardown force-removes the
+  project's `<project>-slowclient-` containers first.
 - **Self-test**: 3,035 expectations. Each new rule was reverted in turn and failed at least one
   expectation, 36 in all: the client's modes, sends, head, endless head, trickle, redial, the
   half-open first byte and acknowledgment wait, its usage rule; the apply's network inspect, the

@@ -100,7 +100,6 @@ class Client:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.dialed += 1
         self.open[sock] = trickled(self.host, self.send)
-        self.max_open = max(self.max_open, len(self.open))
         self.selector.register(sock, selectors.EVENT_READ)
         if not self.write(sock, head(self.host, self.send)):
             return
@@ -129,7 +128,14 @@ class Client:
         for _ in range(self.connections - len(self.open)):
             self.dial()
 
+    def sample(self):
+        """Counts the connections held now toward `max_open`. It runs after a read pass has
+        dropped the ones the listener closed, so a connection the listener accepted and shut at
+        once never counts."""
+        self.max_open = max(self.max_open, len(self.open))
+
     def tick(self):
+        self.sample()
         if self.mode == "trickle":
             for sock in list(self.open):
                 self.write(sock, bytes([next(self.open[sock])]))
@@ -166,6 +172,7 @@ class Client:
         self.fill()
         if self.mode == "half_open":
             self.wait_acked()
+            self.sample()
             print(json.dumps(self.counts("ready")), flush=True)
             while True:
                 time.sleep(3600)

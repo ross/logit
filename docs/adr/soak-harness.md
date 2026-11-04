@@ -972,8 +972,12 @@ SIGTERM, records the counts it prints, and removes it.
   no connection, leaves a byte unacknowledged before a half-open cut, or isn't running at the
   revert, or a disconnect that fails, is `rc` 1, and `timeline` FAILs it. The record carries
   the client's counts, which `timeline` reports.
-- **Labeled into the compose project**, so `compose down --remove-orphans` removes a client a
-  crashed run left behind.
+- **Labeled into the compose project and removed by teardown.** `compose down
+  --remove-orphans` doesn't remove a container with no `config-hash` label (verified on
+  Compose 5.6.0), so a client an interrupted run left would hold the project network and make
+  the next run's `docker run --name` conflict. Teardown force-removes the project's
+  `<project>-slowclient-` containers before `down` and records the count in a `strays` phase.
+  No other one-shot can leak this way: each of the rest runs in the foreground under `--rm`.
 - **On a SUT only, and never in a `[random]` schedule**, which can't set `address`, `mode`, or
   `connections`.
 

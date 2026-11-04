@@ -1029,6 +1029,10 @@ class _AnswerDocker:
     def project_containers(self):
         return []
 
+    def remove_strays(self, timeout=None):
+        self.calls.append(["remove_strays"])
+        return []
+
     def run(self, args, timeout=None, stdout=None, stderr=None):
         return self._ok(args)
 
@@ -1102,7 +1106,9 @@ def _stall_abort(root):
         expect(stall is not None and phases.count("stalled") == 1
                and phases[phases.index("stalled"):phases.index("stalled") + 3]
                == ["stalled", "aborted", "end_begin"]
-               and "end_end" in phases and "down" in phases,
+               and "end_end" in phases and "down" in phases
+               and phases[phases.index("down") - 1] == "strays"
+               and ["remove_strays"] in fake.calls,
                f"a stall records stalled and aborted, then runs the end sequence to end_end, "
                f"got {phases}")
         late = [r for r in timeline if r.get("event") in ("apply", "revert")
@@ -13532,9 +13538,9 @@ def _slowclient_client():
                                       "none"], 1.0)
         done = lines[-1] if lines else {}
         expect(rc == 0 and done.get("sent_bytes") == 0 and listener.received() == [b""]
-               and done.get("dialed", 0) > 3 and done.get("max_open") == 3,
-               f"a silent client sends nothing, holds its connections, and dials again the "
-               f"ones the listener closes, got rc {rc} {lines} {err}")
+               and done.get("dialed", 0) > 3 and done.get("max_open") == 1,
+               f"a silent client sends nothing, dials again the ones the listener closes, and "
+               f"counts as held only the one the listener kept, got rc {rc} {lines} {err}")
     finally:
         listener.close()
     for send in ("http_head", "http_body"):
@@ -13613,6 +13619,33 @@ class _SlowclientDocker:
 
     def __getattr__(self, name):
         raise AssertionError(f"_SlowclientDocker.{name} called")
+
+
+def _stray_removal():
+    """Teardown removes a client container compose doesn't own: `remove_strays` lists the
+    project's `<project>-slowclient-` containers, including stopped ones, and force-removes
+    them, and removes nothing when none is listed."""
+    class Recorded(docker.Docker):
+        def __init__(self, listing):
+            super().__init__("soak-x", [], [], prefix=[])
+            self.calls = []
+            self.listing = listing
+
+        def run(self, args, timeout=None, stdout=None, stderr=None):
+            self.calls.append(list(args))
+            return docker.Result(0, self.listing if args[0] == "ps" else "", "")
+
+    some = Recorded("aa\nbb\n")
+    gone = some.remove_strays()
+    expect(gone == ["aa", "bb"] and some.calls[0][:2] == ["ps", "-aq"]
+           and "label=com.docker.compose.project=soak-x" in some.calls[0]
+           and "name=^soak-x-slowclient-" in some.calls[0]
+           and some.calls[1] == ["rm", "-f", "aa", "bb"],
+           f"teardown lists and force-removes the project's slowclient containers, "
+           f"got {some.calls}")
+    none = Recorded("")
+    expect(none.remove_strays() == [] and len(none.calls) == 1,
+           f"with no stray, nothing is removed, got {none.calls}")
 
 
 def _slowclient_actions():
@@ -15241,13 +15274,15 @@ def _delta_ledger():
                f"{killed['ledger.value']}")
         # A 2xx the stand-in answered after the killed life's last drain at +100 and before
         # the kill at +101: the sink counted it in a drain the kill took. One before that drain
-        # the life should have counted.
+        # the life should have counted, and one after the kill, in the dead life's span before
+        # the restart, no drain could have held.
         def answered_at(offset):
             def edit(requests):
                 return requests + [_datadog_request(len(requests) + 1, offset, [])]
             return edit
 
-        for offset, status in ((100.5, checks.PASS), (98.5, checks.WARN)):
+        for offset, status in ((100.5, checks.PASS), (98.5, checks.WARN),
+                               (102.5, checks.WARN)):
             tail = rows(f"delta-kill-tail-{offset}", restart=True, action="kill",
                         edit=answered_at(offset),
                         counted=lambda r, at=T0 + offset: r["t"] != at)["ledger.standin"]
@@ -17106,7 +17141,7 @@ def run(root, quiet=False):
                      _reopen_checks, _tls_rules, _tls_actions, _tls_driver, _tls_checks,
                      _reset_actions, _reset_rules, _prlimit_actions, _prlimit_rules,
                      _cgroup_actions, _cgroup_rules, _slowclient_client,
-                     _slowclient_actions, _slowclient_rules,
+                     _slowclient_actions, _stray_removal, _slowclient_rules,
                      _fan_out_ledger, _idle_writer, _boundary_skew, _fan_out_rules,
                      _sampling_vectors, _absent_rules, _absent_checks, _merge_ledger,
                      _merge_rules, _delta_ledger, _delta_rules, _scrape_ledger,

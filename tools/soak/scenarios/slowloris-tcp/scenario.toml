@@ -136,6 +136,38 @@ window = "during"
 reduce = "delta"
 min = 8
 
+# The generator's one connection stays open through each client's window: a redial into the
+# full slots would be refused, so a reconnect names itself here.
+[[expect]]
+name = "generator-keeps-connection-silent"
+service = "generator"
+metric = "logit.output.reconnects"
+component = "statsd"
+step = "c0s1"
+window = "during"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "generator-keeps-connection-trickle"
+service = "generator"
+metric = "logit.output.reconnects"
+component = "statsd"
+step = "c0s2"
+window = "during"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "generator-keeps-connection-half-open"
+service = "generator"
+metric = "logit.output.reconnects"
+component = "statsd"
+step = "c0s3"
+window = "during"
+reduce = "delta"
+max = 0
+
 [[expect]]
 name = "fds-released"
 service = "logit"

@@ -57,8 +57,10 @@ Facts a maintainer needs here (docs/plans/soak-harness.md, "Netem scope"):
   own: the client's sockets stay established with no interface under them, so the listener's
   end sees a peer that sends nothing and answers nothing, and no FIN or RST ever leaves. The
   revert stops the client with SIGTERM, records its `done` line, and removes it; its
-  connections close with it, a half-open one silently. The container carries the compose
-  project's labels, so `compose down --remove-orphans` removes one a crashed run left.
+  connections close with it, a half-open one silently. Compose doesn't remove a container it
+  has no `config-hash` label for, so `--remove-orphans` leaves a crashed run's client; the
+  driver's teardown force-removes the project's `<project>-slowclient-` containers before
+  `down`.
 - A `kill` is `docker kill -s KILL`: the process gets no shutdown signal, so it writes no final
   `internal` drain, no shutdown drops, and no `exiting` or `drain complete` line, and the container
   exits with `KILL_EXIT_CODE`. Its revert is a `docker start`, as a `stop`'s is. The container is
@@ -154,8 +156,9 @@ SLOWCLIENT_SOURCE = Path(slowclient.__file__).read_text()
 SLOWCLIENT_READY_S = 30.0
 SLOWCLIENT_POLL_S = 0.25
 SLOWCLIENT_STOP_S = 5
-# The compose labels a client container carries, so that `compose down --remove-orphans`
-# removes one a crashed run left behind.
+# The compose labels a client container carries. They put it in the project's network and
+# `ps` filter, but `compose down --remove-orphans` doesn't remove it: Compose skips a container
+# with no `config-hash` label, so the driver's teardown removes it itself.
 COMPOSE_PROJECT_LABEL = "com.docker.compose.project"
 COMPOSE_SERVICE_LABEL = "com.docker.compose.service"
 

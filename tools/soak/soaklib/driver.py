@@ -1075,6 +1075,8 @@ class Run:
             if self.keep:
                 self.say(f"--keep: leaving compose project {self.project} up")
             else:
+                strays = self.docker.remove_strays()
+                self.phase("strays", removed=len(strays))
                 result = self.docker.compose("down", "-v", "--remove-orphans", timeout=180)
                 self.phase("down", rc=result.rc)
             for jsonl in (self.timeline, self.watchdog, self.stats, self.freshness,
