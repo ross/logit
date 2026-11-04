@@ -3128,9 +3128,9 @@ Deferred to a later round (decided with Ross, 2026-10-29): the `datadog_trace` p
 faults, connection adversity, and native-hop variants. Two
 follow-ups had no item: an overlap of TCP listeners, and a CA rotation.
 
-Round 4 (decided with Ross, 2026-11-03) takes the list below that was deferred on 2026-10-29,
-and the two follow-ups after it, as items 27 to 34, resource faults first, since they need the
-least new machinery. A survey on this development host (Fedora, cgroup v2 under systemd,
+Round 4 (decided with Ross, 2026-11-03) takes that list and those two follow-ups as items 27 to
+34, resource faults first, since they need the least new machinery; item 30 splits clock steps
+out of the resource faults to record why they stay deferred. A survey on this development host (Fedora, cgroup v2 under systemd,
 Docker 29.9, SELinux enforcing) checked each fault's mechanism before it was planned:
 
 27. **A file-descriptor limit (W31).** A `prlimit` action sets the SUT's `RLIMIT_NOFILE` for the
@@ -3150,11 +3150,13 @@ Docker 29.9, SELinux enforcing) checked each fault's mechanism before it was pla
     the sender retries, with `[[expect]]` rows on the resource accept errors (above 0 in the
     window, 0 after it) and on the limit's minimum; and `fd-limit-tail` from
     `tail-rotate-delete`, whose rotations need opens inside the window. The window excuses
-    `progress` and `ready`. W31 first checks two facts the survey left open: the level of the
-    accept and spool diagnostics, which decides whether `self_log` needs an excuse, and whether
-    a SUT with a TCP listener at the default `max_connections:` of 1024 already logs
-    `fd_limit_warning` at start, since a container's soft limit defaults to 1024 and `logit`
-    doesn't raise it; that one is a product finding for the fixing session, not the harness.
+    `progress` and `ready`. `self_log` needs no excuse: the accept and spool diagnostics are
+    throttled warnings (`absorb_accept_error`'s `accept_error`, `count_fs_error`'s
+    `disk_fs_error`). `fd_limit_warning` warns when the listeners' `max_connections:` total is
+    at or above the soft limit, and `tcp-ingress`'s `statsd_in` sets none, so at a soft limit
+    of 1024 it warns at start. W31 first confirms the container's soft limit (the survey read
+    1024, and `logit` doesn't raise it); if it holds, that warning is a product finding for the
+    fixing session, not the harness.
 28. **A CPU quota and memory pressure (W32).** A `cgroup` action writes `cpu.max` or
     `memory.high` in the SUT's own cgroup (`system.slice/docker-<id>.scope`) for the window
     and writes `max` back after, through a one-shot with `/sys/fs/cgroup` bound read-write and
@@ -3196,9 +3198,18 @@ Docker 29.9, SELinux enforcing) checked each fault's mechanism before it was pla
 31. **Connection adversity (W34).** A stdlib one-shot client, cued by a step, against a TCP and
     an HTTP listener: slowloris connections that trickle one byte at a time under
     `handshake_timeout:` and `idle_timeout:`, enough of them to fill `max_connections:`, and
-    half-open peers, connections whose packets a partition drops with no FIN or RST. Rows:
-    `logit.input.connections.closed{reason}` per cause, a well-behaved generator's wire loss at
-    0 while the slow clients hold their slots, and no descriptor growth after.
+    half-open peers, connections whose packets a partition drops with no FIN or RST. What each
+    cause reaches: a full listener refuses a new connection before any TLS accept and counts
+    `logit.input.connections.rejected{reason="limit"}`, on the TCP driver and the HTTP
+    listeners alike; a trickling client is past its first byte, so only `idle_timeout:` bounds
+    it, counted `connections.closed{reason="idle"}`, and only when the scenario sets it; and a
+    first-byte timeout under `handshake_timeout:` shows only as the `connection_error`
+    diagnostic, with no counter, which W34 either judges from stderr or proposes a counter for
+    to the fixing session. Rows: `connections.rejected{reason="limit"}` above 0 while the slow
+    clients hold every slot, `connections.closed{reason="idle"}` for the trickle and the
+    half-open peers, the generator's wire loss at 0 with its connection opened before the
+    slots fill (a redial in that phase is refused, and allowed for), and no descriptor growth
+    after.
 32. **Native-hop variants (W35).** `native-hop` over TLS from the run's private CA, through a
     certificate rotation; under a netem delay on the hop long enough that the send window, not
     the link, bounds throughput, with an `[[expect]]` row on frames in flight; and with more
