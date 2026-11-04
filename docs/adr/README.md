@@ -10,6 +10,7 @@ the same date, write the record, then add a row here.
 
 | ADR | Created | Updated |
 |---|---|---|
+| [`logit run` raises its soft open-files limit to the hard limit](open-files-limit-raise.md) | 2026-11-04 | 2026-11-04 |
 | [`otlp_in` answers busy: a request's first batch waits at most 2 seconds, then `503` or `UNAVAILABLE`](otlp-in-busy-answer.md) | 2026-11-03 | 2026-11-03 |
 | [Stream sinks keep a stalled connection and count the unacknowledged bytes a destroyed one held](stream-sink-stalled-connection.md) | 2026-11-03 | 2026-11-03 |
 | [Server status inputs: `nginx_stub_status_in` and `apache_status_in` on a scrape driver shared with `prometheus_in`](server-status-scrape-inputs.md) | 2026-10-31 | 2026-11-01 |

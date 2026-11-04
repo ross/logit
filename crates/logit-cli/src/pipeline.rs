@@ -14,6 +14,7 @@
 //! graph rule runs (a syslog `sd_id`), so those fail only at `run`.
 
 use crate::admin::AdminListener;
+use crate::fdlimit::Raise;
 use crate::signals::Signals;
 use anyhow::Context;
 use logit_config::{BufferConfig, Config, StdioTarget};
@@ -173,6 +174,9 @@ pub async fn run_pipelines(
     let tls_reload_interval = config.tls_reload_interval;
     let base_dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
     let tls_reloader = TlsReloader::new();
+    // Before `prepare` opens any file or socket, so every descriptor `logit` takes counts against
+    // the raised limit. Logged below, once the self-log layer is active.
+    let fd_raise = crate::fdlimit::raise_soft_limit();
     let (graph, specs, telemetry, internal) =
         prepare(config, base_dir, Some(signals.reopen_generation()), &tls_reloader)
             .map_err(RunError::Startup)?;
@@ -186,6 +190,18 @@ pub async fn run_pipelines(
     // After the layer is active, so `internal`'s `logs:` captures it like any other warning.
     for warning in &graph.warnings {
         tracing::warn!(target: "logit", "{warning}");
+    }
+    match fd_raise {
+        Raise::Unchanged => {}
+        Raise::Raised { from, to } => tracing::info!(
+            target: "logit",
+            from,
+            to,
+            "raised the open-files soft limit to the hard limit"
+        ),
+        Raise::Failed(reason) => {
+            tracing::warn!(target: "logit", "could not raise the open-files soft limit: {reason}");
+        }
     }
     if let Some(warning) =
         fd_limit_warning(listener_connection_budget(&graph), logit_inputs::open_files_limit())
@@ -316,14 +332,16 @@ fn listener_connection_budget(graph: &graph::Graph) -> usize {
 
 /// The startup warning for a connection budget the process's soft open-files limit can't cover,
 /// or `None` when it can or the limit is unknown or unlimited. At the limit already warns: the
-/// process holds other descriptors besides connections.
+/// process holds other descriptors besides connections. It runs after the soft limit was raised to
+/// the hard limit, so it fires only when the hard limit is the one that's too low.
 fn fd_limit_warning(budget: usize, soft_limit: Option<u64>) -> Option<String> {
     let limit = soft_limit?;
     (budget as u64 >= limit).then(|| {
         format!(
             "listeners' max_connections total {budget} is at or above the process's open-files \
-             limit {limit}: the caps can't bind before file descriptors run out; raise the limit \
-             (ulimit -n, LimitNOFILE) or lower the caps"
+             limit {limit}: the caps can't bind before file descriptors run out; the soft limit is \
+             already at the hard limit, so raise the hard limit (systemd's LimitNOFILE=, docker \
+             run --ulimit nofile=) or lower the caps"
         )
     })
 }
@@ -4982,8 +5000,9 @@ mod tests {
         assert_eq!(
             at,
             "listeners' max_connections total 1024 is at or above the process's open-files limit \
-             1024: the caps can't bind before file descriptors run out; raise the limit (ulimit \
-             -n, LimitNOFILE) or lower the caps"
+             1024: the caps can't bind before file descriptors run out; the soft limit is already \
+             at the hard limit, so raise the hard limit (systemd's LimitNOFILE=, docker run \
+             --ulimit nofile=) or lower the caps"
         );
         assert!(fd_limit_warning(2048, Some(1024)).is_some(), "above the limit warns");
     }

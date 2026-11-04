@@ -454,7 +454,7 @@ Without that handle, nothing is sampled.
 | `logit.process.memory.allocated.bytes` | gauge | Bytes live in the Rust global allocator: jemalloc's `stats.allocated`, when built with the `jemalloc` feature. |
 | `logit.process.threads` | gauge | Threads in the process: `/proc/self/status` `Threads:`. |
 | `logit.process.fds` | gauge | Open file descriptors: the entries in `/proc/self/fd`, less the one the listing holds. |
-| `logit.process.fds.limit` | gauge | The soft `Max open files` limit from `/proc/self/limits`. Not emitted when it's `unlimited`. |
+| `logit.process.fds.limit` | gauge | The soft `Max open files` limit from `/proc/self/limits`, read after `logit run` raised it to the hard limit. Not emitted when it's `unlimited`. |
 | `logit.process.cpu.seconds{mode=user\|system}` | delta counter | CPU seconds since the previous tick: `/proc/self/stat` `utime`/`stime`, over `USER_HZ` (100). |
 | `logit.process.interner.strings` | gauge | The process-wide interner's size (`interner::len()`), which never shrinks: the observability hook [`memory.md`](memory.md) §4 names. |
 | `logit.process.uptime` | gauge | Seconds since `internal` started. |

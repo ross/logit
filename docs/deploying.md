@@ -743,9 +743,10 @@ counts here: that sink's `batches.dropped{reason="shutdown"}` and a UDP listener
 
 Outside the lifecycle events, `logit run` can log startup `warn` lines before `ready`:
 
-- The listeners' summed `max_connections` reaches the process's open-files limit (Linux only). See
-  ["`max_connections` on a stream listener"](#max_connections-on-a-stream-listener) for its text and
-  the fix.
+- The listeners' summed `max_connections` reaches the process's open-files limit (Linux only).
+  `logit run` has already raised the soft limit to the hard limit, so it means the hard limit is
+  too low. See ["`max_connections` on a stream listener"](#max_connections-on-a-stream-listener)
+  for its text and the fix.
 - A listener reaches two or more sinks that use `overflow: block` with no `buffer.disk`. See
   [A slow or unreachable sink](#a-slow-or-unreachable-sink).
 - `internal` shares a node with a data path. See
@@ -1521,7 +1522,8 @@ backpressure), but its accept queue has the same shape of problem:
   connection); fix it at the sender before raising `net.core.somaxconn`.
 - `logit.input.accept.errors{reason}` (count): an `accept()` that failed. A burst of file
   descriptor exhaustion shows here as `reason="resource"` while the listener backs off 100 ms and
-  keeps accepting, not as a dead listener; raise the process's `nofile` limit if it recurs.
+  keeps accepting, not as a dead listener; raise the process's hard `nofile` limit if it recurs
+  (`logit run` raises the soft limit to it).
   `reason="fatal"` means the listening socket itself failed, and ends the listener.
 
 ### `handshake_timeout` on a TCP listener
@@ -1742,18 +1744,27 @@ connection, sink socket, tailed file, and disk spool draws from one open-files l
 listeners' caps add up to more than that limit, the process runs out of descriptors before any
 cap is reached: `accept()` fails, counted `logit.input.accept.errors{reason="resource"}`, and a
 sink can fail to connect. A single listener at the default already reaches a soft limit of 1024,
-the stock limit for a systemd service. At `logit run` (not `logit validate`, because the limit belongs to the process rather than
-the config), `logit` sums `max_connections` over every stream listener in the graph and, if the
+the stock limit for a systemd service.
+
+So `logit run` first raises the soft limit to the hard limit, as the Go runtime does for every Go
+program. With the stock Docker and containerd limits (soft 1024, hard 524288) that is 524288, and a
+listener at its default never meets the soft limit. When the hard limit is unlimited, the soft limit
+goes to the kernel's `/proc/sys/fs/nr_open` instead. A raise logs one `info` line with the old and
+new soft limits; a failed raise logs one `warn` line and startup continues. The raise has no
+setting, and `logit validate` doesn't make it, because the limit belongs to the process rather than
+the config.
+
+After the raise, `logit` sums `max_connections` over every stream listener in the graph and, if the
 total is at or above the soft limit, logs a warning like this one, once:
 
 ```text
-listeners' max_connections total 2048 is at or above the process's open-files limit 1024: the caps can't bind before file descriptors run out; raise the limit (ulimit -n, LimitNOFILE) or lower the caps
+listeners' max_connections total 2048 is at or above the process's open-files limit 1024: the caps can't bind before file descriptors run out; the soft limit is already at the hard limit, so raise the hard limit (systemd's LimitNOFILE=, docker run --ulimit nofile=) or lower the caps
 ```
 
-Raise the limit (`ulimit -n`, systemd's `LimitNOFILE=`, or `docker run --ulimit nofile=`), or
-lower the caps on listeners that don't need them. The check reads `/proc/self/limits`, so it runs
-on Linux only. It's an ordinary `warn`-level self-log, so `internal`'s default `logs: warn`
-carries it into the pipeline too.
+The warning means the hard limit is too low. Raise it with systemd's `LimitNOFILE=` or
+`docker run --ulimit nofile=`, or lower the caps on listeners that don't need them. The check reads
+`/proc/self/limits`, so it runs on Linux only. It's an ordinary `warn`-level self-log, so
+`internal`'s default `logs: warn` carries it into the pipeline too.
 
 **Choosing a value.** The default suits most deployments. Lowering it rejects producers that work
 today: a thousand hosts forwarding syslog over TCP, or a thousand OTLP agents each holding one
