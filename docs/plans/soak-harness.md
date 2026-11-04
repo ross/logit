@@ -6971,3 +6971,38 @@ acknowledged"). Each scenario ran once at its default length on the development 
 
 The 8-hour runs close the gap the 1 h runs of W17 and W18 left: a leak that grows per redial or
 per deletion did not show in either path over 8 hours.
+
+### `otlp_in` answers busy, on `outq/w4` (2026-11-04)
+
+`otlp_in` now answers a request whose first batch finds no room within 2 s `503` (gRPC
+`UNAVAILABLE`), counts `logit.input.requests{route, class}` and `logit.input.batches.deferred`,
+and holds the sibling identities in `ledger.intake`
+([ADR `otlp-in-busy-answer`](../adr/otlp-in-busy-answer.md)). Each scenario ran once at its
+default length on the development host, against `logit:soak-outq-w4` built from the branch.
+Every row of the three runs passed.
+
+- **The backend stop now reaches the generator as busy answers, not timeouts.** `otlp-fan-out`
+  (`20261104T024349Z`, 16 minutes) read 13 busy `503`s, 13 deferred batches, and 13 `5xx`
+  answers at the generator through the VictoriaMetrics stop, with no transport error there; the
+  two transport errors came from the SUT's pause. W13b's run read 3 transport errors and 337
+  batches' overflow through the same stop; this one read 424 batches' overflow there, 2,025 over
+  the run, all counted. The overflow doesn't go away, since a busy answer leaves the batch in
+  the generator's queue, as a timeout did. `ledger.intake` read requests `ok` 5,024 against
+  `batches.sent` 5,024 and `busy` 13 against `deferred` 13 in life 0, and 2,609 and 0 in the
+  final life. `rss_slope` read +2.3 MiB/h on `logit`.
+- **With eight requests in flight, the stop still fills every slot.** `otlp-concurrency-tls`
+  (`20261104T024738Z`, 12 minutes) read 21 busy `503`s, 21 deferred, and 21 `5xx` answers, no
+  transport error, `in_flight` 8 through the stop on one HTTP/2 connection, and 362 batches'
+  overflow there, 462 over the run. G read 339,750 against the 2026-10-25 run's 341,050, with
+  no uncounted loss either time.
+- **The gRPC relay never went busy.** `otlp-grpc-egress` (`20261104T024738Z-2`, 17 minutes 50
+  seconds) read 106 requests at `collector`'s `otlp_in`, none busy and none deferred, and
+  `ledger.relay` balanced on all three `collector` lives (4,700, 1,600, and 4,300), as on
+  `soak/round3-followups`.
+- No product finding.
+
+These plan passages describe `otlp_in` before the change and are now stale: the
+`ledger.intake` paragraph's "`otlp_in` counts no requests and never answers busy" (section 6,
+`wire = "http"`), item 14's "no request identity" for `otlp_in`'s rows, W13b's finding "The
+backend stop backed up to the generator, as `otlp_in` has no busy answer", and the
+`otlp_in counts no requests` lines in W13b's and W23's recorded tables.
