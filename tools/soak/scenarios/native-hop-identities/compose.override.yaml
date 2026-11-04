@@ -1,0 +1,11 @@
+# native-hop-identities's far SUT, merged onto tools/soak/compose.yaml as native-hop's
+# override does: the base `logit` service under the name `collector`, with its own config from
+# SOAK_COLLECTOR_CONFIG. `logit` connects to it, so it starts first.
+services:
+  collector:
+    extends: { file: compose.yaml, service: logit }
+    labels: { soak.role: sut }
+    volumes: ["${SOAK_COLLECTOR_CONFIG:?set by script/soak}:/config.yaml:ro,z"]
+  logit:
+    depends_on:
+      collector: { condition: service_healthy }

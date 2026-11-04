@@ -1,0 +1,204 @@
+# native-hop with more sender identities than `collector`'s `logit_in` holds marks for. Its
+# `max_connections: 4` sizes the table at 5 identities, and every start of `logit` opens its
+# spool and mints a new one. Five graceful restarts make six identities: the sixth evicts the
+# oldest, retired with every frame acknowledged, so nothing is forwarded twice. Then a crash
+# loop of six kills, each life up 15 s, under the spool's 60 s checkpoint, leaves every frame
+# the loop's lives committed unpersisted, so each life replays them all under their old
+# identities. The sixth life's replay starts with an identity the table evicted, and each
+# replayed identity it takes back evicts the next one it replays: those frames are forwarded
+# again, the duplicate ADR native-hop-identity-and-sequence accepts, which `ledger.hop` allows
+# only for a life whose replay met an eviction beyond the one its own identity causes. The
+# schema is docs/plans/soak-harness.md's "The scenario schema"; `ledger.hop` is its "The native
+# hop".
+
+name = "native-hop-identities"
+description = "native-hop past the logit_in sender table: restarts and a crash loop mint more identities than it holds"
+duration = "14m30s"       # warmup + one cycle + cooldown
+warmup = "60s"
+cooldown = "120s"         # >= recovery_bound
+recovery_bound = "60s"    # the hop's request_timeout 10s, a sink's retry_max_delay 10s, two windows, a drain
+cycle = "11m30s"          # >= last step's end (9m15s) + recovery_bound + 2 x progress_window
+compose = "compose.override.yaml"   # adds collector, the far SUT
+
+[configs]
+sut = "logit-sut.yaml"
+collector = "logit-collector.yaml"
+generator = "logit-generator.yaml"
+
+[ledger]
+sut_aggregate = "window"  # in collector, the chain's last SUT
+wire_loss_outside_faults = 0.0
+
+[[ledger.source]]
+service = "generator"
+generator_input = "load"
+generator_sink = "statsd"
+sut_listener = "statsd"
+
+[[ledger.hop]]            # the native hop the ledger follows from logit to collector
+from = "logit"
+sink = "hop"              # logit's logit_out
+to = "collector"
+listener = "hop"          # collector's logit_in
+
+[[ledger.sink]]
+id = "victoria_metrics"
+backend = "victoria-metrics"
+vm_selector = '{__name__=~"soak_requests_[0-9]+_total"}'
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64
+fd_growth = 8
+
+# Steps 1 to 5: graceful restarts of logit, each persisting its spool's cursor at the stop and
+# minting the next identity at the start. After step 4 the table holds all five; step 5's is the
+# sixth.
+[[step]]
+at = "0s"
+action = "restart"
+on = "logit"
+for = "20s"
+
+[[step]]
+at = "1m30s"
+action = "restart"
+on = "logit"
+for = "20s"
+
+[[step]]
+at = "3m"
+action = "restart"
+on = "logit"
+for = "20s"
+
+[[step]]
+at = "4m30s"
+action = "restart"
+on = "logit"
+for = "20s"
+
+[[step]]
+at = "6m"
+action = "restart"
+on = "logit"
+for = "20s"
+
+# Steps 6 to 11: a crash loop. Each kill comes before the life's first cursor persist, so the
+# next life replays every frame the loop committed, under the identities that sent them.
+[[step]]
+at = "7m30s"
+action = "kill"
+on = "logit"
+for = "5s"
+
+[[step]]
+at = "7m50s"
+action = "kill"
+on = "logit"
+for = "5s"
+
+[[step]]
+at = "8m10s"
+action = "kill"
+on = "logit"
+for = "5s"
+
+[[step]]
+at = "8m30s"
+action = "kill"
+on = "logit"
+for = "5s"
+
+[[step]]
+at = "8m50s"
+action = "kill"
+on = "logit"
+for = "5s"
+
+[[step]]
+at = "9m10s"
+action = "kill"
+on = "logit"
+for = "5s"
+
+# Five identities fill the table and evict nothing.
+[[expect]]
+name = "table-fills"
+service = "collector"
+metric = "logit.input.senders"
+component = "hop"
+step = 4
+window = "through"
+reduce = "max"
+min = 5
+max = 5
+
+[[expect]]
+name = "no-eviction-at-capacity"
+service = "collector"
+metric = "logit.input.senders.evicted"
+component = "hop"
+step = 4
+window = "through"
+reduce = "delta"
+max = 0
+
+# The sixth evicts one, the oldest.
+[[expect]]
+name = "sixth-evicts-one"
+service = "collector"
+metric = "logit.input.senders.evicted"
+component = "hop"
+step = 5
+window = "through"
+reduce = "delta"
+min = 1
+max = 1
+
+# The table never holds more than its 5.
+[[expect]]
+name = "table-bounded"
+service = "collector"
+metric = "logit.input.senders"
+component = "hop"
+window = "run"
+reduce = "max"
+max = 5
+
+# The loop's first replay is of an identity the table still holds: acknowledged, not
+# forwarded.
+[[expect]]
+name = "loop-replay-deduplicated"
+service = "collector"
+metric = "logit.input.batches.resends"
+component = "hop"
+step = 6
+window = "after"
+reduce = "delta"
+min = 1
+
+# The loop's last life replays six identities into a table of five, evicted in turn: one
+# eviction per identity it takes back, and one for its own.
+[[expect]]
+name = "last-replay-evicts-each"
+service = "collector"
+metric = "logit.input.senders.evicted"
+component = "hop"
+step = 11
+window = "through"
+reduce = "delta"
+min = 7
+max = 7
+
+# Over the run: one for the sixth identity, one for each of the loop's first five lives' own,
+# and the last life's seven.
+[[expect]]
+name = "evictions-total"
+service = "collector"
+metric = "logit.input.senders.evicted"
+component = "hop"
+window = "run"
+reduce = "delta"
+min = 13
+max = 13

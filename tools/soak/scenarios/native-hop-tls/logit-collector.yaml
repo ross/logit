@@ -1,0 +1,30 @@
+# The far SUT in `script/soak`'s native-hop-tls scenario: native-hop's `collector` with TLS on
+# its `logit_in`, which requires a client certificate from the run's CA. Its certificate files
+# sit behind the `live` symlink a `rotate` step repoints, and with the poll off only a SIGHUP or
+# a start reloads them. Its `internal` telemetry goes to stdout as NDJSON for the harness to
+# read; `script/soak` runs it with `--log-format json`.
+tls_reload_interval: 0s             # a SIGHUP is the one trigger
+admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
+components:
+  hop:
+    type: logit_in
+    bind: 0.0.0.0:7400
+    tls:
+      cert_file: /tls/hop/live/cert.pem       # the override mounts <run>/tls here
+      key_file: /tls/hop/live/key.pem
+      client_ca_file: /tls/ca.pem
+  window:
+    type: aggregate
+    sources: [hop]
+    interval: 10s
+    temporality: cumulative
+    series_retention: 360           # a fault must never evict a series
+  victoria_metrics:
+    type: prometheus_out
+    sources: [window]
+    endpoint: http://victoria-metrics:8428/api/v1/write
+    version: 1
+    compression: zstd
+    buffer: { disk: { path: /tmp/soak-spool } }
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }
