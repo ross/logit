@@ -44,8 +44,9 @@ Facts a maintainer needs here (docs/plans/soak-harness.md, "Netem scope"):
   back, and a value read back other than the one written is `rc` 1; the revert writes `found`
   back. On a `memory.high` step the apply and the revert each read `memory.events`, and the
   revert records the difference in its `high` count (`high_events`), the times the kernel
-  throttled the cgroup in the window. `docker update` is the wrong tool: `--memory` can't return to unlimited, and `--cpus`
-  stays in the container's config and comes back on its next start. A start inside the window
+  throttled the cgroup in the window. `docker update` is the wrong tool: `--memory` can't
+  return to unlimited, and `--cpus` stays in the container's config and comes back on its next
+  start. A start inside the window
   makes the scope again with the container's own settings, so the revert then writes nothing
   and records `started_in_window`; a container not running at the revert lost its scope with
   its process, and the revert writes nothing and records `exited_in_window`.
