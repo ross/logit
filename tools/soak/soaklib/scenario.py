@@ -3020,7 +3020,8 @@ def validate(scenario, duration=None, seed=None):
                             problems.append(
                                 f"steps {first.index + 1} and {second.index + 1}: `engaged` "
                                 "can't be judged on a cgroup step a stop or kill ends: the "
-                                "process's counts go with its scope"
+                                "process's counts go with its scope; drop `engaged`, or end the step before "
+                                "the stop"
                             )
                         continue
                     if pair == {"pause", "kill"}:

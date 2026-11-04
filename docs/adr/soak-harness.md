@@ -959,14 +959,16 @@ limited key's found value back, `max` when the device had no line.
   `wbytes` and `wios` and `io.pressure`'s `some` total, and the revert records the window's
   differences and length. `timeline` reports them with the write rate against the limit. An io
   step's optional `engaged` reads the stalled time against 1% of the window: an unthrottled
-  spool's fsyncs on a local disk stall less than that, and a limit below the spool's pace
-  stalls a large share. The stalled time also counts a stall an unthrottled write would have
+  spool's fsyncs on a local disk stall less than that, and a limit stalls a larger share even
+  above the spool's average pace, since the spool writes in bursts (a segment rotation's
+  `fsync`). The stalled time also counts a stall an unthrottled write would have
   had, so a run that reads `engaged` near the line needs the rate beside it.
 - **A stop or kill may start inside a `cgroup` step.** A start makes the cgroup again with no
   limit, so a fault that wants the stop's shutdown under the limit and the next life's replay
   under it too takes two steps, the first containing the stop. The stop or kill must start
   after the cgroup's apply, which needs a running process; the cgroup's revert then records
-  `exited_in_window` or `started_in_window` as for any other end of the process. No other step
+  `exited_in_window` or `started_in_window` as for any other end of the process. Such a step
+  takes no `engaged`, since its counts go with the process's scope. No other step
   may overlap a `cgroup` on its service.
 - **`io.max` needs cgroup writeback.** On a host whose container storage is overlayfs over
   btrfs over dm-crypt, a 1 MiB/s limit let 4 MiB with `fsync` through in 0.1 s, since the

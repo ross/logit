@@ -163,7 +163,8 @@ DRAIN_GAP_INTERVALS = 3
 DRAIN_HELD_ACTIONS = ("stop", "kill", "pause", "restart", "exit", "cgroup")
 # The share of an io step's window that `io.pressure`'s `some` total must reach for the limit to
 # count as engaged. An unthrottled spool's fsyncs on a local disk stall a small fraction of
-# that; a write limit below the spool's pace stalls a large share of the window.
+# that; a write limit stalls a larger share of the window even above the spool's average pace,
+# since the spool writes in bursts (a segment rotation's fsync).
 IO_ENGAGED_STALL_SHARE = 0.01
 SECONDS_PER_HOUR = 3600
 MIB = 1024 * 1024

@@ -245,7 +245,9 @@ settle window would leave a life no fit. `fanin` and `tcp-ingress` set `60s`, an
   and refused elsewhere. The step writes them on the disk behind `io_path`, fails when no block
   device backs it, and records the window's `io.stat` `wbytes` and `wios` and `io.pressure`
   stalled time, which `timeline` reports; `engaged` is allowed on an io step, where it reads
-  the stalled time against 1% of the window.
+  the stalled time against 1% of the window. A `stop` or `kill` of the SUT may start inside a
+  `cgroup` step, after its start; such a step takes no `engaged`, since its counts go with the
+  process's scope.
 - `[ledger] vm_every_window`, optional, is `true` or `false`; `[ledger] sut_script`, optional,
   is a component id.
 - `[[ledger.source]]` (W8b) has the rules under "Sources" below.
@@ -3208,9 +3210,9 @@ Docker 29.9, SELinux enforcing) checked each fault's mechanism before it was pla
       device behind the mount that holds `io_path` in the SUT's mountinfo, followed through an
       overlay's `upperdir` to the host mount, a partition replaced by its whole disk. It needs
       no new image and no privilege beyond W32's `label=disable`, and reverts by writing back
-      each limited key's found value (`max` when the device had none). The VM's first step is the probe the survey ran
-      here: a throwaway container under a 1 MiB/s `wbps` writing 4 MiB with `fsync`, which
-      must take about 4 s.
+      each limited key's found value (`max` when the device had none). The VM's first step is
+      the probe the survey ran here: a throwaway container under a 1 MiB/s `wbps` writing 4
+      MiB with `fsync`, which must take about 4 s.
     - **`dm-delay`, if the probe fails.** A `dm-delay` device over a loop file in the run
       directory, made in a privileged one-shot (the netem image gains `dmsetup`, `losetup`,
       and `mkfs.ext4`), mounted as an `ext4` Docker volume at the spool path by a compose
@@ -3223,10 +3225,10 @@ Docker 29.9, SELinux enforcing) checked each fault's mechanism before it was pla
     `sync_data`, its persist worker's cursor write with two fsyncs, and the write a cancelled
     push leaves running (`disk_queue.rs`'s `HeldWriteFile`). Expected: slow syncs with no loss, no
     `*.dropped` unless the `buffer:` bound trips, the next life replaying the spool, and a
-    clean ledger. No internal metric times a spool write and `io.stat` has no throttle count,
-    so `timeline` reports `io.stat`'s `wbytes` and `wios` deltas and the cgroup's `io.pressure`
-    stall, which `engaged` judges against 1% of the window, so a window that never slowed a
-    write is visible, as `memory.events` is for W32 (ADR `soak-harness`'s amendment). A `dm-flakey`
+    clean ledger. No internal metric times a spool write and `io.stat` has no throttle count.
+    `timeline` therefore reports `io.stat`'s `wbytes` and `wios` deltas and the cgroup's
+    `io.pressure` stall. `engaged` judges the stall against 1% of the window, so a window that
+    never slowed a write is visible, as `memory.events` is for W32 (ADR `soak-harness`'s amendment "a `cgroup` step limits the writes to the disk behind a SUT path"). A `dm-flakey`
     `error_writes` variant, reaching `buffer.disk.errors{op}` on real I/O errors, needs the
     `dm-delay` path's device and stays out of W33 unless that path is the one taken. The
     harness needs Python 3.11 or later and `sudo -n docker`: the VM's Debian 13 image ships
@@ -6939,14 +6941,14 @@ What the runs showed about `logit` and the harness:
 - **Self-test**: 3,049 expectations, unchanged by the scenario fix.
 - **Open: the 6.4 s stall against the ~46 s the bytes predict.** `c0s4`'s 1,503,232 B in 30
   bios is about 11.5 records, so a stall of about 0.53 s per rotation, about 14% of the
-  bytes-over-limit time. The first run's 425,984 B stalled only 0.40 s. Most bytes were
-  therefore kworker writeback, which the scope's PSI doesn't see; the flusher likely wrote
-  back most of each record before the rotation's `fdatasync`. The next VM run should record
+  bytes-over-limit time. The first run's 425,984 B stalled only 0.40 s. In the first run most
+  bytes were kworker writeback, which the scope's PSI doesn't see; in the second, the flusher
+  likely wrote back most of each record before the rotation's `fdatasync`. The next VM run should record
   `sysctl vm.dirty_*`, sample `io.stat`, `io.pressure`, and `/proc/vmstat`'s `nr_dirty` and
   `nr_writeback` each second, and time each `fdatasync` (`strace -f -T -e fdatasync`).
 - **Open, not built: the default segment under throttle.** The first run's 18.5 s shutdown at
   the default segment size exceeds Docker's 10 s default stop timeout and nothing asserts it.
-  A default-segment variant, or an `[[expect]]` on shutdown drain time, would.
+  A default-segment variant, or an `[[expect]]` on shutdown drain time, would assert it.
 
 ### W32: a CPU quota and memory pressure on the SUT's cgroup (2026-11-03)
 
