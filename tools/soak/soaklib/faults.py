@@ -50,6 +50,18 @@ Facts a maintainer needs here (docs/plans/soak-harness.md, "Netem scope"):
   makes the scope again with the container's own settings, so the revert then writes nothing
   and records `started_in_window`; a container not running at the revert lost its scope with
   its process, and the revert writes nothing and records `exited_in_window`.
+- A `cgroup` io step writes `<major>:<minor> wbps=<n>` and/or `wiops=<n>` into the scope's
+  `io.max`, for the disk behind the step's `io_path` in the target (`io_device`): the mount
+  holding that path in the process's `/proc/<pid>/mountinfo`, and for an overlay, the host
+  mount holding its `upperdir` in `/proc/1/mountinfo`; a partition's whole disk from
+  `/sys/dev/block/<major>:<minor>/../dev`, since `io.max` takes no partition. A device with
+  major 0 (btrfs, tmpfs, an overlay with no host mount found) has no block device, and the step
+  fails before any write. `found` is the device's `io.max` line, `max` when it has none, and
+  the revert writes each limited key's found value back, `max` included. The apply and the
+  revert each read `io.stat`'s `wbytes` and `wios` for the device and `io.pressure`'s `some`
+  total, and the revert records the window's differences (`io_wbytes`, `io_wios`,
+  `io_stall_us`) and its length (`io_window_s`). `io.stat` has no count of throttled writes,
+  so the stalled time is the engagement's observable.
 - A `kill` is `docker kill -s KILL`: the process gets no shutdown signal, so it writes no final
   `internal` drain, no shutdown drops, and no `exiting` or `drain complete` line, and the container
   exits with `KILL_EXIT_CODE`. Its revert is a `docker start`, as a `stop`'s is. The container is
@@ -96,6 +108,8 @@ Facts a maintainer needs here (docs/plans/soak-harness.md, "Netem scope"):
 
 import json
 import os
+import re
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -104,7 +118,7 @@ from pathlib import Path
 from . import fileops
 from .scenario import (BACKEND_ROLE, BROKER_ROLE, GENERATOR_ROLE, IDP_ROLE, NETNS_ROLE,
                        SHARED_MOUNT, STANDIN_ROLE, STOP_TIMEOUT_S, SUT_ROLE, SUT_SERVICE,
-                       TLS_MOUNT, memory_bytes)
+                       TLS_MOUNT, io_bytes, memory_bytes)
 
 NETEM_LIMIT = "100000"
 # The timeline key recording, per `[[ledger.source]]` wire, whether a step can affect it.
@@ -137,6 +151,10 @@ CGROUP_HOST_ROOT = "/sys/fs/cgroup"
 CGROUP_MOUNT = "/cg"
 CPU_PERIOD_US = 100000
 CGROUP_SCRIPT = 'if [ $# -eq 2 ]; then printf "%s\\n" "$2" > "$1" || exit 1; fi; cat "$1"'
+# Where an io step reads the host's mounts, and the key order of an `io.max` line.
+SYS_ROOT = "/sys"
+HOST_MOUNTINFO_PID = "1"
+IO_MAX_KEYS = (("io_wbps", "wbps"), ("io_wiops", "wiops"))
 
 
 @dataclass
@@ -157,8 +175,12 @@ class Context:
     tls_dir: object = None
     tls_certs: dict = field(default_factory=dict)
     user: object = None
-    # Where a `cgroup` reads a process's `/proc/<pid>/cgroup`: the host's procfs.
+    # Where a `cgroup` reads a process's `/proc/<pid>/cgroup` and `mountinfo` (the host's
+    # procfs), and a block device's `/sys/dev/block` entry; and the clock an io step's window
+    # is measured on.
     proc_root: str = "/proc"
+    sys_root: str = SYS_ROOT
+    clock: object = time.monotonic
 
 
 @dataclass
@@ -304,34 +326,136 @@ def prlimit_revert(ctx, step):
 
 
 def cgroup_setting(step):
-    """`(file, value)`: the cgroup file a `cgroup` step writes and what it writes there."""
+    """`(file, value)`: the cgroup file a `cgroup` step writes and what it writes there; an io
+    step's value is its `io.max` keys, `{key: n}`, which `io_max_line` puts on a device."""
     if step.cpu is not None:
         return "cpu.max", f"{round(step.cpu * CPU_PERIOD_US)} {CPU_PERIOD_US}"
-    return "memory.high", str(memory_bytes(step.memory_high))
+    if step.memory_high is not None:
+        return "memory.high", str(memory_bytes(step.memory_high))
+    values = {"io_wbps": io_bytes(step.io_wbps) if step.io_wbps is not None else None,
+              "io_wiops": step.io_wiops}
+    return "io.max", {key: str(values[name]) for name, key in IO_MAX_KEYS
+                      if values[name] is not None}
+
+
+def io_max_line(device, values):
+    """The `io.max` line that sets `values` (`{key: n}`) on `device` and leaves its other keys
+    as they are."""
+    return f"{device} " + " ".join(f"{key}={values[key]}" for _, key in IO_MAX_KEYS
+                                    if key in values)
+
+
+def io_max_values(text, device):
+    """`{key: value}` of `device`'s line in a read of `io.max`: every key at `max` when the
+    file has no line for it, as the kernel prints none for a device with no limit."""
+    for line in text.splitlines():
+        words = line.split()
+        if words and words[0] == device:
+            return dict(word.split("=", 1) for word in words[1:] if "=" in word)
+    return {"rbps": "max", "wbps": "max", "riops": "max", "wiops": "max"}
+
+
+def _unescape_mount(text):
+    """A `mountinfo` path with its octal escapes (`\\040` for a space) decoded."""
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), text)
+
+
+def _mountinfo(text):
+    """`[(mount_point, "major:minor", fstype, super_options)]` from a `mountinfo` read; the
+    fields after the ` - ` separator are the filesystem type, source, and super options."""
+    mounts = []
+    for line in text.splitlines():
+        head, sep, tail = line.partition(" - ")
+        fields, rest = head.split(), tail.split()
+        if not sep or len(fields) < 5 or not rest:
+            continue
+        mounts.append((_unescape_mount(fields[4]), fields[2], rest[0],
+                       rest[2] if len(rest) > 2 else ""))
+    return mounts
+
+
+def _covering_mount(mounts, path):
+    """The mount whose mount point is the longest whole-component prefix of `path`, the last
+    of equals (a later mount over the same point hides the earlier), or None."""
+    best = None
+    for mount in mounts:
+        point = mount[0].rstrip("/") or "/"
+        if point == "/" or path == point or path.startswith(point + "/"):
+            if best is None or len(point) >= len(best[0].rstrip("/") or "/"):
+                best = mount
+    return best
+
+
+def io_device(ctx, pid, path):
+    """`(device, detail, None)`: the whole disk behind `path` in process `pid`'s mount
+    namespace as `major:minor`, and how it was found (`{mount, fstype, dev, partition}`); or
+    `(None, detail, why)` when no block device backs it."""
+    def read(where):
+        try:
+            return Path(where).read_text(), None
+        except OSError as err:
+            return None, f"can't read {where}: {err}"
+
+    where = Path(ctx.proc_root, str(pid), "mountinfo")
+    text, why = read(where)
+    if text is None:
+        return None, {}, why
+    mount = _covering_mount(_mountinfo(text), path)
+    if mount is None:
+        return None, {}, f"{where} has no mount holding {path}"
+    point, dev, fstype, options = mount
+    detail = {"mount": point, "fstype": fstype, "dev": dev}
+    if fstype == "overlay":
+        upper = next((opt[len("upperdir="):] for opt in options.split(",")
+                      if opt.startswith("upperdir=")), None)
+        if upper is None:
+            return None, detail, f"no block device backs {path}: its overlay has no upperdir"
+        host = Path(ctx.proc_root, HOST_MOUNTINFO_PID, "mountinfo")
+        text, why = read(host)
+        if text is None:
+            return None, detail, why
+        under = _covering_mount(_mountinfo(text), _unescape_mount(upper))
+        if under is None:
+            return None, detail, f"{host} has no mount holding {upper}"
+        dev, fstype = under[1], under[2]
+        detail.update(upper=upper, upper_mount=under[0], upper_fstype=fstype, dev=dev)
+    if dev.split(":")[0] == "0":
+        return None, detail, (f"no block device backs {path}: it is on {fstype} with the "
+                              f"anonymous device {dev}")
+    block = Path(ctx.sys_root, "dev", "block", dev)
+    if not block.exists():
+        return None, detail, f"no block device backs {path}: {block} doesn't exist"
+    if (block / "partition").exists():
+        text, why = read(block / ".." / "dev")
+        if text is None:
+            return None, detail, why
+        detail["partition"] = dev
+        dev = text.strip()
+    return dev, detail, None
 
 
 def cgroup_dir(ctx, service):
-    """`(path, started_at, None)`: the container's cgroup relative to the hierarchy's root, from
-    the cgroup v2 line of its process's `/proc/<pid>/cgroup` on the host, and the start time of
-    that process from the same inspect; or `(None, None, why)` when the container isn't running
-    or the line doesn't name its full id."""
+    """`(path, started_at, pid, None)`: the container's cgroup relative to the hierarchy's root,
+    from the cgroup v2 line of its process's `/proc/<pid>/cgroup` on the host, and the start
+    time and PID of that process from the same inspect; or `(None, None, None, why)` when the
+    container isn't running or the line doesn't name its full id."""
     info = ctx.docker.inspect(ctx.ids[service]) or {}
     state = info.get("State") or {}
     pid, started = state.get("Pid"), state.get("StartedAt")
     full = info.get("Id")
     if not pid or not full:
-        return None, None, f"{service} has no running process to find its cgroup by"
+        return None, None, None, f"{service} has no running process to find its cgroup by"
     where = Path(ctx.proc_root, str(pid), "cgroup")
     try:
         text = where.read_text()
     except OSError as err:
-        return None, None, f"can't read {where}: {err}"
+        return None, None, None, f"can't read {where}: {err}"
     for line in text.splitlines():
         if line.startswith("0::/"):
             path = line[len("0::/"):].strip()
             if full in path.split("/")[-1] and ".." not in path.split("/"):
-                return path, started, None
-    return None, None, f"{where} names no cgroup v2 path for container {full[:12]}"
+                return path, started, pid, None
+    return None, None, None, f"{where} names no cgroup v2 path for container {full[:12]}"
 
 
 def cgroup_argv(ctx, path, *value):
@@ -342,11 +466,19 @@ def cgroup_argv(ctx, path, *value):
             f"{CGROUP_MOUNT}/{path}", *value]
 
 
-def _cgroup_write(ctx, path, value, **extra):
-    """Writes `value` and reads it back; a read-back that differs is `rc` 1."""
+def _cgroup_write(ctx, path, value, io_disk=None, **extra):
+    """Writes `value` and reads it back; a read-back that differs is `rc` 1. On an `io.max`
+    write (`io_disk` set) the read-back is the file's every line, so it compares the keys
+    `value` sets on `io_disk`'s line, where a line the kernel dropped reads `max`."""
     result = ctx.docker.run_oneshot(cgroup_argv(ctx, path, value))
     record = _record(result, path=path, value=value, **extra)
-    if result.rc == 0 and result.stdout.strip() != value:
+    if io_disk is not None:
+        wanted = dict(word.split("=", 1) for word in value.split()[1:])
+        back = io_max_values(result.stdout, io_disk)
+        differs = any(back.get(key) != want for key, want in wanted.items())
+    else:
+        differs = result.stdout.strip() != value
+    if result.rc == 0 and differs:
         record.update(rc=1, read_back=result.stdout.strip()[-200:],
                       stderr=f"wrote {value!r} to {path} and read back "
                              f"{result.stdout.strip()[-200:]!r}")
@@ -357,40 +489,62 @@ def cgroup_apply(ctx, step):
     """Finds the target's cgroup, reads the step's file there (`found`), writes the step's value,
     and leaves the path, `found`, and the process's start time for the revert. A `memory.high`
     step also reads `memory.events`' `high` count first (`high_events_before`), so the revert
-    can count the window's. A cgroup it can't find, or a read that printed nothing or no count,
-    is `rc` 1 and writes nothing. A failed write leaves nothing for the revert, and a read-back
+    can count the window's; an io step finds the device (`io_device`), puts its keys on that
+    device's line, and reads `io_counts` first (`io_before`). A cgroup or device it can't find,
+    or a read that printed nothing or no count, is `rc` 1 and writes nothing. A failed write leaves nothing for the revert, and a read-back
     that differs writes `found` back at once. A process that started again between the inspect
     that found the cgroup and the write has a new scope, which the write may have reached: the
     apply writes `found` back there and fails the step (`started_during_apply`)."""
     name, value = cgroup_setting(step)
-    found_dir, started, why = cgroup_dir(ctx, step.on)
+    found_dir, started, pid, why = cgroup_dir(ctx, step.on)
     if found_dir is None:
         return {"rc": 1, "stderr": why, "file": name}
     path = f"{found_dir}/{name}"
+    device, extra = None, {}
+    if name == "io.max":
+        device, detail, why = io_device(ctx, pid, step.io_path)
+        extra["io_device"] = detail
+        if device is None:
+            return {"rc": 1, "stderr": why, "file": name, "path": path, **extra}
+        extra["device"] = device
     read = ctx.docker.run_oneshot(cgroup_argv(ctx, path))
     found = read.stdout.strip()
+    if name == "io.max" and read.rc == 0:
+        values = io_max_values(read.stdout, device)
+        found = next((line.strip() for line in read.stdout.splitlines()
+                      if line.split()[:1] == [device]), "max")
+        restore = io_max_line(device, {key: values.get(key, "max") for key in value})
+        value = io_max_line(device, value)
+    else:
+        restore = found
     if read.rc != 0 or not found:
-        record = _record(read, file=name, path=path)
+        record = _record(read, file=name, path=path, **extra)
         record.update(rc=read.rc or 1, stderr=record["stderr"] or f"{path} read empty")
         return record
-    saved = {"path": path, "found": found, "started_at": started}
-    extra = {}
+    saved = {"path": path, "found": restore, "started_at": started, "device": device}
     if name == "memory.high":
         before, why = memory_high_events(ctx, found_dir)
         if before is None:
             return {"rc": 1, "stderr": why, "file": name, "path": path, "found": found}
         saved.update(events_dir=found_dir, high_before=before)
         extra["high_events_before"] = before
-    record = _cgroup_write(ctx, path, value, file=name, found=found, **extra)
+    if name == "io.max":
+        before, why = io_counts(ctx, found_dir, device)
+        if before is None:
+            return {"rc": 1, "stderr": why, "file": name, "path": path, "found": found,
+                    **extra}
+        saved.update(io_dir=found_dir, io_before=before, io_started=ctx.clock())
+        extra["io_before"] = before
+    record = _cgroup_write(ctx, path, value, io_disk=device, file=name, found=found, **extra)
     if record["rc"] != 0:
         if record.get("read_back") is not None:
-            ctx.docker.run_oneshot(cgroup_argv(ctx, path, found))
+            ctx.docker.run_oneshot(cgroup_argv(ctx, path, restore))
         return record
     if _started_at(ctx, step.on) != started:
-        back = ctx.docker.run_oneshot(cgroup_argv(ctx, path, found))
+        back = ctx.docker.run_oneshot(cgroup_argv(ctx, path, restore))
         record.update(rc=1, started_during_apply=True, restored=back.rc == 0,
                       stderr="the process started again during the apply; wrote "
-                             f"{found!r} back to its new scope")
+                             f"{restore!r} back to its new scope")
         return record
     ctx.state[step.id] = saved
     return record
@@ -411,13 +565,51 @@ def memory_high_events(ctx, found_dir):
     return None, f"{path} printed no high count: {read.stdout.strip()[-200:]!r}"
 
 
+def io_counts(ctx, found_dir, device):
+    """`({wbytes, wios, stall_us}, None)`: `device`'s `wbytes` and `wios` in the cgroup's
+    `io.stat`, 0 when it has no line yet (the kernel prints one only once the cgroup has done
+    I/O there), and `io.pressure`'s `some` total, the microseconds some task in the cgroup
+    waited on I/O; or `(None, why)` when a read failed or printed no `some` total."""
+    counts = {}
+    stat = f"{found_dir}/io.stat"
+    read = ctx.docker.run_oneshot(cgroup_argv(ctx, stat))
+    if read.rc != 0:
+        return None, f"{stat}: rc {read.rc}: {read.stderr.strip()[-200:]}"
+    fields = {}
+    for line in read.stdout.splitlines():
+        words = line.split()
+        if words and words[0] == device:
+            fields = dict(word.split("=", 1) for word in words[1:] if "=" in word)
+    for key in ("wbytes", "wios"):
+        value = fields.get(key, "0")
+        if not value.isdigit():
+            return None, f"{stat} printed {key}={value!r} for {device}"
+        counts[key] = int(value)
+    pressure = f"{found_dir}/io.pressure"
+    read = ctx.docker.run_oneshot(cgroup_argv(ctx, pressure))
+    if read.rc != 0:
+        return None, f"{pressure}: rc {read.rc}: {read.stderr.strip()[-200:]}"
+    for line in read.stdout.splitlines():
+        words = line.split()
+        if words[:1] == ["some"]:
+            total = next((word[len("total="):] for word in words
+                          if word.startswith("total=")), "")
+            if total.isdigit():
+                counts["stall_us"] = int(total)
+                return counts, None
+    return None, f"{pressure} printed no some total: {read.stdout.strip()[-200:]!r}"
+
+
 def cgroup_revert(ctx, step):
     """Writes what the apply found back, unless the process exited inside the window, whose
     scope went with it (`exited_in_window`), or started again there, whose new scope has the
     container's own settings (`started_in_window`): the record then says which and writes
     nothing. On a `memory.high` step it first reads `memory.events` again and records how many
     times the kernel throttled the cgroup in the window (`high_events`), or why it couldn't
-    (`events_error`). An apply that failed left nothing to restore."""
+    (`events_error`); on an io step it reads `io.stat` and `io.pressure` again and records the
+    window's written bytes and writes and stalled time (`io_wbytes`, `io_wios`, `io_stall_us`)
+    over its length (`io_window_s`), or why it couldn't (`io_error`). An apply that failed
+    left nothing to restore."""
     saved = ctx.state.pop(step.id, None)
     if saved is None:
         return {"rc": 0, "stderr": "", "restored": False}
@@ -433,7 +625,17 @@ def cgroup_revert(ctx, step):
         after, why = memory_high_events(ctx, saved["events_dir"])
         events = ({"events_error": why} if after is None
                   else {"high_events": after - saved["high_before"]})
-    record = _cgroup_write(ctx, saved["path"], saved["found"], **events)
+    if "io_dir" in saved:
+        after, why = io_counts(ctx, saved["io_dir"], saved["device"])
+        before = saved["io_before"]
+        events = ({"io_error": why} if after is None else {
+            "io_wbytes": after["wbytes"] - before["wbytes"],
+            "io_wios": after["wios"] - before["wios"],
+            "io_stall_us": after["stall_us"] - before["stall_us"],
+            "io_window_s": round(ctx.clock() - saved["io_started"], 3)})
+        events["device"] = saved["device"]
+    record = _cgroup_write(ctx, saved["path"], saved["found"], io_disk=saved.get("device"),
+                           **events)
     record["restored"] = record["rc"] == 0
     return record
 

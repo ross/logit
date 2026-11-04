@@ -1,0 +1,26 @@
+# The system under test in `script/soak`'s slow-spool scenario: spool-kill-replay's SUT, its
+# sink on a disk spool at /tmp/soak-spool in the container's own filesystem, which the
+# scenario's `cgroup` steps slow with an `io.max` write limit on the disk behind it. Its
+# `internal` telemetry goes to stdout as NDJSON for the harness to read; `script/soak` runs it
+# with `--log-format json`.
+admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
+components:
+  statsd: { type: statsd_in, bind: 0.0.0.0:8125 }   # receive: defaults (drop_oldest)
+  window:
+    type: aggregate
+    sources: [statsd]
+    interval: 10s
+    temporality: cumulative
+    series_retention: 360           # a fault must never evict a series
+  victoria_metrics:
+    type: prometheus_out
+    sources: [window]
+    endpoint: http://victoria-metrics:8428/api/v1/write
+    version: 1
+    compression: zstd
+    # The driver stops and starts this container but never recreates it, so a directory in
+    # its own filesystem survives the stop with no volume, and its writes reach the disk
+    # behind the container's writable layer, which the `cgroup` steps' `io_path` names.
+    buffer: { disk: { path: /tmp/soak-spool } }
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }
