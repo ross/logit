@@ -27,10 +27,10 @@ latency").
 
 ### Verified destination behavior (2026-11-04)
 
-Four probes against a Datadog trial org on `datadoghq.com`, one metric name per probe
-(`logit.probe.samesec.f5c1aedc.<probe>`, tagged `probe:f5c1aedc`). Each sent two `POST
+Five probes against a Datadog trial org on `datadoghq.com`, one metric name per probe
+(`logit.probe.samesec.f5c1aedc.<probe>`, tagged `probe:f5c1aedc`). Probes a to d each sent two `POST
 /api/v2/series` JSON requests about 4 s apart, each one point at the same timestamp,
-`1793765277`. Every request drew `202 {"errors":[]}`. A `GET /api/v1/query` over 60 s either side
+`1793765277`. Probe e sent both points in one request. Every request drew `202 {"errors":[]}`. A `GET /api/v1/query` over 60 s either side
 read the stored point at a 1 s rollup 10 s after the second write. It read the same value twice
 more over the next minute and again 7 minutes later.
 
@@ -98,10 +98,11 @@ What this verifies, and what it doesn't:
    previous is forgotten, once the current is full or has been open for an hour of send time. An
    hour is the series route's stale window, past which a point of an older second is dropped
    `stale` before the memory is read. Each generation's table holds at most 65,536 buckets of
-   25 bytes, so the memory is at most about 3.2 MiB.
+   25 bytes, so the memory is at most about 3.1 MiB
+   (1,638,400 bytes, about 1.56 MiB, a generation).
 
 ## Alternatives considered
-- **Carry the stored total forward** (option f): add the earlier point's value into the later and
+- **Carry the stored total forward**: add the earlier point's value into the later and
   send the sum. It makes Datadog hold the second's total for a `count`, and works around the
   destination's overwrite. Rejected: a sink doesn't repair its destination's semantics. The
   operator places the summarization upstream, where the graph shows it.

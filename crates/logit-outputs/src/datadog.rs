@@ -165,8 +165,8 @@
 //! batch reuses that plan's points left off ([`BatchState`]), so a retry doesn't read its own
 //! accepted points as earlier ones. The memory is in memory only and bounded, two generations of
 //! [`SENT_SERIES_PER_GENERATION`] series each, and misses a pair from two process lives, a pair in
-//! flight together above `concurrency: 1`, a series it forgot, and a repeat of an older second
-//! than the latest sent (`docs/known-gaps/datadog.md`).
+//! flight together above `concurrency: 1`, a series it forgot, a repeat of an older second
+//! than the latest sent, and a pair whose earlier request drew a `2xx` naming any series dropped (`docs/known-gaps/datadog.md`).
 //!
 //! ## Size limits
 //!

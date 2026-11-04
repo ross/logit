@@ -139,8 +139,9 @@ Entry format and the other areas: [the known-gaps index](README.md).
     later, losing the other uncounted (for a `count`, an increment), when the two leave from two
     lives of the `datadog_out` process (an SUT restart, not a generator restart); when the
     earlier batch was still in flight above `concurrency: 1`, so either can land last; when the
-    series fell out of the memory; or when the repeated second is older than the latest one sent
-    for the series. A point left off after an earlier one is a loss of the later point: Datadog
+    series fell out of the memory; when the repeated second is older than the latest one sent
+    for the series; or when the earlier point's request drew a `2xx` whose `errors` name any
+    series dropped, which records none of that request's points. A point left off after an earlier one is a loss of the later point: Datadog
     holds the earlier, which for a gauge is the older reading.
   - **Workaround:** keep one series' readings of one second in one batch and one process: an
     `aggregate` upstream leaves one point per series per window, and a `dedup_timestamps` with

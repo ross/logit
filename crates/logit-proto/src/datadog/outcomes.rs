@@ -166,10 +166,12 @@ pub(super) enum MetricOut {
     /// A cumulative kind Datadog's exporter would difference, with no `cumulative_to_delta`
     /// upstream.
     UnresolvedCumulative,
-    /// A series point another point of its series replaced in the same second of one request.
+    /// A series point left off because another point of its series and second replaced it in
+    /// the same request, or an earlier accepted request had already sent that second.
     DuplicateTimestamp,
-    /// A state's series point replaced in the same second by a point equal to it: nothing is
-    /// lost, since Datadog stores the same point.
+    /// A state's series point left off in the same second, in one request or against an earlier
+    /// accepted request's, by a point equal to it: nothing is lost, since Datadog stores the
+    /// same point.
     EqualDuplicateTimestamp,
 }
 

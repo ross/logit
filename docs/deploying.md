@@ -3211,15 +3211,17 @@ single observation to attach one to. To keep exemplars, route those records arou
 
 Remote-write holds one sample per series per millisecond, and Datadog's series intake one point
 per series per second. So `prometheus_out`'s remote-write and `datadog_out` each send only the
-latest of a series' readings in one bucket, and count every other one:
+latest of a series' readings in one bucket, and count every other one. `datadog_out` also leaves
+off a point whose series and second an earlier request already sent (see
+below):
 
 | Removed reading | Counter |
 |---|---|
 | a state equal to the reading sent | `logit.output.metrics.normalized{reason="duplicate_timestamp"}` |
 | any other | `logit.output.metrics.dropped{reason="duplicate_timestamp"}`, with a throttled `duplicate_timestamp` diagnostic |
 
-The sink keeps the later reading because Prometheus and Mimir would keep the first of two in one
-request, and Datadog the higher, and neither adds two deltas. A state is a reading a later one
+Within a batch, the sink keeps the later reading because Prometheus and Mimir would keep the first
+of two in one request, and Datadog the higher, and neither adds two deltas. A state is a reading a later one
 fully replaces: a gauge, or a cumulative sum, histogram, or summary.
 An equal state loses nothing: the destination stores the same sample either way, so a relay or a
 retry resending identical points raises no loss alarm. Equal means the whole reading as the sink
@@ -3229,8 +3231,8 @@ increment or a set of observations (a delta count, a rate such as a Datadog `rat
 `samples`, a distribution, a set) counts `dropped` even when equal: two equal ones are two sets of events, and
 only one is sent. Two sets `{alice}` and `{bob}` both write a size of 1, and their union is 2.
 
-A nonzero dropped count means the flow needs a `dedup_timestamps` component, placed last before
-the sink.
+A nonzero dropped count with the `duplicate_timestamp` diagnostic means the flow needs a
+`dedup_timestamps` component, placed last before the sink.
 You meet it on a flow that keeps source timestamps from a source that can stamp two readings of
 one series inside one bucket: `statsd_in` gauges, which share their datagram's arrival time,
 `internal`, and any relay with no `aggregate` in the path. Set `precision:` to the sink's
@@ -3252,7 +3254,16 @@ before_remote_write:
 `rate`s, where the sink
 can only keep one reading. A record it can't merge passes through, and the sink then drops it,
 counted. It works within one batch, so a later batch repeating a series and instant still reaches
-the destination twice (`docs/known-gaps/prometheus.md` and `docs/known-gaps/datadog.md`).
+the destination twice on remote-write (`docs/known-gaps/prometheus.md`), and on `datadog_out`
+across a restart of its own process or between batches in flight together
+(`docs/known-gaps/datadog.md`).
+
+**Across batches**, `datadog_out` remembers the latest second it sent each series in, while its
+process runs. A later batch's point of a series and second an earlier accepted request already sent is left off, and the
+earlier point stays the one Datadog holds. It's counted by the table's rule, with a throttled
+`duplicate_timestamp_sent` diagnostic in place of `duplicate_timestamp`. `dedup_timestamps` doesn't
+remedy it, since it works within one batch. Keep one series' readings of one second in one batch,
+or merge them upstream with an `aggregate` window.
 
 `aggregate` also leaves one point per series, but it's the wrong stage for a timestamp-faithful
 relay. It stamps every point with the flush's wall-clock time, adds up to a window of latency, and
