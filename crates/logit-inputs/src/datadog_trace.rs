@@ -2672,6 +2672,34 @@ mod tests {
         );
     }
 
+    /// A silent connection on the TCP listener and on the Unix socket is counted
+    /// `handshake_timeout`, one count each.
+    #[tokio::test]
+    async fn a_silent_connection_is_counted_a_handshake_timeout() {
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let dir = TempDir::new("silent");
+        let path = dir.0.join("apm.socket");
+        let mut input = tcp()
+            .with_socket(&path)
+            .with_telemetry(probe.telemetry("apm", "datadog_trace_in", "listener"))
+            .with_handshake_timeout(Duration::from_millis(50));
+        input.bind().await.unwrap();
+        let addr = input.local_addr().unwrap().to_string();
+        let (sink, _rx) = channel_sink();
+        let _running = logit_pipeline::test_util::spawn_input(input, sink).await;
+
+        let mut silent_tcp = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        logit_pipeline::test_util::expect_closed(&mut silent_tcp, "a silent TCP connection").await;
+        let mut silent_unix = tokio::net::UnixStream::connect(&path).await.unwrap();
+        logit_pipeline::test_util::expect_closed(&mut silent_unix, "a silent Unix connection")
+            .await;
+        probe
+            .wait_for("both handshake_timeout close counts", |t| {
+                t.sum("logit.input.connections.closed", &[("reason", "handshake_timeout")]) == 2.0
+            })
+            .await;
+    }
+
     // ---- sender address: `peer:` and `proxy_protocol:` ----------------------------------------
 
     const CONNECTIONS_REJECTED: &str = "logit.input.connections.rejected";

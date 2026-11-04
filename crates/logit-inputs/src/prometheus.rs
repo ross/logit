@@ -3476,6 +3476,24 @@ mod tests {
         drop(silent);
     }
 
+    /// A silent connection is counted `handshake_timeout`.
+    #[tokio::test]
+    async fn a_silent_connection_is_counted_a_handshake_timeout() {
+        let mut probe = TelemetryProbe::new();
+        let (receiver, addr) = bound_receiver("/api/v1/write").await;
+        let receiver = receiver
+            .with_telemetry(probe.telemetry("rw", "prometheus_in", "listener"))
+            .with_handshake_timeout(Duration::from_millis(100));
+        let _rx = spawn_receiver(receiver, 4);
+        let mut silent = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        expect_closed(&mut silent, "a connection that sent nothing").await;
+        probe
+            .wait_for("the handshake_timeout close count", |t| {
+                t.sum("logit.input.connections.closed", &[("reason", "handshake_timeout")]) == 1.0
+            })
+            .await;
+    }
+
     /// A `tokio-rustls` client trusting `testdata/tls/ca.pem`, presenting no client certificate.
     fn test_tls_connector() -> tokio_rustls::TlsConnector {
         let dir = testdata_dir();

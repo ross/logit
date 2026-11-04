@@ -2535,6 +2535,24 @@ mod tests {
         );
     }
 
+    /// A connection that sends no byte is closed at the handshake timeout and counted
+    /// `handshake_timeout`.
+    #[tokio::test]
+    async fn a_silent_connection_is_counted_a_handshake_timeout() {
+        let (addr, _running, _rx, mut probe) = shutdown_listener(
+            SplunkHecInput::new("127.0.0.1:0").with_handshake_timeout(Duration::from_millis(50)),
+        )
+        .await;
+        let mut silent = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        logit_pipeline::test_util::expect_closed(&mut silent, "a connection that sent no bytes")
+            .await;
+        probe
+            .wait_for("the handshake_timeout close count", |t| {
+                t.sum("logit.input.connections.closed", &[("reason", "handshake_timeout")]) == 1.0
+            })
+            .await;
+    }
+
     // ---- units --------------------------------------------------------------------------------
 
     #[test]

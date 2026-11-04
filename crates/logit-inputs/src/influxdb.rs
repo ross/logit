@@ -1868,6 +1868,24 @@ mod tests {
         );
     }
 
+    /// A connection that sends no byte is closed at the handshake timeout and counted
+    /// `handshake_timeout`.
+    #[tokio::test]
+    async fn a_silent_connection_is_counted_a_handshake_timeout() {
+        let (addr, _running, _rx, mut probe) = shutdown_listener(
+            InfluxDbInput::new("127.0.0.1:0").with_handshake_timeout(Duration::from_millis(50)),
+        )
+        .await;
+        let mut silent = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        logit_pipeline::test_util::expect_closed(&mut silent, "a connection that sent no bytes")
+            .await;
+        probe
+            .wait_for("the handshake_timeout close count", |t| {
+                t.sum("logit.input.connections.closed", &[("reason", "handshake_timeout")]) == 1.0
+            })
+            .await;
+    }
+
     // ---- sender address -------------------------------------------------------------------------
 
     /// A v2 `PROXY` over TCP/IPv4 from 203.0.113.5:41000.
