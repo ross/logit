@@ -3190,19 +3190,38 @@ Docker 29.9, SELinux enforcing) checked each fault's mechanism before it was pla
       (`max_memory` bounds one Lua VM), so this is the soak that shows a `buffer:` bound bounds
       memory. `memory.max` isn't planned: its outcome is an OOM kill, which `exit` FAILs, and an
       expected-OOM excuse waits for a reason to want one.
-29. **A slow disk (W33).** `io.max` doesn't throttle on this host: a 1 MiB/s write limit let
-    4 MiB through with `fsync` in 0.1 s, likely because overlayfs over btrfs over dm-crypt
-    loses the writeback's cgroup. W33 puts a `dm-delay` device over a loop file in the run
-    directory instead, made in a privileged one-shot (the netem image gains `dmsetup`,
-    `losetup`, and `mkfs.ext4`), mounted as an `ext4` Docker volume at the spool path by a
-    compose override, as `spool-enospc` mounts its tmpfs, with the delay changed by
-    `dmsetup suspend`, `reload`, and `resume`. Devices are named per compose project, removed
-    in the end sequence, and swept at the driver's start for a crashed run's leftovers. One
-    scenario, `slow-spool`, from `spool-kill-replay`, with a SUT stop inside the slow window,
-    reaches the spool's segment `sync_data`, its persist worker's cursor write, and the write a
-    cancelled push leaves running. A `dm-flakey` `error_writes` variant reaches
-    `buffer.disk.errors{op}` on real I/O errors. W33 lands last of the three and may be
-    dropped if the device setup proves fragile.
+29. **A slow disk (W33), on the perf VM.** `io.max` doesn't throttle on the development host: a
+    1 MiB/s write limit let 4 MiB through with `fsync` in 0.1 s, likely because overlayfs over
+    btrfs over dm-crypt loses the writeback's cgroup. W33 runs on the disposable perf VM
+    instead (ADR `disposable-azure-perf-vm`; decided with Ross, 2026-11-04), where privileged
+    host state is thrown away with the VM, and its root filesystem is ext4 on a managed disk,
+    where cgroup writeback is supported. Two mechanisms, tried in order:
+    - **`io.max` through the `cgroup` action.** W32's action gains `io_wbps` and `io_wiops`
+      keys, written as `<major>:<minor> wbps=<n>` or `wiops=<n>` in the SUT's `io.max`, the
+      device resolved from the filesystem that holds Docker's data root (the volume the spool
+      lives on). It needs no new image and no privilege beyond W32's `label=disable`, and
+      reverts by writing `max` for that device. The VM's first step is the probe the survey ran
+      here: a throwaway container under a 1 MiB/s `wbps` writing 4 MiB with `fsync`, which
+      must take about 4 s.
+    - **`dm-delay`, if the probe fails.** A `dm-delay` device over a loop file in the run
+      directory, made in a privileged one-shot (the netem image gains `dmsetup`, `losetup`,
+      and `mkfs.ext4`), mounted as an `ext4` Docker volume at the spool path by a compose
+      override, as `spool-enospc` mounts its tmpfs, with the delay changed by `dmsetup
+      suspend`, `reload`, and `resume`. Devices are named per compose project, removed in the
+      end sequence, and swept at the driver's start.
+
+    One scenario, `slow-spool`, from `spool-kill-replay`, slows the spool's writes for a window
+    through a sink outage and stops the SUT inside it. It reaches the spool's segment
+    `sync_data`, its persist worker's cursor write with two fsyncs, and the write a cancelled
+    push leaves running (`disk_queue.rs`'s `HeldWriteFile`). Expected: backpressure, no
+    `*.dropped` unless the `buffer:` bound trips, the next life replaying the spool, and a
+    clean ledger. `[[expect]]` rows read the spool's write latency where telemetry has it, and
+    `timeline` reports the throttle's own count, `io.stat`'s `wbytes` and `wios` deltas, so a
+    window that never slowed a write is visible, as `memory.events` is for W32. A `dm-flakey`
+    `error_writes` variant, reaching `buffer.disk.errors{op}` on real I/O errors, needs the
+    `dm-delay` path's device and stays out of W33 unless that path is the one taken. The
+    harness needs Python 3.11 or later and `sudo -n docker`: the VM's Debian 13 image ships
+    Python 3.13, which cloud-init itself runs on, and its cloud-init installs Docker CE.
 30. **Clock steps stay deferred.** `CLOCK_REALTIME` can't be namespaced, a time namespace
     offsets only the monotonic clocks and Docker can't make one, and stepping the host's clock
     would break the driver's own timeline. `libfaketime` in an image layer could step the SUT's
@@ -3304,7 +3323,7 @@ that items 3, 7, and 11 need.
 | W30 | `soak/w30` | `soak/w30: plan round 4, and three round-3 harness follow-ups` | S | — |
 | W31 | `soak/w31` | `soak/w31: file-descriptor-limit soaks, with a prlimit action` | M | W30 |
 | W32 | `soak/w32` | `soak/w32: CPU-quota and memory-pressure soaks, with a cgroup action` | M | W31 |
-| W33 | `soak/w33` | `soak/w33: a slow-disk spool soak on a dm-delay volume` | M | W32 |
+| W33 | `soak/w33` | `soak/w33: a slow-disk spool soak on the perf VM` | M | W32 |
 | W34 | `soak/w34` | `soak/w34: slowloris and half-open peer soaks` | M | W32 |
 | W35 | `soak/w35` | `soak/w35: native-hop soaks over TLS, under RTT, and past the identity table` | M | W34 |
 | W36 | `soak/w36` | `soak/w36: a datadog_trace pair soak, with a span unit` | M | W35 |
