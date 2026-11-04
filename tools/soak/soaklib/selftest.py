@@ -13236,6 +13236,18 @@ def _prlimit_actions():
            and result["started_in_window"] is True,
            f"a process started inside the window has its own limit, so the revert sets "
            f"nothing, got {result}")
+    for status in ("exited", "restarting"):
+        fake = _PrlimitDocker([docker.Result(0, "1024 524288\n", ""), ok], running)
+        ctx = faults.Context(docker=fake, ids={"logit": "sut"}, netem_image="netem")
+        faults.ACTIONS["prlimit"].apply(ctx, step)
+        fake.state = {"Status": status, "StartedAt": running["StartedAt"]}
+        calls = len(fake.calls)
+        result = faults.ACTIONS["prlimit"].revert(ctx, step)
+        expect(len(fake.calls) == calls and result["restored"] is False
+               and result.get("exited_in_window") is True and result["status"] == status
+               and "started_in_window" not in result,
+               f"a container that is {status} at the revert records exited_in_window and sets "
+               f"nothing, got {result}")
     fake.state = running
     ctx.state[step.id] = {"found": [1024, "unlimited"], "started_at": running["StartedAt"]}
     fake.answers.append(ok)
@@ -13243,7 +13255,8 @@ def _prlimit_actions():
     expect(fake.calls[-1][-1] == "--nofile=1024:unlimited",
            f"an unlimited hard limit is set back as found, got {fake.calls[-1]}")
 
-    for printed, rc in (("", 0), ("1024\n", 0), ("soft hard\n", 0), ("", 1)):
+    for printed, rc in (("", 0), ("1024\n", 0), ("soft hard\n", 0), ("", 1),
+                          ("1024 524288\n", 1)):
         fake = _PrlimitDocker([docker.Result(rc, printed, "")], running)
         ctx = faults.Context(docker=fake, ids={"logit": "sut"}, netem_image="netem")
         result = faults.ACTIONS["prlimit"].apply(ctx, step)
@@ -13276,6 +13289,14 @@ def _prlimit_actions():
                and "c0s2 (prlimit on logit): the process started again inside the window"
                in result.detail,
                f"timeline reports a prlimit whose process started inside it, got {result}")
+        timeline[-1] = _action("revert", "c0s2", "prlimit", "logit", 210, restored=False,
+                               exited_in_window=True, status="exited")
+        result = _status(_run_dir(tmp, "prlimit-exited", timeline), checks.check_timeline)
+        expect(result.status == checks.PASS
+               and "c0s2 (prlimit on logit): the process exited inside the window (status "
+               "exited), so nothing was restored" in result.detail
+               and "started again" not in result.detail,
+               f"timeline reports a prlimit whose process exited inside it, got {result}")
 
 
 def _prlimit_rules(root):
@@ -15716,6 +15737,14 @@ def _cri_ledger():
                    "enough to compress a file it hadn't read: 3 rotation(s) in a pause trip the "
                    "guard"),
                f"three rotations in a pause FAIL, got {thrice['ledger.wire']}")
+        # A prlimit keeps the open files too, so it takes the pause's limit, not a stop's.
+        limit = [_action("apply", "c0s2", "prlimit", "logit", 200, 201, nofile=24,
+                         found=[1024, 524288]),
+                 _action("revert", "c0s2", "prlimit", "logit", 230, 230, restored=True)]
+        limited = run("cri-prlimit-twice", timeline_extra=limit, rotations={205: 1, 225: 1})
+        expect(limited["ledger.wire"].status == checks.PASS,
+               f"two rotations in a prlimit pass at the pause's limit, got "
+               f"{limited['ledger.wire']}")
 
 
 def _dangle_log(run_dir, dangles):

@@ -633,6 +633,10 @@ def check_timeline(data):
             "inside the window, so its limit ended there and nothing was restored"
             for record in actions
             if record["event"] == "revert" and record.get("started_in_window")]
+    gone += [f"{record.get('step')} (prlimit on {record.get('on')}): the process exited inside "
+             f"the window (status {record.get('status')}), so nothing was restored"
+             for record in actions
+             if record["event"] == "revert" and record.get("exited_in_window")]
     if lines:
         return Result("timeline", FAIL, lines[0], lines + gone)
     return Result("timeline", PASS, f"{len(actions)} apply/revert action(s) returned 0; "
