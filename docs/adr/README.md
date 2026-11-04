@@ -10,6 +10,7 @@ the same date, write the record, then add a row here.
 
 | ADR | Created | Updated |
 |---|---|---|
+| [`datadog_out` leaves off, and counts, a series point whose series and second an earlier accepted request sent](datadog-out-sent-second-memory.md) | 2026-11-04 | 2026-11-04 |
 | [Server status inputs: `nginx_stub_status_in` and `apache_status_in` on a scrape driver shared with `prometheus_in`](server-status-scrape-inputs.md) | 2026-10-31 | 2026-11-01 |
 | [`s3_out`: one object per time and size window, delivered at completion, under a key its first batch names](s3-object-archive.md) | 2026-10-30 | 2026-10-30 |
 | [Collecting sink window: a windowed sink keeps its window open across arrivals until its own bound, a deadline, store pressure, or shutdown closes it](collecting-sink-window.md) | 2026-10-30 | 2026-10-30 |
@@ -23,7 +24,7 @@ the same date, write the record, then add a row here.
 | [Protocol knowledge stays in family: a component keys behavior on another component's internals only within a lossless family](protocol-knowledge-stays-in-family.md) | 2026-10-23 | 2026-10-23 |
 | [Runtime worker count: a top-level `runtime.workers` sets the Tokio worker threads](runtime-worker-count.md) | 2026-10-23 | 2026-10-23 |
 | [Metric flags: producers set `_logit.metrics.*` flags, and `aggregate` reads flags instead of protocol carriers](metric-flags.md) | 2026-10-22 | 2026-10-23 |
-| [`dedup_timestamps`: collapse readings of one series that share a timestamp, within a batch, before a sink that can't hold both](dedup-timestamps-transform.md) | 2026-10-21 | 2026-10-23 |
+| [`dedup_timestamps`: collapse readings of one series that share a timestamp, within a batch, before a sink that can't hold both](dedup-timestamps-transform.md) | 2026-10-21 | 2026-11-04 |
 | [Lua `vars`: a component's `vars:` map reaches its script as a plain-table global](lua-script-vars.md) | 2026-10-21 | 2026-10-21 |
 | [Full-buffer diagnostics: a full sink buffer or receive queue logs once a minute, and a gauge reads a blocked push live](buffer-full-diagnostics.md) | 2026-10-21 | 2026-11-02 |
 | [`datadog_out` maps OTLP metric kinds as Datadog's OTel exporter does, statelessly](datadog-otlp-metric-mapping.md) | 2026-10-20 | 2026-10-23 |

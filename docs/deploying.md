@@ -3660,7 +3660,10 @@ sketch whose `tags` list holds more than 100 strings, so `datadog_out` drops it 
 points in one request, so of each batch's pair `datadog_out` sends the later and counts the other
 `metrics.dropped{reason="duplicate_timestamp"}`, or
 `metrics.normalized{reason="duplicate_timestamp"}` for a gauge equal to the one sent;
-distribution points are kept, as Datadog keeps them. A `dedup_timestamps` with
+distribution points are kept, as Datadog keeps them. Across requests Datadog keeps the later
+write, so a later batch's point of a series and second the sink already sent is left off and
+counted the same way, with a `duplicate_timestamp_sent` warning. The sink remembers what it sent
+only while its process runs, and not for a batch still in flight above `concurrency: 1`. A `dedup_timestamps` with
 `precision: 1s` ahead of the sink merges deltas instead (see
 [Duplicate timestamps](#duplicate-timestamps)).
 

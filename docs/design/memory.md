@@ -1241,6 +1241,15 @@ compresses one (the 581-allocation row in §2). An object that never fills a par
 `PutObject`; the close's flush can cut more than one part under `gzip` or `zstd`, and that object
 is a multipart upload.
 
+**`datadog_out` remembers the seconds it sent, bounded.** Per series it holds the latest second
+an accepted request carried, in two generations of at most 57,344 series each, a 24-byte table
+entry (a 64-bit hash of the series and a 16-byte `Sent`) plus a control byte. A generation's table
+grows to at most 65,536 buckets, about 1.6 MiB, so the memory is at most about 3.2 MiB; the
+current generation becomes the previous, and the previous is freed, once the current is full or
+an hour old ([ADR `datadog-out-sent-second-memory`](../adr/datadog-out-sent-second-memory.md)).
+`sent_seconds_keep_the_latest_second_and_rotate_by_size_and_age` in
+`crates/logit-outputs/src/datadog.rs` pins the entry size.
+
 **Listeners bound undecoded bytes too.** [ADR `decoupled-listener-io`](../adr/decoupled-listener-io.md)
 generalizes `SinkQueue` into `BoundedQueue<T: Queued>` and weighs a UDP listener's receive queue
 (`logit-inputs::udp::ReceiveQueue`) by `Datagram::weight()`: `bytes.len()` plus the struct's inline
