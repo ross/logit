@@ -1577,8 +1577,9 @@ class HttpListener:
     """One HTTP listener kind's symbols beside its wire's: `requests`, its per-request counter,
     whose `class` tags `ok`, `busy`, and `closed_consumer` split the answers on its write route
     `route`, or None for a listener that counts no requests; `route`, None for a counter with no
-    `route` tag, one the listener counts on its write path alone; and `deferred`, the batches a
-    busy `503` left with the client, or None for a listener that never answers busy."""
+    `route` tag, one the listener counts on its write path alone, or one whose every route is a
+    write route, summed; and `deferred`, the batches a busy `503` left with the client, or None
+    for a listener that never answers busy."""
 
     requests: object
     route: object
@@ -1590,9 +1591,11 @@ class HttpListener:
 # the batch counted sent and its events dropped (crates/logit-inputs/src/influxdb.rs,
 # "Responses"; docs/design/internal-telemetry.md, "influxdb_in"). So per life its `ok` and
 # `closed_consumer` requests sum to its `batches.sent`, and its `busy` requests equal its
-# `batches.deferred`. `otlp_in` counts no requests and never answers busy: a slow downstream
-# holds the request, and a client that gives up leaves its batches to be delivered
-# (crates/logit-inputs/src/otlp.rs). `splunk_hec_in` and `datadog_in` answer as `influxdb_in`
+# `batches.deferred`. `otlp_in` answers as `influxdb_in` does under a 2 s deadline on a request's
+# first batch, on every route, `logs`, `metrics`, and `traces`, each a write route, so its row
+# sums them: a request decodes to one batch per resource, and `otlp_out` sends one resource per
+# request, so the identities hold for every `otlp_out` writer (crates/logit-inputs/src/otlp.rs,
+# "Backpressure"). `splunk_hec_in` and `datadog_in` answer as `influxdb_in`
 # does on the route each writer posts to, `event` and `series_v2`, under a 5 s deadline
 # (`splunk_hec_in` on a request's first batch, `datadog_in` on every batch): a `/event` body
 # decodes to one batch per envelope and a series body to one batch, so the identities hold while each body carries one envelope
@@ -1613,7 +1616,7 @@ class HttpListener:
 # logs and counts a cut send").
 HTTP_LISTENERS = {
     "influxdb_in": HttpListener("logit.input.requests", "write", "logit.input.batches.deferred"),
-    "otlp_in": HttpListener(None, None, None),
+    "otlp_in": HttpListener("logit.input.requests", None, "logit.input.batches.deferred"),
     "splunk_hec_in": HttpListener("logit.input.requests", "event",
                                   "logit.input.batches.deferred"),
     "datadog_in": HttpListener("logit.input.requests", "series_v2",

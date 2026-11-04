@@ -7197,6 +7197,7 @@ HTTP_REQUESTS = {
     "influxdb_in": ("logit.input.requests", {"route": "write"}),
     "splunk_hec_in": ("logit.input.requests", {"route": "event"}),
     "datadog_in": ("logit.input.requests", {"route": "series_v2"}),
+    "otlp_in": ("logit.input.requests", {"route": "metrics"}),
     "prometheus_in": ("logit.input.writes", {}),
 }
 
@@ -7591,11 +7592,13 @@ def _http_ledger():
                f"no request read in flight widens no edge, got {masked['ledger.wire']}")
 
         # `splunk_hec_in` and `datadog_in` hold their write route's requests to batches as
-        # `influxdb_in` does, each on its own route; `prometheus_in`'s receiver counts
-        # `logit.input.writes{class}` with no route tag, and never answers busy.
+        # `influxdb_in` does, each on its own route, and `otlp_in` on its three routes summed;
+        # `prometheus_in`'s receiver counts `logit.input.writes{class}` with no route tag, and
+        # never answers busy.
         for kind, route_text in (
                 ("splunk_hec_in", "logit.input.requests{route=event}"),
                 ("datadog_in", "logit.input.requests{route=series_v2}"),
+                ("otlp_in", "logit.input.requests"),
                 ("prometheus_in", "logit.input.writes")):
             got = results(f"http-{kind}", kind=kind)
             intake = got["ledger.intake"].detail
@@ -7628,15 +7631,7 @@ def _http_ledger():
                    f"{kind}: a closed_consumer request is one batch sent, got "
                    f"{refused['ledger.intake']}")
 
-        # `otlp_in` counts no requests: its intake has no identity of its own, and its wire
-        # still FAILs uncounted loss.
-        otlp = results("http-otlp", kind="otlp_in")
-        expect(otlp["ledger.wire"].status == checks.PASS
-               and otlp["ledger.intake"].status == checks.PASS
-               and "otlp_in counts no requests: W − D == E + B alone"
-               in otlp["ledger.intake"].detail,
-               f"otlp_in's rows PASS its balanced fixture, got {otlp['ledger.wire']}, "
-               f"{otlp['ledger.intake']}")
+        # `otlp_in`'s wire still FAILs uncounted loss.
         otlp_lost = results("http-otlp-lost", kind="otlp_in", gen_edit=_at_offset(
             "logit.component.events.delivered", 60, 1000, "out", add=True))
         expect(otlp_lost["ledger.wire"].status == checks.FAIL

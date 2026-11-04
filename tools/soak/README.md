@@ -520,10 +520,11 @@ lines of InfluxDB line protocol, each point with its own tag value so none merge
 count, a 500 ms `aggregate`, and a two-batch blocking sink queue. The source declares
 `fan_out = { points = 4 }`. Its cycle is `statsd-vm`'s, whose 90 s VictoriaMetrics stop backs
 up through the inboxes past `line_protocol`, each batch holding four times the events, into
-`otlp_in`, which holds each request until the generator's 10 s timeout. The generator then
-resends, and its 50-batch queue overflows, counted. Its expectations assert the sink queue
-filling and never dropping during that stop, the generator's transport errors through the
-SUT's pause, and no line dropped.
+`otlp_in`, which answers a request whose batch finds no room within 2 s `503`, counted
+`logit.input.batches.deferred`. The generator retries it, and its 50-batch queue can overflow,
+counted. Its expectations assert the sink queue filling and never dropping during that stop,
+the listener's deferred batches and the generator's `5xx` answers through it, the generator's
+transport errors through the SUT's pause, and no line dropped.
 
 `otlp-fan-out-conc` (16 minutes) is `otlp-fan-out` with the generator's `otlp_out` at
 `concurrency: 8`, judged by the same ledger. Beside `otlp-fan-out`'s expectations, it asserts
