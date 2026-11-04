@@ -2196,8 +2196,8 @@ components:
   `logit.input.connections.rejected{reason="limit"}` (nonzero means the `max_connections` cap is
   binding), `logit.input.connections.closed{reason="reset"}` (a peer that reset its connection
   after sending data; a partial frame it cut off is also counted `truncated`),
-  `logit.input.connections.closed{reason="handshake_timeout"}` (a peer that connected and sent no
-  TLS ClientHello or first byte within `handshake_timeout:`; not a loss),
+  `logit.input.connections.closed{reason="handshake_timeout"}` (a peer whose TLS accept or first-byte
+  wait outlasted `handshake_timeout:`; not a loss),
   `logit.input.frames`/`.frame.bytes` (one frame is one statsd line), and
   `logit.input.frames.dropped{reason="oversize"|"drained"|"truncated"}`. On either transport, a malformed
   *line* is the decoder's `logit.input.messages.dropped{reason="malformed"}` (diagnostic `bad_line`),
@@ -5480,8 +5480,8 @@ listener"](#idle_timeout-on-a-tcp-listener) above.
   `max_connections` cap is binding), and `logit.input.connections.closed{reason="reset"}`, a
   peer that reset its connection after sending data. A reset that cut off a partial frame is also
   counted `frames.dropped{reason="truncated"}`. `connections.closed{reason="handshake_timeout"}`
-  counts a peer that connected and sent no TLS ClientHello or first byte within
-  `handshake_timeout:`; it isn't a loss.
+  counts a peer whose TLS accept or first-byte wait outlasted `handshake_timeout:`; it isn't a
+  loss.
 - Both: a handshake failure, a framing violation, or an oversize or malformed frame surfaces through
   `logit.component.diagnostics{key="connection_error"|"framing_error"}` and
   `logit.input.frames.dropped{reason="oversize"|"malformed"|"truncated"}`. There is no separate

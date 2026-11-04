@@ -102,8 +102,8 @@ consequence that each such entry cites this ADR. The revisit trigger reopens eve
   ([ADR `untrusted-input-bounds`](untrusted-input-bounds.md)'s "A total body deadline";
   [ADR `idle-connection-timeout`](idle-connection-timeout.md)'s 2026-09-25 amendment). With enough
   connections, such a peer holds the whole `max_connections` cap. On the HTTP listeners,
-  `idle_timeout` does bound a trickled request head: its deadline runs from the last finished
-  request (`Activity::stamp_progress` moves only when a request finishes), and head bytes don't
+  `idle_timeout` does bound a trickled request head: its deadline runs from the connection's start
+  or the last finished request (`Activity::stamp_progress` moves only when a request finishes), and head bytes don't
   re-arm it. A body is bounded only per frame (`collect_with_stall_bound`). If the trigger fires,
   the candidates are a total deadline, a minimum transfer rate, or a per-peer connection cap, each
   worth its false positives only on an untrusted network.
