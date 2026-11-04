@@ -14949,9 +14949,44 @@ def _tls_actions():
                               "/run/tls:/tls:ro,z", "--entrypoint", "/certs.sh", "netem",
                               "probe", "8125", "logit"]
            and result == {"rc": 0, "stderr": "", "serial": "S1", "not_after": 1001,
-                          "verified": True},
+                          "verified": True, "client_ca": 1},
            f"a probe joins the target's namespace and reads the first DNS name, got "
            f"{fake.calls[-1]} {result}")
+    trust = scenario.Step("c0s9", 8, 0, "trust", "logit", "", 400.0, 440.0, cas=[1, 2])
+    fake.answers = [docker.Result(0, "x\n" + json.dumps(
+        {"bundle": 2, "cas": [1, 2], "subjects": ["logit soak CA", "logit soak CA 2"]}) + "\n",
+        "")]
+    result = faults.ACTIONS["trust"].apply(ctx, trust)
+    expect(fake.calls[-1] == ["--user", "1000:1001", "-v", "/run/tls:/tls:z", "--entrypoint",
+                              "/certs.sh", "netem", "trust", "2", "1", "2"]
+           and result == {"rc": 0, "stderr": "", "bundle": 2, "cas": [1, 2],
+                          "subjects": ["logit soak CA", "logit soak CA 2"]}
+           and ctx.state[faults.TLS_TRUST_KEY] == [1, 2]
+           and faults.ACTIONS["trust"].revert(ctx, trust) == {"rc": 0, "stderr": ""},
+           f"a trust writes the next bundle of its CAs and records them, got {fake.calls[-1]} "
+           f"{result}")
+    fake.answers = [docker.Result(0, json.dumps({"serial": "S9", "not_after": 1009,
+                                                 "issuer": "logit soak CA 2",
+                                                 "verified": True}) + "\n", "")]
+    result = faults.ACTIONS["probe"].apply(ctx, probe)
+    expect(fake.calls[-1][-4:] == ["probe", "8125", "logit", "2"]
+           and result["client_ca"] == 2 and result["issuer"] == "logit soak CA 2",
+           f"a probe presents the newest CA's client certificate in the bundle in force, got "
+           f"{fake.calls[-1]} {result}")
+    signed = scenario.Step("c0s10", 9, 0, "rotate", "logit", "", 500.0, 540.0, cert="generator",
+                           days=31, ca=2)
+    result = faults.ACTIONS["rotate"].apply(ctx, signed)
+    expect(fake.calls[-1][7:] == ["issue", "generator", "2", "31", "client", "generator",
+                                  "--ca", "2"],
+           f"a rotate passes its signing CA, got {fake.calls[-1]}")
+    fake.answers = [docker.Result(0, json.dumps({"bundle": 3, "cas": [1]}) + "\n", "")]
+    dropped = scenario.Step("c0s11", 10, 0, "trust", "logit", "", 600.0, 640.0, cas=[2])
+    result = faults.ACTIONS["trust"].apply(ctx, dropped)
+    expect(result["rc"] == 1 and ctx.state[faults.TLS_TRUST_KEY] == [1, 2]
+           and ctx.state[faults.TLS_TRUST_GEN_KEY] == 3,
+           f"a trust whose report names other CAs fails and leaves the bundle in force, its "
+           f"generation used up, got {result} {ctx.state}")
+    ctx.state.pop(faults.TLS_TRUST_KEY)
     fake.answers = [docker.Result(0, "no report\n", "")]
     result = faults.ACTIONS["probe"].apply(ctx, probe)
     expect(result["rc"] == 1 and "printed no report" in result["stderr"],
@@ -15054,10 +15089,13 @@ def _tls_driver(root):
            "the netem image carries openssl and certs.sh at the entrypoint faults.py names")
     script = (root / "netem" / "certs.sh").read_text()
     expect("ec_paramgen_curve:P-256" in script and "mv -T" in script
-           and 'ln -sfn "gen-${gen}"' in script and "chmod 0644" in script
-           and "-cert probe/cert.pem" in script,
-           "certs.sh makes P-256 keys, swaps a relative live link in one rename, makes its "
-           "files readable, and presents the probe's certificate")
+           and 'ln -sfn "$2" "$1/live.next"' in script and 'link "${name}" "gen-${gen}"' in script
+           and 'link trust "gen-${gen}"' in script and "chmod 0644" in script
+           and "client=probe\n" in script and '-cert "${client}/cert.pem"' in script
+           and "-CAfile trust/live/ca.pem" in script,
+           "certs.sh makes P-256 keys, swaps a relative live link in one rename for a "
+           "certificate and the trust bundle, makes its files readable, presents the probe's "
+           "certificate from CA 1 by default, and verifies against the bundle in force")
 
 
 def _tls_stderr_line(offset, key):

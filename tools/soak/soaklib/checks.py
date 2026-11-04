@@ -287,9 +287,10 @@ class Fault:
     to: object = None
     # When the apply finished, which for a `signal` is when Docker had sent it.
     applied: object = None
-    # A `rotate`'s certificate, days, generation, and whether it was issued broken, with the
-    # serial and `notAfter` it issued; a `probe`'s certificate and port, with the serial and
-    # `notAfter` the listener served and whether they verified against the CA. None elsewhere.
+    # A `rotate`'s certificate, days, generation, signing CA, and whether it was issued broken,
+    # with the serial, `notAfter`, and issuer it issued; a `probe`'s certificate and port, with
+    # the serial, `notAfter`, and issuer the listener served and whether they verified against
+    # the trust bundle in force; a `trust`'s CAs. None elsewhere.
     cert: object = None
     days: object = None
     broken: object = None
@@ -298,6 +299,9 @@ class Fault:
     serial: object = None
     not_after: object = None
     verified: object = None
+    ca: object = None
+    issuer: object = None
+    cas: object = None
 
     def affects(self, wire):
         return bool(getattr(self, faults.INGRESS_KEYS[wire]))
@@ -481,6 +485,7 @@ class RunData:
             cert=apply.get("cert"), days=apply.get("days"), broken=apply.get("broken"),
             gen=apply.get("gen"), port=apply.get("port"), serial=apply.get("serial"),
             not_after=apply.get("not_after"), verified=apply.get("verified"),
+            ca=apply.get("ca"), issuer=apply.get("issuer"), cas=apply.get("cas"),
         )
 
     def offset(self, t):
@@ -8546,9 +8551,10 @@ def check_tls_served(data):
     """One `tls.served.<step>` row per `probe` step, else one `tls.served` row that SKIPs. The
     probe pairs with the generation in force for its certificate: the latest rotation of it
     that started before the probe and wasn't broken, else the first issue (the driver's
-    `tls_issued` phase). The row FAILs when the probe didn't apply, the served serial or
-    `notAfter` isn't that generation's, the served chain didn't verify against the run's CA for
-    the certificate's name, or no first issue was recorded."""
+    `tls_issued` phase). The row FAILs when the probe didn't apply, the served serial,
+    `notAfter`, or issuing CA isn't that generation's, the served chain didn't verify against
+    the trust bundle in force for the certificate's name, or no first issue was recorded. A
+    record from before certs.sh reported an issuer compares none."""
     probes = sorted((f for f in data.events if f.action == "probe"), key=lambda f: f.start)
     failed = [r for r in data.timeline if r.get("event") == "apply"
               and r.get("action") == "probe" and r.get("rc")]
@@ -8564,7 +8570,8 @@ def check_tls_served(data):
         first = issued.get(probe.cert)
         want = None if first is None else {"what": "the first issue (gen 1)",
                                            "serial": first.get("serial"),
-                                           "not_after": first.get("not_after")}
+                                           "not_after": first.get("not_after"),
+                                           "issuer": first.get("issuer")}
         skipped = []
         for rotation in rotations:
             if rotation.cert != probe.cert or rotation.start > probe.start:
@@ -8573,9 +8580,10 @@ def check_tls_served(data):
                 skipped.append(rotation.step)
                 continue
             want = {"what": f"{rotation.step}'s gen {rotation.gen}", "serial": rotation.serial,
-                    "not_after": rotation.not_after}
+                    "not_after": rotation.not_after, "issuer": rotation.issuer}
         served = (f"{probe.on}:{probe.port} served {probe.cert} serial {probe.serial}, "
-                  f"notAfter {probe.not_after}")
+                  f"notAfter {probe.not_after}"
+                  + (f", issuer {probe.issuer!r}" if probe.issuer is not None else ""))
         if want is None:
             results.append(Result(f"tls.served.{probe.step}", FAIL,
                                   f"{served}; no first issue of {probe.cert} recorded "
@@ -8583,14 +8591,18 @@ def check_tls_served(data):
             continue
         line = (f"{served}; want {want['what']}, serial {want['serial']}, notAfter "
                 f"{want['not_after']}"
+                + (f", issuer {want['issuer']!r}" if want.get("issuer") is not None else "")
                 + (f", still in force after broken {', '.join(skipped)}" if skipped else ""))
         problems = []
         if probe.serial != want["serial"]:
             problems.append("serial differs")
         if probe.not_after != want["not_after"]:
             problems.append("notAfter differs")
+        if (probe.issuer is not None or want.get("issuer") is not None) \
+                and probe.issuer != want.get("issuer"):
+            problems.append("issuer differs")
         if probe.verified is not True:
-            problems.append("the served chain didn't verify against the run's CA")
+            problems.append("the served chain didn't verify against the trust bundle in force")
         status = FAIL if problems else PASS
         results.append(Result(f"tls.served.{probe.step}", status,
                               f"{line}" + (f": {'; '.join(problems)}" if problems else "")))

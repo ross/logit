@@ -102,15 +102,19 @@ Facts a maintainer needs here (docs/plans/soak-harness.md, "Netem scope"):
   wrote, and for a `copytruncate` the lines written after the copy and before the truncate
   (`lost_lines`). Each opens no window and affects no leg: `ledger.wire` accounts for a
   `copytruncate`'s lines from its record instead.
-- A `rotate` and a `probe` run `certs.sh` (tools/soak/netem/certs.sh) in the netem image, as
-  the host user. A `rotate` issues the certificate's next generation into `<run>/tls` and
-  repoints its `live` symlink there in one rename; generations count from the driver's first
-  issue, 1, and a failed issue still uses its number up. A `probe` joins the target's network
-  namespace and handshakes with the listener on its port, presenting the probe's own client
-  certificate, so a listener that requires one completes the handshake. Each records the
-  `serial` and `not_after` its script reports, and a probe whether the served chain verified
-  against the CA for the certificate's first DNS name (`verified`). Neither can lose data, and
-  neither revert does anything.
+- A `rotate`, a `trust`, and a `probe` run `certs.sh` (tools/soak/netem/certs.sh) in the netem
+  image, as the host user. A `rotate` issues the certificate's next generation into `<run>/tls`,
+  signed by its `ca`, CA 1 by default, and repoints its `live` symlink there in one rename;
+  generations count from the driver's first issue, 1, and a failed issue still uses its number
+  up. A `trust` writes the next trust bundle, its `cas` concatenated, making each CA it doesn't
+  find, and repoints `trust/live` the same way; bundles count from the driver's first, CA 1
+  alone. A `probe` joins the target's network namespace and handshakes with the listener on its
+  port, presenting the probe's own client certificate from the newest CA in the bundle in
+  force, so a listener that requires one completes the handshake. A rotate and a probe record
+  the `serial`, `not_after`, and `issuer` its script reports, and a probe whether the served
+  chain verified against the bundle in force for the certificate's first DNS name
+  (`verified`); a trust records its bundle's CAs and their subjects. None can lose data, and no
+  revert does anything.
 - A `mark` and an `exit` name an event the SUT's own config causes, so neither apply makes a
   Docker call. An `exit`'s revert starts the container only when it has exited, and its record
   says whether it did (`started`): a revert that found the process still running starts no new
@@ -144,6 +148,11 @@ CUE_TIMEOUT_S = 10
 # holding each certificate's last generation.
 CERTS_ENTRYPOINT = "/certs.sh"
 TLS_GEN_KEY = "tls_gen"
+# The `Context.state` keys holding the last trust bundle's generation and its CAs, and the
+# bundle the driver's first issue makes: CA 1 alone.
+TLS_TRUST_GEN_KEY = "tls_trust_gen"
+TLS_TRUST_KEY = "tls_trust"
+TLS_FIRST_BUNDLE = [1]
 # The image a file operation runs in: the stand-in's (compose.yaml), so a run pulls one Python
 # image, and the source it runs there. The driver pulls the image before the schedule starts
 # (`ensure_fileops_image`): a pull inside a step could hold the tick past the driver's stall
@@ -875,11 +884,13 @@ def certs_argv(ctx, command, *args, network=None, read_only=False):
     return argv
 
 
-def issue_args(name, gen, days, cert, broken=False):
+def issue_args(name, gen, days, cert, broken=False, ca=None):
     """`certs.sh issue`'s arguments: the certificate's name, its generation, its days, its
-    usage, and its DNS names, then `--broken` for a key that doesn't match it."""
+    usage, and its DNS names, then `--broken` for a key that doesn't match it and `--ca` for a
+    CA generation other than 1."""
     return ([name, str(gen), str(days), cert["usage"], *cert["san"]]
-            + (["--broken"] if broken else []))
+            + (["--broken"] if broken else [])
+            + (["--ca", str(ca)] if ca not in (None, 1) else []))
 
 
 def cert_report(result):
@@ -912,9 +923,35 @@ def rotate_apply(ctx, step):
     ctx.state.setdefault(TLS_GEN_KEY, {})[step.cert] = gen
     result = ctx.docker.run_oneshot(certs_argv(
         ctx, "issue", *issue_args(step.cert, gen, step.days, ctx.tls_certs[step.cert],
-                                  bool(step.broken))))
+                                  bool(step.broken), step.ca)))
     record = _certs_record(result)
     record["gen"] = gen
+    return record
+
+
+def trust_apply(ctx, step):
+    """Writes the next trust bundle, `step.cas`, and records it: `bundle`, its generation,
+    and `cas` and `subjects` as certs.sh printed them. rc 1 when it printed no report, which
+    leaves the bundle in force as it was for a later probe."""
+    if ctx.tls_dir is None:
+        return {"rc": 1, "stderr": "the run has no [tls] table"}
+    gen = ctx.state.get(TLS_TRUST_GEN_KEY, 1) + 1
+    ctx.state[TLS_TRUST_GEN_KEY] = gen
+    result = ctx.docker.run_oneshot(certs_argv(ctx, "trust", str(gen),
+                                               *(str(ca) for ca in step.cas)))
+    record = _record(result)
+    lines = result.stdout.strip().splitlines()
+    try:
+        report = json.loads(lines[-1]) if lines else None
+    except ValueError:
+        report = None
+    if not isinstance(report, dict) or report.get("cas") != list(step.cas):
+        record["rc"] = record["rc"] or 1
+        record["stderr"] = record["stderr"] or f"certs.sh printed no bundle of {step.cas}"
+        return record
+    record.update(bundle=report.get("bundle"), cas=report["cas"],
+                  subjects=report.get("subjects"))
+    ctx.state[TLS_TRUST_KEY] = list(step.cas)
     return record
 
 
@@ -922,8 +959,12 @@ def probe_apply(ctx, step):
     if ctx.tls_dir is None or step.cert not in ctx.tls_certs:
         return {"rc": 1, "stderr": f"the run has no [tls] certificate {step.cert}"}
     server_name = ctx.tls_certs[step.cert]["san"][0]
-    return _certs_record(ctx.docker.run_oneshot(certs_argv(
-        ctx, "probe", str(step.port), server_name, network=ctx.ids[step.on], read_only=True)))
+    client = max(ctx.state.get(TLS_TRUST_KEY) or TLS_FIRST_BUNDLE)
+    record = _certs_record(ctx.docker.run_oneshot(certs_argv(
+        ctx, "probe", str(step.port), server_name, *([str(client)] if client != 1 else []),
+        network=ctx.ids[step.on], read_only=True)))
+    record["client_ca"] = client
+    return record
 
 
 def restart_apply(ctx, step):
@@ -1242,6 +1283,15 @@ ACTIONS = {
     ) for name in ("copytruncate", "gzip", "replace")},
     "rotate": Action(
         apply=rotate_apply,
+        revert=no_op,
+        affects_udp_ingress=_never,
+        affects_egress=_never,
+        affects_tcp_ingress=_never,
+        affects_file_ingress=_never,
+        affects_http_ingress=_never,
+    ),
+    "trust": Action(
+        apply=trust_apply,
         revert=no_op,
         affects_udp_ingress=_never,
         affects_egress=_never,
