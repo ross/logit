@@ -7644,8 +7644,7 @@ def _http_ledger():
 
         # `splunk_hec_in` and `datadog_in` hold their write route's requests to batches as
         # `influxdb_in` does, each on its own route, and `otlp_in` on its three routes summed;
-        # `prometheus_in`'s receiver counts `logit.input.writes{class}` with no route tag, and
-        # never answers busy.
+        # `prometheus_in`'s receiver counts `logit.input.writes{class}` with no route tag.
         for kind, route_text in (
                 ("splunk_hec_in", "logit.input.requests{route=event}"),
                 ("datadog_in", "logit.input.requests{route=series_v2}"),
@@ -7657,7 +7656,7 @@ def _http_ledger():
                    and got["ledger.intake"].status == checks.PASS
                    and f"final life 1: {route_text} ok 340 + closed_consumer 0 == batches.sent "
                    "340" in intake
-                   and ("busy" in intake) == (kind != "prometheus_in"),
+                   and "busy" in intake,
                    f"{kind}'s intake judges its request identities, got {got['ledger.intake']}")
             name, tags = HTTP_REQUESTS[kind]
             unanswered = results(f"http-{kind}-unanswered", kind=kind, sut_edit=_chain(

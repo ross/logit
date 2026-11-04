@@ -1,6 +1,6 @@
 ---
 created: 2026-09-23
-updated: 2026-11-03
+updated: 2026-11-04
 ---
 
 # Datadog: two lossless pairs, the Agent's own protocols, and a Datadog-mapped `DdSketch`
@@ -953,5 +953,6 @@ as the pipeline takes. They don't: every OTLP exporter has a request timeout (`o
 seconds, the Collector's 5) and resends a request that timed out, so a blocked `otlp_in`
 delivered each timed-out request twice. [ADR `otlp-in-busy-answer`](otlp-in-busy-answer.md) gives
 `otlp_in` a 2-second bound on a request's first batch and a busy `503` (gRPC `UNAVAILABLE`), by
-`splunk_hec_in`'s first-batch rule. `prometheus_in`'s remote-write receiver still blocks, tracked
-in [`known-gaps/prometheus.md`](../known-gaps/prometheus.md).
+`splunk_hec_in`'s first-batch rule. `prometheus_in`'s remote-write receiver followed on
+2026-11-04, by that record's amendment "`prometheus_in`'s remote-write receiver answers busy
+too".

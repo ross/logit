@@ -600,8 +600,8 @@ in the pool, past its limit of 650.
 
 Re-scored, the failed run PASSes with 90 of loss judged against 650, and the passing run reads
 96 as before. A backend stop still opens no judged HTTP window: whether it reaches the wire
-depends on the listener (`prometheus_in`'s receiver holds a request past the writer's timeout,
-`influxdb_in` and `otlp_in` answer a busy `503`), so its resends' surplus counts 0 as steady state's does.
+depends on the listener (`influxdb_in`, `otlp_in`, and `prometheus_in`'s receiver answer a busy
+`503`), so its resends' surplus counts 0 as steady state's does.
 
 ## Amendment: a merge is credited back as delivered, and a keyed discard is judged by absence (2026-10-29)
 
@@ -683,7 +683,8 @@ The HTTP wire follows `splunk_hec_in`, `datadog_in`, and `prometheus_in`'s remot
 receiver, from `splunk_hec_out`, `datadog_out`, and `prometheus_out`. `splunk_hec_in` and
 `datadog_in` count requests and answer busy as `influxdb_in` does, so `ledger.intake` holds them
 to its two identities on their write routes. `prometheus_in` counts `logit.input.writes{class}`,
-with no `route` tag, and never answers busy, so it holds only the first. It has no `transport:`,
+with no `route` tag, and answers busy as `otlp_in` does, so it holds both, its `busy` class
+against `logit.input.batches.deferred`. It has no `transport:`,
 so its wire is keyed on the mode its config sets: `bind:` is the receiver, and
 `scrape_targets:` the scrape wire, the next amendment.
 

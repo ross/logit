@@ -693,9 +693,9 @@ pub(crate) async fn deliver_with_deadline(
 
 /// Sends a request's first batch through [`deliver_with_deadline`] under `busy_after`, then the
 /// rest through [`deliver_detached`]: the shape of a listener that answers busy only while nothing
-/// of the request is taken (`splunk_hec_in`, `otlp_in`). Once a batch is delivered, a busy answer
-/// would tell the client nothing was taken, and its retry would deliver that batch twice, so the
-/// rest wait for as long as the pipeline takes.
+/// of the request is taken (`splunk_hec_in`, `otlp_in`, `prometheus_in`'s receiver). Once a batch
+/// is delivered, a busy answer would tell the client nothing was taken, and its retry would
+/// deliver that batch twice, so the rest wait for as long as the pipeline takes.
 ///
 /// [`Undelivered::Busy`] carries every batch of the request and is the caller's to count and
 /// answer: nothing was sent, and the client still holds the body. Every [`Undelivered::Closed`]

@@ -1210,16 +1210,17 @@ would add one point per probe interval to this key forever.
 |---|---|---|---|
 | scrape | `logit.input.scrapes{class="2xx"\|"4xx"\|"5xx"\|"other"\|"network_error"\|"timeout"\|"parse_error"\|"oversize"}` | count | one per target per tick: the HTTP classes plus three ways a scrape fails before or after a status (`parse_error` is a 2xx body that wouldn't decode) |
 | scrape | `logit.input.scrape.duration` | timing | one per target per tick, recorded regardless of outcome |
-| bind | `logit.input.writes{class="ok"\|"not_found"\|"method"\|"unauthorized"\|"unsupported"\|"oversize"\|"timeout"\|"bad_request"\|"closed_consumer"}`, plus `encoding="snappy"\|"zstd"` on `class="ok"` | count | one per request, one class per row of the module doc's routes table. A write that reaches delivery is counted on the delivery's task, so it counts even when its sender closed before the response. See below. |
+| bind | `logit.input.writes{class="ok"\|"not_found"\|"method"\|"unauthorized"\|"unsupported"\|"oversize"\|"timeout"\|"bad_request"\|"busy"\|"closed_consumer"}`, plus `encoding="snappy"\|"zstd"` on `class="ok"` | count | one per request, one class per row of the module doc's routes table. A write is counted `ok` once its batch is in every inbox, so it counts even when its sender closed before the response; one whose sender closed during the bounded wait counts no class. See below. |
+| bind | `logit.input.batches.deferred` | count | the batch of a write answered busy: `503` with `Retry-After: 1`, because it found no room in every consumer within 2 seconds. Disjoint from `logit.component.batches.sent`. Not loss: the sender resends it |
 | bind | `logit.input.write.duration` | timing | one per request answered, every exit included, which is why the timer lives in one wrapper around the routing itself |
 | both | `logit.input.samples` | count | a different unit in each mode. See below. |
 
 These are this component's own spellings, not `otlp_in`'s `logit.input.requests{route, class}`. In `logit.input.writes`:
 
 - `ok` carries the body's `encoding`, so a vmagent that stayed on its default zstd wire, rather
-  than downgrading to Snappy, reads as `encoding="zstd"`. It counts a delivered write whose
-  sender timed out waiting for the `204` too: the batch went out, and the sender's resend is the
-  ordinary at-least-once duplicate. So `ok` and `closed_consumer` sum to the listener's
+  than downgrading to Snappy, reads as `encoding="zstd"`. It's counted the moment the batch is in
+  every inbox, so a sender that closes after that, before the `204` reaches it, still counts. So
+  `ok` and `closed_consumer` sum to the listener's
   `logit.component.batches.sent` while no write decodes to nothing: a write that decodes to no
   events, such as a 1.0 metadata-only request, is answered `204` and counts `ok` with no batch sent.
 - `unauthorized` is a `401` from `bind_auth:`, checked before the body. It's also counted
@@ -1233,6 +1234,11 @@ These are this component's own spellings, not `otlp_in`'s `logit.input.requests{
   `idle_timeout:` is set**, because the per-frame stall bound is derived from it and it's off by
   default. On a default `bind:` this class never fires, and a half-uploaded request holds its
   connection permit instead.
+- `busy` is a write whose batch found no room in every consumer within 2 seconds, answered `503`
+  with `Retry-After: 1` and the body `busy`, with a throttled `busy` diagnostic. Nothing of it was
+  delivered, and `logit.input.batches.deferred` counts its batch. A sender retries a `5xx`, so
+  it's not loss; read a steady rate as a pipeline that can't keep up with its senders
+  ([ADR `otlp-in-busy-answer`](../adr/otlp-in-busy-answer.md)'s remote-write amendment).
 - `closed_consumer` is a write no consumer took, answered `503`. Its samples aren't counted in
   `logit.input.samples`, and `logit.input.batches.dropped{reason="closed_consumer"}` counts the
   batch. Not disjoint from `logit.component.batches.sent`: the refused batch is also counted there

@@ -287,9 +287,8 @@ Entry format and the other areas: [the known-gaps index](README.md).
   `splunk_hec_in` and `otlp_in` in the `deliver_detached` wait for the rest
   (`crate::http::deliver_first_bounded`). A client that closes then drops the handler, so the
   batches already sent count `logit.component.batches.sent` and the request counts no class.
-  Nothing is lost: the batches are delivered and the client resends. `prometheus_in`'s receiver
-  counts on the detached delivery's task (`crate::http::deliver_detached`'s `settle`), and
-  `influxdb_in` and `datadog_trace_in` send one batch, whose commit and count share one poll, as
+  Nothing is lost: the batches are delivered and the client resends. `prometheus_in`'s receiver,
+  `influxdb_in`, and `datadog_trace_in` send one batch, whose commit and count share one poll, as
   does a one-resource `otlp_in` request, which is every request `otlp_out` sends.
   - The fix is for each handler to settle the request's class on the delivery's task. For
     `splunk_hec_in` that task would also own the `ackId` draw and the code-6 class, and
