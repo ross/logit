@@ -43,7 +43,7 @@ pub(crate) enum Unavailable {
         allow(dead_code, reason = "built only by the non-Linux twins")
     )]
     NotLinux,
-    /// The read failed: a sandbox hiding the file, or a missing procfs mount.
+    /// The read failed. [`Unavailable::is_permanent`] says which errors clear up later.
     Io(io::Error),
     /// The file read, but not in the shape this module parses. Names what was missing.
     Malformed(&'static str),

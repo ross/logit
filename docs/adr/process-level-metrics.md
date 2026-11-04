@@ -66,12 +66,14 @@ once per `interval`.
 Each of the four procfs sources has its own enabled flag. The first permanent failure (no procfs,
 a file that is missing or forbidden, or contents the parser doesn't recognize) latches only that
 source off and emits one diagnostic: `debug` when the platform has no procfs, `warn` when a read
-failed on Linux. Any other failure is transient: the source skips that tick's reading, retries on
-the next tick, and reports under a throttled `warn`. A process at its descriptor limit can't open
-`/proc/self/status`, and latching off then would drop the metrics that show the exhaustion and
-never bring them back. That's the shape `AcceptQueueSampler` (`crates/logit-inputs/src/tcp.rs`) uses for
-`TCP_INFO`. One latch for all four would let a sandbox that hides one file, such as gVisor or a
-seccomp profile, silence the other three.
+failed on Linux. That's the per-source latch `AcceptQueueSampler`
+(`crates/logit-inputs/src/tcp.rs`) uses for `TCP_INFO`. One latch for all four would let a sandbox
+that hides one file, such as gVisor or a seccomp profile, silence the other three.
+
+Unlike `AcceptQueueSampler`, which latches off on any error, a procfs source treats any other
+failure as transient: it skips that tick's reading, retries on the next tick, and reports under a
+throttled `warn`. A process at its descriptor limit can't open `/proc/self/status`, and latching
+off then would drop the metrics that show the exhaustion and never bring them back.
 
 ### CPU is a delta counter
 Every other `internal` counter is a delta `Sum`, and the downstream story is already built for it:

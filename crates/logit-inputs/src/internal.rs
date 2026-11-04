@@ -283,10 +283,10 @@ type Reader<T> = fn() -> Result<T, Unavailable>;
 /// (`docs/adr/process-level-metrics.md`).
 ///
 /// Each of the four procfs sources latches off on its own first permanent failure
-/// ([`Unavailable::is_permanent`]), with one diagnostic, as `crate::tcp::AcceptQueueSampler` does:
-/// a sandbox that hides one file must not silence the others. A transient failure skips that
-/// tick's reading and retries on the next, so a process at its descriptor limit keeps reporting
-/// once the limit clears. The heap hook is independent of all four.
+/// ([`Unavailable::is_permanent`]), with one diagnostic: a sandbox that hides one file must not
+/// silence the others. `crate::tcp::AcceptQueueSampler` shares that per-source latch but latches
+/// on any error. Here a transient failure skips that tick's reading and retries on the next, so a
+/// process at its descriptor limit keeps reporting once the limit clears. The heap hook is independent of all four.
 struct ProcessSampler {
     read_status: Reader<Status>,
     read_cpu: Reader<CpuTicks>,
