@@ -1824,6 +1824,10 @@ clones the repository into `~/logit`, and its Debian image has Python 3.13, Dock
 ## Cleanup and a shared daemon
 
 Everything a run creates belongs to the `soak-<scenario>` project, apart from the one-shot netem
-containers, which remove themselves. The script refuses to start while that project has
-containers, and prints the `down` command for a stack a crashed or `--keep` run left behind. Two
-different scenarios can run at once; it never prunes.
+containers, which remove themselves, and a `slowclient` step's container. That one carries the
+project's label and a `<project>-slowclient-` name but no `config-hash` label, so
+`compose down --remove-orphans` and `compose ps` leave it; teardown removes it before `down`
+unless `--keep` is set, and a SIGKILLed driver or a `--keep` run leaves it. The script refuses
+to start while the project has containers or a `slowclient` container, and prints the commands
+for a stack a crashed or `--keep` run left behind: `docker rm -f <ids>` for the client, then
+`compose -p <project> ... down -v`. Two different scenarios can run at once; it never prunes.

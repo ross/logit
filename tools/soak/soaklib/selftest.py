@@ -1029,6 +1029,9 @@ class _AnswerDocker:
     def project_containers(self):
         return []
 
+    def stray_containers(self):
+        return []
+
     def remove_strays(self, timeout=None):
         self.calls.append(["remove_strays"])
         return []
@@ -4966,6 +4969,18 @@ def _target_rules(root):
             driver._print = real_print
         expect(code == 2 and not private.exists() and not private.parent.exists(),
                "execute() exits 2 on a busy project, and removes the private env copy")
+        run.docker = _StrayOnlyDocker()
+        printed = []
+        driver._print = lambda text, stream=None: printed.append(text)
+        try:
+            code = run.execute()
+        finally:
+            driver._print = real_print
+        expect(code == 2 and len(printed) == 1 and "docker rm -f aa bb" in printed[0]
+               and "compose -p" in printed[0] and "down -v" in printed[0]
+               and printed[0].index("rm -f") < printed[0].index("down -v"),
+               f"a stray client container alone refuses the start and prints both cleanup "
+               f"commands, got {printed}")
         vm_run = driver.Run(root, local, local.duration, None, False, Path(tmp) / "vm", [],
                             "logit:soak", roles=scenario.BASE_ROLES)
         vm_run.prepare()
@@ -5094,6 +5109,25 @@ class _BusyDocker:
 
     def project_containers(self):
         return ["leftover"]
+
+    def stray_containers(self):
+        return []
+
+
+class _StrayOnlyDocker(_BusyDocker):
+    """A daemon with no compose container in the project, but a `slowclient` one a crashed
+    run left, listed through the real `Docker.stray_containers` with the daemon faked."""
+
+    def __init__(self):
+        self.real = docker.Docker("soak-x", [], [], prefix=["docker"])
+        self.real.run = lambda args, timeout=None, stdout=None, stderr=None: docker.Result(
+            0, "aa\nbb\n" if args[0] == "ps" else "", "")
+
+    def project_containers(self):
+        return []
+
+    def stray_containers(self):
+        return self.real.stray_containers()
 
 
 class _TailDocker:
