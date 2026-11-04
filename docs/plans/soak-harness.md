@@ -6871,7 +6871,7 @@ What the runs showed about `logit` and the harness:
   "after a stall nothing applies, and the open step reverts early, got []" while another
   agent's soak and an image build shared the host; four reruns passed. It isn't W32's code,
   and is noted for the flake log.
-- **Self-test**: 2,938 expectations. Each new rule was reverted in turn and failed at least one
+- **Self-test**: 2,939 expectations. Each new rule was reverted in turn and failed at least one
   expectation: the cgroup v2 line, the full-id and `..` checks, a missing process, the failed
   read, the read-back, `label=disable` on the one-shot, the revert's `started_in_window` and
   `exited_in_window` branches and `timeline`'s report of each, UDP ingress, the drain gap's
