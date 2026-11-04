@@ -2098,6 +2098,115 @@ mod tests {
         assert_eq!(diag.occurrences("unacknowledged"), 1);
     }
 
+    /// Waits until the connection is idle: every byte `total` put on the stream is read (`read`)
+    /// or held in the receiver's buffer and acknowledged, so the client's send queue holds the
+    /// rest and nothing is in flight. Returns what the receiver holds.
+    async fn wait_idle(
+        fd: sockstat::RawFd,
+        receiver: &std::net::TcpStream,
+        read: u64,
+        total: u64,
+    ) -> u64 {
+        let mut buf = vec![0u8; 8 << 20];
+        let mut held = 0;
+        wait_until("the connection to go idle", || {
+            held = receiver.peek(&mut buf).unwrap() as u64;
+            u64::from(sockstat::send_queue(fd).unwrap()) + read + held == total
+        })
+        .await;
+        held
+    }
+
+    /// Two `Ambiguous` stalls on one kept connection, with the first frame still in the send
+    /// queue at the second. The second stall's queue reading is what keeps the first frame's
+    /// range, so the reset's count leaves out the queued bytes of both frames and counts only
+    /// the frames sent whole that the receiver never acknowledged.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_second_stall_keeps_the_first_stalled_frame_out_of_the_unacknowledged_count() {
+        use std::io::Read;
+
+        // A set receive buffer doesn't grow as the receiver reads, so it holds about as much when
+        // full again as before.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(64 * 1024).unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(8).unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let dial = Dial {
+            target: Target::Tcp { endpoint: &endpoint, tls: None },
+            connect_timeout: STALL_BOUND,
+            accept_timeout: Duration::ZERO,
+            sink: "test_out",
+            nodelay: false,
+        };
+        let (mut probe, telemetry) = sink_telemetry();
+        let mut diag = Diagnostics::default();
+        let mut pool = PooledStream::default();
+        // Not a multiple of the write chunk, so a stall rarely falls on a frame boundary.
+        let frame = vec![b'x'; 100_003];
+        let len = frame.len() as u64;
+
+        // Frame A stalls part-written.
+        let mut start = 0;
+        let err = loop {
+            match pool.send(&dial, &frame, &telemetry, &mut diag).await {
+                Ok(()) => start += len,
+                Err(err) => break err,
+            }
+        };
+        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous, "{err:#}");
+        let a = start..start + len;
+        let a_tail = pool.pending().expect("A's tail is kept").len() as u64;
+        let fd = pool.conn.as_ref().and_then(|conn| conn.tcp_fd).expect("a TCP connection");
+        let (receiver, _) = listener.accept().await.unwrap();
+        let mut receiver = receiver.into_std().unwrap();
+        receiver.set_nonblocking(false).unwrap();
+        let held = wait_idle(fd, &receiver, 0, a.end - a_tail).await;
+        let queued = a.end - a_tail - held;
+
+        // Reading A's tail and half the queue frees room for the tail and more, while A's end
+        // stays past everything the receiver can have read or acknowledged.
+        let read = queued / 2 + a_tail;
+        receiver.read_exact(&mut vec![0u8; read as usize]).unwrap();
+        wait_idle(fd, &receiver, read, a.end - a_tail).await;
+
+        // The next attempt finishes A; frames go whole until frame B stalls part-written.
+        let mut start = a.end;
+        let err = loop {
+            match pool.send(&dial, &frame, &telemetry, &mut diag).await {
+                Ok(()) => start += len,
+                Err(err) => break err,
+            }
+        };
+        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous, "{err:#}");
+        let b_tail = pool.pending().expect("B's tail is kept").len() as u64;
+        let b = start..start + len - b_tail;
+        let held = wait_idle(fd, &receiver, read, b.end).await;
+        let acked = read + held;
+        assert!(a.end > acked, "A is still queued: A {a:?}, acknowledged {acked}");
+        assert_eq!(bytes_dropped(&mut probe), 0.0, "a stall loses nothing yet");
+
+        // Closing with bytes unread resets the connection.
+        drop(receiver);
+        let pooled = pool.stream_mut().expect("kept");
+        wait_until("the pooled connection to probe the reset", || {
+            matches!(probe_now(&mut **pooled), PendingClose::Eof)
+        })
+        .await;
+        pool.send(&dial, FRAME, &telemetry, &mut diag).await.expect("delivered on a redial");
+
+        let queued_part = |range: &std::ops::Range<u64>| range.end - range.start.max(acked);
+        let whole_unacknowledged = b.end - acked - queued_part(&a) - queued_part(&b);
+        assert!(whole_unacknowledged > 0, "A {a:?}, B {b:?}, acknowledged {acked}");
+        assert_eq!(
+            bytes_dropped(&mut probe),
+            whole_unacknowledged as f64,
+            "A {a:?}, B {b:?}, acknowledged {acked}"
+        );
+        assert_eq!(reconnects(&mut probe), 1.0);
+    }
+
     /// The same over TLS: the stalled connection is kept, and the receiver's reset counts a loss.
     /// Ciphertext's framing makes the count an estimate, so only its presence is checked.
     #[tokio::test]
