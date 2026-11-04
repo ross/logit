@@ -1,6 +1,6 @@
 ---
 created: 2026-09-15
-updated: 2026-10-18
+updated: 2026-11-04
 ---
 
 # `Event.new(t)`: Lua constructs events from the table shape `event:to_table()` already emits
@@ -105,7 +105,11 @@ Concretely:
   applies: a span whose `status_message`/`trace_state`/`dropped_*` are all default has `ext: None`,
   so a minimal constructed span costs what a minimal decoded one does.
 - **`flush(now)`.** The Lua `flush` function receives one argument: the runtime's tick time as a
-  decimal-nanos string, the same value `flush_now` already passes the native `aggregate`. A script
+  decimal-nanos string, ~~the same value `flush_now` already passes the native `aggregate`~~ the
+  wall time the flush ran at. Since 2026-11-04 the native `aggregate` gets its tick's grid point
+  instead ([`aggregation-window-semantics`](aggregation-window-semantics.md)'s "Amendment: a
+  deadline flush is stamped on its grid point (2026-11-04)"); a Lua `flush()` keeps the wall time,
+  so the two no longer match. A script
   declaring `function flush()` ignores it (Lua semantics; no shim). This is *not* a clock: nothing
   is exposed to `process()`, and the no-clock posture in `lua-api.md` stands with this one named
   exception.

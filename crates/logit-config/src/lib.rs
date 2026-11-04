@@ -3517,8 +3517,9 @@ pub enum ComponentKind {
     /// older than `max_age`, or, with `max_ahead` set, further in the future than `max_ahead`; an
     /// age equal to the bound is fresh. The clock is read once per batch.
     ///
-    /// `max_age` must cover the clock skew between tiers, one `aggregate` flush interval, and
-    /// normal pipeline latency, or fresh events are called stale.
+    /// `max_age` must cover the clock skew between tiers, two `aggregate` flush intervals, and
+    /// normal pipeline latency, or fresh events are called stale. An `aggregate` flush that a
+    /// full downstream delays is stamped up to one interval before it ran.
     ///
     /// With the same bounds, `has_stale` forwards what `drop_stale` discards. Point it at an
     /// archive sink, such as a `file_out` with `format: native`, which keeps every field.
@@ -3539,8 +3540,9 @@ pub enum ComponentKind {
     /// older than `max_age`, or, with `max_ahead` set, further in the future than `max_ahead`; an
     /// age equal to the bound is fresh. The clock is read once per batch.
     ///
-    /// `max_age` must cover the clock skew between tiers, one `aggregate` flush interval, and
-    /// normal pipeline latency, or fresh events are called stale.
+    /// `max_age` must cover the clock skew between tiers, two `aggregate` flush intervals, and
+    /// normal pipeline latency, or fresh events are called stale. An `aggregate` flush that a
+    /// full downstream delays is stamped up to one interval before it ran.
     ///
     /// Place it immediately before `aggregate`, or before any other component that keeps state
     /// across events. Ahead of an `aggregate` with `temporality: cumulative`, discarding a

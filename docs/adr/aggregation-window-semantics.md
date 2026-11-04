@@ -1,6 +1,6 @@
 ---
 created: 2026-08-29
-updated: 2026-10-25
+updated: 2026-11-04
 ---
 
 # `aggregate` transform: tumbling windows, pass-through, and the flush-tick contract
@@ -56,7 +56,9 @@ today — `statsd_in` always uses `Resource::default()`, and `internal` always u
 `service.name = logit` resource, so `windowed`/`self_windowed`-style aggregators downstream of
 either still see exactly one distinct resource across the batches they receive).
 
-**Emitted timestamp is flush wall-clock**, i.e. when the window closed — not a source event's
+**Emitted timestamp is flush wall-clock**, ~~i.e. when the window closed~~ (a deadline flush is
+stamped with its grid point since 2026-11-04; see "Amendment: a deadline flush is stamped on its
+grid point (2026-11-04)") — not a source event's
 timestamp, and not the gauge's internally-tracked "latest write" timestamp (used only to pick the
 winner, then discarded). A record that carries its source's own timestamp isn't merged at all;
 see "Amendment: timestamped records, APM stats, and non-finite gauges pass through (2026-10-19)".
@@ -1250,3 +1252,69 @@ series' new start can precede its previous point, and emitted points stop being 
 a consumer still sees a changed start and re-bases. The stage stays on `SystemTime`: a monotonic
 clock would need its own mapping to wall time on every emitted point, which nothing else in the
 pipeline does.
+
+## Amendment: a deadline flush is stamped on its grid point (2026-11-04)
+
+**The defect.** `run_transform` keeps its flush deadlines on a grid counted from node start, and
+runs a flush only between batches. A send blocked on a full downstream inbox therefore holds the
+next flush back, and `advance_flush_deadline` then picks the first grid point strictly after the
+time the late flush ran. A flush 9.99 s late on a 10 s interval is followed about 10 ms later by
+the next one. Both were stamped with the wall time they ran at, so two windows of one series
+landed in the same second. `graphite_out` floors to seconds and carbon overwrites the first point
+with no signal; `datadog_out` drops one and counts it `duplicate_timestamp`. Either way a window's
+delta is lost.
+
+**Decision.** `run_transform` reads the wall clock (`SystemTime`) once when the node starts, as an
+anchor, before the `Instant` its deadlines count from. A deadline flush hands `Transform::flush`
+the wall-clock grid point at or below the flush's own wall time: `now - ((now - anchor) mod
+interval)`, the same remainder `advance_flush_deadline` takes, Euclidean so that a wall clock
+stepped back past the anchor still yields a point at or below `now` (`grid_stamp`,
+`crates/logit-pipeline/src/runtime.rs`). A late flush and its catch-up get consecutive grid
+points, an interval apart, distinct for any interval. Reading the anchor first means a flush that
+fires at or after its deadline floors onto that deadline's grid point, not the one below.
+
+`Aggregator`'s `window_start` and a series' `first_seen` take the stamp as `now`, so the window
+start is the previous flush's grid point and `first_seen.min(now)` still keeps every emitted start
+at or below its point's timestamp. `shape` stamps its events with it too. The scope is the
+`Transform` trait: a Lua `flush(now)` and `BatchAccumulator` keep the wall time.
+
+**The close-time flush keeps the wall time.** Flooring it could repeat the last deadline flush's
+stamp, a guaranteed collision. With the wall time, a shutdown less than a second after a
+deadline flush still lands in that flush's second. That's the one residual same-second case, and
+[`datadog-out-sent-second-memory`](datadog-out-sent-second-memory.md) already counts it.
+
+**What peers do.** The Datadog Agent and carbon-aggregator bucket points by their own timestamps
+and stamp each bucket's start. Telegraf's aggregators flush on a fixed grid. etsy's `statsd`
+stamps the flush's own time and has this defect. Vector's interval timers use tokio's default
+`MissedTickBehavior::Burst`, which fires every missed tick at once.
+
+**Not done: anchoring the grid to the epoch.** Aligning every node's grid to multiples of the
+interval since the Unix epoch would make windows comparable across processes, but it also makes a
+whole fleet flush in the same instant, a synchronized burst on every shared destination, for a
+small gain. It may come back as an opt-in.
+
+### Alternatives considered
+
+- **Restart the cadence from the late flush's time.** The next flush would come a full interval
+  later, but the cadence drifts by every delay, and the stamp is still the late flush's wall time.
+- **Skip a grid point too close to the last flush.** A spacing floor guarantees distinct seconds
+  only for an interval of 2 s or more, and skipping a flush merges two windows.
+- **Document it and point at `dedup_timestamps`.** `dedup_timestamps` holds no state across
+  batches, and the two windows leave in separate batches.
+- **Map the `Instant` deadline to wall time through a fixed offset.** That's the monotonic-to-wall
+  mapping "Amendment: the flush clock stays `SystemTime` (2026-10-25)" declines, and the offset
+  goes stale after any wall-clock step.
+
+### Consequences
+
+- **A stamp can precede what its window absorbed by up to one interval** when backpressure delays
+  a flush, as a Datadog bucket's start precedes its points. A `drop_stale` placed after `aggregate`
+  with a `max_age` under about two intervals can discard such a window. Put `drop_stale` before
+  `aggregate`, as [`stale-event-filtering`](stale-event-filtering.md) advises.
+- **A wall-clock step, or a host suspend, moves the grid relative to the deadlines.** Without
+  one, the anchor is read before the deadlines' `Instant`, so each flush floors onto its own grid
+  point. After one, a deadline can fall within timer latency of a grid point, and two consecutive
+  flushes on either side of it can floor onto the same point. A backward step also moves stamps back, as it moved
+  the wall-time stamps before (the 2026-10-25 amendment).
+- **The shutdown flush** is the residual same-second case above.
+
