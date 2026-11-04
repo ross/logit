@@ -1936,7 +1936,7 @@ mod tests {
         assert_eq!(events.sum("logit.input.requests", &[("class", "ok")]), 0.0);
     }
 
-    /// A first batch no consumer takes is answered as a full downstream is, but counted
+    /// A body no consumer takes is answered as a full downstream is, but counted
     /// `closed_consumer`, and leaves `/health` alone.
     #[tokio::test]
     async fn a_first_batch_no_consumer_takes_is_503_code_9_and_leaves_health_alone() {
@@ -2524,8 +2524,9 @@ mod tests {
 
         running.handle.abort();
         logit_pipeline::test_util::expect_closed(&mut client, "an aborted connection").await;
-        // `TWO_ENVELOPES` decodes into two batches: the first is sent under the busy deadline, the
-        // second on a detached task (this module's "Backpressure").
+        // `TWO_ENVELOPES` decodes into two batches, more than the one-slot inbox holds: the first
+        // is sent under the busy deadline, the second on a detached task (this module's
+        // "Backpressure").
         let index = |b: &EventBatch| b.resource.attributes.get("com.splunk.index").cloned();
         assert_eq!(index(&recv_batch(&mut rx).await), Some(logit_core::Value::str("i1")));
         assert_eq!(index(&recv_batch(&mut rx).await), Some(logit_core::Value::str("i2")));

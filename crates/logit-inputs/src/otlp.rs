@@ -277,7 +277,7 @@ const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 /// Also the grace an idle close gives hyper (this module's "Idle timeout").
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// How long a request's first batch may wait for room in every consumer before the request is
+/// How long a request's batches may wait for room in every consumer before the request is
 /// answered busy (this module's "Backpressure"). Under the 5 s export timeout the Collector's
 /// `otlphttp` and `otlp` exporters default to, so a client reads the `503` before it gives up and
 /// resends.
@@ -1191,7 +1191,7 @@ async fn deliver(
 }
 
 /// A connection's `auth:` check, the diagnostics a refusal reports under, and the bound on a
-/// request's first batch ([`deliver`]).
+/// request's delivery ([`deliver`]).
 #[derive(Clone)]
 struct Gate {
     auth: AuthGate,
@@ -2745,7 +2745,7 @@ mod tests {
     /// A listener over one edge per capacity in `capacities`, each carrying consumer telemetry
     /// `c<i>` under the returned probe, so a send that finds one full counts
     /// `logit.component.inbox.full`. The listener's telemetry and diagnostics are on the probe
-    /// too, and its first batch waits at most `busy_after`. Returns each edge's sender beside its
+    /// too, and a request waits at most `busy_after`. Returns each edge's sender beside its
     /// receiver, for filling it.
     #[allow(clippy::type_complexity)] // a test rig's parts, destructured at each call
     async fn busy_listener(
@@ -2989,7 +2989,7 @@ mod tests {
         assert_eq!(a, ["a", "b"], "a: both of the request's batches");
     }
 
-    /// A client that closes while its first batch waits under the bound takes the batch with it:
+    /// A client that closes while its request waits under the bound takes the request with it:
     /// nothing was reserved on every consumer yet, so no consumer gets it, and nothing counts it
     /// deferred, since no answer was written.
     #[tokio::test]
