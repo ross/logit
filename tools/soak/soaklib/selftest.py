@@ -9348,7 +9348,7 @@ TWO_SUT_COLLECTOR_CONFIG = ("components:\n"
 def _two_sut_run(tmp, name, kill_on="collector", collector_lives=2, extra=0, short=0,
                  hop_dropped=0, drops=(), pause=False, logit_lives=None, replayed=3,
                  stalled=False, partial=False, collector_restart=False, evicted=(),
-                 checkpoint=None, burst=0, segment_bytes="512MiB"):
+                 checkpoint=None, burst=0, segment_bytes="512MiB", kill_action="kill"):
     """A two-SUT run across a native hop: the generator and `logit` move `PER_DRAIN` lines per
     5 s drain into `logit`'s one life, whose hop sink `hop` takes each drain's lines in 10
     frames; `collector`'s `logit_in` `hop_in` forwards them into `window`, which delivers one
@@ -9365,7 +9365,8 @@ def _two_sut_run(tmp, name, kill_on="collector", collector_lives=2, extra=0, sho
     `stalled` its hop sink delivers nothing in its last two drains and leaves 23 queued; under
     `partial` it delivers 2 of its last drain's 10 and leaves 11 queued. `collector_restart`
     stops `collector` over the same span as that kill, a graceful restart. `evicted` lists
-    `(offset, count)` pairs of `logit.input.senders.evicted` at `hop_in`. `checkpoint` sets the
+    `(offset, count)` pairs of `logit.input.senders.evicted` at `hop_in`. `kill_action` names the
+    action the kill's timeline records carry, a `stop` for a graceful one. `checkpoint` sets the
     hop sink's spool `checkpoint_interval` in seconds, and `burst` adds that many batches to its
     `batches.delivered` at +50 s, as a replay delivered early in the life. `collector` counts one
     `events.dropped{reason="stale"}` at `window`. `drops` adds a count of 1 for each `(service,
@@ -9461,9 +9462,9 @@ def _two_sut_run(tmp, name, kill_on="collector", collector_lives=2, extra=0, sho
     timeline = [_phase("start", 0, t0=T0)]
     if kill_on is not None:
         timeline += [
-            _action("apply", "c0s1", "kill", kill_on, TWO_SUT_KILL[0], TWO_SUT_KILL[0] + 0.1,
+            _action("apply", "c0s1", kill_action, kill_on, TWO_SUT_KILL[0], TWO_SUT_KILL[0] + 0.1,
                     affects_udp_ingress=kill_on == "logit", affects_egress=True),
-            _action("revert", "c0s1", "kill", kill_on, TWO_SUT_KILL[1] - 1, TWO_SUT_KILL[1],
+            _action("revert", "c0s1", kill_action, kill_on, TWO_SUT_KILL[1] - 1, TWO_SUT_KILL[1],
                     affects_udp_ingress=kill_on == "logit", affects_egress=True),
             _ready("c0s1", kill_on, TWO_SUT_KILL[1] + 1)]
     if collector_restart:
@@ -9523,15 +9524,17 @@ def _span_line(offset, component, trace, span, parent=None):
 
 
 def _join_run(tmp, name, unmatched=(), wrong_trace=False, dropped=0, children=True,
-              buffer_held=False):
+              buffer_held=False, stop=False):
     """`_two_sut_run`'s run with a kill on `logit` (+203 to +213), with spans: `logit`'s
     listener `in` records two spans a drain interval in each life, and `collector`'s `hop_in`
     one child of each, 0.2 s later. `unmatched` adds a `collector` child at each offset whose
     parent `logit` never exported; `wrong_trace` gives one child its parent's span id under
     another trace id; `dropped` adds that many `logit.internal.spans.dropped` at `logit`;
     `children` false records only roots at `collector`; and `buffer_held` holds the hop sink's
-    queue in `logit`'s next life until +260."""
-    run_dir = _two_sut_run(tmp, name, kill_on="logit", collector_lives=1)
+    queue in `logit`'s next life until +260. `stop` makes the kill a graceful stop over the same
+    span."""
+    run_dir = _two_sut_run(tmp, name, kill_on="logit", collector_lives=1,
+                           kill_action="stop" if stop else "kill")
     ingress, egress = [], []
     offsets = [o for o in range(5, 300, 5)
                if not TWO_SUT_KILL[0] - 3 < o < TWO_SUT_KILL[1] + 3]
@@ -9611,6 +9614,22 @@ def _span_join():
                and "1 unmatched outside every killed life's window" in outside.detail
                and any("outside every killed life's window" in line for line in outside.lines),
                f"an unmatched child outside every window FAILs, got {outside}")
+        # `logit`'s life 0 drains last at +198, so its window opens at +197, one
+        # `SPAN_JOIN_SLACK_S` before.
+        slack = row("join-slack", unmatched=(197.5,))
+        expect(slack.status == checks.PASS
+               and "unmatched 1 (1 inside a killed life's window" in slack.detail,
+               f"an unmatched child within SPAN_JOIN_SLACK_S before the killed life's last "
+               f"drain is inside its window, got {slack}")
+        early = row("join-early", unmatched=(196.5,))
+        expect(early.status == checks.FAIL
+               and "1 unmatched outside every killed life's window" in early.detail,
+               f"an unmatched child before the window's lower edge FAILs, got {early}")
+        stopped = row("join-stopped", unmatched=(199, 205), stop=True)
+        expect(stopped.status == checks.FAIL
+               and "2 unmatched outside every killed life's window" in stopped.detail,
+               f"a graceful stop exports its spans at its shutdown drain, so it opens no window "
+               f"and its unmatched children FAIL, got {stopped}")
         late = row("join-late", unmatched=(240,))
         expect(late.status == checks.FAIL,
                f"an unmatched child after the next life's queue read 0 FAILs, got {late}")
@@ -12732,9 +12751,10 @@ def _overlap_tcp_checks():
     """`ledger.overlap` on a TCP wire: two of each generator sink's batches per close, so a
     loss at the close up to that passes and one past it FAILs; a kill is reported, not judged;
     a surplus at the end is allowed a batch per ambiguous attempt beyond the end allowance.
-    `overlap.migrate` reads each churn: with migrate 1 a reset FAILs, with 0 a close with resets
-    PASSes, one with none WARNs, and resets with no close FAIL; a live value other than the
-    declared one FAILs; and with no churn, or no migrate_req, there's no row."""
+    A pause of an instance is judged. `overlap.migrate` reads each churn: with migrate 1 a reset
+    FAILs, with 0 a close (a stop, a kill, or an `exit`) with resets PASSes, one with none
+    WARNs, and resets with no close FAIL; a live value other than the declared one FAILs; and
+    with no churn, or no migrate_req, there's no row."""
     with tempfile.TemporaryDirectory() as tmp:
         def rows(name, **kwargs):
             return {r.id: r for r in checks.run_all(_overlap_run(tmp, name, tcp=True, **kwargs))}
@@ -12803,6 +12823,20 @@ def _overlap_tcp_checks():
         expect("overlap.migrate" not in rows("unmigrated", churns=[
                    (*across, {"dialed": 900, "closed": 900, "resets": 0}, 1)]),
                "with no migrate_req there's no overlap.migrate row")
+        for action, article in (("kill", "a"), ("exit", "an")):
+            row = rows(f"control-{action}", action=action, migrate=0, churns=[
+                (*across, {"dialed": 900, "closed": 890, "resets": 10}, 0)])["overlap.migrate"]
+            expect(row.status == checks.PASS
+                   and f"closes in its window: c0s1 {action} on logit" in "\n".join(row.lines),
+                   f"overlap.migrate counts {article} {action} of an instance in a churn's "
+                   f"window as a close, got {row} {row.lines}")
+        pause = [_action("apply", "c0s4", "pause", "logit-b", 240, affects_tcp_ingress=True,
+                         affects_egress=True),
+                 _action("revert", "c0s4", "pause", "logit-b", 249, 250,
+                         affects_tcp_ingress=True, affects_egress=True)]
+        paused = rows("paused", extra=pause)["ledger.overlap"]
+        expect(paused.status == checks.PASS and "= 0, within [-200, 400]" in paused.detail,
+               f"a pause of a TCP instance is judged, since TCP retransmits, got {paused}")
 
 
 def _overlap_checks():
@@ -14095,6 +14129,65 @@ def _churn_client():
            and done.get("closed") == 0,
            f"a churn client counts the connections a closing listener resets and the dials "
            f"refused after it, got {proc.returncode} {done} {err}")
+    # A port nothing listens on: every dial is refused, a reset.
+    unbound = socket.socket()
+    unbound.bind(("127.0.0.1", 0))
+    port = unbound.getsockname()[1]
+    unbound.close()
+    rc, lines, err = _run_client(["churn", "127.0.0.1", str(port), "5", "0.1", "none"], 0.6)
+    done = lines[-1] if lines else {}
+    expect(rc == 0 and done.get("resets", 0) >= 10 and done.get("dial_errors") == 0
+           and done.get("closed") == 0,
+           f"a churn client counts each refused dial as a reset, got rc {rc} {lines} {err}")
+    # A listener that reads each connection's FIN and closes it with a reset (SO_LINGER 0):
+    # the client's handshake and FIN succeed, and its read fails.
+    resetting = socket.socket()
+    resetting.bind(("127.0.0.1", 0))
+    resetting.listen(512)
+    stop = threading.Event()
+
+    def reset_each():
+        resetting.settimeout(0.05)
+        while not stop.is_set():
+            try:
+                conn, _ = resetting.accept()
+            except (socket.timeout, OSError):
+                continue
+            conn.settimeout(1)
+            try:
+                conn.recv(16)
+            except OSError:
+                pass
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            conn.close()
+
+    thread = threading.Thread(target=reset_each, daemon=True)
+    thread.start()
+    try:
+        rc, lines, err = _run_client(["churn", "127.0.0.1", str(resetting.getsockname()[1]),
+                                      "5", "0.1", "none"], 0.6)
+    finally:
+        stop.set()
+        thread.join()
+        resetting.close()
+    done = lines[-1] if lines else {}
+    expect(rc == 0 and done.get("resets", 0) >= 10 and done.get("dial_errors") == 0
+           and done.get("closed") == 0,
+           f"a churn client counts a read the listener resets as a reset, got rc {rc} {lines} "
+           f"{err}")
+    # A listener that never accepts: no connection ends in `DIAL_TIMEOUT_S`.
+    stuck = socket.socket()
+    stuck.bind(("127.0.0.1", 0))
+    stuck.listen(0)
+    try:
+        rc, lines, err = _run_client(["churn", "127.0.0.1", str(stuck.getsockname()[1]), "2",
+                                      "0.5", "none"], faults.slowclient.DIAL_TIMEOUT_S + 1.2)
+    finally:
+        stuck.close()
+    done = lines[-1] if lines else {}
+    expect(rc == 0 and done.get("timeouts", 0) >= 1 and done.get("resets") == 0,
+           f"a churn client counts each connection unanswered for DIAL_TIMEOUT_S as timed out, "
+           f"got rc {rc} {lines} {err}")
 
 
 class _SlowclientDocker:

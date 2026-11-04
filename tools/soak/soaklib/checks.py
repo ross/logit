@@ -3540,7 +3540,7 @@ def _skip_without_sut(check_id, led):
 
 # ---- a rolling overlap ---------------------------------------------------------------------------
 #
-# Under `[overlap]` every instance runs the whole pipeline on one shared UDP port (the plan's
+# Under `[overlap]` every instance runs the whole pipeline on one shared UDP or TCP port (the plan's
 # "Rolling overlap (W12b)"). A row about a process life (`ledger.intake`, `ledger.edge`,
 # `ledger.script`, `ledger.aggregate`, `ledger.egress`, `ledger.windows`, `ledger.replay`,
 # `identity.sink`, and `drops`, and `ledger.summary`'s per-life terms) judges each instance on
@@ -3848,8 +3848,7 @@ def _tcp_overlap(data, first, sources, G, read, gap):
             lines.append(f"{fault.step} {fault.action} on {fault.on} at "
                          f"{data.offset(fault.start)}: at most {_n(bound)}, "
                          f"{OVERLAP_TCP_CLOSE_BATCHES} batch(es) of each generator sink")
-        elif (fault.affects("tcp") and wire_judgment(fault, "tcp") == "fault"
-              and not (fault.on in instances and fault.action == "pause")):
+        elif fault.affects("tcp") and wire_judgment(fault, "tcp") == "fault":
             unjudged.append(f"{fault.step} {fault.action} on {fault.on}")
             lines.append(f"{fault.step} {fault.action} on {fault.on} at "
                          f"{data.offset(fault.start)}: can lose a connection's unread writes "
