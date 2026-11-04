@@ -2,7 +2,7 @@
 # `max_connections: 4` sizes the table at 5 identities, and every start of `logit` opens its
 # spool and mints a new one. Five graceful restarts make six identities: the sixth evicts the
 # oldest, retired with every frame acknowledged, so nothing is forwarded twice. Then a crash
-# loop of six kills, each life up 15 s, under the spool's 60 s checkpoint, leaves every frame
+# loop of kills, each life up 15 s, under the spool's 60 s checkpoint, leaves every frame
 # the loop's lives committed unpersisted, so each life replays them all under their old
 # identities. The sixth life's replay starts with an identity the table evicted, and each
 # replayed identity it takes back evicts the next one it replays: those frames are forwarded
@@ -84,8 +84,10 @@ action = "restart"
 on = "logit"
 for = "20s"
 
-# Steps 6 to 11: a crash loop. Each kill comes before the life's first cursor persist, so the
-# next life replays every frame the loop committed, under the identities that sent them.
+# Step 6 ends the last graceful life, up about 90 s, after it persisted its cursor. Steps 7 to
+# 11 are the crash loop: each kills a life up 15 s, before its first cursor persist, so the next
+# life replays every frame the loop committed, under the identities that sent them. The spool's
+# 512MiB segment_bytes keeps any segment roll, which would persist the cursor, out of the loop.
 [[step]]
 at = "7m30s"
 action = "kill"

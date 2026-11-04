@@ -2380,7 +2380,10 @@ the other.
   [−(delivered × t) − 1, received × t + the commit rate × the checkpoint interval + 1].
   A spool persists only once the interval has passed since it opened, so for a life killed
   sooner after its start the commit term is every batch it delivered, plus delivered × t: it
-  never persisted, and in a crash loop each life's replay carries the one before (W35).
+  never persisted, and in a crash loop each life's replay carries the one before (W35). That
+  assumes the spool rolled no segment, since `DiskQueue::roll_read_cursor` persists the cursor
+  at every segment boundary; a scenario using the rule sets `segment_bytes` large enough that
+  no roll happens, as `native-hop-identities` does with 512MiB.
   The first two `native-hop` runs found both terms: a kill inside `collector`'s stop replayed 55
   batches over the queue, 50 it received in the 5 s before the kill and 5 committed before the
   stop and never persisted.
@@ -6948,7 +6951,9 @@ What the runs showed about `logit` and the harness:
   batches against bands of at most 657. A spool persists only once the interval has passed since it
   opened, so a life killed 15 s in never persisted, and each replay carried the one before.
   The band now takes every batch such a life delivered, and the run, rescored, passes with each
-  replay within about 50 batches of the life's commits plus its queue. A harness fix: every
+  replay within about 50 batches of the life's commits plus its queue. The band assumes the
+  spool rolled no segment, which would persist the cursor at the boundary; the scenario's
+  512MiB `segment_bytes` rules a roll out, and the harness can't see one. A harness fix: every
   replay matched what the spool's persist rule predicts.
 - **Self-test**: 3,127 expectations. Reverting the eviction allowance fails its passing case
   and the `ledger.summary` text case; reverting the replay band's crash-loop term fails its

@@ -6804,7 +6804,11 @@ def check_ledger_replay(data):
     that commit rate × the checkpoint interval + 1]. The spool persists only once the interval
     has passed since it opened, so a life killed sooner after its start never persisted, and
     the upper edge's commit term is every batch it delivered instead, counted or after its last
-    drain at its delivered rate: in a crash loop each life's replay carries the one before."""
+    drain at its delivered rate: in a crash loop each life's replay carries the one before.
+    That holds only while the spool rolled no segment: `DiskQueue::roll_read_cursor` persists
+    the cursor at every segment boundary whatever the interval, and the harness can't see a
+    roll (`buffer.disk.segments` is a gauge sampled at drains). A scenario using this band sets
+    `segment_bytes` large enough that no roll happens."""
     if _overlapped(data):
         return _per_instance(data, check_ledger_replay)
     led = _ledger(data)
@@ -6841,7 +6845,9 @@ def check_ledger_replay(data):
             if start is not None and done - start < led.hop_checkpoint:
                 # The spool persists its cursor only once the interval has passed since it
                 # opened, so a life killed sooner never persisted: every frame it committed,
-                # its own replay's included, replays again.
+                # its own replay's included, replays again. A segment roll persists the cursor
+                # at any age, so this assumes the spool never rolled; the scenario's
+                # `segment_bytes` must rule a roll out.
                 committed = sum(v for _, v, point_life in sut.counter_points(
                     "logit.component.batches.delivered", component=sink) if point_life == life)
                 high = math.ceil(took * after + committed + sent * after) + 1
