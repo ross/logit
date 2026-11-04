@@ -3167,11 +3167,10 @@ Docker 29.9, SELinux enforcing) checked each fault's mechanism before it was pla
     `tail-rotate-delete`, whose rotations need opens inside the window. The window excuses
     `progress` and `ready`. `self_log` needs no excuse: the accept and spool diagnostics are
     throttled warnings (`absorb_accept_error`'s `accept_error`, `count_fs_error`'s
-    `disk_fs_error`). `fd_limit_warning` warns when the listeners' `max_connections:` total is
-    at or above the soft limit, and `tcp-ingress`'s `statsd_in` sets none, so at a soft limit
-    of 1024 it warns at start. W31 first confirms the container's soft limit (the survey read
-    1024, and `logit` doesn't raise it); if it holds, that warning is a product finding for the
-    fixing session, not the harness.
+    `disk_fs_error`). `logit run` raises its soft open-files limit to the hard limit at start, so
+    `fd_limit_warning`, which warns when the listeners' `max_connections:` total is at or above
+    the soft limit, stays quiet under a container's default 1024 soft and 524288 hard, and the
+    step's restore writes back soft equal to hard.
 28. **A CPU quota and memory pressure (W32).** A `cgroup` action writes `cpu.max` or
     `memory.high` in the SUT's own cgroup (`system.slice/docker-<id>.scope`) for the window
     and writes `max` back after, through a one-shot with `/sys/fs/cgroup` bound read-write and
