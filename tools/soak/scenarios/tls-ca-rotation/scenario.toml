@@ -137,8 +137,8 @@ on = "logit"
 signal = "HUP"
 for = "10s"
 
-# Steps 11 to 13: a rotation under CA 2 alone, and a probe, whose own client certificate is
-# then CA 2's.
+# Steps 11 to 13: a rotation under CA 2 alone, and a probe. Each probe presents a client
+# certificate from the newest CA in the bundle, CA 2's here as at step 5.
 [[step]]
 at = "9m"
 action = "rotate"

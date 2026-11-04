@@ -750,7 +750,7 @@ empty, then the relay once the backends' totals hold.
 
 ### Rolling overlap
 
-A scenario can run two or more instances of one SUT on one UDP port, as a rolling upgrade
+A scenario can run two or more instances of one SUT on one UDP or TCP port, as a rolling upgrade
 overlaps them. Each instance runs the whole pipeline. The override adds a namespace holder with
 the role `netns`, which owns the address, since an instance that owned it would take it along
 when it stopped, and puts every instance in it:
@@ -929,24 +929,24 @@ the issuer, which `tls.served` checks.
 | `copytruncate` | on a file source's writer, does what logrotate's `copytruncate` does to `path` in `<run>/shared`: copies it to `to`, created empty and filled, and truncates `path` in place, so an `O_APPEND` writer goes on at offset 0. It records the lines copied and the lines written after the copy and before the truncate, which are in neither file (`lost_lines`). It runs in a one-shot container of the stand-in's Python image, as root, because the writer's files belong to its container's `logit` user | none |
 | `gzip` | on a file source's writer, compresses `path` into `to` and removes `path`, as `gzip` does, in the same container | none |
 | `replace` | on a file source's writer, writes `path`'s bytes to a dot-prefixed temporary name and renames it over `path`: the same content under a new inode, as a restore or a migration leaves it, in the same container | none |
-| `rotate` | issues `cert`'s next generation into `<run>/tls`, valid `days`, with a mismatched key under `broken = true`, and repoints its `live` link; records the new serial and `notAfter`. See [TLS certificates](#tls-certificates) | none |
+| `rotate` | issues `cert`'s next generation into `<run>/tls`, valid `days`, signed by CA `ca` (CA 1 when unset), with a mismatched key under `broken = true`, and repoints its `live` link; records the new serial, `notAfter`, and issuer. See [TLS certificates](#tls-certificates) | none |
 | `trust` | makes each CA in `cas` not made yet, writes a bundle of them as the next generation of `trust/`, and repoints `trust/live`; records the bundle's CAs and subjects. See [TLS certificates](#tls-certificates) | none |
 | `probe` | from the network namespace of the service it's `on`, handshakes with `127.0.0.1:<port>`, presenting a probe certificate from the newest CA in the trust bundle, and records the served serial, `notAfter`, and issuer and whether they verify against the bundle for `cert`'s first DNS name | none |
 
 A `mark`, `exit`, or `respond` window is a fault window like any other, so the checks excuse
-what happens inside it. A `signal`, `rename`, `rotate`, `probe`, `copytruncate`, `gzip`, or
-`replace` window excuses nothing, so every row judges straight through it, and only `[[expect]]`,
-`file.reopen`, `tls.served`, and `self_log`'s excusal of a broken rotation's failed reload read
-it; `ledger.wire` takes a `copytruncate`'s lost and duplicated lines from its record instead (see
-[The checks](#the-checks)). A `signal` or `probe` may start inside a `rename` or `rotate` on its
-own service, and no other step may overlap one of these on its service. A `kill` may start
-inside a `pause` of its service, after the pause starts, and end when the pause does: a stalled
-kill. Docker signals a paused container and then thaws it, and the process dies on the pending
+what happens inside it. A `signal`, `rename`, `rotate`, `trust`, `probe`, `copytruncate`,
+`gzip`, or `replace` window excuses nothing, so every row judges straight through it, and only
+`[[expect]]`, `file.reopen`, `tls.served`, and `self_log`'s excusal of a broken rotation's failed
+reload read it; `ledger.wire` takes a `copytruncate`'s lost and duplicated lines from its record
+instead (see [The checks](#the-checks)). A `signal` or `probe` may start inside a `rename`,
+`rotate`, or `trust` on its own service, and no other step may overlap one of these on its
+service. A `kill` may start inside a `pause` of its service, after the pause starts, and end
+when the pause does: a stalled kill. Docker signals a paused container and then thaws it, and the process dies on the pending
 SIGKILL before it runs again, so it never reads what its sockets hold; the kill's revert starts
 the container, the pause's revert finds it started and unpauses nothing, and the driver probes
 readiness after the start alone. On a `tcp` source a stalled kill on the SUT needs the source's
 `socket_buffers`, the bound `ledger.wire` holds its loss to. A `copytruncate` or a
-`gzip` runs once per run, since a second cycle's would find its `to` taken. None of these ten
+`gzip` runs once per run, since a second cycle's would find its `to` taken. None of these eleven
 can go in a `[random]` schedule, and neither can a `prlimit`, a `cgroup`, or a `slowclient`,
 whose `nofile`, `cpu`, `memory_high`, io keys, `address`, `mode`, and `connections` a template
 can't set. A `respond` or a `stop` of

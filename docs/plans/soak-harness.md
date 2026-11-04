@@ -209,8 +209,8 @@ settle window would leave a life no fit. `fanin` and `tcp-ingress` set `60s`, an
 - Every fault carries `for`, so its revert is scheduled with it. `netem clear` is a revert, never
   a step.
 - No two faults overlap on one container, except a `signal` inside a `rename` (W12c), a
-  `signal` or a `probe` inside a `rotate` (W12d), and a `stop` or `kill` starting inside a
-  `cgroup` after its start (W33).
+  `signal` or a `probe` inside a `rotate` (W12d) or a `trust` (W37), and a `stop` or `kill`
+  starting inside a `cgroup` after its start (W33).
 - No netem on a container during its `stop`, `kill`, `pause`, `partition`, or `exit`, because the qdisc
   is lost with the namespace and `docker run --network container:<id>` needs a running target.
 - No fault ends inside `cooldown`, and `cooldown` is at least `recovery_bound`.
@@ -506,18 +506,19 @@ for = "5s"
   reads a set's files one at a time, so a poll that lands on the rename can pair two
   generations, fail, and load the new pair on its next poll. A certs.sh failure stops
   `prepare()`.
-- A `rotate`'s apply issues the next generation and records its `gen`, `serial`, and
-  `not_after`; a failed issue still uses its number up. `cert` and `days` are required, `days` a
-  whole number above 30 and above every earlier rotation of the certificate, so its `notAfter`
-  rises; `broken`, optional, writes a key that doesn't match the certificate, which a reload
-  refuses. The step's service must read `/tls/<cert>/live/` in its config. A rotation runs once
-  per run, since a second cycle's would name the same days, so a scenario with one sets
-  `max_duration` to one cycle's run.
+- A `rotate`'s apply issues the next generation, signed by CA `ca` (CA 1 when unset, W37), and
+  records its `gen`, `serial`, `not_after`, and `issuer`; a failed issue still uses its number
+  up. `cert` and `days` are required, `days` a whole number above 30 and above every earlier
+  rotation of the certificate, so its `notAfter` rises; `broken`, optional, writes a key that
+  doesn't match the certificate, which a reload refuses. The step's service must read
+  `/tls/<cert>/live/` in its config. A rotation runs once per run, since a second cycle's would
+  name the same days, so a scenario with one sets `max_duration` to one cycle's run.
 - A `probe`'s apply runs `openssl s_client` from the step's service's network namespace against
-  `127.0.0.1:<port>`, presenting the probe certificate, so a listener that requires one completes
-  the handshake and counts no `connection_error`. It records the served `serial` and `not_after`,
-  and `verified`, whether the chain verifies against the CA for the certificate's first DNS
-  name. `cert`, a `server` certificate, and `port` are required. A probe starts inside a
+  `127.0.0.1:<port>`, presenting the probe client certificate of the newest CA in the trust
+  bundle in force (W37), so a listener that requires one completes the handshake and counts no
+  `connection_error`. It records the served `serial`, `not_after`, and `issuer`, and `verified`,
+  whether the chain verifies against the bundle in force, `trust/live`, for the certificate's
+  first DNS name. `cert`, a `server` certificate, and `port` are required. A probe starts inside a
   `rotate` of its certificate on its own service, after a `signal = "HUP"` step there that
   starts inside the same rotate, because a listener reloads only on a SIGHUP or its poll. On a
   service with `tls_reload_interval: 0s`, every earlier rotate of a certificate a probe reads
@@ -1732,9 +1733,9 @@ The rows:
 - `tls.served.<step>` (W12d), one row per `probe` step, else one `tls.served` row that SKIPs:
   the generation in force for the probe's certificate is the latest rotation of it that started
   before the probe and wasn't `broken`, else the first issue, because a failed reload keeps the
-  previous files. The row FAILs when the probe didn't apply, its served serial or `notAfter`
-  isn't that generation's, the served chain didn't verify against the run's CA, or the run has
-  no `tls_issued` phase.
+  previous files. The row FAILs when the probe didn't apply, its served serial, `notAfter`, or
+  issuer isn't that generation's, the served chain didn't verify against the trust bundle in
+  force, or the run has no `tls_issued` phase.
 - `expect.<name>`, one per `[[expect]]` table: a scenario's own bound on one metric over a
   window around one step, or over the whole run (W8c); see "The scenario schema".
 
@@ -7039,7 +7040,7 @@ What the runs showed about `logit` and the harness:
 - **`tcp_migrate_req` removes the resets a closing instance's listener makes.** With the
   holder's sysctl at 0, each stop of an instance under a 100 ms holder delay reset 7 of the
   handshakes the churn client had in flight; an earlier control run read 9 and 14. With it at 1,
-  four closes, two of them restarts' stops, reset none. Docker 29.9.2 set the per-namespace
+  four closes, one of them a restart's stop, reset none. Docker 29.9.2 set the per-namespace
   sysctl through compose `sysctls:` with no added capability, and each churn read the value back
   from the holder. No product defect: the reset is the kernel's, and the setting is the
   operator's ([docs/deploying.md](../deploying.md#tcp-listeners-and-tcp_migrate_req)). The
