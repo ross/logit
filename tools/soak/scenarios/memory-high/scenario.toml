@@ -39,13 +39,14 @@ rss_growth_mib_per_hour = 64
 fd_growth = 8
 
 # With no throttle the SUT's cgroup peaked at 42.0 MiB and its resident memory at 45.5 MiB
-# through this outage, against 26 to 30 MiB steady (20261104T020422Z). The throttle sits 18 MiB
+# through this outage, against 26 to 30 MiB steady (20261104T020422Z). The throttle sits 22 MiB
 # above that peak, opens before the outage, and closes after its recovery.
 [[step]]
 at = "0s"
 action = "cgroup"
 on = "logit"
 memory_high = "64M"
+engaged = false           # the queues hold it under the throttle
 for = "160s"
 
 [[step]]

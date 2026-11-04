@@ -311,25 +311,27 @@ def cgroup_setting(step):
 
 
 def cgroup_dir(ctx, service):
-    """`(path, None)`: the container's cgroup relative to the hierarchy's root, from the cgroup
-    v2 line of its process's `/proc/<pid>/cgroup` on the host; or `(None, why)` when the
-    container isn't running or the line doesn't name its full id."""
+    """`(path, started_at, None)`: the container's cgroup relative to the hierarchy's root, from
+    the cgroup v2 line of its process's `/proc/<pid>/cgroup` on the host, and the start time of
+    that process from the same inspect; or `(None, None, why)` when the container isn't running
+    or the line doesn't name its full id."""
     info = ctx.docker.inspect(ctx.ids[service]) or {}
-    pid = (info.get("State") or {}).get("Pid")
+    state = info.get("State") or {}
+    pid, started = state.get("Pid"), state.get("StartedAt")
     full = info.get("Id")
     if not pid or not full:
-        return None, f"{service} has no running process to find its cgroup by"
+        return None, None, f"{service} has no running process to find its cgroup by"
     where = Path(ctx.proc_root, str(pid), "cgroup")
     try:
         text = where.read_text()
     except OSError as err:
-        return None, f"can't read {where}: {err}"
+        return None, None, f"can't read {where}: {err}"
     for line in text.splitlines():
         if line.startswith("0::/"):
             path = line[len("0::/"):].strip()
             if full in path.split("/")[-1] and ".." not in path.split("/"):
-                return path, None
-    return None, f"{where} names no cgroup v2 path for container {full[:12]}"
+                return path, started, None
+    return None, None, f"{where} names no cgroup v2 path for container {full[:12]}"
 
 
 def cgroup_argv(ctx, path, *value):
@@ -345,8 +347,9 @@ def _cgroup_write(ctx, path, value, **extra):
     result = ctx.docker.run_oneshot(cgroup_argv(ctx, path, value))
     record = _record(result, path=path, value=value, **extra)
     if result.rc == 0 and result.stdout.strip() != value:
-        record.update(rc=1, stderr=f"wrote {value!r} to {path} and read back "
-                                   f"{result.stdout.strip()[-200:]!r}")
+        record.update(rc=1, read_back=result.stdout.strip()[-200:],
+                      stderr=f"wrote {value!r} to {path} and read back "
+                             f"{result.stdout.strip()[-200:]!r}")
     return record
 
 
@@ -355,10 +358,12 @@ def cgroup_apply(ctx, step):
     and leaves the path, `found`, and the process's start time for the revert. A `memory.high`
     step also reads `memory.events`' `high` count first (`high_events_before`), so the revert
     can count the window's. A cgroup it can't find, or a read that printed nothing or no count,
-    is `rc` 1 and writes nothing."""
+    is `rc` 1 and writes nothing. A failed write leaves nothing for the revert, and a read-back
+    that differs writes `found` back at once. A process that started again between the inspect
+    that found the cgroup and the write has a new scope, which the write may have reached: the
+    apply writes `found` back there and fails the step (`started_during_apply`)."""
     name, value = cgroup_setting(step)
-    started = _started_at(ctx, step.on)
-    found_dir, why = cgroup_dir(ctx, step.on)
+    found_dir, started, why = cgroup_dir(ctx, step.on)
     if found_dir is None:
         return {"rc": 1, "stderr": why, "file": name}
     path = f"{found_dir}/{name}"
@@ -376,8 +381,19 @@ def cgroup_apply(ctx, step):
             return {"rc": 1, "stderr": why, "file": name, "path": path, "found": found}
         saved.update(events_dir=found_dir, high_before=before)
         extra["high_events_before"] = before
+    record = _cgroup_write(ctx, path, value, file=name, found=found, **extra)
+    if record["rc"] != 0:
+        if record.get("read_back") is not None:
+            ctx.docker.run_oneshot(cgroup_argv(ctx, path, found))
+        return record
+    if _started_at(ctx, step.on) != started:
+        back = ctx.docker.run_oneshot(cgroup_argv(ctx, path, found))
+        record.update(rc=1, started_during_apply=True, restored=back.rc == 0,
+                      stderr="the process started again during the apply; wrote "
+                             f"{found!r} back to its new scope")
+        return record
     ctx.state[step.id] = saved
-    return _cgroup_write(ctx, path, value, file=name, found=found, **extra)
+    return record
 
 
 def memory_high_events(ctx, found_dir):

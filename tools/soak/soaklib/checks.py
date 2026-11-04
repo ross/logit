@@ -605,7 +605,8 @@ def check_timeline(data):
     early revert in the end sequence isn't probed, so it needs none. A `prlimit` or `cgroup`
     whose process started again or exited inside its window is reported: its limit went with
     the old process. A `memory.high` revert's throttle count is reported, and one that couldn't
-    read `memory.events` FAILs, since nothing then says whether the throttle engaged."""
+    read `memory.events` FAILs, since nothing then says whether the throttle engaged; so does a
+    count that contradicts the step's `engaged`."""
     if data.t0 is None:
         return Result("timeline", SKIP, "no timeline start")
     lines = []
@@ -649,6 +650,14 @@ def check_timeline(data):
               f"throttling: {record['events_error']}"
               for record in actions if record["event"] == "revert" and "events_error" in record]
     gone += engaged
+    for record in actions:
+        if record["event"] != "revert" or "high_events" not in record:
+            continue
+        want, count = record.get("engaged"), record["high_events"]
+        if (want is True and count <= 0) or (want is False and count > 0):
+            lines.append(f"{record.get('step')} (cgroup on {record.get('on')}): memory.high "
+                         f"engaged {_n(count)} time(s), and the step expects it "
+                         f"{'to engage' if want else 'never to engage'}")
     if lines:
         return Result("timeline", FAIL, lines[0], lines + gone)
     return Result("timeline", PASS, f"{len(actions)} apply/revert action(s) returned 0; "

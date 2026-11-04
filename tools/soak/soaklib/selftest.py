@@ -13511,14 +13511,62 @@ def _cgroup_actions():
                    and memory.id not in ctx.state,
                    f"an apply that can't count memory.high's throttling writes nothing, got "
                    f"{result}")
-        fake, ctx = context(tmp, [ok(0, "max\n", ""), events(3), ok(0, "268431360\n", "")])
+        fake, ctx = context(tmp, [ok(0, "max\n", ""), events(3), ok(0, "268431360\n", ""),
+                                  ok(0, "max\n", "")])
         result = action.apply(ctx, memory)
-        expect(result["rc"] == 1 and "read back '268431360'" in result["stderr"],
-               f"a read-back that differs from the value written fails the step, got {result}")
+        calls = len(fake.calls)
+        expect(result["rc"] == 1 and "read back '268431360'" in result["stderr"]
+               and fake.calls[-1] == argv("memory.high", "max") and memory.id not in ctx.state
+               and action.revert(ctx, memory) == {"rc": 0, "stderr": "", "restored": False}
+               and len(fake.calls) == calls,
+               f"a read-back that differs fails the step and writes what it found back at once, "
+               f"leaving the revert nothing to write, got {fake.calls[-1]} {result}")
         fake, ctx = context(tmp, [ok(0, "max\n", ""), events(3), ok(1, "", "Permission denied")])
         result = action.apply(ctx, memory)
-        expect(result["rc"] == 1 and "Permission denied" in result["stderr"],
-               f"a failed write fails the step, got {result}")
+        calls = len(fake.calls)
+        expect(result["rc"] == 1 and "Permission denied" in result["stderr"]
+               and calls == 3 and memory.id not in ctx.state
+               and action.revert(ctx, memory) == {"rc": 0, "stderr": "", "restored": False}
+               and len(fake.calls) == calls,
+               f"a failed write fails the step and leaves the revert nothing to write, got "
+               f"{result}")
+        fake, ctx = context(tmp, [ok(0, "max 100000\n", ""), ok(0, "25000 100000\n", ""),
+                                  ok(0, "max 100000\n", "")])
+        real_oneshot = fake.run_oneshot
+
+        def restart_on_write(args, timeout=None):
+            answer = real_oneshot(args, timeout)
+            if len(fake.calls) == 2:
+                fake.state = dict(running, StartedAt="2026-10-08T12:00:05Z")
+            return answer
+
+        fake.run_oneshot = restart_on_write
+        result = action.apply(ctx, cpu)
+        calls = len(fake.calls)
+        expect(result["rc"] == 1 and result.get("started_during_apply") is True
+               and fake.calls[-1] == argv("cpu.max", "max 100000") and cpu.id not in ctx.state
+               and action.revert(ctx, cpu) == {"rc": 0, "stderr": "", "restored": False}
+               and len(fake.calls) == calls,
+               f"a process that started again during the apply gets what was found written "
+               f"back at once, and the step fails, got {fake.calls[-1]} {result}")
+        fake, ctx = context(tmp, [ok(0, "max 100000\n", ""), ok(0, "25000 100000\n", "")])
+        real_inspect, inspects = fake.inspect, []
+
+        def restart_after_check(container, timeout=None):
+            inspects.append(container)
+            if len(inspects) == 3:
+                fake.state = dict(running, StartedAt="2026-10-08T12:00:05Z")
+            return real_inspect(container, timeout)
+
+        fake.inspect = restart_after_check
+        result = action.apply(ctx, cpu)
+        calls = len(fake.calls)
+        reverted = action.revert(ctx, cpu)
+        expect(result["rc"] == 0 and len(inspects) == 3
+               and reverted.get("started_in_window") is True and len(fake.calls) == calls,
+               f"the apply takes the cgroup and the start time from one inspect and checks it "
+               f"once after the write, so a start after that check is the revert's to find, "
+               f"got {result} {reverted} after {len(inspects)} inspect(s)")
         for line, why in ((None, "can't read"), ("0::/\n", "names no cgroup v2 path"),
                           ("0::/system.slice/docker-0123.scope\n", "names no cgroup v2 path"),
                           (f"1:name=systemd:/{scope}\n", "names no cgroup v2 path"),
@@ -13586,6 +13634,17 @@ def _cgroup_actions():
                in result.detail,
                f"timeline FAILs a memory.high revert that couldn't read memory.events, got "
                f"{result}")
+        for want, count, status in ((True, 0, checks.FAIL), (True, 3, checks.PASS),
+                                    (False, 3, checks.FAIL), (False, 0, checks.PASS)):
+            judged = timeline[:2] + [_action("revert", "c0s1", "cgroup", "logit", 180,
+                                             restored=True, high_events=count, engaged=want)
+                                     ] + timeline[3:]
+            result = _status(_run_dir(tmp, f"cgroup-engaged-{want}-{count}", judged),
+                             checks.check_timeline)
+            expect(result.status == status
+                   and (status == checks.PASS or "and the step expects it" in result.detail),
+                   f"timeline judges engaged = {want} against a count of {count} as {status}, "
+                   f"got {result}")
         quiet = [line for line in _sut_stdout(400)
                  if not 70 < (telemetry.parse_rfc3339(json.loads(line)["timestamp"]) - T0) < 100]
         result = _status(_run_dir(tmp, "cgroup-gap", timeline, quiet), checks.check_progress)
@@ -13635,10 +13694,25 @@ def _cgroup_rules(root):
     for size in ("256", "256MB", "0M", "15M", "16383K", "1025G", 268435456, "256m", "01M"):
         _refused(path, with_step(memory_high=size), "`memory_high` must be a whole number with "
                  "a K, M, or G suffix", f"a cgroup's memory_high {size!r}")
-    for key, value in (("cpu", 0.5), ("memory_high", "256M")):
+    _refused(path, with_step(memory_high="16385K"), "`memory_high` must be a whole number of "
+             "4 KiB pages", "a memory_high of 16385K")
+    try:
+        loaded = scenario.from_dict(with_step(memory_high="16388K", engaged=True), path)
+        scenario.validate(loaded)
+        expect(scenario.expand(loaded)[0].expected() == {"memory_high": "16388K",
+                                                         "engaged": True},
+               "a memory_high of whole pages and its engaged reach the step's records")
+    except scenario.ScenarioError as err:
+        expect(False, f"a memory_high of 16388K with engaged loads, got {err.problems}")
+    _refused(path, with_step(cpu=0.5, engaged=True), "`engaged` is for a cgroup step with "
+             "`memory_high` only", "engaged on a cpu step")
+    _refused(path, with_step(memory_high="64M", engaged="yes"), "`engaged` must be true or "
+             "false", "an engaged that isn't a bool")
+    for key, value in (("cpu", 0.5), ("memory_high", "256M"), ("engaged", True)):
         changed = copy.deepcopy(raw)
         changed["step"][0][key] = value
-        _refused(path, changed, f"`{key}` is for cgroup only",
+        _refused(path, changed, "`engaged` is for a cgroup step with `memory_high` only"
+                 if key == "engaged" else f"`{key}` is for cgroup only",
                  f"{key} on a {raw['step'][0]['action']}")
     _refused(path, with_step(cpu=0.5, args="50"), "`args` is for netem only", "args on a cgroup")
     gen = with_step(cpu=0.5)
@@ -13668,6 +13742,7 @@ def _cgroup_rules(root):
     limits = [one for one in scenario.expand(shipped) if one.action == "cgroup"]
     rows = [exp.to_json() for exp in shipped.expectations]
     expect(len(limits) == 1 and limits[0].on == "logit" and limits[0].memory_high is not None
+           and limits[0].engaged is False
            and any(row.get("metric") == "logit.process.memory.resident.bytes"
                    and row.get("reduce") == "max" and row.get("max") is not None
                    and row.get("step") == limits[0].id for row in rows),
@@ -13679,7 +13754,8 @@ def _cgroup_rules(root):
     expect(len(limits) == 1 and limits[0].on == "logit" and len(stops) == 1
            and 30 * 1024 ** 2 < (scenario.memory_bytes(limits[0].memory_high) or 0)
            < 42 * 1024 ** 2
-           and limits[0].start < stops[0].start and stops[0].end < limits[0].end,
+           and limits[0].start < stops[0].start and stops[0].end < limits[0].end
+           and limits[0].engaged is True,
            f"memory-high-pressure throttles the SUT between its steady memory and its outage "
            f"peak, around the outage, got {limits} {stops}")
 

@@ -2,8 +2,8 @@
 # cost in the outage, so the kernel throttles and reclaims from it while the queues fill.
 # Over `memory.high` the kernel throttles, never kills: no OOM is expected, and whatever the
 # slowed SUT can't take must be counted. The `cgroup` revert counts how often the throttle
-# engaged, and `timeline` reports it. The schema is docs/plans/soak-harness.md's "The scenario
-# schema".
+# engaged, and `timeline` FAILs a count of 0, since the step sets `engaged = true`. The
+# schema is docs/plans/soak-harness.md's "The scenario schema".
 
 name = "memory-high-pressure"
 description = "sink-outage-block with memory.high at 36M on the SUT's cgroup, below the outage's 42 MiB: the kernel throttles and reclaims, and nothing is lost uncounted"
@@ -45,6 +45,7 @@ at = "0s"
 action = "cgroup"
 on = "logit"
 memory_high = "36M"
+engaged = true           # the throttle must reach the kernel
 for = "160s"
 
 [[step]]

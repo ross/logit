@@ -123,10 +123,13 @@ PRLIMIT_MAX_NOFILE = 1048576
 # 1 ms per 100 ms period. Below `CGROUP_MIN_MEMORY_HIGH` the process can't hold its own
 # binary and runtime, so it does nothing but reclaim.
 CGROUP_KEYS = ("cpu", "memory_high")
+# A `memory_high` step's optional `engaged`: whether the kernel must throttle the cgroup in the
+# window (`true`) or must not (`false`), which `timeline` judges from the revert's count.
 CGROUP_MIN_CPU = 0.01
 CGROUP_MAX_CPU = 1024
 CGROUP_MIN_MEMORY_HIGH = 16 * 1024 ** 2
 CGROUP_MAX_MEMORY_HIGH = 1024 ** 4
+CGROUP_PAGE_BYTES = 4096
 _MEMORY_HIGH = re.compile(r"^([1-9][0-9]*)([KMG])$")
 _MEMORY_UNITS = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}
 # The `SUT_ONLY_ACTIONS` allowed on a scrape wire's generator: it sends nothing, so a kill
@@ -244,7 +247,7 @@ _TARGET_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 PRIVATE_ENV_PREFIX = "soak-env-"
 STEP_KEYS = {"at", "action", "on", "args", "for", "ready", "code", "key", "class", "signal",
-             "path", "to", "cert", "days", "broken", "port", "nofile", *CGROUP_KEYS,
+             "path", "to", "cert", "days", "broken", "port", "nofile", "engaged", *CGROUP_KEYS,
              *RESPOND_KEYS}
 RANDOM_KEYS = {"seed", "gap", "fault"}
 RANDOM_FAULT_KEYS = {"weight", "action", "on", "args", "for"}
@@ -568,9 +571,10 @@ class StepSpec:
     port: object = None
     # A `prlimit`'s open-files limit.
     nofile: object = None
-    # A `cgroup`'s CPU quota or memory throttle.
+    # A `cgroup`'s CPU quota or memory throttle, and whether a throttle must engage.
     cpu: object = None
     memory_high: object = None
+    engaged: object = None
 
 
 # The `Step` fields `expected()` writes into its JSON and its timeline records, each under its
@@ -583,7 +587,7 @@ STEP_FIELDS = (("ready", "ready"), ("code", "code"), ("key", "key"), ("status", 
                ("fault_class", "class"),
                ("signal", "signal"), ("path", "path"), ("to", "to"), ("cert", "cert"),
                ("days", "days"), ("broken", "broken"), ("port", "port"), ("nofile", "nofile"),
-               ("cpu", "cpu"), ("memory_high", "memory_high"))
+               ("cpu", "cpu"), ("memory_high", "memory_high"), ("engaged", "engaged"))
 
 
 @dataclass
@@ -657,6 +661,7 @@ class Step:
     nofile: object = None
     cpu: object = None
     memory_high: object = None
+    engaged: object = None
 
     def expected(self):
         """The fields this step sets (`STEP_FIELDS`), for its JSON and its timeline records."""
@@ -1097,6 +1102,7 @@ def from_dict(raw, path):
             cert=raw_step.get("cert"), days=raw_step.get("days"), broken=raw_step.get("broken"),
             port=raw_step.get("port"), nofile=raw_step.get("nofile"),
             cpu=raw_step.get("cpu"), memory_high=raw_step.get("memory_high"),
+            engaged=raw_step.get("engaged"),
         ))
         if "for" not in raw_step:
             problems.append(f"{where}: every fault needs `for`, so its revert is scheduled with it")
@@ -3072,6 +3078,10 @@ def _cgroup_problems(spec, where):
     another action; `cpu` a number from `CGROUP_MIN_CPU` to `CGROUP_MAX_CPU`; `memory_high` a
     size from `CGROUP_MIN_MEMORY_HIGH` to `CGROUP_MAX_MEMORY_HIGH`."""
     given = [key for key in CGROUP_KEYS if getattr(spec, key) is not None]
+    if spec.engaged is not None and (spec.action != "cgroup" or spec.memory_high is None):
+        return [f"{where}: `engaged` is for a cgroup step with `memory_high` only"]
+    if spec.engaged is not None and not isinstance(spec.engaged, bool):
+        return [f"{where}: `engaged` must be true or false, got {spec.engaged!r}"]
     if spec.action != "cgroup":
         return [f"{where}: `{key}` is for cgroup only" for key in given]
     if len(given) != 1:
@@ -3087,6 +3097,10 @@ def _cgroup_problems(spec, where):
     if size is None or not CGROUP_MIN_MEMORY_HIGH <= size <= CGROUP_MAX_MEMORY_HIGH:
         return [f"{where}: `memory_high` must be a whole number with a K, M, or G suffix from "
                 f"16M to 1024G, got {spec.memory_high!r}"]
+    if size % CGROUP_PAGE_BYTES:
+        return [f"{where}: `memory_high` must be a whole number of 4 KiB pages, since the kernel "
+                f"rounds it down to one and the read-back would differ, got "
+                f"{spec.memory_high!r}"]
     return []
 
 
@@ -3936,7 +3950,7 @@ def expand(scenario, duration=None, seed=None):
                     invalid_event=spec.invalid_event, withhold_acks=spec.withhold_acks,
                     signal=spec.signal, path=spec.path, to=spec.to, cert=spec.cert,
                     days=spec.days, broken=spec.broken, port=spec.port, nofile=spec.nofile,
-                    cpu=spec.cpu, memory_high=spec.memory_high,
+                    cpu=spec.cpu, memory_high=spec.memory_high, engaged=spec.engaged,
                 ))
         cycle += 1
     steps.sort(key=lambda s: (s.start, s.spec_index))
