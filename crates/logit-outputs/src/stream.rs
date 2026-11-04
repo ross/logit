@@ -55,16 +55,16 @@
 //! answers. A redial would land in the frozen listener's accept backlog and fill a second buffer
 //! pair there, and a third on the next stall, all lost if the receiver dies; a kept connection
 //! puts at most one pair at risk (ADR `stream-sink-stalled-connection`). Under
-//! `at_least_once` the stalled frame's head is delivered twice once the receiver reads again: in
-//! its tail's connection and in the batch's resend.
+//! `at_least_once` the whole stalled batch is delivered twice once the receiver reads again: the
+//! kept connection finishes its frame, and the retry sends the frame whole.
 //!
 //! **Counting what a dropped connection lost.** When a connection ends with its data destroyed
 //! (a probe's EOF, reset, unsolicited bytes, or alert, or a failed write), the driver reads the
 //! TCP socket's unacknowledged send queue ([`sockstat::send_queue`]) before closing it and counts
 //! what earlier batches left there as `logit.output.bytes.dropped{reason="unacknowledged"}`, with
-//! a throttled `warn` keyed `unacknowledged`. Bytes of the frame an attempt returned `Ambiguous`
-//! for are left out ([`Conn::unaccounted`]): that batch is resent, or counted dropped under
-//! `at_most_once`. The count is on the sink's ungated handles, since it is the destination's
+//! a throttled `warn` keyed `unacknowledged`. Bytes of every frame an attempt returned
+//! `Ambiguous` for are left out ([`Sent::unaccounted`]), however many attempts ago: that batch
+//! is resent, or counted dropped under `at_most_once`. The count is on the sink's ungated handles, since it is the destination's
 //! verdict on earlier batches, not an encode outcome. Under TLS it is wire bytes, record framing
 //! included, and leaves out up to 64 KiB of ciphertext still queued in the session. Nothing is
 //! counted on a Unix stream, whose queue the receiver's close frees, on a stall, whose closed
@@ -451,42 +451,91 @@ struct Conn {
     /// flush. The next attempt finishes it before writing its own frame, so the receiver never
     /// sees a frame cut and another begun.
     pending: Option<Vec<u8>>,
-    /// Bytes `stream` has accepted over the connection's life: plaintext under TLS.
-    sent: u64,
-    /// The stream offsets of the last frame an attempt returned `Ambiguous` for. Its batch is
-    /// resent, or counted dropped under `at_most_once`, so its bytes aren't counted again as
-    /// unacknowledged.
-    resent: std::ops::Range<u64>,
+    /// What `stream` has accepted, and which of it no batch's own accounting covers.
+    sent: Sent,
 }
 
 impl Conn {
     fn new(stream: Box<dyn AsyncStream>, tcp_fd: Option<sockstat::RawFd>) -> Self {
-        Self { stream, tcp_fd, pending: None, sent: 0, resent: 0..0 }
+        Self { stream, tcp_fd, pending: None, sent: Sent::default() }
+    }
+
+    /// The connection's send queue, if it is TCP and the kernel answers.
+    fn queued(&self) -> Option<u32> {
+        self.tcp_fd.and_then(|fd| sockstat::send_queue(fd).ok())
+    }
+}
+
+/// The bytes a connection's stream accepted, and the stream offsets of each frame an attempt
+/// returned `Ambiguous` for that may still be in the send queue. Each such batch is resent, or
+/// counted dropped under `at_most_once`, so its bytes aren't counted again as unacknowledged.
+/// A frame cut by a failed write needs no pruning: the abandon that follows reads the queue.
+#[derive(Default)]
+struct Sent {
+    /// Bytes accepted over the connection's life: plaintext under TLS.
+    total: u64,
+    /// In stream order. The last is the frame a kept connection's pending tail belongs to.
+    ambiguous: Vec<std::ops::Range<u64>>,
+}
+
+impl Sent {
+    fn wrote(&mut self, n: usize) {
+        self.total += n as u64;
+    }
+
+    /// `n` more bytes of the pending tail, which belongs to the last `Ambiguous` frame.
+    fn wrote_tail(&mut self, n: usize) {
+        self.wrote(n);
+        if let Some(last) = self.ambiguous.last_mut() {
+            last.end = self.total;
+        }
+    }
+
+    /// Records `range` as an `Ambiguous` frame's and forgets every earlier one `queued` shows
+    /// has left the send queue. With no queue reading, only `range` is kept: a connection whose
+    /// queue can't be read counts nothing when abandoned.
+    fn ambiguous(&mut self, range: std::ops::Range<u64>, queued: Option<u32>, tls: bool) {
+        match queued {
+            Some(queued) => {
+                let total = self.total;
+                self.ambiguous.retain(|range| in_queue(total, range, queued, tls));
+            }
+            None => self.ambiguous.clear(),
+        }
+        self.ambiguous.push(range);
     }
 
     /// The unacknowledged bytes `queued` holds that no batch's own accounting covers: `queued`
-    /// less the part of [`Self::resent`] still in it. On plaintext the queue is the last
-    /// `queued` bytes sent, so the overlap is computed. Under TLS `queued` is ciphertext and up
-    /// to [`TLS_SESSION_BUFFER`] more may wait in the session, so `resent` is taken out whole,
-    /// with the most framing it could carry, unless the bytes after it can't fit in both.
+    /// less each `Ambiguous` range's part still in it. On plaintext the queue is the last
+    /// `queued` bytes sent, so each overlap is computed. Under TLS each range still in reach is
+    /// taken out whole, with the most framing it could carry.
     fn unaccounted(&self, queued: u32, tls: bool) -> u64 {
-        let queued = u64::from(queued);
-        let resent = &self.resent;
-        let overlap = if tls {
-            let after = self.sent.saturating_sub(resent.end);
-            if after >= queued + TLS_SESSION_BUFFER {
-                0
-            } else {
-                let len = (resent.end - resent.start) as usize;
-                let records = len.div_ceil(TLS_MAX_FRAGMENT) + len.div_ceil(WRITE_CHUNK) + 1;
-                (len + records * TLS_RECORD_OVERHEAD) as u64
-            }
-        } else {
-            let queue_start = self.sent.saturating_sub(queued);
-            resent.end.saturating_sub(resent.start.max(queue_start))
-        };
-        queued.saturating_sub(overlap)
+        let queue_start = self.total.saturating_sub(u64::from(queued));
+        let overlap: u64 = self
+            .ambiguous
+            .iter()
+            .filter(|range| in_queue(self.total, range, queued, tls))
+            .map(|range| {
+                if tls {
+                    let len = (range.end - range.start) as usize;
+                    let records = len.div_ceil(TLS_MAX_FRAGMENT) + len.div_ceil(WRITE_CHUNK) + 1;
+                    (len + records * TLS_RECORD_OVERHEAD) as u64
+                } else {
+                    range.end.saturating_sub(range.start.max(queue_start))
+                }
+            })
+            .sum();
+        u64::from(queued).saturating_sub(overlap)
     }
+}
+
+/// Whether any of `range` can still be in a send queue holding `queued` bytes, `total` bytes
+/// into the stream. The queue only drains from the front, so a range that left it never
+/// returns. Under TLS `queued` is ciphertext and up to [`TLS_SESSION_BUFFER`] more may wait in
+/// the session.
+fn in_queue(total: u64, range: &std::ops::Range<u64>, queued: u32, tls: bool) -> bool {
+    let reach = u64::from(queued) + if tls { TLS_SESSION_BUFFER } else { 0 };
+    total.saturating_sub(range.end) < reach
 }
 
 /// A sink's pooled connection. `has_connected_once` lives here, not on the sink, because a sink
@@ -560,12 +609,11 @@ impl PooledStream {
                 None => self.dial(dial, telemetry).await?,
             };
 
-            // An earlier attempt's frame goes first. Its tail extends the frame `resent` names.
+            // An earlier attempt's frame goes first.
             if let Some(tail) = conn.pending.take() {
                 let mut written = 0;
                 let result = write_counting(&mut *conn.stream, &tail, bound, &mut written).await;
-                conn.sent += written as u64;
-                conn.resent.end = conn.sent;
+                conn.sent.wrote_tail(written);
                 match result {
                     Ok(()) => {}
                     // Nothing of this frame was written.
@@ -586,10 +634,10 @@ impl PooledStream {
                 }
             }
 
-            let start = conn.sent;
+            let start = conn.sent.total;
             let mut written = 0;
             let result = write_counting(&mut *conn.stream, frame, bound, &mut written).await;
-            conn.sent += written as u64;
+            conn.sent.wrote(written);
             let err = match result {
                 Ok(()) => {
                     self.conn = Some(conn);
@@ -604,7 +652,8 @@ impl PooledStream {
                 if written == 0 {
                     return self.keep_stalled(conn, err, Fault::Clean, diag);
                 }
-                conn.resent = start..conn.sent;
+                let queued = conn.queued();
+                conn.sent.ambiguous(start..conn.sent.total, queued, tls);
                 conn.pending = Some(frame[written..].to_vec());
                 return self.keep_stalled(conn, err, Fault::Ambiguous, diag);
             }
@@ -612,7 +661,7 @@ impl PooledStream {
             // failed call's chunk may have left as whole records first.
             let accepted_nothing = written == 0 && !tls;
             let reached = if tls { (written + WRITE_CHUNK).min(frame.len()) } else { written };
-            conn.resent = start..start + reached as u64;
+            conn.sent.ambiguous.push(start..start + reached as u64);
             self.abandon(conn, Abandoned::WriteFailed, tls, telemetry, diag);
             if accepted_nothing && !retried {
                 retried = true;
@@ -652,7 +701,7 @@ impl PooledStream {
     }
 
     /// Drops `conn`, which `cause` ended with its unacknowledged bytes destroyed, and counts
-    /// them ([`Conn::unaccounted`]) as `logit.output.bytes.dropped{reason="unacknowledged"}`
+    /// them ([`Sent::unaccounted`]) as `logit.output.bytes.dropped{reason="unacknowledged"}`
     /// with a throttled warning. Reads the send queue before the drop closes the socket.
     fn abandon(
         &mut self,
@@ -665,7 +714,7 @@ impl PooledStream {
         let Some(fd) = conn.tcp_fd else { return };
         match sockstat::send_queue(fd) {
             Ok(queued) => {
-                let lost = conn.unaccounted(queued, tls);
+                let lost = conn.sent.unaccounted(queued, tls);
                 if lost > 0 {
                     telemetry.count(
                         "logit.output.bytes.dropped",
@@ -790,6 +839,80 @@ mod tests {
 
     fn connect_to(fake: &FakeStream) -> DialStep {
         DialStep::Connect(Box::new(fake.clone()))
+    }
+
+    /// A connection's ledger after an `Ambiguous` stall on frame A (100 bytes, 40 written), a
+    /// later attempt that finishes A's tail and writes batch B (50 bytes) whole, and an
+    /// `Ambiguous` stall on frame C (80 bytes, 30 written) with all 180 bytes still queued.
+    fn two_stalls_around_a_success(queued_at_second_stall: u32) -> Sent {
+        let mut sent = Sent::default();
+        sent.wrote(40);
+        sent.ambiguous(0..40, Some(40), false);
+        sent.wrote_tail(60);
+        sent.wrote(50);
+        sent.wrote(30);
+        sent.ambiguous(150..180, Some(queued_at_second_stall), false);
+        sent
+    }
+
+    #[test]
+    fn every_ambiguous_frame_still_queued_is_left_out_of_the_unacknowledged_count() {
+        let sent = two_stalls_around_a_success(180);
+        assert_eq!(sent.unaccounted(180, false), 50, "only B's bytes are unaccounted");
+        assert_eq!(sent.unaccounted(120, false), 50, "A's last 40 bytes, B, and C's 30");
+        assert_eq!(sent.unaccounted(20, false), 0, "only part of C is queued");
+    }
+
+    #[test]
+    fn a_resent_frame_after_its_finished_tail_leaves_both_out() {
+        // Frame A stalls after 40 of 100 bytes; the next attempt finishes its tail and then
+        // stalls after 20 bytes of A's resend.
+        let mut sent = Sent::default();
+        sent.wrote(40);
+        sent.ambiguous(0..40, Some(40), false);
+        sent.wrote_tail(60);
+        sent.wrote(20);
+        sent.ambiguous(100..120, Some(120), false);
+        assert_eq!(sent.unaccounted(120, false), 0);
+    }
+
+    #[test]
+    fn an_ambiguous_frame_that_left_the_queue_is_forgotten() {
+        // At the second stall only C's 30 bytes are queued, so A has left the queue.
+        let sent = two_stalls_around_a_success(30);
+        assert_eq!((sent.ambiguous.len(), sent.ambiguous.first()), (1, Some(&(150..180))));
+        assert_eq!(sent.unaccounted(30, false), 0);
+
+        let mut unread = Sent::default();
+        unread.ambiguous(0..10, None, false);
+        unread.wrote(10);
+        unread.ambiguous(10..20, None, false);
+        assert_eq!(
+            (unread.ambiguous.len(), unread.ambiguous.first()),
+            (1, Some(&(10..20))),
+            "with no queue reading, only the last is kept"
+        );
+    }
+
+    #[test]
+    fn a_tls_ambiguous_frame_is_left_out_whole_with_its_most_framing() {
+        // Batch B (500 bytes) whole, then frame A (1,000 bytes) cut. A spans one record and one
+        // write call, so it is taken out as 1,000 bytes plus three records' framing.
+        let mut sent = Sent::default();
+        sent.wrote(500);
+        sent.wrote(1000);
+        sent.ambiguous(500..1500, Some(2000), true);
+        assert_eq!(sent.unaccounted(2000, true), 2000 - (1000 + 3 * 29));
+    }
+
+    #[test]
+    fn a_tls_ambiguous_frame_too_far_back_for_the_queue_and_a_session_is_not_left_out() {
+        // 200,000 bytes followed A, more than the 1,000 queued and a full 64 KiB session.
+        let mut sent = Sent::default();
+        sent.wrote(100);
+        sent.ambiguous(0..100, Some(100), true);
+        sent.wrote(200_000);
+        assert_eq!(sent.unaccounted(1000, true), 1000);
     }
 
     fn sink_telemetry() -> (TelemetryProbe, Telemetry) {
