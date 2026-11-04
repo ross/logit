@@ -68,18 +68,6 @@ Entry format and the other areas: [the known-gaps index](README.md).
   that stays open ([ADR `delivery-semantics`](../adr/delivery-semantics.md), item 3, and its W3
   amendment).
   - **Consequence:** the sender counts the write delivered and doesn't resend it.
-- **The remote-write receiver waits for a full pipeline with no bound.** `prometheus_in(bind)`
-  sends each write through `crate::http::deliver_detached` and answers `204` only once the batch
-  is in every inbox, however long that takes. A sender times a request out on its own clock
-  (Prometheus's `remote_timeout`, 30 s by default) and resends it, and the detached send delivers
-  the original anyway, so each timeout under a pipeline that stays full is one duplicate, and
-  each waiting write holds its body and, over HTTP/2, a stream. `otlp_in` had the same gap and
-  answers busy after a bound now ([ADR `otlp-in-busy-answer`](../adr/otlp-in-busy-answer.md));
-  the receiver decodes a write to one batch, so the same bound with a `503` would apply whole.
-  - **Consequence:** duplicate samples under sustained backpressure. A sample's identity is its
-    series and timestamp, so most receivers downstream overwrite the duplicate.
-  - **Revisit trigger:** a soak run or an operator seeing the receiver's writes park past their
-    senders' timeout.
 - **An `ExponentialHistogram` can't reach VictoriaMetrics's native-histogram ingest over
   remote-write.** VictoriaMetrics accepts a remote-write native histogram and converts it to its
   `vmrange` buckets, but `prometheus_out` writes no `ExponentialHistogram` on either wire, and a

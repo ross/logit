@@ -425,7 +425,9 @@ Per pair:
     request from its own `Content-Type`, with `bind_tls:` for server TLS and `bind_auth:` for
     bearer and basic credentials. It decodes
     `Content-Encoding: snappy` or `zstd` (the VictoriaMetrics remote write protocol, vmagent's
-    default, through `ruzstd`), so vmagent stays on zstd with no configuration. A bounded
+    default, through `ruzstd`), so vmagent stays on zstd with no configuration. A write whose
+    batch can't reach every consumer within 2 s is answered a busy `503` with `Retry-After: 1`
+    ([ADR `otlp-in-busy-answer`](docs/adr/otlp-in-busy-answer.md)). A bounded
     `metadata_cache:` (`max_families`/`ttl`) is what makes 1.0 typed at all, because
     Prometheus's own 1.0 sender ships `metadata[]` in separate requests from the samples it
     describes.

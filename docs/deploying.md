@@ -3408,6 +3408,18 @@ retry, as OTLP exporters do for these answers. A busy request counts
 in, its later batches wait with no deadline, because a `503` would make the client resend a batch
 already delivered. See [ADR `otlp-in-busy-answer`](adr/otlp-in-busy-answer.md).
 
+## `prometheus_in`: a busy answer
+
+If a remote-write's batch can't reach every consumer directly downstream of `prometheus_in`'s
+receiver within 2 s (one full consumer is enough), the receiver answers `503` with
+`Retry-After: 1` and delivers nothing. Prometheus, vmagent, Grafana Alloy, and `prometheus_out`
+retry a `5xx`, so the sender still holds the write and resends it. A busy write counts
+`logit.input.writes{class="busy"}` once and its batch `logit.input.batches.deferred`; neither is
+loss. A write is one batch, so it's delivered whole or not at all. Read a steady busy rate as a
+pipeline that can't keep up with its senders. See
+[ADR `otlp-in-busy-answer`](adr/otlp-in-busy-answer.md)'s amendment "`prometheus_in`'s
+remote-write receiver answers busy too".
+
 ## `otlp_in`: a request no consumer took
 
 When every consumer directly downstream of `otlp_in` has closed, which happens as a shutdown tears
