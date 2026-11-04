@@ -24,7 +24,7 @@ duration = "6m15s"        # warmup + one cycle + cooldown
 warmup = "60s"
 cooldown = "60s"          # >= recovery_bound
 recovery_bound = "45s"
-cycle = "4m15s"           # the stop, its recovery, and two progress windows of steady state
+cycle = "4m15s"           # the stop and two progress windows; no recovery row for the stop
 
 [configs]
 sut = "logit-sut.yaml"

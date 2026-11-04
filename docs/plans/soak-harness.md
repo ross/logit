@@ -3205,9 +3205,10 @@ Docker 29.9, SELinux enforcing) checked each fault's mechanism before it was pla
     where cgroup writeback is supported. Two mechanisms, tried in order:
     - **`io.max` through the `cgroup` action.** W32's action gains `io_wbps` and `io_wiops`
       keys, written as `<major>:<minor> wbps=<n>` or `wiops=<n>` in the SUT's `io.max`, the
-      device resolved from the filesystem that holds Docker's data root (the volume the spool
-      lives on). It needs no new image and no privilege beyond W32's `label=disable`, and
-      reverts by writing `max` for that device. The VM's first step is the probe the survey ran
+      device behind the mount that holds `io_path` in the SUT's mountinfo, followed through an
+      overlay's `upperdir` to the host mount, a partition replaced by its whole disk. It needs
+      no new image and no privilege beyond W32's `label=disable`, and reverts by writing back
+      each limited key's found value (`max` when the device had none). The VM's first step is the probe the survey ran
       here: a throwaway container under a 1 MiB/s `wbps` writing 4 MiB with `fsync`, which
       must take about 4 s.
     - **`dm-delay`, if the probe fails.** A `dm-delay` device over a loop file in the run
@@ -3220,11 +3221,12 @@ Docker 29.9, SELinux enforcing) checked each fault's mechanism before it was pla
     One scenario, `slow-spool`, from `spool-kill-replay`, slows the spool's writes for a window
     through a sink outage and stops the SUT inside it. It reaches the spool's segment
     `sync_data`, its persist worker's cursor write with two fsyncs, and the write a cancelled
-    push leaves running (`disk_queue.rs`'s `HeldWriteFile`). Expected: backpressure, no
+    push leaves running (`disk_queue.rs`'s `HeldWriteFile`). Expected: slow syncs with no loss, no
     `*.dropped` unless the `buffer:` bound trips, the next life replaying the spool, and a
-    clean ledger. `[[expect]]` rows read the spool's write latency where telemetry has it, and
-    `timeline` reports the throttle's own count, `io.stat`'s `wbytes` and `wios` deltas, so a
-    window that never slowed a write is visible, as `memory.events` is for W32. A `dm-flakey`
+    clean ledger. No internal metric times a spool write and `io.stat` has no throttle count,
+    so `timeline` reports `io.stat`'s `wbytes` and `wios` deltas and the cgroup's `io.pressure`
+    stall, which `engaged` judges against 1% of the window, so a window that never slowed a
+    write is visible, as `memory.events` is for W32 (ADR `soak-harness`'s amendment). A `dm-flakey`
     `error_writes` variant, reaching `buffer.disk.errors{op}` on real I/O errors, needs the
     `dm-delay` path's device and stays out of W33 unless that path is the one taken. The
     harness needs Python 3.11 or later and `sudo -n docker`: the VM's Debian 13 image ships
@@ -6935,6 +6937,16 @@ What the runs showed about `logit` and the harness:
   fault windows and PASSed in the second (-444.5 MiB/h over 60 s, limit 334): the scenario's
   windows cover most of each life, so the row is thin either way.
 - **Self-test**: 3,049 expectations, unchanged by the scenario fix.
+- **Open: the 6.4 s stall against the ~46 s the bytes predict.** `c0s4`'s 1,503,232 B in 30
+  bios is about 11.5 records, so a stall of about 0.53 s per rotation, about 14% of the
+  bytes-over-limit time. The first run's 425,984 B stalled only 0.40 s. Most bytes were
+  therefore kworker writeback, which the scope's PSI doesn't see; the flusher likely wrote
+  back most of each record before the rotation's `fdatasync`. The next VM run should record
+  `sysctl vm.dirty_*`, sample `io.stat`, `io.pressure`, and `/proc/vmstat`'s `nr_dirty` and
+  `nr_writeback` each second, and time each `fdatasync` (`strace -f -T -e fdatasync`).
+- **Open, not built: the default segment under throttle.** The first run's 18.5 s shutdown at
+  the default segment size exceeds Docker's 10 s default stop timeout and nothing asserts it.
+  A default-segment variant, or an `[[expect]]` on shutdown drain time, would.
 
 ### W32: a CPU quota and memory pressure on the SUT's cgroup (2026-11-03)
 
