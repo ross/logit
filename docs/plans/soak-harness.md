@@ -3201,15 +3201,20 @@ Docker 29.9, SELinux enforcing) checked each fault's mechanism before it was pla
     half-open peers, connections whose packets a partition drops with no FIN or RST. What each
     cause reaches: a full listener refuses a new connection before any TLS accept and counts
     `logit.input.connections.rejected{reason="limit"}`, on the TCP driver and the HTTP
-    listeners alike; a trickling client is past its first byte, so only `idle_timeout:` bounds
-    it, counted `connections.closed{reason="idle"}`, and only when the scenario sets it; and a
-    first-byte timeout under `handshake_timeout:` shows only as the `connection_error`
-    diagnostic, with no counter, which W34 either judges from stderr or proposes a counter for
-    to the fixing session. Rows: `connections.rejected{reason="limit"}` above 0 while the slow
-    clients hold every slot, `connections.closed{reason="idle"}` for the trickle and the
-    half-open peers, the generator's wire loss at 0 with its connection opened before the
-    slots fill (a redial in that phase is refused, and allowed for), and no descriptor growth
-    after.
+    listeners alike; a trickling client is past its first byte, so `handshake_timeout:` no
+    longer bounds it, and `idle_timeout:`, when the scenario sets it, bounds it only on the
+    HTTP listeners, whose clock re-arms when a request finishes, counted
+    `connections.closed{reason="idle"}`, while the TCP driver re-arms its clock on every read
+    that returns bytes, so a byte sent faster than `idle_timeout:` holds the slot until the
+    client leaves; and a first-byte timeout under `handshake_timeout:` shows only as the
+    `connection_error` diagnostic, with no counter, which W34 either judges from stderr or
+    proposes a counter for to the fixing session. Rows: `connections.rejected{reason="limit"}`
+    above 0 while the slow clients hold every slot; `connections.closed{reason="idle"}` for
+    the trickle on an HTTP listener and for the half-open peers on both, since they send
+    nothing; on the TCP listener, the trickle holding its slot with no close, recorded as a
+    product finding (nothing bounds a connection that sends bytes but never completes a
+    frame); the generator's wire loss at 0 with its connection opened before the slots fill (a
+    redial in that phase is refused, and allowed for); and no descriptor growth after.
 32. **Native-hop variants (W35).** `native-hop` over TLS from the run's private CA, through a
     certificate rotation; under a netem delay on the hop long enough that the send window, not
     the link, bounds throughput, with an `[[expect]]` row on frames in flight; and with more
