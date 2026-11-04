@@ -5665,7 +5665,9 @@ def check_ledger_value(data):
       Ab − V (what `Ledger.kill_band` judges), each up to the largest stored delta; a widened
       window, the increments over its whole span.
     - A delta the sink dropped short of the stand-in (an event dropped other than `rejected`,
-      or a record other than `VALUE_SEEN_RECORD_REASONS`) loses at most the largest stored.
+      a record other than `VALUE_SEEN_RECORD_REASONS`, or a series point dropped
+      `duplicate_timestamp`, one whose series and second the sink had already sent) loses at
+      most the largest stored.
 
     So the windows bound the loss they explain and excuse none outside them."""
     if not data.ledger.get("sut_delta"):
@@ -5729,6 +5731,10 @@ def check_ledger_value(data):
     unseen += sum(point.value for point in led.sut.matching("logit.output.records.dropped",
                                                             component=sink)
                   if point.attributes.get("reason") not in VALUE_SEEN_RECORD_REASONS
+                  and isinstance(point.value, (int, float)))
+    unseen += sum(point.value for point in led.sut.matching("logit.output.metrics.dropped",
+                                                            component=sink)
+                  if point.attributes.get("reason") == "duplicate_timestamp"
                   and isinstance(point.value, (int, float)))
     band = sum(bounds) + unseen * largest
     head = (f"I {_n(increments)} (generate_in sent {_n(sent)} − lost {_n(lost)}) − V {_n(v)} "
@@ -7134,7 +7140,9 @@ def check_ledger_standin(data):
     under `at_least_once` after an answer the sink didn't see accepted, and a FAIL under
     `at_most_once`, or as a resend within one life of a point the stand-in answered `2xx`.
     Two values of one series in one second WARN rather than FAIL as a changed resend: they're
-    two points the sink sent in two requests, of which Datadog keeps the later.
+    two points the sink sent in two requests, of which Datadog keeps the later, a pair the sink
+    leaves off within one of its lives but not across two, or between batches in flight
+    together.
 
     Under the `influxdb` shape (`_standin_influxdb`), also: per SUT life, no point of a request
     answered under the cue of a step classed `rejected` is stored, and the egress gap, Ab − V
@@ -7194,14 +7202,16 @@ def check_ledger_standin(data):
     if shape == standin.DATADOG and conflicts:
         # `datadog_out` re-encodes a resend's points unchanged, so two values of one series in
         # one second are two points its whole-second timestamps merged, sent in two requests.
-        # Datadog keeps the later and loses the other uncounted, a known gap the sink can't
-        # close across batches (docs/known-gaps/datadog.md).
+        # Datadog keeps the later and loses the other uncounted. The sink leaves such a point
+        # off, counted, within one of its process lives; across two, or between two batches in
+        # flight together, it can't (docs/known-gaps/datadog.md).
         key, stamp, first, last = conflicts[0]
         flag(WARN, f"{_n(len(conflicts))} pair(s) of points of one series in one second from "
                    f"two requests, first {dict(key).get('__name__', key)} at "
                    f"{data.offset(stamp / 1000)} stored {first:g}, then {last:g}: Datadog keeps "
-                   "the later and loses the other uncounted, which datadog_out collapses only "
-                   "within one batch (docs/known-gaps/datadog.md)")
+                   "the later and loses the other uncounted, which datadog_out leaves off only "
+                   "within one of its process lives and not between batches in flight together "
+                   "(docs/known-gaps/datadog.md)")
         conflicts = []
     for key, stamp, first, last in conflicts[:5]:
         flag(FAIL, f"{dict(key).get('__name__', key)} at {stamp} ms stored {first:g}, then "
