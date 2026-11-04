@@ -6942,32 +6942,32 @@ acknowledged"). Each scenario ran once at its default length on the development 
 ### Round 3 follow-ups, on `soak/round3-followups` (2026-11-03)
 
 - **`otlp-grpc-egress` passed with `ledger.relay` balanced** (`20261103T223813Z`, 17 minutes).
-  `ledger.relay` balanced on all three `collector` lives: life 0 read E_r 4,700 = S_r 4,700 =
-  Del_r 4,700, life 1 (killed) 1,600 on each, and life 2 4,300 on each, with no relay drop.
-  The cross line read ΣE_r 10,600 against Del 10,000 less 100, so no point `logit` delivered went missing
-  at the relay. `ledger.egress` read Ab − V of 0 on both lives, and no batch was dropped over
-  the run.
-- **`syslog-tcp-ingress` with the `reset` step passed on its rerun** (`20261103T230043Z`, 15
-  minutes 15 seconds). Its first run (`20261103T222138Z`) failed `timeline` and `reset-counted`: SELinux confined the
-  netem container and blocked its `sock_diag` socket, so `ss -K` never applied and
-  `reset-counted` read "never applied cleanly". The reset one-shot now runs with
-  `label=disable`, and the step fails on a denied `ss`. On the rerun `reset-counted` read 1 and
-  `resets-run` read 1 against a limit of 1, and the pause, partition, generator stop, SUT stop,
-  and SUT kill each read 0 resets. The wire loss read 40 lines against a limit of 2,100.
-- **The 8-hour `kafka-sasl-reauth` run passed** (`20261103T141635Z`, 28,800 s, on the
-  development host). The sink redialed 1,069 times, 133.9 an hour, inside [80, 300], and 74
-  attempts, 9.3 an hour, were `ambiguous` against a limit of 40 an hour; none was `refused` and no batch
-  was dropped. The topic held 144,040 distinct records with 0 duplicate copies, equal to the
-  records the sink saw accepted, and G, W, and Ab each read 57,611,200. `rss_slope` read +0.0
-  MiB/h on the generator and +0.2 on `logit` against 65, from one life each, and descriptors held
-  at 17 on `logit`. All 221 faults recovered within 45 s over 147 starts.
-- **The 8-hour `tail-rotate-delete` run passed** (`20261103T141647Z`, 28,800 s). The tailer
-  rotated 3,714 files while the driver counted 646 deletions (the writer rotated 652 times), read no lost bytes, and logged no checkpoint
-  error. `files.open` peaked at 10 against a limit of 10 and ended at 8, process descriptors
-  peaked at 28 against 31, and watches peaked at 11 against 11. `logit` rose from a median of 20
-  descriptors after warmup to 26 at the end, inside the +10 limit; `rss_slope` read -28.8 to
-  +0.9 MiB/h across its lives against 69. `ledger.wire` read W + F − G of -900 inside the replay
-  band [-80,002, 102,239] over 16 kills, and all 40 faults recovered within 45 s.
+  `ledger.relay` balanced on all three `collector` lives: life 0 read E_r 4,700 = S_r 4,700 = Del_r
+  4,700, life 1 (killed) 1,600 on each, and life 2 4,300 on each, with no relay drop. The cross line
+  read ΣE_r 10,600 against Del 10,000 less 100, so no point `logit` delivered went missing at the
+  relay. `ledger.egress` read Ab − V of 0 on both lives, and no batch was dropped over the run.
+- **`syslog-tcp-ingress` with the `reset` step passed on its rerun** (`20261103T230043Z`, 15 minutes
+  15 seconds). Its first run (`20261103T222138Z`) failed `timeline` and `reset-counted`: SELinux
+  confined the netem container and blocked its `sock_diag` socket, so `ss -K` never applied and
+  `reset-counted` read "never applied cleanly". The reset one-shot now runs with `label=disable`,
+  and the step fails on a denied `ss`. On the rerun `reset-counted` read 1 and `resets-run` read 1
+  against a limit of 1, and the pause, partition, generator stop, SUT stop, and SUT kill each read 0
+  resets. The wire loss read 40 lines against a limit of 2,100.
+- **The 8-hour `kafka-sasl-reauth` run passed** (`20261103T141635Z`, 28,800 s, on the development
+  host). The sink redialed 1,069 times, 133.9 an hour, inside [80, 300], and 74 attempts, 9.3 an
+  hour, were `ambiguous` against a limit of 40 an hour; none was `refused` and no batch was dropped.
+  The topic held 144,040 distinct records with 0 duplicate copies, equal to the records the sink saw
+  accepted, and G, W, and Ab each read 57,611,200. `rss_slope` read +0.0 MiB/h on the generator and
+  +0.2 on `logit` against 65, from one life each, and descriptors held at 17 on `logit`. All 221
+  faults recovered within 45 s over 147 starts.
+- **The 8-hour `tail-rotate-delete` run passed** (`20261103T141647Z`, 28,800 s). The tailer rotated
+  3,714 files while the driver counted 646 deletions (the writer rotated 652 times), read no lost
+  bytes, and logged no checkpoint error. `files.open` peaked at 10 against a limit of 10 and ended
+  at 8, process descriptors peaked at 28 against 31, and watches peaked at 11 against 11. `logit`
+  rose from a median of 20 descriptors after warmup to 26 at the end, inside the +10 limit;
+  `rss_slope` read -28.8 to +0.9 MiB/h across its lives against 69. `ledger.wire` read W + F − G of
+  -900 inside the replay band [-80,002, 102,239] over 16 kills, and all 40 faults recovered within
+  45 s.
 
 The 8-hour runs close the gap the 1 h runs of W17 and W18 left: a leak that grows per redial or
 per deletion did not show in either path over 8 hours.
