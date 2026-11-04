@@ -49,16 +49,26 @@ action = "pause"
 on = "generator"
 for = "90s"
 
-# The SUT holds 16 descriptors with the eight connections closed: its listeners, stdio, the
-# runtimes' epoll instances and eventfds, and the remote-write connection. A limit of 20 leaves
-# room for `internal`'s /proc reads and a readiness probe's connection until the generator's
-# redials at 90 s take it.
+# The SUT holds 24 descriptors with the eight connections open and 15 with them closed: its
+# listeners, stdio, and the runtimes' epoll instances and eventfds. A limit of 20 leaves room
+# for `internal`'s /proc reads and a readiness probe's connection until the generator's redials
+# at 90 s take it. The revert at 120 s ends inside the pause's recovery, so `ledger.wire` judges
+# the lines the generator wrote into the accept queue and the reads after the revert in one
+# run of drain intervals.
 [[step]]
 at = "70s"
 action = "prlimit"
 on = "logit"
 nofile = 20
-for = "80s"
+for = "50s"
+
+# The drain straddling the revert carries the accept errors counted before it, so the window
+# that must see none starts a drain interval and more past the revert.
+[[step]]
+at = "128s"
+action = "mark"
+on = "logit"
+for = "40s"
 
 [[expect]]
 name = "limit-landed"
@@ -87,8 +97,8 @@ service = "logit"
 metric = "logit.input.accept.errors"
 component = "statsd"
 attrs = { reason = "resource" }
-step = "c0s2"
-window = "after"
+step = "c0s3"
+window = "during"
 reduce = "delta"
 max = 0
 

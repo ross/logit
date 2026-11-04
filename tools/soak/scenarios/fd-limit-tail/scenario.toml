@@ -58,6 +58,14 @@ on = "logit"
 nofile = 24
 for = "4m"
 
+# The drain straddling the revert carries the failures counted before it, so the window that
+# must see none starts a drain interval and more past the revert.
+[[step]]
+at = "4m8s"
+action = "mark"
+on = "logit"
+for = "60s"
+
 [[expect]]
 name = "limit-landed"
 service = "logit"
@@ -85,8 +93,8 @@ service = "logit"
 metric = "logit.input.scan.errors"
 component = "tail"
 attrs = { op = "read_dir" }
-step = "c0s1"
-window = "after"
+step = "c0s2"
+window = "during"
 reduce = "delta"
 max = 0
 
@@ -115,8 +123,8 @@ name = "checkpoints-recover"
 service = "logit"
 metric = "logit.input.checkpoint.errors"
 component = "tail"
-step = "c0s1"
-window = "after"
+step = "c0s2"
+window = "during"
 reduce = "delta"
 max = 0
 

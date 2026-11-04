@@ -13334,12 +13334,20 @@ def _prlimit_rules(root):
                and landed.get("metric") == "logit.process.fds.limit",
                f"{name} limits the SUT once and expects logit.process.fds.limit to read the "
                f"limit inside the window, got {limits} {landed}")
-        failed = [exp for exp in rows.values() if exp.get("metric") == metric
-                  and limits and exp.get("step") == limits[0].id]
-        expect({(exp.get("window"), exp.get("min"), exp.get("max")) for exp in failed}
-               == {("during", 1, None), ("after", None, 0)},
-               f"{name} expects {metric} above 0 inside the window and 0 after it, got "
-               f"{failed}")
+        steps = {one.id: one for one in scenario.expand(shipped)}
+        failed = [exp for exp in rows.values() if exp.get("metric") == metric]
+        inside = [exp for exp in failed if limits and exp.get("step") == limits[0].id
+                  and exp.get("window") == "during" and exp.get("min") == 1]
+        # The drain straddling the revert carries what was counted before it, so the window
+        # that must read none is a mark starting a drain interval past the revert.
+        recovered = [exp for exp in failed if exp.get("max") == 0
+                     and exp.get("window") == "during"
+                     and steps.get(exp.get("step")) is not None
+                     and steps[exp["step"]].action == "mark" and limits
+                     and steps[exp["step"]].start >= limits[0].end + 5]
+        expect(len(inside) == 1 and len(recovered) == 1 and len(failed) == 2,
+               f"{name} expects {metric} above 0 inside the window and 0 from a drain "
+               f"interval past it, got {failed}")
 
 
 def _reset_rules(root):
