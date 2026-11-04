@@ -2427,8 +2427,8 @@ spool holds the hop's frames through the stop.
 
 ### 8e. Rolling overlap (W12b)
 
-A scenario can run two or more instances of one SUT on one UDP port, as a rolling upgrade
-overlaps them ([ADR `listener-port-sharing-and-shutdown-delay`](../adr/listener-port-sharing-and-shutdown-delay.md),
+A scenario can run two or more instances of one SUT on one UDP port, or from W37 one TCP port
+("A TCP rolling overlap (W37)" below), as a rolling upgrade overlaps them ([ADR `listener-port-sharing-and-shutdown-delay`](../adr/listener-port-sharing-and-shutdown-delay.md),
 "What an overlap means for the data"):
 
 ```toml
@@ -2454,7 +2454,7 @@ each sink's last queue plus one by its own input's batch.
 
 **The schema.** `[overlap]` has the three keys and no other; `instances` lists two or more
 distinct services, `logit` first, none the holder; `label` is a Prometheus label name. With the
-config: no `[[ledger.hop]]`; every source on a `udp` wire; a `[configs]` key other than `sut` and
+config: no `[[ledger.hop]]`; every source on a `udp` wire, or from W37 a `tcp` one; a `[configs]` key other than `sut` and
 the generators only for an instance, which then runs its own config, else `sut`'s; and in each
 instance's config `reuse_port: true` on every source's listener, a `shutdown.delay` above 0 that
 with a 10 s drain (the listeners' 5 s `shutdown_grace` and `internal`'s 5 s second stage) is
@@ -2547,6 +2547,92 @@ keeps a valid token loses nothing, so it has no `*.dropped` counter, and none is
 counted in `logit.component.diagnostics{key="token_refresh_failed"}`
 ([ADR `kafka-sasl`](../adr/kafka-sasl.md)'s fallback amendment), which an `[[expect]]` reads like
 any other counter.
+
+### 8g. A TCP rolling overlap (W37)
+
+Item 34's first part runs §8e's overlap over `transport: tcp`. TCP moves the loss to two places
+UDP doesn't have. An established connection stays on the instance that accepted it until that
+instance closes it, so a close loses what the instance's kernel acknowledged and the process
+never read; and a listener that closes with handshakes in flight or connections in its accept
+queue resets them, unless `net.ipv4.tcp_migrate_req` is 1, when the kernel moves them to
+another listener of the port. The sysctl is per network namespace and defaults to 0 whatever
+the host's, so it goes on the holder through compose `sysctls:`. Docker 29.9.2 sets it there with
+no extra capability.
+
+**The schema.** Under `[overlap]` a source's wire is `udp` or `tcp`. With a `tcp` source the
+compose override sets `net.ipv4.tcp_migrate_req` on the holder to 0 or 1, which the resolved
+`[overlap]` carries as `migrate_req`; with `udp` sources alone it sets none.
+
+**The client.** A `slowclient` step gains `mode = "churn"`: every `interval` it dials
+`connections` new connections without waiting on any, sends each only a FIN once its handshake
+completes, and reads it to the listener's close. It counts each dial's end: `closed`, `resets`
+(a reset or a refusal), `timeouts` (no answer in 2 s), or `dial_errors`. It takes no `send`. On
+an overlap instance, whose container has no network of its own, the client joins the holder's
+first network, and a `churn` reads the holder's `/proc/sys/net/ipv4/tcp_migrate_req` into its
+record. A close must find handshakes in flight for the control to show a reset, so each close
+runs inside a netem delay on the holder, which holds every SYN-ACK about that long: a probe in a
+throwaway namespace, two `SO_REUSEPORT` listeners and a client at 400 dials a second under a
+100 ms delay on loopback, read 36 to 41 resets at a close with the sysctl at 0 and none at 1.
+
+**The rows.**
+
+- `ledger.overlap` on a TCP wire: the run's G − Σ(W + K + F) is at most two of each generator
+  sink's batches per stop or restart of an instance, a write the closing instance acknowledged
+  and never read and one written before the sink saw the close; below 0, the end allowance plus
+  one generator batch per ambiguous attempt the sinks counted, a write the instance may have read
+  before the sink resent it. A kill, an `exit`, a `reset`, or a partition that moved an address,
+  the windows `ledger.wire` reports on TCP, makes the row report and SKIP; a netem or a pause is
+  judged, since TCP retransmits.
+- `overlap.migrate`, one row over the run's `churn` steps: a namespace value other than the
+  declared one FAILs. At 1 a churn's resets FAIL. At 0 a churn with an instance's stop, restart,
+  kill, or `exit` starting in its window PASSes on a reset and WARNs on none, and a reset with no
+  close FAILs.
+
+**The scenarios.** `rolling-overlap-tcp` (13.5 minutes, the sysctl at 1) and its control
+`rolling-overlap-tcp-nomigrate` (8.5 minutes, at 0) run `rolling-overlap`'s pipeline with
+`statsd_in` over TCP and a generator of eight `statsd_out` TCP sinks, 250 lines a second each
+in batches of 25. Each close of an instance (stop `logit`, stop `logit-b`, and in the first also
+restart `logit` and stop `logit-b` again) sits inside a 100 ms netem delay on the holder and a
+`churn` on the other instance at 20 dials every 100 ms. Their expectations assert that each
+instance reads while the other is down.
+
+### 8h. A CA rotation (W37)
+
+Item 34's second part carries `tls-reload` through a rotation of the CA. `certs.sh` makes CA N
+in `ca-N/` (CA 1 stays at the top), each with a probe client certificate, and keeps a trust
+bundle as generations under `trust/`, `trust/live` a relative link to the one in force, at
+first CA 1 alone. A `trust` step, `cas = [1, 2]`, makes each listed CA not made yet, writes
+their bundle as the next generation, and repoints the link; it opens no window. A `rotate` step
+takes `ca = N` and issues from that CA. A `probe` presents the probe certificate of the newest
+CA in the bundle in force, verifies against that bundle, and records the issuer's CN, which
+`tls.served` checks beside the serial and `notAfter`.
+
+The loader holds a `trust` to a `[tls]` table, a service whose config reads `trust/live/`, and,
+on a service that doesn't poll, a SIGHUP inside it or a restart before the next `trust`; its
+`cas` to ascending CAs from 1, new ones in turn; its bundle to every certificate's CA in force;
+and a `rotate`'s `ca` to the bundle in force. A second cycle would repeat the CA generations,
+so it runs once.
+
+`tls-ca-rotation` (15.5 minutes) trusts {1, 2}, rotates the SUT's server certificate to CA 2
+and probes it, restarts the SUT, rotates the generator's client certificate to CA 2, restarts
+the SUT again so the generator handshakes with it, trusts {2} alone, rotates the server
+certificate once more and probes it, and restarts the SUT. The SUT reloads on SIGHUP with the
+poll off; the generator polls every 10 s. Its expectations count one reload through each
+SIGHUP and each poll, no failed reload, lines after each restart, and no `connection_error`.
+
+### 8i. Joining spans across the hop (W37)
+
+Item 34's third part adds `spans.join` under `[[ledger.hop]]`. The NDJSON reader keeps each
+span line as a span with its component, trace id, span id, parent, and process life. Each span
+the far SUT's hop listener recorded with a parent joins, on trace id and span id, a span the
+ingress SUT exported: `logit_out` carries a batch's context only for a trace its own process
+sampled, so every such parent is a sender span. A parent the sender recorded after its last
+drain is never exported (`docs/known-gaps/telemetry.md`'s internal-spans entry, item 7). For each
+killed sender life the row allows unmatched spans from that life's last drain, less 1 s, to the
+first drain of the next life whose hop sink's `buffer.batches` reads 0, when the spool's replay
+of the killed life's frames is done, up to the most joined parents in one of the killed life's
+drain intervals plus one. Anywhere else it allows the sender's `logit.internal.spans.dropped`. A
+graceful stop gets nothing, since `internal` drains last.
 
 ### 9. Not in this stack
 
@@ -3588,9 +3674,11 @@ that items 3, 7, and 11 need.
   each, the `standin-datadog-trace` scenario, `datadog_trace_out`'s table among those the
   `standin-*` scenarios restate, an amendment to ADR `soak-harness`, and the run recorded under
   "Findings".
-- **W37**: item 34, with its action or wire, self-test fixtures for each rule, an amendment to
-  ADR `soak-harness` where it adds a ledger rule or an action, and each scenario's run recorded
-  under "Findings". Item 30 has no workstream.
+- **W37**: item 34: the `tcp` wire under `[overlap]`, the `churn` slowclient, `ledger.overlap`'s
+  TCP bound and `overlap.migrate`, the `rolling-overlap-tcp` scenario and its control; the
+  `trust` action, a `rotate`'s `ca`, the probe's issuer, and `tls-ca-rotation`; `spans.join`;
+  self-test fixtures for each rule, amendments to ADR `soak-harness`, and each scenario's run
+  recorded under "Findings". Item 30 has no workstream.
 
 Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9a → W9b → W10a → W10b → W11a → W11b → W12a → W12b → W12c → W12d → W14 → W13b → W15, linear; W13a, W16, and W17 land off `main` beside W14, and W18, W19, and W20 off `main` after it. W21 → W22 → W23 → W24 → W25 → W26 → W27 → W28 → W29 land after them, a linear stack off `main`. W30 lands off `main`, then W31 → W32 → W33 and W34 → W35 → W36 → W37, two stacks off W32, the second needing none of W33. Each PR is based on and targets its
 parent's branch and is brought up to date with `git merge origin/main`, never a rebase.
@@ -6931,6 +7019,57 @@ What the runs showed about `logit` and the harness:
   the stopped stand-in, which never reach the record, as in W9a.
 - **Self-test**: 2,375 expectations after the merges. Each new rule was reverted in turn and
   failed at least one expectation; the PR lists them.
+
+### W37: a TCP rolling overlap, a CA rotation, and a span join (2026-11-04)
+
+W37 adds the `tcp` wire under `[overlap]`, the `churn` slowclient, `overlap.migrate`, the
+`trust` action and a `rotate`'s `ca`, and `spans.join`. Each scenario ran at its default
+duration on the development host (Docker 29.9.2, Linux 7.2.13), one at a time, against
+`logit:soak-w37` built from `soak/w37` (W37 changes no Rust).
+
+| Run | Scenario | Verdict | Highlights |
+|---|---|---|---|
+| `20261104T194422Z` | `native-hop-spans` | PASS | `spans.join` joined 962 of 968 `collector` hop spans with a parent; the 6 unmatched all fell in the windows after `logit`'s two kills, 1 against a bound of 11 and 5 against 12; 835 roots; no span counted dropped |
+| `20261104T201237Z` | `tls-ca-rotation` | PASS | both probes served the leaf in force, issuer `logit soak CA 2`, verified against the bundle; the SUT reloaded 4 times, the generator 3, none failed; no `connection_error`; G − W 0 |
+| `20261104T204050Z` | `rolling-overlap-tcp-nomigrate` | WARN | `tcp_migrate_req` 0: the churn clients read 7 and 7 resets across the two closes, of 23,920 dials; `ledger.overlap` 300 within its 800 |
+| `20261104T205135Z` | `rolling-overlap-tcp` | WARN | `tcp_migrate_req` 1: 0 resets across all four closes, of 44,817 dials; `ledger.overlap` 725 within its 1,600 |
+
+What the runs showed about `logit` and the harness:
+
+- **`tcp_migrate_req` removes the resets a closing instance's listener makes.** With the
+  holder's sysctl at 0, each stop of an instance under a 100 ms holder delay reset 7 of the
+  handshakes the churn client had in flight; an earlier control run read 9 and 14. With it at 1,
+  four closes, two of them restarts' stops, reset none. Docker 29.9.2 set the per-namespace
+  sysctl through compose `sysctls:` with no added capability, and each churn read the value back
+  from the holder. No product defect: the reset is the kernel's, and the setting is the
+  operator's ([docs/deploying.md](../deploying.md#tcp-listeners-and-tcp_migrate_req)). The
+  exposed set grows with the clients' round trip: `logit` accepts until the close, so its accept
+  queue is near empty, but a handshake whose final ACK is still in flight at the close is reset
+  too, about the dial rate times the round trip on the closing listener's share.
+- **A TCP close loses less than two batches per generator connection.** Each run's G −
+  Σ(W + K + F) was 300 and 725 over two and four closes, under the allowance of two 25-line
+  batches per sink per close (400). `ledger.wire` reported the closes' windows, 273 and 658, and
+  judged the rest.
+- **A connection stays where it was accepted.** After an instance restarted, the other held
+  every generator connection until its own close, so `logit-b`'s final life read nothing and
+  `ledger.egress` WARNed its series' resets, the overlap's known WARN; on UDP it's rare, on TCP
+  it follows from the schedule. The first control run's `[[expect]]` rows FAILed for the same
+  reason: a per-drain `min_delta` saw the other instance's first drain of a stop empty, before
+  the closing instance's 5 s `shutdown.delay` and the redial. A measurement fix: the rows read
+  the window's total, and the control was rerun fresh.
+- **A CA rotation through a bundle loses nothing.** With both CAs trusted, then leaves from the
+  new one, then the old CA dropped, each end reloaded on its SIGHUP or poll and kept every
+  connection; a SUT restart after each change made the generator handshake again under it, and
+  lines kept flowing. The first run attempt stopped at compose up: the netem image was an older
+  build without the trust bundle, so the run was repeated with the images rebuilt.
+- **The dangling-parent gap shows only at a kill.** Every unmatched `collector` span followed
+  one of `logit`'s two SIGKILLs, inside the replay of that life's spool; a graceful stop left
+  none, as `internal` draining last predicts.
+- **Self-test**: 3,348 expectations. Reverting each new rule fails its case: the span join's
+  window, bound, trace key, and counted-drop allowance; the probe's issuer; the trust bundle's
+  kept CA and CAs made in turn; the TCP overlap's sysctl rule, its close bound, and its resend
+  allowance; `overlap.migrate`'s reset at 1 and its reset with no close at 0; the churn
+  client's reset count; and the client joining an instance's holder network.
 
 ### W36: the `datadog_trace` pair against an Agent stand-in, in spans (2026-11-04)
 

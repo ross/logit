@@ -43,7 +43,11 @@ Entry format and the other areas: [the known-gaps index](README.md).
      span, and any span recorded before a crash, is never exported. `logit_out` still carries the
      batch's context when its process sampled the trace, so the receiver's `logit_in` span is
      exported with a parent no backend receives
-     ([ADR `native-hop-trace-context`](../adr/native-hop-trace-context.md)).
+     ([ADR `native-hop-trace-context`](../adr/native-hop-trace-context.md)). The soak harness's
+     `spans.join` row measures it across `native-hop-spans`: a 17-minute run joined 962 of 968
+     `collector` hop spans to a parent `logit` exported, and the 6 it couldn't all followed one of
+     `logit`'s two kills, none a graceful stop's
+     ([tools/soak/README.md](../../tools/soak/README.md)).
 
 - **`host_metrics` isn't built.** Facts about the machine (CPU, disks, NICs) are a different kind
   of source than `internal`: read from the OS rather than `logit`'s own counters, with their own

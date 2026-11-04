@@ -939,6 +939,61 @@ fails on a read-back that differs; the revert writes what it found back.
 - **On a SUT only, and never in a `[random]` schedule**, which can't set `cpu` or
   `memory_high`.
 
+## Amendment: a rolling overlap over TCP, read against `tcp_migrate_req` (2026-11-04)
+
+A rolling overlap ran over UDP only, since a datagram's loss at a close is the socket queue
+`ledger.overlap` bounds. Over TCP the loss moves: an established connection stays on the
+instance that accepted it until that instance closes it, and a listener that closes resets its
+handshakes in flight and its accept queue unless the kernel's `net.ipv4.tcp_migrate_req` is 1,
+which moves them to another listener of the port.
+
+- **The sysctl is declared, and read back.** It's per network namespace with a default of 0
+  whatever the host's, so a TCP overlap's compose override sets it on the holder in `sysctls:`,
+  0 or 1, and the loader refuses one that doesn't, or a UDP overlap that does. A `churn` client
+  reads the value in force from the holder at its apply, and `overlap.migrate` FAILs one that
+  differs from the declared one, so a run can't claim a setting the kernel didn't have.
+- **A churn client makes the handshakes a close resets.** The generator's connections are
+  established long before a close, so they never show the sysctl. A `churn` slowclient dials the
+  port many times a second and sends only a FIN, and a netem delay on the holder holds each
+  SYN-ACK in flight, so every close finds handshakes on its listener. With the sysctl at 1 any
+  reset FAILs; at 0 a close's reset PASSes, a close with none WARNs, and a reset with no close
+  FAILs. A control scenario at 0 shows what the setting removes.
+- **A close loses at most two batches per generator connection.** `ledger.overlap` on a TCP
+  wire allows, per stop or restart, two of each generator sink's batches: a write the closing
+  instance's kernel acknowledged and the process never read, and one written before the sink
+  saw the close. Below 0 it allows a batch per ambiguous attempt beyond the end allowance. A
+  kill, an `exit`, a `reset`, or a moved partition, which `ledger.wire` reports on TCP, isn't
+  judged.
+
+## Amendment: a CA rotation through a trust bundle (2026-11-04)
+
+`tls-reload` rotated leaves under one CA. Rotating the CA itself takes a bundle both ends trust
+through the change: a `trust` step makes the CAs it names that don't exist and writes their
+bundle as a generation under `trust/`, `trust/live` repointed in one rename as a certificate's
+is; a `rotate` takes the CA to issue from; and a probe presents a client certificate from the
+newest CA in force and records the issuer, which `tls.served` checks.
+
+- **The loader keeps every certificate trusted.** CAs are made in turn, a bundle keeps the CA of
+  every certificate's generation in force, a `rotate` issues only from a CA the bundle in force
+  holds, and a service that doesn't poll gets a SIGHUP inside the `trust` or a restart before
+  the next. A rotation that would leave a peer untrusted is a scenario error, not a run that
+  fails for a reason the schedule wrote in.
+- **Once per run.** A second cycle would repeat the CA generations, as a second cycle's rotations
+  would repeat a certificate's days.
+
+## Amendment: each far hop span joins a sender span (2026-11-04)
+
+`native-hop-spans` showed both SUTs emitted spans, and nothing checked that a span crossing the
+hop kept its parent. The NDJSON reader keeps span lines, and `spans.join` joins each span the far
+hop listener recorded with a parent, on trace id and span id, to a span the sender exported.
+
+- **The known dangling parent is bounded, not excused.** A parent recorded after the sender's
+  last drain is never exported (`docs/known-gaps/telemetry.md`'s internal-spans entry). A kill is
+  where that happens, so unmatched spans are allowed only in a killed sender life's window, from
+  its last drain to the end of its spool's replay, up to the most joined parents in one of that
+  life's drain intervals plus one. Anywhere else the allowance is the sender's counted span
+  drops; a graceful stop gets none, since `internal` drains last.
+
 ## Amendment: a `slowclient` step holds a listener's connection slots (2026-11-04)
 
 No fault reached what a listener does with a client that connects and then delivers nothing:
