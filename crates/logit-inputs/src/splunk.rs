@@ -58,6 +58,9 @@
 //! ids, and per channel an issue window of `max_pending_acks` ids, the oldest expiring as a new one
 //! is issued. A client that names a channel and never polls (`splunk_hec_out` with `ack: false`)
 //! costs one bit per request up to that window. Neither the channel nor the id enters an event.
+//! The ledger is in memory only: a restart forgets every issued id, a poll for one is `false`, and
+//! a client waiting on it resends a body already delivered (a duplicate, never a loss; ADR
+//! `splunk-hec-relay`, "Amendment (2026-11-03)").
 //!
 //! **Health.** `/health` answers `503` `{"text":"HEC is unhealthy, queues are full","code":18}`
 //! while the pipeline is refusing posts: the most recent `/event` or `/raw` request to reach
