@@ -868,6 +868,29 @@ kernel sends each peer a reset: the side the step is `on` reads `ECONNABORTED`, 
 - **A namespace fault.** Under `[overlap]` or beside an `idp` it goes on the holder, as `netem`
   and `partition` do, since a member shares the holder's namespace.
 
+## Amendment: a `prlimit` step sets the SUT's open-files limit for its window (2026-11-03)
+
+No fault reached what a process does when it runs out of file descriptors: a listener's accept
+backoff, a tailer's failed opens, a spool's or a checkpoint's failed create. A `prlimit` step
+runs util-linux's `prlimit` from a one-shot of the netem image joined to the SUT's PID
+namespace (`--pid container:<id>`, CAP_SYS_RESOURCE) against PID 1, which is `logit`, since the
+compose file runs it with no init. It reads the soft and hard `RLIMIT_NOFILE`, sets both to the
+step's `nofile`, and its revert sets what it read back. `docker update` can't change a running
+container's ulimits, and the step needs no `label=disable`.
+
+- **Set above what's open.** Lowering the limit closes nothing, so a scenario sets it a few
+  descriptors above the SUT's steady `logit.process.fds` and lets the fault's own opens fill
+  it: a generator's redials, or a tailer's opens at its writer's rotations. An `[[expect]]` row
+  on `logit.process.fds.limit` confirms the limit landed.
+- **A new process ends the fault.** A process started inside the window has the container's own
+  limit, so the revert then sets nothing and records `started_in_window`, which `timeline`
+  reports.
+- **Judged, never reported.** A limited listener leaves a connection in the accept queue, a
+  tailer finds an unopened file at its next scan, and a sink retries a failed dial, so no wire
+  reports the window. A file wire's retention guard bounds it as a pause: the tailer keeps what
+  it has open and can open nothing its writer creates.
+- **On a SUT only, and never in a `[random]` schedule**, which can't set `nofile`.
+
 ## Amendment: a backend kill is allowed on a tailed sink, and `ledger.tail` measures it (2026-11-03)
 
 A `kill` was for the SUT only. A stream sink can't count what it wrote that its receiver dies

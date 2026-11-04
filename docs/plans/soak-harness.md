@@ -226,7 +226,10 @@ settle window would leave a life no fit. `fanin` and `tcp-ingress` set `60s`, an
   follow-ups add `reset`, on any service: a one-shot netem container in its namespace closes
   its established TCP connections with `ss -K`, or those on the step's optional `port`, 1 to
   65535, and fails the step when it closed none. Under `[overlap]` or beside an `idp` it goes
-  on the holder, as `netem` and `partition` do.
+  on the holder, as `netem` and `partition` do. W31 adds `prlimit`, on a SUT only, never in a
+  `[random]` schedule: a one-shot netem container in its PID namespace sets PID 1's open-files
+  limit, soft and hard, to the step's required `nofile`, a whole number from 8 to 1048576, and
+  its revert sets back the limit it found, unless the process started again inside the window.
 - `[ledger] vm_every_window`, optional, is `true` or `false`; `[ledger] sut_script`, optional,
   is a component id.
 - `[[ledger.source]]` (W8b) has the rules under "Sources" below.
@@ -3479,7 +3482,10 @@ that items 3, 7, and 11 need.
   from the relay's other lives, with a self-test case; and the round-3 follow-up Findings
   rewrapped. The stall-kill bound is left to the change that counts a stream sink's abandoned
   buffer bytes.
-- **W31** to **W37**: items 27, 28, 29, 31, 32, 33, and 34 in turn, each with its action or
+- **W31**: item 27: the `prlimit` action, its rules and the file wire's retention guard for
+  it, self-test fixtures for each, the `fd-limit-tcp` and `fd-limit-tail` scenarios, an
+  amendment to ADR `soak-harness`, and both runs recorded under "Findings".
+- **W32** to **W37**: items 28, 29, 31, 32, 33, and 34 in turn, each with its action or
   wire, self-test fixtures for each rule, an amendment to ADR `soak-harness` where it adds a
   ledger rule or an action, and each scenario's run recorded under "Findings". Item 30 has no
   workstream.
