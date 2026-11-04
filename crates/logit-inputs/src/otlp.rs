@@ -83,8 +83,10 @@
 //! from `handshake_timeout:` by [`OtlpInput::with_handshake_timeout`]) bounds each pre-request
 //! phase, as `crate::tcp`'s driver does (`crates/logit-inputs/src/tcp.rs`'s "Pre-handshake
 //! timeout" section): the PROXY header under `proxy_protocol:`, then the TLS accept on a TLS
-//! listener or the wait for the first byte on a plaintext one. Without it, a client that completes the TCP connect and never speaks pins a
-//! permit forever.
+//! listener or the wait for the first byte on a plaintext one. Without it, a client that completes
+//! the TCP connect and never speaks pins a permit forever. Expiry of the TLS accept or the
+//! first-byte wait closes the connection, counted
+//! `logit.input.connections.closed{reason="handshake_timeout"}` and not diagnosed, as `crate::tcp` does.
 //!
 //! **The plaintext first-byte bound is a `peek`, not a read.** `tokio::net::TcpStream::peek` is
 //! `recv(..., MSG_PEEK)`: it waits for the first byte and leaves it queued, so the stream handed
@@ -97,8 +99,8 @@
 //! check: `demo/haproxy/haproxy.cfg`'s `server logit logit:4318 check` against `demo/logit.yaml`'s
 //! plaintext `browser_in`, a Kubernetes `tcpSocket` probe, `nc -z`. A `peek` of `Ok(0)` or of a
 //! reset (`ECONNRESET`) returns `Ok(())`; only the deadline (a connection held open saying
-//! nothing) and any other read error reach `connection_error`, which a probe would otherwise hit
-//! once per interval, forever. `crate::tcp` makes the same call for an EOF or a reset before its
+//! nothing) is counted `handshake_timeout`, and any other read error reaches `connection_error`,
+//! which a probe would otherwise hit once per interval, forever. `crate::tcp` makes the same call for an EOF or a reset before its
 //! first payload byte (`crates/logit-inputs/src/tcp.rs`'s "Reset before the first byte" section).
 //!
 //! **Sender address.** Under `peer:` and `proxy_protocol:` ([`OtlpInput::with_peer`],
@@ -587,52 +589,35 @@ impl Input for OtlpInput {
                     // connection.
                     match tls_acceptor {
                         // Bounded, or a client that sends no ClientHello pins this permit
-                        // forever. Failure and timeout both reach `connection_error` below, and
-                        // the permit comes back when this task ends. No first-byte peek:
+                        // forever. A failure reaches `connection_error` below and a timeout is
+                        // counted `handshake_timeout`; the permit comes back when this task ends. No first-byte peek:
                         // `acceptor.accept` already waits on the first bytes under the same
                         // budget.
                         Some(acceptor) => {
-                            match tokio::time::timeout(handshake_timeout, acceptor.accept(stream))
-                                .await
-                            {
-                                Ok(Ok(tls_stream)) => {
-                                    Prelude::Tls(Box::new(tls_stream), connection_peer)
-                                }
-                                Ok(Err(err)) => {
-                                    Prelude::Failed(format!("TLS handshake failed: {err}"))
-                                }
-                                Err(_elapsed) => Prelude::Failed(format!(
-                                    "TLS handshake did not complete within {handshake_timeout:?}"
-                                )),
-                            }
+                            crate::listener::accept_tls(
+                                acceptor,
+                                stream,
+                                handshake_timeout,
+                                connection_peer,
+                            )
+                            .await
                         }
                         // The plaintext arm's budget: a `peek` that consumes nothing (this
-                        // module's "peek, not a read"). A read error and the deadline reach
-                        // `connection_error` like the TLS arm's; a clean close or a reset before
+                        // module's "peek, not a read"). A read error reaches
+                        // `connection_error` like the TLS arm's, and the deadline is counted
+                        // `handshake_timeout`; a clean close or a reset before
                         // the first byte is a TCP health check (this module's "not a fault"), as
                         // in `crate::tcp`.
                         None => {
                             // Bound to a local, not matched directly: the scrutinee's
                             // temporaries (`peek`'s borrow of `stream`) would outlive the arms,
                             // and the success arm moves `stream` into `hyper`.
-                            let first_byte =
-                                tokio::time::timeout(handshake_timeout, stream.peek(&mut [0u8; 1]))
-                                    .await;
-                            match first_byte {
-                                Ok(Ok(0)) => Prelude::Probe,
-                                Ok(Err(err))
-                                    if err.kind() == std::io::ErrorKind::ConnectionReset =>
-                                {
-                                    Prelude::Probe
-                                }
-                                Ok(Ok(_)) => Prelude::Plain(stream, connection_peer),
-                                Ok(Err(err)) => Prelude::Failed(format!(
-                                    "waiting for a first byte failed: {err}"
-                                )),
-                                Err(_elapsed) => Prelude::Failed(format!(
-                                    "no first byte received within {handshake_timeout:?}"
-                                )),
-                            }
+                            crate::listener::peek_first_byte(
+                                stream,
+                                handshake_timeout,
+                                connection_peer,
+                            )
+                            .await
                         }
                     }
                 };
@@ -671,6 +656,10 @@ impl Input for OtlpInput {
                         .await
                     }
                     Prelude::Probe => Ok(()),
+                    Prelude::HandshakeTimeout => {
+                        crate::listener::count_handshake_timeout(&telemetry);
+                        Ok(())
+                    }
                     Prelude::Failed(err) => Err(err),
                     Prelude::ProxyRejected(err) => {
                         drop(live);
@@ -2442,6 +2431,9 @@ mod tests {
         // One listener for both halves, so the second proves this listener still serves TLS. Its
         // 500ms handshake timeout also bounds the second half's real rustls handshake, which a
         // debug build under load stretches well past 50ms; the close wait's 5s ceiling is 10x it.
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let diag = Diagnostics::new("otlp_in");
+        let listener_diag = diag.clone();
         let mut input = OtlpInput::new("127.0.0.1:0", OtlpTransport::Http)
             .with_tls(
                 &test_tls_settings(None),
@@ -2449,6 +2441,8 @@ mod tests {
                 &logit_pipeline::tls::TlsReloader::new(),
             )
             .unwrap()
+            .with_telemetry(probe.telemetry("otlp_in", "otlp_in", "listener"))
+            .with_diagnostics(diag)
             .with_handshake_timeout(Duration::from_millis(500));
         input.bind().await.expect("binding an ephemeral port should succeed");
         let addr = input.local_addr().expect("bind() leaves a real address behind").to_string();
@@ -2459,6 +2453,11 @@ mod tests {
         // could have closed it.
         let mut silent = tokio::net::TcpStream::connect(&addr).await.unwrap();
         logit_pipeline::test_util::expect_closed(&mut silent, "a silent TLS connection").await;
+        logit_pipeline::test_util::wait_until("the handshake_timeout close count", || {
+            probe.sum("logit.input.connections.closed", &[("reason", "handshake_timeout")]) == 1.0
+        })
+        .await;
+        assert_eq!(listener_diag.occurrences("connection_error"), 0, "counted, not diagnosed");
 
         // The listener still serves real TLS traffic afterwards.
         let mut encoder = logit_proto::otlp::OtlpEncoder::new();
@@ -2548,8 +2547,14 @@ mod tests {
     #[tokio::test]
     async fn a_silent_plaintext_connection_is_closed_after_the_handshake_timeout() {
         let (addr, input) = bound_input(OtlpTransport::Http).await;
-        let mut input =
-            input.with_max_connections(1).with_handshake_timeout(Duration::from_millis(50));
+        let mut probe = logit_pipeline::test_util::TelemetryProbe::new();
+        let diag = Diagnostics::new("otlp_in");
+        let listener_diag = diag.clone();
+        let mut input = input
+            .with_telemetry(probe.telemetry("otlp_in", "otlp_in", "listener"))
+            .with_diagnostics(diag)
+            .with_max_connections(1)
+            .with_handshake_timeout(Duration::from_millis(50));
         let (sink, mut rx) = fanout_into_channel();
         tokio::spawn(async move { input.run(sink).await });
 
@@ -2561,6 +2566,11 @@ mod tests {
             "a plaintext connection that sent no bytes",
         )
         .await;
+        logit_pipeline::test_util::wait_until("the handshake_timeout close count", || {
+            probe.sum("logit.input.connections.closed", &[("reason", "handshake_timeout")]) == 1.0
+        })
+        .await;
+        assert_eq!(listener_diag.occurrences("connection_error"), 0, "counted, not diagnosed");
 
         let mut encoder = logit_proto::otlp::OtlpEncoder::new();
         let payloads =

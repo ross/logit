@@ -528,41 +528,21 @@ impl Input for SplunkHecInput {
 
                     match tls_acceptor {
                         Some(acceptor) => {
-                            match tokio::time::timeout(handshake_timeout, acceptor.accept(stream))
-                                .await
-                            {
-                                Ok(Ok(tls_stream)) => {
-                                    Prelude::Tls(Box::new(tls_stream), connection_peer)
-                                }
-                                Ok(Err(err)) => {
-                                    Prelude::Failed(format!("TLS handshake failed: {err}"))
-                                }
-                                Err(_elapsed) => Prelude::Failed(format!(
-                                    "TLS handshake did not complete within {handshake_timeout:?}"
-                                )),
-                            }
+                            crate::listener::accept_tls(
+                                acceptor,
+                                stream,
+                                handshake_timeout,
+                                connection_peer,
+                            )
+                            .await
                         }
                         None => {
-                            let first_byte =
-                                tokio::time::timeout(handshake_timeout, stream.peek(&mut [0u8; 1]))
-                                    .await;
-                            match first_byte {
-                                // A clean close or a reset before the first byte is a
-                                // health-check probe, not a fault (`crate::otlp`'s "not a fault").
-                                Ok(Ok(0)) => Prelude::Probe,
-                                Ok(Err(err))
-                                    if err.kind() == std::io::ErrorKind::ConnectionReset =>
-                                {
-                                    Prelude::Probe
-                                }
-                                Ok(Ok(_)) => Prelude::Plain(stream, connection_peer),
-                                Ok(Err(err)) => Prelude::Failed(format!(
-                                    "waiting for a first byte failed: {err}"
-                                )),
-                                Err(_elapsed) => Prelude::Failed(format!(
-                                    "no first byte received within {handshake_timeout:?}"
-                                )),
-                            }
+                            crate::listener::peek_first_byte(
+                                stream,
+                                handshake_timeout,
+                                connection_peer,
+                            )
+                            .await
                         }
                     }
                 };
@@ -606,6 +586,10 @@ impl Input for SplunkHecInput {
                         .await
                     }
                     Prelude::Probe => Ok(()),
+                    Prelude::HandshakeTimeout => {
+                        crate::listener::count_handshake_timeout(&telemetry);
+                        Ok(())
+                    }
                     Prelude::Failed(err) => Err(err),
                     Prelude::ProxyRejected(err) => {
                         drop(live);
@@ -2563,6 +2547,30 @@ mod tests {
             .await;
     }
 
+    /// A client that sends no ClientHello is closed at the handshake timeout and counted
+    /// `handshake_timeout`.
+    #[tokio::test]
+    async fn a_silent_tls_connection_is_counted_a_handshake_timeout() {
+        let settings = TlsServerSettings {
+            cert_file: "server.pem".to_string(),
+            key_file: "server.key".to_string(),
+            client_ca_file: None,
+        };
+        let input = SplunkHecInput::new("127.0.0.1:0")
+            .with_tls(&settings, &testdata_dir(), &logit_pipeline::tls::TlsReloader::new())
+            .unwrap()
+            .with_handshake_timeout(Duration::from_millis(100));
+        let (addr, _running, _rx, mut probe) = shutdown_listener(input).await;
+
+        let mut silent = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        logit_pipeline::test_util::expect_closed(&mut silent, "a silent TLS connection").await;
+        probe
+            .wait_for("the handshake_timeout close count", |t| {
+                t.sum("logit.input.connections.closed", &[("reason", "handshake_timeout")]) == 1.0
+            })
+            .await;
+    }
+
     /// A connection still in its TLS accept when shutdown fires ends at once rather than at its
     /// `handshake_timeout`. That timeout is an hour, far past `Running::stop`'s 5s ceiling, so the
     /// stop returns in time only if the prelude races the signal; the gauge reading 0 right after
@@ -2594,6 +2602,24 @@ mod tests {
             Some(0.0),
             "the connection's task ended before the listener returned"
         );
+    }
+
+    /// A connection that sends no byte is closed at the handshake timeout and counted
+    /// `handshake_timeout`.
+    #[tokio::test]
+    async fn a_silent_connection_is_counted_a_handshake_timeout() {
+        let (addr, _running, _rx, mut probe) = shutdown_listener(
+            SplunkHecInput::new("127.0.0.1:0").with_handshake_timeout(Duration::from_millis(50)),
+        )
+        .await;
+        let mut silent = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        logit_pipeline::test_util::expect_closed(&mut silent, "a connection that sent no bytes")
+            .await;
+        probe
+            .wait_for("the handshake_timeout close count", |t| {
+                t.sum("logit.input.connections.closed", &[("reason", "handshake_timeout")]) == 1.0
+            })
+            .await;
     }
 
     // ---- units --------------------------------------------------------------------------------

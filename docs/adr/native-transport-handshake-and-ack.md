@@ -161,7 +161,7 @@ trigger of the close sequence" decides theirs.
   declared-and-unimplemented kinds. The credit-window, QUIC, and OTLP-passthrough-codec follow-ups
   this plan explicitly deferred are recorded there instead, alongside `otlp_in`'s shutdown gap this
   ADR names above and `logit_in`'s currently-fixed (not operator-tunable) 5s shutdown grace.
-- **Amendment (2026-09-13):** the pre-`Hello` timeout is operator-tunable now. `LogitIn` carries a
+- **Amendment (2026-09-13):** the pre-`Hello` timeout is operator-tunable now. (A silent peer's timeout is counted, not diagnosed, since 2026-11-04; see [ADR `syslog-tcp-ingress-and-tls`](syslog-tcp-ingress-and-tls.md)'s amendment of that date.) `LogitIn` carries a
   `handshake_timeout: Duration` field (default 5s, still applied *per* pre-`Hello` phase -- the TLS
   accept, then the `Hello` read -- rather than as one shared deadline), set through
   `LogitInput::with_handshake_timeout`, which is `pub` rather than `#[cfg(test)]`. `syslog_in` and
