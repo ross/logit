@@ -9345,7 +9345,8 @@ TWO_SUT_COLLECTOR_CONFIG = ("components:\n"
 
 def _two_sut_run(tmp, name, kill_on="collector", collector_lives=2, extra=0, short=0,
                  hop_dropped=0, drops=(), pause=False, logit_lives=None, replayed=3,
-                 stalled=False, partial=False, collector_restart=False, evicted=()):
+                 stalled=False, partial=False, collector_restart=False, evicted=(),
+                 checkpoint=None, burst=0):
     """A two-SUT run across a native hop: the generator and `logit` move `PER_DRAIN` lines per
     5 s drain into `logit`'s one life, whose hop sink `hop` takes each drain's lines in 10
     frames; `collector`'s `logit_in` `hop_in` forwards them into `window`, which delivers one
@@ -9362,7 +9363,9 @@ def _two_sut_run(tmp, name, kill_on="collector", collector_lives=2, extra=0, sho
     `stalled` its hop sink delivers nothing in its last two drains and leaves 23 queued; under
     `partial` it delivers 2 of its last drain's 10 and leaves 11 queued. `collector_restart`
     stops `collector` over the same span as that kill, a graceful restart. `evicted` lists
-    `(offset, count)` pairs of `logit.input.senders.evicted` at `hop_in`. `collector` counts one
+    `(offset, count)` pairs of `logit.input.senders.evicted` at `hop_in`. `checkpoint` sets the
+    hop sink's spool `checkpoint_interval` in seconds, and `burst` adds that many batches to its
+    `batches.delivered` at +50 s, as a replay delivered early in the life. `collector` counts one
     `events.dropped{reason="stale"}` at `window`. `drops` adds a count of 1 for each `(service,
     metric, component, reason)`, `service` being "logit" or "collector"."""
     if logit_lives is None:
@@ -9392,7 +9395,8 @@ def _two_sut_run(tmp, name, kill_on="collector", collector_lives=2, extra=0, sho
                                     ("logit.component.batches.delivered",
                                      0 if stalled and offset in (195, 200) else
                                      2 if partial and offset == 200 else
-                                     10 + (replayed if restarted and offset == 215 else 0),
+                                     10 + (replayed if restarted and offset == 215 else 0)
+                                     + (burst if offset == 50 else 0),
                                      "hop")):
             ingress.append(_line(early, metric, "sum", value, component=comp))
         ingress.append(_line(early, "logit.component.receive.utilization", "gauge", 0,
@@ -9482,7 +9486,9 @@ def _two_sut_run(tmp, name, kill_on="collector", collector_lives=2, extra=0, sho
                        configs={"sut": "logit-sut.yaml", "collector": "logit-collector.yaml"})
     (run_dir / "configs").mkdir()
     (run_dir / "configs" / "logit-sut.yaml").write_text(
-        KILL_SUT_CONFIG.split("  window:")[0] + TWO_SUT_HOP_CONFIG)
+        KILL_SUT_CONFIG.split("  window:")[0] + (TWO_SUT_HOP_CONFIG if checkpoint is None else
+        TWO_SUT_HOP_CONFIG.replace(" }\n", ", buffer: { disk: { path: /s, checkpoint_interval: "
+                                   f"{checkpoint}s }} }} }}\n")))
     (run_dir / "configs" / "logit-collector.yaml").write_text(TWO_SUT_COLLECTOR_CONFIG)
     (run_dir / "logs" / "collector.stdout").write_text("\n".join(egress) + "\n")
     (run_dir / "logs" / "generator.stdout").write_text("\n".join(gen) + "\n")
@@ -9823,6 +9829,21 @@ def _two_sut_checks():
                and "band [-4, 14]" in partial["ledger.replay"].detail,
                f"a drain interval whose delivery stopped partway doesn't understate the commits "
                f"a replay repeats, got {partial['ledger.replay']}")
+        # A life killed before its first cursor persist replays every batch it committed, a
+        # replay it delivered early included, past one interval at its last commit rate.
+        loop = hop_row("two-logit-loop", kill_on="logit", collector_lives=1, replayed=403 + 1000,
+                       checkpoint=300, burst=1000)
+        expect(loop["ledger.replay"].status == checks.PASS
+               and "all 1,400 batches it committed, since it died 203s after its start, inside "
+               "its 300s checkpoint, with no persist" in loop["ledger.replay"].detail,
+               f"a life killed inside its first checkpoint replays all it committed, got "
+               f"{loop['ledger.replay']}")
+        persisted = hop_row("two-logit-persisted", kill_on="logit", collector_lives=1,
+                            replayed=403 + 1000, checkpoint=100, burst=1000)
+        expect(persisted["ledger.replay"].status == checks.FAIL
+               and "a 100s checkpoint of its last delivering" in persisted["ledger.replay"].detail,
+               f"a life that outlived its checkpoint replays one interval at most, got "
+               f"{persisted['ledger.replay']}")
         over = hop_row("two-logit-over", kill_on="logit", collector_lives=1, replayed=20)
         expect(over["ledger.replay"].status == checks.FAIL
                and "off by 17" in over["ledger.replay"].detail,

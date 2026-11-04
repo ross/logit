@@ -6801,7 +6801,10 @@ def check_ledger_replay(data):
     life's last drain interval, t the time from its last drain to the `docker kill`'s return,
     and the highest delivered rate over its last few drain intervals that delivered anything
     (`_commit_rate`), replayed − queued is in [−(delivered rate × t) − 1, received rate × t +
-    that commit rate × the checkpoint interval + 1]."""
+    that commit rate × the checkpoint interval + 1]. The spool persists only once the interval
+    has passed since it opened, so a life killed sooner after its start never persisted, and
+    the upper edge's commit term is every batch it delivered instead, counted or after its last
+    drain at its delivered rate: in a crash loop each life's replay carries the one before."""
     if _overlapped(data):
         return _per_instance(data, check_ledger_replay)
     led = _ledger(data)
@@ -6834,11 +6837,25 @@ def check_ledger_replay(data):
             done = led.inn.killed_done.get(life) or led.inn.killed_at[life]
             after = max(0.0, done - drains[-1]) if drains else 0.0
             low = -math.ceil(sent * after) - 1
-            high = math.ceil(took * after + last * led.hop_checkpoint) + 1
-            band = (f", band [{_n(low)}, {_n(high)}]: {took:,.1f} batches/s received and "
-                    f"{sent:,.1f} delivered over its last drain interval, {after:.1f}s from "
-                    f"its last drain to the kill, and a {led.hop_checkpoint:g}s checkpoint of "
-                    f"its last delivering {last:,.1f}/s")
+            start = led.inn.life_starts[life] if life < len(led.inn.life_starts) else None
+            if start is not None and done - start < led.hop_checkpoint:
+                # The spool persists its cursor only once the interval has passed since it
+                # opened, so a life killed sooner never persisted: every frame it committed,
+                # its own replay's included, replays again.
+                committed = sum(v for _, v, point_life in sut.counter_points(
+                    "logit.component.batches.delivered", component=sink) if point_life == life)
+                high = math.ceil(took * after + committed + sent * after) + 1
+                band = (f", band [{_n(low)}, {_n(high)}]: {took:,.1f} batches/s received and "
+                        f"{sent:,.1f} delivered over its last drain interval, {after:.1f}s "
+                        f"from its last drain to the kill, and all {_n(committed)} batches it "
+                        f"committed, since it died {done - start:.0f}s after its start, inside "
+                        f"its {led.hop_checkpoint:g}s checkpoint, with no persist")
+            else:
+                high = math.ceil(took * after + last * led.hop_checkpoint) + 1
+                band = (f", band [{_n(low)}, {_n(high)}]: {took:,.1f} batches/s received and "
+                        f"{sent:,.1f} delivered over its last drain interval, {after:.1f}s "
+                        f"from its last drain to the kill, and a {led.hop_checkpoint:g}s "
+                        f"checkpoint of its last delivering {last:,.1f}/s")
         ok = low <= replayed - queued <= high
         status = worst([status, PASS if ok else FAIL])
         where = f"{service} " if service is not None else ""
