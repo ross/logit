@@ -50,6 +50,15 @@ Facts a maintainer needs here (docs/plans/soak-harness.md, "Netem scope"):
   makes the scope again with the container's own settings, so the revert then writes nothing
   and records `started_in_window`; a container not running at the revert lost its scope with
   its process, and the revert writes nothing and records `exited_in_window`.
+- A `slowclient` runs slowclient.py's source in a detached `FILEOPS_IMAGE` container on the
+  first network of the service it's `on`, so the step's `address` resolves as that service's
+  peers resolve it, and records the client's `ready` line. Under `half_open` the apply then
+  disconnects the client from that network, the `partition` mechanism on a container of its
+  own: the client's sockets stay established with no interface under them, so the listener's
+  end sees a peer that sends nothing and answers nothing, and no FIN or RST ever leaves. The
+  revert stops the client with SIGTERM, records its `done` line, and removes it; its
+  connections close with it, a half-open one silently. The container carries the compose
+  project's labels, so `compose down --remove-orphans` removes one a crashed run left.
 - A `kill` is `docker kill -s KILL`: the process gets no shutdown signal, so it writes no final
   `internal` drain, no shutdown drops, and no `exiting` or `drain complete` line, and the container
   exits with `KILL_EXIT_CODE`. Its revert is a `docker start`, as a `stop`'s is. The container is
@@ -96,15 +105,16 @@ Facts a maintainer needs here (docs/plans/soak-harness.md, "Netem scope"):
 
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import fileops
+from . import fileops, slowclient
 from .scenario import (BACKEND_ROLE, BROKER_ROLE, GENERATOR_ROLE, IDP_ROLE, NETNS_ROLE,
-                       SHARED_MOUNT, STANDIN_ROLE, STOP_TIMEOUT_S, SUT_ROLE, SUT_SERVICE,
-                       TLS_MOUNT, memory_bytes)
+                       SHARED_MOUNT, SLOWCLIENT_INTERVAL_S, STANDIN_ROLE, STOP_TIMEOUT_S,
+                       SUT_ROLE, SUT_SERVICE, TLS_MOUNT, memory_bytes, slowclient_send)
 
 NETEM_LIMIT = "100000"
 # The timeline key recording, per `[[ledger.source]]` wire, whether a step can affect it.
@@ -137,6 +147,17 @@ CGROUP_HOST_ROOT = "/sys/fs/cgroup"
 CGROUP_MOUNT = "/cg"
 CPU_PERIOD_US = 100000
 CGROUP_SCRIPT = 'if [ $# -eq 2 ]; then printf "%s\\n" "$2" > "$1" || exit 1; fi; cat "$1"'
+# A `slowclient`'s source, run in `FILEOPS_IMAGE`; how long its apply waits for the client's
+# `ready` line, polling its log every `SLOWCLIENT_POLL_S`; and how long its revert's
+# `docker stop` waits on SIGTERM before it kills the client.
+SLOWCLIENT_SOURCE = Path(slowclient.__file__).read_text()
+SLOWCLIENT_READY_S = 30.0
+SLOWCLIENT_POLL_S = 0.25
+SLOWCLIENT_STOP_S = 5
+# The compose labels a client container carries, so that `compose down --remove-orphans`
+# removes one a crashed run left behind.
+COMPOSE_PROJECT_LABEL = "com.docker.compose.project"
+COMPOSE_SERVICE_LABEL = "com.docker.compose.service"
 
 
 @dataclass
@@ -528,6 +549,114 @@ def file_op_apply(ctx, step):
     return record
 
 
+def slowclient_name(ctx, step):
+    """The client container's name: the compose project's, then the step's id."""
+    return f"{getattr(ctx.docker, 'project', None) or 'soak'}-slowclient-{step.id}"
+
+
+def slowclient_argv(ctx, step, name, network):
+    """`docker run -d` arguments for a step's client (slowclient.py) on `network`, labeled into
+    the compose project."""
+    host, port = step.address.rsplit(":", 1)
+    project = getattr(ctx.docker, "project", None) or "soak"
+    interval = step.interval if step.interval is not None else SLOWCLIENT_INTERVAL_S
+    return ["run", "-d", "--name", name, "--label", f"{COMPOSE_PROJECT_LABEL}={project}",
+            "--label", f"{COMPOSE_SERVICE_LABEL}={name}", "--network", network, FILEOPS_IMAGE,
+            "python", "-I", "-u", "-c", SLOWCLIENT_SOURCE, step.mode, host, port,
+            str(step.connections), f"{interval:g}", slowclient_send(step)]
+
+
+def client_lines(text):
+    """The JSON objects a client printed, in order; any other line is skipped."""
+    found = []
+    for line in text.splitlines():
+        try:
+            one = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(one, dict):
+            found.append(one)
+    return found
+
+
+def _client_event(result, event, last=False):
+    lines = [one for one in client_lines(result.stdout) if one.get("event") == event]
+    return (lines[-1] if last else lines[0]) if lines else None
+
+
+def slowclient_apply(ctx, step):
+    """Starts the step's client on the first network of the service it's `on`, waits up to
+    `SLOWCLIENT_READY_S` for its `ready` line (`ready`), and under `half_open` disconnects it
+    from that network. A client that printed no `ready` line, opened no connection, or, under
+    `half_open`, left bytes unacknowledged, or a disconnect that failed, is `rc` 1, and the
+    client is removed."""
+    info = ctx.docker.inspect(ctx.ids[step.on]) or {}
+    networks = sorted((info.get("NetworkSettings") or {}).get("Networks") or {})
+    if not networks:
+        return {"rc": 1, "stderr": f"{step.on} is on no network for a client to join"}
+    name, network = slowclient_name(ctx, step), networks[0]
+    started = ctx.docker.run(slowclient_argv(ctx, step, name, network))
+    record = _record(started, container=name, network=network)
+    if started.rc != 0:
+        ctx.docker.run(["rm", "-f", name])
+        return record
+    deadline = time.monotonic() + SLOWCLIENT_READY_S
+    while True:
+        logs = ctx.docker.run(["logs", name])
+        ready = _client_event(logs, "ready")
+        if ready is not None or time.monotonic() >= deadline:
+            break
+        time.sleep(SLOWCLIENT_POLL_S)
+    record["ready"] = ready
+    if ready is None:
+        record.update(rc=1, stderr=f"the client printed no ready line in "
+                                   f"{SLOWCLIENT_READY_S:g}s: {logs.stderr.strip()[-500:]}")
+    elif not ready.get("dialed"):
+        record.update(rc=1, stderr=f"the client opened no connection to {step.address}")
+    elif step.mode == "half_open" and ready.get("unacked_bytes"):
+        record.update(rc=1, stderr=f"{step.address} left {ready['unacked_bytes']} byte(s) "
+                                   "unacknowledged before the disconnect")
+    elif step.mode == "half_open":
+        cut = ctx.docker.run(["network", "disconnect", network, name])
+        record["disconnected"] = cut.rc == 0
+        if cut.rc != 0:
+            record.update(rc=cut.rc, stderr=cut.stderr.strip()[-2000:])
+    if record["rc"] != 0:
+        ctx.docker.run(["rm", "-f", name])
+        return record
+    ctx.state[step.id] = name
+    return record
+
+
+def slowclient_revert(ctx, step):
+    """Stops the client with SIGTERM, records the counts its `done` line printed (`done`), and
+    removes it. A client no longer running at the revert ended its connections early, and one
+    that printed no `done` line can't say what it held: either is `rc` 1. An apply that failed
+    left no client."""
+    name = ctx.state.pop(step.id, None)
+    if name is None:
+        return {"rc": 0, "stderr": "", "stopped": False}
+    state = (ctx.docker.inspect(name) or {}).get("State") or {}
+    stop = ctx.docker.run(["stop", "-t", str(SLOWCLIENT_STOP_S), name],
+                          timeout=SLOWCLIENT_STOP_S + 15)
+    logs = ctx.docker.run(["logs", name])
+    removed = ctx.docker.run(["rm", "-f", name])
+    done = _client_event(logs, "done", last=True)
+    record = {"rc": 0, "stderr": "", "container": name, "stopped": True, "done": done}
+    if state.get("Status") != "running":
+        record.update(rc=1, stderr=f"the client wasn't running at the revert (status "
+                                   f"{state.get('Status')}, exit code {state.get('ExitCode')}), "
+                                   f"so its connections ended early: "
+                                   f"{logs.stderr.strip()[-500:]}")
+    elif stop.rc != 0 or removed.rc != 0:
+        failed = stop if stop.rc != 0 else removed
+        record.update(rc=failed.rc, stderr=failed.stderr.strip()[-2000:])
+    elif done is None:
+        record.update(rc=1, stderr=f"the client printed no done line: "
+                                   f"{logs.stderr.strip()[-500:]}")
+    return record
+
+
 def certs_argv(ctx, command, *args, network=None, read_only=False):
     """`docker run --rm` arguments for one `certs.sh` command in the netem image, as the host
     user so the files it writes in `<run>/tls` are the user's, with `<run>/tls` at
@@ -834,6 +963,19 @@ ACTIONS = {
         affects_file_ingress=_on_ingress_sut,
         affects_http_ingress=_on_ingress_sut,
         affects_kafka_ingress=_on_ingress_sut,
+    ),
+    # A slow client holds the SUT's connection slots and sends nothing a listener frames or
+    # decodes, so it loses nothing on any leg; a generator's connection opened before the
+    # slots fill goes on as before, and its window is judged.
+    "slowclient": Action(
+        apply=slowclient_apply,
+        revert=slowclient_revert,
+        affects_udp_ingress=_never,
+        affects_egress=_never,
+        affects_tcp_ingress=_never,
+        affects_file_ingress=_never,
+        affects_http_ingress=_never,
+        affects_kafka_ingress=_never,
     ),
     # A mark on the SUT holds what it marks, such as a stalled script backing up into the UDP
     # receive queue.

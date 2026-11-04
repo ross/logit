@@ -93,8 +93,8 @@ STANDIN_ROLES = {"standin": STANDIN_ROLE}
 # Every action the scenario schema accepts. faults.py implements them; the names must match its
 # ACTIONS.
 ACTION_NAMES = ("netem", "pause", "stop", "kill", "restart", "partition", "reset", "prlimit",
-                "cgroup", "mark", "exit", "respond", "signal", "rename", "rotate", "probe",
-                "copytruncate", "gzip", "replace")
+                "cgroup", "slowclient", "mark", "exit", "respond", "signal", "rename", "rotate",
+                "probe", "copytruncate", "gzip", "replace")
 # The actions that take `port`: a `probe`, which needs the listener's, and a `reset`, which
 # closes only the connections whose local or remote port it is, and every one without it.
 PORT_ACTIONS = ("probe", "reset")
@@ -110,6 +110,8 @@ SUT_ONLY_ACTIONS = {
                 "a generator's failed dials have no rule"),
     "cgroup": ("the checks score its window on the SUT's own listeners and sinks, and a slowed "
                "generator's loss has no rule"),
+    "slowclient": ("it holds the connection slots of the SUT's listeners, which is what the "
+                   "checks read; the service it's `on` is the one whose network it joins"),
 }
 # A `prlimit` step's `nofile`: the open-files limit, soft and hard, it sets on the SUT's process
 # for its window. Below `PRLIMIT_MIN_NOFILE` the process can't open the stdio and runtime
@@ -132,6 +134,23 @@ CGROUP_MAX_MEMORY_HIGH = 1024 ** 4
 CGROUP_PAGE_BYTES = 4096
 _MEMORY_HIGH = re.compile(r"^([1-9][0-9]*)([KMG])$")
 _MEMORY_UNITS = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}
+# A `slowclient` step's keys (slowclient.py): `address`, the `host:port` it dials; `mode`, one of
+# `SLOWCLIENT_MODES`; `connections`, how many it holds, up to `SLOWCLIENT_MAX_CONNECTIONS`;
+# `interval`, its tick, from `SLOWCLIENT_MIN_INTERVAL_S` to `SLOWCLIENT_MAX_INTERVAL_S`, by
+# default `SLOWCLIENT_INTERVAL_S`; and `send`, what it sends, one of `SLOWCLIENT_SENDS`, by
+# default `lf`. A `silent` client sends nothing, so it takes no `send`.
+SLOWCLIENT_KEYS = ("address", "mode", "connections", "interval", "send")
+SLOWCLIENT_MODES = ("silent", "trickle", "half_open")
+SLOWCLIENT_SENDS = ("lf", "http_head", "http_body")
+SLOWCLIENT_DEFAULT_SEND = "lf"
+SLOWCLIENT_MAX_CONNECTIONS = 1024
+SLOWCLIENT_INTERVAL_S = 1.0
+SLOWCLIENT_MIN_INTERVAL_S = 0.1
+SLOWCLIENT_MAX_INTERVAL_S = 60.0
+_HOST_NAME = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$")
+# Actions that run a one-shot of the `python` image the stand-in runs (faults.py's
+# `FILEOPS_IMAGE`), which the driver pulls before the schedule starts.
+PYTHON_ACTIONS = ("copytruncate", "gzip", "replace", "slowclient")
 # The `SUT_ONLY_ACTIONS` allowed on a scrape wire's generator: it sends nothing, so a kill
 # loses only the increments after the SUT's last scrape, which `ledger.wire` bounds per life.
 SCRAPED_GENERATOR_ACTIONS = ("kill",)
@@ -248,7 +267,7 @@ _ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 PRIVATE_ENV_PREFIX = "soak-env-"
 STEP_KEYS = {"at", "action", "on", "args", "for", "ready", "code", "key", "class", "signal",
              "path", "to", "cert", "days", "broken", "port", "nofile", "engaged", *CGROUP_KEYS,
-             *RESPOND_KEYS}
+             *SLOWCLIENT_KEYS, *RESPOND_KEYS}
 RANDOM_KEYS = {"seed", "gap", "fault"}
 RANDOM_FAULT_KEYS = {"weight", "action", "on", "args", "for"}
 RANGE_KEYS = {"min", "max"}
@@ -439,6 +458,8 @@ METRIC_KINDS = {
     "logit.input.frames": "sum",
     "logit.input.frames.dropped": "sum",
     "logit.input.connections.closed": "sum",
+    "logit.input.connections.rejected": "sum",
+    "logit.input.connections": "gauge",
     "logit.input.lines": "sum",
     "logit.input.files.rotated": "sum",
     "logit.input.files.resume_rejected": "sum",
@@ -577,6 +598,12 @@ class StepSpec:
     cpu: object = None
     memory_high: object = None
     engaged: object = None
+    # A `slowclient`'s address, mode, connections, interval (seconds), and what it sends.
+    address: object = None
+    mode: object = None
+    connections: object = None
+    interval: object = None
+    send: object = None
 
 
 # The `Step` fields `expected()` writes into its JSON and its timeline records, each under its
@@ -589,7 +616,9 @@ STEP_FIELDS = (("ready", "ready"), ("code", "code"), ("key", "key"), ("status", 
                ("fault_class", "class"),
                ("signal", "signal"), ("path", "path"), ("to", "to"), ("cert", "cert"),
                ("days", "days"), ("broken", "broken"), ("port", "port"), ("nofile", "nofile"),
-               ("cpu", "cpu"), ("memory_high", "memory_high"), ("engaged", "engaged"))
+               ("cpu", "cpu"), ("memory_high", "memory_high"), ("engaged", "engaged"),
+               ("address", "address"), ("mode", "mode"), ("connections", "connections"),
+               ("interval", "interval"), ("send", "send"))
 
 
 @dataclass
@@ -664,6 +693,11 @@ class Step:
     cpu: object = None
     memory_high: object = None
     engaged: object = None
+    address: object = None
+    mode: object = None
+    connections: object = None
+    interval: object = None
+    send: object = None
 
     def expected(self):
         """The fields this step sets (`STEP_FIELDS`), for its JSON and its timeline records."""
@@ -1104,7 +1138,10 @@ def from_dict(raw, path):
             cert=raw_step.get("cert"), days=raw_step.get("days"), broken=raw_step.get("broken"),
             port=raw_step.get("port"), nofile=raw_step.get("nofile"),
             cpu=raw_step.get("cpu"), memory_high=raw_step.get("memory_high"),
-            engaged=raw_step.get("engaged"),
+            engaged=raw_step.get("engaged"), address=raw_step.get("address"),
+            mode=raw_step.get("mode"), connections=raw_step.get("connections"),
+            interval=dur(raw_step, "interval", where) if "interval" in raw_step else None,
+            send=raw_step.get("send"),
         ))
         if "for" not in raw_step:
             problems.append(f"{where}: every fault needs `for`, so its revert is scheduled with it")
@@ -2954,6 +2991,7 @@ def validate(scenario, duration=None, seed=None):
         problems += _tls_step_problems(spec, where, scenario.tls)
         problems += _prlimit_problems(spec, where)
         problems += _cgroup_problems(spec, where)
+        problems += _slowclient_problems(spec, where)
         if spec.for_ <= 0:
             problems.append(f"{where}: `for` must be longer than 0s")
         if spec.action == "netem":
@@ -3052,6 +3090,55 @@ def validate(scenario, duration=None, seed=None):
                 problems += _schedule_problems(scenario, steps, length)
     if problems:
         raise ScenarioError(problems)
+
+
+def slowclient_send(step):
+    """What a `slowclient` step's client sends: `none` under `silent`, else its `send` or
+    `SLOWCLIENT_DEFAULT_SEND`."""
+    if step.mode == "silent":
+        return "none"
+    return step.send if step.send is not None else SLOWCLIENT_DEFAULT_SEND
+
+
+def _slowclient_problems(spec, where):
+    """What a step breaks of the `slowclient` rules: `address` a `host:port` with a port from 1
+    to 65535, `mode` one of `SLOWCLIENT_MODES`, and `connections` a whole number from 1 to
+    `SLOWCLIENT_MAX_CONNECTIONS`, each required; `interval` from `SLOWCLIENT_MIN_INTERVAL_S` to
+    `SLOWCLIENT_MAX_INTERVAL_S`; `send` one of `SLOWCLIENT_SENDS`, refused under `silent`; and
+    every key refused on another action."""
+    given = [key for key in SLOWCLIENT_KEYS if getattr(spec, key) is not None]
+    if spec.action != "slowclient":
+        return [f"{where}: `{key}` is for slowclient only" for key in given]
+    problems = []
+    for key in ("address", "mode", "connections"):
+        if getattr(spec, key) is None:
+            problems.append(f"{where}: slowclient needs `{key}`")
+    if spec.address is not None:
+        host, _, port = spec.address.rpartition(":") if isinstance(spec.address, str) \
+            else ("", "", "")
+        if not (_HOST_NAME.match(host) and port.isdigit() and 1 <= int(port) <= 65535):
+            problems.append(f"{where}: `address` must be a host:port with a port from 1 to "
+                            f"65535, got {spec.address!r}")
+    if spec.mode is not None and spec.mode not in SLOWCLIENT_MODES:
+        problems.append(f"{where}: `mode` must be one of {', '.join(SLOWCLIENT_MODES)}, got "
+                        f"{spec.mode!r}")
+    if spec.connections is not None and (
+            not isinstance(spec.connections, int) or isinstance(spec.connections, bool)
+            or not 1 <= spec.connections <= SLOWCLIENT_MAX_CONNECTIONS):
+        problems.append(f"{where}: `connections` must be a whole number from 1 to "
+                        f"{SLOWCLIENT_MAX_CONNECTIONS}, got {spec.connections!r}")
+    if spec.interval is not None and not (
+            SLOWCLIENT_MIN_INTERVAL_S <= spec.interval <= SLOWCLIENT_MAX_INTERVAL_S):
+        problems.append(f"{where}: `interval` must be from "
+                        f"{format_duration(SLOWCLIENT_MIN_INTERVAL_S)} to "
+                        f"{format_duration(SLOWCLIENT_MAX_INTERVAL_S)}, got "
+                        f"{format_duration(spec.interval)}")
+    if spec.send is not None and spec.mode == "silent":
+        problems.append(f"{where}: a silent slowclient sends nothing, so it takes no `send`")
+    elif spec.send is not None and spec.send not in SLOWCLIENT_SENDS:
+        problems.append(f"{where}: `send` must be one of {', '.join(SLOWCLIENT_SENDS)}, got "
+                        f"{spec.send!r}")
+    return problems
 
 
 def _prlimit_problems(spec, where):
@@ -3590,6 +3677,9 @@ def _random_problems(scenario, duration):
         if template.action == "cgroup":
             problems.append(f"{where}: cgroup takes `cpu` or `memory_high`, which a [random] "
                             "fault can't set; write it as a [[step]]")
+        if template.action == "slowclient":
+            problems.append(f"{where}: slowclient takes `address`, `mode`, and `connections`, "
+                            "which a [random] fault can't set; write it as a [[step]]")
         if template.action in NO_WINDOW_ACTIONS:
             problems.append(f"{where}: {template.action} opens no fault window and takes keys a "
                             "[random] fault can't set; write it as a [[step]]")
@@ -3954,6 +4044,8 @@ def expand(scenario, duration=None, seed=None):
                     signal=spec.signal, path=spec.path, to=spec.to, cert=spec.cert,
                     days=spec.days, broken=spec.broken, port=spec.port, nofile=spec.nofile,
                     cpu=spec.cpu, memory_high=spec.memory_high, engaged=spec.engaged,
+                    address=spec.address, mode=spec.mode, connections=spec.connections,
+                    interval=spec.interval, send=spec.send,
                 ))
         cycle += 1
     steps.sort(key=lambda s: (s.start, s.spec_index))

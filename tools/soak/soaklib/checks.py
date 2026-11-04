@@ -606,7 +606,8 @@ def check_timeline(data):
     whose process started again or exited inside its window is reported: its limit went with
     the old process. A `memory.high` revert's throttle count is reported, and one that couldn't
     read `memory.events` FAILs, since nothing then says whether the throttle engaged; so does a
-    count that contradicts the step's `engaged`."""
+    count that contradicts the step's `engaged`. A `slowclient` revert's counts are reported:
+    the most connections it held, its dials, and how many the listener closed."""
     if data.t0 is None:
         return Result("timeline", SKIP, "no timeline start")
     lines = []
@@ -650,6 +651,12 @@ def check_timeline(data):
               f"throttling: {record['events_error']}"
               for record in actions if record["event"] == "revert" and "events_error" in record]
     gone += engaged
+    gone += [f"{record.get('step')} (slowclient on {record.get('on')}): {record.get('mode')} "
+             f"held at most {_n(done.get('max_open', 0))} of {_n(record.get('connections', 0))} "
+             f"connection(s), dialed {_n(done.get('dialed', 0))}, "
+             f"{_n(done.get('peer_closed', 0))} closed by the listener"
+             for record in actions if record["event"] == "revert"
+             and isinstance(done := record.get("done"), dict)]
     for record in actions:
         if record["event"] != "revert" or "high_events" not in record:
             continue

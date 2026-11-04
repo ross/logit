@@ -5550,7 +5550,8 @@ def _kafka_rules(root):
     expect("kafka: { condition: service_healthy, required: false }" in sut,
            "the SUT waits for a healthy broker when its profile runs, and only then")
     for name, action in faults.ACTIONS.items():
-        if name in scenario.NO_WINDOW_ACTIONS:
+        # A slowclient runs on a SUT only and affects no leg.
+        if name in scenario.NO_WINDOW_ACTIONS or name == "slowclient":
             continue
         expect(action.affects_egress(scenario.Step(id="x", spec_index=0, cycle=0, action="stop",
                                                    on="kafka", args="", start=0, end=1), roles),
@@ -10000,7 +10001,8 @@ def _respond_rules(root):
     expect(applied.cue() == {"step": applied.id, "status": 503, "apply": True},
            f"`apply` travels in the cue, got {applied.cue()}")
     for name, action in faults.ACTIONS.items():
-        if name in scenario.NO_WINDOW_ACTIONS:
+        # A slowclient runs on a SUT only and affects no leg.
+        if name in scenario.NO_WINDOW_ACTIONS or name == "slowclient":
             continue
         one = scenario.Step(id="x", spec_index=0, cycle=0, action=name, on="standin", args="",
                             start=0, end=1)
@@ -13440,6 +13442,378 @@ def _prlimit_rules(root):
                f"interval past it, got {failed}")
 
 
+class _Listener:
+    """A local TCP listener for the slow client's tests: it keeps the first `keep` connections
+    and reads them, closing every later one at once, and records the bytes each kept one sent
+    and how many it accepted."""
+
+    def __init__(self, keep):
+        import socket
+        import threading
+        self.keep, self.accepted, self.kept = keep, 0, []
+        self.server = socket.create_server(("127.0.0.1", 0))
+        self.port = self.server.getsockname()[1]
+        self.lock = threading.Lock()
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self):
+        import threading
+        while True:
+            try:
+                conn, _ = self.server.accept()
+            except OSError:
+                return
+            with self.lock:
+                self.accepted += 1
+                if len(self.kept) >= self.keep:
+                    conn.close()
+                    continue
+                got = bytearray()
+                self.kept.append((conn, got))
+            threading.Thread(target=self._read, args=(conn, got), daemon=True).start()
+
+    def _read(self, conn, got):
+        while True:
+            try:
+                data = conn.recv(4096)
+            except OSError:
+                return
+            if not data:
+                return
+            with self.lock:
+                got.extend(data)
+
+    def received(self):
+        with self.lock:
+            return [bytes(got) for _, got in self.kept]
+
+    def close(self):
+        self.server.close()
+        for conn, _ in self.kept:
+            conn.close()
+
+
+def _run_client(args, seconds):
+    """Runs slowclient.py's source as faults.py ships it, for `seconds`, then SIGTERM: `(rc,
+    [printed JSON objects], stderr)`."""
+    proc = subprocess.Popen([sys.executable, "-I", "-u", "-c", faults.SLOWCLIENT_SOURCE, *args],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    time.sleep(seconds)
+    proc.send_signal(signal.SIGTERM)
+    out, err = proc.communicate(timeout=10)
+    return proc.returncode, faults.client_lines(out), err
+
+
+def _slowclient_client():
+    """slowclient.py against a local listener: `trickle` sends one byte per connection per
+    tick and dials again each connection the listener closes; `silent` sends nothing and dials
+    again too; `http_head` trickles a request head that never ends, and `http_body` sends a
+    whole head with its `Content-Length` and then trickles the body; `half_open` sends each
+    connection one byte, reports it acknowledged, and dials no more; a `ready` line comes
+    after the first round of dials and a `done` line at SIGTERM; and a silent client with a
+    `send`, or another with none, is refused."""
+    listener = _Listener(keep=2)
+    try:
+        rc, lines, err = _run_client(["trickle", "127.0.0.1", str(listener.port), "4", "0.1",
+                                      "lf"], 1.5)
+        ready = next((one for one in lines if one["event"] == "ready"), {})
+        done = lines[-1] if lines else {}
+        got = listener.received()
+        expect(rc == 0 and ready.get("dialed") == 4 and done.get("event") == "done"
+               and done["dialed"] > 4 and done["peer_closed"] >= done["dialed"] - 4
+               and len(got) == 2 and all(5 <= len(one) and set(one) == {10} for one in got),
+               f"a trickle sends LF bytes on the connections a listener keeps and dials again "
+               f"the ones it closes, got rc {rc} {lines} {got} {err}")
+    finally:
+        listener.close()
+    listener = _Listener(keep=1)
+    try:
+        rc, lines, err = _run_client(["silent", "127.0.0.1", str(listener.port), "3", "0.1",
+                                      "none"], 1.0)
+        done = lines[-1] if lines else {}
+        expect(rc == 0 and done.get("sent_bytes") == 0 and listener.received() == [b""]
+               and done.get("dialed", 0) > 3 and done.get("max_open") == 3,
+               f"a silent client sends nothing, holds its connections, and dials again the "
+               f"ones the listener closes, got rc {rc} {lines} {err}")
+    finally:
+        listener.close()
+    for send in ("http_head", "http_body"):
+        listener = _Listener(keep=1)
+        try:
+            rc, lines, err = _run_client(["trickle", "127.0.0.1", str(listener.port), "1", "0.1",
+                                          send], 1.5)
+            got = listener.received()[0]
+            head, _, body = got.partition(b"\r\n\r\n")
+            request_line = b"POST /api/v2/write?org=soak&bucket=soak HTTP/1.1\r\n"
+            if send == "http_head":
+                ok = (got.startswith(request_line[:5]) and b"\r\n\r\n" not in got
+                      and 5 <= len(got) <= 20)
+            else:
+                ok = (got.startswith(request_line) and head.endswith(b"Content-Length: 1048576")
+                      and len(body) >= 5 and set(body) == {10})
+            what = "a head" if send == "http_head" else "a whole head, then its body,"
+            expect(rc == 0 and ok, f"a {send} trickle sends {what} a byte at a time, got "
+                                   f"rc {rc} {got!r} {err}")
+        finally:
+            listener.close()
+    import itertools
+    endless = bytes(itertools.islice(faults.slowclient.trickled("logit", "http_head"), 10000))
+    expect(b"\r\n\r\n" not in endless and endless.endswith(b"a" * 100),
+           f"an http_head trickle's head never ends, got {endless[:120]!r}")
+    listener = _Listener(keep=1)
+    try:
+        rc, lines, err = _run_client(["half_open", "127.0.0.1", str(listener.port), "2", "0.1",
+                                      "http_head"], 1.0)
+        ready = next((one for one in lines if one["event"] == "ready"), {})
+        got = listener.received()
+        expect(rc == 0 and ready.get("unacked_bytes") == 0 and ready.get("dialed") == 2
+               and lines[-1].get("dialed") == 2 and got == [b"P"],
+               f"a half_open client sends each connection its first byte, reports it "
+               f"acknowledged, and dials no more, got rc {rc} {lines} {got} {err}")
+    finally:
+        listener.close()
+    for args in (["silent", "127.0.0.1", "1", "1", "1", "lf"],
+                 ["trickle", "127.0.0.1", "1", "1", "1", "none"],
+                 ["trickle", "127.0.0.1", "1", "0", "1", "lf"],
+                 ["trickle", "127.0.0.1", "1", "1"]):
+        proc = subprocess.run([sys.executable, "-I", "-c", faults.SLOWCLIENT_SOURCE, *args],
+                              capture_output=True, text=True, timeout=10)
+        expect(proc.returncode == 2 and "usage:" in proc.stderr,
+               f"the client refuses {args}, got {proc.returncode} {proc.stderr!r}")
+
+
+class _SlowclientDocker:
+    """Answers a `slowclient`'s Docker calls: `inspect` of the SUT with `networks`, of the client
+    with `state`; `logs` with the next of `logs`; `network` with `cut`; every other call `ok`.
+    Records each `run` call."""
+
+    def __init__(self, logs, networks=("soak-x_default",), state=None, cut=None, started=None):
+        self.calls = []
+        self.logs = list(logs)
+        self.networks = networks
+        self.state = state if state is not None else {"Status": "running"}
+        self.cut = cut or docker.Result(0, "", "")
+        self.started = started or docker.Result(0, "abc\n", "")
+        self.project = "soak-x"
+
+    def run(self, args, timeout=None):
+        self.calls.append(list(args))
+        if args[0] == "run":
+            return self.started
+        if args[0] == "logs":
+            return self.logs.pop(0) if self.logs else docker.Result(0, "", "")
+        if args[0] == "network":
+            return self.cut
+        return docker.Result(0, "", "")
+
+    def inspect(self, container, timeout=None):
+        if container == "sut":
+            return {"NetworkSettings": {"Networks": {name: {} for name in self.networks}}}
+        return {"State": dict(self.state)}
+
+    def __getattr__(self, name):
+        raise AssertionError(f"_SlowclientDocker.{name} called")
+
+
+def _slowclient_actions():
+    """A `slowclient` starts slowclient.py's source detached in the `python` image on the first
+    network of the service it's `on`, labeled into the compose project, with the step's mode,
+    address, connections, interval (1s by default), and send (`lf` by default, `none` when
+    silent); its apply waits for the `ready` line, and under `half_open` disconnects the client
+    from that network; a service on no network, a failed start, no `ready` line, no connection
+    opened, a byte unacknowledged under `half_open`, or a failed disconnect fails the step and
+    removes the client; its revert stops the client, records its `done` line, and removes it,
+    failing when the client had stopped or printed none, and does nothing after a failed apply;
+    it affects no leg; and `timeline` reports what the client held."""
+    ok = docker.Result(0, "", "")
+    ready = docker.Result(0, json.dumps({"event": "ready", "dialed": 24, "open": 24}) + "\n", "")
+    done = docker.Result(0, ready.stdout + json.dumps(
+        {"event": "done", "dialed": 40, "max_open": 24, "peer_closed": 16}) + "\n", "")
+    step = scenario.Step("c0s2", 1, 0, "slowclient", "logit", "", 90.0, 180.0,
+                         address="logit:8125", mode="trickle", connections=24)
+    fake = _SlowclientDocker([ok, ready, done], networks=("soak-x_z", "soak-x_default"))
+    ctx = faults.Context(docker=fake, ids={"logit": "sut"}, netem_image="netem")
+    saved = faults.SLOWCLIENT_POLL_S
+    faults.SLOWCLIENT_POLL_S = 0
+    try:
+        result = faults.ACTIONS["slowclient"].apply(ctx, step)
+        run = fake.calls[0]
+        expect(run[:8] == ["run", "-d", "--name", "soak-x-slowclient-c0s2", "--label",
+                           "com.docker.compose.project=soak-x", "--label",
+                           "com.docker.compose.service=soak-x-slowclient-c0s2"]
+               and run[8:12] == ["--network", "soak-x_default", faults.FILEOPS_IMAGE, "python"]
+               and run[-6:] == ["trickle", "logit", "8125", "24", "1", "lf"]
+               and faults.SLOWCLIENT_SOURCE in run and result["rc"] == 0
+               and result["ready"]["dialed"] == 24 and len(fake.calls) == 3
+               and ctx.state[step.id] == "soak-x-slowclient-c0s2",
+               f"a slowclient starts its client on the service's first network, labeled into "
+               f"the project, and waits for its ready line, got {fake.calls} {result}")
+        result = faults.ACTIONS["slowclient"].revert(ctx, step)
+        expect([call[0] for call in fake.calls[3:]] == ["stop", "logs", "rm"]
+               and result["rc"] == 0 and result["done"]["max_open"] == 24
+               and step.id not in ctx.state,
+               f"a slowclient's revert stops the client, reads its done line, and removes it, "
+               f"got {fake.calls[3:]} {result}")
+
+        for mode, send, interval, word in (("silent", None, None, "none"),
+                                           ("trickle", "http_body", 0.5, "http_body")):
+            one = scenario.Step("c0s1", 0, 0, "slowclient", "logit", "", 0.0, 1.0,
+                                address="logit:8086", mode=mode, connections=3, send=send,
+                                interval=interval)
+            fake = _SlowclientDocker([ready])
+            ctx = faults.Context(docker=fake, ids={"logit": "sut"}, netem_image="netem")
+            faults.ACTIONS["slowclient"].apply(ctx, one)
+            expect(fake.calls[0][-6:] == [mode, "logit", "8086", "3",
+                                          "1" if interval is None else "0.5", word],
+                   f"a {mode} client sends {word}, got {fake.calls[0][-6:]}")
+
+        half = scenario.Step("c0s3", 2, 0, "slowclient", "logit", "", 0.0, 1.0,
+                             address="logit:8125", mode="half_open", connections=8)
+        acked = docker.Result(0, json.dumps({"event": "ready", "dialed": 8,
+                                             "unacked_bytes": 0}) + "\n", "")
+        fake = _SlowclientDocker([acked])
+        ctx = faults.Context(docker=fake, ids={"logit": "sut"}, netem_image="netem")
+        result = faults.ACTIONS["slowclient"].apply(ctx, half)
+        expect(fake.calls[-1] == ["network", "disconnect", "soak-x_default",
+                                  "soak-x-slowclient-c0s3"]
+               and result["rc"] == 0 and result["disconnected"] is True,
+               f"a half_open client is disconnected from its network once ready, got "
+               f"{fake.calls} {result}")
+
+        unacked = docker.Result(0, json.dumps({"event": "ready", "dialed": 8,
+                                               "unacked_bytes": 8}) + "\n", "")
+        none = docker.Result(0, json.dumps({"event": "ready", "dialed": 0}) + "\n", "")
+        failing = (
+            ("no network", dict(logs=[], networks=()), step, "is on no network"),
+            ("a failed start", dict(logs=[], started=docker.Result(125, "", "no such image")),
+             step, "no such image"),
+            ("no ready line", dict(logs=[ok]), step, "printed no ready line"),
+            ("no connection", dict(logs=[none]), step, "opened no connection to logit:8125"),
+            ("an unacknowledged byte", dict(logs=[unacked]), half,
+             "left 8 byte(s) unacknowledged"),
+            ("a failed disconnect", dict(logs=[acked], cut=docker.Result(1, "", "boom")), half,
+             "boom"),
+        )
+        saved_ready = faults.SLOWCLIENT_READY_S
+        faults.SLOWCLIENT_READY_S = 0
+        try:
+            for what, kwargs, one, needle in failing:
+                fake = _SlowclientDocker(**kwargs)
+                ctx = faults.Context(docker=fake, ids={"logit": "sut"}, netem_image="netem")
+                result = faults.ACTIONS["slowclient"].apply(ctx, one)
+                removed = (what == "no network"
+                           or fake.calls[-1] == ["rm", "-f", f"soak-x-slowclient-{one.id}"])
+                expect(result["rc"] != 0 and needle in result["stderr"] and removed
+                       and one.id not in ctx.state
+                       and faults.ACTIONS["slowclient"].revert(ctx, one)
+                       == {"rc": 0, "stderr": "", "stopped": False},
+                       f"{what} fails a slowclient, removes the client, and leaves nothing to "
+                       f"revert, got {result} {fake.calls}")
+        finally:
+            faults.SLOWCLIENT_READY_S = saved_ready
+
+        for what, state, logs, needle in (
+                ("a client that stopped", {"Status": "exited", "ExitCode": 1}, done,
+                 "wasn't running at the revert"),
+                ("a client with no done line", {"Status": "running"}, ready,
+                 "printed no done line")):
+            fake = _SlowclientDocker([logs], state=state)
+            ctx = faults.Context(docker=fake, ids={"logit": "sut"}, netem_image="netem")
+            ctx.state[step.id] = "soak-x-slowclient-c0s2"
+            result = faults.ACTIONS["slowclient"].revert(ctx, step)
+            expect(result["rc"] == 1 and needle in result["stderr"]
+                   and fake.calls[-1] == ["rm", "-f", "soak-x-slowclient-c0s2"],
+                   f"{what} fails the revert and is removed, got {result} {fake.calls}")
+    finally:
+        faults.SLOWCLIENT_POLL_S = saved
+
+    roles = {"logit": "sut", "generator": "generator", "victoria-metrics": "backend"}
+    action = faults.ACTIONS["slowclient"]
+    expect(not any(action.affects(wire, step, roles)
+                   for wire in ("udp", "tcp", "http", "file", "kafka"))
+           and not action.affects_egress(step, roles),
+           "a slowclient affects no leg, so every wire judges its window")
+    with tempfile.TemporaryDirectory() as tmp:
+        timeline = [_phase("start", 0, t0=T0),
+                    _action("apply", "c0s2", "slowclient", "logit", 90, mode="trickle",
+                            connections=24),
+                    _action("revert", "c0s2", "slowclient", "logit", 180, mode="trickle",
+                            connections=24, done={"event": "done", "dialed": 40,
+                                                  "max_open": 24, "peer_closed": 16})]
+        result = _status(_run_dir(tmp, "slowclient", timeline), checks.check_timeline)
+        expect(result.status == checks.PASS
+               and "c0s2 (slowclient on logit): trickle held at most 24 of 24 connection(s), "
+                   "dialed 40, 16 closed by the listener" in result.detail,
+               f"timeline reports what a slowclient held, got {result}")
+
+
+def _slowclient_rules(root):
+    """`load()`'s rules for a `slowclient` step: `address`, `mode`, and `connections` required
+    and each in its form or range; `interval` in range; `send` one of three and refused on a
+    silent client; every key refused on another action; a slowclient on the SUT only and never
+    in a [random] schedule; and the keys reaching the expanded step."""
+    path, raw = _base(root)
+    base = {"address": "logit:8125", "mode": "trickle", "connections": 16}
+
+    def with_step(**fields):
+        changed = copy.deepcopy(raw)
+        changed["step"] = [{"at": "0s", "action": "slowclient", "on": "logit", "for": "10s",
+                            **fields}]
+        return changed
+
+    try:
+        loaded = scenario.from_dict(with_step(**base, interval="500ms", send="http_body"), path)
+        scenario.validate(loaded)
+        expanded = scenario.expand(loaded)
+        expect(expanded[0].expected() == {"address": "logit:8125", "mode": "trickle",
+                                          "connections": 16, "interval": 0.5,
+                                          "send": "http_body"},
+               f"a slowclient's keys reach its step and its records, got {expanded[0]}")
+        for mode in ("silent", "half_open"):
+            scenario.validate(scenario.from_dict(with_step(**{**base, "mode": mode}), path))
+    except scenario.ScenarioError as err:
+        expect(False, f"a slowclient with its keys loads, got {err.problems}")
+    for key in ("address", "mode", "connections"):
+        missing = {k: v for k, v in base.items() if k != key}
+        _refused(path, with_step(**missing), f"slowclient needs `{key}`",
+                 f"a slowclient with no {key}")
+    for address in ("logit", "logit:0", "logit:65536", ":8125", "logit:http", 8125,
+                    "-logit:8125"):
+        _refused(path, with_step(**{**base, "address": address}), "`address` must be a "
+                 "host:port with a port from 1 to 65535", f"a slowclient's address {address!r}")
+    _refused(path, with_step(**{**base, "mode": "slow"}), "`mode` must be one of silent, "
+             "trickle, half_open", "a slowclient's mode 'slow'")
+    for connections in (0, 1025, "16", 16.0, True):
+        _refused(path, with_step(**{**base, "connections": connections}), "`connections` must "
+                 "be a whole number from 1 to 1024", f"a slowclient's connections {connections!r}")
+    for interval in ("50ms", "61s"):
+        _refused(path, with_step(**base, interval=interval), "`interval` must be from 0.1s to "
+                 "1m", f"a slowclient's interval {interval}")
+    _refused(path, with_step(**base, send="bytes"), "`send` must be one of lf, http_head, "
+             "http_body", "a slowclient's send 'bytes'")
+    _refused(path, with_step(**{**base, "mode": "silent"}, send="lf"), "a silent slowclient "
+             "sends nothing, so it takes no `send`", "a silent slowclient with a send")
+    for key, value in (*base.items(), ("interval", "1s"), ("send", "lf")):
+        changed = copy.deepcopy(raw)
+        changed["step"][0][key] = value
+        _refused(path, changed, f"`{key}` is for slowclient only",
+                 f"{key} on a {raw['step'][0]['action']}")
+    gen = with_step(**base)
+    gen["step"][0]["on"] = "generator"
+    _refused(path, gen, "slowclient is for logit only", "a slowclient on the generator")
+    rand = copy.deepcopy(raw)
+    for key in ("cycle", "step", "expect"):
+        rand.pop(key, None)
+    rand["random"] = {"seed": 1, "gap": {"min": "60s", "max": "90s"},
+                      "fault": [{"weight": 1, "action": "slowclient", "on": "logit",
+                                 "for": {"min": "10s", "max": "20s"}}]}
+    _refused(path, rand, "slowclient takes `address`, `mode`, and `connections`, which a "
+             "[random] fault can't set", "a slowclient in a [random] schedule")
+    expect("slowclient" in scenario.PYTHON_ACTIONS
+           and set(scenario.FILE_ACTIONS) <= set(scenario.PYTHON_ACTIONS),
+           "the driver pulls the python image for a slowclient step as for a file action")
+
+
 class _CgroupDocker:
     """Records each `run_oneshot` call and answers with the next of `answers`; `inspect` answers
     with the container's `Id` and `state`, which a test changes between calls."""
@@ -16731,7 +17105,8 @@ def run(root, quiet=False):
                      _signal_rules, _signal_actions, _sighup_driver,
                      _reopen_checks, _tls_rules, _tls_actions, _tls_driver, _tls_checks,
                      _reset_actions, _reset_rules, _prlimit_actions, _prlimit_rules,
-                     _cgroup_actions, _cgroup_rules,
+                     _cgroup_actions, _cgroup_rules, _slowclient_client,
+                     _slowclient_actions, _slowclient_rules,
                      _fan_out_ledger, _idle_writer, _boundary_skew, _fan_out_rules,
                      _sampling_vectors, _absent_rules, _absent_checks, _merge_ledger,
                      _merge_rules, _delta_ledger, _delta_rules, _scrape_ledger,
@@ -16758,7 +17133,7 @@ def run(root, quiet=False):
                               _overlap_rules, _overlap_driver, _idp_rules, _signal_rules,
                               _sighup_driver,
                               _tls_rules, _tls_driver, _reset_rules, _prlimit_rules,
-                              _cgroup_rules,
+                              _cgroup_rules, _slowclient_rules,
                               _fan_out_rules, _sampling_vectors,
                               _absent_rules, _merge_rules, _delta_rules, _scrape_rules)
                 part(root) if part in takes_root else part()
