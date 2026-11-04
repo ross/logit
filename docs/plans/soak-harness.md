@@ -3202,16 +3202,18 @@ Docker 29.9, SELinux enforcing) checked each fault's mechanism before it was pla
     cause reaches: a full listener refuses a new connection before any TLS accept and counts
     `logit.input.connections.rejected{reason="limit"}`, on the TCP driver and the HTTP
     listeners alike; a trickling client is past its first byte, so `handshake_timeout:` no
-    longer bounds it, and `idle_timeout:`, when the scenario sets it, bounds it only on the
-    HTTP listeners, whose clock re-arms when a request finishes, counted
-    `connections.closed{reason="idle"}`, while the TCP driver re-arms its clock on every read
-    that returns bytes, so a byte sent faster than `idle_timeout:` holds the slot until the
-    client leaves; and a first-byte timeout under `handshake_timeout:` shows only as the
+    longer bounds it, and `idle_timeout:`, when the scenario sets it, bounds it only in an HTTP
+    request's head, where the clock re-arms only when a request finishes, counted
+    `connections.closed{reason="idle"}`; an HTTP body is read under a per-frame stall bound and
+    the TCP driver re-arms its clock on every read that returns bytes, so in either a byte sent
+    faster than `idle_timeout:` holds the slot until the client leaves or, for a body, the size
+    cap; and a first-byte timeout under `handshake_timeout:` shows only as the
     `connection_error` diagnostic, with no counter yet, so W34 judges it from stderr unless the
     fixing session's `connections.closed{reason="handshake_timeout"}` has landed. Rows: `connections.rejected{reason="limit"}`
     above 0 while the slow clients hold every slot; `connections.closed{reason="idle"}` for
-    the trickle on an HTTP listener and for the half-open peers on both, since they send
-    nothing; on the TCP listener, the trickle holding its slot with no close, pinned as the
+    a trickled HTTP request head and for the half-open peers on both listeners, since they send
+    nothing; a trickled HTTP body and a TCP trickle each holding its slot with no close, pinned
+    as the
     limit [ADR `deployment-threat-model`](../adr/deployment-threat-model.md) documents ("A
     stalled or dribbled body holds its connection permit"), not a new finding; the generator's wire loss at 0 with its connection opened before the slots fill (a
     redial in that phase is refused, and allowed for); and no descriptor growth after.
