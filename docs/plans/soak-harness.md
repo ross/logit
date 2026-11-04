@@ -7005,8 +7005,5 @@ Every row of the three runs passed.
   `soak/round3-followups`.
 - No product finding.
 
-These plan passages describe `otlp_in` before the change and are now stale: the
-`ledger.intake` paragraph's "`otlp_in` counts no requests and never answers busy" (section 6,
-`wire = "http"`), item 14's "no request identity" for `otlp_in`'s rows, W13b's finding "The
-backend stop backed up to the generator, as `otlp_in` has no busy answer", and the
-`otlp_in counts no requests` lines in W13b's and W23's recorded tables.
+The `otlp_in counts no requests` lines in W13b's and W23's recorded tables describe `otlp_in`
+before the change; they're left as recorded.
