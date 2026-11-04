@@ -1,6 +1,6 @@
 ---
 created: 2026-10-13
-updated: 2026-11-02
+updated: 2026-11-03
 ---
 
 # Telemetry loss vocabulary: any nonzero `*.dropped` is loss, and intended outcomes use other words
@@ -539,6 +539,17 @@ only its copy in the pipeline is lost.
 [internal-telemetry.md](../design/internal-telemetry.md)'s "Logs" section carries the same
 statement.
 
+## Amendment (2026-11-03): a stream sink's unacknowledged bytes
+
+A stream sink's TCP connection that ends with its data destroyed (the receiver's reset or close,
+unsolicited bytes, a TLS alert, or a failed write) counts the bytes of earlier batches its socket
+still held unacknowledged as `output.bytes.dropped{reason="unacknowledged"}`, with a throttled
+`warn` keyed `unacknowledged` in the same branch
+([ADR `stream-sink-stalled-connection`](stream-sink-stalled-connection.md)). It's loss: those
+batches were counted sent. The unit is bytes, as for `input.bytes.dropped`, because the socket's
+queue doesn't know message boundaries. A connection closed on a stall or at shutdown counts
+nothing, because the kernel keeps sending what it holds and the receiver may still read it.
+
 ## Migration record
 The classification of every `*.dropped`, `*.skipped`, `*.degraded`, `*.truncated`, and loss-related
 `*.rejected` name and reason that existed on 2026-10-13, verified against the emit sites in
@@ -556,6 +567,7 @@ row reading "unchanged" keeps its name and every reason listed.
 | network listeners | `input.connections.rejected` (`limit`, `proxy_header`) | unchanged |
 | HTTP listeners | `input.requests.rejected` (every reason) | unchanged |
 | `datadog_in`, `datadog_trace_in`, `splunk_hec_in` | `input.batches.dropped` (`busy`) | `input.batches.deferred` (untagged) |
+| `otlp_in` | none: it answered no request busy until [ADR `otlp-in-busy-answer`](otlp-in-busy-answer.md) | `input.batches.deferred` (untagged), for every batch of a request answered busy |
 | `kafka_in` | none: the component postdates this record | `input.batches.deferred` (untagged), for a batch left uncommitted at a revoke's or shutdown's drain deadline; this record's 2026-10-30 amendment |
 | HTTP listeners, `tail_in`, `docker_in`, `logit_in` | `input.batches.dropped` (`closed_consumer`, `rejected`) | unchanged |
 | `splunk_hec_in` | `input.acks.dropped` (`expired`) | `input.acks.evicted` (`expired`) |

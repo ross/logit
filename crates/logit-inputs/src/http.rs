@@ -669,8 +669,8 @@ where
     }
 }
 
-/// Sends `batches` in order under one deadline, `busy_after` from now: the bounded wait both
-/// Datadog listeners answer `503` after (`crate::datadog`'s "Backpressure" section). Each batch
+/// Sends `batches` in order under one deadline, `busy_after` from now: the bounded wait a listener
+/// answers busy after (`crate::datadog`'s "Backpressure" section). Each batch
 /// reaches every consumer or none ([`logit_pipeline::Fanout::send_with_deadline`]). The `Err`
 /// counts the refused batch and every one after it: [`Undelivered::Busy`] for a deadline that
 /// passed, [`Undelivered::Closed`] for a batch no consumer took.
@@ -689,6 +689,61 @@ pub(crate) async fn deliver_with_deadline(
         }
     }
     Ok(())
+}
+
+/// Sends a request's first batch through [`deliver_with_deadline`] under `busy_after`, then the
+/// rest through [`deliver_detached`]: the shape of a listener that answers busy only while nothing
+/// of the request is taken (`splunk_hec_in`, `otlp_in`). Once a batch is delivered, a busy answer
+/// would tell the client nothing was taken, and its retry would deliver that batch twice, so the
+/// rest wait for as long as the pipeline takes.
+///
+/// [`Undelivered::Busy`] carries every batch of the request and is the caller's to count and
+/// answer: nothing was sent, and the client still holds the body. Every [`Undelivered::Closed`]
+/// outcome reaches `settle` first, the first batch's refusal inline and a later one on the
+/// delivery's task, so the caller counts a closed consumer there alone. `accepted` runs once the
+/// first batch is in every inbox, before the rest are offered, and [`Unfinished::taken`] says
+/// whether it ran. Empty `batches` is `Ok` and runs neither callback.
+pub(crate) async fn deliver_first_bounded<F>(
+    sink: &logit_pipeline::Fanout,
+    batches: Vec<logit_core::EventBatch>,
+    busy_after: std::time::Duration,
+    accepted: impl FnOnce(),
+    settle: F,
+) -> Result<(), Unfinished>
+where
+    F: FnOnce(Result<(), Undelivered>) + Send + 'static,
+{
+    if batches.is_empty() {
+        return Ok(());
+    }
+    let total = batches.len();
+    let mut batches = batches.into_iter();
+    let first: Vec<logit_core::EventBatch> = batches.by_ref().take(1).collect();
+    match deliver_with_deadline(sink, first, busy_after).await {
+        Ok(()) => {
+            accepted();
+            deliver_detached(sink, batches.collect(), settle)
+                .await
+                .map_err(|undelivered| Unfinished { undelivered, taken: true })
+        }
+        Err(Undelivered::Busy(_)) => {
+            Err(Unfinished { undelivered: Undelivered::Busy(total), taken: false })
+        }
+        Err(Undelivered::Closed(_)) => {
+            let undelivered = Undelivered::Closed(total);
+            settle(Err(undelivered));
+            Err(Unfinished { undelivered, taken: false })
+        }
+    }
+}
+
+/// A request [`deliver_first_bounded`] didn't finish delivering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Unfinished {
+    /// The batches left undelivered, the refused one included.
+    pub(crate) undelivered: Undelivered,
+    /// Whether the first batch reached every inbox, so a client's retry repeats it.
+    pub(crate) taken: bool,
 }
 
 /// One listener's `auth:` or `bind_auth:` check ([`logit_proto::auth`]), with what it reports

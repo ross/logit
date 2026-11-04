@@ -1,6 +1,7 @@
 //! The pooled-stream send driver `statsd_out`, `syslog_out`, and `graphite_out` share: one
 //! connection kept between batches, dialed lazily over TCP, TCP with TLS, or a Unix stream, and
-//! one frame written per `send` (ADR `sink-send-path-and-attempt-accounting`, decisions 4 to 6).
+//! one frame written per `send` (ADR `sink-send-path-and-attempt-accounting`, decisions 4 to 6,
+//! and ADR `stream-sink-stalled-connection`).
 //!
 //! A caller builds the frame with its own framing and counts its own encode-side and per-message
 //! results; [`PooledStream::send`] sees only the bytes. A stream has no application response, so
@@ -15,13 +16,16 @@
 //! | that connection: an alert before the first write (`certificate_required`, `bad_certificate`, any other) | `Refused`, not retried inside `send` | the server rejected the client certificate or the handshake, so a redial would be rejected the same way | `syslog::tests::tls_tcp_without_a_client_certificate_delivers_nothing_to_a_client_ca_requiring_collector`, `statsd::tests::tls_tcp_without_a_client_certificate_is_refused_by_a_client_ca_requiring_collector` |
 //! | that connection: a close before the first write (EOF, `close_notify`, a reset, another read error), tickets or none before it | `Refused`, not retried inside `send` | a server that checks the certificate in its own code after the handshake turns the client away by closing, often with no alert | `a_close_after_session_tickets_is_refused_and_data_is_clean`, `a_resumed_dial_to_a_server_that_asked_for_a_certificate_waits_and_reads_a_close` |
 //! | that connection: data from the server before the first write | `Clean`, not retried inside `send` | no byte of the frame left, the bytes are already off the stream, and a line receiver never sends any | `a_close_after_session_tickets_is_refused_and_data_is_clean` |
-//! | a reused connection's probe answers anything but open (EOF, unsolicited bytes, a reset) | no fault: the driver redials, and the redial doesn't consume the retry | the old connection was dead before this frame | `a_reused_connection_that_probes_eof_is_redialed_and_the_retry_survives`, `a_reused_connection_that_probes_unsolicited_bytes_is_redialed_and_the_retry_survives`, `unix_stream_redials_when_the_probe_finds_the_pooled_connection_closed` |
-//! | a reused TLS connection's probe reads an alert | `Refused`, nothing written, no redial | the server ended the session, usually by rejecting the client certificate after the batch before this one was written; a silent redial would hide that | `a_reused_connection_that_probes_a_tls_alert_is_refused_and_never_redialed` |
+//! | a reused connection's probe answers anything but open (EOF, unsolicited bytes, a reset) | no fault: the driver counts what the connection lost (below) and redials, and the redial doesn't consume the retry | the old connection was dead before this frame | `a_reused_connection_that_probes_eof_is_redialed_and_the_retry_survives`, `a_reused_connection_that_probes_unsolicited_bytes_is_redialed_and_the_retry_survives`, `unix_stream_redials_when_the_probe_finds_the_pooled_connection_closed` |
+//! | a reused TLS connection's probe reads an alert | `Refused`, nothing written, no redial; what the connection lost is counted | the server ended the session, usually by rejecting the client certificate after the batch before this one was written; a silent redial would hide that | `a_reused_connection_that_probes_a_tls_alert_is_refused_and_never_redialed` |
 //! | the plaintext first `write` fails (`Err`, or `Ok(0)` read as `WriteZero`) | retried once on a fresh connection; a second failure is `Clean` | a failed plaintext first write accepted nothing | `a_plaintext_first_write_error_is_retried_once_then_clean`, `a_plaintext_first_write_of_zero_bytes_is_write_zero_retried_once_then_clean`, `unix_stream_retries_a_first_write_the_peer_refused` |
-//! | the plaintext first `write` makes no progress for `connect_timeout` | `Clean`, the connection dropped | it accepted nothing | `a_stalled_plaintext_first_write_is_clean` |
+//! | the first `write`, plaintext or TLS, accepts nothing for `connect_timeout` | `Clean`, the connection kept | it accepted nothing: tokio-rustls answers `Pending` only when its session took nothing (`crate::stream_pins`) | `a_first_write_that_accepts_nothing_is_clean_and_keeps_the_connection`, `a_stalled_connection_is_kept_and_a_reset_counts_what_the_receiver_never_acknowledged` |
 //! | the TLS first `write` fails | `Ambiguous`, never retried | rustls may have put whole records on the wire first (below) | `a_tls_write_error_is_ambiguous_and_never_retried` |
 //! | the remainder's `write_all`, or the `flush`, fails, a reset mid-frame included | `Ambiguous`, never retried | part of the frame left, and a line receiver keeps every complete line it got | `a_remainder_failure_after_a_short_first_write_is_ambiguous_and_never_resent`, `a_flush_failure_after_a_complete_write_is_ambiguous_and_drops_the_connection`, `a_real_reset_mid_frame_is_ambiguous` |
-//! | any other write, or the flush, makes no progress for `connect_timeout` | `Ambiguous`, the connection dropped | part of the frame may have left | `a_write_that_makes_no_progress_fails_ambiguous_and_the_next_send_dials_fresh` |
+//! | any other write, or the flush, makes no progress for `connect_timeout` | `Ambiguous`, the connection kept with the frame's unwritten tail | part of the frame left; the tail goes before the next frame, so the receiver never sees a frame cut and another begun | `a_write_that_stalls_mid_frame_is_ambiguous_and_its_tail_goes_first_on_the_kept_connection`, `a_stalled_tls_connection_is_kept_and_a_reset_counts_a_loss` |
+//! | a kept connection's unwritten tail makes no progress for `connect_timeout` | `Clean`, the connection kept with what is left of the tail | nothing of this frame was written | `a_write_that_stalls_mid_frame_is_ambiguous_and_its_tail_goes_first_on_the_kept_connection` |
+//! | a kept connection's unwritten tail fails to write | no fault: the driver counts what the connection lost, redials, and writes the frame there; the redial doesn't consume the retry | nothing of this frame was written | `a_pending_tail_that_fails_is_dropped_and_the_frame_goes_on_a_fresh_connection` |
+//! | any stall above, on a TCP connection whose peer isn't answering ([`sockstat::tcp_peer_answering`]) | the stall's class; the connection dropped, nothing counted | a vanished or partitioned host never answers a window probe, and the kernel goes on sending what the socket holds after the close | `sockstat`'s `a_receiver_that_stopped_reading_still_answers_window_probes` and `the_peer_answers_while_nothing_is_retransmitted_and_one_probe_at_most_is_out` |
 //!
 //! **The acceptance wait.** Under TLS 1.3 a server checks the client certificate after the client's
 //! last handshake message, and may check it again in its own code after its TLS library has
@@ -43,25 +47,49 @@
 //! next send's probe reports an alert, or redials past a close, and the redial's own wait reads
 //! the rejection.
 //!
-//! `connect_timeout` bounds each write's progress as well as each dial phase
-//! ([`write_with_progress`]), so a peer that accepts the connection and stops reading fails the
-//! attempt instead of parking it until shutdown; a large frame on a slow link keeps making progress
-//! and never trips it (`a_slow_write_that_keeps_making_progress_is_never_cut`).
+//! **A receiver that stops reading.** `connect_timeout` bounds each write's progress as well as
+//! each dial phase ([`write_with_progress`]), so a peer that accepts the connection and stops
+//! reading fails the attempt instead of parking it until shutdown; a large frame on a slow link
+//! keeps making progress and never trips it (`a_slow_write_that_keeps_making_progress_is_never_cut`).
+//! The stalled connection is kept, with any unwritten tail of its frame, while its peer still
+//! answers. A redial would land in the frozen listener's accept backlog and fill a second buffer
+//! pair there, and a third on the next stall, all lost if the receiver dies; a kept connection
+//! puts at most one pair at risk (ADR `stream-sink-stalled-connection`). Under
+//! `at_least_once` the whole stalled batch is delivered twice once the receiver reads again: the
+//! kept connection finishes its frame, and the retry sends the frame whole.
+//!
+//! **Counting what a dropped connection lost.** When a connection ends with its data destroyed
+//! (a probe's EOF, reset, unsolicited bytes, or alert, or a failed write), the driver reads the
+//! TCP socket's unacknowledged send queue ([`sockstat::send_queue`]) before closing it and counts
+//! what earlier batches left there as `logit.output.bytes.dropped{reason="unacknowledged"}`, with
+//! a throttled `warn` keyed `unacknowledged`. Bytes of every frame an attempt returned
+//! `Ambiguous` for are left out ([`Sent::unaccounted`]), however many attempts ago: that batch
+//! is resent, or counted dropped under `at_most_once`. The count is on the sink's ungated handles, since it is the destination's
+//! verdict on earlier batches, not an encode outcome. Under TLS it is wire bytes, record framing
+//! included, and leaves out up to 64 KiB of ciphertext still queued in the session. Nothing is
+//! counted on a Unix stream, whose queue the receiver's close frees, on a stall, whose closed
+//! connection the kernel keeps sending, or on shutdown. A receiver that half-closes and keeps
+//! reading is overcounted: its FIN reads as a close.
 //!
 //! A TLS write `Err` is `Ambiguous` because rustls may have put whole records on the wire first.
 //! rustls splits what each session write accepted into records of at most 16384 bytes of
 //! plaintext, with no regard for line or message boundaries, so a record can end mid-line, but a
 //! line or message stream's receiver keeps every complete line or message in what arrived
-//! (`crate::stream_pins` pins the tokio-rustls side). `flush` runs before a connection is pooled
-//! and before `Ok`, because a TLS write's `Ok` can leave ciphertext queued in the session.
+//! (`crate::stream_pins` pins the tokio-rustls side). `flush` runs before `Ok`, because a TLS
+//! write's `Ok` can leave ciphertext queued in the session; a connection kept after its flush
+//! stalled owes that flush, as an empty tail, before its next frame. A write the stall bound cut
+//! leaves any ciphertext it queued in the session, and the next write or flush sends it first.
 //!
 //! The connection is moved out of the pool for the whole attempt and put back only after the
-//! flush, so a `send` future dropped at any await leaves the pool empty and the next `send`
-//! dials fresh rather than write into a stream holding part of a frame.
+//! flush or a stall, so a `send` future dropped at any await leaves the pool empty and the next
+//! `send` dials fresh rather than write into a stream holding part of a frame it no longer knows.
+//! The shutdown flush finishes a kept tail under the same bound and drops the connection on a
+//! stall, so a frozen receiver can't hold shutdown.
 //!
-//! Counters: `logit.output.reconnects` on every successful dial after the first, and
-//! `logit.output.requests{class}` once per returned attempt ([`count_request`]). A dropped attempt
-//! counts no `requests`.
+//! Counters: `logit.output.reconnects` on every successful dial after the first,
+//! `logit.output.requests{class}` once per returned attempt ([`count_request`]), and
+//! `logit.output.bytes.dropped{reason="unacknowledged"}` above. A dropped attempt counts no
+//! `requests`.
 
 use std::future::poll_fn;
 use std::io;
@@ -72,8 +100,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use logit_core::{redact, Telemetry};
-use logit_pipeline::Fault;
+use logit_core::{redact, Diagnostics, Telemetry};
+use logit_pipeline::{sockstat, Fault};
 use rustls_pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpStream, UnixStream};
@@ -182,6 +210,14 @@ impl Dial<'_> {
 /// failure is `Fault::Clean`, except a TLS alert during the acceptance wait, which is
 /// `Fault::Refused`. Counts nothing, so `logit_out` can share it with its own accounting.
 pub(crate) async fn connect(dial: &Dial<'_>) -> anyhow::Result<Box<dyn AsyncStream>> {
+    connect_tcp_fd(dial).await.map(|(stream, _fd)| stream)
+}
+
+/// [`connect`], with the TCP socket's descriptor, taken before any TLS wrap; `None` for a Unix
+/// stream and a scripted one. It stays valid while the stream lives.
+async fn connect_tcp_fd(
+    dial: &Dial<'_>,
+) -> anyhow::Result<(Box<dyn AsyncStream>, Option<sockstat::RawFd>)> {
     let sink = dial.sink;
     match dial.target {
         Target::Tcp { endpoint, tls } => {
@@ -201,14 +237,15 @@ pub(crate) async fn connect(dial: &Dial<'_>) -> anyhow::Result<Box<dyn AsyncStre
                     .with_context(|| format!("setting TCP_NODELAY toward {sink} endpoint {shown}"))
                     .context(Fault::Clean)?;
             }
-            let Some(tls) = tls else { return Ok(Box::new(tcp)) };
+            let fd = sockstat::fd_of(&tcp);
+            let Some(tls) = tls else { return Ok((Box::new(tcp), fd)) };
             let (mut stream, _) = handshake(tls, tcp, dial.connect_timeout, sink).await?;
             let tls13 =
                 stream.get_ref().1.protocol_version() == Some(rustls::ProtocolVersion::TLSv1_3);
             if tls13 && tls.asks_for_client_cert() && !dial.accept_timeout.is_zero() {
                 await_acceptance(&mut stream, dial.accept_timeout, sink).await?;
             }
-            Ok(Box::new(stream))
+            Ok((Box::new(stream), fd))
         }
         Target::Unix { path } => {
             let unix = tokio::time::timeout(dial.connect_timeout, UnixStream::connect(path))
@@ -224,10 +261,10 @@ pub(crate) async fn connect(dial: &Dial<'_>) -> anyhow::Result<Box<dyn AsyncStre
                     r.with_context(|| format!("connecting to {sink} socket {}", path.display()))
                 })
                 .context(Fault::Clean)?;
-            Ok(Box::new(unix))
+            Ok((Box::new(unix), None))
         }
         #[cfg(test)]
-        Target::Scripted(script) => script.connect().await,
+        Target::Scripted(script) => Ok((script.connect().await?, None)),
     }
 }
 
@@ -335,39 +372,195 @@ pub(crate) async fn write_with_progress<W>(
 where
     W: AsyncWrite + Unpin + ?Sized,
 {
-    let mut written = 0;
-    while written < bytes.len() {
-        let end = bytes.len().min(written + WRITE_CHUNK);
-        let n = tokio::time::timeout(bound, stream.write(&bytes[written..end]))
+    write_counting(stream, bytes, bound, &mut 0).await
+}
+
+/// [`write_with_progress`], adding to `written` each byte a `write` call accepted, whatever the
+/// result: a stalled or failed call leaves the bytes before it accepted. An empty `bytes` only
+/// flushes.
+async fn write_counting<W>(
+    stream: &mut W,
+    bytes: &[u8],
+    bound: Duration,
+    written: &mut usize,
+) -> anyhow::Result<()>
+where
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    let mut done = 0;
+    while done < bytes.len() {
+        let end = bytes.len().min(done + WRITE_CHUNK);
+        let n = tokio::time::timeout(bound, stream.write(&bytes[done..end]))
             .await
             .map_err(|_elapsed| Stalled(bound))??;
         if n == 0 {
             return Err(io::Error::from(io::ErrorKind::WriteZero).into());
         }
-        written += n;
+        done += n;
+        *written += n;
     }
     tokio::time::timeout(bound, stream.flush()).await.map_err(|_elapsed| Stalled(bound))??;
     Ok(())
+}
+
+fn is_stall(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| e.is::<Stalled>())
+}
+
+/// TLS framing a record adds to its plaintext, at most: a 5-byte header, TLS 1.2 GCM's 8-byte
+/// explicit nonce, and a 16-byte tag. TLS 1.3 adds 22.
+const TLS_RECORD_OVERHEAD: usize = 29;
+
+/// rustls's plaintext fragment size: each record carries at most this much.
+const TLS_MAX_FRAGMENT: usize = 16384;
+
+/// rustls's cap on ciphertext queued in a session (`DEFAULT_BUFFER_LIMIT`).
+const TLS_SESSION_BUFFER: u64 = 64 * 1024;
+
+/// What ended a connection the driver abandons, for the warning that reports its lost bytes.
+#[derive(Clone, Copy)]
+enum Abandoned {
+    /// The probe of a reused connection read an EOF or a read error.
+    Closed,
+    /// The probe read bytes, and closing a connection with unread bytes sends a reset.
+    Unsolicited,
+    /// The probe read a TLS alert.
+    Alert,
+    /// A write or flush failed.
+    WriteFailed,
+}
+
+impl std::fmt::Display for Abandoned {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Closed => "the destination closed or reset the connection",
+            Self::Unsolicited => "the destination sent bytes, so closing the connection reset it",
+            Self::Alert => "the TLS destination ended the session with an alert",
+            Self::WriteFailed => "a write to the destination failed",
+        })
+    }
+}
+
+/// A pooled connection and what the driver tracks beside it.
+struct Conn {
+    stream: Box<dyn AsyncStream>,
+    /// The TCP socket under `stream`, for [`sockstat::tcp_peer_answering`] and
+    /// [`sockstat::send_queue`]. `None` on a Unix stream, which is kept and never counted.
+    tcp_fd: Option<sockstat::RawFd>,
+    /// What a stalled attempt didn't get into `stream`: the rest of its frame, or nothing but a
+    /// flush. The next attempt finishes it before writing its own frame, so the receiver never
+    /// sees a frame cut and another begun.
+    pending: Option<Vec<u8>>,
+    /// What `stream` has accepted, and which of it no batch's own accounting covers.
+    sent: Sent,
+}
+
+impl Conn {
+    fn new(stream: Box<dyn AsyncStream>, tcp_fd: Option<sockstat::RawFd>) -> Self {
+        Self { stream, tcp_fd, pending: None, sent: Sent::default() }
+    }
+
+    /// The connection's send queue, if it is TCP and the kernel answers.
+    fn queued(&self) -> Option<u32> {
+        self.tcp_fd.and_then(|fd| sockstat::send_queue(fd).ok())
+    }
+}
+
+/// The bytes a connection's stream accepted, and the stream offsets of each frame an attempt
+/// returned `Ambiguous` for that may still be in the send queue. Each such batch is resent, or
+/// counted dropped under `at_most_once`, so its bytes aren't counted again as unacknowledged.
+/// A frame cut by a failed write needs no pruning: the abandon that follows reads the queue.
+#[derive(Default)]
+struct Sent {
+    /// Bytes accepted over the connection's life: plaintext under TLS.
+    total: u64,
+    /// In stream order. The last is the frame a kept connection's pending tail belongs to.
+    ambiguous: Vec<std::ops::Range<u64>>,
+}
+
+impl Sent {
+    fn wrote(&mut self, n: usize) {
+        self.total += n as u64;
+    }
+
+    /// `n` more bytes of the pending tail, which belongs to the last `Ambiguous` frame.
+    fn wrote_tail(&mut self, n: usize) {
+        self.wrote(n);
+        if let Some(last) = self.ambiguous.last_mut() {
+            last.end = self.total;
+        }
+    }
+
+    /// Records `range` as an `Ambiguous` frame's and forgets every earlier one `queued` shows
+    /// has left the send queue. With no queue reading, only `range` is kept: a connection whose
+    /// queue can't be read counts nothing when abandoned.
+    fn ambiguous(&mut self, range: std::ops::Range<u64>, queued: Option<u32>, tls: bool) {
+        match queued {
+            Some(queued) => {
+                let total = self.total;
+                self.ambiguous.retain(|range| in_queue(total, range, queued, tls));
+            }
+            None => self.ambiguous.clear(),
+        }
+        self.ambiguous.push(range);
+    }
+
+    /// The unacknowledged bytes `queued` holds that no batch's own accounting covers: `queued`
+    /// less each `Ambiguous` range's part still in it. On plaintext the queue is the last
+    /// `queued` bytes sent, so each overlap is computed. Under TLS each range still in reach is
+    /// taken out whole, with the most framing it could carry.
+    fn unaccounted(&self, queued: u32, tls: bool) -> u64 {
+        let queue_start = self.total.saturating_sub(u64::from(queued));
+        let overlap: u64 = self
+            .ambiguous
+            .iter()
+            .filter(|range| in_queue(self.total, range, queued, tls))
+            .map(|range| {
+                if tls {
+                    let len = (range.end - range.start) as usize;
+                    let records = len.div_ceil(TLS_MAX_FRAGMENT) + len.div_ceil(WRITE_CHUNK) + 1;
+                    (len + records * TLS_RECORD_OVERHEAD) as u64
+                } else {
+                    range.end.saturating_sub(range.start.max(queue_start))
+                }
+            })
+            .sum();
+        u64::from(queued).saturating_sub(overlap)
+    }
+}
+
+/// Whether any of `range` can still be in a send queue holding `queued` bytes, `total` bytes
+/// into the stream. The queue only drains from the front, so a range that left it never
+/// returns. Under TLS `queued` is ciphertext and up to [`TLS_SESSION_BUFFER`] more may wait in
+/// the session.
+fn in_queue(total: u64, range: &std::ops::Range<u64>, queued: u32, tls: bool) -> bool {
+    let reach = u64::from(queued) + if tls { TLS_SESSION_BUFFER } else { 0 };
+    total.saturating_sub(range.end) < reach
 }
 
 /// A sink's pooled connection. `has_connected_once` lives here, not on the sink, because a sink
 /// holds one transport for its life, so no other arm dials under the same sink.
 #[derive(Default)]
 pub(crate) struct PooledStream {
-    stream: Option<Box<dyn AsyncStream>>,
+    conn: Option<Conn>,
     has_connected_once: bool,
+    /// Set once a kernel read reported itself unavailable, so that is reported once.
+    kernel_reads_reported: bool,
 }
 
 impl PooledStream {
     /// Writes `frame` (non-empty) on the pooled connection or a fresh one, with the module doc's
-    /// fault rules, and counts `logit.output.requests` for the attempt.
+    /// fault rules, and counts `logit.output.requests` for the attempt. `telemetry` and `diag`
+    /// are the sink's ungated handles: the bytes an abandoned connection lost are a destination
+    /// verdict, counted once whatever batch is being attempted.
     pub(crate) async fn send(
         &mut self,
         dial: &Dial<'_>,
         frame: &[u8],
         telemetry: &Telemetry,
+        diag: &mut Diagnostics,
     ) -> anyhow::Result<()> {
-        let result = self.attempt(dial, frame, telemetry).await;
+        let result = self.attempt(dial, frame, telemetry, diag).await;
         count_request(telemetry, &result);
         result
     }
@@ -377,23 +570,32 @@ impl PooledStream {
         dial: &Dial<'_>,
         frame: &[u8],
         telemetry: &Telemetry,
+        diag: &mut Diagnostics,
     ) -> anyhow::Result<()> {
+        let bound = dial.connect_timeout;
+        let tls = dial.is_tls();
         let mut retried = false;
         loop {
-            let mut conn = match self.stream.take() {
+            let mut conn = match self.conn.take() {
                 // Only a reused connection is probed. The probe never suspends, so a dropped
                 // `send` can't stop inside it.
                 Some(mut conn) => {
-                    let probed = poll_pending_close_or_alert(&mut *conn, &mut [0u8; 1]).await;
+                    let probed =
+                        poll_pending_close_or_alert(&mut *conn.stream, &mut [0u8; 1]).await;
                     match probed {
                         Ok(PendingClose::Open) => conn,
-                        Ok(PendingClose::Eof | PendingClose::Bytes(_)) => {
-                            drop(conn);
+                        Ok(PendingClose::Eof) => {
+                            self.abandon(conn, Abandoned::Closed, tls, telemetry, diag);
+                            self.dial(dial, telemetry).await?
+                        }
+                        Ok(PendingClose::Bytes(_)) => {
+                            self.abandon(conn, Abandoned::Unsolicited, tls, telemetry, diag);
                             self.dial(dial, telemetry).await?
                         }
                         // A redial would hide a rejection that already cost the batch written
                         // on this connection.
                         Err(alert) => {
+                            self.abandon(conn, Abandoned::Alert, tls, telemetry, diag);
                             return Err(anyhow::anyhow!(
                                 "{}: the TLS peer sent alert {} on a pooled connection: it \
                                  rejected the client certificate or ended the session",
@@ -407,86 +609,200 @@ impl PooledStream {
                 None => self.dial(dial, telemetry).await?,
             };
 
-            let bound = dial.connect_timeout;
-            let first = match tokio::time::timeout(bound, conn.write(frame)).await {
-                // The peer stopped reading. A plaintext `write` that stayed pending handed the
-                // kernel nothing, so it's `Clean`, as a failed one is below; a TLS session may
-                // hold part of the frame, so there it's `Ambiguous`. No retry inside `send`
-                // either way: the peer that stalled this write would stall the next.
-                Err(_elapsed) => {
-                    let fault = if dial.is_tls() { Fault::Ambiguous } else { Fault::Clean };
-                    return Err(anyhow::Error::new(Stalled(bound))
-                        .context(format!("{}: writing a frame", dial.sink))
-                        .context(fault));
-                }
-                Ok(Ok(0)) if !frame.is_empty() => {
-                    Err(io::Error::new(io::ErrorKind::WriteZero, "wrote zero bytes"))
-                }
-                Ok(other) => other,
-            };
-            match first {
-                Ok(n) => {
-                    return match write_with_progress(&mut *conn, &frame[n..], bound).await {
-                        Ok(()) => {
-                            self.stream = Some(conn);
-                            Ok(())
-                        }
-                        // Part of the frame may be at the peer; the connection is dropped.
-                        Err(err) => Err(err
-                            .context(format!("{}: writing a frame", dial.sink))
-                            .context(Fault::Ambiguous)),
-                    };
-                }
-                // A plaintext `write(2)` that failed accepted nothing of this frame.
-                Err(_) if !dial.is_tls() && !retried => retried = true,
-                Err(err) => {
-                    let fault = if dial.is_tls() { Fault::Ambiguous } else { Fault::Clean };
-                    return Err(anyhow::Error::new(err)
-                        .context(format!("{}: writing a frame", dial.sink))
-                        .context(fault));
+            // An earlier attempt's frame goes first.
+            if let Some(tail) = conn.pending.take() {
+                let mut written = 0;
+                let result = write_counting(&mut *conn.stream, &tail, bound, &mut written).await;
+                conn.sent.wrote_tail(written);
+                match result {
+                    Ok(()) => {}
+                    // Nothing of this frame was written.
+                    Err(err) if is_stall(&err) => {
+                        conn.pending = Some(tail[written..].to_vec());
+                        let err = err.context(format!(
+                            "{}: finishing the frame an earlier attempt left part-written",
+                            dial.sink
+                        ));
+                        return self.keep_stalled(conn, err, Fault::Clean, diag);
+                    }
+                    // Nothing of this frame was written either, so it goes on a fresh
+                    // connection, and that doesn't consume the retry.
+                    Err(_) => {
+                        self.abandon(conn, Abandoned::WriteFailed, tls, telemetry, diag);
+                        conn = self.dial(dial, telemetry).await?;
+                    }
                 }
             }
+
+            let start = conn.sent.total;
+            let mut written = 0;
+            let result = write_counting(&mut *conn.stream, frame, bound, &mut written).await;
+            conn.sent.wrote(written);
+            let err = match result {
+                Ok(()) => {
+                    self.conn = Some(conn);
+                    return Ok(());
+                }
+                Err(err) => err.context(format!("{}: writing a frame", dial.sink)),
+            };
+            if is_stall(&err) {
+                // The peer stopped reading. A write that stayed pending handed the stream
+                // nothing, plaintext or TLS (tokio-rustls answers `Pending` only when its
+                // session took nothing), so with nothing accepted the frame never left.
+                if written == 0 {
+                    return self.keep_stalled(conn, err, Fault::Clean, diag);
+                }
+                let queued = conn.queued();
+                conn.sent.ambiguous(start..conn.sent.total, queued, tls);
+                conn.pending = Some(frame[written..].to_vec());
+                return self.keep_stalled(conn, err, Fault::Ambiguous, diag);
+            }
+            // A plaintext `write(2)` that failed accepted nothing of this frame. Under TLS the
+            // failed call's chunk may have left as whole records first.
+            let accepted_nothing = written == 0 && !tls;
+            let reached = if tls { (written + WRITE_CHUNK).min(frame.len()) } else { written };
+            conn.sent.ambiguous.push(start..start + reached as u64);
+            self.abandon(conn, Abandoned::WriteFailed, tls, telemetry, diag);
+            if accepted_nothing && !retried {
+                retried = true;
+                continue;
+            }
+            let fault = if accepted_nothing { Fault::Clean } else { Fault::Ambiguous };
+            return Err(err.context(fault));
         }
     }
 
-    async fn dial(
+    /// Pools `conn` after a stall, unless its TCP peer isn't answering
+    /// ([`sockstat::tcp_peer_answering`]): a vanished host is closed, as a redial would find
+    /// nothing better, and the kernel keeps sending what it holds. Returns `err` under `fault`.
+    fn keep_stalled(
         &mut self,
-        dial: &Dial<'_>,
+        conn: Conn,
+        err: anyhow::Error,
+        fault: Fault,
+        diag: &mut Diagnostics,
+    ) -> anyhow::Result<()> {
+        let answering = match conn.tcp_fd.map(sockstat::tcp_peer_answering) {
+            None | Some(Ok(true)) => true,
+            Some(Ok(false)) => false,
+            // Kept: a dead peer still ends in a write error once the kernel gives up.
+            Some(Err(unavailable)) => {
+                self.report_unavailable(&unavailable, diag);
+                true
+            }
+        };
+        let err = if answering {
+            self.conn = Some(conn);
+            err.context("the destination stopped reading; the connection is kept")
+        } else {
+            err.context("the destination stopped answering; the connection is closed")
+        };
+        Err(err.context(fault))
+    }
+
+    /// Drops `conn`, which `cause` ended with its unacknowledged bytes destroyed, and counts
+    /// them ([`Sent::unaccounted`]) as `logit.output.bytes.dropped{reason="unacknowledged"}`
+    /// with a throttled warning. Reads the send queue before the drop closes the socket.
+    fn abandon(
+        &mut self,
+        conn: Conn,
+        cause: Abandoned,
+        tls: bool,
         telemetry: &Telemetry,
-    ) -> anyhow::Result<Box<dyn AsyncStream>> {
-        let conn = connect(dial).await?;
+        diag: &mut Diagnostics,
+    ) {
+        let Some(fd) = conn.tcp_fd else { return };
+        match sockstat::send_queue(fd) {
+            Ok(queued) => {
+                let lost = conn.sent.unaccounted(queued, tls);
+                if lost > 0 {
+                    telemetry.count(
+                        "logit.output.bytes.dropped",
+                        lost as f64,
+                        &[("reason", "unacknowledged")],
+                    );
+                    diag.warn_throttled(
+                        "unacknowledged",
+                        format_args!(
+                            "{cause}: {lost} bytes of earlier batches the destination never \
+                             acknowledged are lost"
+                        ),
+                    );
+                }
+            }
+            Err(unavailable) => self.report_unavailable(&unavailable, diag),
+        }
+    }
+
+    /// Reports once that a kernel read isn't available, at `debug` off Linux, where nothing
+    /// can be done about it, and at `warn` otherwise.
+    fn report_unavailable(&mut self, unavailable: &sockstat::Unavailable, diag: &Diagnostics) {
+        if std::mem::replace(&mut self.kernel_reads_reported, true) {
+            return;
+        }
+        let message = format_args!(
+            "the kernel's per-connection send counters are not available: {unavailable}; bytes a \
+             destination never acknowledged are not counted in logit.output.bytes.dropped, and a \
+             stalled connection is kept whether or not its peer still answers"
+        );
+        if matches!(
+            unavailable,
+            sockstat::Unavailable::NotLinux | sockstat::Unavailable::NoDescriptor
+        ) {
+            diag.debug(message);
+        } else {
+            diag.warn(message);
+        }
+    }
+
+    async fn dial(&mut self, dial: &Dial<'_>, telemetry: &Telemetry) -> anyhow::Result<Conn> {
+        let (stream, fd) = connect_tcp_fd(dial).await?;
         if self.has_connected_once {
             telemetry.count("logit.output.reconnects", 1.0, &[]);
         } else {
             self.has_connected_once = true;
         }
-        Ok(conn)
+        Ok(Conn::new(stream, fd))
     }
 
-    /// Flushes the pooled connection, if any. `send` already flushed it, so this is the
-    /// shutdown backstop `Output::flush` calls.
-    pub(crate) async fn flush(&mut self) -> io::Result<()> {
-        match &mut self.stream {
-            Some(stream) => stream.flush().await,
-            None => Ok(()),
+    /// The shutdown backstop `Output::flush` calls: finishes the pooled connection's unwritten
+    /// tail, if any, and flushes it, each step bounded by `bound`. A stall or a failure drops the
+    /// connection, uncounted: what it held may still reach a receiver that resumes reading.
+    pub(crate) async fn flush(&mut self, bound: Duration) -> anyhow::Result<()> {
+        let Some(conn) = &mut self.conn else { return Ok(()) };
+        let tail = conn.pending.take().unwrap_or_default();
+        let result = write_counting(&mut *conn.stream, &tail, bound, &mut 0).await;
+        if result.is_err() {
+            self.conn = None;
         }
+        result
     }
 
     /// A pool holding `stream`, as after a first successful dial.
     #[cfg(test)]
     pub(crate) fn pooled(stream: Box<dyn AsyncStream>) -> Self {
-        Self { stream: Some(stream), has_connected_once: true }
+        Self {
+            conn: Some(Conn::new(stream, None)),
+            has_connected_once: true,
+            kernel_reads_reported: false,
+        }
     }
 
     /// The pooled connection, for a test that breaks it in place.
     #[cfg(test)]
     pub(crate) fn stream_mut(&mut self) -> Option<&mut Box<dyn AsyncStream>> {
-        self.stream.as_mut()
+        self.conn.as_mut().map(|conn| &mut conn.stream)
     }
 
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
-        self.stream.is_none()
+        self.conn.is_none()
+    }
+
+    /// The unwritten tail the pooled connection holds, if any.
+    #[cfg(test)]
+    fn pending(&self) -> Option<&[u8]> {
+        self.conn.as_ref()?.pending.as_deref()
     }
 }
 
@@ -523,6 +839,80 @@ mod tests {
 
     fn connect_to(fake: &FakeStream) -> DialStep {
         DialStep::Connect(Box::new(fake.clone()))
+    }
+
+    /// A connection's ledger after an `Ambiguous` stall on frame A (100 bytes, 40 written), a
+    /// later attempt that finishes A's tail and writes batch B (50 bytes) whole, and an
+    /// `Ambiguous` stall on frame C (80 bytes, 30 written) with all 180 bytes still queued.
+    fn two_stalls_around_a_success(queued_at_second_stall: u32) -> Sent {
+        let mut sent = Sent::default();
+        sent.wrote(40);
+        sent.ambiguous(0..40, Some(40), false);
+        sent.wrote_tail(60);
+        sent.wrote(50);
+        sent.wrote(30);
+        sent.ambiguous(150..180, Some(queued_at_second_stall), false);
+        sent
+    }
+
+    #[test]
+    fn every_ambiguous_frame_still_queued_is_left_out_of_the_unacknowledged_count() {
+        let sent = two_stalls_around_a_success(180);
+        assert_eq!(sent.unaccounted(180, false), 50, "only B's bytes are unaccounted");
+        assert_eq!(sent.unaccounted(120, false), 50, "A's last 40 bytes, B, and C's 30");
+        assert_eq!(sent.unaccounted(20, false), 0, "only part of C is queued");
+    }
+
+    #[test]
+    fn a_resent_frame_after_its_finished_tail_leaves_both_out() {
+        // Frame A stalls after 40 of 100 bytes; the next attempt finishes its tail and then
+        // stalls after 20 bytes of A's resend.
+        let mut sent = Sent::default();
+        sent.wrote(40);
+        sent.ambiguous(0..40, Some(40), false);
+        sent.wrote_tail(60);
+        sent.wrote(20);
+        sent.ambiguous(100..120, Some(120), false);
+        assert_eq!(sent.unaccounted(120, false), 0);
+    }
+
+    #[test]
+    fn an_ambiguous_frame_that_left_the_queue_is_forgotten() {
+        // At the second stall only C's 30 bytes are queued, so A has left the queue.
+        let sent = two_stalls_around_a_success(30);
+        assert_eq!((sent.ambiguous.len(), sent.ambiguous.first()), (1, Some(&(150..180))));
+        assert_eq!(sent.unaccounted(30, false), 0);
+
+        let mut unread = Sent::default();
+        unread.ambiguous(0..10, None, false);
+        unread.wrote(10);
+        unread.ambiguous(10..20, None, false);
+        assert_eq!(
+            (unread.ambiguous.len(), unread.ambiguous.first()),
+            (1, Some(&(10..20))),
+            "with no queue reading, only the last is kept"
+        );
+    }
+
+    #[test]
+    fn a_tls_ambiguous_frame_is_left_out_whole_with_its_most_framing() {
+        // Batch B (500 bytes) whole, then frame A (1,000 bytes) cut. A spans one record and one
+        // write call, so it is taken out as 1,000 bytes plus three records' framing.
+        let mut sent = Sent::default();
+        sent.wrote(500);
+        sent.wrote(1000);
+        sent.ambiguous(500..1500, Some(2000), true);
+        assert_eq!(sent.unaccounted(2000, true), 2000 - (1000 + 3 * 29));
+    }
+
+    #[test]
+    fn a_tls_ambiguous_frame_too_far_back_for_the_queue_and_a_session_is_not_left_out() {
+        // 200,000 bytes followed A, more than the 1,000 queued and a full 64 KiB session.
+        let mut sent = Sent::default();
+        sent.wrote(100);
+        sent.ambiguous(0..100, Some(100), true);
+        sent.wrote(200_000);
+        assert_eq!(sent.unaccounted(1000, true), 1000);
     }
 
     fn sink_telemetry() -> (TelemetryProbe, Telemetry) {
@@ -571,7 +961,10 @@ mod tests {
         // counted reconnect would show, and so would the closed connection put back.
         let mut pool = PooledStream::pooled(Box::new(FakeStream::new().reading(ReadStep::Eof)));
 
-        let err = pool.send(&dial, FRAME, &telemetry).await.expect_err("nothing listens");
+        let err = pool
+            .send(&dial, FRAME, &telemetry, &mut Diagnostics::default())
+            .await
+            .expect_err("nothing listens");
 
         assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
         assert_eq!(io_kind(&err), Some(io::ErrorKind::ConnectionRefused), "{err:#}");
@@ -612,7 +1005,9 @@ mod tests {
         let (mut probe, telemetry) = sink_telemetry();
         let mut pool = PooledStream::pooled(Box::new(closed.clone()));
 
-        pool.send(&scripted(&script), FRAME, &telemetry).await.expect("the retry delivers");
+        pool.send(&scripted(&script), FRAME, &telemetry, &mut Diagnostics::default())
+            .await
+            .expect("the retry delivers");
 
         assert_eq!(closed.state().reads, 1, "the reused connection is probed once");
         assert_eq!(closed.state().writes, 0, "and never written");
@@ -652,7 +1047,10 @@ mod tests {
             let (mut probe, telemetry) = sink_telemetry();
             let mut pool = PooledStream::pooled(Box::new(client));
 
-            let err = pool.send(&scripted(&script), FRAME, &telemetry).await.expect_err("alert");
+            let err = pool
+                .send(&scripted(&script), FRAME, &telemetry, &mut Diagnostics::default())
+                .await
+                .expect_err("alert");
 
             assert_eq!(logit_pipeline::classify(&err), Fault::Refused, "{err:#}");
             assert!(format!("{err:#}").contains("alert certificate_required"), "{err:#}");
@@ -676,7 +1074,9 @@ mod tests {
         let (mut probe, telemetry) = sink_telemetry();
         let mut pool = PooledStream::pooled(Box::new(pooled.clone()));
 
-        pool.send(&scripted(&script), FRAME, &telemetry).await.expect("the retry delivers");
+        pool.send(&scripted(&script), FRAME, &telemetry, &mut Diagnostics::default())
+            .await
+            .expect("the retry delivers");
 
         assert!(pooled.state().flushed.is_empty() && pooled.state().unflushed.is_empty());
         assert_eq!(fresh.state().flushed, FRAME);
@@ -684,7 +1084,9 @@ mod tests {
         assert_eq!(reconnects(&mut probe), 1.0);
         assert_one_request(&mut probe, "ok");
         // The fresh connection is the one pooled: the next send probes it and dials nothing.
-        pool.send(&scripted(&script), FRAME, &telemetry).await.expect("reuse");
+        pool.send(&scripted(&script), FRAME, &telemetry, &mut Diagnostics::default())
+            .await
+            .expect("reuse");
         assert_eq!((fresh.state().reads, script.dials()), (1, 1));
 
         // The retry fails too: `Clean`, and no third connection.
@@ -695,7 +1097,10 @@ mod tests {
         let (mut probe, telemetry) = sink_telemetry();
         let mut pool = PooledStream::pooled(Box::new(pooled.clone()));
 
-        let err = pool.send(&scripted(&script), FRAME, &telemetry).await.expect_err("both fail");
+        let err = pool
+            .send(&scripted(&script), FRAME, &telemetry, &mut Diagnostics::default())
+            .await
+            .expect_err("both fail");
 
         assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
         let want_kind = match step {
@@ -734,7 +1139,10 @@ mod tests {
         let (mut probe, telemetry) = sink_telemetry();
         let mut pool = PooledStream::pooled(Box::new(pooled.clone()));
 
-        let err = pool.send(&scripted(&script), FRAME, &telemetry).await.expect_err("remainder");
+        let err = pool
+            .send(&scripted(&script), FRAME, &telemetry, &mut Diagnostics::default())
+            .await
+            .expect_err("remainder");
 
         assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous);
         let state = pooled.state();
@@ -755,7 +1163,10 @@ mod tests {
         let (mut probe, telemetry) = sink_telemetry();
         let mut pool = PooledStream::pooled(Box::new(pooled.clone()));
 
-        let err = pool.send(&scripted(&script), FRAME, &telemetry).await.expect_err("flush");
+        let err = pool
+            .send(&scripted(&script), FRAME, &telemetry, &mut Diagnostics::default())
+            .await
+            .expect_err("flush");
 
         assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous);
         let state = pooled.state();
@@ -781,7 +1192,10 @@ mod tests {
         let (mut probe, telemetry) = sink_telemetry();
         let mut pool = PooledStream::pooled(Box::new(client));
 
-        let err = pool.send(&scripted(&script), FRAME, &telemetry).await.expect_err("write");
+        let err = pool
+            .send(&scripted(&script), FRAME, &telemetry, &mut Diagnostics::default())
+            .await
+            .expect_err("write");
 
         assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous);
         assert_eq!(io_kind(&err), Some(io::ErrorKind::BrokenPipe), "{err:#}");
@@ -805,8 +1219,9 @@ mod tests {
 
         let mut got = vec![0u8; frame.len()];
         let dial = scripted(&script);
+        let mut diag = Diagnostics::default();
         let (sent, read) = tokio::join!(
-            pool.send(&dial, &frame, &telemetry),
+            pool.send(&dial, &frame, &telemetry, &mut diag),
             tokio::time::timeout(RECV_TIMEOUT, server.read_exact(&mut got)),
         );
 
@@ -834,7 +1249,8 @@ mod tests {
 
         {
             let dial = scripted(&script);
-            let mut send = pin!(pool.send(&dial, &frame, &telemetry));
+            let mut diag = Diagnostics::default();
+            let mut send = pin!(pool.send(&dial, &frame, &telemetry, &mut diag));
             assert!(poll_once(&mut send).await.is_pending(), "parked on a full pipe");
         }
         // The first write took 16 bytes, so the send was parked in `write_all`.
@@ -846,7 +1262,9 @@ mod tests {
             "the half-written connection was closed"
         );
 
-        pool.send(&scripted(&script), &frame, &telemetry).await.expect("a fresh dial delivers");
+        pool.send(&scripted(&script), &frame, &telemetry, &mut Diagnostics::default())
+            .await
+            .expect("a fresh dial delivers");
         let mut got = [0u8; 64];
         second_peer.read_exact(&mut got).await.unwrap();
         assert_eq!(got, frame);
@@ -856,37 +1274,90 @@ mod tests {
     }
 
     /// A peer that stops reading: a 64-byte frame into a 16-byte pipe nobody reads. The write
-    /// makes no progress for `connect_timeout`, so the attempt fails `Ambiguous` instead of
-    /// parking, and the next send dials fresh.
+    /// stalls after 16 bytes, so the attempt is `Ambiguous`, and the connection is kept with the
+    /// frame's other 48 bytes. While the peer stays stalled, the next attempt can't finish them and
+    /// is `Clean`. Once it reads, the tail goes ahead of the next frame on the same connection.
     #[tokio::test(start_paused = true)]
-    async fn a_write_that_makes_no_progress_fails_ambiguous_and_the_next_send_dials_fresh() {
-        let (first, mut first_peer) = tokio::io::duplex(16);
-        let (second, mut second_peer) = tokio::io::duplex(1024);
-        let script = ScriptedDial::new(
-            false,
-            [DialStep::Connect(Box::new(first)), DialStep::Connect(Box::new(second))],
-        );
+    async fn a_write_that_stalls_mid_frame_is_ambiguous_and_its_tail_goes_first_on_the_kept_connection(
+    ) {
+        let (first, mut peer) = tokio::io::duplex(16);
+        let script = ScriptedDial::new(false, [DialStep::Connect(Box::new(first))]);
         let (mut probe, telemetry) = sink_telemetry();
+        let mut diag = Diagnostics::default();
         let mut pool = PooledStream::default();
-        let frame = [b'x'; 64];
+        let frame: Vec<u8> = (0..64u8).collect();
+        let next: Vec<u8> = (100..164u8).collect();
 
-        let err = pool.send(&scripted(&script), &frame, &telemetry).await.unwrap_err();
+        let err = pool.send(&scripted(&script), &frame, &telemetry, &mut diag).await.unwrap_err();
         assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous, "{err:#}");
-        assert!(err.chain().any(|e| e.is::<Stalled>()), "{err:#}");
-        assert!(pool.is_empty(), "the stalled connection isn't pooled");
+        assert!(is_stall(&err), "{err:#}");
+        assert_eq!(pool.pending(), Some(&frame[16..]), "kept with the unwritten tail");
         assert_one_request(&mut probe, "ambiguous");
-        let mut buf = [0u8; 64];
-        assert!(matches!(read_once(&mut first_peer, &mut buf).await, Poll::Ready(Ok(16))));
-        assert!(
-            matches!(read_once(&mut first_peer, &mut buf).await, Poll::Ready(Ok(0))),
-            "the stalled connection was closed"
-        );
 
-        pool.send(&scripted(&script), &frame, &telemetry).await.expect("a fresh dial delivers");
-        let mut got = [0u8; 64];
-        second_peer.read_exact(&mut got).await.unwrap();
-        assert_eq!(got, frame);
-        assert_eq!(script.dials(), 2);
+        let err = pool.send(&scripted(&script), &next, &telemetry, &mut diag).await.unwrap_err();
+        assert_eq!(logit_pipeline::classify(&err), Fault::Clean, "{err:#}");
+        assert!(is_stall(&err), "{err:#}");
+        assert_eq!(pool.pending(), Some(&frame[16..]), "the tail is still owed");
+
+        let mut got = vec![0u8; frame.len() + next.len()];
+        let dial = scripted(&script);
+        let (sent, read) = tokio::join!(
+            pool.send(&dial, &next, &telemetry, &mut diag),
+            peer.read_exact(&mut got),
+        );
+        sent.expect("the tail, then the frame");
+        read.unwrap();
+        assert_eq!(got, [frame, next].concat(), "the cut frame finished before the next began");
+        assert_eq!(pool.pending(), None);
+        assert_eq!(script.dials(), 1, "one connection throughout");
+        assert_eq!(reconnects(&mut probe), 0.0);
+    }
+
+    /// A pending tail whose write fails is dropped with its connection, and the frame goes on a
+    /// fresh one. That redial doesn't consume the retry: the fresh connection's failed first write
+    /// still gets it.
+    #[tokio::test]
+    async fn a_pending_tail_that_fails_is_dropped_and_the_frame_goes_on_a_fresh_connection() {
+        let broken = FakeStream::new().on_write(1, WriteStep::Fail(io::ErrorKind::BrokenPipe));
+        let refusing = FakeStream::new().on_write(1, WriteStep::Fail(io::ErrorKind::BrokenPipe));
+        let healthy = FakeStream::new();
+        let script = ScriptedDial::new(false, [connect_to(&refusing), connect_to(&healthy)]);
+        let (mut probe, telemetry) = sink_telemetry();
+        let mut pool = PooledStream::pooled(Box::new(broken.clone()));
+        pool.conn.as_mut().unwrap().pending = Some(b"tail\n".to_vec());
+
+        pool.send(&scripted(&script), FRAME, &telemetry, &mut Diagnostics::default())
+            .await
+            .expect("the frame is delivered on the retry");
+
+        assert_eq!(broken.state().writes, 1, "the tail was tried once");
+        assert!(broken.state().unflushed.is_empty());
+        assert_eq!(refusing.state().writes, 1);
+        assert_eq!(healthy.state().flushed, FRAME, "the frame alone, with no tail before it");
+        assert_eq!(script.dials(), 2, "the tail's redial, then the one retry");
+        assert_eq!(pool.pending(), None);
+        assert_one_request(&mut probe, "ok");
+    }
+
+    /// The shutdown flush finishes a pending tail, and a stalled one is bounded: the connection is
+    /// dropped instead of holding shutdown.
+    #[tokio::test(start_paused = true)]
+    async fn the_shutdown_flush_finishes_a_pending_tail_and_gives_up_on_a_stalled_one() {
+        let (stream, mut peer) = tokio::io::duplex(64);
+        let mut pool = PooledStream::pooled(Box::new(stream));
+        pool.conn.as_mut().unwrap().pending = Some(b"tail\n".to_vec());
+        pool.flush(Duration::from_secs(1)).await.expect("the pipe has room");
+        let mut got = [0u8; 5];
+        peer.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"tail\n");
+        assert_eq!(pool.pending(), None);
+        assert!(!pool.is_empty());
+
+        let mut pool = PooledStream::pooled(Box::new(NeverWrites));
+        pool.conn.as_mut().unwrap().pending = Some(b"tail\n".to_vec());
+        let err = pool.flush(Duration::from_secs(1)).await.expect_err("the peer never reads");
+        assert!(is_stall(&err), "{err:#}");
+        assert!(pool.is_empty(), "the stalled connection is dropped");
     }
 
     /// A writer whose `poll_write` stays pending forever.
@@ -924,19 +1395,26 @@ mod tests {
         }
     }
 
-    /// A plaintext first `write` that never accepts a byte stalls past `connect_timeout`: nothing
-    /// of the frame left, so the attempt is `Clean`, and nothing is pooled.
+    /// A first `write` that never accepts a byte stalls past `connect_timeout`: nothing of the
+    /// frame left, so the attempt is `Clean`, and the connection is kept with nothing owed. The
+    /// next attempt probes it open and stalls the same way, with no redial.
     #[tokio::test(start_paused = true)]
-    async fn a_stalled_plaintext_first_write_is_clean() {
+    async fn a_first_write_that_accepts_nothing_is_clean_and_keeps_the_connection() {
         let script = ScriptedDial::new(false, [DialStep::Connect(Box::new(NeverWrites))]);
         let (mut probe, telemetry) = sink_telemetry();
+        let mut diag = Diagnostics::default();
         let mut pool = PooledStream::default();
-        let err = pool.send(&scripted(&script), FRAME, &telemetry).await.unwrap_err();
-        assert_eq!(logit_pipeline::classify(&err), Fault::Clean, "{err:#}");
-        assert!(err.chain().any(|e| e.is::<Stalled>()), "{err:#}");
-        assert!(pool.is_empty());
-        assert_eq!(script.dials(), 1, "no retry inside send");
-        assert_one_request(&mut probe, "clean");
+        for _ in 0..2 {
+            let err =
+                pool.send(&scripted(&script), FRAME, &telemetry, &mut diag).await.unwrap_err();
+            assert_eq!(logit_pipeline::classify(&err), Fault::Clean, "{err:#}");
+            assert!(is_stall(&err), "{err:#}");
+            assert!(format!("{err:#}").contains("the connection is kept"), "{err:#}");
+            assert!(!pool.is_empty());
+            assert_eq!(pool.pending(), None);
+        }
+        assert_eq!(script.dials(), 1, "never redialed");
+        assert_eq!(probe.poll().sum("logit.output.requests", &[("class", "clean")]), 2.0);
     }
 
     /// A slow peer that keeps reading never trips the progress bound, however long the whole
@@ -972,12 +1450,15 @@ mod tests {
 
         {
             let dial = scripted(&script);
-            let mut send = pin!(pool.send(&dial, FRAME, &telemetry));
+            let mut diag = Diagnostics::default();
+            let mut send = pin!(pool.send(&dial, FRAME, &telemetry, &mut diag));
             assert!(poll_once(&mut send).await.is_pending());
         }
         assert_eq!(script.dials(), 1, "dropped inside the dial");
 
-        pool.send(&scripted(&script), FRAME, &telemetry).await.expect("the next send works");
+        pool.send(&scripted(&script), FRAME, &telemetry, &mut Diagnostics::default())
+            .await
+            .expect("the next send works");
         assert_eq!(fresh.state().flushed, FRAME);
         assert_eq!(reconnects(&mut probe), 0.0, "the hung dial never connected");
         assert_one_request(&mut probe, "ok");
@@ -995,13 +1476,16 @@ mod tests {
 
         {
             let dial = scripted(&script);
-            let mut send = pin!(pool.send(&dial, FRAME, &telemetry));
+            let mut diag = Diagnostics::default();
+            let mut send = pin!(pool.send(&dial, FRAME, &telemetry, &mut diag));
             assert!(poll_once(&mut send).await.is_pending());
         }
         assert_eq!((closed.state().reads, script.dials()), (1, 1), "probed, then dialing");
         assert!(pool.is_empty(), "the closed connection isn't put back");
 
-        pool.send(&scripted(&script), FRAME, &telemetry).await.expect("the next send works");
+        pool.send(&scripted(&script), FRAME, &telemetry, &mut Diagnostics::default())
+            .await
+            .expect("the next send works");
         assert_eq!(fresh.state().flushed, FRAME);
         assert_eq!(fresh.state().reads, 0, "a fresh connection is never probed");
         assert!(closed.state().unflushed.is_empty());
@@ -1038,10 +1522,13 @@ mod tests {
         let mut pool = PooledStream::default();
         let frame = vec![b'x'; 32 << 20];
 
-        let err = tokio::time::timeout(RECV_TIMEOUT, pool.send(&dial, &frame, &telemetry))
-            .await
-            .expect("the reset ends the send")
-            .expect_err("a reset mid-frame fails the send");
+        let err = tokio::time::timeout(
+            RECV_TIMEOUT,
+            pool.send(&dial, &frame, &telemetry, &mut Diagnostics::default()),
+        )
+        .await
+        .expect("the reset ends the send")
+        .expect_err("a reset mid-frame fails the send");
 
         assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous, "{err:#}");
         assert!(pool.is_empty());
@@ -1341,7 +1828,10 @@ mod tests {
                 Some(read) => PooledStream::pooled(Box::new(failing().reading(read))),
             };
 
-            let err = pool.send(&scripted(&script), FRAME, &telemetry).await.expect_err(&what);
+            let err = pool
+                .send(&scripted(&script), FRAME, &telemetry, &mut Diagnostics::default())
+                .await
+                .expect_err(&what);
 
             assert_eq!(script.dials(), want_dials, "{what}");
             assert_eq!(logit_pipeline::classify(&err), want_fault, "{what}");
@@ -1359,9 +1849,13 @@ mod tests {
         let fresh = FakeStream::new();
         let script = ScriptedDial::new(false, [DialStep::Refuse, connect_to(&fresh)]);
         let mut pool = PooledStream::default();
-        pool.send(&scripted(&script), FRAME, &telemetry).await.expect_err("refused");
+        pool.send(&scripted(&script), FRAME, &telemetry, &mut Diagnostics::default())
+            .await
+            .expect_err("refused");
         assert!(!pool.has_connected_once);
-        pool.send(&scripted(&script), FRAME, &telemetry).await.expect("first connect");
+        pool.send(&scripted(&script), FRAME, &telemetry, &mut Diagnostics::default())
+            .await
+            .expect("first connect");
         assert_eq!(reconnects(&mut probe), 0.0, "the first successful connect isn't one");
         assert!(pool.has_connected_once);
 
@@ -1369,12 +1863,16 @@ mod tests {
         let closed = FakeStream::new().reading(ReadStep::Eof);
         let script = ScriptedDial::new(false, [connect_to(&FakeStream::new()), DialStep::Refuse]);
         let mut pool = PooledStream::pooled(Box::new(closed));
-        pool.send(&scripted(&script), FRAME, &telemetry).await.expect("redial");
+        pool.send(&scripted(&script), FRAME, &telemetry, &mut Diagnostics::default())
+            .await
+            .expect("redial");
         assert_eq!(reconnects(&mut probe), 1.0);
 
         // A failed redial isn't.
-        pool.stream = Some(Box::new(FakeStream::new().reading(ReadStep::Eof)));
-        pool.send(&scripted(&script), FRAME, &telemetry).await.expect_err("refused");
+        pool.conn = Some(Conn::new(Box::new(FakeStream::new().reading(ReadStep::Eof)), None));
+        pool.send(&scripted(&script), FRAME, &telemetry, &mut Diagnostics::default())
+            .await
+            .expect_err("refused");
         assert_eq!(reconnects(&mut probe), 1.0);
         assert!(pool.has_connected_once);
     }
@@ -1427,7 +1925,9 @@ mod tests {
         let (mut probe, telemetry) = sink_telemetry();
         let mut pool = PooledStream::default();
 
-        pool.send(&unix_dial(&path), FRAME, &telemetry).await.expect("first");
+        pool.send(&unix_dial(&path), FRAME, &telemetry, &mut Diagnostics::default())
+            .await
+            .expect("first");
         let mut first = accept_frame(&listener).await;
         first.shutdown().await.unwrap();
         let pooled = pool.stream_mut().expect("the first send pooled its connection");
@@ -1436,7 +1936,9 @@ mod tests {
         })
         .await;
 
-        pool.send(&unix_dial(&path), FRAME, &telemetry).await.expect("second, on the redial");
+        pool.send(&unix_dial(&path), FRAME, &telemetry, &mut Diagnostics::default())
+            .await
+            .expect("second, on the redial");
 
         let _second = accept_frame(&listener).await;
         let mut rest = Vec::new();
@@ -1461,10 +1963,14 @@ mod tests {
         let (mut probe, telemetry) = sink_telemetry();
         let mut pool = PooledStream::default();
 
-        pool.send(&unix_dial(&path), FRAME, &telemetry).await.expect("first");
+        pool.send(&unix_dial(&path), FRAME, &telemetry, &mut Diagnostics::default())
+            .await
+            .expect("first");
         let first = accept_frame(&listener).await.into_std().unwrap();
         first.shutdown(std::net::Shutdown::Read).unwrap();
-        pool.send(&unix_dial(&path), FRAME, &telemetry).await.expect("second, on the retry");
+        pool.send(&unix_dial(&path), FRAME, &telemetry, &mut Diagnostics::default())
+            .await
+            .expect("second, on the retry");
         let _second = accept_frame(&listener).await;
 
         assert_eq!(reconnects(&mut probe), 1.0);
@@ -1480,7 +1986,10 @@ mod tests {
 
         // Nothing at the path.
         let mut pool = PooledStream::default();
-        let err = pool.send(&unix_dial(&path), FRAME, &telemetry).await.expect_err("no socket");
+        let err = pool
+            .send(&unix_dial(&path), FRAME, &telemetry, &mut Diagnostics::default())
+            .await
+            .expect_err("no socket");
         assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
         assert!(format!("{err:#}").contains("connecting to test_out socket"), "{err:#}");
         assert!(pool.is_empty());
@@ -1490,14 +1999,292 @@ mod tests {
         // I/O driver hasn't stored the hang-up: the probe answers open, the write fails with
         // `EPIPE`, and the `Clean` comes from the retry's dial finding no socket.
         let listener = UnixListener::bind(&path).unwrap();
-        pool.send(&unix_dial(&path), FRAME, &telemetry).await.expect("delivered");
+        pool.send(&unix_dial(&path), FRAME, &telemetry, &mut Diagnostics::default())
+            .await
+            .expect("delivered");
         let conn = accept_frame(&listener).await;
         drop((conn, listener));
         std::fs::remove_file(&path).unwrap();
-        let err = pool.send(&unix_dial(&path), FRAME, &telemetry).await.expect_err("gone");
+        let err = pool
+            .send(&unix_dial(&path), FRAME, &telemetry, &mut Diagnostics::default())
+            .await
+            .expect_err("gone");
         assert_eq!(logit_pipeline::classify(&err), Fault::Clean);
         assert!(pool.is_empty());
         assert_eq!(probe.sum("logit.output.requests", &[("class", "clean")]), 2.0);
+    }
+
+    // -- A receiver that stops reading, over real sockets -----------------------------------------
+
+    /// How long a write may make no progress in these tests: each stalled send waits it once.
+    const STALL_BOUND: Duration = Duration::from_millis(200);
+
+    fn bytes_dropped(probe: &mut TelemetryProbe) -> f64 {
+        probe.sum("logit.output.bytes.dropped", &[("reason", "unacknowledged")])
+    }
+
+    /// Sends `frame` until a send fails, then twice more, each failing on the stall too. Returns
+    /// the bytes of the frames sent whole.
+    async fn send_until_stalled_three_times(
+        pool: &mut PooledStream,
+        dial: &Dial<'_>,
+        frame: &[u8],
+        telemetry: &Telemetry,
+        diag: &mut Diagnostics,
+    ) -> u64 {
+        let mut whole = 0;
+        let first = loop {
+            match pool.send(dial, frame, telemetry, diag).await {
+                Ok(()) => whole += frame.len() as u64,
+                Err(err) => break err,
+            }
+        };
+        assert!(is_stall(&first), "{first:#}");
+        for _ in 0..2 {
+            let err = pool.send(dial, frame, telemetry, diag).await.expect_err("still stalled");
+            assert_eq!(logit_pipeline::classify(&err), Fault::Clean, "{err:#}");
+            assert!(is_stall(&err), "{err:#}");
+        }
+        assert!(!pool.is_empty(), "the stalled connection is kept");
+        whole
+    }
+
+    /// The receiver accepts and never reads. Once its buffers fill, each send stalls, and the
+    /// connection is kept: no redial fills another buffer pair behind the frozen listener. When
+    /// the receiver closes with the bytes unread, its reset destroys what the client's kernel
+    /// still held, and the next send's probe counts it: the bytes of every frame sent whole, less
+    /// what the receiver's own buffer took and acknowledged. The head of the frame the stall cut
+    /// is the stalled batch's own, so it isn't counted.
+    #[tokio::test]
+    async fn a_stalled_connection_is_kept_and_a_reset_counts_what_the_receiver_never_acknowledged()
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let dial = Dial {
+            target: Target::Tcp { endpoint: &endpoint, tls: None },
+            connect_timeout: STALL_BOUND,
+            accept_timeout: Duration::ZERO,
+            sink: "test_out",
+            nodelay: false,
+        };
+        let (mut probe, telemetry) = sink_telemetry();
+        let mut diag = Diagnostics::default();
+        let mut pool = PooledStream::default();
+        let frame = vec![b'x'; 64 * 1024];
+
+        let whole =
+            send_until_stalled_three_times(&mut pool, &dial, &frame, &telemetry, &mut diag).await;
+
+        assert_eq!(reconnects(&mut probe), 0.0, "never redialed");
+        let (receiver, _) = listener.accept().await.unwrap();
+        let listener_fd = sockstat::fd_of(&listener).unwrap();
+        let (waiting, _) = sockstat::listen_queue(listener_fd).unwrap();
+        assert_eq!(waiting, 0, "no second connection waits behind the frozen receiver");
+        assert_eq!(bytes_dropped(&mut probe), 0.0, "a stall loses nothing yet");
+
+        // Everything the receiver's kernel acknowledged is in its receive queue, unread.
+        let mut buf = vec![0u8; 64 << 20];
+        let held = receiver.peek(&mut buf).await.unwrap() as u64;
+        drop(receiver);
+        let pooled = pool.stream_mut().expect("kept");
+        wait_until("the pooled connection to probe the reset", || {
+            matches!(probe_now(&mut **pooled), PendingClose::Eof)
+        })
+        .await;
+        pool.send(&dial, &frame, &telemetry, &mut diag).await.expect("delivered on a redial");
+
+        assert_eq!(bytes_dropped(&mut probe), (whole - held) as f64, "whole {whole}, held {held}");
+        assert_eq!(reconnects(&mut probe), 1.0);
+        assert_eq!(diag.occurrences("unacknowledged"), 1);
+    }
+
+    /// Waits until the connection is idle: every byte `total` put on the stream is read (`read`)
+    /// or held in the receiver's buffer and acknowledged, so the client's send queue holds the
+    /// rest and nothing is in flight. Returns what the receiver holds.
+    async fn wait_idle(
+        fd: sockstat::RawFd,
+        receiver: &std::net::TcpStream,
+        read: u64,
+        total: u64,
+    ) -> u64 {
+        let mut buf = vec![0u8; 8 << 20];
+        let mut held = 0;
+        wait_until("the connection to go idle", || {
+            held = receiver.peek(&mut buf).unwrap() as u64;
+            u64::from(sockstat::send_queue(fd).unwrap()) + read + held == total
+        })
+        .await;
+        held
+    }
+
+    /// Two `Ambiguous` stalls on one kept connection, with the first frame still in the send
+    /// queue at the second. The second stall's queue reading is what keeps the first frame's
+    /// range, so the reset's count leaves out the queued bytes of both frames and counts only
+    /// the frames sent whole that the receiver never acknowledged.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_second_stall_keeps_the_first_stalled_frame_out_of_the_unacknowledged_count() {
+        use std::io::Read;
+
+        // A set receive buffer doesn't grow as the receiver reads, so it holds about as much when
+        // full again as before.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(64 * 1024).unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(8).unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let dial = Dial {
+            target: Target::Tcp { endpoint: &endpoint, tls: None },
+            connect_timeout: STALL_BOUND,
+            accept_timeout: Duration::ZERO,
+            sink: "test_out",
+            nodelay: false,
+        };
+        let (mut probe, telemetry) = sink_telemetry();
+        let mut diag = Diagnostics::default();
+        let mut pool = PooledStream::default();
+        // Not a multiple of the write chunk, so a stall rarely falls on a frame boundary.
+        let frame = vec![b'x'; 100_003];
+        let len = frame.len() as u64;
+
+        // Frame A stalls part-written.
+        let mut start = 0;
+        let err = loop {
+            match pool.send(&dial, &frame, &telemetry, &mut diag).await {
+                Ok(()) => start += len,
+                Err(err) => break err,
+            }
+        };
+        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous, "{err:#}");
+        let a = start..start + len;
+        let a_tail = pool.pending().expect("A's tail is kept").len() as u64;
+        let fd = pool.conn.as_ref().and_then(|conn| conn.tcp_fd).expect("a TCP connection");
+        let (receiver, _) = listener.accept().await.unwrap();
+        let mut receiver = receiver.into_std().unwrap();
+        receiver.set_nonblocking(false).unwrap();
+        receiver.set_read_timeout(Some(RECV_TIMEOUT)).unwrap();
+        let held = wait_idle(fd, &receiver, 0, a.end - a_tail).await;
+        let queued = a.end - a_tail - held;
+
+        // Reading A's tail and half the queue frees room for the tail and more, while A's end
+        // stays past everything the receiver can have read or acknowledged.
+        let read = queued / 2 + a_tail;
+        receiver.read_exact(&mut vec![0u8; read as usize]).unwrap();
+        wait_idle(fd, &receiver, read, a.end - a_tail).await;
+
+        // The next attempt finishes A; frames go whole until frame B stalls part-written.
+        let mut start = a.end;
+        let err = loop {
+            match pool.send(&dial, &frame, &telemetry, &mut diag).await {
+                Ok(()) => start += len,
+                Err(err) => break err,
+            }
+        };
+        assert_eq!(logit_pipeline::classify(&err), Fault::Ambiguous, "{err:#}");
+        let b_tail = pool.pending().expect("B's tail is kept").len() as u64;
+        let b = start..start + len - b_tail;
+        let held = wait_idle(fd, &receiver, read, b.end).await;
+        let acked = read + held;
+        assert!(a.end > acked, "A is still queued: A {a:?}, acknowledged {acked}");
+        assert_eq!(bytes_dropped(&mut probe), 0.0, "a stall loses nothing yet");
+
+        // Closing with bytes unread resets the connection.
+        drop(receiver);
+        let pooled = pool.stream_mut().expect("kept");
+        wait_until("the pooled connection to probe the reset", || {
+            matches!(probe_now(&mut **pooled), PendingClose::Eof)
+        })
+        .await;
+        pool.send(&dial, FRAME, &telemetry, &mut diag).await.expect("delivered on a redial");
+
+        let queued_part = |range: &std::ops::Range<u64>| range.end - range.start.max(acked);
+        let whole_unacknowledged = b.end - acked - queued_part(&a) - queued_part(&b);
+        assert!(whole_unacknowledged > 0, "A {a:?}, B {b:?}, acknowledged {acked}");
+        assert_eq!(
+            bytes_dropped(&mut probe),
+            whole_unacknowledged as f64,
+            "A {a:?}, B {b:?}, acknowledged {acked}"
+        );
+        assert_eq!(reconnects(&mut probe), 1.0);
+    }
+
+    /// The same over TLS: the stalled connection is kept, and the receiver's reset counts a loss.
+    /// Ciphertext's framing makes the count an estimate, so only its presence is checked.
+    #[tokio::test]
+    async fn a_stalled_tls_connection_is_kept_and_a_reset_counts_a_loss() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_tls_config(false));
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let frozen = acceptor.accept(tcp).await.expect("the handshake completes");
+            released.await.unwrap();
+            drop(frozen);
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut fresh = acceptor.accept(tcp).await.expect("the redial's handshake completes");
+            let mut got = vec![0u8; FRAME.len()];
+            fresh.read_exact(&mut got).await.unwrap();
+            (got, listener)
+        });
+        let tls = mtls_target();
+        let dial = Dial {
+            target: Target::Tcp { endpoint: &endpoint, tls: Some(&tls) },
+            connect_timeout: STALL_BOUND,
+            accept_timeout: Duration::ZERO,
+            sink: "test_out",
+            nodelay: false,
+        };
+        let (mut probe, telemetry) = sink_telemetry();
+        let mut diag = Diagnostics::default();
+        let mut pool = PooledStream::default();
+        let frame = vec![b'x'; 64 * 1024];
+
+        send_until_stalled_three_times(&mut pool, &dial, &frame, &telemetry, &mut diag).await;
+        assert_eq!(reconnects(&mut probe), 0.0, "never redialed");
+
+        release.send(()).unwrap();
+        let pooled = pool.stream_mut().expect("kept");
+        wait_until("the pooled connection to probe the reset", || {
+            matches!(probe_now(&mut **pooled), PendingClose::Eof)
+        })
+        .await;
+        pool.send(&dial, FRAME, &telemetry, &mut diag).await.expect("delivered on a redial");
+
+        let (got, _listener) = server.await.unwrap();
+        assert_eq!(got, FRAME, "the redial carries the new frame alone");
+        assert!(bytes_dropped(&mut probe) > 0.0);
+        assert_eq!(reconnects(&mut probe), 1.0);
+    }
+
+    /// The same over a Unix stream: kept while stalled, but nothing is counted when the receiver
+    /// goes, since its close frees the queue the count would read.
+    #[tokio::test]
+    async fn a_stalled_unix_stream_is_kept_and_its_receiver_s_close_counts_nothing() {
+        let dir = scratch_dir("stream-unix-stall");
+        let path = dir.join("s.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let dial = Dial { connect_timeout: STALL_BOUND, ..unix_dial(&path) };
+        let (mut probe, telemetry) = sink_telemetry();
+        let mut diag = Diagnostics::default();
+        let mut pool = PooledStream::default();
+        let frame = vec![b'x'; 64 * 1024];
+
+        send_until_stalled_three_times(&mut pool, &dial, &frame, &telemetry, &mut diag).await;
+        assert_eq!(reconnects(&mut probe), 0.0, "never redialed");
+
+        let (receiver, _) = listener.accept().await.unwrap();
+        drop(receiver);
+        let pooled = pool.stream_mut().expect("kept");
+        wait_until("the pooled connection to probe the close", || {
+            matches!(probe_now(&mut **pooled), PendingClose::Eof)
+        })
+        .await;
+        pool.send(&dial, FRAME, &telemetry, &mut diag).await.expect("delivered on a redial");
+        let _fresh = accept_frame(&listener).await;
+
+        assert_eq!(reconnects(&mut probe), 1.0);
+        assert_eq!(bytes_dropped(&mut probe), 0.0);
     }
 
     // -- The server name --------------------------------------------------------------------------

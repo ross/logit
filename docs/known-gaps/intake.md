@@ -280,16 +280,18 @@ Entry format and the other areas: [the known-gaps index](README.md).
     [ADR `deployment-threat-model`](../adr/deployment-threat-model.md).
   - **Revisit trigger:** a public listener, or an operator seeing memory pressure from concurrent
     large requests.
-- **`datadog_in` and `splunk_hec_in` miss the request count of a multi-batch body whose client
-  closes mid-delivery.** Each counts `logit.input.requests{route, class}` in its `handle` after
-  `respond` returns. A body that decodes to more than one batch awaits again after its first batch
-  is in every inbox: `datadog_in` between batches in `deliver_with_deadline`, and `splunk_hec_in`
-  in the `deliver_detached` wait for the rest. A client that closes then drops the handler, so the
+- **`datadog_in`, `splunk_hec_in`, and `otlp_in` miss the request count of a multi-batch body
+  whose client closes mid-delivery.** Each counts `logit.input.requests{route, class}` in its
+  handler after the answer is built. A body that decodes to more than one batch awaits again after
+  its first batch is in every inbox: `datadog_in` between batches in `deliver_with_deadline`, and
+  `splunk_hec_in` and `otlp_in` in the `deliver_detached` wait for the rest
+  (`crate::http::deliver_first_bounded`). A client that closes then drops the handler, so the
   batches already sent count `logit.component.batches.sent` and the request counts no class.
   Nothing is lost: the batches are delivered and the client resends. `prometheus_in`'s receiver
-  and `otlp_in` count on the detached delivery's task (`crate::http::deliver_detached`'s `settle`),
-  and `influxdb_in` and `datadog_trace_in` send one batch, whose commit and count share one poll.
-  - The fix is for each `respond` to settle the request's class on the delivery's task. For
+  counts on the detached delivery's task (`crate::http::deliver_detached`'s `settle`), and
+  `influxdb_in` and `datadog_trace_in` send one batch, whose commit and count share one poll, as
+  does a one-resource `otlp_in` request, which is every request `otlp_out` sends.
+  - The fix is for each handler to settle the request's class on the delivery's task. For
     `splunk_hec_in` that task would also own the `ackId` draw and the code-6 class, and
     `datadog_in` would need its deadline delivery moved onto a task.
   - **Revisit trigger:** a soak run whose `ledger.intake` request identity fails on a body of more

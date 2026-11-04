@@ -2,7 +2,8 @@
 # `otlp_in` whose certificate the run's private CA signs, so the handshake picks `h2` through
 # ALPN and every request in flight shares one connection, where plaintext HTTP/1.1 opens one per
 # request. A 200 ms delay on the SUT's answers keeps two or three requests in flight, and a
-# backend stop, which `otlp_in` answers by holding each request, fills all eight. The listener's
+# backend stop, which `otlp_in` answers by holding each request up to 2 s and then `503`, fills
+# all eight. The listener's
 # `logit.input.connections` shows how many connections carried them. A 15 s pause of the
 # generator then leaves its connection idle past `otlp_in`'s 4 s `idle_timeout`, under the
 # generator's 30 s default, so the destination closes the idle h2 connection first, with a
@@ -57,8 +58,8 @@ on = "logit"
 args = "delay 200ms 50ms"
 for = "3m30s"
 
-# The sink's queue and the inboxes behind it fill, and `otlp_in` holds each request until the
-# generator's 10 s timeout, so every slot fills; each timed-out request is resent.
+# The sink's queue and the inboxes behind it fill, and `otlp_in` holds each request up to 2 s
+# and then answers `503`, so every slot fills; each busy request is retried.
 [[step]]
 at = "4m15s"
 action = "stop"
