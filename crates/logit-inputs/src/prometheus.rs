@@ -93,7 +93,8 @@
 //! | a body, or its decompressed size, over [`MAX_REQUEST_BYTES`] | `413` |
 //! | a body that stops arriving mid-upload, **when `idle_timeout:` is set** (it is off by default, and the stall bound is derived from it) | `408`, and the connection closes |
 //! | Snappy, zstd, or protobuf failure, 2.0 symbol-table errors | `400`, `text/plain` reason |
-//! | a decoded write no consumer takes (every consumer of the listener has closed) | `503`, `text/plain` reason |
+//! | a decoded write whose batch can't reach every consumer within [`BUSY_AFTER`] (2 s) | `503` + `Retry-After: 1`, body `busy` |
+//! | a decoded write no consumer takes (every consumer of the listener has closed) | `503` + `Retry-After: 1`, `text/plain` reason |
 //!
 //! **`zstd` is the VictoriaMetrics remote write protocol**: a 1.0 request compressed with zstd,
 //! which vmagent sends by default
@@ -113,8 +114,9 @@
 //! protobuf decode errors instead of the one status the spec has for it.
 //!
 //! **The `-Written` headers.** A 2.0 request's response carries
-//! `X-Prometheus-Remote-Write-{Samples,Histograms,Exemplars}-Written`, on `4xx` as well as `2xx`
-//! as 2.0 requires, reporting what this receiver stored: zeros on a rejection, and always `0`
+//! `X-Prometheus-Remote-Write-{Samples,Histograms,Exemplars}-Written` on every answer, success or
+//! failure, as 2.0 requires, reporting what this receiver stored: zeros on a rejection or a `503`,
+//! and always `0`
 //! histograms, since native histograms are dropped and counted rather than stored
 //! (`docs/known-gaps/prometheus.md`). A 1.0 request gets none: 1.0 defines none.
 //!
@@ -153,6 +155,23 @@
 //! it would make a remote-write → exposition relay stamp an explicit timestamp on every line it
 //! writes, which no scrape of the same data would have produced, and would make `aggregate` pass
 //! every remote-write sample through unwindowed.
+//!
+//! ## Backpressure: a bounded wait, then busy
+//!
+//! A write's one batch waits at most [`BUSY_AFTER`] (2 s) for room in every consumer, reaching
+//! every consumer or none ([`crate::http::deliver_first_bounded`]). When the bound passes, nothing
+//! of the write was taken: the receiver answers `503` with `Retry-After: 1` and the body `busy`,
+//! counts the batch `logit.input.batches.deferred` and the write
+//! `logit.input.writes{class="busy"}`, and logs a throttled `busy` line. Every remote-write sender
+//! has a request timeout and resends a write it timed out (Prometheus's `remote_timeout`, 30 s;
+//! vmagent's `-remoteWrite.sendTimeout`, 1 m; `prometheus_out`'s `timeout:`, 10 s), so a wait with
+//! no bound turned each timeout under a full pipeline into a duplicate. Both specs make a `5xx`
+//! one a sender MUST retry, while Prometheus drops a `429` unless `retry_on_http_429` is set, so
+//! the busy answer is a `503` (ADR `otlp-in-busy-answer`'s amendment "`prometheus_in`'s
+//! remote-write receiver answers busy too").
+//!
+//! A sender that closes during the bounded wait takes the write with it: nothing is reserved on
+//! every consumer until the send, so no consumer gets any of it, and nothing counts it.
 //!
 //! ## Metadata cache
 //!
@@ -280,12 +299,12 @@
 //! ## Counters
 //!
 //! `logit.input.writes{class}` -- one count per request, `class` one of `ok`, `not_found`,
-//! `method`, `unauthorized`, `unsupported`, `oversize`, `timeout`, `bad_request`, or
+//! `method`, `unauthorized`, `unsupported`, `oversize`, `timeout`, `bad_request`, `busy`, or
 //! `closed_consumer`. An `ok` count also carries `encoding` (`snappy` or `zstd`), which is how to
-//! see whether a vmagent stayed on zstd. A write that reaches delivery is counted `ok` or
-//! `closed_consumer` on the delivery's own task, so a sender whose timeout fires while
-//! backpressure holds the `204` still counts the write it gave up on, as
-//! `logit.component.batches.sent` counts its batch. A request whose connection closes mid-body
+//! see whether a vmagent stayed on zstd. A write is counted `ok` the moment its batch is in every
+//! inbox, before the `204` is written, so a sender that closes after that still counts the write,
+//! as `logit.component.batches.sent` counts its batch; one that closes during the bounded wait
+//! counts no class, and nothing of it was sent. A request whose connection closes mid-body
 //! counts `oversize` when the handler reads the error, and no class when hyper drops the handler
 //! first; nothing of it was sent either way. `logit.input.write.duration` --
 //! a timing sample per request answered, whatever the outcome. `logit.input.samples` -- reused
@@ -293,10 +312,11 @@
 //! took: every decoded series' worth minus every series the model
 //! mapping then dropped, the number the `-Written` header reports. A counter and a header
 //! disagreeing about one request would be a puzzle with no right answer.
-//! `logit.input.batches.dropped{reason="closed_consumer"}` -- the write's batch when no consumer
-//! took it, answered `503`. `logit.input.requests.rejected{reason="auth"}` -- a write
-//! `bind_auth:` refused, also counted `writes{class="unauthorized"}`, as every HTTP listener that
-//! checks a credential counts it.
+//! `logit.input.batches.deferred` -- the write's batch when it was answered busy: the sender
+//! still holds it and retries. `logit.input.batches.dropped{reason="closed_consumer"}` -- the
+//! write's batch when no consumer took it, answered `503`.
+//! `logit.input.requests.rejected{reason="auth"}` -- a write `bind_auth:` refused, also counted
+//! `writes{class="unauthorized"}`, as every HTTP listener that checks a credential counts it.
 //!
 //! `logit.input.metadata_cache.size` -- how many families are remembered, a gauge published
 //! whenever the table changes (a transition, like `logit.input.connections`, not a per-request
@@ -466,6 +486,12 @@ const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 /// **Not an operator-facing field**, unlike `otlp_in`'s `handshake_timeout:`: `prometheus_in` has
 /// no such field for graph rule 45 to check. A field can be added if a deployment needs one.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a write's batch may wait for room in every consumer before the write is answered busy
+/// (this module's "Backpressure"). Under every remote-write sender's request timeout, the shortest
+/// of which is `prometheus_out`'s 10 s default, so a sender reads the `503` before it gives up and
+/// resends; `otlp_in`'s bound.
+const BUSY_AFTER: Duration = Duration::from_secs(2);
 
 /// `logit_pipeline::tls::TlsServerSettings`, re-exported for the receiver's `bind_tls:` block: the
 /// server-side twin of [`TlsClientSettings`] above, same convention as `otlp::TlsServerSettings`.
@@ -784,6 +810,8 @@ pub struct PrometheusReceiver {
     forwarded: Option<ForwardedHeader>,
     /// `bind_auth:` in config. See [`Self::with_auth`].
     auth: AuthGate,
+    /// [`BUSY_AFTER`] unless [`Self::with_busy_after`] sets it.
+    busy_after: Duration,
     diag: Diagnostics,
     telemetry: Telemetry,
 }
@@ -807,9 +835,16 @@ impl PrometheusReceiver {
             proxy_protocol: false,
             forwarded: None,
             auth: AuthGate::default(),
+            busy_after: BUSY_AFTER,
             diag: Diagnostics::default(),
             telemetry: Telemetry::default(),
         }
+    }
+
+    /// Overrides [`BUSY_AFTER`]. Not a config field: a test and tuning hook, as on `otlp_in`.
+    pub fn with_busy_after(mut self, busy_after: Duration) -> Self {
+        self.busy_after = busy_after;
+        self
     }
 
     /// The address bound, once [`Input::bind`] has run, so a test can learn the OS-assigned port
@@ -965,6 +1000,7 @@ impl Input for PrometheusReceiver {
         let live_connections = crate::listener::LiveConnections::new(self.telemetry.clone());
         let handshake_timeout = self.handshake_timeout;
         let idle_timeout = self.idle_timeout;
+        let busy_after = self.busy_after;
         let metadata_cache = self.metadata_cache.clone();
         // `crate::tcp`'s accept-queue gauges: `logit.input.accept_queue.depth`/`.utilization`,
         // sampled before each accept and once a second while waiting for one.
@@ -1106,6 +1142,7 @@ impl Input for PrometheusReceiver {
                             telemetry.clone(),
                             diag.clone(),
                             idle_timeout,
+                            busy_after,
                             handshake_timeout,
                             conn_shutdown,
                         )
@@ -1123,6 +1160,7 @@ impl Input for PrometheusReceiver {
                             telemetry.clone(),
                             diag.clone(),
                             idle_timeout,
+                            busy_after,
                             handshake_timeout,
                             conn_shutdown,
                         )
@@ -1173,6 +1211,7 @@ async fn serve_write_connection<IO>(
     telemetry: Telemetry,
     diag: Diagnostics,
     idle_timeout: Option<Duration>,
+    busy_after: Duration,
     grace: Duration,
     shutdown: watch::Receiver<bool>,
 ) -> Result<(), String>
@@ -1210,6 +1249,7 @@ where
                     diag,
                     &activity,
                     idle_timeout,
+                    busy_after,
                 )
                 .await
             }
@@ -1233,9 +1273,9 @@ where
 
 /// One request, timed and counted: every exit from [`write_response`], early rejections included,
 /// contributes one `logit.input.writes{class}` count (plus `encoding` on `ok`) and one
-/// `logit.input.write.duration` timing. A write that reaches delivery is counted on the delivery's
-/// task instead (`write_response`'s `None` class), so the count survives a client that closes
-/// before the response.
+/// `logit.input.write.duration` timing. A write that reaches delivery is counted by the delivery's
+/// callbacks instead (`write_response`'s `None` class), so an `ok` is counted the moment its batch
+/// is in, whether or not the client stays for the response.
 #[allow(clippy::too_many_arguments)]
 async fn handle_write(
     req: http::Request<Incoming>,
@@ -1249,6 +1289,7 @@ async fn handle_write(
     diag: Diagnostics,
     activity: &Activity,
     stall: Option<Duration>,
+    busy_after: Duration,
 ) -> Result<http::Response<Full<Bytes>>, std::convert::Infallible> {
     let started = Instant::now();
     let (counted, response) = write_response(
@@ -1263,6 +1304,7 @@ async fn handle_write(
         diag,
         activity,
         stall,
+        busy_after,
     )
     .await;
     if let Some((class, encoding)) = counted {
@@ -1285,7 +1327,8 @@ fn count_write(telemetry: &Telemetry, class: &'static str, encoding: Option<Enco
 
 /// The routes table in this module's doc comment, in order, returning the
 /// `logit.input.writes{class}` label alongside the response, and on `ok` the encoding the request
-/// arrived in. The label is `None` for a write that reached delivery, whose task has counted it.
+/// arrived in. The label is `None` for a write that reached delivery, whose callbacks have counted
+/// it.
 #[allow(clippy::too_many_arguments)]
 async fn write_response(
     req: http::Request<Incoming>,
@@ -1299,6 +1342,7 @@ async fn write_response(
     mut diag: Diagnostics,
     activity: &Activity,
     stall: Option<Duration>,
+    busy_after: Duration,
 ) -> (Option<(&'static str, Option<Encoding>)>, http::Response<Full<Bytes>>) {
     if req.uri().path() != path {
         return (
@@ -1496,21 +1540,21 @@ async fn write_response(
         telemetry.count("logit.input.samples", written as f64, &[]);
         return (Some(("ok", Some(encoding))), no_content(seen, written, decoded.exemplars));
     }
-    // **Before** the response is built: channel backpressure delays the `204` and
-    // the sender's queue throttles, remote-write's own flow-control model. On its own task, so a
-    // sender that disconnects mid-wait cancels only the wait, never part of the fan-out. Counted
-    // there too: a sender whose request timeout fires during the wait drops this future, and its
-    // write still went out (`crate::http::deliver_detached`).
+    // **Before** the response is built, under `busy_after` (the module doc's "Backpressure"). The
+    // write is one batch, so `deliver_first_bounded`'s detached rest is always empty: the batch
+    // reaches every consumer or none, and a sender that closes mid-wait cancels the whole write.
+    // `accepted` runs in the same poll as the send that delivered it, so a sender that closes
+    // after that still has its write counted `ok`.
     let mut batch = vec![EventBatch { resource, scope: None, events }];
     request_peer.stamp_batches(&mut batch);
+    let accepted = || {
+        count_write(telemetry, "ok", Some(encoding));
+        telemetry.count("logit.input.samples", written as f64, &[]);
+    };
     let settle = {
-        let (telemetry, peer) = (telemetry.clone(), peer.clone());
-        move |outcome: Result<(), crate::http::Undelivered>| match outcome {
-            Ok(()) => {
-                count_write(&telemetry, "ok", Some(encoding));
-                telemetry.count("logit.input.samples", written as f64, &[]);
-            }
-            Err(undelivered) => {
+        let (telemetry, peer, mut diag) = (telemetry.clone(), peer.clone(), diag.clone());
+        move |outcome: Result<(), crate::http::Undelivered>| {
+            if let Err(undelivered) = outcome {
                 undelivered.record(&telemetry);
                 count_write(&telemetry, "closed_consumer", None);
                 diag.warn_throttled(
@@ -1522,12 +1566,34 @@ async fn write_response(
             }
         }
     };
-    if crate::http::deliver_detached(sink, batch, settle).await.is_err() {
-        let message = "no consumer took the batch";
-        return (None, text_response(seen, StatusCode::SERVICE_UNAVAILABLE, message));
+    let delivered =
+        crate::http::deliver_first_bounded(sink, batch, busy_after, accepted, settle).await;
+    if let Err(unfinished) = delivered {
+        let undelivered = unfinished.undelivered;
+        let (class, message) = match undelivered {
+            crate::http::Undelivered::Busy(_) => {
+                undelivered.record(telemetry);
+                diag.warn_throttled(
+                    "busy",
+                    format_args!(
+                        "prometheus_in: answered busy to {peer}: the pipeline did not accept the \
+                         write within {busy_after:?}"
+                    ),
+                );
+                (Some((BUSY, None)), BUSY)
+            }
+            // Counted by `settle`.
+            crate::http::Undelivered::Closed(_) => (None, "no consumer took the batch"),
+        };
+        let mut response = text_response(seen, StatusCode::SERVICE_UNAVAILABLE, message);
+        response.headers_mut().insert(http::header::RETRY_AFTER, HeaderValue::from_static("1"));
+        return (class, response);
     }
     (None, no_content(seen, written, decoded.exemplars))
 }
+
+/// A busy `503`'s body, and its `logit.input.writes` class.
+const BUSY: &str = "busy";
 
 /// `""` for an absent or non-ASCII header: either way it says nothing usable, and the caller's
 /// message quotes what came back.
@@ -2928,7 +2994,7 @@ mod tests {
         use tokio::io::AsyncWriteExt;
         let (receiver, addr) = bound_receiver("/api/v1/write").await;
         // Capacity 1, nothing draining: the first batch fills it and the second parks.
-        let mut rx = spawn_receiver(receiver, 1);
+        let mut rx = spawn_receiver(receiver.with_busy_after(PARKED_BUSY_AFTER), 1);
         let body = request_body(
             &[vec![gauge_family("queue_depth", ("job", "api"), 1.0, millis(1))]],
             remote_write::Version::V1,
@@ -3460,6 +3526,7 @@ mod tests {
     fn plaintext_shutdown_receiver() -> PrometheusReceiver {
         PrometheusReceiver::new("127.0.0.1:0", "/api/v1/write")
             .with_handshake_timeout(SHUTDOWN_GRACE)
+            .with_busy_after(PARKED_BUSY_AFTER)
     }
 
     /// One 1.0 write on an open stream, keep-alive, so hyper waits for the next request rather
@@ -3480,7 +3547,7 @@ mod tests {
     }
 
     /// Two writes on one keep-alive connection: the first fills the edge's one slot and is
-    /// answered, the second parks on its detached delivery. Returns once the park is counted.
+    /// answered, the second parks in its bounded wait. Returns once the park is counted.
     async fn park_a_write(addr: &str, probe: &mut TelemetryProbe) -> tokio::net::TcpStream {
         let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
         write_keep_alive(&mut client, addr).await;
@@ -3550,11 +3617,11 @@ mod tests {
     }
 
     /// Dropping the receiver's future (what `run_input`'s grace backstop does) aborts its
-    /// connection tasks: the connection closes and the gauge reads 0. The parked batch still
-    /// arrives, because its send runs on a detached task the abort doesn't reach; the abort costs
-    /// the sender its response, never the batch.
+    /// connection tasks: the connection closes and the gauge reads 0. The parked write is dropped
+    /// with its task before any consumer took it, so it delivers nothing: the abort costs the
+    /// sender its response, and its resend delivers the write once.
     #[tokio::test]
-    async fn dropping_the_receiver_future_aborts_its_connections_but_not_a_parked_delivery() {
+    async fn dropping_the_receiver_future_aborts_a_parked_write_unsent() {
         let (addr, running, mut rx, mut probe) =
             shutdown_receiver(plaintext_shutdown_receiver()).await;
         let mut client = park_a_write(&addr, &mut probe).await;
@@ -3562,20 +3629,21 @@ mod tests {
         running.handle.abort();
         expect_closed(&mut client, "an aborted connection").await;
         test_util::recv_batch(&mut rx).await;
-        test_util::recv_batch(&mut rx).await;
         expect_inbox_closed(&mut rx).await;
         probe
             .wait_for("the connections gauge to read 0", |t| {
                 t.gauge("logit.input.connections", &[]) == Some(0.0)
             })
             .await;
+        assert_eq!(probe.sum("logit.input.writes", &[("class", "ok")]), 1.0, "the first alone");
     }
 
-    /// A sender whose request timeout fires while its write is parked on a full downstream closes
-    /// the connection, and hyper drops the handler before any response. The detached delivery
-    /// still sends the batch, so the write counts `ok` and its samples.
+    /// A sender whose request timeout fires while its write waits under the bound closes the
+    /// connection, and hyper drops the handler before any response. Nothing was reserved on the
+    /// consumer yet, so the write delivers nothing and counts no class: the sender's resend is
+    /// the one copy.
     #[tokio::test]
-    async fn a_write_whose_sender_closes_while_parked_is_still_counted() {
+    async fn a_write_whose_sender_closes_during_the_bounded_wait_delivers_nothing() {
         let (addr, _running, mut rx, mut probe) =
             shutdown_receiver(plaintext_shutdown_receiver()).await;
         let client = park_a_write(&addr, &mut probe).await;
@@ -3587,13 +3655,156 @@ mod tests {
             })
             .await;
         test_util::recv_batch(&mut rx).await;
-        test_util::recv_batch(&mut rx).await;
+        test_util::assert_no_batch(&mut rx, TEST_BUSY_AFTER, "the abandoned write").await;
+        assert_eq!(probe.sum("logit.input.writes", &[("class", "ok")]), 1.0, "the first alone");
+        assert_eq!(probe.sum("logit.input.samples", &[]), 1.0);
+        assert_eq!(probe.sum("logit.input.batches.deferred", &[]), 0.0, "no answer was written");
+    }
+
+    /// A busy test's bound: a send to a consumer with room never meets it.
+    const TEST_BUSY_AFTER: Duration = Duration::from_millis(200);
+
+    /// Far past any wait in these tests, so a write parked on a full edge stays parked rather than
+    /// being answered busy at the bound.
+    const PARKED_BUSY_AFTER: Duration = Duration::from_secs(30);
+
+    /// A running receiver over one edge per capacity in `capacities`, each carrying consumer
+    /// telemetry `c<i>` under the returned probe beside the receiver's own, its batch waiting at
+    /// most `busy_after`. Returns each edge's sender beside its receiver, for filling it.
+    #[allow(clippy::type_complexity)] // a test rig's parts, destructured at each call
+    async fn busy_receiver(
+        capacities: &[usize],
+        busy_after: Duration,
+    ) -> (
+        String,
+        test_util::Running,
+        Vec<(mpsc::Sender<Delivered>, mpsc::Receiver<Delivered>)>,
+        TelemetryProbe,
+    ) {
+        let probe = TelemetryProbe::new();
+        let telemetry = probe.telemetry("prometheus_in", "prometheus_in", "listener");
+        let diag = Diagnostics::new("prometheus_in").with_telemetry(telemetry.clone());
+        let (receiver, addr) = bound_receiver("/api/v1/write").await;
+        let receiver =
+            receiver.with_telemetry(telemetry).with_diagnostics(diag).with_busy_after(busy_after);
+        let mut edges = Vec::new();
+        let mut channels = Vec::new();
+        for (i, &capacity) in capacities.iter().enumerate() {
+            let (tx, rx) = mpsc::channel(capacity);
+            let consumer = probe.telemetry(&format!("c{i}"), "null_out", "sink");
+            edges.push(logit_pipeline::fanout::Edge::new(tx.clone()).with_telemetry(consumer));
+            channels.push((tx, rx));
+        }
+        let running = test_util::spawn_input(receiver, Fanout::from_edges(edges)).await;
+        (addr, running, channels, probe)
+    }
+
+    /// Fills `tx`'s inbox with one batch, through a `Fanout` that counts nothing.
+    async fn fill(tx: &mpsc::Sender<Delivered>) {
+        let batch =
+            EventBatch { resource: Arc::new(Resource::default()), scope: None, events: vec![] };
+        assert!(Fanout::new(vec![tx.clone()]).send(batch).await, "the filler is taken");
+    }
+
+    #[test]
+    fn default_busy_after_is_two_seconds() {
+        let receiver = PrometheusReceiver::new("127.0.0.1:0", "/api/v1/write");
+        assert_eq!(receiver.busy_after, Duration::from_secs(2));
+    }
+
+    /// A write whose batch finds the consumer full past the bound is answered `503` with
+    /// `Retry-After: 1` and the body `busy`, under either remote-write version, and nothing is
+    /// delivered: the sender still holds the write, so the batch is counted `deferred`, not
+    /// dropped. A 2.0 answer carries the `-Written` zeros, as 2.0 requires on a failure.
+    #[tokio::test]
+    async fn a_write_that_waits_past_the_bound_is_answered_busy_and_delivers_nothing() {
+        for version in [remote_write::Version::V1, remote_write::Version::V2] {
+            let (addr, _running, mut channels, mut probe) =
+                busy_receiver(&[1], TEST_BUSY_AFTER).await;
+            fill(&channels[0].0).await;
+
+            let started = tokio::time::Instant::now();
+            let response =
+                post_write(&addr, "/api/v1/write", version, &one_gauge_body(version)).await;
+            assert!(response.starts_with("HTTP/1.1 503"), "{version:?}: {response}");
+            assert!(started.elapsed() >= TEST_BUSY_AFTER, "answered before the bound");
+            let lower = response.to_ascii_lowercase();
+            assert!(lower.contains("retry-after: 1\r\n"), "{version:?}: {response}");
+            assert!(response.ends_with("\r\n\r\nbusy"), "{version:?}: {response}");
+            let written =
+                format!("{}: 0", remote_write::HEADER_SAMPLES_WRITTEN.to_ascii_lowercase());
+            assert_eq!(
+                lower.contains(&written),
+                version == remote_write::Version::V2,
+                "{response}"
+            );
+
+            let rx = &mut channels[0].1;
+            test_util::recv_batch(rx).await;
+            test_util::assert_no_batch(rx, TEST_BUSY_AFTER, "the busy write").await;
+            assert_eq!(probe.sum("logit.input.batches.deferred", &[]), 1.0);
+            assert_eq!(probe.sum("logit.input.batches.dropped", &[]), 0.0);
+            assert_eq!(probe.sum("logit.component.diagnostics", &[("key", "busy")]), 1.0);
+            assert_eq!(probe.sum("logit.input.writes", &[("class", "busy")]), 1.0);
+            assert_eq!(probe.sum("logit.input.writes", &[("class", "ok")]), 0.0);
+            assert_eq!(probe.sum("logit.input.samples", &[]), 0.0);
+        }
+    }
+
+    /// In a diamond, one full consumer is enough to answer busy, and the consumer with room
+    /// doesn't get the batch either: the resend then delivers it once to each.
+    #[tokio::test]
+    async fn a_write_one_of_two_consumers_cant_take_reaches_neither() {
+        let (addr, _running, mut channels, mut probe) =
+            busy_receiver(&[16, 1], TEST_BUSY_AFTER).await;
+        fill(&channels[1].0).await;
+
+        let version = remote_write::Version::V1;
+        let response = post_write(&addr, "/api/v1/write", version, &one_gauge_body(version)).await;
+        assert!(response.starts_with("HTTP/1.1 503"), "got: {response}");
+
+        test_util::assert_no_batch(&mut channels[0].1, TEST_BUSY_AFTER, "the open edge").await;
+        test_util::recv_batch(&mut channels[1].1).await;
+        test_util::assert_no_batch(&mut channels[1].1, TEST_BUSY_AFTER, "the full edge").await;
+        assert_eq!(probe.sum("logit.input.batches.deferred", &[]), 1.0);
+    }
+
+    /// A consumer that frees up inside the bound takes the write, and the sender gets its `204`
+    /// once it does, counted `ok`, never `busy`.
+    #[tokio::test]
+    async fn a_write_whose_consumer_frees_up_inside_the_bound_is_answered_204() {
+        use tokio::io::AsyncWriteExt;
+        let (addr, _running, mut channels, mut probe) =
+            busy_receiver(&[1], PARKED_BUSY_AFTER).await;
+        fill(&channels[0].0).await;
+
+        let version = remote_write::Version::V2;
+        let body = one_gauge_body(version);
+        let mut client = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let request = format!(
+            "POST /api/v1/write HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\n{}\r\n",
+            body.len(),
+            write_headers(version)
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        client.write_all(&body).await.unwrap();
         probe
-            .wait_for("both writes counted ok, with their samples", |t| {
-                t.sum("logit.input.writes", &[("class", "ok")]) == 2.0
-                    && t.sum("logit.input.samples", &[]) == 2.0
+            .wait_for("the write to wait on the full edge", |t| {
+                t.sum("logit.component.inbox.full", &[]) >= 1.0
             })
             .await;
+
+        test_util::recv_batch(&mut channels[0].1).await;
+        let head = read_head(&mut client, test_util::RECV_TIMEOUT)
+            .await
+            .expect("the write is answered once the consumer has room");
+        assert!(head.starts_with("HTTP/1.1 204"), "got: {head}");
+        let samples = format!("{}: 1", remote_write::HEADER_SAMPLES_WRITTEN.to_ascii_lowercase());
+        assert!(head.to_ascii_lowercase().contains(&samples), "got: {head}");
+        test_util::recv_batch(&mut channels[0].1).await;
+        assert_eq!(probe.sum("logit.input.writes", &[("class", "ok")]), 1.0);
+        assert_eq!(probe.sum("logit.input.writes", &[("class", "busy")]), 0.0);
+        assert_eq!(probe.sum("logit.input.batches.deferred", &[]), 0.0);
     }
 
     /// A connection still in its TLS accept when shutdown fires ends at once rather than at its
