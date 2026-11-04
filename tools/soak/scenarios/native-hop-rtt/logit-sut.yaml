@@ -1,0 +1,20 @@
+# The ingress SUT in `script/soak`'s native-hop-rtt scenario: native-hop's `logit` with a send
+# window of 4 frames, so a netem delay on its sends of a second leaves the window, not the link,
+# bounding the hop: 4 frames a round trip, about 4 a second, below the 10 batches a second
+# `statsd_in` assembles from 2,000 lines a second. The backlog waits in the disk spool. Its
+# `internal` telemetry goes to stdout as NDJSON for the harness to read; `script/soak` runs it
+# with `--log-format json`.
+admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
+components:
+  statsd: { type: statsd_in, bind: 0.0.0.0:8125 }   # receive: defaults (drop_oldest)
+  hop:
+    type: logit_out
+    sources: [statsd]
+    endpoint: collector:7400
+    concurrency: 4                  # the window: 4 frames awaiting their acks at most
+    request_timeout: 10s
+    # The driver kills and starts this container but never recreates it, so a directory in its
+    # own filesystem survives the kill with no volume.
+    buffer: { disk: { path: /tmp/soak-spool } }
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }

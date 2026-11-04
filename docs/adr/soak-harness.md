@@ -939,6 +939,138 @@ fails on a read-back that differs; the revert writes what it found back.
 - **On a SUT only, and never in a `[random]` schedule**, which can't set `cpu` or
   `memory_high`.
 
+## Amendment: a `slowclient` step holds a listener's connection slots (2026-11-04)
+
+No fault reached what a listener does with a client that connects and then delivers nothing:
+its connection cap, its first-byte and idle timeouts, and a peer that vanishes with no FIN or
+RST. A `slowclient` step runs a stdlib client of the harness's own (`soaklib/slowclient.py`) in
+a detached container of the `python` image the stand-in and the file actions already pull, on
+the first network of the SUT service it's `on`, against the step's `address`. It opens
+`connections` connections and, by `mode`, sends nothing (`silent`), sends each one byte every
+`interval` (`trickle`), or sends each its first byte and then loses its network (`half_open`).
+What it sends (`send`) is LF bytes, which a stream listener's framer skips with no frame
+counted, an HTTP request head that never ends, or a whole head to `influxdb_in`'s write route
+and then its body's LF bytes, short of the `Content-Length` it declared. It dials again each
+connection the listener closes, as a client sent away comes back. The revert stops it with
+SIGTERM, records the counts it prints, and removes it.
+
+- **A client container of its own, not the generator's namespace.** A `--network
+  container:<generator>` one-shot would share the generator's interfaces, so cutting the
+  client's network would cut the generator's. A container of its own on the compose network
+  reaches the SUT by its service name as the generator does, and its network can go alone.
+- **Half-open by the `partition` mechanism.** Once the peer has acknowledged every byte the
+  client sent (`TIOCOUTQ` reads 0 on each socket), the apply runs `docker network disconnect`
+  on the client: its sockets stay established with no interface under them, so the listener's
+  end sees a peer that sends nothing and answers nothing, and no FIN or RST leaves. That reuses
+  what a `partition` does with no new image or capability; an `iptables` drop in the client's
+  namespace would need both. A connection that sent nothing would meet the first-byte bound
+  instead, so each half-open connection sends its first byte before the cut.
+- **It loses nothing on any leg.** The clients send nothing a listener frames or decodes, so W
+  is the generator's alone, and every wire judges the window. A generator's connection opened
+  before the slots fill goes on as before; a redial inside the window would be refused, and a
+  scenario keeps its generator's connection open from the start.
+- **A step that didn't happen fails.** A client that prints no `ready` line within 30 s, opens
+  no connection, leaves a byte unacknowledged before a half-open cut, or isn't running at the
+  revert, or a disconnect that fails, is `rc` 1, and `timeline` FAILs it. The record carries
+  the client's counts, which `timeline` reports.
+- **Labeled into the compose project and removed by teardown.** `compose down
+  --remove-orphans` doesn't remove a container with no `config-hash` label (verified on
+  Compose 5.6.0), so a client an interrupted run left would hold the project network and make
+  the next run's `docker run --name` conflict. Teardown force-removes the project's
+  `<project>-slowclient-` containers before `down` and records the count in a `strays` phase.
+  No other one-shot can leak this way: each of the rest runs in the foreground under `--rm`.
+- **On a SUT only, and never in a `[random]` schedule**, which can't set `address`, `mode`, or
+  `connections`.
+
+## Amendment: a replay into a full sender table may be forwarded again (2026-11-04)
+
+`logit_in` holds a high-water mark for `max_connections + max_connections / 4` sender
+identities and evicts the least recently seen when a new one takes a slot in a full table
+(`crates/logit-inputs/src/logit/senders.rs`). A `logit_out` spool mints an identity every time
+it opens and replays its unpersisted frames under the identities that sent them, so one SUT's
+restarts are enough to fill a small table. `ledger.hop` and `ledger.summary`'s end-to-end bound
+allowed no duplicate for it, and `native-hop-identities` reaches one.
+
+- **One sender evicts an identity that sends nothing again, until a crash loop's unpersisted
+  span reaches the table's capacity.** Every frame of an identity is sent before any frame of a
+  later one, and a replay refreshes each identity it touches, so a graceful restart, or a kill
+  with its spool's cursor persisted since, evicts a retired identity. A crash loop whose lives
+  each die before their first cursor persist leaves every life's commits to the next one's
+  replay. Once the span of lives to replay equals the table's capacity, the next life's own
+  identity evicts the oldest identity of that span, which the life after it replays again; once
+  that replay names more identities than the table holds, the first is gone, and each one it
+  takes back evicts the next it replays, so the whole replay is forwarded again.
+- **Judged from `logit.input.senders.evicted`.** A life's own identity evicts at most one, when
+  its first frame takes a slot; any other eviction counted at the far SUT from the life's start
+  to its replay's window's end (its first drain that counted a replay plus two of the far SUT's
+  drain intervals, or the next life's start) is a replayed identity a forward took back. Such a
+  life allows its replayed frames, `logit.component.buffer.disk.replayed` × the largest frame,
+  below 0 in `ledger.hop` and above `G − counted` end to end. A life with one eviction allows
+  nothing.
+- **One ingress sender.** The trigger of more than one eviction holds for a single ingress
+  sender: with several sharing `collector`'s table, another sender's churn can supply the
+  second eviction, and a multi-sender hop scenario would need a per-life capacity test
+  (ingress lives since collector's last start > `max_connections + max_connections / 4`).
+- **An upper bound, not a count.** `logit_in` can't tell a forward of an identity it no longer
+  holds from a new one, and exports nothing per frame, so the row can't count the duplicates;
+  the replayed frames bound them, the never-delivered backlog among them included.
+- **A life killed inside its first checkpoint replays everything it committed.** A spool
+  persists its cursor only once `checkpoint_interval` has passed since it opened, so
+  `ledger.replay`'s band for the hop sink, one interval at the life's last commit rate, held
+  only for a life that outlived it. For a life killed sooner the commit term is every batch it
+  delivered, its own replay included, plus its delivered rate after its last drain. That holds
+  only while the spool rolled no segment, because `DiskQueue::roll_read_cursor` persists the
+  cursor at every segment boundary whatever the interval, and the harness can't see a roll
+  (`buffer.disk.segments` is a gauge sampled at drains). The band therefore requires the hop
+  sink to declare `segment_bytes`, set large enough that no roll happens, as
+  `native-hop-identities` does with 512MiB. The declaration is the scenario's assertion: the
+  harness doesn't check its size. A sink that doesn't declare one gets the one-interval band, and
+  the row says no `segment_bytes` is set. The first
+  `native-hop-identities` run FAILed three lives of its crash loop on the old band, each replay
+  about one life's commits over it.
+
+## Amendment: a `datadog_trace` stand-in counts spans, with no `aggregate` (2026-11-04)
+
+The `datadog_trace_in -> datadog_trace_out` pair relays spans, which no `aggregate` summarizes
+and no backend stores as samples, so a stand-in target can play a Datadog Agent's trace API
+(`[target] shape = "datadog_trace"`) and the ledger counts in spans from the listener to it. The
+stand-in takes `PUT` and `POST` on `/v0.4/traces`, `/v0.7/traces`, and `/v0.6/stats`, answers a
+trace request with an Agent's `rate_by_service` body, and decodes each body with a bounded
+stdlib MessagePack reader, `soaklib/msgpack.py`, into one series per span keyed by its trace and
+span ids. A tracer's payloads come from a generator's `datadog_trace_out` writing v0.4, fed by a
+`lua` stage that turns each generated event into a span, so G is the spans that writer saw
+accepted, W the spans `datadog_trace_in` sent, and V the spans of the writes the stand-in
+answered `2xx`, every copy. A recorded dd-trace tracer's body would have pinned one tracer's
+shape; the generator's sink is the writer the pair's lossless claim covers, and its bodies sit
+in `standin/datadog-trace-vectors.json` beside a dd-trace-py capture.
+
+The scenario rules hold such a run to the one shape the rows can judge: one source on an
+`http` wire into a `datadog_trace_in`, one sink that is a `datadog_trace_out`, one SUT
+service, and no `sut_transforms`, `fan_out`, `merge`, `sut_aggregate`, `sut_delta`,
+`sut_script`, `hop`, `split`, `vm_every_window`, or `[overlap]`. As on a scrape wire,
+`ledger.aggregate` SKIPs and the edge reads E − X against the sink's events received.
+`ledger.egress` holds each final or stopped life's W − X − V to the spans the sink counted
+lost: its `records.dropped` under every reason, and its `events.dropped` under any reason but
+`rejected` and `ambiguous_at_most_once`, whose spans `records.dropped` already counts; a killed
+life's gap is reported. `ledger.summary` requires the final life's uncounted spans to be 0 and
+the distinct spans accepted over the run to be at most G, since a span keeps its identity end
+to end and no resend at either hop can add one. `ledger.standin` holds the sink's
+`records.dropped{reason="rejected"}` to the spans of the requests answered under a step classed
+`rejected`, a `413`'s to `oversize`, and reports the accepted copies and the spans of writes
+stored under a non-`2xx` answer, which the sink resends. `datadog_trace_out`'s response-class
+table joins the tables the `standin-*` scenarios restate as cued steps.
+
+## Amendment: a killed life's requests answered after its last drain are reported (2026-11-04)
+
+`ledger.standin` holds the record's requests per status class to the sink's
+`logit.output.requests` in each SUT life, and WARNed any mismatch in a killed life. A SIGKILL
+takes the sink's last telemetry interval with it, so a request the stand-in answered between
+the life's last drain and the kill is one the sink counted in a drain that never ran: a
+`delta-datadog` run WARNed "the stand-in answered 30 request(s) 2xx, datadog counted 29" for a
+life with one such request. A killed life's shortfall of a class is now reported when it's no
+more than the requests of that class the stand-in recorded from the life's last drain to the
+kill, and resets the same way; a shortfall past it, or a surplus, still WARNs.
+
 ## Amendment: a `cgroup` step limits the writes to the disk behind a SUT path (2026-11-04)
 
 A spool's `sync_data`, its cursor's fsyncs, and a shutdown with a write in flight run on a fast

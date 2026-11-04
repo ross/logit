@@ -1,0 +1,49 @@
+{
+  "what": "Bodies the datadog_trace shape's decoder reads in the self-test, each with the spans it holds and the first spans' trace and span ids. A `file` is read from the repository in place of `body_b64`.",
+  "bodies": [
+    {
+      "what": "a v0.7 body datadog_trace_out wrote under gzip in standin-datadog-trace's run 20261104T185238Z, relaying a v0.4 writer's spans",
+      "path": "/v0.7/traces",
+      "content_encoding": "gzip",
+      "body_b64": "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",
+      "spans": 30,
+      "first": [
+        [
+          "14955511972751426667",
+          "14435952760779822290"
+        ],
+        [
+          "6601915918648237781",
+          "4365232783563266775"
+        ]
+      ]
+    },
+    {
+      "what": "a dd-trace-py 4.15.2 tracer's recorded v0.4 body",
+      "path": "/v0.4/traces",
+      "content_encoding": null,
+      "file": "testdata/interop/datadog/tracer-v04-v0-4-traces-000.bin",
+      "body_b64": "",
+      "spans": 10,
+      "first": [
+        [
+          "15785587148021361665",
+          "11685112389553893461"
+        ],
+        [
+          "15785587148021361665",
+          "8197691299176281266"
+        ]
+      ]
+    },
+    {
+      "what": "the same tracer's recorded v0.6 stats body",
+      "path": "/v0.6/stats",
+      "content_encoding": null,
+      "file": "testdata/interop/datadog/tracer-v04-v0-6-stats-000.bin",
+      "body_b64": "",
+      "spans": 0,
+      "first": []
+    }
+  ]
+}

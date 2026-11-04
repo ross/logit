@@ -428,15 +428,24 @@ class Run:
             scenario_mod.remove_private_env(self.private_env)
 
     def _execute(self):
-        if self.docker.project_containers():
-            _print(f"soak: compose project '{self.project}' already has containers on this "
-                   "daemon.\n  Not this run's to stop. If it is yours, run:\n"
-                   f"  {' '.join(self.docker.prefix)} compose -p {self.project} "
-                   + "".join(f"-f {path} " for path in self.docker.compose_files) + "down -v")
+        leftovers = self.docker.project_containers()
+        strays = self.docker.stray_containers()
+        if leftovers or strays:
+            prefix = " ".join(self.docker.prefix)
+            cleanup = [f"{prefix} compose -p {self.project} "
+                       + "".join(f"-f {path} " for path in self.docker.compose_files)
+                       + "down -v"]
+            if strays:
+                cleanup.insert(0, f"{prefix} rm -f {' '.join(strays)}")
+            what = ("containers" if leftovers else "no compose containers, but a client "
+                    "container a crashed or `--keep` run left")
+            _print(f"soak: compose project '{self.project}' already has {what} on this "
+                   "daemon.\n  Not this run's to stop. If it is yours, run:\n  "
+                   + "\n  ".join(cleanup))
             return 2
-        file_steps = any(spec.action in scenario_mod.FILE_ACTIONS
+        python_steps = any(spec.action in scenario_mod.PYTHON_ACTIONS
                          for spec in self.scenario.steps)
-        if file_steps:
+        if python_steps:
             problem = faults.ensure_fileops_image(self.docker)
             if problem is not None:
                 _print(f"soak: {problem}")
@@ -444,7 +453,7 @@ class Run:
         images = ([self.image, NETEM_IMAGE] + ([VM_IMAGE] if self.has_vm else [])
                   + ([KAFKA_IMAGE] if self.scenario.runs_broker else [])
                   + ([STANDIN_IMAGE] if self.standin or self.scenario.cri_sources else [])
-                  + ([faults.FILEOPS_IMAGE] if file_steps and not self.standin else []))
+                  + ([faults.FILEOPS_IMAGE] if python_steps and not self.standin else []))
         collect.provenance(self.run_dir, self.root.parent.parent, self.docker,
                            images, self.scenario.name,
                            self.duration, self.seed, self.argv, self.seed_source)
@@ -1075,6 +1084,8 @@ class Run:
             if self.keep:
                 self.say(f"--keep: leaving compose project {self.project} up")
             else:
+                strays = self.docker.remove_strays()
+                self.phase("strays", removed=len(strays))
                 result = self.docker.compose("down", "-v", "--remove-orphans", timeout=180)
                 self.phase("down", rc=result.rc)
             for jsonl in (self.timeline, self.watchdog, self.stats, self.freshness,

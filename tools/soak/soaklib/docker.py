@@ -97,6 +97,22 @@ class Docker:
         result = self.compose("ps", "-a", "-q")
         return result.stdout.split() if result.ok else []
 
+    def stray_containers(self, timeout=DEFAULT_TIMEOUT):
+        """Ids of the containers the run started outside compose, a `slowclient`'s, stopped
+        ones included: each carries the project's label and a `<project>-slowclient-` name but
+        no `config-hash` label, so `compose ps` and `compose down --remove-orphans` miss it."""
+        found = self.run(["ps", "-aq", "--filter",
+                          f"label=com.docker.compose.project={self.project}",
+                          "--filter", f"name=^{self.project}-slowclient-"], timeout=timeout)
+        return found.stdout.split() if found.ok else []
+
+    def remove_strays(self, timeout=DEFAULT_TIMEOUT):
+        """Force-removes every container `stray_containers` lists. Returns the ids removed."""
+        ids = self.stray_containers(timeout=timeout)
+        if ids:
+            self.run(["rm", "-f", *ids], timeout=timeout)
+        return ids
+
     def inspect(self, container, timeout=DEFAULT_TIMEOUT):
         """`docker inspect` of one container as a dict, or None."""
         result = self.run(["inspect", container], timeout=timeout)

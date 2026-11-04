@@ -2047,7 +2047,7 @@ the pause, so `ledger.topic`'s no-duplicate verdict rests on resends, and `retry
 during the stop and 0 after it. `kafka-otlp-broker-restart` is the same run under `format:
 otlp_proto`, `topics: {metrics: soak}`, with the same expectations: one record per window.
 
-### 8c. Stand-in targets (W9a, W9b, W16, W29)
+### 8c. Stand-in targets (W9a, W9b, W16, W29, W36)
 
 A `[target]` table with `kind = "standin"` runs a scripted HTTP destination in place of
 VictoriaMetrics, so every row of a sink's response-class table
@@ -2056,7 +2056,7 @@ VictoriaMetrics, so every row of a sink's response-class table
 ```toml
 [target]
 kind = "standin"          # name defaults to "standin"
-shape = "remote_write"    # or "datadog" (W9b), "influxdb" (W16), "otlp" or "splunk" (W29)
+shape = "remote_write"    # or "datadog" (W9b), "influxdb" (W16), "otlp" or "splunk" (W29), or "datadog_trace" (W36)
 
 [[ledger.sink]]           # one sink, with no backend or vm_selector
 id = "remote_write"
@@ -2278,6 +2278,27 @@ to it, as on an external target. Under `remote_write` and `influxdb`, `ledger.se
   reset, every ack withheld (`ambiguous`), and a `stop` of the stand-in. Not cued: Splunk Cloud's
   code 6 at object 0 of a body over 5 MiB, a connect failure after a body was accepted, the
   request timeout (the stand-in holds no answer), and the two `connect_timeout:` rows.
+- `standin-datadog-trace` (W36): `[target] shape = "datadog_trace"`, the stand-in for an
+  Agent's trace API. A generator's `generate_in`, a `lua` stage minting a span per event (one
+  per trace, by `random.trace_id()`), and `datadog_trace_out` writing v0.4 to the SUT's
+  `datadog_trace_in`, which relays every span through `datadog_trace_out` (v0.7, gzip,
+  `idle_timeout: 1s`) to `endpoint: http://standin:8080`, with no `aggregate`. Thirteen steps,
+  60 s apart: a kill of the SUT, so every cued row falls in the final life; eleven 10 s cues,
+  `400`, `404`, `401`, `408`, `413`, `415`, `429`, `501`, a `503` after storing (its resend a
+  copy), `302`, and a reset; and a `stop` of the stand-in. Not cued: a dial past `connect_timeout:` and the request timeout. The
+  stand-in takes `PUT` and `POST` on `/v0.4/traces`, `/v0.7/traces`, and `/v0.6/stats`, and
+  answers a trace request with `rate_by_service`. Each body is read by
+  `soaklib/msgpack.py`, a bounded stdlib reader, into one series per span keyed by trace and
+  span id. The ledger counts spans: G the writer's `events.delivered`, W `datadog_trace_in`'s
+  `events.sent`, and V the spans of the writes answered `2xx`, every copy. The scenario
+  rules allow one source on an `http` wire into a `datadog_trace_in`, one `datadog_trace_out`
+  sink, one SUT service, and nothing between them. `ledger.aggregate` SKIPs, `ledger.edge`
+  holds E − X to the sink's events received as on a scrape wire, `ledger.egress` holds a
+  final or stopped life's W − X − V to the sink's `records.dropped` under every reason plus
+  its `events.dropped` under any reason but `rejected` and `ambiguous_at_most_once`,
+  `ledger.summary` holds the distinct spans accepted to G, and `ledger.standin` holds
+  `records.dropped{reason="rejected"}` and `{reason="oversize"}` to the spans of the rejected
+  steps' requests.
 
 The black-hole control is a `2xx` the stand-in doesn't store (`status = 200`, `apply = false`).
 `ledger.standin` FAILs it wherever it falls. Under cumulative temporality the next stored totals
@@ -2346,7 +2367,12 @@ the other.
   acknowledged. Each `pause` of `collector` allows − one send window: the resend can race the
   frames an ended connection still holds
   ([`docs/deploying.md`](../deploying.md#forwarding-between-logit-nodes)). A partition or packet loss
-  allows nothing: the race needs a forward parked on a full inbox. Any other gap FAILs, below
+  allows nothing: the race needs a forward parked on a full inbox. A `logit` life whose replay
+  met more sender evictions at `collector` than its own identity causes, from its start to its
+  first drain that counted a replay plus two of `collector`'s drain intervals (or the next
+  life's start), allows − its replayed frames, `buffer.disk.replayed` in frames of the largest
+  frame: a replayed identity the full table had evicted is forwarded again (W35). Any other gap
+  FAILs, below
   the allowance as a surplus and above it as uncounted. A `rejected` or `disk_corrupt` batch
   drop at the hop sink FAILs too. Resends, resumed frames, and reconnects are shown beside it,
   and the row's lines give the running gap at each fault's start, the hop's backlog plus any
@@ -2356,7 +2382,8 @@ the other.
   bound end to end, which no kill or restart can loosen: each egress group's V over the whole
   run is at most G less every counted loss (K, D, B, X, the hop's drops, and X_B, and on a TCP
   wire F), plus one generator batch per ambiguous attempt of a TCP source, the partial-frame
-  surplus `ledger.wire` allows. A duplicate
+  surplus `ledger.wire` allows, and the replayed frames `ledger.hop` allows for a replay into a
+  full sender table. A duplicate
   forwarded across the hop adds the same increments to E_B, A, Ab, and V, so every per-life term
   balances around it; this bound and `ledger.hop` are what see it, the bound only once the
   surplus exceeds the run's uncounted loss, the wire loss among it.
@@ -2372,6 +2399,13 @@ the other.
   averages low over it), and
   t from its last drain to the `docker kill`'s return, replayed − queued is in
   [−(delivered × t) − 1, received × t + the commit rate × the checkpoint interval + 1].
+  A spool persists only once the interval has passed since it opened, so for a life killed
+  sooner after its start the commit term is every batch it delivered, plus delivered × t: it
+  never persisted, and in a crash loop each life's replay carries the one before (W35). That
+  assumes the spool rolled no segment, since `DiskQueue::roll_read_cursor` persists the cursor
+  at every segment boundary; the rule requires the hop sink to declare `segment_bytes`, large
+  enough that no roll happens, as `native-hop-identities` does with 512MiB (the harness takes
+  the size on trust), and a sink that doesn't gets the one-interval band.
   The first two `native-hop` runs found both terms: a kill inside `collector`'s stop replayed 55
   batches over the queue, 50 it received in the 5 s before the kill and 5 committed before the
   stop and never persisted.
@@ -3541,10 +3575,22 @@ that items 3, 7, and 11 need.
   `slow-spool` scenario, `tools/soak/vm-io-probe.sh`, the README's "Running a scenario on the
   perf VM", and an amendment to ADR `soak-harness`. The `dm-delay` fallback waits for the VM's
   probe to fail, and the runs happen on the perf VM.
-- **W34** to **W37**: items 31, 32, 33, and 34 in turn, each with its action or
-  wire, self-test fixtures for each rule, an amendment to ADR `soak-harness` where it adds a
-  ledger rule or an action, and each scenario's run recorded under "Findings". Item 30 has no
-  workstream.
+- **W34**: item 31: the `slowclient` action and its client, `soaklib/slowclient.py`, their
+  rules, self-test fixtures for each, the `slowloris-tcp` and `slowloris-http` scenarios, the
+  killed-life allowance in `ledger.standin` for requests answered after the life's last drain,
+  an amendment to ADR `soak-harness` for each, and both runs recorded under "Findings".
+- **W35**: item 32: the `native-hop-tls`, `native-hop-rtt`, and `native-hop-identities`
+  scenarios, `ledger.hop`'s and `ledger.summary`'s allowance for a replay into a full sender
+  table, self-test fixtures for it, an amendment to ADR `soak-harness`, and the runs recorded
+  under "Findings".
+- **W36**: item 33: the `datadog_trace` stand-in shape, `soaklib/msgpack.py`, the span
+  ledger's egress, summary, and stand-in rules and its scenario rules, self-test fixtures for
+  each, the `standin-datadog-trace` scenario, `datadog_trace_out`'s table among those the
+  `standin-*` scenarios restate, an amendment to ADR `soak-harness`, and the run recorded under
+  "Findings".
+- **W37**: item 34, with its action or wire, self-test fixtures for each rule, an amendment to
+  ADR `soak-harness` where it adds a ledger rule or an action, and each scenario's run recorded
+  under "Findings". Item 30 has no workstream.
 
 Landing order: W0 → W1a → W1b → W2 → W3 → W4 → W5 → W6 → W7a → W7b → W8a → W8b → W8c → W9a → W9b → W10a → W10b → W11a → W11b → W12a → W12b → W12c → W12d → W14 → W13b → W15, linear; W13a, W16, and W17 land off `main` beside W14, and W18, W19, and W20 off `main` after it. W21 → W22 → W23 → W24 → W25 → W26 → W27 → W28 → W29 land after them, a linear stack off `main`. W30 lands off `main`, then W31 → W32 → W33 and W34 → W35 → W36 → W37, two stacks off W32, the second needing none of W33. Each PR is based on and targets its
 parent's branch and is brought up to date with `git merge origin/main`, never a rebase.
@@ -6885,6 +6931,153 @@ What the runs showed about `logit` and the harness:
   the stopped stand-in, which never reach the record, as in W9a.
 - **Self-test**: 2,375 expectations after the merges. Each new rule was reverted in turn and
   failed at least one expectation; the PR lists them.
+
+### W36: the `datadog_trace` pair against an Agent stand-in, in spans (2026-11-04)
+
+W36 adds the `datadog_trace` stand-in shape, `soaklib/msgpack.py`, the span ledger, and
+`standin-datadog-trace`. The scenario ran twice at its default duration on the development host,
+one after the other, against `logit:soak-w36` built from `soak/w36` (W36 changes no Rust).
+
+| Run | Scenario | Verdict | Highlights |
+|---|---|---|---|
+| `20261104T185238Z` | `standin-datadog-trace` | PASS | the SUT kill last, so every cued row fell in the killed life and `ledger.egress` only reported its gap, 8,820 against 9,000 counted drops |
+| `20261104T191140Z` | `standin-datadog-trace` | PASS | the kill first; the final life's W − X − V 9,000 equal to the sink's `records.dropped`, 6,000 `rejected` and 3,000 `oversize`; 257,550 distinct spans accepted of G 266,550; 240 spans stored under the `503` and resent, no accepted copy; every class signature at the sink |
+
+What the runs showed about `logit` and the harness:
+
+- **The tracer-API sink reads every cued row as its table says.** The `400`, `413`, and `302`
+  steps each dropped all 100 of their requests, 30 spans each, counted under
+  `records.dropped`, `oversize` for the `413`. The `404`, `401`, `415`, and `429` steps each
+  held the head through 8 attempts in 10 s at the 2 s retry cap, a `retrying` line naming
+  `refused` or `clean`, with nothing dropped. The `408`, `501`, `503`, and the reset were
+  retried as `ambiguous`; the `503` steps stored 240 spans that the resends then stored again
+  under a `2xx`, which is why V's accepted writes held no copy. A stop of the stand-in was 4
+  `connect_error` attempts, `clean`. No product defect.
+- **The kill belongs first.** A killed life's egress gap is reported, never judged, since the
+  kill takes the life's last telemetry interval: in the second run life 0 read W − X − V = −210,
+  its last drain's sends uncounted. The first run put the kill after the cues, so none of the
+  rows the scenario exists for was judged at egress. A measurement fix: moving the kill to the
+  cycle's start judged them in the final life.
+- **The listener never answered busy.** The SUT sink's default buffer absorbed each 10 s hold,
+  138 batches at most, so `datadog_trace_in` sent every batch without its 2 s busy wait and the
+  `503` path stayed unexercised. The generator's 50-batch queue overflowed only across the SUT
+  kill, 172 batches counted `overflow_newest` at its writer, loss outside G.
+- **Self-test**: 3,270 expectations. Reverting each new rule fails its case: the egress loss
+  and surplus verdicts, the summary's terms and its distinct-span bound, the stand-in's
+  `rejected` and `oversize` counts, the six span-relay scenario rules, and the msgpack reader's
+  length, depth, container-key, and trailing-byte bounds.
+
+### W35: the native hop over TLS, under RTT, and past the sender table (2026-11-04)
+
+W35 adds `native-hop-tls`, `native-hop-rtt`, and `native-hop-identities`, `ledger.hop`'s and
+`ledger.summary`'s allowance for a replay into a full sender table, and the hop sink's replay
+band for a life killed inside its first checkpoint. Each ran once at its default duration on the
+development host, one after the other, against `logit:soak-w35` built from `soak/w35` before it
+merged `soak/w34` and `main` (W35 changes no Rust; `main`'s merge brought `prometheus_in`'s busy
+answer, which none of the three runs). Item 32 assumed `max_connections:` sizes `logit_in`'s
+table; it does, at `max_connections + max_connections / 4` identities
+(`crates/logit-inputs/src/logit/senders.rs`), each eviction counted
+`logit.input.senders.evicted`.
+
+| Run | Scenario | Verdict | Highlights |
+|---|---|---|---|
+| `20261104T174012Z` | `native-hop-tls` | PASS, rescored | three probes served generations 2, 2 (after the broken rotation), and 4; two server reloads, one failure, one client reload, each `notAfter` a day up; a reconnect after `collector`'s restart and 7 resends after `logit`'s kill; `ledger.hop` −1,400 within [−10,000, 816]; G 1,691,700, V 1,691,500 |
+| `20261104T175703Z` | `native-hop-rtt` | PASS | `in_flight` and `window` at 4 under both long delays, at most 1 under the 50 ms control; the spool's backlog rose 909 batches in 150 s at 1 s and 249 in 120 s at 500 ms and drained to 1 after each; `ledger.hop` 0; G = W = V = 1,571,700 |
+| `20261104T181321Z` | `native-hop-identities` | PASS, rescored | `senders` 5 at most; evictions 0 at capacity, 1 at the sixth identity, 7 in the last replay, 13 over the run; 2,806 resends; `ledger.hop` −315,300 within [−655,255, 3,732], life 11's 957 replayed frames allowed; V 2,007,300 against G 1,751,800 plus that allowance |
+
+What the runs showed about `logit` and the harness:
+
+- **A probe of `logit_in` is a `connection_error`.** The probe completes its TLS handshake and
+  closes with no `Hello`, which `logit_in` diagnoses as "connection closed before sending
+  Hello", once per probe. `no-connection-errors` FAILed on those 3, and the run was rescored
+  against rows of one per probe over the run and none around the restart and the kill, the
+  handshakes that matter. A measurement fix: no handshake of `logit`'s failed.
+- **The window bounds the hop as the arithmetic says.** `statsd_in` hands the hop 10 batches a
+  second, one frame each. At 1 s of delay 4 frames a round trip carry about 4 a second, and the
+  backlog rose 6.1 a second; at 500 ms, about 8, and it rose 2.1 a second. At 50 ms the window
+  carries 80 a second, and `in_flight` never read above 1. Nothing was lost or forwarded twice.
+- **One sender evicts a retired identity, and only a crash loop changes that.** Five graceful
+  restarts made six identities, and the sixth evicted the oldest with nothing more to send: no
+  duplicate. In the crash loop each life replayed every frame the loop had committed, its
+  replay deduplicated while the table held all its identities (826 resends in the fifth life's
+  first drain). The sixth life's replay spanned six identities in a table of five: the first
+  was gone, and each one it took back evicted the next it replayed, so `collector` forwarded
+  the whole replay again, 275,400 events in one drain with no resend and 7 evictions. That is
+  the duplicate ADR `native-hop-identity-and-sequence` accepts for an evicted sender, made a
+  whole replay's worth by LRU order; at the default 1,280 identities one sender would need
+  1,281 lives with no cursor persist to reach it. Not a defect, but an operator with a small
+  `max_connections:` and crash-looping senders should know it.
+- **`ledger.replay` read a crash loop as replaying too much.** Its band allowed one checkpoint
+  interval of commits at the life's last commit rate, and lives 9 to 11 replayed 693 to 957
+  batches against bands of at most 657. A spool persists only once the interval has passed since it
+  opened, so a life killed 15 s in never persisted, and each replay carried the one before.
+  The band now takes every batch such a life delivered, and the run, rescored, passes with each
+  replay within about 50 batches of the life's commits plus its queue. The band assumes the
+  spool rolled no segment, which would persist the cursor at the boundary; the scenario's
+  512MiB `segment_bytes` rules a roll out, and the harness can't see one. A harness fix: every
+  replay matched what the spool's persist rule predicts.
+- **Self-test**: 3,130 expectations. Reverting the eviction allowance fails its passing case,
+  the `ledger.summary` text case, and the inside and past surplus cases; reverting the replay
+  band's crash-loop term fails its case, and reverting its `segment_bytes` fallback fails the
+  undeclared-`segment_bytes` case. The eviction rule's one-eviction and late-eviction cases,
+  and the replay band's outlived-checkpoint case, FAIL as they should with each rule in place.
+
+### W34: slowloris and half-open peers on a TCP and an HTTP listener (2026-11-04)
+
+W34 adds the `slowclient` action and the `slowloris-tcp` and `slowloris-http` scenarios, and
+the killed-life allowance in `ledger.standin`. Both scenarios ran at their default duration on
+the development host (Docker 29.9, SELinux enforcing), one after the other, against
+`logit:soak-w34` built from `soak/w34` (W34 changes no Rust). The client ran in the
+`python:3.13.16-alpine3.24` image the file actions already pull, on the SUT's compose network,
+and was gone after each revert.
+
+| Run | Scenario | Verdict | Highlights |
+|---|---|---|---|
+| `20261104T165809Z` | `slowloris-tcp` | PASS | `silent-closed` 80 first-byte timeouts from 8 silent connections in 60 s; `slots-full` 801 limit refusals and `slots-held` 16 under the trickle; `trickle-holds` 0 closes; `half-open-idle` 8; `fds-released` 17 at most; G = W = Ab = V = 1,271,300, loss judged 36 against 500 |
+| `20261104T171030Z` | `slowloris-http` | PASS | `head-idle` 24 idle closes from 8 trickled heads in 60 s; `slots-full` 810 and `slots-held` 16 under the dribbled bodies; `body-holds` 0 closes; `half-open-idle` 8; `fds-released` 17 at most; G = W = Ab = V = 1,271,300, loss judged 46 against 500 |
+
+A copy of `delta-datadog`'s run `20261104T045821Z`, rescored with the `ledger.standin` change,
+reads PASS where it had WARNed, with "life 1: the stand-in answered 1 request(s) 2xx datadog
+never counted, reported".
+
+What the runs showed about `logit` and the harness:
+
+- **The TCP driver bounds a silent connection and nothing past its first byte.** Each silent
+  connection was closed at `handshake_timeout:` (5 s) and counted, and the client redialed it,
+  80 closes in the window. Under the trickle, 15 connections and the generator's held all 16
+  slots for the whole 90 s window with no close: an LF a second re-arms `idle_timeout:` (20 s)
+  on every read, and the LF framer counts no frame for it, so W gained nothing. The other nine
+  were each accepted and closed at once, 801 `rejected{reason="limit"}` over the client's 825
+  dials, the generator's connection unaffected.
+- **An HTTP head is bounded by `idle_timeout:`, a body is not.** A head trickled a byte a
+  second was closed at the 10 s `idle_timeout:` from accept, since the clock re-arms only on a
+  finished request, 24 closes for 8 connections in 60 s. A body dribbled under a 1 MiB
+  `Content-Length` met the per-frame stall bound with each byte and held its slot until the
+  revert, when the listener counted 15 `logit.input.requests.rejected{reason="body_read"}`, each
+  with its throttled warning. A slot taken that way is released by the client or the size cap,
+  which at a byte a second is about 12 days: the limit ADR `deployment-threat-model` records.
+- **A half-open peer is closed by `idle_timeout:` on both listeners.** Each of the 8
+  connections sent its first byte, saw it acknowledged (`TIOCOUTQ` 0), and lost its network, so
+  no FIN or RST reached the SUT; each was closed `idle` within the window. The SUT's FIN went
+  unanswered, and its descriptor count returned to 17 by the `mark`, the warmup's median.
+- **No warning line accompanies a limit refusal or a timeout close.** Neither run logged a WARN
+  for the 801 and 810 refusals or the 80 and 24 timeout closes; each is counted, and none is a
+  `*.dropped`, so the loss vocabulary asks for no line. Not a finding.
+- **`max_open` in the two runs above is the old count.** The client sampled it right after
+  each `create_connection`, before a read saw the listener's close, so it read 24 of 24 with 15
+  slots free. It now samples at each tick after the read pass, so it means the connections the
+  listener let the client hold; the recorded runs' numbers have not been redone.
+- **A killed client no longer leaks.** `compose down --remove-orphans` doesn't remove a
+  container with no `config-hash` label (Compose 5.6.0), so teardown force-removes the
+  project's `<project>-slowclient-` containers first.
+- **Self-test**: 3,035 expectations. Each new rule was reverted in turn and failed at least one
+  expectation, 36 in all: the client's modes, sends, head, endless head, trickle, redial, the
+  half-open first byte and acknowledgment wait, its usage rule; the apply's network inspect, the
+  start, the `ready` wait and each failure it reads, the disconnect and its cleanup, the
+  revert's stop, `done` read, and failed-apply path; `timeline`'s report; the scenario rules for
+  each key, its range and form, `send` against `silent`, the keys off another action, the
+  SUT-only and `[random]` refusals, and the keys reaching the expanded step. Reverting the
+  `ledger.standin` allowance fails its new killed-life case.
 
 ### W33: a slow spool on the perf VM (2026-11-04)
 

@@ -1,0 +1,155 @@
+# http-ingress's pipeline with a 16-connection cap and a 10 s idle_timeout, under slow clients
+# that hold its slots (docs/plans/soak-harness.md, item 31). The generator's kept connection is
+# open from the start, before any slot fills, and no client finishes a request, so they add
+# nothing to W, and the generator's wire is judged through every window as http-ingress judges
+# it: G counts only the points the SUT answered `204` for, and a request whose connection the
+# full listener closed is resent, a surplus allowed one batch per transport-error attempt. The
+# schema is docs/plans/soak-harness.md's "The scenario schema".
+
+name = "slowloris-http"
+description = "generator influxdb_out -> influxdb_in (HTTP, max_connections 16) under trickling and half-open clients -> kv_metrics -> aggregate 500ms cumulative -> prometheus_out RW1 zstd -> VictoriaMetrics"
+duration = "10m30s"       # warmup + one cycle + cooldown; --duration overrides
+warmup = "60s"            # no faults: baseline rate, RSS, fds
+cooldown = "120s"         # no faults at the end; >= recovery_bound
+recovery_bound = "45s"    # the generator's retry_max_delay 1s, the sink's 10s, and a drain
+cycle = "7m30s"           # >= last recovery (6m15s) + 2 x progress_window
+
+[configs]
+sut = "logit-sut.yaml"
+generator = "logit-generator.yaml"
+
+[ledger]                  # component ids the checker reads; no rates here
+sut_aggregate = "window"
+wire_loss_outside_faults = 0.0
+
+[[ledger.source]]
+service = "generator"
+generator_input = "load"
+generator_sink = "influx"
+sut_listener = "influx"
+sut_transforms = ["count"]
+wire = "http"             # G events.delivered, W the listener's events.sent
+
+[[ledger.sink]]
+id = "victoria_metrics"
+backend = "victoria-metrics"
+vm_selector = '{__name__="soak_requests_total"}'
+
+[thresholds]
+progress_window = "30s"
+rss_growth_mib_per_hour = 64   # WARN under 1h, FAIL above
+fd_growth = 8
+
+# Eight request heads a byte a second that never end: the idle_timeout clock re-arms only when a
+# request finishes, so each is closed 10 s after its accept, counted, and dialed again.
+[[step]]
+at = "0s"
+action = "slowclient"
+on = "logit"
+address = "logit:8086"
+mode = "trickle"
+send = "http_head"
+connections = 8
+interval = "1s"
+for = "60s"
+
+# 24 whole heads to the write route, each body then an LF a second toward a 1 MiB
+# Content-Length: the body is read under a per-frame stall bound, which each byte meets, so 15
+# take every free slot and hold it, and the listener closes each of the other nine at accept,
+# counted, until the revert. That a dribbled body holds its slot is the limit ADR
+# deployment-threat-model documents ("A stalled or dribbled body holds its connection permit"),
+# so the scenario pins it: no idle close in the window. The revert ends the 15 bodies short,
+# each answered as a failed body read.
+[[step]]
+at = "90s"
+action = "slowclient"
+on = "logit"
+address = "logit:8086"
+mode = "trickle"
+send = "http_body"
+connections = 24
+interval = "1s"
+for = "90s"
+
+# Eight connections that send a head's first byte, then lose their network with no FIN or RST:
+# past the first-byte peek, so the idle_timeout closes each, counted.
+[[step]]
+at = "210s"
+action = "slowclient"
+on = "logit"
+address = "logit:8086"
+mode = "half_open"
+send = "http_head"
+connections = 8
+for = "60s"
+
+# Every client gone: the descriptors they held are back. The SUT holds 17 with the generator's
+# connection and nothing else, at warmup and after the clients.
+[[step]]
+at = "290s"
+action = "mark"
+on = "logit"
+for = "40s"
+
+[[expect]]
+name = "head-idle"
+service = "logit"
+metric = "logit.input.connections.closed"
+component = "influx"
+attrs = { reason = "idle" }
+step = "c0s1"
+window = "during"
+reduce = "delta"
+min = 8
+
+[[expect]]
+name = "slots-full"
+service = "logit"
+metric = "logit.input.connections.rejected"
+component = "influx"
+attrs = { reason = "limit" }
+step = "c0s2"
+window = "during"
+reduce = "delta"
+min = 1
+
+[[expect]]
+name = "slots-held"
+service = "logit"
+metric = "logit.input.connections"
+component = "influx"
+step = "c0s2"
+window = "during"
+reduce = "max"
+min = 16
+max = 16
+
+[[expect]]
+name = "body-holds"
+service = "logit"
+metric = "logit.input.connections.closed"
+component = "influx"
+step = "c0s2"
+window = "during"
+reduce = "delta"
+max = 0
+
+[[expect]]
+name = "half-open-idle"
+service = "logit"
+metric = "logit.input.connections.closed"
+component = "influx"
+attrs = { reason = "idle" }
+step = "c0s3"
+window = "during"
+reduce = "delta"
+min = 8
+
+[[expect]]
+name = "fds-released"
+service = "logit"
+metric = "logit.process.fds"
+step = "c0s4"
+window = "during"
+reduce = "max"
+max = 18

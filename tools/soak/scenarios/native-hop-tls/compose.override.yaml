@@ -1,0 +1,17 @@
+# native-hop-tls's far SUT, merged onto tools/soak/compose.yaml as native-hop's override does:
+# the base `logit` service under the name `collector`, with its own config from
+# SOAK_COLLECTOR_CONFIG. Both SUTs mount the run's TLS directory, `<run>/tls`, which the driver
+# fills from a private CA and names in SOAK_TLS_DIR, read-only at /tls: a whole directory, not
+# single files, so a `rotate` step's repointed `live` symlink reaches the process. `:z` relabels
+# it for SELinux. `logit` connects to `collector`, so it starts first.
+services:
+  collector:
+    extends: { file: compose.yaml, service: logit }
+    labels: { soak.role: sut }
+    volumes:
+      - "${SOAK_COLLECTOR_CONFIG:?set by script/soak}:/config.yaml:ro,z"
+      - "${SOAK_TLS_DIR:?set by script/soak}:/tls:ro,z"
+  logit:
+    volumes: ["${SOAK_TLS_DIR:?set by script/soak}:/tls:ro,z"]
+    depends_on:
+      collector: { condition: service_healthy }

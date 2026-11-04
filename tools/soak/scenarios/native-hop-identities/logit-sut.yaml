@@ -1,0 +1,22 @@
+# The ingress SUT in `script/soak`'s native-hop-identities scenario: native-hop's `logit`, whose
+# hop sink's disk spool mints a new sender identity every time the process opens it. The spool
+# persists its read cursor at a graceful stop and otherwise once a minute, so a life killed
+# sooner leaves every frame it committed to be replayed, under its own identity, by the next
+# life. A segment far larger than the run writes keeps a segment roll from persisting it
+# sooner. Its `internal` telemetry goes to stdout as NDJSON for the harness to read;
+# `script/soak` runs it with `--log-format json`.
+admin: { bind: 127.0.0.1:9600 }     # the image HEALTHCHECK's probe address
+components:
+  statsd: { type: statsd_in, bind: 0.0.0.0:8125 }   # receive: defaults (drop_oldest)
+  hop:
+    type: logit_out
+    sources: [statsd]
+    endpoint: collector:7400
+    concurrency: 32
+    request_timeout: 10s
+    # The driver kills and starts this container but never recreates it, so a directory in its
+    # own filesystem survives the kill with no volume.
+    buffer:
+      disk: { path: /tmp/soak-spool, checkpoint_interval: 60s, segment_bytes: 512MiB }
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }

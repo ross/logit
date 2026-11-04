@@ -257,8 +257,8 @@ import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import (checks, collect, criwriter, docker, driver, faults, otlp, report, sampling,
-               scenario, standin, telemetry,
+from . import (checks, collect, criwriter, docker, driver, faults, msgpack, otlp, report,
+               sampling, scenario, standin, telemetry,
                topic, vm)
 
 _FAILURES = []
@@ -1029,6 +1029,13 @@ class _AnswerDocker:
     def project_containers(self):
         return []
 
+    def stray_containers(self):
+        return []
+
+    def remove_strays(self, timeout=None):
+        self.calls.append(["remove_strays"])
+        return []
+
     def run(self, args, timeout=None, stdout=None, stderr=None):
         return self._ok(args)
 
@@ -1102,7 +1109,9 @@ def _stall_abort(root):
         expect(stall is not None and phases.count("stalled") == 1
                and phases[phases.index("stalled"):phases.index("stalled") + 3]
                == ["stalled", "aborted", "end_begin"]
-               and "end_end" in phases and "down" in phases,
+               and "end_end" in phases and "down" in phases
+               and phases[phases.index("down") - 1] == "strays"
+               and ["remove_strays"] in fake.calls,
                f"a stall records stalled and aborted, then runs the end sequence to end_end, "
                f"got {phases}")
         late = [r for r in timeline if r.get("event") in ("apply", "revert")
@@ -4960,6 +4969,18 @@ def _target_rules(root):
             driver._print = real_print
         expect(code == 2 and not private.exists() and not private.parent.exists(),
                "execute() exits 2 on a busy project, and removes the private env copy")
+        run.docker = _StrayOnlyDocker()
+        printed = []
+        driver._print = lambda text, stream=None: printed.append(text)
+        try:
+            code = run.execute()
+        finally:
+            driver._print = real_print
+        expect(code == 2 and len(printed) == 1 and "docker rm -f aa bb" in printed[0]
+               and "compose -p" in printed[0] and "down -v" in printed[0]
+               and printed[0].index("rm -f") < printed[0].index("down -v"),
+               f"a stray client container alone refuses the start and prints both cleanup "
+               f"commands, got {printed}")
         vm_run = driver.Run(root, local, local.duration, None, False, Path(tmp) / "vm", [],
                             "logit:soak", roles=scenario.BASE_ROLES)
         vm_run.prepare()
@@ -5088,6 +5109,25 @@ class _BusyDocker:
 
     def project_containers(self):
         return ["leftover"]
+
+    def stray_containers(self):
+        return []
+
+
+class _StrayOnlyDocker(_BusyDocker):
+    """A daemon with no compose container in the project, but a `slowclient` one a crashed
+    run left, listed through the real `Docker.stray_containers` with the daemon faked."""
+
+    def __init__(self):
+        self.real = docker.Docker("soak-x", [], [], prefix=["docker"])
+        self.real.run = lambda args, timeout=None, stdout=None, stderr=None: docker.Result(
+            0, "aa\nbb\n" if args[0] == "ps" else "", "")
+
+    def project_containers(self):
+        return []
+
+    def stray_containers(self):
+        return self.real.stray_containers()
 
 
 class _TailDocker:
@@ -5550,7 +5590,8 @@ def _kafka_rules(root):
     expect("kafka: { condition: service_healthy, required: false }" in sut,
            "the SUT waits for a healthy broker when its profile runs, and only then")
     for name, action in faults.ACTIONS.items():
-        if name in scenario.NO_WINDOW_ACTIONS:
+        # A slowclient runs on a SUT only and affects no leg.
+        if name in scenario.NO_WINDOW_ACTIONS or name == "slowclient":
             continue
         expect(action.affects_egress(scenario.Step(id="x", spec_index=0, cycle=0, action="stop",
                                                    on="kafka", args="", start=0, end=1), roles),
@@ -7741,7 +7782,7 @@ def _http_rules(root):
     problems = with_configs(influx_in, statsd_out, "http", "influx", "statsd")
     expect(problems == ["ledger.source 1: an http wire's `generator_sink` must be one of "
                         "influxdb_out, otlp_out, splunk_hec_out, datadog_out, prometheus_out, "
-                        "and 'statsd' is a statsd_out"],
+                        "datadog_trace_out, and 'statsd' is a statsd_out"],
            f"an http wire's writer must be an HTTP sink, got {problems}")
     problems = with_configs(statsd_in, influx_out, None, "statsd", "influx")
     expect(problems == ["ledger.source 1: `generator_sink` 'influx' is an influxdb_out, which "
@@ -9304,7 +9345,8 @@ TWO_SUT_COLLECTOR_CONFIG = ("components:\n"
 
 def _two_sut_run(tmp, name, kill_on="collector", collector_lives=2, extra=0, short=0,
                  hop_dropped=0, drops=(), pause=False, logit_lives=None, replayed=3,
-                 stalled=False, partial=False, collector_restart=False):
+                 stalled=False, partial=False, collector_restart=False, evicted=(),
+                 checkpoint=None, burst=0, segment_bytes="512MiB"):
     """A two-SUT run across a native hop: the generator and `logit` move `PER_DRAIN` lines per
     5 s drain into `logit`'s one life, whose hop sink `hop` takes each drain's lines in 10
     frames; `collector`'s `logit_in` `hop_in` forwards them into `window`, which delivers one
@@ -9320,8 +9362,10 @@ def _two_sut_run(tmp, name, kill_on="collector", collector_lives=2, extra=0, sho
     life leaves 3 hop batches queued, and its next life's first drain replays `replayed`; under
     `stalled` its hop sink delivers nothing in its last two drains and leaves 23 queued; under
     `partial` it delivers 2 of its last drain's 10 and leaves 11 queued. `collector_restart`
-    stops `collector` over the same span as that kill, a graceful restart.
-    `collector` counts one
+    stops `collector` over the same span as that kill, a graceful restart. `evicted` lists
+    `(offset, count)` pairs of `logit.input.senders.evicted` at `hop_in`. `checkpoint` sets the
+    hop sink's spool `checkpoint_interval` in seconds, and `burst` adds that many batches to its
+    `batches.delivered` at +50 s, as a replay delivered early in the life. `collector` counts one
     `events.dropped{reason="stale"}` at `window`. `drops` adds a count of 1 for each `(service,
     metric, component, reason)`, `service` being "logit" or "collector"."""
     if logit_lives is None:
@@ -9351,7 +9395,8 @@ def _two_sut_run(tmp, name, kill_on="collector", collector_lives=2, extra=0, sho
                                     ("logit.component.batches.delivered",
                                      0 if stalled and offset in (195, 200) else
                                      2 if partial and offset == 200 else
-                                     10 + (replayed if restarted and offset == 215 else 0),
+                                     10 + (replayed if restarted and offset == 215 else 0)
+                                     + (burst if offset == 50 else 0),
                                      "hop")):
             ingress.append(_line(early, metric, "sum", value, component=comp))
         ingress.append(_line(early, "logit.component.receive.utilization", "gauge", 0,
@@ -9404,6 +9449,9 @@ def _two_sut_run(tmp, name, kill_on="collector", collector_lives=2, extra=0, sho
                 egress.append(_line(stamp, metric, "gauge", 0, component="sink"))
     egress.append(_line(_stamp(T0 + 100), "logit.component.events.dropped", "sum", 1,
                         component="window", attrs={"reason": "stale"}))
+    for offset, count in evicted:
+        egress.append(_line(_stamp(T0 + offset), "logit.input.senders.evicted", "sum", count,
+                            component="hop_in"))
     for service, metric, component, reason in drops:
         line = _line(_stamp(T0 + 150), metric, "sum", 1, component=component,
                      attrs={"reason": reason})
@@ -9438,7 +9486,11 @@ def _two_sut_run(tmp, name, kill_on="collector", collector_lives=2, extra=0, sho
                        configs={"sut": "logit-sut.yaml", "collector": "logit-collector.yaml"})
     (run_dir / "configs").mkdir()
     (run_dir / "configs" / "logit-sut.yaml").write_text(
-        KILL_SUT_CONFIG.split("  window:")[0] + TWO_SUT_HOP_CONFIG)
+        KILL_SUT_CONFIG.split("  window:")[0] + (TWO_SUT_HOP_CONFIG if checkpoint is None else
+        TWO_SUT_HOP_CONFIG.replace(" }\n", ", buffer: { disk: { path: /s, checkpoint_interval: "
+                                   f"{checkpoint}s"
+                                   + (f", segment_bytes: {segment_bytes}" if segment_bytes else "")
+                                   + " } } }\n")))
     (run_dir / "configs" / "logit-collector.yaml").write_text(TWO_SUT_COLLECTOR_CONFIG)
     (run_dir / "logs" / "collector.stdout").write_text("\n".join(egress) + "\n")
     (run_dir / "logs" / "generator.stdout").write_text("\n".join(gen) + "\n")
@@ -9722,6 +9774,52 @@ def _two_sut_checks():
                "collector, restarted at +213s, forwards again)" in again["ledger.hop"].detail,
                f"a killed logit's replay forwarded again by a collector that restarted in "
                f"between passes, got {again['ledger.hop']}")
+        # A replay into a full sender table: an eviction beyond the life's own identity's means
+        # a replayed identity was taken back by a forward, so the replayed frames may be
+        # forwarded twice; one eviction, or one counted after the replay's window, allows none.
+        evicted = hop_row("two-logit-evicted", kill_on="logit", collector_lives=1, extra=1250,
+                          evicted=((215, 2),))
+        expect(evicted["ledger.hop"].status == checks.PASS
+               and "= -1,250, within allowance (allowance [-1,300, 100]" in
+               evicted["ledger.hop"].detail
+               and "logit life 1: −300 (its 3 replayed frames, which collector, evicting 2 "
+               "identities as it took them, more than the life's own one, may forward again)"
+               in evicted["ledger.hop"].detail,
+               f"a replay that met an eviction beyond its own identity's may be forwarded "
+               f"again, got {evicted['ledger.hop']}")
+        expect("plus an eviction allowance 300, the frames replayed into a full sender table"
+               in evicted["ledger.summary"].detail,
+               f"ledger.summary allows the same frames end to end, got "
+               f"{evicted['ledger.summary']}")
+        # The backend's surplus over G decides ledger.summary: 200 is inside the 300 eviction
+        # allowance, 400 is past it.
+        inside = hop_row("two-logit-evicted-inside", kill_on="logit", collector_lives=1,
+                         extra=2200, evicted=((215, 2),))
+        expect(inside["ledger.summary"].status == checks.PASS
+               and "V 60,200 <= G − counted + evicted 60,300"
+               in inside["ledger.summary"].detail,
+               f"a backend surplus inside the eviction allowance passes, got "
+               f"{inside['ledger.summary']}")
+        past = hop_row("two-logit-evicted-past", kill_on="logit", collector_lives=1,
+                       extra=2400, evicted=((215, 2),))
+        expect(past["ledger.summary"].status == checks.FAIL
+               and "V 60,400 > G − counted + evicted 60,300, a surplus of 100"
+               in past["ledger.summary"].detail,
+               f"a backend surplus past the eviction allowance FAILs, got "
+               f"{past['ledger.summary']}")
+        own = hop_row("two-logit-evicted-own", kill_on="logit", collector_lives=1, extra=1250,
+                      evicted=((215, 1),))
+        expect(own["ledger.hop"].status == checks.FAIL
+               and "= -1,250, surplus" in own["ledger.hop"].detail
+               and "replayed frames" not in own["ledger.hop"].detail,
+               f"the one eviction a life's own identity causes allows nothing, got "
+               f"{own['ledger.hop']}")
+        late_evict = hop_row("two-logit-evicted-late", kill_on="logit", collector_lives=1,
+                             extra=1250, evicted=((215, 1), (230, 1)))
+        expect(late_evict["ledger.hop"].status == checks.FAIL
+               and "= -1,250, surplus" in late_evict["ledger.hop"].detail,
+               f"an eviction after the replay's window allows nothing, got "
+               f"{late_evict['ledger.hop']}")
         lost = hop_row("two-logit-tail", kill_on="logit", collector_lives=1, extra=500)
         expect(lost["ledger.hop"].status == checks.PASS
                and "= -500, within allowance" in lost["ledger.hop"].detail,
@@ -9749,6 +9847,29 @@ def _two_sut_checks():
                and "band [-4, 14]" in partial["ledger.replay"].detail,
                f"a drain interval whose delivery stopped partway doesn't understate the commits "
                f"a replay repeats, got {partial['ledger.replay']}")
+        # A life killed before its first cursor persist replays every batch it committed, a
+        # replay it delivered early included, past one interval at its last commit rate.
+        loop = hop_row("two-logit-loop", kill_on="logit", collector_lives=1, replayed=403 + 1000,
+                       checkpoint=300, burst=1000)
+        expect(loop["ledger.replay"].status == checks.PASS
+               and "all 1,400 batches it committed, since it died 203s after its start, inside "
+               "its 300s checkpoint, with no persist" in loop["ledger.replay"].detail,
+               f"a life killed inside its first checkpoint replays all it committed, got "
+               f"{loop['ledger.replay']}")
+        unrolled = hop_row("two-logit-no-segment", kill_on="logit", collector_lives=1,
+                           replayed=403 + 1000, checkpoint=300, burst=1000, segment_bytes=None)
+        expect(unrolled["ledger.replay"].status == checks.FAIL
+               and "no segment_bytes set: a roll may have persisted"
+               in unrolled["ledger.replay"].detail
+               and "all 1,400 batches" not in unrolled["ledger.replay"].detail,
+               f"a spool with no declared segment_bytes gets the one-interval band, got "
+               f"{unrolled['ledger.replay']}")
+        persisted = hop_row("two-logit-persisted", kill_on="logit", collector_lives=1,
+                            replayed=403 + 1000, checkpoint=100, burst=1000)
+        expect(persisted["ledger.replay"].status == checks.FAIL
+               and "a 100s checkpoint of its last delivering" in persisted["ledger.replay"].detail,
+               f"a life that outlived its checkpoint replays one interval at most, got "
+               f"{persisted['ledger.replay']}")
         over = hop_row("two-logit-over", kill_on="logit", collector_lives=1, replayed=20)
         expect(over["ledger.replay"].status == checks.FAIL
                and "off by 17" in over["ledger.replay"].detail,
@@ -9999,7 +10120,8 @@ def _respond_rules(root):
     expect(applied.cue() == {"step": applied.id, "status": 503, "apply": True},
            f"`apply` travels in the cue, got {applied.cue()}")
     for name, action in faults.ACTIONS.items():
-        if name in scenario.NO_WINDOW_ACTIONS:
+        # A slowclient runs on a SUT only and affects no leg.
+        if name in scenario.NO_WINDOW_ACTIONS or name == "slowclient":
             continue
         one = scenario.Step(id="x", spec_index=0, cycle=0, action=name, on="standin", args="",
                             start=0, end=1)
@@ -11620,8 +11742,9 @@ def _splunk_codec(root):
 
 
 def _standin_on_loopback(root, shape, path, exchange):
-    """Runs the stand-in's handlers for `shape` on loopback ports and `exchange(request, cue)`,
-    where `request(method, path, body, headers)` returns `(status, headers, body)` and
+    """Runs the stand-in's handlers for `shape` on loopback ports, its write paths `path` (one
+    or a tuple), and `exchange(request, cue)`, where `request(path, body, headers, method)`, a
+    `POST` by default, returns `(status, headers, body)` and
     `cue(obj)` posts a cue; returns the record lines it printed."""
     import http.client
     import io
@@ -11640,8 +11763,8 @@ def _standin_on_loopback(root, shape, path, exchange):
     try:
         conn = http.client.HTTPConnection("127.0.0.1", data.server_address[1], timeout=5)
 
-        def request(path, body, headers=None):
-            conn.request("POST", path, body=body, headers=headers or {})
+        def request(path, body, headers=None, method="POST"):
+            conn.request(method, path, body=body, headers=headers or {})
             response = conn.getresponse()
             sent[0] += 1
             return response.status, dict(response.getheaders()), response.read()
@@ -13439,6 +13562,405 @@ def _prlimit_rules(root):
                f"interval past it, got {failed}")
 
 
+class _Listener:
+    """A local TCP listener for the slow client's tests: it keeps the first `keep` connections
+    and reads them, closing every later one at once, and records the bytes each kept one sent
+    and how many it accepted."""
+
+    def __init__(self, keep):
+        import socket
+        import threading
+        self.keep, self.accepted, self.kept = keep, 0, []
+        self.server = socket.create_server(("127.0.0.1", 0))
+        self.port = self.server.getsockname()[1]
+        self.lock = threading.Lock()
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self):
+        import threading
+        while True:
+            try:
+                conn, _ = self.server.accept()
+            except OSError:
+                return
+            with self.lock:
+                self.accepted += 1
+                if len(self.kept) >= self.keep:
+                    conn.close()
+                    continue
+                got = bytearray()
+                self.kept.append((conn, got))
+            threading.Thread(target=self._read, args=(conn, got), daemon=True).start()
+
+    def _read(self, conn, got):
+        while True:
+            try:
+                data = conn.recv(4096)
+            except OSError:
+                return
+            if not data:
+                return
+            with self.lock:
+                got.extend(data)
+
+    def received(self):
+        with self.lock:
+            return [bytes(got) for _, got in self.kept]
+
+    def close(self):
+        self.server.close()
+        for conn, _ in self.kept:
+            conn.close()
+
+
+def _run_client(args, seconds):
+    """Runs slowclient.py's source as faults.py ships it, for `seconds`, then SIGTERM: `(rc,
+    [printed JSON objects], stderr)`."""
+    proc = subprocess.Popen([sys.executable, "-I", "-u", "-c", faults.SLOWCLIENT_SOURCE, *args],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    time.sleep(seconds)
+    proc.send_signal(signal.SIGTERM)
+    out, err = proc.communicate(timeout=10)
+    return proc.returncode, faults.client_lines(out), err
+
+
+def _slowclient_client():
+    """slowclient.py against a local listener: `trickle` sends one byte per connection per
+    tick and dials again each connection the listener closes; `silent` sends nothing and dials
+    again too; `http_head` trickles a request head that never ends, and `http_body` sends a
+    whole head with its `Content-Length` and then trickles the body; `half_open` sends each
+    connection one byte, reports it acknowledged, and dials no more; a `ready` line comes
+    after the first round of dials and a `done` line at SIGTERM; and a silent client with a
+    `send`, or another with none, is refused."""
+    listener = _Listener(keep=2)
+    try:
+        rc, lines, err = _run_client(["trickle", "127.0.0.1", str(listener.port), "4", "0.1",
+                                      "lf"], 1.5)
+        ready = next((one for one in lines if one["event"] == "ready"), {})
+        done = lines[-1] if lines else {}
+        got = listener.received()
+        expect(rc == 0 and ready.get("dialed") == 4 and done.get("event") == "done"
+               and done["dialed"] > 4 and done["peer_closed"] >= done["dialed"] - 4
+               and len(got) == 2 and all(5 <= len(one) and set(one) == {10} for one in got),
+               f"a trickle sends LF bytes on the connections a listener keeps and dials again "
+               f"the ones it closes, got rc {rc} {lines} {got} {err}")
+    finally:
+        listener.close()
+    listener = _Listener(keep=1)
+    try:
+        rc, lines, err = _run_client(["silent", "127.0.0.1", str(listener.port), "3", "0.1",
+                                      "none"], 1.0)
+        done = lines[-1] if lines else {}
+        expect(rc == 0 and done.get("sent_bytes") == 0 and listener.received() == [b""]
+               and done.get("dialed", 0) > 3 and done.get("max_open") == 1,
+               f"a silent client sends nothing, dials again the ones the listener closes, and "
+               f"counts as held only the one the listener kept, got rc {rc} {lines} {err}")
+    finally:
+        listener.close()
+    for send in ("http_head", "http_body"):
+        listener = _Listener(keep=1)
+        try:
+            rc, lines, err = _run_client(["trickle", "127.0.0.1", str(listener.port), "1", "0.1",
+                                          send], 1.5)
+            got = listener.received()[0]
+            head, _, body = got.partition(b"\r\n\r\n")
+            request_line = b"POST /api/v2/write?org=soak&bucket=soak HTTP/1.1\r\n"
+            if send == "http_head":
+                ok = (got.startswith(request_line[:5]) and b"\r\n\r\n" not in got
+                      and 5 <= len(got) <= 20)
+            else:
+                ok = (got.startswith(request_line) and head.endswith(b"Content-Length: 1048576")
+                      and len(body) >= 5 and set(body) == {10})
+            what = "a head" if send == "http_head" else "a whole head, then its body,"
+            expect(rc == 0 and ok, f"a {send} trickle sends {what} a byte at a time, got "
+                                   f"rc {rc} {got!r} {err}")
+        finally:
+            listener.close()
+    import itertools
+    endless = bytes(itertools.islice(faults.slowclient.trickled("logit", "http_head"), 10000))
+    expect(b"\r\n\r\n" not in endless and endless.endswith(b"a" * 100),
+           f"an http_head trickle's head never ends, got {endless[:120]!r}")
+    listener = _Listener(keep=1)
+    try:
+        rc, lines, err = _run_client(["half_open", "127.0.0.1", str(listener.port), "2", "0.1",
+                                      "http_head"], 1.0)
+        ready = next((one for one in lines if one["event"] == "ready"), {})
+        got = listener.received()
+        expect(rc == 0 and ready.get("unacked_bytes") == 0 and ready.get("dialed") == 2
+               and lines[-1].get("dialed") == 2 and got == [b"P"],
+               f"a half_open client sends each connection its first byte, reports it "
+               f"acknowledged, and dials no more, got rc {rc} {lines} {got} {err}")
+    finally:
+        listener.close()
+    for args in (["silent", "127.0.0.1", "1", "1", "1", "lf"],
+                 ["trickle", "127.0.0.1", "1", "1", "1", "none"],
+                 ["trickle", "127.0.0.1", "1", "0", "1", "lf"],
+                 ["trickle", "127.0.0.1", "1", "1"]):
+        proc = subprocess.run([sys.executable, "-I", "-c", faults.SLOWCLIENT_SOURCE, *args],
+                              capture_output=True, text=True, timeout=10)
+        expect(proc.returncode == 2 and "usage:" in proc.stderr,
+               f"the client refuses {args}, got {proc.returncode} {proc.stderr!r}")
+
+
+class _SlowclientDocker:
+    """Answers a `slowclient`'s Docker calls: `inspect` of the SUT with `networks`, of the client
+    with `state`; `logs` with the next of `logs`; `network` with `cut`; every other call `ok`.
+    Records each `run` call."""
+
+    def __init__(self, logs, networks=("soak-x_default",), state=None, cut=None, started=None):
+        self.calls = []
+        self.logs = list(logs)
+        self.networks = networks
+        self.state = state if state is not None else {"Status": "running"}
+        self.cut = cut or docker.Result(0, "", "")
+        self.started = started or docker.Result(0, "abc\n", "")
+        self.project = "soak-x"
+
+    def run(self, args, timeout=None):
+        self.calls.append(list(args))
+        if args[0] == "run":
+            return self.started
+        if args[0] == "logs":
+            return self.logs.pop(0) if self.logs else docker.Result(0, "", "")
+        if args[0] == "network":
+            return self.cut
+        return docker.Result(0, "", "")
+
+    def inspect(self, container, timeout=None):
+        if container == "sut":
+            return {"NetworkSettings": {"Networks": {name: {} for name in self.networks}}}
+        return {"State": dict(self.state)}
+
+    def __getattr__(self, name):
+        raise AssertionError(f"_SlowclientDocker.{name} called")
+
+
+def _stray_removal():
+    """Teardown removes a client container compose doesn't own: `remove_strays` lists the
+    project's `<project>-slowclient-` containers, including stopped ones, and force-removes
+    them, and removes nothing when none is listed."""
+    class Recorded(docker.Docker):
+        def __init__(self, listing):
+            super().__init__("soak-x", [], [], prefix=[])
+            self.calls = []
+            self.listing = listing
+
+        def run(self, args, timeout=None, stdout=None, stderr=None):
+            self.calls.append(list(args))
+            return docker.Result(0, self.listing if args[0] == "ps" else "", "")
+
+    some = Recorded("aa\nbb\n")
+    gone = some.remove_strays()
+    expect(gone == ["aa", "bb"] and some.calls[0][:2] == ["ps", "-aq"]
+           and "label=com.docker.compose.project=soak-x" in some.calls[0]
+           and "name=^soak-x-slowclient-" in some.calls[0]
+           and some.calls[1] == ["rm", "-f", "aa", "bb"],
+           f"teardown lists and force-removes the project's slowclient containers, "
+           f"got {some.calls}")
+    none = Recorded("")
+    expect(none.remove_strays() == [] and len(none.calls) == 1,
+           f"with no stray, nothing is removed, got {none.calls}")
+
+
+def _slowclient_actions():
+    """A `slowclient` starts slowclient.py's source detached in the `python` image on the first
+    network of the service it's `on`, labeled into the compose project, with the step's mode,
+    address, connections, interval (1s by default), and send (`lf` by default, `none` when
+    silent); its apply waits for the `ready` line, and under `half_open` disconnects the client
+    from that network; a service on no network, a failed start, no `ready` line, no connection
+    opened, a byte unacknowledged under `half_open`, or a failed disconnect fails the step and
+    removes the client; its revert stops the client, records its `done` line, and removes it,
+    failing when the client had stopped or printed none, and does nothing after a failed apply;
+    it affects no leg; and `timeline` reports what the client held."""
+    ok = docker.Result(0, "", "")
+    ready = docker.Result(0, json.dumps({"event": "ready", "dialed": 24, "open": 24}) + "\n", "")
+    done = docker.Result(0, ready.stdout + json.dumps(
+        {"event": "done", "dialed": 40, "max_open": 24, "peer_closed": 16}) + "\n", "")
+    step = scenario.Step("c0s2", 1, 0, "slowclient", "logit", "", 90.0, 180.0,
+                         address="logit:8125", mode="trickle", connections=24)
+    fake = _SlowclientDocker([ok, ready, done], networks=("soak-x_z", "soak-x_default"))
+    ctx = faults.Context(docker=fake, ids={"logit": "sut"}, netem_image="netem")
+    saved = faults.SLOWCLIENT_POLL_S
+    faults.SLOWCLIENT_POLL_S = 0
+    try:
+        result = faults.ACTIONS["slowclient"].apply(ctx, step)
+        run = fake.calls[0]
+        expect(run[:8] == ["run", "-d", "--name", "soak-x-slowclient-c0s2", "--label",
+                           "com.docker.compose.project=soak-x", "--label",
+                           "com.docker.compose.service=soak-x-slowclient-c0s2"]
+               and run[8:12] == ["--network", "soak-x_default", faults.FILEOPS_IMAGE, "python"]
+               and run[-6:] == ["trickle", "logit", "8125", "24", "1", "lf"]
+               and faults.SLOWCLIENT_SOURCE in run and result["rc"] == 0
+               and result["ready"]["dialed"] == 24 and len(fake.calls) == 3
+               and ctx.state[step.id] == "soak-x-slowclient-c0s2",
+               f"a slowclient starts its client on the service's first network, labeled into "
+               f"the project, and waits for its ready line, got {fake.calls} {result}")
+        result = faults.ACTIONS["slowclient"].revert(ctx, step)
+        expect([call[0] for call in fake.calls[3:]] == ["stop", "logs", "rm"]
+               and result["rc"] == 0 and result["done"]["max_open"] == 24
+               and step.id not in ctx.state,
+               f"a slowclient's revert stops the client, reads its done line, and removes it, "
+               f"got {fake.calls[3:]} {result}")
+
+        for mode, send, interval, word in (("silent", None, None, "none"),
+                                           ("trickle", "http_body", 0.5, "http_body")):
+            one = scenario.Step("c0s1", 0, 0, "slowclient", "logit", "", 0.0, 1.0,
+                                address="logit:8086", mode=mode, connections=3, send=send,
+                                interval=interval)
+            fake = _SlowclientDocker([ready])
+            ctx = faults.Context(docker=fake, ids={"logit": "sut"}, netem_image="netem")
+            faults.ACTIONS["slowclient"].apply(ctx, one)
+            expect(fake.calls[0][-6:] == [mode, "logit", "8086", "3",
+                                          "1" if interval is None else "0.5", word],
+                   f"a {mode} client sends {word}, got {fake.calls[0][-6:]}")
+
+        half = scenario.Step("c0s3", 2, 0, "slowclient", "logit", "", 0.0, 1.0,
+                             address="logit:8125", mode="half_open", connections=8)
+        acked = docker.Result(0, json.dumps({"event": "ready", "dialed": 8,
+                                             "unacked_bytes": 0}) + "\n", "")
+        fake = _SlowclientDocker([acked])
+        ctx = faults.Context(docker=fake, ids={"logit": "sut"}, netem_image="netem")
+        result = faults.ACTIONS["slowclient"].apply(ctx, half)
+        expect(fake.calls[-1] == ["network", "disconnect", "soak-x_default",
+                                  "soak-x-slowclient-c0s3"]
+               and result["rc"] == 0 and result["disconnected"] is True,
+               f"a half_open client is disconnected from its network once ready, got "
+               f"{fake.calls} {result}")
+
+        unacked = docker.Result(0, json.dumps({"event": "ready", "dialed": 8,
+                                               "unacked_bytes": 8}) + "\n", "")
+        none = docker.Result(0, json.dumps({"event": "ready", "dialed": 0}) + "\n", "")
+        failing = (
+            ("no network", dict(logs=[], networks=()), step, "is on no network"),
+            ("a failed start", dict(logs=[], started=docker.Result(125, "", "no such image")),
+             step, "no such image"),
+            ("no ready line", dict(logs=[ok]), step, "printed no ready line"),
+            ("no connection", dict(logs=[none]), step, "opened no connection to logit:8125"),
+            ("an unacknowledged byte", dict(logs=[unacked]), half,
+             "left 8 byte(s) unacknowledged"),
+            ("a failed disconnect", dict(logs=[acked], cut=docker.Result(1, "", "boom")), half,
+             "boom"),
+        )
+        saved_ready = faults.SLOWCLIENT_READY_S
+        faults.SLOWCLIENT_READY_S = 0
+        try:
+            for what, kwargs, one, needle in failing:
+                fake = _SlowclientDocker(**kwargs)
+                ctx = faults.Context(docker=fake, ids={"logit": "sut"}, netem_image="netem")
+                result = faults.ACTIONS["slowclient"].apply(ctx, one)
+                removed = (what == "no network"
+                           or fake.calls[-1] == ["rm", "-f", f"soak-x-slowclient-{one.id}"])
+                expect(result["rc"] != 0 and needle in result["stderr"] and removed
+                       and one.id not in ctx.state
+                       and faults.ACTIONS["slowclient"].revert(ctx, one)
+                       == {"rc": 0, "stderr": "", "stopped": False},
+                       f"{what} fails a slowclient, removes the client, and leaves nothing to "
+                       f"revert, got {result} {fake.calls}")
+        finally:
+            faults.SLOWCLIENT_READY_S = saved_ready
+
+        for what, state, logs, needle in (
+                ("a client that stopped", {"Status": "exited", "ExitCode": 1}, done,
+                 "wasn't running at the revert"),
+                ("a client with no done line", {"Status": "running"}, ready,
+                 "printed no done line")):
+            fake = _SlowclientDocker([logs], state=state)
+            ctx = faults.Context(docker=fake, ids={"logit": "sut"}, netem_image="netem")
+            ctx.state[step.id] = "soak-x-slowclient-c0s2"
+            result = faults.ACTIONS["slowclient"].revert(ctx, step)
+            expect(result["rc"] == 1 and needle in result["stderr"]
+                   and fake.calls[-1] == ["rm", "-f", "soak-x-slowclient-c0s2"],
+                   f"{what} fails the revert and is removed, got {result} {fake.calls}")
+    finally:
+        faults.SLOWCLIENT_POLL_S = saved
+
+    roles = {"logit": "sut", "generator": "generator", "victoria-metrics": "backend"}
+    action = faults.ACTIONS["slowclient"]
+    expect(not any(action.affects(wire, step, roles)
+                   for wire in ("udp", "tcp", "http", "file", "kafka"))
+           and not action.affects_egress(step, roles),
+           "a slowclient affects no leg, so every wire judges its window")
+    with tempfile.TemporaryDirectory() as tmp:
+        timeline = [_phase("start", 0, t0=T0),
+                    _action("apply", "c0s2", "slowclient", "logit", 90, mode="trickle",
+                            connections=24),
+                    _action("revert", "c0s2", "slowclient", "logit", 180, mode="trickle",
+                            connections=24, done={"event": "done", "dialed": 40,
+                                                  "max_open": 24, "peer_closed": 16})]
+        result = _status(_run_dir(tmp, "slowclient", timeline), checks.check_timeline)
+        expect(result.status == checks.PASS
+               and "c0s2 (slowclient on logit): trickle held at most 24 of 24 connection(s), "
+                   "dialed 40, 16 closed by the listener" in result.detail,
+               f"timeline reports what a slowclient held, got {result}")
+
+
+def _slowclient_rules(root):
+    """`load()`'s rules for a `slowclient` step: `address`, `mode`, and `connections` required
+    and each in its form or range; `interval` in range; `send` one of three and refused on a
+    silent client; every key refused on another action; a slowclient on the SUT only and never
+    in a [random] schedule; and the keys reaching the expanded step."""
+    path, raw = _base(root)
+    base = {"address": "logit:8125", "mode": "trickle", "connections": 16}
+
+    def with_step(**fields):
+        changed = copy.deepcopy(raw)
+        changed["step"] = [{"at": "0s", "action": "slowclient", "on": "logit", "for": "10s",
+                            **fields}]
+        return changed
+
+    try:
+        loaded = scenario.from_dict(with_step(**base, interval="500ms", send="http_body"), path)
+        scenario.validate(loaded)
+        expanded = scenario.expand(loaded)
+        expect(expanded[0].expected() == {"address": "logit:8125", "mode": "trickle",
+                                          "connections": 16, "interval": 0.5,
+                                          "send": "http_body"},
+               f"a slowclient's keys reach its step and its records, got {expanded[0]}")
+        for mode in ("silent", "half_open"):
+            scenario.validate(scenario.from_dict(with_step(**{**base, "mode": mode}), path))
+    except scenario.ScenarioError as err:
+        expect(False, f"a slowclient with its keys loads, got {err.problems}")
+    for key in ("address", "mode", "connections"):
+        missing = {k: v for k, v in base.items() if k != key}
+        _refused(path, with_step(**missing), f"slowclient needs `{key}`",
+                 f"a slowclient with no {key}")
+    for address in ("logit", "logit:0", "logit:65536", ":8125", "logit:http", 8125,
+                    "-logit:8125"):
+        _refused(path, with_step(**{**base, "address": address}), "`address` must be a "
+                 "host:port with a port from 1 to 65535", f"a slowclient's address {address!r}")
+    _refused(path, with_step(**{**base, "mode": "slow"}), "`mode` must be one of silent, "
+             "trickle, half_open", "a slowclient's mode 'slow'")
+    for connections in (0, 1025, "16", 16.0, True):
+        _refused(path, with_step(**{**base, "connections": connections}), "`connections` must "
+                 "be a whole number from 1 to 1024", f"a slowclient's connections {connections!r}")
+    for interval in ("50ms", "61s"):
+        _refused(path, with_step(**base, interval=interval), "`interval` must be from 0.1s to "
+                 "1m", f"a slowclient's interval {interval}")
+    _refused(path, with_step(**base, send="bytes"), "`send` must be one of lf, http_head, "
+             "http_body", "a slowclient's send 'bytes'")
+    _refused(path, with_step(**{**base, "mode": "silent"}, send="lf"), "a silent slowclient "
+             "sends nothing, so it takes no `send`", "a silent slowclient with a send")
+    for key, value in (*base.items(), ("interval", "1s"), ("send", "lf")):
+        changed = copy.deepcopy(raw)
+        changed["step"][0][key] = value
+        _refused(path, changed, f"`{key}` is for slowclient only",
+                 f"{key} on a {raw['step'][0]['action']}")
+    gen = with_step(**base)
+    gen["step"][0]["on"] = "generator"
+    _refused(path, gen, "slowclient is for logit only", "a slowclient on the generator")
+    rand = copy.deepcopy(raw)
+    for key in ("cycle", "step", "expect"):
+        rand.pop(key, None)
+    rand["random"] = {"seed": 1, "gap": {"min": "60s", "max": "90s"},
+                      "fault": [{"weight": 1, "action": "slowclient", "on": "logit",
+                                 "for": {"min": "10s", "max": "20s"}}]}
+    _refused(path, rand, "slowclient takes `address`, `mode`, and `connections`, which a "
+             "[random] fault can't set", "a slowclient in a [random] schedule")
+    expect("slowclient" in scenario.PYTHON_ACTIONS
+           and set(scenario.FILE_ACTIONS) <= set(scenario.PYTHON_ACTIONS),
+           "the driver pulls the python image for a slowclient step as for a file action")
+
+
 class _CgroupDocker:
     """Records each `run_oneshot` call and answers with the next of `answers`; `inspect` answers
     with the container's `Id` and `state`, which a test changes between calls."""
@@ -15023,7 +15545,7 @@ DELTA_GENERATOR = ("components:\n  load: { type: generate_in }\n"
 
 
 def _delta_run(tmp, name, restart=False, evict_at=None, edit=None, timeline_extra=(),
-               sut_extra=(), gen_extra=(), action="stop"):
+               sut_extra=(), gen_extra=(), action="stop", counted=None):
     """A `sut_delta` run directory that balances in points and in value. The generator sends
     from +5 to +300; each SUT drain receives one window's points and sends their deltas, each
     stored by a `202` request a second before the drain. With `restart`, the SUT is stopped
@@ -15031,7 +15553,8 @@ def _delta_run(tmp, name, restart=False, evict_at=None, edit=None, timeline_extr
     first drain, where the transform skips each series' first point, losing one window's
     increments, and the stand-in stores the rest by one request, their timestamps in life 0. `evict_at` makes the drain at
     that offset an idle eviction: each series evicted and its point skipped, a window's
-    increments lost. `edit(requests)` returns the record's request lines, edited."""
+    increments lost. `edit(requests)` returns the record's request lines, edited, and the sink
+    counts each request `counted(request)` accepts, by default every one."""
     per_point = DELTA_PER_DRAIN / DELTA_SERIES
     gen = []
     for offset in range(5, 301, 5):
@@ -15104,7 +15627,8 @@ def _delta_run(tmp, name, restart=False, evict_at=None, edit=None, timeline_extr
     requests = edit(requests) if edit else requests
     _write_standin(run_dir, requests, shape=standin.DATADOG)
     with open(run_dir / "logs" / "logit.stdout", "a") as out:
-        out.write("\n".join(_standin_telemetry(requests)) + "\n")
+        out.write("\n".join(_standin_telemetry(
+            [r for r in requests if counted is None or counted(r)])) + "\n")
     _write_export(run_dir, "sink", [])
     return run_dir
 
@@ -15255,6 +15779,26 @@ def _delta_ledger():
                and "killed life 0's Ab − V 4 x 50" in " ".join(killed["ledger.value"].lines),
                f"a kill's window holds the points the killed life lost, got "
                f"{killed['ledger.value']}")
+        # A 2xx the stand-in answered after the killed life's last drain at +100 and before
+        # the kill at +101: the sink counted it in a drain the kill took. One before that drain
+        # the life should have counted, and one after the kill, in the dead life's span before
+        # the restart, no drain could have held.
+        def answered_at(offset):
+            def edit(requests):
+                return requests + [_datadog_request(len(requests) + 1, offset, [])]
+            return edit
+
+        for offset, status in ((100.5, checks.PASS), (98.5, checks.WARN),
+                               (102.5, checks.WARN)):
+            tail = rows(f"delta-kill-tail-{offset}", restart=True, action="kill",
+                        edit=answered_at(offset),
+                        counted=lambda r, at=T0 + offset: r["t"] != at)["ledger.standin"]
+            reported = ("life 0: the stand-in answered 1 request(s) 2xx sink never counted, "
+                        "reported: the stand-in recorded 1 2xx after the killed life's last "
+                        "drain" in tail.lines)
+            expect(tail.status == status and reported == (status == checks.PASS),
+                   f"a 2xx at +{offset} the killed life never counted "
+                   f"{'is reported' if status == checks.PASS else 'WARNs'}, got {tail}")
         dropped = [_line(_stamp(T0 + 110), "logit.component.batches.dropped", "sum", 1,
                          component="out", attrs={"reason": "overflow_oldest"})]
         overflowed = rows("delta-drop-queue", restart=True, edit=lost_queue, gen_extra=dropped)
@@ -17059,6 +17603,451 @@ def _backstop_ledger():
                f"{far['ledger.egress']}")
 
 
+def _msgpack_reader():
+    """`msgpack.unpack` reads every format into Python values, `pack` round-trips them in the
+    smallest forms, and each bound refuses: a declared length the bytes can't hold, nesting past
+    `MAX_DEPTH`, a container map key, a `str` that isn't UTF-8, `0xc1`, a cut value, trailing
+    bytes, and an empty body."""
+    cases = [
+        (b"\x00", 0), (b"\x7f", 127), (b"\xff", -1), (b"\xe0", -32), (b"\xc0", None),
+        (b"\xc2", False), (b"\xc3", True), (b"\xcc\xff", 255), (b"\xcd\x01\x00", 256),
+        (b"\xce\x00\x01\x00\x00", 65536), (b"\xcf" + (2**64 - 1).to_bytes(8, "big"), 2**64 - 1),
+        (b"\xd0\x80", -128), (b"\xd1\x80\x00", -32768), (b"\xd2\x80\x00\x00\x00", -2**31),
+        (b"\xd3" + (-2**63).to_bytes(8, "big", signed=True), -2**63),
+        (b"\xca" + struct.pack(">f", 1.5), 1.5), (b"\xcb" + struct.pack(">d", -2.25), -2.25),
+        (b"\xa3abc", "abc"), (b"\xd9\x03abc", "abc"), (b"\xda\x00\x03abc", "abc"),
+        (b"\xdb\x00\x00\x00\x03abc", "abc"), (b"\xc4\x02\x01\x02", b"\x01\x02"),
+        (b"\xc5\x00\x01\x09", b"\x09"), (b"\xc6\x00\x00\x00\x01\x09", b"\x09"),
+        (b"\x92\x01\xa1x", [1, "x"]), (b"\xdc\x00\x02\x01\x02", [1, 2]),
+        (b"\xdd\x00\x00\x00\x01\xc0", [None]), (b"\x81\xa1k\x05", {"k": 5}),
+        (b"\xde\x00\x01\x01\x02", {1: 2}), (b"\xdf\x00\x00\x00\x01\xa1a\x90", {"a": []}),
+        (b"\x82\xa1k\x01\xa1k\x02", {"k": 2}),
+        (b"\xd4\x05\x01", msgpack.Ext(5, b"\x01")), (b"\xd8\xff" + b"\x00" * 16,
+                                                     msgpack.Ext(-1, b"\x00" * 16)),
+        (b"\xc7\x03\x07abc", msgpack.Ext(7, b"abc")),
+    ]
+    for raw, want in cases:
+        try:
+            got = msgpack.unpack(raw)
+        except msgpack.MsgpackError as err:
+            got = err
+        expect(got == want and type(got) is type(want),
+               f"msgpack {raw.hex()} reads {want!r}, got {got!r}")
+    for value in (0, 127, 128, 255, 256, 65535, 65536, 2**32, 2**64 - 1, -1, -32, -33, -128,
+                  -129, -2**15 - 1, -2**31 - 1, -2**63, 1.25, "", "a" * 31, "a" * 32,
+                  "a" * 300, b"", b"x" * 70000, [], list(range(15)), list(range(16)),
+                  {str(i): i for i in range(15)}, {str(i): i for i in range(16)}, None, True,
+                  msgpack.Ext(3, b"abc"), [{"spans": [{"trace_id": 2**64 - 1}]}]):
+        raw = msgpack.pack(value)
+        expect(msgpack.unpack(raw) == value, f"{value!r} round-trips, got {msgpack.unpack(raw)!r}")
+    expect(msgpack.pack(1) == b"\x01" and msgpack.pack(200) == b"\xcc\xc8"
+           and msgpack.pack(-5) == b"\xfb" and msgpack.pack("ab") == b"\xa2ab"
+           and msgpack.pack([1]) == b"\x91\x01" and msgpack.pack({"a": 1}) == b"\x81\xa1a\x01",
+           "pack writes each value's smallest form")
+    deep = b"\x91" * (msgpack.MAX_DEPTH + 1) + b"\x00"
+    expect(msgpack.unpack(b"\x91" * msgpack.MAX_DEPTH + b"\x00") is not None,
+           f"{msgpack.MAX_DEPTH} levels of nesting read")
+    for raw, needle in (
+            (b"\xdd\xff\xff\xff\xff", "declares 4294967295 item(s)"),
+            (b"\xdf\x00\x00\x00\x02\x01", "declares 2 item(s)"),
+            (deep, f"nesting past {msgpack.MAX_DEPTH} levels"),
+            (b"\x81\x90\x01", "is a container"), (b"\xa2\xff\xfe", "isn't UTF-8"),
+            (b"\xc1", "0xc1"), (b"\xa5ab", "run past"), (b"\xcd\x01", "run past"),
+            (b"\x01\x02", "1 byte(s) after the value"), (b"", "empty body"),
+            (b"\xc6\xff\xff\xff\xff", "run past")):
+        try:
+            msgpack.unpack(raw)
+            expect(False, f"msgpack {raw[:8].hex()} read")
+        except msgpack.MsgpackError as err:
+            expect(needle in str(err), f"msgpack {raw[:8].hex()} refused with {needle!r}, "
+                                       f"got {err}")
+
+
+def _trace_payload(spans, version="v0.7"):
+    """A tracer body holding `spans`, `[(trace_id, span_id, start_ns)]`, one trace each: a v0.7
+    `TracerPayload` with one chunk per trace, or v0.4's array of traces."""
+    def span(trace_id, span_id, start):
+        return {"service": "soak", "name": "http.request", "resource": "GET /cart",
+                "trace_id": trace_id, "span_id": span_id, "parent_id": 0, "start": start,
+                "duration": 1000, "error": 0, "meta": {}, "metrics": {}, "type": "web"}
+    traces = [[span(*one)] for one in spans]
+    if version == "v0.4":
+        return msgpack.pack(traces)
+    return msgpack.pack({"container_id": "", "language_name": "", "chunks": [
+        {"priority": 1, "origin": "", "spans": trace, "tags": {}} for trace in traces]})
+
+
+def _trace_request(seq, offset, spans, status=200, stored=True, cue=None, answer="status",
+                   path="/v0.7/traces", encoding="gzip"):
+    """One `datadog_trace` stand-in record line at `T0 + offset` whose body holds `spans`."""
+    raw = _trace_payload(spans, "v0.4" if path == "/v0.4/traces" else "v0.7")
+    body = gzip.compress(raw, mtime=0) if encoding == "gzip" else raw
+    return {"event": "request", "seq": seq, "t": T0 + offset, "path": path,
+            "content_type": "application/msgpack", "content_encoding": encoding,
+            "bytes": len(body), "cue": cue, "answer": answer,
+            "status": None if answer == "reset" else status, "stored": stored,
+            "body_b64": base64.b64encode(body).decode()}
+
+
+def _datadog_trace_codec(root):
+    """The `datadog_trace` shape's decoder: v0.7 under gzip and v0.4 under none read one series
+    per span, keyed by its trace and span ids at its start in ms; a stats body holds none; a
+    body of another shape, a cut body, and another path refused; the bodies a real
+    `datadog_trace_out` wrote, from `standin/datadog-trace-vectors.json`, and a dd-trace
+    tracer's recorded v0.4 and stats bodies read as the vectors state; and `stored_spans`
+    counting each accepted span once, a copy reported, and a stored write answered otherwise
+    resent, not accepted."""
+    spans = [(7, 70, 5_000_000), (2**64 - 1, 1, 6_999_999)]
+    for path, encoding in (("/v0.7/traces", "gzip"), ("/v0.4/traces", None)):
+        series = standin.decode_body(_trace_request(1, 0, spans, path=path, encoding=encoding),
+                                     standin.DATADOG_TRACE)
+        expect(series == [({"__name__": "span", "trace_id": "7", "span_id": "70"}, [(5, 1.0)]),
+                          ({"__name__": "span", "trace_id": str(2**64 - 1), "span_id": "1"},
+                           [(6, 1.0)])],
+               f"a {path} body under {encoding} reads one series per span, got {series}")
+    stats = {**_trace_request(1, 0, [], path="/v0.6/stats", encoding=None),
+             "body_b64": base64.b64encode(msgpack.pack({"Stats": []})).decode()}
+    expect(standin.decode_body(stats, standin.DATADOG_TRACE) == [],
+           "a stats body holds no span")
+    for request, needle in (
+            ({**_trace_request(1, 0, spans, encoding=None),
+              "body_b64": base64.b64encode(msgpack.pack([[]])).decode()}, "not a TracerPayload"),
+            ({**_trace_request(1, 0, spans, path="/v0.4/traces", encoding=None),
+              "body_b64": base64.b64encode(msgpack.pack([{"a": 1}])).decode()}, "not an array"),
+            ({**_trace_request(1, 0, spans, encoding=None),
+              "body_b64": base64.b64encode(_trace_payload(spans)[:-3]).decode()}, "msgpack"),
+            ({**_trace_request(1, 0, spans), "path": "/v0.5/traces"}, "no trace route")):
+        try:
+            standin.decode_body(request, standin.DATADOG_TRACE)
+            expect(False, f"a datadog_trace body with {needle} decoded")
+        except standin.DecodeError as err:
+            expect(needle in str(err), f"a datadog_trace body is refused with {needle!r}, "
+                                       f"got {err}")
+    vectors = json.loads((root / "standin" / "datadog-trace-vectors.json").read_text())
+    for vector in vectors["bodies"]:
+        raw = base64.b64decode(vector["body_b64"])
+        if vector.get("file"):
+            raw = (root.parent.parent / vector["file"]).read_bytes()
+        request = {"path": vector["path"], "content_encoding": vector.get("content_encoding"),
+                   "body_b64": base64.b64encode(raw).decode()}
+        series = standin.decode_body(request, standin.DATADOG_TRACE)
+        ids = [[labels["trace_id"], labels["span_id"]] for labels, _ in series]
+        expect(len(series) == vector["spans"] and ids[:len(vector["first"])] == vector["first"],
+               f"{vector['what']} reads {vector['spans']} span(s), first {vector['first']}, got "
+               f"{len(series)}, {ids[:len(vector['first'])]}")
+    accepted = _trace_request(1, 0, spans[:1])
+    copy_of = _trace_request(2, 1, spans[:1])
+    resent = _trace_request(3, 2, spans[1:], status=503)
+    found = standin.stored_spans([accepted, copy_of, resent])
+    expect(found.distinct == 1 and found.arrivals == [(T0, 1), (T0 + 1, 1)]
+           and [c[2:] for c in found.copies] == [(0, 1)] and found.resent == [(2, 1)]
+           and found.undecodable == [],
+           f"stored_spans counts an accepted span once, its copy, and a stored 503 resent, got "
+           f"{found}")
+
+
+def _datadog_trace_server(root):
+    """The stand-in's `datadog_trace` shape on loopback ports: an Agent's `rate_by_service`
+    answer to a `PUT` on `/v0.4/traces` and `/v0.7/traces`, `{}` to a `POST` on `/v0.6/stats`,
+    each recorded as a write; a cued `413`; and `404` on another path; and the shape's paths and
+    default status the same in the stand-in and in `soaklib.standin`."""
+    answers = []
+
+    def exchange(request, cue):
+        answers.append(request("/v0.4/traces", b"\x90", method="PUT"))
+        answers.append(request("/v0.7/traces", b"\x80", method="PUT"))
+        answers.append(request("/v0.6/stats", b"\x80"))
+        cue({"step": "c0s1", "status": 413})
+        answers.append(request("/v0.7/traces", b"\x80", method="PUT"))
+        cue({})
+        answers.append(request("/info", b"", method="PUT"))
+
+    paths = standin.write_paths(standin.DATADOG_TRACE)
+    lines = _standin_on_loopback(root, "datadog_trace", paths, exchange)
+    server = _load_standin_server(root)
+    expect([a[0] for a in answers] == [200, 200, 200, 413, 404]
+           and answers[0][2] == answers[1][2] == server.TRACE_REPLY
+           and answers[2][2] == b"{}"
+           and answers[0][1].get("Content-Type") == "application/json",
+           f"the datadog_trace shape answers as an Agent does, got {answers}")
+    expect([(line["path"], line["status"], line["cue"]) for line in lines[:4]]
+           == [("/v0.4/traces", 200, None), ("/v0.7/traces", 200, None),
+               ("/v0.6/stats", 200, None), ("/v0.7/traces", 413, "c0s1")],
+           f"each write is recorded with its path, answer, and cue, got {lines}")
+    expect(paths == ("/v0.4/traces", "/v0.7/traces", "/v0.6/stats")
+           and server.DEFAULT_PATH["datadog_trace"] == standin.PATHS[standin.DATADOG_TRACE]
+           and server.EXTRA_WRITE_PATHS["datadog_trace"]
+           == standin.EXTRA_WRITE_PATHS[standin.DATADOG_TRACE]
+           and server.DEFAULT_STATUS["datadog_trace"]
+           == standin.DEFAULT_STATUS[standin.DATADOG_TRACE] == 200,
+           "the datadog_trace shape's paths and default status agree in both files")
+
+
+def _span_rules(root):
+    """The span relay's load-time rules, against the shipped standin-datadog-trace scenario."""
+    path = root / "scenarios" / "standin-datadog-trace" / "scenario.toml"
+    raw = tomllib.loads(path.read_text())
+    loaded = scenario.load(path)
+    expect(loaded.standin_shape == "datadog_trace" and "sut_aggregate" not in loaded.ledger,
+           f"standin-datadog-trace loads with no aggregate, got {loaded.ledger}")
+
+    def mutate(change):
+        changed = copy.deepcopy(raw)
+        change(changed)
+        return changed
+
+    for key, value in (("sut_aggregate", "agent"), ("sut_delta", "agent"),
+                       ("sut_script", "agent"), ("split", "copy"), ("vm_every_window", True)):
+        _refused(path, mutate(lambda r, key=key, value=value: r["ledger"].update({key: value})),
+                 f"ledger.{key} can't be combined with a datadog_trace stand-in",
+                 f"a span relay beside {key}")
+    for key, value in (("sut_transforms", ["agent"]), ("fan_out", {"points": 4}),
+                       ("merge", "agent")):
+        _refused(path, mutate(lambda r, key=key, value=value: r["ledger"]["source"][0].update(
+                     {key: value})),
+                 f"`{key}` can't be combined with a datadog_trace stand-in",
+                 f"a span relay's {key}")
+    _refused(path, mutate(lambda r: r["ledger"]["source"][0].update(wire="udp")),
+             "takes wire = \"http\"", "a span relay on another wire")
+    _refused(path, mutate(lambda r: r["ledger"]["source"][0].update(sut_listener="agent")),
+             "sut_listener 'agent' is a datadog_trace_out", "a span relay's listener of "
+             "another kind")
+    _refused(path, mutate(lambda r: r["ledger"]["sink"][0].update(id="apm")),
+             "'apm' is a datadog_trace_in, and a datadog_trace stand-in's sink",
+             "a span relay's sink of another kind")
+    _refused(path, mutate(lambda r: r["ledger"]["sink"].append(dict(r["ledger"]["sink"][0]))),
+             "a datadog_trace stand-in needs one [[ledger.sink]]", "a span relay with two sinks")
+    _refused(path, mutate(lambda r: r["ledger"]["source"].append(
+                 dict(r["ledger"]["source"][0]))),
+             "a datadog_trace stand-in needs one [[ledger.source]]",
+             "a span relay with two sources")
+    _refused(path, mutate(lambda r: r.update(overlap={"instances": ["logit", "logit-b"]})),
+             "[overlap] can't be combined with a datadog_trace stand-in",
+             "a span relay under [overlap]")
+    _refused(path, mutate(lambda r: r["configs"].update(collector="logit-sut.yaml")),
+             "a datadog_trace stand-in needs one SUT service", "a span relay with a second SUT")
+    _refused(path, mutate(lambda r: r["target"].update(shape="otlp")),
+             "missing `sut_aggregate`", "another shape with no aggregate")
+
+
+SPAN_LEDGER = {"source": [{"service": "generator", "generator_input": "load",
+                           "generator_sink": "tracer", "sut_listener": "apm", "wire": "http"}],
+               "wire_loss_outside_faults": 0.0, "sink": [{"id": "agent"}]}
+SPAN_SUT = ("components:\n  apm: { type: datadog_trace_in, bind: 0.0.0.0:8126 }\n"
+            "  agent: { type: datadog_trace_out, sources: [apm], endpoint: http://standin:8080,"
+            " version: v0.7 }\n")
+SPAN_GENERATOR = ("components:\n  load: { type: generate_in }\n"
+                  "  tracer: { type: datadog_trace_out, sources: [load],"
+                  " endpoint: http://logit:8126 }\n")
+# Each 5 s drain's spans: two requests of `SPAN_BATCH`.
+SPAN_BATCH = 10
+# A SUT kill's apply and revert offsets.
+SPAN_KILL = (150, 180)
+
+
+def _span_run(tmp, name, requests_edit=None, sut_extra=(), gen_extra=(), timeline_extra=(),
+              kill=False, lost=0):
+    """A span relay's run directory that balances: from +5 to +300 each 5 s drain counts two
+    requests of `SPAN_BATCH` spans from the generator's `tracer` into the SUT's `apm`, which
+    sends them on, and two to the stand-in, which stores them, each span its own trace. With
+    `kill`, the SUT is killed over `SPAN_KILL`: its last drain before it goes unexported, which
+    leaves the stand-in holding that drain's spans beyond what the SUT counted. `lost` whole
+    requests (`SPAN_BATCH` spans each, the most recent ones the SUT counted) never reach the
+    stand-in, though the SUT counted them sent: the queue a kill discards. The unexported drain
+    is two requests, so `lost` must exceed two for a positive gap.
+    `requests_edit(requests)` returns the stand-in record's request lines to write."""
+    lives = [(0, 0, SPAN_KILL[0]), (1, SPAN_KILL[1], 300)] if kill else [(0, 0, 300)]
+    gen, sut, requests = [], [], []
+    span = 0
+    for offset in range(5, 301, 5):
+        stamp = _stamp(T0 + offset)
+        n = 2 * SPAN_BATCH
+        gen += [_line(stamp, "logit.process.uptime", "gauge", float(offset)),
+                _line(stamp, "logit.component.events.sent", "sum", n, component="load"),
+                _line(stamp, "logit.component.events.received", "sum", n, component="tracer"),
+                _line(stamp, "logit.component.events.delivered", "sum", n, component="tracer"),
+                _line(stamp, "logit.component.batches.delivered", "sum", 2, component="tracer")]
+        life = next(((one, start) for one, start, end in lives if start < offset <= end), None)
+        if life is None:
+            continue
+        unexported = kill and life[0] == 0 and offset == SPAN_KILL[0]
+        for index in range(2):
+            ids = [(span + i + 1, span + i + 1, int((T0 + offset - 3 + index) * 1e9))
+                   for i in range(SPAN_BATCH)]
+            span += SPAN_BATCH
+            requests.append(_trace_request(len(requests) + 1, offset - 3 + index, ids))
+        if kill and life[0] == 0 and offset == SPAN_KILL[0] - 5 and lost:
+            del requests[len(requests) - lost:]
+        if unexported:
+            continue
+        sut += [_line(stamp, "logit.process.uptime", "gauge", float(offset - life[1]))]
+        for metric, value, component, attrs in (
+                ("logit.component.events.sent", n, "apm", None),
+                ("logit.component.batches.sent", 2, "apm", None),
+                ("logit.input.requests", 2, "apm", {"route": "traces_v04", "class": "ok"}),
+                ("logit.input.spans", n, "apm", None),
+                ("logit.component.events.received", n, "agent", None),
+                ("logit.component.batches.received", 2, "agent", None),
+                ("logit.component.events.delivered", n, "agent", None),
+                ("logit.component.batches.delivered", 2, "agent", None),
+                ("logit.output.records", n, "agent", {"route": "traces_v07"}),
+                ("logit.output.requests", 2, "agent", {"route": "traces_v07",
+                                                       "class": "2xx"})):
+            sut.append(_line(stamp, metric, "sum", value, component=component, attrs=attrs))
+        sut += [_line(stamp, "logit.component.buffer.batches", "gauge", 0, component="agent"),
+                _line(stamp, "logit.component.retrying", "gauge", 0, component="agent")]
+    timeline = [_phase("start", 0, t0=T0)]
+    if kill:
+        timeline += [_action("apply", "c0s9", "kill", "logit", SPAN_KILL[0] - 1,
+                             affects_http_ingress=True),
+                     _action("revert", "c0s9", "kill", "logit", SPAN_KILL[1] - 1, SPAN_KILL[1],
+                             affects_http_ingress=True),
+                     _ready("c0s9", "logit", SPAN_KILL[1] + 1)]
+    timeline += list(timeline_extra) + [_phase("end_begin", 300), _phase("end_end", 330)]
+    run_dir = _run_dir(tmp, name, timeline, sut + list(sut_extra), ledger=SPAN_LEDGER,
+                       configs={"sut": "sut.yaml", "generator": "generator.yaml"},
+                       target={"kind": "standin", "name": "standin", "env": [],
+                               "shape": "datadog_trace"},
+                       services={"logit": "sut", "generator": "generator",
+                                 "standin": "standin"})
+    (run_dir / "configs").mkdir()
+    (run_dir / "configs" / "sut.yaml").write_text(SPAN_SUT)
+    (run_dir / "configs" / "generator.yaml").write_text(SPAN_GENERATOR)
+    (run_dir / "logs" / "generator.stdout").write_text("\n".join(gen + list(gen_extra)) + "\n")
+    (run_dir / "logs" / "logit.stderr").write_text(json.dumps(
+        {"timestamp": _stamp(T0 + 301), "level": "INFO", "message": "drain complete",
+         "target": "logit", "duration": "1ms"}) + "\n")
+    _write_standin(run_dir, requests_edit(requests) if requests_edit else requests,
+                   shape="datadog_trace")
+    return run_dir
+
+
+def _span_ledger():
+    """The ledger in spans over `_span_run`'s fixtures: a relay that balances PASSing every
+    row, `ledger.aggregate` SKIPping; a request the stand-in never stored FAILing egress and the
+    summary as uncounted loss; a copy of an accepted span a surplus in egress, reported by
+    `ledger.standin`; more distinct spans than G a summary surplus; a rejected step's spans held
+    to the sink's `records.dropped{reason="rejected"}` and a 413's to `oversize`, either
+    uncounted FAILing; and a killed life's gap reported."""
+    with tempfile.TemporaryDirectory() as tmp:
+        def rows(name, **kwargs):
+            return {r.id: r for r in checks.run_all(_span_run(tmp, name, **kwargs))}
+
+        clean = rows("span-clean")
+        for row in ("ledger.wire", "ledger.intake", "ledger.edge", "ledger.egress",
+                    "ledger.summary", "ledger.standin", "drops", "identity.sink"):
+            expect(clean[row].status == checks.PASS,
+                   f"a span relay that balances PASSes {row}, got {clean[row]}")
+        expect(clean["ledger.aggregate"].status == checks.SKIP,
+               f"a span relay has no aggregate, so ledger.aggregate SKIPs, got "
+               f"{clean['ledger.aggregate']}")
+        expect("W − X 1,200 − V 1,200 = 0, sink drops 0 (none), exact"
+               in clean["ledger.egress"].detail,
+               f"every relayed span is stored, got {clean['ledger.egress']}")
+        expect("1,200 distinct span(s) accepted <= G 1,200" in clean["ledger.summary"].detail,
+               f"the distinct spans are held to G, got {clean['ledger.summary']}")
+
+        # The stand-in's record lacks one request: 10 spans the SUT sent, never stored.
+        unstored = rows("span-unstored", requests_edit=lambda r: r[:40] + r[41:])
+        expect(unstored["ledger.egress"].status == checks.FAIL
+               and "uncounted loss of 10 span(s)" in unstored["ledger.egress"].detail,
+               f"spans that never reached the stand-in FAIL egress, got "
+               f"{unstored['ledger.egress']}")
+        expect(unstored["ledger.summary"].status == checks.FAIL
+               and "(S_in − V − drops) 10" in unstored["ledger.summary"].detail,
+               f"and the summary, got {unstored['ledger.summary']}")
+
+        # A resend the stand-in accepted twice: V counts both copies, past W − X.
+        copied = rows("span-copy", requests_edit=lambda r: r + [
+            {**r[3], "seq": len(r) + 1, "t": T0 + 299}])
+        expect(copied["ledger.egress"].status == checks.FAIL
+               and "a surplus: 10 span(s)" in copied["ledger.egress"].detail,
+               f"a copy past what the listener sent is a surplus, got {copied['ledger.egress']}")
+        expect(any("10 accepted copy(ies) of a span already accepted (life 0 10)" in line
+                   for line in copied["ledger.standin"].lines),
+               f"ledger.standin reports the copies, got {copied['ledger.standin'].lines}")
+
+        # The generator saw fewer spans accepted than the stand-in holds distinct.
+        short = _at_offset("logit.component.events.delivered", 300, -20, "tracer", add=True)
+        run_dir = _span_run(tmp, "span-over-g")
+        lines = (run_dir / "logs" / "generator.stdout").read_text().splitlines()
+        edited = []
+        for line in lines:
+            for one in (lambda got: got if isinstance(got, list) else [got])(
+                    short(json.loads(line))):
+                edited.append(json.dumps(one))
+        (run_dir / "logs" / "generator.stdout").write_text("\n".join(edited) + "\n")
+        over = {r.id: r for r in checks.run_all(run_dir)}
+        expect(over["ledger.summary"].status == checks.FAIL
+               and "1,200 distinct span(s) accepted > G 1,180, a surplus of 20"
+               in over["ledger.summary"].detail,
+               f"more distinct spans than G FAIL the summary, got {over['ledger.summary']}")
+
+        # The request at +297 answered 400 under a step classed rejected, its 10 spans dropped
+        # and counted, and the one at +298 a 413, counted oversize.
+        def rejected(requests):
+            requests[-2].update(status=400, stored=False, cue="c0s2")
+            requests[-1].update(status=413, stored=False, cue="c0s2")
+            return requests
+
+        def counted(rejected_n=SPAN_BATCH, oversize_n=SPAN_BATCH):
+            stamp = _stamp(T0 + 300)
+            out = [_line(stamp, "logit.output.requests", "sum", 2, component="agent",
+                         attrs={"route": "traces_v07", "class": "4xx"}),
+                   _line(stamp, "logit.output.requests", "sum", -2, component="agent",
+                         attrs={"route": "traces_v07", "class": "2xx"}),
+                   _line(stamp, "logit.component.batches.dropped", "sum", 2, component="agent",
+                         attrs={"reason": "rejected"}),
+                   _line(stamp, "logit.component.events.dropped", "sum", 2 * SPAN_BATCH,
+                         component="agent", attrs={"reason": "rejected"})]
+            for reason, n in (("rejected", rejected_n), ("oversize", oversize_n)):
+                if n:
+                    out.append(_line(stamp, "logit.output.records.dropped", "sum", n,
+                                     component="agent",
+                                     attrs={"route": "traces_v07", "reason": reason}))
+            return out
+
+        cued = _respond_fault("c0s2", 290, 300, status=400, cls="rejected")
+        judged = rows("span-rejected", requests_edit=rejected, timeline_extra=cued,
+                      sut_extra=counted())
+        for row in ("ledger.standin", "ledger.egress", "ledger.summary", "drops"):
+            expect(judged[row].status == checks.PASS,
+                   f"rejected spans the sink counted PASS {row}, got {judged[row]}")
+        expect("W − X 1,200 − V 1,180 = 20, sink drops 20 (records oversize 10, records "
+               "rejected 10), counted: the sink's drops" in judged["ledger.egress"].detail,
+               f"the gap is the sink's records dropped, counted once, got "
+               f"{judged['ledger.egress']}")
+        for name, extra, needle in (
+                ("span-rejected-uncounted", counted(rejected_n=0),
+                 "counted 0 record(s) dropped rejected, the record holds 10"),
+                ("span-oversize-uncounted", counted(oversize_n=0),
+                 "counted 0 record(s) dropped oversize, the record holds 10")):
+            broken = rows(name, requests_edit=rejected, timeline_extra=cued, sut_extra=extra)
+            expect(broken["ledger.standin"].status == checks.FAIL
+                   and needle in broken["ledger.standin"].detail,
+                   f"{name} FAILs ledger.standin, got {broken['ledger.standin']}")
+            expect(broken["ledger.egress"].status == checks.FAIL
+                   and "uncounted loss of 10 span(s)" in broken["ledger.egress"].detail,
+                   f"{name} FAILs egress, got {broken['ledger.egress']}")
+
+        # A kill whose queue held three requests the SUT counted sent: life 0's positive gap is
+        # reported, not FAILed, and life 1 is exact.
+        killed = rows("span-kill", kill=True, lost=3)
+        expect(killed["ledger.egress"].status == checks.PASS
+               and "= 10, sink drops 0 (none), reported: a kill discards the sink's queue"
+               in killed["ledger.egress"].detail
+               and "life 1 (final): W − X 480 − V 480 = 0" in killed["ledger.egress"].detail,
+               f"a killed life's gap is reported, got {killed['ledger.egress']}")
+        # The kill's own last drain goes unexported while its spans reach the stand-in: a
+        # surplus over the life's counts, reported the same way.
+        unexported = rows("span-kill-unexported", kill=True)
+        expect(unexported["ledger.egress"].status == checks.PASS
+               and "reported: a kill discards the sink's queue"
+               in unexported["ledger.egress"].detail,
+               f"a killed life's unexported last drain is reported, got "
+               f"{unexported['ledger.egress']}")
+
+
 def run(root, quiet=False):
     """Returns 0 when every expectation holds, else prints the failures and returns 1."""
     root = Path(root)
@@ -17104,11 +18093,13 @@ def run(root, quiet=False):
                      _reopen_checks, _tls_rules, _tls_actions, _tls_driver, _tls_checks,
                      _reset_actions, _reset_rules, _prlimit_actions, _prlimit_rules,
                      _cgroup_actions, _cgroup_rules, _cgroup_io_device, _cgroup_io_actions,
-                     _cgroup_io_rules,
+                     _cgroup_io_rules, _slowclient_client,
+                     _slowclient_actions, _stray_removal, _slowclient_rules,
                      _fan_out_ledger, _idle_writer, _boundary_skew, _fan_out_rules,
                      _sampling_vectors, _absent_rules, _absent_checks, _merge_ledger,
                      _merge_rules, _delta_ledger, _delta_rules, _scrape_ledger,
-                     _scrape_rules, _shipped):
+                     _scrape_rules, _msgpack_reader, _datadog_trace_codec,
+                     _datadog_trace_server, _span_rules, _span_ledger, _shipped):
             try:
                 takes_root = (_rules, _expect_rules, _expand, _random, _signals, _hung_inspect,
                               _stalled, _stall_abort,
@@ -17131,9 +18122,10 @@ def run(root, quiet=False):
                               _overlap_rules, _overlap_driver, _idp_rules, _signal_rules,
                               _sighup_driver,
                               _tls_rules, _tls_driver, _reset_rules, _prlimit_rules,
-                              _cgroup_rules, _cgroup_io_rules,
+                              _cgroup_rules, _cgroup_io_rules, _slowclient_rules,
                               _fan_out_rules, _sampling_vectors,
-                              _absent_rules, _merge_rules, _delta_rules, _scrape_rules)
+                              _absent_rules, _merge_rules, _delta_rules, _scrape_rules,
+                              _datadog_trace_codec, _datadog_trace_server, _span_rules)
                 part(root) if part in takes_root else part()
             except Exception as err:  # report the part that broke, then keep going
                 _FAILURES.append(f"{part.__name__}: {type(err).__name__}: {err}")

@@ -1,0 +1,45 @@
+# The load source in `script/soak`'s standin-datadog-trace scenario: 300 spans a second, each
+# its own trace, written by `datadog_trace_out` as a tracer writes them, v0.4 msgpack, to the
+# system under test's `datadog_trace_in`. A `lua` stage turns each generated event into a
+# span, since `generate_in` makes no span. Its `internal` telemetry goes to stdout as NDJSON,
+# so the harness reads what it sent.
+admin: { bind: 127.0.0.1:9600 }
+components:
+  load:
+    type: generate_in               # unbounded
+    rate: 300
+    batch: 30                       # one request per batch, under the sink's 1,000 traces
+    event:
+      attributes: { seq: "{seq}" }
+  spans:
+    type: lua
+    sources: [load]
+    script: |
+      function process(event)
+        local ts = event.timestamp
+        return Event.new{
+          timestamp = ts,
+          attributes = {
+            ["service.name"] = "soak-checkout",
+            ["resource.name"] = "GET /cart",
+            ["span.type"] = "web",
+            seq = tonumber(event.attributes.seq),
+          },
+          span = {
+            trace_id = random.trace_id(),
+            span_id = random.span_id(),
+            name = "http.request",
+            kind = "server",
+            end_timestamp = ts,
+          },
+        }
+      end
+  tracer:
+    type: datadog_trace_out
+    sources: [spans]
+    endpoint: http://logit:8126
+    version: v0.4                   # what most tracers send
+    # Never stall generate_in; retry fast, so a busy 503 from the SUT is a short wait.
+    buffer: { max_batches: 50, overflow: drop_newest, retry_max_delay: 1s }
+  self: { type: internal, interval: 5s, span_sample_rate: 0.0, logs: off }
+  telemetry: { type: stdio_out, sources: [self], format: json }

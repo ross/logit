@@ -93,8 +93,8 @@ STANDIN_ROLES = {"standin": STANDIN_ROLE}
 # Every action the scenario schema accepts. faults.py implements them; the names must match its
 # ACTIONS.
 ACTION_NAMES = ("netem", "pause", "stop", "kill", "restart", "partition", "reset", "prlimit",
-                "cgroup", "mark", "exit", "respond", "signal", "rename", "rotate", "probe",
-                "copytruncate", "gzip", "replace")
+                "cgroup", "slowclient", "mark", "exit", "respond", "signal", "rename", "rotate",
+                "probe", "copytruncate", "gzip", "replace")
 # The actions that take `port`: a `probe`, which needs the listener's, and a `reset`, which
 # closes only the connections whose local or remote port it is, and every one without it.
 PORT_ACTIONS = ("probe", "reset")
@@ -110,6 +110,8 @@ SUT_ONLY_ACTIONS = {
                 "a generator's failed dials have no rule"),
     "cgroup": ("the checks score its window on the SUT's own listeners and sinks, and a slowed "
                "generator's loss has no rule"),
+    "slowclient": ("it holds the connection slots of the SUT's listeners, which is what the "
+                   "checks read; the service it's `on` is the one whose network it joins"),
 }
 # A `prlimit` step's `nofile`: the open-files limit, soft and hard, it sets on the SUT's process
 # for its window. Below `PRLIMIT_MIN_NOFILE` the process can't open the stdio and runtime
@@ -146,6 +148,23 @@ CGROUP_MAX_IO_WBPS = 1024 ** 4
 CGROUP_MIN_IO_WIOPS = 1
 CGROUP_MAX_IO_WIOPS = 1000000
 _MEMORY_UNITS = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}
+# A `slowclient` step's keys (slowclient.py): `address`, the `host:port` it dials; `mode`, one of
+# `SLOWCLIENT_MODES`; `connections`, how many it holds, up to `SLOWCLIENT_MAX_CONNECTIONS`;
+# `interval`, its tick, from `SLOWCLIENT_MIN_INTERVAL_S` to `SLOWCLIENT_MAX_INTERVAL_S`, by
+# default `SLOWCLIENT_INTERVAL_S`; and `send`, what it sends, one of `SLOWCLIENT_SENDS`, by
+# default `lf`. A `silent` client sends nothing, so it takes no `send`.
+SLOWCLIENT_KEYS = ("address", "mode", "connections", "interval", "send")
+SLOWCLIENT_MODES = ("silent", "trickle", "half_open")
+SLOWCLIENT_SENDS = ("lf", "http_head", "http_body")
+SLOWCLIENT_DEFAULT_SEND = "lf"
+SLOWCLIENT_MAX_CONNECTIONS = 1024
+SLOWCLIENT_INTERVAL_S = 1.0
+SLOWCLIENT_MIN_INTERVAL_S = 0.1
+SLOWCLIENT_MAX_INTERVAL_S = 60.0
+_HOST_NAME = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$")
+# Actions that run a one-shot of the `python` image the stand-in runs (faults.py's
+# `FILEOPS_IMAGE`), which the driver pulls before the schedule starts.
+PYTHON_ACTIONS = ("copytruncate", "gzip", "replace", "slowclient")
 # The `SUT_ONLY_ACTIONS` allowed on a scrape wire's generator: it sends nothing, so a kill
 # loses only the increments after the SUT's last scrape, which `ledger.wire` bounds per life.
 SCRAPED_GENERATOR_ACTIONS = ("kill",)
@@ -247,7 +266,15 @@ SPLUNK_SHAPE = standin_mod.SPLUNK
 # the one object it names, and a `splunk` `withhold_acks` 2xx, which the sink must read as
 # `ambiguous`, take the opposite rule.
 CLASS_REQUIRED_SHAPES = (standin_mod.DATADOG, standin_mod.INFLUXDB, standin_mod.OTLP,
-                         standin_mod.SPLUNK)
+                         standin_mod.SPLUNK, standin_mod.DATADOG_TRACE)
+# A `datadog_trace` stand-in's run relays spans with no `aggregate`: the one source's listener
+# is a `datadog_trace_in` on an HTTP wire, the one sink a `datadog_trace_out`, and every row
+# counts spans (`_span_problems()`).
+SPAN_LISTENER_KIND = "datadog_trace_in"
+SPAN_SINK_KIND = "datadog_trace_out"
+# The `[ledger]` keys refused beside a span relay, whose rows read no `aggregate`.
+SPAN_REFUSED_KEYS = ("sut_aggregate", "sut_delta", "sut_script", "hop", "split",
+                     "vm_every_window")
 # Kafka's legal topic names (`Topic.validate`): ASCII letters, digits, `.`, `_`, and `-`, up to
 # 249 characters.
 _TOPIC_NAME = re.compile(r"^[A-Za-z0-9._-]{1,249}$")
@@ -262,8 +289,7 @@ _ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 PRIVATE_ENV_PREFIX = "soak-env-"
 STEP_KEYS = {"at", "action", "on", "args", "for", "ready", "code", "key", "class", "signal",
              "path", "to", "cert", "days", "broken", "port", "nofile", "engaged", "io_path",
-             *CGROUP_KEYS,
-             *RESPOND_KEYS}
+             *CGROUP_KEYS, *SLOWCLIENT_KEYS, *RESPOND_KEYS}
 RANDOM_KEYS = {"seed", "gap", "fault"}
 RANDOM_FAULT_KEYS = {"weight", "action", "on", "args", "for"}
 RANGE_KEYS = {"min", "max"}
@@ -342,7 +368,7 @@ FILE_WRITER_KIND = "file_out"
 # An HTTP wire's writers, whose G is also `events.delivered`: the events of the batches the
 # listener answered with a success.
 HTTP_WRITER_KINDS = ("influxdb_out", "otlp_out", "splunk_hec_out", "datadog_out",
-                     "prometheus_out")
+                     "prometheus_out", "datadog_trace_out")
 # A scrape wire's writer: an exposition on `bind:`, whose G is its generator's increments, since
 # a scrape reads running totals (checks.py's `check_ledger_wire`).
 SCRAPE_WRITER_KIND = "prometheus_out"
@@ -367,6 +393,7 @@ LISTENER_WIRES = {
     "otlp_in": ("http", {}),
     "splunk_hec_in": ("http", {}),
     "datadog_in": ("http", {}),
+    "datadog_trace_in": ("http", {}),
     "kafka_in": ("kafka", {}),
 }
 # Each listener kind with no `transport:` that runs in one of several modes, each chosen by the
@@ -454,6 +481,8 @@ METRIC_KINDS = {
     "logit.input.frames": "sum",
     "logit.input.frames.dropped": "sum",
     "logit.input.connections.closed": "sum",
+    "logit.input.connections.rejected": "sum",
+    "logit.input.connections": "gauge",
     "logit.input.lines": "sum",
     "logit.input.files.rotated": "sum",
     "logit.input.files.resume_rejected": "sum",
@@ -596,6 +625,12 @@ class StepSpec:
     io_wiops: object = None
     io_path: object = None
     engaged: object = None
+    # A `slowclient`'s address, mode, connections, interval (seconds), and what it sends.
+    address: object = None
+    mode: object = None
+    connections: object = None
+    interval: object = None
+    send: object = None
 
 
 # The `Step` fields `expected()` writes into its JSON and its timeline records, each under its
@@ -609,7 +644,9 @@ STEP_FIELDS = (("ready", "ready"), ("code", "code"), ("key", "key"), ("status", 
                ("signal", "signal"), ("path", "path"), ("to", "to"), ("cert", "cert"),
                ("days", "days"), ("broken", "broken"), ("port", "port"), ("nofile", "nofile"),
                ("cpu", "cpu"), ("memory_high", "memory_high"), ("io_wbps", "io_wbps"),
-               ("io_wiops", "io_wiops"), ("io_path", "io_path"), ("engaged", "engaged"))
+               ("io_wiops", "io_wiops"), ("io_path", "io_path"), ("engaged", "engaged"),
+               ("address", "address"), ("mode", "mode"), ("connections", "connections"),
+               ("interval", "interval"), ("send", "send"))
 
 
 @dataclass
@@ -687,6 +724,11 @@ class Step:
     io_wiops: object = None
     io_path: object = None
     engaged: object = None
+    address: object = None
+    mode: object = None
+    connections: object = None
+    interval: object = None
+    send: object = None
 
     def expected(self):
         """The fields this step sets (`STEP_FIELDS`), for its JSON and its timeline records."""
@@ -1017,8 +1059,10 @@ def from_dict(raw, path):
         ledger_keys = ledger_keys - {"sut_aggregate"}
         ledger_optional = ledger_optional | {"sut_aggregate"}
     # `sut_delta` takes `sut_aggregate`'s place, and `_delta_problems()` refuses both together.
-    # A scrape wire's rows read no `aggregate`, and `_scrape_problems()` refuses one.
-    if isinstance(ledger, dict) and ("sut_delta" in ledger or _scraped(ledger)):
+    # A scrape wire's rows and a span relay's read no `aggregate`, and `_scrape_problems()`
+    # and `_span_problems()` refuse one.
+    if isinstance(ledger, dict) and ("sut_delta" in ledger or _scraped(ledger)
+                                     or _spanned(target)):
         ledger_keys = ledger_keys - {"sut_aggregate"}
         ledger_optional = ledger_optional | {"sut_aggregate"}
     if no_vm and isinstance(ledger, dict):
@@ -1084,6 +1128,7 @@ def from_dict(raw, path):
             problems += _delta_problems(ledger, sut_text, target, "overlap" in raw)
             problems += _scrape_problems(ledger, target, "overlap" in raw, extra_suts,
                                          sut_text, configs, path.parent)
+            problems += _span_problems(ledger, target, "overlap" in raw, extra_suts, sut_text)
             if target["kind"] == KAFKA_TARGET:
                 target["format"] = kafka_format(ledger, sut_text, target["topic"], problems)
             problems += _kafka_wire_problems(ledger, configs, path.parent, sut_text)
@@ -1129,6 +1174,10 @@ def from_dict(raw, path):
             cpu=raw_step.get("cpu"), memory_high=raw_step.get("memory_high"),
             io_wbps=raw_step.get("io_wbps"), io_wiops=raw_step.get("io_wiops"),
             io_path=raw_step.get("io_path"), engaged=raw_step.get("engaged"),
+            address=raw_step.get("address"),
+            mode=raw_step.get("mode"), connections=raw_step.get("connections"),
+            interval=dur(raw_step, "interval", where) if "interval" in raw_step else None,
+            send=raw_step.get("send"),
         ))
         if "for" not in raw_step:
             problems.append(f"{where}: every fault needs `for`, so its revert is scheduled with it")
@@ -2172,6 +2221,62 @@ def _scraped(ledger):
                for source in sources)
 
 
+def _spanned(target):
+    """Whether the target is a `datadog_trace` stand-in, whose run relays spans."""
+    return (target.get("kind") == STANDIN_TARGET
+            and target.get("shape") == standin_mod.DATADOG_TRACE)
+
+
+def _span_problems(ledger, target, overlap, extra_suts, sut_text):
+    """What a span relay breaks: under a `datadog_trace` stand-in, one `[[ledger.source]]` on an
+    HTTP wire into a `datadog_trace_in`, with no `sut_transforms`, `fan_out`, or `merge`, one
+    `[[ledger.sink]]` naming a `datadog_trace_out`, and one SUT service; and
+    `SPAN_REFUSED_KEYS` and `[overlap]` refused beside it. The rows count spans from the listener
+    to the stand-in, so nothing between them may add, drop, or reshape one."""
+    if not _spanned(target):
+        return []
+    problems = []
+    sources = ledger.get("source") if isinstance(ledger.get("source"), list) else []
+    if len(sources) != 1:
+        problems.append("a datadog_trace stand-in needs one [[ledger.source]], since every row "
+                        "counts that listener's spans")
+    for index, source in enumerate(sources):
+        if not isinstance(source, dict):
+            continue
+        if source.get("wire") != HTTP_WIRE:
+            problems.append(f"ledger.source {index + 1}: a datadog_trace stand-in's source takes "
+                            f"wire = \"{HTTP_WIRE}\", a writer's tracer API requests")
+        listener = source.get("sut_listener")
+        kind = component_kind(sut_text, listener) if isinstance(listener, str) else None
+        if isinstance(listener, str) and kind is not None and kind != SPAN_LISTENER_KIND:
+            problems.append(f"ledger.source {index + 1}: sut_listener {listener!r} is a {kind}, "
+                            f"and a datadog_trace stand-in's listener is a {SPAN_LISTENER_KIND}")
+        for key in ("sut_transforms", "fan_out", "merge"):
+            if key in source:
+                problems.append(f"ledger.source {index + 1}: `{key}` can't be combined with a "
+                                "datadog_trace stand-in, whose rows count each span from the "
+                                "listener to the sink")
+    sinks = ledger.get("sink") if isinstance(ledger.get("sink"), list) else []
+    if len(sinks) != 1:
+        problems.append("a datadog_trace stand-in needs one [[ledger.sink]], whose writes the "
+                        "stand-in records")
+    for index, sink in enumerate(sinks):
+        sink_id = sink.get("id") if isinstance(sink, dict) else None
+        kind = component_kind(sut_text, sink_id) if isinstance(sink_id, str) else None
+        if kind is not None and kind != SPAN_SINK_KIND:
+            problems.append(f"ledger.sink {index + 1}: {sink_id!r} is a {kind}, and a "
+                            f"datadog_trace stand-in's sink is a {SPAN_SINK_KIND}")
+    for key in SPAN_REFUSED_KEYS:
+        if key in ledger:
+            problems.append(f"ledger.{key} can't be combined with a datadog_trace stand-in, "
+                            "whose rows read no aggregate")
+    if overlap:
+        problems.append("[overlap] can't be combined with a datadog_trace stand-in")
+    if extra_suts:
+        problems.append("a datadog_trace stand-in needs one SUT service")
+    return problems
+
+
 def _scrape_problems(ledger, target, overlap, extra_suts, sut_text, configs, directory):
     """What a scrape wire breaks: it is the one `[[ledger.source]]`, with no `sut_transforms`,
     `fan_out`, or `merge`, into one SUT service with one `[[ledger.sink]]` on the local target,
@@ -2978,6 +3083,7 @@ def validate(scenario, duration=None, seed=None):
         problems += _tls_step_problems(spec, where, scenario.tls)
         problems += _prlimit_problems(spec, where)
         problems += _cgroup_problems(spec, where)
+        problems += _slowclient_problems(spec, where)
         if spec.for_ <= 0:
             problems.append(f"{where}: `for` must be longer than 0s")
         if spec.action == "netem":
@@ -3088,6 +3194,55 @@ def validate(scenario, duration=None, seed=None):
                 problems += _schedule_problems(scenario, steps, length)
     if problems:
         raise ScenarioError(problems)
+
+
+def slowclient_send(step):
+    """What a `slowclient` step's client sends: `none` under `silent`, else its `send` or
+    `SLOWCLIENT_DEFAULT_SEND`."""
+    if step.mode == "silent":
+        return "none"
+    return step.send if step.send is not None else SLOWCLIENT_DEFAULT_SEND
+
+
+def _slowclient_problems(spec, where):
+    """What a step breaks of the `slowclient` rules: `address` a `host:port` with a port from 1
+    to 65535, `mode` one of `SLOWCLIENT_MODES`, and `connections` a whole number from 1 to
+    `SLOWCLIENT_MAX_CONNECTIONS`, each required; `interval` from `SLOWCLIENT_MIN_INTERVAL_S` to
+    `SLOWCLIENT_MAX_INTERVAL_S`; `send` one of `SLOWCLIENT_SENDS`, refused under `silent`; and
+    every key refused on another action."""
+    given = [key for key in SLOWCLIENT_KEYS if getattr(spec, key) is not None]
+    if spec.action != "slowclient":
+        return [f"{where}: `{key}` is for slowclient only" for key in given]
+    problems = []
+    for key in ("address", "mode", "connections"):
+        if getattr(spec, key) is None:
+            problems.append(f"{where}: slowclient needs `{key}`")
+    if spec.address is not None:
+        host, _, port = spec.address.rpartition(":") if isinstance(spec.address, str) \
+            else ("", "", "")
+        if not (_HOST_NAME.match(host) and port.isdigit() and 1 <= int(port) <= 65535):
+            problems.append(f"{where}: `address` must be a host:port with a port from 1 to "
+                            f"65535, got {spec.address!r}")
+    if spec.mode is not None and spec.mode not in SLOWCLIENT_MODES:
+        problems.append(f"{where}: `mode` must be one of {', '.join(SLOWCLIENT_MODES)}, got "
+                        f"{spec.mode!r}")
+    if spec.connections is not None and (
+            not isinstance(spec.connections, int) or isinstance(spec.connections, bool)
+            or not 1 <= spec.connections <= SLOWCLIENT_MAX_CONNECTIONS):
+        problems.append(f"{where}: `connections` must be a whole number from 1 to "
+                        f"{SLOWCLIENT_MAX_CONNECTIONS}, got {spec.connections!r}")
+    if spec.interval is not None and not (
+            SLOWCLIENT_MIN_INTERVAL_S <= spec.interval <= SLOWCLIENT_MAX_INTERVAL_S):
+        problems.append(f"{where}: `interval` must be from "
+                        f"{format_duration(SLOWCLIENT_MIN_INTERVAL_S)} to "
+                        f"{format_duration(SLOWCLIENT_MAX_INTERVAL_S)}, got "
+                        f"{format_duration(spec.interval)}")
+    if spec.send is not None and spec.mode == "silent":
+        problems.append(f"{where}: a silent slowclient sends nothing, so it takes no `send`")
+    elif spec.send is not None and spec.send not in SLOWCLIENT_SENDS:
+        problems.append(f"{where}: `send` must be one of {', '.join(SLOWCLIENT_SENDS)}, got "
+                        f"{spec.send!r}")
+    return problems
 
 
 def _prlimit_problems(spec, where):
@@ -3681,6 +3836,9 @@ def _random_problems(scenario, duration):
         if template.action == "cgroup":
             problems.append(f"{where}: cgroup takes `cpu`, `memory_high`, or an io limit, which "
                             "a [random] fault can't set; write it as a [[step]]")
+        if template.action == "slowclient":
+            problems.append(f"{where}: slowclient takes `address`, `mode`, and `connections`, "
+                            "which a [random] fault can't set; write it as a [[step]]")
         if template.action in NO_WINDOW_ACTIONS:
             problems.append(f"{where}: {template.action} opens no fault window and takes keys a "
                             "[random] fault can't set; write it as a [[step]]")
@@ -4046,6 +4204,8 @@ def expand(scenario, duration=None, seed=None):
                     days=spec.days, broken=spec.broken, port=spec.port, nofile=spec.nofile,
                     cpu=spec.cpu, memory_high=spec.memory_high, io_wbps=spec.io_wbps,
                     io_wiops=spec.io_wiops, io_path=spec.io_path, engaged=spec.engaged,
+                    address=spec.address, mode=spec.mode, connections=spec.connections,
+                    interval=spec.interval, send=spec.send,
                 ))
         cycle += 1
     steps.sort(key=lambda s: (s.start, s.spec_index))

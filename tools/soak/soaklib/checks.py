@@ -427,6 +427,8 @@ class RunData:
         self.standin_counts = None
         self.standin_datadog = self.standin_shape == standin.DATADOG
         self.standin_influxdb = self.standin_shape == standin.INFLUXDB
+        # Under `datadog_trace`, the stored spans (`standin.Spans`): V counts spans.
+        self.standin_spans = None
         if self.standin:
             service = next((name for name, role in self.services.items()
                             if role == STANDIN_ROLE), STANDIN_TARGET)
@@ -445,6 +447,10 @@ class RunData:
                 self.standin_counts = counts
                 self.standin_store = (counts.series, len(counts.rewrites), counts.conflicts,
                                       counts.undecodable)
+            elif self.standin_shape == standin.DATADOG_TRACE:
+                spans = standin.stored_spans(self.standin_requests)
+                self.standin_spans = spans
+                self.standin_store = (spans.series, len(spans.copies), [], spans.undecodable)
             else:
                 self.standin_store = standin.stored_series(self.standin_requests,
                                                            self.standin_shape)
@@ -615,7 +621,8 @@ def check_timeline(data):
     count that contradicts the step's `engaged`. An io revert's written bytes and writes, their
     rate against the limit, and the stalled time are reported, and one that couldn't read them
     FAILs; `engaged` there reads the stalled time against `IO_ENGAGED_STALL_SHARE` of the
-    window."""
+    window. A `slowclient` revert's counts are reported: the most connections it held, its
+    dials, and how many the listener closed."""
     if data.t0 is None:
         return Result("timeline", SKIP, "no timeline start")
     lines = []
@@ -659,6 +666,12 @@ def check_timeline(data):
               f"throttling: {record['events_error']}"
               for record in actions if record["event"] == "revert" and "events_error" in record]
     gone += engaged
+    gone += [f"{record.get('step')} (slowclient on {record.get('on')}): {record.get('mode')} "
+             f"held at most {_n(done.get('max_open', 0))} of {_n(record.get('connections', 0))} "
+             f"connection(s), dialed {_n(done.get('dialed', 0))}, "
+             f"{_n(done.get('peer_closed', 0))} closed by the listener"
+             for record in actions if record["event"] == "revert"
+             and isinstance(done := record.get("done"), dict)]
     for record in actions:
         if record["event"] != "revert":
             continue
@@ -1513,6 +1526,18 @@ def component_duration(text, component, key):
     return None
 
 
+def component_bytes(text, component, key):
+    """A byte-size field of one component in a YAML text (`512MiB`, `64KiB`, `1GiB`, or a bare
+    count), in bytes, or None."""
+    units = {"": 1, "B": 1, "KiB": 1024, "MiB": MIB, "GiB": 1024 * MIB, "KB": 1000,
+             "MB": 1000 ** 2, "GB": 1000 ** 3}
+    for block in component_blocks(text, component):
+        found = re.search(rf"\b{key}\s*:\s*[\"']?([0-9.]+)\s*([A-Za-z]*)", block)
+        if found and found.group(2) in units:
+            return float(found.group(1)) * units[found.group(2)]
+    return None
+
+
 # The aggregate window assumed when the SUT config names none.
 DEFAULT_AGGREGATE_INTERVAL_S = 10.0
 
@@ -1685,6 +1710,11 @@ class HttpListener:
 # `route` tag, decodes it to one batch, and answers as `influxdb_in` does under a 2 s deadline
 # (crates/logit-inputs/src/prometheus.rs, "Backpressure"). It counts `ok` in the poll its batch
 # went in, so one whose sender closed before the `204` is still `ok` ("Counters").
+# `datadog_trace_in` answers a trace or stats request as `influxdb_in` does, under a 2 s
+# deadline on its one batch, counting `logit.input.requests{route, class}` on every route; its
+# row sums the routes, since `datadog_trace_out` writes only to its `version:`'s trace route
+# and `/v0.6/stats`, each a write route, and never reads `/info`
+# (crates/logit-inputs/src/datadog_trace.rs, "Backpressure").
 #
 # The runtime's shutdown backstop can cut a request out of its deadline send: the send counts
 # `batches.sent` only once every consumer's slot is held, and the handler that counts the class
@@ -1703,6 +1733,8 @@ HTTP_LISTENERS = {
     "datadog_in": HttpListener("logit.input.requests", "series_v2",
                                "logit.input.batches.deferred"),
     "prometheus_in": HttpListener("logit.input.writes", None, "logit.input.batches.deferred"),
+    "datadog_trace_in": HttpListener("logit.input.requests", None,
+                                     "logit.input.batches.deferred"),
 }
 # `cri_in`'s `partial_timeout` and `poll_interval` when the config names neither
 # (crates/logit-config, `ComponentKind::CriIn` and `TailOptions`).
@@ -2058,6 +2090,13 @@ class Ledger:
         # A scrape wire's SUT relays samples to its one sink with no `aggregate` (scenario.py's
         # `_scrape_problems`): the rows from `aggregate` on judge samples, or SKIP.
         self.scraped = any(source_wire(source) == SCRAPE_WIRE for source in self.sources)
+        # A `datadog_trace` stand-in's SUT relays spans to its one sink with no `aggregate`
+        # (scenario.py's `_span_problems`): every row counts spans, and V is the spans of the
+        # writes the stand-in answered `2xx`, credited to the life it answered them in.
+        self.spans = data.standin_spans is not None
+        # Either relay: the listener sends to the sink, and the rows from `aggregate` on read
+        # the sink's events received in its place.
+        self.relayed = self.scraped or self.spans
         # Under `[ledger] sut_delta`, the `cumulative_to_delta` feeding the sink takes
         # `aggregate`'s place: A is its events received, Ab its events sent, each one delta
         # point, and Δ_disc the events a skipped point left with nothing, counted (`discarded`).
@@ -2105,6 +2144,7 @@ class Ledger:
         if self.delta:
             self.discarded_text += "Δ_disc − "
         self.residual_text = ("W + Y − D − B − X − S_in" if self.scraped
+                              else "W − D − B − X − S_in" if self.spans
                               else "E_B − X_B − Ab" if cfg.get("hop")
                               else "W′ − R_in" if self.reshaped and self.targeted
                               else f"W − D − B − X − {self.discarded_text}R_in" if self.targeted
@@ -2368,6 +2408,13 @@ class Ledger:
                 self.V[sink], self.V_total[sink] = topic.totals_by_life(
                     [(t, 1) for t, _ in data.standin_counts.arrivals], self.life_starts)
             self.resets[sink], self.mismatched[sink] = {}, []
+        # A `datadog_trace` stand-in's one sink has the spans of its accepted writes for its V,
+        # every copy, credited to the life the stand-in answered each in.
+        if self.spans and self.sinks:
+            sink = self.sinks[0]
+            self.V[sink], self.V_total[sink] = topic.totals_by_life(
+                data.standin_spans.arrivals, self.life_starts)
+            self.resets[sink], self.mismatched[sink] = {}, []
         # Per sink, what `edge` judges: the events it received, and under `route` the events
         # its target sent; and the events `aggregate` sent, once per send whatever its fan-out.
         self.S_in = {sink: sut.counter_by_life("logit.component.events.received",
@@ -2574,6 +2621,7 @@ class Ledger:
         self.window = component_int(text, sink, "concurrency") or DEFAULT_HOP_WINDOW
         self.hop_checkpoint = (component_duration(text, sink, "checkpoint_interval")
                                or DEFAULT_CHECKPOINT_INTERVAL_S)
+        self.hop_segment_bytes = component_bytes(text, sink, "segment_bytes")
 
     def fed(self, life):
         """What reached `aggregate`'s side of the sinks' SUT in `life`: W − D − B − X, or across
@@ -2881,7 +2929,7 @@ class Ledger:
         `sinks`, the listeners' side: what reached the router's side short of the router,
         W − D − B − X (less ΣT_disc) − R_in. With `sinks`, each sink's branch: what its target
         sent that its `aggregate` hadn't absorbed, `branch_fed` − Ab, summed."""
-        if self.scraped:
+        if self.relayed:
             return (self.fed(life) + self.get("Y", life)
                     - sum(self.S_in[sink].get(life, 0) for sink in self.sinks))
         if self.targeted:
@@ -4990,8 +5038,9 @@ def check_ledger_edge(data):
         edges = [("L_sent", "A", led.L_sent, led.A, "script to aggregate", out)]
     elif led.targeted:
         edges = _target_edges(led, out)
-    elif led.scraped:
-        # No `aggregate`: the listener sends to the sink, the synthetic samples with the rest.
+    elif led.relayed:
+        # No `aggregate`: the listener sends to the sink, on a scrape wire the synthetic
+        # samples with the rest.
         sent = {life: led.get("E", life) - led.get("X", life) for life in led.lives}
         edges = [("E − X", f"S_in[{sink}]", sent, led.S_in[sink], f"listener to {sink}", out)
                  for sink in led.sinks]
@@ -5003,7 +5052,7 @@ def check_ledger_edge(data):
         else:
             edges.append(("ΣE" if not any(led.transforms.values()) else "Σ(sent into aggregate)",
                           "A", into, led.A, "listeners to aggregate", out))
-    for sink in led.sinks if not led.targeted and not led.scraped else ():
+    for sink in led.sinks if not led.targeted and not led.relayed else ():
         received = led.S_in[sink]
         if led.split == "route":
             target = led.targets.get(sink)
@@ -5212,6 +5261,9 @@ def check_ledger_aggregate(data):
     if led.scraped:
         return Result("ledger.aggregate", SKIP, "a scrape wire: the SUT relays samples with no "
                       "aggregate")
+    if led.spans:
+        return Result("ledger.aggregate", SKIP, "a datadog_trace stand-in: the SUT relays spans "
+                      "with no aggregate")
     if led.delta and not led.problems:
         return _final_equality(data, "ledger.aggregate", "Ab", "Ad",
                                f"every point {led.delta} didn't skip sent on: Ab its events "
@@ -5268,6 +5320,8 @@ def check_ledger_egress(data):
         return Result("ledger.egress", FAIL, "no [[ledger.sink]] to judge")
     if led.scraped:
         return _scrape_egress(led)
+    if led.spans:
+        return _span_egress(led)
     status = PASS
     lines = []
     groups = []
@@ -5472,6 +5526,106 @@ def _scrape_egress(led):
                   + " (V_n the distinct stored samples)", lines)
 
 
+# The reasons a sink's `events.dropped` shares with its `records.dropped`: a batch the send
+# verdict dropped, whose records the sink counted itself, per request.
+VERDICT_DROP_REASONS = ("rejected", "ambiguous_at_most_once")
+
+
+def _span_drops(led, sink, life):
+    """`(drops, text)`: the spans `sink` counted lost in `life`, its
+    `logit.output.records.dropped` under every reason, per request it read as lost, plus its
+    `logit.component.events.dropped` under any reason but `VERDICT_DROP_REASONS`, which count
+    the same spans again (an overflow or a shutdown cut, which no request saw)."""
+    sut = led.sut
+    by_reason = {}
+    for point in sut.matching("logit.output.records.dropped", component=sink):
+        if point.life == life and isinstance(point.value, (int, float)) and point.value:
+            reason = point.attributes.get("reason", "?")
+            by_reason[f"records {reason}"] = by_reason.get(f"records {reason}", 0) + point.value
+    for point in sut.matching("logit.component.events.dropped", component=sink):
+        reason = point.attributes.get("reason", "?")
+        if (point.life == life and reason not in VERDICT_DROP_REASONS
+                and isinstance(point.value, (int, float)) and point.value):
+            by_reason[f"events {reason}"] = by_reason.get(f"events {reason}", 0) + point.value
+    text = ", ".join(f"{key} {_n(value)}" for key, value in sorted(by_reason.items()))
+    return sum(by_reason.values()), text or "none"
+
+
+def _span_egress(led):
+    """`ledger.egress` for a `datadog_trace` stand-in, in spans: per SUT life, W − X, the spans
+    the listener sent, against V, the spans of the writes the stand-in stored and answered
+    `2xx` in that life, every copy (`standin.stored_spans`). The sink settles each request once
+    (`crates/logit-outputs/src/datadog_trace.rs`, "Faults, retries, and duplicate safety"), so
+    in a life the process ended with its drain, the final one or a stopped one, every span it
+    received is accepted once or counted lost by the sink (`_span_drops`): the gap must equal
+    those drops, and anything else is uncounted loss, or a surplus below them. A killed life's
+    gap is reported, since the kill discards the sink's queue and its last drain's counts."""
+    status, parts, lines = PASS, [], []
+    sink = led.sinks[0]
+    spans = led.data.standin_spans
+    if not spans.arrivals:
+        return Result("ledger.egress", FAIL, f"{sink}: the stand-in accepted no span")
+    for life in led.lives:
+        sent = led.get("W", life) - led.get("X", life)
+        v = led.v(life, [sink])
+        gap = sent - v
+        drops, text = _span_drops(led, sink, life)
+        killed = life in led.killed and life != led.final
+        if killed:
+            verdict = "reported: a kill discards the sink's queue"
+        elif gap == drops:
+            verdict = "exact" if gap == 0 else "counted: the sink's drops"
+        elif gap < drops:
+            verdict, status = (f"a surplus: {_n(drops - gap)} span(s) stored past what the "
+                               "sink didn't count lost"), FAIL
+        else:
+            verdict, status = f"uncounted loss of {_n(gap - drops)} span(s)", FAIL
+        part = (f"life {life}{' (final)' if life == led.final else ''}"
+                f"{' (killed)' if killed else ''}: W − X {_n(sent)} − V {_n(v)} = {_n(gap)}, "
+                f"sink drops {_n(drops)} ({text}), {verdict}")
+        lines.append(part)
+        if verdict.startswith(("a surplus", "uncounted")):
+            parts.insert(0, part)
+        else:
+            parts.append(part)
+    lines.append(f"{sink}: {_n(sum(n for _, n in spans.arrivals))} span(s) in accepted writes, "
+                 f"{_n(spans.distinct)} distinct, {_n(len(spans.copies))} copies of a span "
+                 f"already accepted; {_n(sum(n for _, n in spans.resent))} span(s) stored by "
+                 "writes answered other than 2xx, which the sink resent")
+    return Result("ledger.egress", status, f"{sink}: " + "; ".join(parts)
+                  + " (V the spans of the writes the stand-in answered 2xx)", lines)
+
+
+def _span_summary(led):
+    """`ledger.summary` for a `datadog_trace` stand-in: the final life's uncounted spans,
+    (W − D − E − B) + (E − X − S_in) + (S_in − V − the sink's drops), which must be 0, and over
+    the run the distinct spans the stand-in accepted, which can't exceed G, the spans the
+    generator's writer saw accepted: a span has one identity end to end, so a resend at either
+    hop can't add one."""
+    life = led.final
+    g = led.get
+    sink = led.sinks[0]
+    drops, _ = _span_drops(led, sink, life)
+    s_in = led.S_in[sink].get(life, 0)
+    v = led.v(life, [sink])
+    terms = [("W − D − E − B", g("W", life) - led.D(life) - g("E", life) - g("B", life)),
+             ("E − X − S_in", g("E", life) - g("X", life) - s_in),
+             ("S_in − V − drops", s_in - v - drops)]
+    uncounted = sum(value for _, value in terms)
+    status = PASS if all(value == 0 for _, value in terms) else FAIL
+    text = " + ".join(f"({name}) {_n(value)}" for name, value in terms)
+    parts = [f"final life {life}: uncounted {_n(uncounted)} = {text}"]
+    distinct = led.data.standin_spans.distinct
+    if distinct > led.G:
+        status = FAIL
+        parts.insert(0, f"{_n(distinct)} distinct span(s) accepted > G {_n(led.G)}, a surplus "
+                        f"of {_n(distinct - led.G)}")
+    else:
+        parts.append(f"{_n(distinct)} distinct span(s) accepted <= G {_n(led.G)}, "
+                     f"{_n(led.G - distinct)} short over the run")
+    return Result("ledger.summary", status, "; ".join(parts), parts)
+
+
 def check_ledger_summary(data):
     """The final life's uncounted = (W − D − E − B) + (E − A) + (A − Ab) + (Ab − V), which must
     be 0, with wire loss beside it by design. There is one Ab − V term per egress group, and
@@ -5493,6 +5647,8 @@ def check_ledger_summary(data):
     skipped = _skip_without_sut("ledger.summary", led)
     if skipped:
         return skipped
+    if led.spans:
+        return _span_summary(led)
     if led.scraped:
         return Result("ledger.summary", SKIP, "a scrape wire: ledger.wire judges the "
                       "generator's increments against V end to end, per generator life, and "
@@ -5949,8 +6105,9 @@ def _end_to_end(data, led):
     on an HTTP wire no X, which the client resends), plus one generator batch per ambiguous
     attempt on a TCP wire and per transport-error attempt or ack timeout on an HTTP wire, as
     `ledger.wire` allows, and
-    on a file wire the replay band's upper edge, and on a `cri` wire S, each split line's
-    second event. With a `fan_out`, each source's share is
+    on a file wire the replay band's upper edge, on a `cri` wire S, each split line's
+    second event, and across a hop the frames replayed into a full sender table that
+    `ledger.hop` allows (`_evicted_replays`). With a `fan_out`, each source's share is
     carried through its chain instead (`Ledger.through`). A kill on either side shifts lives but
     never adds increments, so V above that is a surplus whatever was killed; V below it is the
     per-life rows' to judge."""
@@ -5985,9 +6142,13 @@ def _end_to_end(data, led):
     files = files + kafkas
     # On a `cri` wire each split line's second event reaches `aggregate` too.
     splits = sum(sum(led.per[listener]["S"].values()) for listener in files)
-    limit = led.G - counted + partial + resent + replay + splits
+    # A replay a full sender table met can forward again what the hop already forwarded.
+    replays = _evicted_replays(led)
+    evicted = sum(replayed for _, replayed, _ in replays) * round(led.per_frame) if replays else 0
+    limit = led.G - counted + partial + resent + replay + splits + evicted
     bound = ("G − counted" + (" + partial" if partial else "") + (" + resent" if https else "")
-             + (" + replay" if files else "") + (" + S" if splits else ""))
+             + (" + replay" if files else "") + (" + S" if splits else "")
+             + (" + evicted" if evicted else ""))
     carried = ""
     if led.reshaped:
         # Each source's own share of the limit, in its listener's events, carried through its
@@ -6027,6 +6188,8 @@ def _end_to_end(data, led):
                     + (f" plus the replay band's {_n(replay)}" if files else "")
                     + (f" plus S {_n(splits)}, the split lines' second events" if splits
                        else "")
+                    + (f" plus an eviction allowance {_n(evicted)}, the frames replayed into "
+                       "a full sender table" if evicted else "")
                     + carried + ": " + "; ".join(parts))
 
 
@@ -6058,6 +6221,49 @@ def _commit_rate(tel, name, component, life):
     moved = [(a, b) for a, b in zip(drains, drains[1:]) if b > a and by_ts.get(b)]
     rate = max((by_ts[b] / (b - a) for a, b in moved[-COMMIT_RATE_INTERVALS:]), default=0.0)
     return rate, (moved[-1][1] if moved else None)
+
+
+def _evicted_replays(led):
+    """`[(life, replayed, evictions)]`: each ingress life after the first whose spool replayed
+    frames while the far SUT's `logit_in` counted more than one sender eviction, from the life's
+    start to the end of its replay's window, its first drain that counted a replay plus two of
+    the far SUT's drain intervals, or the next life's start if sooner. A life's own identity
+    evicts at most one, when its first frame takes a slot in a full table; any other eviction in
+    that window is a replayed identity the table no longer held, taken back by a forward of a
+    frame it had acknowledged before (docs/plans/soak-harness.md's "The native hop (W10b)").
+    The life's replayed frames bound those forwards. A collector restart's forgotten marks are
+    allowed apart, and evict nothing. The count > 1 trigger assumes one ingress sender: with
+    several sharing `collector`'s table, another sender's churn can supply the second eviction,
+    and a multi-sender hop scenario would need a per-life capacity test (ingress lives since
+    collector's last start > max_connections + max_connections / 4)."""
+    if led.hop is None:
+        return []
+    sink, listener = led.hop.get("sink"), led.hop.get("listener")
+    evicted = [(ts, v) for ts, v, _ in
+               led.sut.counter_points("logit.input.senders.evicted", component=listener) if v]
+    if not evicted:
+        return []
+    drains = sorted(led.sut.drains)
+    gaps = [b - a for a, b in zip(drains, drains[1:]) if b > a]
+    gap = statistics.median(gaps) if gaps else 0.0
+    replays = {}
+    for ts, v, life in led.ingress.counter_points("logit.component.buffer.disk.replayed",
+                                                  component=sink):
+        if v and life > 0:
+            first, total = replays.get(life, (ts, 0))
+            replays[life] = (min(first, ts), total + v)
+    starts = led.inn.life_starts
+    found = []
+    for life, (first, replayed) in sorted(replays.items()):
+        if life >= len(starts):
+            continue
+        end = first + 2 * gap
+        if life + 1 < len(starts):
+            end = min(end, starts[life + 1])
+        count = sum(v for ts, v in evicted if starts[life] < ts <= end)
+        if count > 1:
+            found.append((life, replayed, count))
+    return found
 
 
 def _first_moved(tel, name, component, life):
@@ -6108,7 +6314,10 @@ def check_ledger_hop(data):
     the far SUT can make it forward a resend twice: a kill forgets its marks, and a pause
     leaves frames in an ended connection that a resend races (docs/deploying.md),
     each up to one send window of frames below 0. A partition or packet loss can't: the race
-    needs a forward parked on a full inbox. Any other
+    needs a forward parked on a full inbox. An ingress life whose replay met more evictions at
+    the far SUT than its own identity causes may have its replayed frames forwarded again, each
+    of an identity the full table had evicted (`_evicted_replays`), so the gap may fall by
+    those frames too. Any other
     gap FAILs, as a surplus below the allowance or uncounted loss above it. Resends, resumed
     frames, and reconnects are shown beside it. The lines report the running gap at each
     fault's start, the hop's backlog plus any surplus so far, from both sides' running totals,
@@ -6154,6 +6363,13 @@ def check_ledger_hop(data):
         low, high = low - race, high + tail
         allowances.append(f"{out.service} life {life} killed: −{_n(race)} (its marks lost), "
                           f"+{_n(tail)} ({rate:,.0f}/s over its last drain interval)")
+    for life, replayed, count in _evicted_replays(led):
+        resent = replayed * frame
+        low -= resent
+        allowances.append(f"{inn.service} life {life}: −{_n(resent)} (its {_n(replayed)} "
+                          f"replayed frames, which {out.service}, evicting {_n(count)} "
+                          f"identities as it took them, more than the life's own one, may "
+                          f"forward again)")
     for fault in data.faults:
         if fault.on == out.service and fault.action == "pause":
             low -= race
@@ -6741,7 +6957,16 @@ def check_ledger_replay(data):
     life's last drain interval, t the time from its last drain to the `docker kill`'s return,
     and the highest delivered rate over its last few drain intervals that delivered anything
     (`_commit_rate`), replayed − queued is in [−(delivered rate × t) − 1, received rate × t +
-    that commit rate × the checkpoint interval + 1]."""
+    that commit rate × the checkpoint interval + 1]. The spool persists only once the interval
+    has passed since it opened, so a life killed sooner after its start never persisted, and
+    the upper edge's commit term is every batch it delivered instead, counted or after its last
+    drain at its delivered rate: in a crash loop each life's replay carries the one before.
+    That holds only while the spool rolled no segment: `DiskQueue::roll_read_cursor` persists
+    the cursor at every segment boundary whatever the interval, and the harness can't see a
+    roll (`buffer.disk.segments` is a gauge sampled at drains). The band therefore requires the
+    sink to declare `segment_bytes`, which the scenario sets large enough that no roll happens;
+    the declaration is the scenario's assertion, and the harness doesn't check its size. A sink
+    that doesn't declare one gets the one-interval band, and the row says so."""
     if _overlapped(data):
         return _per_instance(data, check_ledger_replay)
     led = _ledger(data)
@@ -6774,11 +6999,32 @@ def check_ledger_replay(data):
             done = led.inn.killed_done.get(life) or led.inn.killed_at[life]
             after = max(0.0, done - drains[-1]) if drains else 0.0
             low = -math.ceil(sent * after) - 1
-            high = math.ceil(took * after + last * led.hop_checkpoint) + 1
-            band = (f", band [{_n(low)}, {_n(high)}]: {took:,.1f} batches/s received and "
-                    f"{sent:,.1f} delivered over its last drain interval, {after:.1f}s from "
-                    f"its last drain to the kill, and a {led.hop_checkpoint:g}s checkpoint of "
-                    f"its last delivering {last:,.1f}/s")
+            start = led.inn.life_starts[life] if life < len(led.inn.life_starts) else None
+            if (start is not None and done - start < led.hop_checkpoint
+                    and led.hop_segment_bytes):
+                # The spool persists its cursor only once the interval has passed since it
+                # opened, so a life killed sooner never persisted: every frame it committed,
+                # its own replay's included, replays again. A segment roll persists the cursor
+                # at any age, so this assumes the spool never rolled; the scenario's
+                # `segment_bytes` must rule a roll out.
+                committed = sum(v for _, v, point_life in sut.counter_points(
+                    "logit.component.batches.delivered", component=sink) if point_life == life)
+                high = math.ceil(took * after + committed + sent * after) + 1
+                band = (f", band [{_n(low)}, {_n(high)}]: {took:,.1f} batches/s received and "
+                        f"{sent:,.1f} delivered over its last drain interval, {after:.1f}s "
+                        f"from its last drain to the kill, and all {_n(committed)} batches it "
+                        f"committed, since it died {done - start:.0f}s after its start, inside "
+                        f"its {led.hop_checkpoint:g}s checkpoint, with no persist")
+            else:
+                high = math.ceil(took * after + last * led.hop_checkpoint) + 1
+                band = (f", band [{_n(low)}, {_n(high)}]: {took:,.1f} batches/s received and "
+                        f"{sent:,.1f} delivered over its last drain interval, {after:.1f}s "
+                        f"from its last drain to the kill, and a {led.hop_checkpoint:g}s "
+                        f"checkpoint of its last delivering {last:,.1f}/s")
+                if (start is not None and done - start < led.hop_checkpoint
+                        and not led.hop_segment_bytes):
+                    band += (", no segment_bytes set: a roll may have persisted, so one "
+                             "interval's band")
         ok = low <= replayed - queued <= high
         status = worst([status, PASS if ok else FAIL])
         where = f"{service} " if service is not None else ""
@@ -7198,8 +7444,10 @@ def check_ledger_standin(data):
     every answer other than the default carries the cue of a `respond` step and falls inside
     its span, and every write went to the stand-in's path; each step with a `count` answered
     that many writes to the path under its cue; and each step with a `class` shows
-    that class's effect at the sink (`_class_signature`). A killed life's mismatch WARNs, since
-    a kill loses that life's last telemetry interval. Every other target SKIPs.
+    that class's effect at the sink (`_class_signature`). A kill loses that life's last
+    telemetry interval, so a killed life's shortfall of no more requests of a class than the
+    stand-in recorded from the life's last drain to the kill is reported, and any other
+    mismatch in it WARNs. Every other target SKIPs.
 
     Under the `remote_write` shape (`_standin_not_written`), also: per SUT life, the samples the
     stand-in's short `X-Prometheus-Remote-Write-Samples-Written` answers said weren't written
@@ -7298,20 +7546,31 @@ def check_ledger_standin(data):
         flag(FAIL, f"{_n(len(lost))} sample(s) the stand-in answered 2xx were never stored, "
                    f"first {dict(key).get('__name__', key)} at {data.offset(stamp / 1000)}: a "
                    "write the sink saw accepted and the destination lost")
-    paths = (path,) + standin.OTHER_PATHS.get(shape, ())
+    writes = standin.write_paths(shape)
+    paths = writes + standin.OTHER_PATHS.get(shape, ())
     wrong_path = [r for r in requests if r.get("path") not in paths]
     if wrong_path:
-        flag(FAIL, f"{len(wrong_path)} write(s) to a path other than {path}, first "
-                   f"{wrong_path[0].get('path')!r}")
+        flag(FAIL, f"{len(wrong_path)} write(s) to a path other than {', '.join(writes)}, "
+                   f"first {wrong_path[0].get('path')!r}")
 
     sinks = led.sinks
     sink = sinks[0] if sinks else None
     by_life = {}
+    # `{life: {class: n}}`: a killed life's requests the stand-in recorded after the life's
+    # last drain, up to the kill, whose count the killed process never drained.
+    undrained = {}
     for request in requests:
-        life = vm.life_at(led.life_starts, request.get("t") or 0)
+        t = request.get("t") or 0
+        life = vm.life_at(led.life_starts, t)
         cls = standin.status_class(request)
         by_life.setdefault(life, {})
         by_life[life][cls] = by_life[life].get(cls, 0) + 1
+        if life in led.killed and life != led.final:
+            drains = led.sut.life_drains(life)
+            kill = led.out.killed_done.get(life) or led.killed_at[life]
+            if drains and drains[-1] < t <= kill:
+                undrained.setdefault(life, {})
+                undrained[life][cls] = undrained[life].get(cls, 0) + 1
     for life in led.lives:
         recorded = by_life.get(life, {})
         counted = {}
@@ -7320,13 +7579,25 @@ def check_ledger_standin(data):
                 cls = point.attributes.get("class", "?")
                 counted[cls] = counted.get(cls, 0) + point.value
         verdict = WARN if life in led.killed and life != led.final else FAIL
+        late = undrained.get(life, {})
         unrecorded = {"network_error", HTTP_CONNECT_CLASS}
         for cls in sorted((set(recorded) | set(counted)) - unrecorded):
-            if recorded.get(cls, 0) != counted.get(cls, 0):
-                flag(verdict, f"life {life}: the stand-in answered {_n(recorded.get(cls, 0))} "
-                              f"request(s) {cls}, {sink} counted {_n(counted.get(cls, 0))}")
+            short = recorded.get(cls, 0) - counted.get(cls, 0)
+            if short == 0:
+                continue
+            if 0 < short <= late.get(cls, 0):
+                lines.append(f"life {life}: the stand-in answered {_n(short)} request(s) {cls} "
+                             f"{sink} never counted, reported: the stand-in recorded "
+                             f"{_n(late[cls])} {cls} after the killed life's last drain")
+                continue
+            flag(verdict, f"life {life}: the stand-in answered {_n(recorded.get(cls, 0))} "
+                          f"request(s) {cls}, {sink} counted {_n(counted.get(cls, 0))}")
         resets, errors = recorded.get("network_error", 0), counted.get("network_error", 0)
-        if resets > errors:
+        if 0 < resets - errors <= late.get("network_error", 0):
+            lines.append(f"life {life}: the stand-in reset {_n(resets - errors)} request(s) "
+                         f"{sink} never counted, reported: the stand-in reset "
+                         f"{_n(late['network_error'])} after the killed life's last drain")
+        elif resets > errors:
             flag(verdict, f"life {life}: the stand-in reset {_n(resets)} request(s), {sink} "
                           f"counted {_n(errors)} network_error")
         lines.append(f"life {life}: recorded " + (", ".join(
@@ -7344,7 +7615,7 @@ def check_ledger_standin(data):
                    and request.get("status") == standin.DEFAULT_STATUS[shape]
                    and request.get("stored") is True)
         if cue is None:
-            if not default and request.get("path") == path:
+            if not default and request.get("path") in writes:
                 flag(FAIL, f"request #{request.get('seq')} was answered "
                            f"{request.get('answer')} {request.get('status')} with no cue")
             continue
@@ -7364,7 +7635,7 @@ def check_ledger_standin(data):
         if fault.count is not None:
             # A counted cue answers that many writes and no more, so a shortfall means the
             # step's span closed before the sink sent them, and the step tested less than it says.
-            spent = sum(1 for r in requests if r.get("cue") == step and r.get("path") == path)
+            spent = sum(1 for r in requests if r.get("cue") == step and r.get("path") in writes)
             if spent != fault.count:
                 flag(FAIL, f"{step}: its cue answered {_n(spent)} write(s), not its count "
                            f"{_n(fault.count)}")
@@ -7387,13 +7658,15 @@ def check_ledger_standin(data):
     elif data.standin_influxdb:
         resent = _standin_influxdb(data, led, sink, at_most_once, flag, lines)
     else:
+        resent = f"{_n(rewrites)} resent sample(s) stored again with the same value"
         if shape == standin.REMOTE_WRITE:
             _standin_not_written(data, led, sink, flag, lines)
         elif shape == standin.OTLP:
             _standin_otlp(data, led, sink, flag, lines)
+        elif shape == standin.DATADOG_TRACE:
+            resent = _standin_datadog_trace(data, led, sink, flag, lines)
         else:
             _standin_splunk(data, led, sink, flag, lines)
-        resent = f"{_n(rewrites)} resent sample(s) stored again with the same value"
     summary = (f"{_n(len(requests))} request(s) recorded, {_n(stored)} stored, "
                f"{_n(len(data.standin_cues))} cue(s); {resent}; {len(classed)} classed step(s) "
                f"({'at_most_once' if at_most_once else 'at_least_once'})")
@@ -7475,6 +7748,41 @@ def _standin_otlp(data, led, sink, flag, lines):
     _judge_records_dropped(led, sink, "rejected", expected,
                            "the points partial_success answers rejected plus the points of "
                            "requests answered under a rejected step", flag, lines)
+
+
+def _standin_datadog_trace(data, led, sink, flag, lines):
+    """`ledger.standin`'s rules for a `datadog_trace` stand-in: per SUT life, the sink's
+    `records.dropped{reason="rejected"}` equals the spans of the requests answered under the cue
+    of a step classed `rejected`, other than a `413`, and `records.dropped{reason="oversize"}`
+    the spans of the `413` ones, since `datadog_trace_out` counts a rejected request's records
+    under that reason. The copies are reported: a span of an accepted write already in an
+    earlier one, which an ambiguous answer at either hop explains, and the spans of writes
+    stored and answered otherwise, which the sink resends."""
+    classed = {f.step: f for f in data.faults if f.action == "respond" and f.fault_class}
+    rejected, oversize = {}, {}
+    for request in data.standin_requests:
+        fault = classed.get(request.get("cue"))
+        if fault is None or fault.fault_class != "rejected":
+            continue
+        life = vm.life_at(led.life_starts, request.get("t") or 0)
+        into = oversize if request.get("status") == 413 else rejected
+        into[life] = into.get(life, 0) + standin.points_in(request, standin.DATADOG_TRACE)
+    _judge_records_dropped(led, sink, "rejected", rejected,
+                           "the spans of requests answered under a rejected step", flag, lines)
+    _judge_records_dropped(led, sink, "oversize", oversize,
+                           "the spans of 413s answered under a rejected step", flag, lines)
+    spans = data.standin_spans
+    by_life = {}
+    for _, _, _, index in spans.copies:
+        life = vm.life_at(led.life_starts, data.standin_requests[index].get("t") or 0)
+        by_life[life] = by_life.get(life, 0) + 1
+    lines.append(f"{_n(len(spans.copies))} accepted copy(ies) of a span already accepted"
+                 + ("" if not by_life else " (" + ", ".join(
+                     f"life {life} {_n(n)}" for life, n in sorted(by_life.items())) + ")")
+                 + f"; {_n(sum(n for _, n in spans.resent))} span(s) in "
+                 f"{_n(len(spans.resent))} write(s) stored and answered other than 2xx")
+    return (f"{_n(len(spans.copies))} accepted copy(ies) of an accepted span, "
+            f"{_n(sum(n for _, n in spans.resent))} span(s) stored under a non-2xx answer")
 
 
 def _standin_splunk(data, led, sink, flag, lines):
@@ -8386,6 +8694,8 @@ STANDIN_JUDGED_DROPS = {
     (standin.REMOTE_WRITE, "logit.output.samples.dropped", "not_written"),
     (standin.OTLP, "logit.output.records.dropped", "rejected"),
     (standin.SPLUNK, "logit.output.records.dropped", "invalid_event"),
+    (standin.DATADOG_TRACE, "logit.output.records.dropped", "rejected"),
+    (standin.DATADOG_TRACE, "logit.output.records.dropped", "oversize"),
 }
 
 
