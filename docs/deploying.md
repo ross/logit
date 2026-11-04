@@ -487,21 +487,32 @@ What an operator sees in the graphs:
 
 ### TCP listeners and `tcp_migrate_req`
 
-When a listener closes, the kernel resets every connection in its accept queue: connections whose
-client already saw `connect()` succeed and may have sent data. With `net.ipv4.tcp_migrate_req=1`
-(Linux 5.14 and later), the kernel moves them to the surviving process instead. `logit` accepts
-through the delay, until the instant the drain drops a listener, so its queue is near empty at the
-close, and the sysctl matters only for connections that finish their handshake in that
-last instant. Every stream client `logit` serves reconnects after a reset, but a line it had sent
-into the reset connection is lost unless its protocol acknowledges.
+When a TCP listener closes, the kernel resets every connection in its accept queue and every
+handshake in flight to it, including a handshake whose final ACK hasn't arrived yet. A client whose
+`connect()` succeeded may already have sent data. `logit` accepts through the delay, so its queue
+is near empty, but the handshakes in flight still reset: about the dial rate times the round-trip
+time, on the closing listener's share of the port. With `net.ipv4.tcp_migrate_req=1` (Linux 5.14
+and later), the kernel moves the queue and the in-flight handshakes to the surviving listener
+instead. With a 100 ms path delay, a soak run at `0` reset 7 connections at each of two closes, of
+23,920 dials, and a run at `1` reset none across four closes, of 44,817. Every stream client `logit` serves reconnects after a reset, but a
+line it had sent into the reset connection is lost unless its protocol acknowledges.
 
-It's a node-level setting. A `hostNetwork` pod shares the node's network namespace and can't set
-network sysctls, so set it in the node image, from a privileged init DaemonSet, or through your
-distribution's node tuning:
+The setting applies to TCP listeners only. A UDP socket has no handshake or accept queue.
+
+The sysctl is per network namespace, and both overlap instances share one, so set it where that
+namespace is owned. A new container's own namespace starts at 0 whatever the host's value, so
+setting it on the host doesn't reach a container. Set it on the container that owns the namespace,
+the one whose network the other instance joins with `--network container:NAME`. Docker applies it
+inside that namespace, with no added capability. On a host, setting it takes root:
 
 ```sh
-sysctl -w net.ipv4.tcp_migrate_req=1    # persist it in /etc/sysctl.d/
+docker run --sysctl net.ipv4.tcp_migrate_req=1 ...    # or `sysctls:` in a Compose service
+sysctl -w net.ipv4.tcp_migrate_req=1                  # on a host, as root; persist it in /etc/sysctl.d/
 ```
+
+A `hostNetwork` pod shares the node's namespace and can't set network sysctls, so set it at the
+node: in the node image, from a privileged init DaemonSet, or through your distribution's node
+tuning.
 
 ### systemd: two instance units
 
