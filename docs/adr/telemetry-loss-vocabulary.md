@@ -1,6 +1,6 @@
 ---
 created: 2026-10-13
-updated: 2026-11-02
+updated: 2026-11-03
 ---
 
 # Telemetry loss vocabulary: any nonzero `*.dropped` is loss, and intended outcomes use other words
@@ -538,6 +538,17 @@ the log that was dropped has already been written to stderr under the operator's
 only its copy in the pipeline is lost.
 [internal-telemetry.md](../design/internal-telemetry.md)'s "Logs" section carries the same
 statement.
+
+## Amendment (2026-11-03): a stream sink's unacknowledged bytes
+
+A stream sink's TCP connection that ends with its data destroyed (the receiver's reset or close,
+unsolicited bytes, a TLS alert, or a failed write) counts the bytes of earlier batches its socket
+still held unacknowledged as `output.bytes.dropped{reason="unacknowledged"}`, with a throttled
+`warn` keyed `unacknowledged` in the same branch
+([ADR `stream-sink-stalled-connection`](stream-sink-stalled-connection.md)). It's loss: those
+batches were counted sent. The unit is bytes, as for `input.bytes.dropped`, because the socket's
+queue doesn't know message boundaries. A connection closed on a stall or at shutdown counts
+nothing, because the kernel keeps sending what it holds and the receiver may still read it.
 
 ## Migration record
 The classification of every `*.dropped`, `*.skipped`, `*.degraded`, `*.truncated`, and loss-related

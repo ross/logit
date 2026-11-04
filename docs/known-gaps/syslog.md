@@ -37,3 +37,12 @@ Entry format and the other areas: [the known-gaps index](README.md).
     ([ADR `syslog-tcp-ingress-and-tls`](../adr/syslog-tcp-ingress-and-tls.md)), so a `0x0A` inside
     an octet-counted MSG survives end to end. The HAProxy CBOR entry records why the decoder that
     would consume such a payload was measured and not built.
+- **`syslog_out` has no RELP transport, so a receiver's unread bytes are lost uncounted.** Over
+  TCP or TLS, a receiver acknowledges bytes when its kernel takes them, before its process reads
+  them, so a receiver that dies loses its receive buffer and the sender never learns how much
+  ([ADR `delivery-semantics`](../adr/delivery-semantics.md), item 6). `syslog_out` counts only
+  its own socket's unacknowledged share ([sinks.md](sinks.md)'s stream-sink entry).
+  - **To close:** RELP (the Reliable Event Logging Protocol, rsyslog's `omrelp`/`imrelp`)
+    acknowledges each message after the receiver's process takes it, which is the only way to
+    see that share from the sender. It needs a `transport: relp` on `syslog_out`, with its own
+    ADR, and an interop check against rsyslog's `imrelp`.

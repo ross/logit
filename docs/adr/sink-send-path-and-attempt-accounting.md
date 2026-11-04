@@ -1,6 +1,6 @@
 ---
 created: 2026-09-29
-updated: 2026-10-25
+updated: 2026-11-03
 ---
 
 # Sink send path and attempt accounting: counters that say what they count, one pooled-stream driver, and TLS writes that are flushed
@@ -1175,3 +1175,15 @@ rule rejects that configuration; the field's doc tells the operator to keep `con
 below the request timeout. Under it, `network_error` is an upper bound on the requests a destination may
 hold, and a reader counting it as resends, such as the soak harness's allowance, is loose by
 the stalled dials.
+
+## Amendment: the stream driver keeps a stalled connection (2026-11-03)
+
+The pooled-stream driver no longer drops a connection whose write stalled past
+`connect_timeout`: it keeps it, with any unwritten tail of the frame, while the TCP peer still
+answers, and counts the unacknowledged bytes a destroyed connection held as
+`logit.output.bytes.dropped{reason="unacknowledged"}` on the ungated handles, a destination
+verdict in decision 1's third class, met once per connection
+([ADR `stream-sink-stalled-connection`](stream-sink-stalled-connection.md)). Where the sections
+above say a stalled write drops the connection or that the next send dials fresh, read that it
+keeps the connection. A first write that accepts nothing is `Clean` under TLS as on plaintext.
+`write_with_progress` and `connect` keep their behavior for `logit_out`.

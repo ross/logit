@@ -62,6 +62,47 @@ async fn a_tls_write_returns_ok_with_ciphertext_still_queued_in_the_session() {
     .await;
 }
 
+/// tokio-rustls `common/mod.rs`, `Stream::poll_write`: a write answers `Pending` only when the
+/// session took none of its bytes (`(0, true)`), so a write dropped while pending, as the stream
+/// sinks' stall bound drops one, accepted nothing. The ciphertext queued before it stays in the
+/// session and leaves ahead of the next write's: the peer reads what was accepted, then the next
+/// write, and nothing of the dropped one.
+#[tokio::test]
+async fn a_pending_tls_write_accepted_nothing_and_queued_ciphertext_leaves_first() {
+    unconstrained(async {
+        let ((client_io, _), (server_io, _)) = tapped_duplex(CAPACITY);
+        let (mut client, mut server) = tls_pair(client_io, server_io).await;
+        let payload = payload(200_000);
+        // One poll per write, each dropped after it, until one answers `Pending`: the session
+        // takes plaintext while its queue is under the limit, and the pipe stays full.
+        let mut n = 0;
+        loop {
+            let mut write = pin!(client.write(&payload[n..]));
+            match std::future::poll_fn(|cx| Poll::Ready(write.as_mut().poll(cx))).await {
+                Poll::Ready(Ok(taken)) => n += taken,
+                Poll::Ready(Err(err)) => panic!("a write into a full pipe failed: {err}"),
+                Poll::Pending => break,
+            }
+        }
+        assert!(n >= RUSTLS_BUFFER_LIMIT, "the session filled first: {n} bytes");
+
+        let next = b"the next frame\n";
+        let mut got = vec![0u8; n + next.len()];
+        let (written, read) = tokio::join!(
+            async {
+                client.write_all(next).await?;
+                client.flush().await
+            },
+            server.read_exact(&mut got),
+        );
+        written.expect("the next write completes while the server reads");
+        read.expect("the server reads the accepted bytes and the next write");
+        assert_eq!(got[..n], payload[..n]);
+        assert_eq!(&got[n..], next, "nothing of the dropped write arrived");
+    })
+    .await;
+}
+
 /// tokio-rustls `common/mod.rs`, `Stream::poll_fill_buf` and `Stream::read_io`: a read that
 /// processes its records cleanly calls only `read_io`, so a reader waiting for a reply doesn't
 /// push out an unflushed request, even with room in the socket for it. The exception, a read whose

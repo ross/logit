@@ -1,6 +1,6 @@
 ---
 created: 2026-09-21
-updated: 2026-09-25
+updated: 2026-11-03
 ---
 
 # Out-of-CI verification of raw-`libc` `unsafe`: a throwaway nightly image, not a Dockerfile.dev change
@@ -246,3 +246,14 @@ reaches them. They were run on the dev box with `--cap-add SYS_PTRACE` alone:
 An `EMFILE` or `EPERM` scenario that fails, or an `EBADF` scenario that shows repeated `accept4`
 calls, means the classification in `crates/logit-inputs/src/listener.rs`
 (`classify_accept_error`) regressed.
+
+## Amendment: `sockstat.rs` reads a stream sink's send queue (2026-11-03)
+
+`sockstat.rs` gained two readers for the stream sinks ([ADR
+`stream-sink-stalled-connection`](stream-sink-stalled-connection.md)): `send_queue`, an
+`ioctl(TIOCOUTQ)` (Linux's `SIOCOUTQ`) into a `c_int`, and `tcp_peer_answering`, a third
+`getsockopt(TCP_INFO)` that reads `tcpi_retransmits` and `tcpi_probes`. NET-11 now covers three
+`getsockopt` calls and one `ioctl`, still in the same file. Miri can't execute either call;
+`tcp_peer_answering`'s reply parser is in `sockstat::tests::reply_parsing`, so the `miri` target
+already runs it. `inject` can force an errno on the `ioctl` (`-e inject=ioctl:error=EBADF`) as on
+the other calls; no committed scenario does.
