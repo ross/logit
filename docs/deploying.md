@@ -3350,11 +3350,12 @@ secret, so a token in it is a token anyone can read.
 
 ## `otlp_in`: a busy answer
 
-If a request's first batch finds every consumer directly downstream full for 2 s, `otlp_in`
-answers HTTP `503` with `Retry-After: 1`, or gRPC status 14 (`UNAVAILABLE`), and delivers
-nothing. The exporter still holds the data and is expected to retry, as OTLP exporters do for
-these answers. Each one counts `logit.input.batches.deferred` and
-`logit.input.requests{class="busy"}`, neither of which is loss. Once a request's first batch is
+If a request's first batch can't reach every consumer directly downstream within 2 s (one full
+consumer is enough), `otlp_in` answers HTTP `503` with `Retry-After: 1`, or gRPC status 14
+(`UNAVAILABLE`), and delivers nothing. The exporter still holds the data and is expected to
+retry, as OTLP exporters do for these answers. A busy request counts
+`logit.input.requests{class="busy"}` once and each of its batches in
+`logit.input.batches.deferred`; neither is loss. Once a request's first batch is
 in, its later batches wait with no deadline, because a `503` would make the client resend a batch
 already delivered. See [ADR `otlp-in-busy-answer`](adr/otlp-in-busy-answer.md).
 

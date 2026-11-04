@@ -1287,13 +1287,14 @@ in `logit.input.batches.deferred`: a retry, not loss. A request the shutdown bac
 of its send at a stop counts its events `events.dropped{reason="shutdown"}` and was never
 counted sent, and the client resends it, so X on an HTTP wire leaves those drops out.
 `influxdb_in`, `splunk_hec_in`,
-`datadog_in`, and `otlp_in` also count their requests, so `ledger.intake` holds each one's `ok` and
+and `datadog_in` also count their requests, so `ledger.intake` holds each one's `ok` and
 `closed_consumer` requests on its write route (`write`, `event`, and `series_v2`) to its
 `batches.sent` and its `busy` ones to `batches.deferred` in every SUT life a kill didn't end,
 and reports a killed life unjudged. `prometheus_in`'s receiver counts
 `logit.input.writes{class}`, with no route tag, and never answers busy, so only the first holds
-it. `otlp_in` counts `logit.input.requests{route, class}` too, with a `busy` class for its
-bounded first batch, so it is judged as those three are. `otlp_in` sends one event per log record and per metric data
+it. `otlp_in` counts `logit.input.requests{route, class}`, with a `busy` class for its bounded
+first batch, and `ledger.intake` sums its `logs`, `metrics`, and `traces` routes against its
+`batches.sent` and `batches.deferred`. `otlp_in` sends one event per log record and per metric data
 point, the units G counts while each event carries one. An HTTP writer sends its own batches,
 one per request, so a resend's allowance is the writer's batch, its events received over its
 batches received, not its input's: behind an `aggregate`, one window's points. A writer that
