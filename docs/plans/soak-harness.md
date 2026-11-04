@@ -6880,6 +6880,62 @@ What the runs showed about `logit` and the harness:
 - **Self-test**: 2,375 expectations after the merges. Each new rule was reverted in turn and
   failed at least one expectation; the PR lists them.
 
+### W33: a slow spool on the perf VM (2026-11-04)
+
+W33 adds the `cgroup` action's `io_wbps` and `io_wiops` keys, `tools/soak/vm-io-probe.sh`, and
+the `slow-spool` scenario. Both runs were on the disposable perf VM (`Standard_F8as_v6`, 8 cores
+of an AMD EPYC 9V74, 31 GiB, Debian 13 `debian-13:13-gen2`, kernel 6.12.115+deb13.1-cloud-amd64,
+Docker 29.9.3 with the containerd image store, Python 3.13.5), one after the other, at the
+scenario's default duration, with the driver running docker with no `sudo` (`DOCKER=docker`).
+The root filesystem is ext4 on `/dev/nvme0n1p1`, a 128 GiB Premium_LRS managed disk; a
+container's root is overlayfs whose upperdir, under
+`/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/`, sits on that ext4
+partition (259:7), and `io_device` resolved its whole disk, 259:0, in the probe and in every
+apply.
+
+The probe PASSed on the first try: under `259:0 wbps=1048576`, 4 MiB with `fsync` took 4.05 s,
+and `io.stat` counted 4,194,304 bytes in 17 writes. With no limit the same `dd` took 0.06 s, its
+cgroup's `io.pressure` `some` total gaining 71 µs and 2,059 µs in two tries, and six 40 KiB
+writes with `fsync` 3 s apart stalled 641 µs in all (about 0.004% of their 18 s); under
+`wbps=32768` those six stalled 7.5 s.
+
+| Run | Scenario | Verdict | Highlights |
+|---|---|---|---|
+| `20261104T160417Z` | `slow-spool`, first cut (the default 64MiB `segment_bytes`) | FAIL | `timeline`: `c0s4` wrote 425,984 bytes in 11 writes over 123.8 s, 3,441 B/s against the 32,768 limit, and stalled 0.40 s (0.3%), under `engaged`'s 1%; below. Every other row PASS; the SUT's stop inside `c0s2` took 18.7 s (`drain complete` 18.5 s), exit 0 |
+| `20261104T161635Z` | `slow-spool`, `segment_bytes: 64KiB` | PASS | `timeline`: both applies rc 0 on 259:0; `c0s4` wrote 1,503,232 bytes in 30 writes over 123.5 s, 12,169 B/s against 32,768, and stalled 6.4 s (5.2%). The stop inside `c0s2` took 9.8 s (`drain complete` 9.56 s), exit 0, against 14 ms unthrottled at the end. 5 records replayed at the restart, none truncated, no second replay, no `buffer.disk.errors`, no drop; G 760,700, W 741,400, Ab = V = 530,800, uncounted 0; `ledger.windows`' widest gap 10.0 s |
+
+Both runs used `logit:soak` built on the VM from the branch (`sha256:91d57082f118` at
+`1dfa6a27`, `sha256:a6784b790215` at `2aef5edd`).
+
+What the runs showed about `logit` and the harness:
+
+- **A spool push doesn't wait on the disk.** The first cut's limit throttled the writeback and
+  nothing in the SUT waited on it: a push writes its record with no `fsync`, and a segment is
+  synced only when it rotates and at close ([ADR `disk-backed-sink-buffer`](../adr/disk-backed-sink-buffer.md)),
+  so under the default 64MiB the segment never rotated, the flusher wrote 3.4 KB/s of the
+  spool's 12.8 KiB/s back under the limit, and the stall the run saw was the cursor persists'
+  `fsync`s. The scenario's premise, a `sync_data` per window, held only with a segment smaller
+  than one record: `segment_bytes: 64KiB` rotates at every push (each window's record is
+  130,978 bytes, from `logit.component.buffer.bytes`), and the rotation syncs the previous
+  record under the limit. That stalled 5.2% of the window, five times the threshold and more
+  than a thousand times the unthrottled share. It stalled less than the bytes over the limit
+  would predict (1.5 MB at 32K is 46 s); `io.pressure` counts only the time a task waited, and
+  the run doesn't show how much writeback the flusher did between rotations. The 1% threshold
+  stays: it sits between 0.004% and 5.2%.
+- **A shutdown under a slow disk syncs the unsynced segment.** The first cut's stop drained in
+  18.5 s, against 15 ms unthrottled at the end of the same run, because `finish` syncs the
+  active segment, which held every record since the last writeback; at one record per segment
+  it took 9.6 s. Both are under the driver's 30 s `docker stop -t`, but past Docker's default
+  10 s, which would SIGKILL a spool mid-sync on a slow disk; the next open recovers it, so it's
+  replay, not loss. An operator note, not a defect.
+- **Records sit in the page cache between rotations.** Under the default segment size and a
+  slow disk the dirty backlog grows with the outage; a power loss loses what the flusher hadn't
+  written. That is the ADR's documented durability, with per-push `fsync` left to a later knob.
+- **`rss_slope` WARNed on `logit` in the first cut** with no life of enough samples outside the
+  fault windows and PASSed in the second (-444.5 MiB/h over 60 s, limit 334): the scenario's
+  windows cover most of each life, so the row is thin either way.
+- **Self-test**: 3,049 expectations, unchanged by the scenario fix.
+
 ### W32: a CPU quota and memory pressure on the SUT's cgroup (2026-11-03)
 
 W32 adds the `cgroup` action and the `cpu-quota`, `memory-high`, and `memory-high-pressure`

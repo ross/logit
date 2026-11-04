@@ -11,7 +11,8 @@
 # write about 128 KiB a window (`logit.component.buffer.bytes` grew 130,978 bytes a window on
 # the perf VM), 12.8 KiB/s. A push doesn't fsync; the SUT's `segment_bytes`, below one record,
 # rotates the segment at every push, and the rotation's `sync_data` of the previous record
-# waits on the limit. At 32K a second that is about 4 s of the window: slow, and not so slow
+# waits on the limit. On the perf VM the second step's window stalled 6.4 s of 124 s (5.2%)
+# at 32K a second, against under 0.01% for an unthrottled fsync there: slow, and not so slow
 # that the spool falls behind `aggregate`. No `internal`
 # metric times a spool write, so the second step's `engaged` judges `io.pressure`'s stalled
 # time, and `timeline` reports the bytes and writes `io.stat` counted. The schema is
