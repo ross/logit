@@ -1654,7 +1654,9 @@ impl Aggregator {
     }
 
     /// Emits one event per series updated this window, stamped with `now` and paired with its
-    /// `SpanLink`s.
+    /// `SpanLink`s. `now` is the runtime's flush stamp, the wall time a deadline flush's deadline
+    /// came due (`Transform::flush`), so it can precede events this window absorbed when the flush
+    /// ran late; `first_seen.min(now)` keeps each start at or below it all the same.
     ///
     /// Every non-retainable accumulator is removed. A retainable series (a gauge in either mode, a
     /// `Sum`/`Histogram` under `temporality: cumulative`) survives into the next window when

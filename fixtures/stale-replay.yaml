@@ -12,7 +12,7 @@
 #   [the wire] --> central_in
 #                          \--> late (has_stale) -----------------------------> archive
 #
-# `max_age` must cover clock skew between tiers, one aggregate flush interval, and pipeline
+# `max_age` must cover clock skew between tiers, two aggregate flush intervals, and pipeline
 # latency. This aggregate runs `temporality: delta` (the default). Ahead of a cumulative one,
 # discarding a replayed delta leaves the running total low by that amount, while merging it late
 # keeps the total right but spikes the rate.

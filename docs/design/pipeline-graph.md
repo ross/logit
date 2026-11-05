@@ -700,6 +700,16 @@ advances it with `advance_flush_deadline`, which is constant-time however many t
 worker kept a `Vec` of deadlines only because a pipeline's stages shared one thread and one receive
 loop.
 
+A flush runs only between batches, so one held up by a send blocked on a full downstream inbox
+runs late, and the catch-up flush follows it at the next deadline. `run_transform` therefore hands
+a deadline flush of an `aggregate` or `shape` the wall time its most recent missed deadline came
+due, not the wall time itself: the wall clock read at the flush, less the flush's monotonic
+lateness modulo the interval. The late flush and the catch-up carry their own deadlines' times, an
+interval apart, and since both clocks are read again at every flush, a wall-clock step applies at
+the next one. The close-time flush and a Lua `flush(now)` take the wall time
+([`aggregation-window-semantics`](../adr/aggregation-window-semantics.md)'s
+"Amendment: a deadline flush is stamped with its deadline (2026-11-04)").
+
 A flushed event leaves through the node's own `Fanout`, like a normally processed batch. So the
 "flushed output isn't exempt from downstream processing" property
 (`docs/adr/aggregation-window-semantics.md`) holds by construction: downstream processing is

@@ -246,7 +246,11 @@ global's section below says what this means for it.
 
 **`flush` receives one argument, `now`: the runtime's tick time as a decimal-nanos string.** It
 uses the same encoding as `event.timestamp` (and isn't a Lua number for the same 2^53 reason), and
-it's the same `now_unix_nanos()` value the runtime hands the native `aggregate`'s own flush. It
+it's the wall time the flush ran at. The native `aggregate` gets the wall time its tick's
+deadline came due instead
+([ADR `aggregation-window-semantics`](../adr/aggregation-window-semantics.md)'s "Amendment: a
+deadline flush is stamped with its deadline (2026-11-04)"), so the two can differ by up to an
+interval. It
 exists so a flush-driven `Event.new{timestamp = now, ...}` ("Constructing events" below) has a
 timestamp without a general clock. A script that declares `function flush()` with no parameter
 ignores it, per ordinary Lua semantics.

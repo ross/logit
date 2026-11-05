@@ -419,8 +419,8 @@ impl ScriptWorker {
     /// (`docs/adr/target-components.md`). `event:clone()` copies the mark and the target table, so
     /// a clone stashed in `process()` can be routed here, as can `Event.new(..):to("x")`.
     ///
-    /// `now` is the runtime's tick time, the `now_unix_nanos()` a native `aggregate` gets, passed
-    /// as `flush(now)` in decimal nanos: a string, as `event.timestamp` is, so
+    /// `now` is the wall time of the tick, `now_unix_nanos()` (not the deadline stamp a native
+    /// `aggregate` gets), passed as `flush(now)` in decimal nanos: a string, as `event.timestamp` is, so
     /// `Event.new{timestamp = now, ..}` works with no clock in the sandbox
     /// (`docs/adr/lua-event-constructor.md`). A `function flush()` ignores it.
     pub fn flush(&self, now: i64) -> Result<Vec<(Event, Option<u16>)>, ScriptError> {
