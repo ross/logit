@@ -7044,6 +7044,8 @@ What the runs showed about `logit` and the harness:
   sysctl through compose `sysctls:` with no added capability, and each churn read the value back
   from the holder. No product defect: the reset is the kernel's, and the setting is the
   operator's ([docs/deploying.md](../deploying.md#tcp-listeners-and-tcp_migrate_req)). The
+  product docs had called the exposure only the connections finishing in the last instant; they
+  now state the full exposure and recommend the sysctl. The
   exposed set grows with the clients' round trip: `logit` accepts until the close, so its accept
   queue is near empty, but a handshake whose final ACK is still in flight at the close is reset
   too, about the dial rate times the round trip on the closing listener's share.
