@@ -57,9 +57,9 @@ today — `statsd_in` always uses `Resource::default()`, and `internal` always u
 either still see exactly one distinct resource across the batches they receive).
 
 **Emitted timestamp is flush wall-clock**, ~~i.e. when the window closed~~ (a deadline flush is
-stamped with its grid point since 2026-11-04; see "Amendment: a deadline flush is stamped on its
-grid point (2026-11-04)") — not a source event's
-timestamp, and not the gauge's internally-tracked "latest write" timestamp (used only to pick the
+stamped with the wall time its deadline came due since 2026-11-04; see "Amendment: a deadline
+flush is stamped with its deadline (2026-11-04)") — not a source event's timestamp, and not
+the gauge's internally-tracked "latest write" timestamp (used only to pick the
 winner, then discarded). A record that carries its source's own timestamp isn't merged at all;
 see "Amendment: timestamped records, APM stats, and non-finite gauges pass through (2026-10-19)".
 A relay that must keep source timestamps and still leave one point per series per instant uses
@@ -1253,7 +1253,7 @@ a consumer still sees a changed start and re-bases. The stage stays on `SystemTi
 clock would need its own mapping to wall time on every emitted point, which nothing else in the
 pipeline does.
 
-## Amendment: a deadline flush is stamped on its grid point (2026-11-04)
+## Amendment: a deadline flush is stamped with its deadline (2026-11-04)
 
 **The defect.** `run_transform` keeps its flush deadlines on a grid counted from node start, and
 runs a flush only between batches. A send blocked on a full downstream inbox therefore holds the
@@ -1264,34 +1264,39 @@ landed in the same second. `graphite_out` floors to seconds and carbon overwrite
 with no signal; `datadog_out` drops one and counts it `duplicate_timestamp`. Either way a window's
 delta is lost.
 
-**Decision.** `run_transform` reads the wall clock (`SystemTime`) once when the node starts, as an
-anchor, before the `Instant` its deadlines count from. A deadline flush hands `Transform::flush`
-the wall-clock grid point at or below the flush's own wall time: `now - ((now - anchor) mod
-interval)`, the same remainder `advance_flush_deadline` takes, Euclidean so that a wall clock
-stepped back past the anchor still yields a point at or below `now` (`grid_stamp`,
-`crates/logit-pipeline/src/runtime.rs`). A late flush and its catch-up get consecutive grid
-points, an interval apart, distinct for any interval. Reading the anchor first means a flush that
-fires at or after its deadline floors onto that deadline's grid point, not the one below.
+**Decision.** A deadline flush hands `Transform::flush` the wall time at which its most recent
+missed deadline came due: `wall_now - ((now_instant - deadline) mod interval)`, with `wall_now`
+read from `SystemTime` beside `now_instant`, right before the flush. The remainder is the one
+`advance_flush_deadline` takes (`deadline_stamp` and `cadence_remainder`,
+`crates/logit-pipeline/src/runtime.rs`). A flush 9.99 s late stamps the wall time of its deadline
+D1, and its catch-up at D2 + 10 ms stamps the wall time of D2: an interval apart, distinct for any
+interval.
+
+This isn't the node-start `Instant` offset rejected below. The stamp re-reads `SystemTime` at
+every flush and backs off only that flush's lateness, which is less than an interval, so a step or
+a suspend applies at the next flush and nothing accumulates. There's no wall-clock anchor and no
+wall-clock grid, so a step can't leave a deadline in a phase where two flushes floor onto one
+point.
 
 `Aggregator`'s `window_start` and a series' `first_seen` take the stamp as `now`, so the window
-start is the previous flush's grid point and `first_seen.min(now)` still keeps every emitted start
-at or below its point's timestamp. `shape` stamps its events with it too. The scope is the
+start is the previous flush's stamp and `first_seen.min(now)` still keeps every emitted start at
+or below its point's timestamp. `shape` stamps its events with it too. The scope is the
 `Transform` trait: a Lua `flush(now)` and `BatchAccumulator` keep the wall time.
 
-**The close-time flush keeps the wall time.** Flooring it could repeat the last deadline flush's
-stamp, a guaranteed collision. With the wall time, a shutdown less than a second after a
-deadline flush still lands in that flush's second. That's the one residual same-second case, and
-[`datadog-out-sent-second-memory`](datadog-out-sent-second-memory.md) already counts it.
+**The close-time flush keeps the wall time.** Backing it off to a deadline could repeat the last
+deadline flush's stamp, a guaranteed collision. With the wall time, a shutdown less than a second
+after a deadline flush still lands in that flush's second. That's the one residual same-second
+case, and [`datadog-out-sent-second-memory`](datadog-out-sent-second-memory.md) already counts it.
 
 **What peers do.** The Datadog Agent and carbon-aggregator bucket points by their own timestamps
 and stamp each bucket's start. Telegraf's aggregators flush on a fixed grid. etsy's `statsd`
 stamps the flush's own time and has this defect. Vector's interval timers use tokio's default
 `MissedTickBehavior::Burst`, which fires every missed tick at once.
 
-**Not done: anchoring the grid to the epoch.** Aligning every node's grid to multiples of the
-interval since the Unix epoch would make windows comparable across processes, but it also makes a
-whole fleet flush in the same instant, a synchronized burst on every shared destination, for a
-small gain. It may come back as an opt-in.
+**Not done: anchoring the grid to the epoch.** Aligning every node's deadlines to multiples of
+the interval since the Unix epoch would make windows comparable across processes, but it also
+makes a whole fleet flush in the same instant, a synchronized burst on every shared destination,
+for a small gain. It may come back as an opt-in.
 
 ### Alternatives considered
 
@@ -1301,9 +1306,12 @@ small gain. It may come back as an opt-in.
   only for an interval of 2 s or more, and skipping a flush merges two windows.
 - **Document it and point at `dedup_timestamps`.** `dedup_timestamps` holds no state across
   batches, and the two windows leave in separate batches.
-- **Map the `Instant` deadline to wall time through a fixed offset.** That's the monotonic-to-wall
-  mapping "Amendment: the flush clock stays `SystemTime` (2026-10-25)" declines, and the offset
-  goes stale after any wall-clock step.
+- **Map the `Instant` deadline to wall time through an offset fixed at node start.** That's the
+  monotonic-to-wall mapping "Amendment: the flush clock stays `SystemTime` (2026-10-25)" declines,
+  and the offset goes stale after any wall-clock step or suspend.
+- **Floor the wall time onto a wall-clock grid anchored at node start.** It stamps the same points
+  while the clocks agree, but after a step or suspend a deadline can sit within timer latency of a
+  grid point, and a late flush and an on-time one either side of it floor onto the same point.
 
 ### Consequences
 
@@ -1311,10 +1319,7 @@ small gain. It may come back as an opt-in.
   a flush, as a Datadog bucket's start precedes its points. A `drop_stale` placed after `aggregate`
   with a `max_age` under about two intervals can discard such a window. Put `drop_stale` before
   `aggregate`, as [`stale-event-filtering`](stale-event-filtering.md) advises.
-- **A wall-clock step, or a host suspend, moves the grid relative to the deadlines.** Without
-  one, the anchor is read before the deadlines' `Instant`, so each flush floors onto its own grid
-  point. After one, a deadline can fall within timer latency of a grid point, and two consecutive
-  flushes on either side of it can floor onto the same point. A backward step also moves stamps back, as it moved
-  the wall-time stamps before (the 2026-10-25 amendment).
+- **Stamps follow the wall clock.** A forward step or a suspend moves the next stamp forward with
+  the clock. Only a backward step moves stamps back and makes them non-monotonic, as it did the
+  wall-time stamps before ("Amendment: the flush clock stays `SystemTime` (2026-10-25)").
 - **The shutdown flush** is the residual same-second case above.
-

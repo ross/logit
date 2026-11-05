@@ -88,7 +88,8 @@ carries none. Comparing against the wall clock is also what makes the filter wor
 tier. The native hop carries `event.timestamp` across unchanged, so a statsd line stamped at the
 edge keeps its edge time through a replay. The operator sizes `max_age` to cover clock skew between
 tiers, ~~one flush interval~~ two flush intervals (an `aggregate` flush that backpressure delays
-is stamped with its grid point, up to an interval before it ran), and normal pipeline latency.
+is stamped with the wall time its deadline came due, up to an interval before it ran), and normal
+pipeline latency.
 
 **Accounting.** This follows [`telemetry-loss-vocabulary`](telemetry-loss-vocabulary.md): a
 discard here is by design, not loss.
@@ -106,10 +107,11 @@ discard here is by design, not loss.
 **Placement.**
 
 - Put `drop_stale` immediately before `aggregate`, or before any other consumer that keeps state
-  across events. Not after it: a flush that backpressure delays is stamped with its grid point,
-  up to an interval before the events it absorbed, so a `max_age` under about two intervals can
-  discard a whole window ([`aggregation-window-semantics`](aggregation-window-semantics.md)'s
-  "Amendment: a deadline flush is stamped on its grid point (2026-11-04)").
+  across events. Not after it: a flush that backpressure delays is stamped with the wall time its
+  deadline came due, up to an interval before the events it absorbed, so a `max_age` under about
+  two intervals can discard a whole window
+  ([`aggregation-window-semantics`](aggregation-window-semantics.md)'s
+  "Amendment: a deadline flush is stamped with its deadline (2026-11-04)").
 - Put it after `timestamp` when one resolves the record's own time. A backlog that `tail_in`
   re-reads after a restart carries its read time unless `timestamp` restamps it, and an event
   carrying its read time is fresh.

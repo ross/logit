@@ -106,10 +106,11 @@ Concretely:
   so a minimal constructed span costs what a minimal decoded one does.
 - **`flush(now)`.** The Lua `flush` function receives one argument: the runtime's tick time as a
   decimal-nanos string, ~~the same value `flush_now` already passes the native `aggregate`~~ the
-  wall time the flush ran at. Since 2026-11-04 the native `aggregate` gets its tick's grid point
-  instead ([`aggregation-window-semantics`](aggregation-window-semantics.md)'s "Amendment: a
-  deadline flush is stamped on its grid point (2026-11-04)"); a Lua `flush()` keeps the wall time,
-  so the two no longer match. A script
+  wall time the flush ran at. Since 2026-11-04 the native `aggregate` gets the wall time its
+  tick's deadline came due instead
+  ([`aggregation-window-semantics`](aggregation-window-semantics.md)'s "Amendment: a deadline
+  flush is stamped with its deadline (2026-11-04)"); a Lua `flush()` keeps the wall time, so the
+  two no longer match. A script
   declaring `function flush()` ignores it (Lua semantics; no shim). This is *not* a clock: nothing
   is exposed to `process()`, and the no-clock posture in `lua-api.md` stands with this one named
   exception.
